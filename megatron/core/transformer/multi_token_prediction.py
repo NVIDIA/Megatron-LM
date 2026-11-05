@@ -1266,8 +1266,9 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
-    ce_enabled = config.mtp_ce_loss_weight > 0
-    kd_enabled = is_training and config.mtp_kl_loss_weight > 0
+    # Preserve CE-only behavior for config-like callers predating KD options.
+    ce_enabled = getattr(config, "mtp_ce_loss_weight", 1.0) > 0
+    kd_enabled = is_training and getattr(config, "mtp_kl_loss_weight", 0.0) > 0
     if not ce_enabled and not kd_enabled:
         if is_training:
             # HybridModel can return separate main states. Keep all MTP gradient
@@ -1355,7 +1356,9 @@ def process_mtp_loss(
                 ).transpose(0, 1)
                 * layer_loss_mask
             )
-        head_loss = config.mtp_ce_loss_weight * ce_loss if ce_loss is not None else 0
+        head_loss = (
+            getattr(config, "mtp_ce_loss_weight", 1.0) * ce_loss if ce_loss is not None else 0
+        )
         if kd_loss is not None:
             head_loss = head_loss + config.mtp_kl_loss_weight * kd_loss
         correct = total = None
@@ -1456,7 +1459,7 @@ def process_mtp_loss(
 
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
-            combined_sum = config.mtp_ce_loss_weight * ce_sum if ce_enabled else 0
+            combined_sum = getattr(config, "mtp_ce_loss_weight", 1.0) * ce_sum if ce_enabled else 0
             if kd_enabled:
                 combined_sum = combined_sum + config.mtp_kl_loss_weight * kd_sum
             mtp_loss_for_log = combined_sum

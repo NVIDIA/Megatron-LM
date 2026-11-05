@@ -24,8 +24,6 @@ def loss_scale(monkeypatch):
 def _config(num_layers=1, per_token=True):
     return SimpleNamespace(
         mtp_num_layers=num_layers,
-        mtp_ce_loss_weight=1.0,
-        mtp_kl_loss_weight=0.0,
         mtp_loss_scaling_factor=0.3,
         calculate_per_token_loss=per_token,
         mtp_detach_heads=False,

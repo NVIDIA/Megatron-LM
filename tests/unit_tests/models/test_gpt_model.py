@@ -65,24 +65,6 @@ class TestGPTModel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("mtp_num_layers", [None, 0])
-    def test_kd_requires_explicit_mtp_depth(self, mtp_num_layers):
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            mtp_num_layers=mtp_num_layers,
-            mtp_kl_loss_weight=1.0,
-        )
-        with pytest.raises(ValueError, match="MTP KL loss requires positive mtp_num_layers"):
-            GPTModel(
-                config=config,
-                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-                vocab_size=100,
-                max_sequence_length=4,
-            )
-
     @pytest.mark.internal
     def test_constructor(self):
         self.mock_log_single_rank.assert_called_once()

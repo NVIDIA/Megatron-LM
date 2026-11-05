@@ -579,3 +579,75 @@ def test_invalid_kd_loss_scale(loss_scale):
     logits = torch.zeros(2, 1, 4, device="cuda")
     with pytest.raises(ValueError, match="MTP KD loss scale must be finite and nonnegative"):
         vocab_parallel_kl_div(logits, logits, loss_scale=loss_scale)
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+@pytest.mark.parametrize("mtp_num_layers", [None, 0])
+def test_kd_requires_resolved_model_depth(model_type, mtp_num_layers):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=12,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        mtp_num_layers=mtp_num_layers,
+        mtp_kl_loss_weight=1.0,
+    )
+    with pytest.raises(ValueError, match="MTP KL loss requires positive mtp_num_layers"):
+        if model_type == "hybrid":
+            from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+            from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-",
+            )
+        else:
+            from megatron.core.models.gpt.gpt_layer_specs import (
+                get_gpt_layer_with_transformer_engine_spec,
+            )
+            from megatron.core.models.gpt.gpt_model import GPTModel
+
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+
+@pytest.mark.parametrize("architecture", ["pattern", "config_list"])
+@pytest.mark.parametrize("mtp_num_layers", [None, 2])
+def test_kd_accepts_inferred_hybrid_depth(architecture, mtp_num_layers):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=12,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        mtp_num_layers=mtp_num_layers,
+        mtp_kl_loss_weight=1.0,
+    )
+    if architecture == "pattern":
+        kwargs = {"hybrid_layer_pattern": "-/-/-"}
+    else:
+        from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit
+        from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+
+        main = MLPLayerConfig.from_config(config)
+        mtp = MLPLayerConfig.from_config(config)
+        kwargs = {"hybrid_layer_config_list": [main, MTPSplit, mtp, MTPSplit, mtp]}
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=100,
+        max_sequence_length=4,
+        **kwargs,
+    )
+    assert config.mtp_num_layers == 2
+    assert model.mtp_process
+    assert len(model.mtp.layers) == 2

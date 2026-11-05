@@ -480,17 +480,14 @@ class TestHybridModel:
         assert config.mtp_hsm is True
 
     @pytest.mark.parametrize("mtp_num_layers", [None, 2])
-    @pytest.mark.parametrize("kd_weight", [0.0, 1.0])
-    @pytest.mark.parametrize("hsm", [False, True])
-    def test_mtp_accepts_inferred_or_matching_depth(self, mtp_num_layers, kd_weight, hsm):
+    def test_hsm_accepts_inferred_or_matching_mtp_depth(self, mtp_num_layers):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
             mtp_num_layers=mtp_num_layers,
-            mtp_hsm=hsm,
-            mtp_kl_loss_weight=kd_weight,
+            mtp_hsm=True,
         )
         model = HybridModel(
             config=config,
@@ -501,28 +498,9 @@ class TestHybridModel:
         )
 
         assert config.mtp_num_layers == 2
-        assert config.mtp_hsm is hsm
+        assert config.mtp_hsm is True
         assert model.mtp_process is True
         assert len(model.mtp.layers) == 2
-
-    @pytest.mark.parametrize("mtp_num_layers", [None, 0])
-    def test_kd_requires_resolved_mtp_depth(self, mtp_num_layers):
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            mtp_num_layers=mtp_num_layers,
-            mtp_kl_loss_weight=1.0,
-        )
-        with pytest.raises(ValueError, match="MTP KL loss requires positive mtp_num_layers"):
-            HybridModel(
-                config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=100,
-                max_sequence_length=4,
-                hybrid_layer_pattern="-",
-            )
 
     def test_mtp_placement_uses_model_pipeline_group(self, mocker):
         placement = mocker.patch(
@@ -1691,11 +1669,3 @@ class TestHybridModelWithYarn:
                 # StaticInferenceContext always sets materialize_only_last_token_logits=True.
                 assert logits.shape[1] == 1
                 assert logits.shape[2] == self.model.vocab_size
-
-
-def test_config_list_kd_accepts_inferred_mtp_depth(config_list_model_boundary, config_list_root):
-    config_list_root.mtp_kl_loss_weight = 1.0
-    main = MLPLayerConfig.from_config(config_list_root)
-    mtp = MLPLayerConfig.from_config(config_list_root)
-    config_list_model_boundary(config_list_root, [main, MTPSplit, mtp, MTPSplit, mtp])
-    assert config_list_root.mtp_num_layers == 2
