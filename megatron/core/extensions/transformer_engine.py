@@ -237,6 +237,9 @@ class TEQuantizationRecipe:
     If no FP8 or FP4 quantization is configured, the recipe is execution
     in high-precision (BF16).
     """
+
+    recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the TE quantization recipe class."""
     custom_recipe_factory: Optional[str] = None
     """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
     fp8_format: str = "e4m3"
@@ -433,6 +436,11 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
+    # Set recipe attrs
+    if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+        for key, val in qrecipe.recipe_attrs.items():
+            setattr(quant_recipe, key, val)
+
     return fp8_model_init(
         enabled=enabled,
         recipe=quant_recipe,
@@ -511,7 +519,12 @@ def _get_fp8_autocast_for_quant_recipe(
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
                 quant_recipe = te.common.recipe.NVFP4BlockScaling()
             else:
-                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
+
+        # Set recipe attrs
+        if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+            for key, val in qrecipe.recipe_attrs.items():
+                setattr(quant_recipe, key, val)
 
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
@@ -2377,14 +2390,28 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
         super().__init__()
         if not HAVE_TE_GDN:
             raise ImportError("Transformer Engine GatedDeltaNetAttention (GDN) is not available.")
-        assert _TE_LINEAR_ATTENTION is not None
+        self.num_attention_heads = num_attention_heads
+        self.qk_head_dim = qk_head_dim
         self.value_head_dim = value_head_dim
-        self.te_attention = _TE_LINEAR_ATTENTION(
+        self.layer_number = layer_number
+        self.te_attention = self._make_te_attention(num_attention_heads)
+        # TE GDN has no parameters. Keep runtime variants outside module registration
+        # so selecting another head count does not change checkpoint state.
+        self._runtime_attentions: dict[int, torch.nn.Module] = {}
+
+    def _make_te_attention(self, num_attention_heads: int) -> torch.nn.Module:
+        """Build a TE adapter whose head geometry remains fixed across forwards."""
+        assert _TE_LINEAR_ATTENTION is not None
+        attention = _TE_LINEAR_ATTENTION(
             num_attention_heads=num_attention_heads,
-            kv_channels=(qk_head_dim, value_head_dim),
+            kv_channels=(self.qk_head_dim, self.value_head_dim),
             qkv_format="bshd",
-            layer_number=layer_number,
+            layer_number=self.layer_number,
         )
+        assert not any(True for _ in attention.parameters()) and not any(
+            True for _ in attention.buffers()
+        ), "TE GDN runtime variants are cached outside module registration and must be stateless"
+        return attention
 
     def forward(
         self,
@@ -2402,6 +2429,14 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
         """Run TE GDN through the FLA-compatible Megatron kernel interface."""
         del kwargs
 
+        runtime_heads = q.shape[-2]
+        attention = self.te_attention
+        if runtime_heads != self.num_attention_heads:
+            if runtime_heads not in self._runtime_attentions:
+                self._runtime_attentions[runtime_heads] = self._make_te_attention(runtime_heads)
+            attention = self._runtime_attentions[runtime_heads]
+            attention.train(self.training)
+
         batch, sequence = q.shape[:2]
         qkv_format = "bshd"
         if cu_seqlens is not None:
@@ -2409,7 +2444,7 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
             g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
 
-        result = self.te_attention(
+        result = attention(
             q,
             k,
             v,
@@ -2628,6 +2663,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
+        self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
@@ -2736,10 +2773,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
-        if packed_seq_params is not None:
-            self.kept_packed_seq_params.discard("cp_group")
-            self.kept_packed_seq_params.discard("local_cp_size")
-
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:
             num_splits = self.num_splits
@@ -3855,9 +3888,39 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Build fused impl and cache recipe lazily on first forward pass.
             # Both are created once and reused — avoids object creation every call.
+            # This recipe cache is a hack (TEFusedMLP does not need
+            # it). Keep it for now for expediency, but future
+            # developers are warned that this should be refactored to
+            # use the model's recipe config like the other TE modules.
             if not hasattr(self, '_recipe'):
                 if os.getenv("FP4_RECIPE", "") == "nvfp4":
                     self._recipe = te.common.recipe.NVFP4BlockScaling()
+                elif os.getenv("FP4_RECIPE", "") == "nvfp4_ue5m3":
+
+                    def _make_nvfp4_ue5m3_quantizer(
+                        role: te.pytorch.QuantizerRole,
+                    ) -> te.pytorch.NVFP4Quantizer:
+                        """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
+                        scale for activations."""
+                        tensor_type = role.tensor_type if role is not None else None
+                        if not tensor_type:
+                            tensor_type = "input"
+                        with_rht = tensor_type in ("input", "grad_output")
+                        return te.pytorch.NVFP4Quantizer(
+                            scale_dtype=te.pytorch.DType.kFloat8UE5M3,
+                            with_rht=with_rht,
+                            with_post_rht_amax=with_rht,
+                            with_2d_quantization=tensor_type == "weight",
+                            stochastic_rounding=False,
+                            with_random_sign_mask=False,
+                            disable_second_level_scale=tensor_type == "input",
+                        )
+
+                    # Construct custom recipe for NVFP4 with UE5M3 scales
+                    self._recipe = te.common.recipe.CustomRecipe(
+                        qfactory=_make_nvfp4_ue5m3_quantizer
+                    )
+                    self._recipe.enable_cutedsl_fused_grouped_mlp = True
                 else:
                     self._recipe = te.common.recipe.MXFP8BlockScaling()
             recipe = self._recipe
