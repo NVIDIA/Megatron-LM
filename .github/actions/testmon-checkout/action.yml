@@ -1,0 +1,36 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Restore PR checkout on the Testmon baseline
+description: Use the same prepared PR checkout for unit-test planning and execution.
+inputs:
+  artifact-id:
+    required: true
+    description: Prepared checkout artifact from configure.
+  original-sha:
+    required: true
+    description: Original PR merge commit to which the artifact belongs.
+outputs:
+  sha:
+    value: ${{ steps.restore.outputs.sha }}
+    description: Prepared unit-test commit.
+  baseline_sha:
+    value: ${{ steps.restore.outputs.baseline_sha }}
+    description: Source commit of the pinned Testmon cache.
+  generation:
+    value: ${{ steps.restore.outputs.generation }}
+    description: Pinned Testmon cache generation.
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      with:
+        artifact-ids: ${{ inputs.artifact-id }}
+        path: ${{ runner.temp }}/testmon-checkout
+        merge-multiple: true
+    - id: restore
+      shell: bash -e -u -o pipefail {0}
+      env:
+        ORIGINAL_SHA: ${{ inputs.original-sha }}
+      run: |
+        python3 .github/scripts/testmon_checkout.py restore \
+          --directory "$RUNNER_TEMP/testmon-checkout" --expected-sha "$ORIGINAL_SHA"

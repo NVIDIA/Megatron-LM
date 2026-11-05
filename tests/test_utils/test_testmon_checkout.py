@@ -1,0 +1,193 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Exercise baseline checkout preparation with real Git objects and bundles."""
+
+import argparse
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / ".github/scripts/testmon_checkout.py"
+SPEC = importlib.util.spec_from_file_location("testmon_checkout", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+checkout = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(checkout)
+
+
+def git(repo, *args):
+    return (
+        subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE)
+        .decode()
+        .strip()
+    )
+
+
+def commit(repo, message):
+    git(repo, "add", ".")
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-m", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def repository(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "CI test")
+    git(repo, "config", "user.email", "ci@example.com")
+    (repo / "model.py").write_text("original\n")
+    (repo / "removed.py").write_text("remove me\n")
+    (repo / "pyproject.toml").write_text("# unchanged image\n")
+    baseline = commit(repo, "Baseline")
+    git(repo, "remote", "add", "origin", str(repo))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setattr(checkout, "latest_baseline", lambda: (baseline, "123-1"))
+    return repo, baseline
+
+
+def arguments(repo, base, head):
+    pr_files = repo.parent / "pr-files"
+    pr_files.mkdir(exist_ok=True)
+    (pr_files / "metadata.json").write_text(json.dumps({"tested_sha": head, "changed_paths": 3}))
+    (pr_files / "changed-files").write_text("model.py\nremoved.py\nnew.bin\n")
+    return argparse.Namespace(
+        pr_head=head,
+        pr_base=base,
+        tested_sha=head,
+        pr_files_dir=str(pr_files),
+        output_dir=str(repo.parent / "output"),
+    )
+
+
+def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
+    repository, tmp_path, monkeypatch
+):
+    repo, baseline = repository
+    (repo / "unrelated.py").write_text("new main work\n")
+    base = commit(repo, "Newer main")
+    git(repo, "checkout", "-b", "pr")
+    (repo / "model.py").write_text("PR change\n")
+    (repo / "removed.py").unlink()
+    (repo / "new.bin").write_bytes(b"\x00\xff\x80complete binary change")
+    head = commit(repo, "Complete PR change")
+    args = arguments(repo, base, head)
+    original_metadata = json.loads((Path(args.pr_files_dir) / "metadata.json").read_text())
+    checkout.prepare(args)
+    output = Path(args.output_dir)
+    manifest = json.loads((output / "manifest.json").read_text())
+    tested = manifest["tested_sha"]
+    assert manifest["source_sha"] == baseline
+    assert manifest["original_sha"] == head
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "show", f"{tested}:model.py") == "PR change"
+    assert "unrelated.py" not in git(repo, "ls-tree", "--name-only", tested)
+    assert "removed.py" not in git(repo, "ls-tree", "--name-only", tested)
+    assert subprocess.check_output(["git", "show", f"{tested}:new.bin"], cwd=repo) == (
+        b"\x00\xff\x80complete binary change"
+    )
+    assert json.loads((Path(args.pr_files_dir) / "metadata.json").read_text()) == {
+        **original_metadata,
+        "tested_sha": tested,
+    }
+    assert git(repo, "for-each-ref", "refs/testmon-checkout") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+    # A separate, shallow consumer has no synthetic commit until bundle restore.
+    consumer = tmp_path / "consumer"
+    git(repo, "clone", "--depth=1", "--no-local", str(repo), str(consumer))
+    monkeypatch.chdir(consumer)
+    github_output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+    step_summary = tmp_path / "summary"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
+    checkout.restore(argparse.Namespace(directory=str(output), expected_sha=head))
+    assert git(consumer, "rev-parse", "HEAD") == tested
+    assert not (consumer / "unrelated.py").exists()
+    assert (consumer / "new.bin").read_bytes() == b"\x00\xff\x80complete binary change"
+    assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
+    assert step_summary.read_text() == (
+        "### Unit tests on Testmon baseline\n\n"
+        f"- Prepared commit: `{tested}`\n"
+        f"- Baseline commit: `{baseline}`\n"
+        "- Cache generation: `123-1`\n"
+        f"- Original commit: `{head}`\n\n"
+    )
+
+
+@pytest.mark.parametrize("failure", ["conflict", "image", "controller", "lookup"])
+def test_prepare_fallback_preserves_checkout_and_metadata(repository, monkeypatch, failure, capsys):
+    repo, baseline = repository
+    if failure == "conflict":
+        (repo / "model.py").write_text("different main implementation\n")
+    if failure == "image":
+        (repo / "pyproject.toml").write_text("# newer main dependencies\n")
+    if failure == "controller":
+        controller = repo / "tests/unit_tests/run_ci_test.sh"
+        controller.parent.mkdir(parents=True)
+        controller.write_text("# newer main Testmon contract\n")
+    base = commit(repo, "New main") if failure != "lookup" else baseline
+    (repo / "model.py").write_text("PR implementation\n")
+    head = commit(repo, "PR")
+    args = arguments(repo, base, head)
+    metadata_path = Path(args.pr_files_dir) / "metadata.json"
+    original_metadata = metadata_path.read_bytes()
+    if failure == "lookup":
+
+        def unavailable():
+            raise ValueError("No successful baseline")
+
+        monkeypatch.setattr(checkout, "latest_baseline", unavailable)
+    checkout.prepare(args)
+    message = capsys.readouterr().out
+    assert "::notice::Using original PR checkout:" in message
+    if failure == "conflict":
+        assert "Applied patch to 'model.py' with conflicts" in message
+    if failure in {"image", "controller"}:
+        assert "CI image or Testmon inputs" in message
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "status", "--porcelain") == ""
+    assert metadata_path.read_bytes() == original_metadata
+    assert not Path(args.output_dir).exists()
+    assert git(repo, "for-each-ref", "refs/testmon-checkout") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_restore_rejects_original_commit_mismatch(repository):
+    repo, baseline = repository
+    (repo / "model.py").write_text("PR change\n")
+    head = commit(repo, "PR")
+    args = arguments(repo, baseline, head)
+    checkout.prepare(args)
+    with pytest.raises(ValueError, match="does not belong"):
+        checkout.restore(argparse.Namespace(directory=args.output_dir, expected_sha=baseline))
+    assert git(repo, "rev-parse", "HEAD") == head
+
+
+def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
+    candidate = {
+        "event": "schedule",
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": "main",
+        "path": checkout.WORKFLOW,
+        "repository": {"full_name": checkout.REPOSITORY},
+        "head_repository": {"full_name": checkout.REPOSITORY},
+        "run_attempt": 1,
+        "id": 123,
+        "head_sha": "a" * 40,
+    }
+    candidates = [
+        {**candidate, "event": "push"},
+        {**candidate, "run_attempt": 2},
+        {**candidate, "head_repository": {"full_name": "fork/Megatron-LM"}},
+        candidate,
+    ]
+    monkeypatch.setattr(checkout, "run", lambda *args: json.dumps({"workflow_runs": candidates}))
+    assert checkout.latest_baseline() == ("a" * 40, "123-1")
+    candidates.pop()
+    with pytest.raises(ValueError, match="No successful first-attempt"):
+        checkout.latest_baseline()

@@ -36,6 +36,7 @@ def main() -> None:
         raise ValueError("Testmon selection requires main")
     platform = os.environ["RECIPE_PLATFORM"]
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+    baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
     cache_dir = Path("assets_dir/testmon")
     plan = "assets_dir/testmon-plan/plan.json"
@@ -68,11 +69,35 @@ def main() -> None:
         matched_key = ""
         key_file = temporary / "unit-testmon-matched-key"
         prefix = identity["cache_prefix"]
+        requested_key = (
+            f"{prefix}{baseline_generation}"
+            if baseline_generation
+            else f"{prefix}lookup-{generation}"
+        )
         try:
             _actions(
-                "restore", str(cache_dir), f"{prefix}lookup-{generation}", prefix, str(key_file)
+                "restore",
+                str(cache_dir),
+                requested_key,
+                "" if baseline_generation else prefix,
+                str(key_file),
             )
             matched_key = key_file.read_text()
+            if baseline_generation and matched_key and matched_key != requested_key:
+                logger.warning("Ignoring a different Testmon cache generation for %s", bucket)
+                matched_key = ""
+            if baseline_generation and matched_key:
+                try:
+                    manifest = json.loads((cache_dir / "manifest.json").read_text())
+                    if not isinstance(manifest, dict) or manifest.get(
+                        "source_sha"
+                    ) != os.environ.get("TESTMON_BASE_SHA"):
+                        raise ValueError("cache source commit does not match the pinned baseline")
+                except (OSError, ValueError) as error:
+                    logger.warning(
+                        "Ignoring an invalid pinned Testmon baseline for %s: %s", bucket, error
+                    )
+                    matched_key = ""
         except subprocess.CalledProcessError:
             logger.warning("Testmon cache restore failed for %s", bucket)
         result = _python(

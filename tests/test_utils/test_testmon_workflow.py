@@ -930,7 +930,112 @@ def test_gpu_reselection_respects_full_run_guards(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
+    ("ready", "branch", "setting", "expected"),
+    [
+        ("true", "main", "", True),
+        ("true", "main", "true", True),
+        ("true", "main", "false", False),
+        ("false", "main", "", False),
+        ("true", "dev", "", False),
+        ("true", "", "", False),
+    ],
+)
+def test_cache_base_checkout_requires_eligible_main_pr_and_respects_kill_switch(
+    ready, branch, setting, expected
+):
+    step = _step("cicd-main.yml", "configure", "prepare-testmon-checkout")
+    expression = step["if"].replace("steps.unit-test-pr-files.outputs.ready", "ready")
+    expression = (
+        expression.replace("fromJSON(steps.get-pr-info.outputs.pr-info).base.ref", "branch")
+        .replace("vars.UNIT_TESTMON_USE_CACHE_BASE", "setting")
+        .replace("&&", "and")
+    )
+    assert (
+        eval(
+            expression, {"__builtins__": {}}, {"ready": ready, "branch": branch, "setting": setting}
+        )
+        is expected
+    )
+    assert _step("cicd-main.yml", "configure", "unit-test-pr-files")["if"] == (
+        "steps.configure.outputs.unit_testmon_eligible == 'true'"
+    )
+
+
+def test_prepared_checkout_pins_cpu_gpu_source_and_cache_generation():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    steps = workflow["jobs"]["select"]["steps"]
+    apply = next(step for step in steps if step.get("id") == "testmon-checkout")
+    saved = next(step for step in steps if step["name"] == "Save CPU planner")
+    dependencies = next(step for step in steps if step.get("id") == "dependencies")
+    assert steps.index(saved) < steps.index(apply) < steps.index(dependencies)
+    assert apply["with"]["original-sha"] == "${{ inputs.sha }}"
+    plan = _step("_unit-tests.yml", "select", "plan")
+    assert plan["env"]["SOURCE_SHA"] == "${{ steps.testmon-checkout.outputs.sha || inputs.sha }}"
+    assert plan["env"]["TESTMON_GENERATION"] == "${{ steps.testmon-checkout.outputs.generation }}"
+    assert plan["env"]["TESTMON_BASE_SHA"] == "${{ steps.testmon-checkout.outputs.baseline_sha }}"
+    assert "args[2] ? [args[2]] : []" in plan["with"]["script"]
+    assert "process.env.RUNNER_TEMP + '/select_unit_tests.py'" in plan["with"]["script"]
+
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    gpu_steps = action["runs"]["steps"]
+    gpu_apply = next(step for step in gpu_steps if step.get("id") == "testmon-checkout")
+    assert gpu_apply["if"] == (
+        "inputs.is_unit_test == 'true' && inputs.unit_testmon_checkout_artifact_id != ''"
+    )
+    mode = next(step for step in gpu_steps if step.get("id") == "unit-testmon")
+    assert mode["env"]["TESTED_SHA"] == (
+        "${{ steps.testmon-checkout.outputs.sha || inputs.sha || github.sha }}"
+    )
+    assert mode["env"]["TESTMON_BASE_SHA"] == "${{ steps.testmon-checkout.outputs.baseline_sha }}"
+    restore = next(step for step in gpu_steps if step.get("id") == "restore-unit-testmon")
+    assert restore["with"]["key"] == (
+        "${{ steps.unit-testmon-identity.outputs.cache_prefix }}"
+        "${{ steps.testmon-checkout.outputs.generation || format('lookup-{0}-{1}', github.run_id, github.run_attempt) }}"
+    )
+    assert restore["with"]["restore-keys"] == (
+        "${{ steps.testmon-checkout.outputs.generation == '' && steps.unit-testmon-identity.outputs.cache_prefix || '' }}"
+    )
+    assert gpu_steps.index(gpu_apply) < gpu_steps.index(restore)
+
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    for suffix in ("", "-gb200"):
+        call = callers[f"cicd-unit-tests-latest{suffix}"]["with"]
+        assert call["sha"] == "${{ needs.configure.outputs.sha }}"
+        assert call["unit_testmon_checkout_artifact_id"] == (
+            "${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}"
+        )
+        parser = callers[f"cicd-parse-unit-tests{suffix}"]["steps"]
+        parse = next(step for step in parser if step.get("id") == "parse-unit-tests")
+        checkout = next(
+            step for step in parser if step.get("uses") == "./.github/actions/testmon-checkout"
+        )
+        assert parser.index(checkout) < parser.index(parse)
+    assert callers["cicd-unit-tests-latest"]["with"]["container-image"] == (
+        "${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}"
+    )
+    assert callers["cicd-parse-unit-tests-gb200"]["outputs"]["container-image"] == (
+        "${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu"
+    )
+    assert _step("cicd-main.yml", "Coverage", "coverage")["env"]["SOURCE_SHA"] == (
+        "${{ needs.configure.outputs.unit_testmon_sha || needs.configure.outputs.sha }}"
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "mixed",
+        "empty",
+        "cache-error",
+        "selector-error",
+        "upload-error",
+        "pinned",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+        "pinned-bad-manifest",
+        "pinned-missing-manifest",
+    ],
 )
 def test_grouped_cpu_selection(
     tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -976,6 +1081,8 @@ def test_grouped_cpu_selection(
         "RECIPE_PLATFORM": "dgx_h100",
         "SOURCE_SHA": "a" * 40,
         "TARGET_BRANCH": "main",
+        "TESTMON_GENERATION": "111-1" if scenario.startswith("pinned") else "",
+        "TESTMON_BASE_SHA": "b" * 40 if scenario.startswith("pinned") else "",
         "PR_FILES_DIR": str(pr_files),
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_RUN_ID": "123",
@@ -1030,7 +1137,15 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         if operation == "restore":
             path, key, prefix, key_file = args
             assert path == "assets_dir/testmon"
-            assert key == f"{prefix}lookup-123-2"
+            cache_prefix = json.loads((tmp_path / "unit-testmon-identity.json").read_text())[
+                "cache_prefix"
+            ]
+            if scenario.startswith("pinned"):
+                assert key == f"{cache_prefix}111-1"
+                assert prefix == "", "a pinned baseline must not use any restore-key fallback"
+            else:
+                assert prefix == cache_prefix
+                assert key == f"{prefix}lookup-123-2"
             assert not Path(path).exists(), "previous bucket cache was not cleared"
             index = restores
             restores += 1
@@ -1039,9 +1154,37 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             if scenario == "cache-error" and index == 0:
                 raise subprocess.CalledProcessError(1, [operation])
             saved = tmp_path / "saved" / str(index)
+            if scenario == "pinned-miss" and index == 0:
+                Path(key_file).write_text("")
+                return
             if saved.exists():
                 shutil.copytree(saved, path)
-            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
+            matched_generation = "111-1"
+            if scenario == "pinned-other-generation" and index == 0:
+                # Even a complete compatible generation must not substitute for
+                # the baseline used to construct the tested checkout.
+                matched_generation = "222-1"
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["generation"] = matched_generation
+                manifest_path.write_text(json.dumps(manifest))
+            if index == 0 and scenario in {
+                "pinned-source-mismatch",
+                "pinned-bad-manifest",
+                "pinned-missing-manifest",
+            }:
+                manifest_path = Path(path) / "manifest.json"
+                if scenario == "pinned-source-mismatch":
+                    manifest = json.loads(manifest_path.read_text())
+                    manifest["source_sha"] = "c" * 40
+                    manifest_path.write_text(json.dumps(manifest))
+                elif scenario == "pinned-bad-manifest":
+                    manifest_path.write_text("{")
+                else:
+                    manifest_path.unlink()
+            Path(key_file).write_text(
+                f"{cache_prefix}{matched_generation}" if saved.exists() else ""
+            )
         else:
             assert operation == "upload"
             if scenario == "upload-error":
@@ -1067,13 +1210,19 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
     ]
+    fallback = scenario in {
+        "cache-error",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+        "pinned-bad-manifest",
+        "pinned-missing-manifest",
+    }
     assert [entry["mode"] for entry in matrix] == (
-        []
-        if scenario == "empty"
-        else ["full" if scenario == "cache-error" else "preselected", "full"]
+        [] if scenario == "empty" else [("full" if fallback else "preselected"), "full"]
     )
     assert all(entry["timeout"] == 40 for entry in matrix)
-    assert bool(caplog.records) == (scenario == "cache-error")
+    assert bool(caplog.records) == (fallback and scenario != "pinned-miss")
     for upload in uploads:
         plan = upload["plan"]
         assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
