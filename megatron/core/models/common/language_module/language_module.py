@@ -269,6 +269,8 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # The input table's post-update transforms must also reach its tied copies.
+            weight.is_word_embedding_parameter = True
             # Keep optimizer grouping consistent for tied embedding/output copies.
             if self.config.use_mup:
                 weight.is_embedding_parameter = True
