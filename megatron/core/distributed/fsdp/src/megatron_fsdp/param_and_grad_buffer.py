@@ -4699,6 +4699,35 @@ class AllGatherPipeline:
 
         return list(sorted(result))
 
+    def _complete_frontier_fsdp_unit(
+        self, bucket_ids: List[int], prefetch_order: PrefetchOrder
+    ) -> List[int]:
+        """Extend a bucket list through the rest of the FSDP unit at its prefetch frontier,
+        including buckets of that unit the window skipped."""
+        parameter_groups = self.buffer.parameter_groups
+        result = set(bucket_ids)
+        step = 1 if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER else -1
+        frontier = max(result) if step > 0 else min(result)
+        fsdp_unit_id = parameter_groups[frontier].fsdp_unit_id
+        if fsdp_unit_id is None:
+            return list(sorted(result))
+
+        bucket_id = frontier + step
+        while (
+            0 <= bucket_id < len(parameter_groups)
+            and parameter_groups[bucket_id].fsdp_unit_id == fsdp_unit_id
+        ):
+            result.update(self.buffer.bucket_to_bucket_group[bucket_id])
+            bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
+
+        # Buckets split by dtype but bucket groups only by expert status, so a selected group
+        # can skip over buckets of the same unit.
+        for bucket_id in range(min(result), max(result) + 1):
+            if bucket_id not in result and parameter_groups[bucket_id].fsdp_unit_id == fsdp_unit_id:
+                result.update(self.buffer.bucket_to_bucket_group[bucket_id])
+
+        return list(sorted(result))
+
     def _extend_by_prefetch_size(
         self,
         bucket_ids: List[int],
@@ -4958,6 +4987,10 @@ class AllGatherPipeline:
                 double_buf_units,
                 outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
+            if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
+                # DP-Outer gathers count toward the size, so one large bucket can end the
+                # window mid-unit; finish that unit instead of gathering the rest at its hook.
+                ag_buckets = self._complete_frontier_fsdp_unit(ag_buckets, prefetch_order)
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
             outer_ag_buckets = self._extend_by_fsdp_units(
