@@ -22,6 +22,7 @@ from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -36,6 +37,9 @@ def model_provider_mock_vlm_single_encoder(
     """
     Build a MIMO model with a vision encoder.
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     # PP not supported, so add_encoder/add_decoder are ignored
     # Get configs for each component
     vision_config = get_mock_vision_model_config()
@@ -84,6 +88,7 @@ def model_provider_mock_vlm_single_encoder(
             "max_sequence_length": 2048,
             "pre_process": pre_process,
             "post_process": post_process,
+            "pg_collection": pg_collection,
         },
     )
 
