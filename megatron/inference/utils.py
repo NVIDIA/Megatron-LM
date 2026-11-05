@@ -6,6 +6,8 @@ from argparse import ArgumentParser, Namespace
 from copy import copy
 from typing import Literal, Optional
 
+from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
 import torch
 
 from megatron.core import dist_checkpointing
@@ -19,7 +21,6 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -33,7 +34,7 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
-from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
+from megatron.training.models import GPTModelBuilder, GPTModelConfig, HybridModelBuilder, ModelBuilder
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 def get_model_builder(
     args: Namespace,
+    tokenizer_config: TokenizerConfig,
     provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
     *,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -88,16 +90,26 @@ def get_model_builder(
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
-    if provider in ("hybrid", "mamba"):
+        model_config = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = GPTModelBuilder
+    elif provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
-    raise ValueError(f"Invalid model provider {provider}")
+        model_config = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = HybridModelBuilder
+    else:
+        raise ValueError(f"Invalid model provider {provider}")
+
+    if model_config.vocab_size is None:
+        if tokenizer_config.padded_vocab_size is None:
+            raise ValueError('Model vocabulary must be resolved before model construction')
+        model_config.vocab_size = tokenizer_config.padded_vocab_size
+        model_config.should_pad_vocab = False
+    return builder_cls(model_config)
 
 
 def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
@@ -175,6 +187,7 @@ def get_model_for_inference(
     """
 
     args = get_args()
+    tokenizer_config = get_run_config().tokenizer
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
         if pg_collection is not None:
@@ -189,7 +202,7 @@ def get_model_for_inference(
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        builder = get_model_builder(args, pg_collection=pg_collection)
+        builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
     # Load checkpoint.
@@ -475,7 +488,7 @@ def get_dynamic_inference_engine(
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     return build_dynamic_inference_engine(
