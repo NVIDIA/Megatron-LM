@@ -18,6 +18,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from megatron.training.utils.common_utils import _get_param_data
@@ -231,3 +232,71 @@ def test_sharded_param_norm_owner_selection_replays(non_owner_has_main_param):
     model_data, model_sharded = _get_param_data(non_owner, True, True)
     assert not model_sharded
     assert torch.equal(model_data, non_owner.detach().float())
+
+
+@pytest.mark.parametrize("end_in_padding", [False, True], ids=["ends_in_row", "ends_in_padding"])
+def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
+    """The post-step input-embedding floor is bit-exact on a shard that splits rows.
+
+    The shard starts inside a wide row and ends either inside one or inside two complete GTP
+    padding rows. Rows sit exactly at zero, below, at and above the threshold, so both the
+    rescaled and the untouched paths are replayed alongside the interval statistics.
+    """
+    seeded()
+    num_rows, padding_rows, row_width, min_norm = 64, 2, 4096, 1.0
+    full_master = torch.randn(num_rows + padding_rows, row_width, device="cuda")
+    full_master[num_rows:] = 0.0
+    full_master[1] = 0.0
+    # Single-element rows give exact norms, so the at-threshold row is exactly at it.
+    for row, norm in ((2, 0.5 * min_norm), (3, min_norm), (4, 4.0 * min_norm)):
+        full_master[row] = 0.0
+        full_master[row, row_width // 2] = norm
+    full_master[5:num_rows] *= 1e-4  # Below the threshold, so most rows are rescaled.
+    valid_numel = num_rows * row_width
+    start = row_width // 3
+    end = (full_master.numel() if end_in_padding else valid_numel) - row_width // 5
+    shard = full_master.flatten()[start:end].clone()
+
+    embedding = torch.nn.Parameter(
+        torch.zeros_like(full_master, dtype=torch.bfloat16), requires_grad=False
+    )
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(embedding_min_norm=min_norm),
+        _word_embedding_params=[embedding],
+        _embedding_min_norm_stats=None,
+        model_param_gbuf_map={embedding: object()},
+        data_parallel_group=SimpleNamespace(rank=lambda: 0),
+        distributed_optimizer_instance_id=0,
+        _get_model_param_range_map=lambda _: {"param": SimpleNamespace(start=start, end=end)},
+    )
+    # A single data-parallel rank owns the whole shard, so the row-sum all-reduce is identity.
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
+        lambda *_: padding_rows * row_width,
+    )
+    optimizer._embedding_min_norm_states = DistributedOptimizer._build_embedding_min_norm_states(
+        optimizer
+    )
+
+    def fn(master):
+        embedding.main_param = master.clone()
+        DistributedOptimizer._post_optimizer_step(optimizer)
+        stats = DistributedOptimizer._consume_embedding_min_norm_stats(optimizer)
+        return embedding.main_param, stats
+
+    assert_replays_bit_exact(
+        fn,
+        (shard,),
+        replays=8,
+        backward=False,
+        contention=True,
+        what="embedding_min_norm projection",
+    )
+    projected, stats = fn(shard)
+    assert stats[0].item() == num_rows - 4  # Every nonzero row below the threshold.
+    unchanged = torch.zeros(num_rows + padding_rows, dtype=torch.bool, device="cuda")
+    unchanged[[0, 1, 3, 4]] = True
+    unchanged[num_rows:] = True
+    flat_unchanged = unchanged.repeat_interleave(row_width)[start:end]
+    assert bytes_equal(projected[flat_unchanged], shard[flat_unchanged])
