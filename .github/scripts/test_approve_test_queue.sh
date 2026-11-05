@@ -69,4 +69,51 @@ if [[ -z "$next_approval_line" ]] || ! /usr/bin/sed -n "${guard_line},${next_app
   exit 1
 fi
 
-echo "Approve Test Queue preserves concurrency while skipping disabled full-test PRs"
+python3 - "$WORKFLOW" <<'PY'
+import sys
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+
+workflow = Path(sys.argv[1]).read_text()
+assert 'MAX_CONCURRENCY_DEV: ${{ vars.MAX_CONCURRENCY_DEV }}' in workflow
+assert 'MAX_CONCURRENCY_OTHERS: ${{ vars.MAX_CONCURRENCY_OTHERS }}' in workflow
+assert 'TARGET_BRANCH: ${{ matrix.branch }}' in workflow
+start = workflow.index('          if CONTRIBUTOR_TYPE == "external":')
+end = workflow.index('          API_BASE =', start)
+limit_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
+
+
+def limit(branch, contributor="internal", dev=None, others=None, shared="8"):
+    env = {
+        "TARGET_BRANCH": branch,
+        "MAX_CONCURRENCY": shared,
+        "MAX_CONCURRENCY_EXTERNAL": "3",
+    }
+    for name, value in (("MAX_CONCURRENCY_DEV", dev), ("MAX_CONCURRENCY_OTHERS", others)):
+        if value is not None:
+            env[name] = value
+    namespace = {"os": SimpleNamespace(environ=env), "CONTRIBUTOR_TYPE": contributor}
+    exec(limit_code, namespace)
+    return namespace["MAX_CONCURRENCY"]
+
+
+for branch in ("dev", "others"):
+    for override, expected in ((None, 4), ("", 4), (" ", 4), ("0", 0), ("1", 1), ("2", 2)):
+        assert limit(branch, **{branch: override}) == expected
+    assert limit(branch, shared="9") == 4
+    for override in ("-1", "invalid", "1.5"):
+        try:
+            limit(branch, **{branch: override})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Accepted invalid {branch} concurrency: {override!r}")
+assert limit("dev", dev="1", others="invalid") == 1
+assert limit("others", dev="invalid", others="2") == 2
+for override in ("0", "1", "invalid"):
+    assert limit("main", dev=override, others=override) == 4
+    assert limit("all", contributor="external", dev=override, others=override) == 3
+PY
+
+echo "Approve Test Queue preserves branch-specific concurrency while skipping disabled full-test PRs"
