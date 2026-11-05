@@ -32,6 +32,7 @@ except ImportError:
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.layer_key_aliases import remap_sharded_state_dict_for_load
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -3003,6 +3004,13 @@ def load_checkpoint(
             for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
+
+        # Resolve legacy layer-spec names against the checkpoint actually selected by the
+        # loader. Include optimizer tensors, whose storage keys can contain model keys.
+        if ckpt_type == CheckpointType.GLOBAL:
+            remap_sharded_state_dict_for_load(
+                model, load_kwargs['sharded_state_dict'], checkpoint_name
+            )
     elif args.ckpt_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:

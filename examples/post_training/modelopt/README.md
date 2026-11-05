@@ -88,6 +88,14 @@ pip install -e /workspace/Model-Optimizer
 
 ### Megatron-Core Checkpoint Prerequisite
 
+ModelOpt's local modules use canonical Transformer Engine keys when saving distributed
+checkpoints. Older ModelOpt checkpoints with separate layernorm names are accepted during
+loading: canonical keys are preferred, with legacy names used only when the requested key
+is absent. This applies to model weights and model-keyed optimizer tensors and does not
+change the model's subsequent save behavior. `--export-te-mcore-model` is deprecated and
+ignored; `--export-default-te-spec` selects full Transformer Engine modules instead of
+ModelOpt's local modules.
+
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
 CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)

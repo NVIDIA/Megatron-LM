@@ -3213,17 +3213,12 @@ def setup_model_and_optimizer(
         process_group=setup_dp_group,
     )
 
-    # [ModelOpt]: Save layernorms under the fused keys again if the student was loaded from a
-    # checkpoint with legacy keys, then load the teacher checkpoint for distillation if applicable.
+    # [ModelOpt]: Load the teacher checkpoint for distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
     # imports `get_args` from megatron.training at module scope.
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import (
-            load_kd_teacher_checkpoint,
-            restore_layernorm_key_remaps,
-        )
+        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        restore_layernorm_key_remaps(model)
         load_kd_teacher_checkpoint(
             model,
             getattr(cfg_container, "distillation", None),

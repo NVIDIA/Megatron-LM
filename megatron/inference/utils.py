@@ -116,11 +116,11 @@ def get_model_builder(
     return builder_cls(model_config)
 
 
-def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
+def _get_checkpoint_model_modifier(args: Namespace, requested_state_dicts: list):
     """Map model sharded keys onto a checkpoint that nests the model under a prefix.
 
-    Records the resulting keys in `requested_keys` so unloaded checkpoint tensors can be
-    reported after the load.
+    Retains the load templates so unloaded-tensor diagnostics see any aliases resolved
+    after this modifier, rather than a snapshot of the originally requested names.
     """
     prefix = getattr(args, 'checkpoint_model_prefix', '')
     if not prefix:
@@ -128,13 +128,18 @@ def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
 
     def modifier(sharded_state_dict):
         apply_prefix_mapping(sharded_state_dict, {'': prefix})
-        requested_keys.update(
-            value.key
-            for value in nested_values(sharded_state_dict)
-            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
-        )
+        requested_state_dicts.append(sharded_state_dict)
 
     return modifier
+
+
+def _checkpoint_tensor_keys(state_dict):
+    """Yield actual storage keys, including aliases resolved inside tensor factories."""
+    for value in nested_values(state_dict):
+        if isinstance(value, ShardedTensorFactory):
+            yield from _checkpoint_tensor_keys(value.build())
+        elif isinstance(value, ShardedTensor):
+            yield value.key
 
 
 def _warn_on_unloaded_checkpoint_tensors(
@@ -216,7 +221,7 @@ def get_model_for_inference(
 
     # Load checkpoint.
     assert args.load is not None
-    requested_keys = set()
+    requested_state_dicts = []
     args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
@@ -229,9 +234,16 @@ def get_model_for_inference(
         dp_group=pg_collection.dp if pg_collection is not None else None,
         expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
         checkpoint_group=checkpoint_group,
-        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(
+            args, requested_state_dicts
+        ),
     )
-    if requested_keys:
+    if requested_state_dicts:
+        requested_keys = {
+            key
+            for state_dict in requested_state_dicts
+            for key in _checkpoint_tensor_keys(state_dict)
+        }
         _warn_on_unloaded_checkpoint_tensors(args, requested_keys, checkpoint_group)
 
     # No virtual PP.

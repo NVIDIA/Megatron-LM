@@ -10,10 +10,9 @@ serializable configuration on each build, in this order:
 1. ``restore_modelopt_state_hook``: must come before any hook that converts the model.
 2. ``qad_freeze_hook``
 3. ``lsq_hook``
-4. ``legacy_layernorm_keys_hook``
-5. ``te_load_state_dict_hook``
-6. User ``pre_wrap_hooks`` (including training freezes)
-7. ``kd_convert_hook``
+4. ``te_load_state_dict_hook``
+5. User ``pre_wrap_hooks`` (including training freezes)
+6. ``kd_convert_hook``
 """
 
 import dataclasses
@@ -29,11 +28,7 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.post_training.checkpointing import (
-    load_legacy_layernorm_keys,
-    load_modelopt_state,
-    resolve_checkpoint_load_dir,
-)
+from megatron.post_training.checkpointing import load_modelopt_state, resolve_checkpoint_load_dir
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
 from megatron.training.models.base import compose_hooks
@@ -191,21 +186,6 @@ def lsq_hook(scale_lr: float | None) -> PreWrapHook:
     return hook
 
 
-def legacy_layernorm_keys_hook(load_dir: str, ckpt_format: str) -> PreWrapHook:
-    """Let each stage load ``load_dir`` if it stores layernorms under their module names.
-
-    See ``megatron.post_training.checkpointing.load_legacy_layernorm_keys``. Whoever loads
-    the checkpoint calls ``restore_layernorm_key_remaps`` afterwards.
-    """
-
-    def hook(models: list[MegatronModule]) -> list[MegatronModule]:
-        for model in models:
-            load_legacy_layernorm_keys(model, load_dir, ckpt_format)
-        return models
-
-    return hook
-
-
 def te_load_state_dict_hook() -> PreWrapHook:
     """Register a ``load_state_dict`` pre-hook that handles known TE/local state_dict key mismatches."""
 
@@ -316,8 +296,6 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))
         if not options.default_te_spec:
-            if load_dir is not None:
-                register(legacy_layernorm_keys_hook(load_dir, checkpoint.ckpt_format))
             register(te_load_state_dict_hook())
 
     hooks.extend(model_config.pre_wrap_hooks)

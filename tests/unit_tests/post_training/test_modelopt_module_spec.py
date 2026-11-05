@@ -1,12 +1,16 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import tempfile
+from dataclasses import replace
 
 import pytest
 import torch
 from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.dist_checkpointing.layer_key_aliases import remap_sharded_state_dict_for_load
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -126,6 +130,73 @@ class TestModelOptGPTModel:
         config: TransformerConfig = self.modelopt_model.config
         model = self.modelopt_model.cuda()
         model_forward(model, config)
+
+    def test_legacy_checkpoint_load_and_canonical_save(self, tmp_path_dist_ckpt):
+        """Load real legacy weights and Adam moments, then save under canonical keys."""
+        model = self.modelopt_model
+        metadata = {
+            "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+        }
+        expected = {
+            name: value.clone()
+            for name, value in model.state_dict().items()
+            if isinstance(value, torch.Tensor)
+        }
+
+        # Reproduce the old ModelOpt spec's checkpoint naming for the fixture only.
+        originals = []
+        try:
+            for module in model.modules():
+                submodules = getattr(module, "submodules_config", None)
+                if getattr(submodules, "sharded_state_dict_keys_map", None):
+                    originals.append((module, submodules))
+                    module.submodules_config = replace(submodules, sharded_state_dict_keys_map={})
+            legacy_sd = model.sharded_state_dict(metadata=metadata)
+        finally:
+            for module, submodules in originals:
+                module.submodules_config = submodules
+
+        def optimizer_template(model_sd, value):
+            return {
+                name: make_sharded_optimizer_tensor(
+                    shard, torch.full_like(shard.data, value), "optimizer.state.exp_avg"
+                )
+                for name, shard in model_sd.items()
+                if isinstance(shard, ShardedTensor)
+            }
+
+        canonical_keys = {
+            shard.key
+            for shard in model.sharded_state_dict(metadata=metadata).values()
+            if isinstance(shard, ShardedTensor)
+        }
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "legacy_keys", sync=True) as legacy_dir,
+            TempNamedDir(tmp_path_dist_ckpt / "canonical_keys", sync=True) as canonical_dir,
+        ):
+            dist_checkpointing.save(
+                {"model": legacy_sd, "optimizer": optimizer_template(legacy_sd, 0.25)}, legacy_dir
+            )
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.fill_(-100)
+
+            model_sd = model.sharded_state_dict(metadata=metadata)
+            request = {"model": model_sd, "optimizer": optimizer_template(model_sd, 0)}
+            remap_sharded_state_dict_for_load([model], request, legacy_dir)
+            loaded = dist_checkpointing.load(request, legacy_dir, strict="raise_all")
+            model.load_state_dict(loaded["model"])
+            for name, value in model.state_dict().items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+            for value in loaded["optimizer"].values():
+                torch.testing.assert_close(value, torch.full_like(value, 0.25), rtol=0, atol=0)
+
+            # A fresh save template still uses canonical keys without a cleanup call.
+            dist_checkpointing.save(
+                {"model": model.sharded_state_dict(metadata=metadata)}, canonical_dir
+            )
+            assert canonical_keys <= dist_checkpointing.load_tensors_metadata(canonical_dir).keys()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

@@ -1,7 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import dataclasses
-import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -17,7 +15,6 @@ from modelopt.torch.opt.plugins.mcore_dist_checkpointing import (
 )
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.post_training.modelopt.checkpointing import restore_sharded_modelopt_state
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
@@ -31,8 +28,6 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.models.distillation import DistillationConfig
 from megatron.training.utils import print_rank_0
-
-logger = logging.getLogger(__name__)
 
 
 def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
@@ -153,94 +148,6 @@ def resolve_checkpoint_load_dir(checkpoint) -> Optional[str]:
     return checkpoint.load
 
 
-def _layernorm_key_remaps(model: nn.Module) -> set[tuple[str, str]]:
-    """The ``(module-name fragment, checkpoint-key fragment)`` pairs ``model``'s layers remap.
-
-    Read from the layer specs' ``sharded_state_dict_keys_map`` (e.g. ``input_layernorm.`` ->
-    ``self_attention.linear_qkv.layer_norm_``), which the ModelOpt-local spec uses to load and
-    save layernorms under the fused Transformer-Engine keys.
-    """
-    remaps = set()
-    for module in model.modules():
-        submodules = getattr(module, "submodules_config", None)
-        keys_map = getattr(submodules, "sharded_state_dict_keys_map", None) or {}
-        remaps.update(keys_map.items())
-    return remaps
-
-
-# Where load_legacy_layernorm_keys keeps a layer's original submodules_config.
-_REMAPPED_SUBMODULES_ATTR = "_modelopt_remapped_submodules_config"
-
-
-def load_legacy_layernorm_keys(model: nn.Module, load_dir: str, ckpt_format: str) -> bool:
-    """Prepare ``model`` to load a distributed checkpoint that stores layernorms by module name.
-
-    The ModelOpt-local spec loads and saves layernorms under the fused Transformer-Engine keys
-    (e.g. ``self_attention.linear_qkv.layer_norm_weight``). A checkpoint saved without that
-    remapping (``--export-te-mcore-model`` off) has ``input_layernorm.weight`` etc. instead,
-    for the same tensors. If ``load_dir`` is such a checkpoint, turn off the remappings it
-    lacks on ``model``'s layers so it loads as is, until ``restore_layernorm_key_remaps``;
-    later saves then use the fused keys, converting the checkpoint. Remappings the checkpoint
-    does use, such as a stock MLA spec's, are kept.
-
-    Returns:
-        Whether the checkpoint stores layernorms under their module names.
-    """
-    if ckpt_format != "torch_dist":
-        return False
-    remaps = _layernorm_key_remaps(model)
-    if not remaps:
-        return False
-    sharded_load_dir = get_sharded_load_dir(load_dir)
-    if sharded_load_dir is None:
-        return False
-    try:
-        checkpoint_keys = set(dist_checkpointing.load_tensors_metadata(str(sharded_load_dir)))
-        model_keys = {
-            getattr(value, "key", None) for value in nested_values(model.sharded_state_dict())
-        }
-    except Exception as e:  # The check is advisory; the load itself reports real errors.
-        logger.warning(f"Skipping the layernorm checkpoint-key check for {sharded_load_dir}: {e}")
-        return False
-    # The remappings whose keys the checkpoint has under the module names instead.
-    legacy = {
-        (unfused, fused)
-        for key in model_keys
-        if key is not None and key not in checkpoint_keys
-        for unfused, fused in remaps
-        if fused in key and key.replace(fused, unfused) in checkpoint_keys
-    }
-    if not legacy:
-        return False
-    print_rank_0(
-        f"Checkpoint {sharded_load_dir} stores layernorm weights under their module names; "
-        f"loading them as such. Checkpoints saved from this run use the fused "
-        f"Transformer-Engine keys."
-    )
-    for module in model.modules():
-        submodules = getattr(module, "submodules_config", None)
-        keys_map = getattr(submodules, "sharded_state_dict_keys_map", None) or {}
-        kept = {
-            unfused: fused for unfused, fused in keys_map.items() if (unfused, fused) not in legacy
-        }
-        if len(kept) < len(keys_map):
-            # Replace rather than modify: layers built from one spec share its submodules.
-            setattr(module, _REMAPPED_SUBMODULES_ATTR, submodules)
-            module.submodules_config = dataclasses.replace(
-                submodules, sharded_state_dict_keys_map=kept
-            )
-    return True
-
-
-def restore_layernorm_key_remaps(model) -> None:
-    """Undo ``load_legacy_layernorm_keys`` once the checkpoint is loaded. No-op otherwise."""
-    for stage in model if isinstance(model, list) else [model]:
-        for module in stage.modules():
-            original = module.__dict__.pop(_REMAPPED_SUBMODULES_ATTR, None)
-            if original is not None:
-                module.submodules_config = original
-
-
 def load_kd_teacher_checkpoint(
     model, distillation: DistillationConfig | None = None, *, student_checkpoint=None
 ) -> None:
@@ -260,9 +167,6 @@ def load_kd_teacher_checkpoint(
     ckpt_format = distillation.teacher_ckpt_format or (
         student_checkpoint.ckpt_format if student_checkpoint is not None else args.ckpt_format
     )
-    transformations = getattr(distillation.teacher_model, "transformations", None)
-    if transformations is not None and not transformations.default_te_spec:
-        load_legacy_layernorm_keys(teacher, distillation.teacher_load, ckpt_format)
     print_rank_0(
         f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ..."
     )
@@ -285,7 +189,6 @@ def load_kd_teacher_checkpoint(
             setattr(args, key, value)
         load_checkpoint([teacher], None, None, load_arg="export_kd_teacher_load")
     finally:
-        restore_layernorm_key_remaps(teacher)
         for key, value in original.items():
             if value is missing:
                 delattr(args, key)

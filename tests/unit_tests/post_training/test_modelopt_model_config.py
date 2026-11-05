@@ -2,7 +2,6 @@
 
 """Unit tests for building ModelOpt model configs/hooks that use the stock GPT/Hybrid builders."""
 
-import contextlib
 import functools
 import warnings
 from argparse import Namespace
@@ -440,129 +439,7 @@ class TestModelType:
         assert te_hook.called is not default_te_spec
 
 
-class TestLegacyLayernormCheckpointKeys:
-    FUSED = "decoder.layers.self_attention.linear_qkv.layer_norm_weight"
-    LEGACY = "decoder.layers.input_layernorm.weight"
-
-    KEYS_MAP = {"input_layernorm.": "self_attention.linear_qkv.layer_norm_"}
-
-    @staticmethod
-    def _model(model_keys, keys_maps):
-        from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-
-        model = torch.nn.Module()
-        model.layers = torch.nn.ModuleList()
-        # Layers built from one spec share its submodules config.
-        for keys_map in keys_maps:
-            layer = torch.nn.Module()
-            layer.submodules_config = TransformerLayerSubmodules(
-                sharded_state_dict_keys_map=keys_map
-            )
-            model.layers.append(layer)
-        model.sharded_state_dict = lambda: {k: Mock(key=k) for k in model_keys}
-        return model
-
-    def _load(self, model_keys, checkpoint_keys, ckpt_format="torch_dist", keys_maps=None):
-        from megatron.post_training import checkpointing
-
-        model = self._model(model_keys, [self.KEYS_MAP] if keys_maps is None else keys_maps)
-        with (
-            patch.object(checkpointing, "get_sharded_load_dir", return_value="/ckpt/iter_1"),
-            patch.object(
-                checkpointing.dist_checkpointing,
-                "load_tensors_metadata",
-                return_value=dict.fromkeys(checkpoint_keys),
-            ),
-        ):
-            legacy = checkpointing.load_legacy_layernorm_keys(model, "/ckpt", ckpt_format)
-        return model, legacy
-
-    @staticmethod
-    def _keys_maps(model):
-        return [layer.submodules_config.sharded_state_dict_keys_map for layer in model.layers]
-
-    def test_loads_module_name_keys_then_restores_fused_keys(self):
-        from megatron.post_training import checkpointing
-
-        shared = {"input_layernorm.": "self_attention.linear_qkv.layer_norm_"}
-        model, legacy = self._load([self.FUSED], [self.LEGACY], keys_maps=[shared, shared])
-        assert legacy
-        assert self._keys_maps(model) == [{}, {}]
-        assert shared == self.KEYS_MAP  # The spec's map is replaced on the layer, not modified.
-
-        checkpointing.restore_layernorm_key_remaps([model])
-        assert self._keys_maps(model) == [self.KEYS_MAP, self.KEYS_MAP]
-        checkpointing.restore_layernorm_key_remaps([model])  # Idempotent.
-        assert self._keys_maps(model) == [self.KEYS_MAP, self.KEYS_MAP]
-
-    def test_keeps_remappings_the_checkpoint_uses(self):
-        """A legacy ModelOpt decoder with a stock MLA MTP layer, whose remapping stays."""
-        from megatron.post_training import checkpointing
-
-        # The stock fused-MLA spec stores its runtime down-projection layernorm as input_layernorm.
-        mla_map = {"self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm."}
-        mtp_key = "mtp.layers.0.transformer_layer.input_layernorm.weight"
-        model, legacy = self._load(
-            [self.FUSED, mtp_key], [self.LEGACY, mtp_key], keys_maps=[self.KEYS_MAP, mla_map]
-        )
-        assert legacy
-        assert self._keys_maps(model) == [{}, mla_map]
-
-        checkpointing.restore_layernorm_key_remaps(model)
-        assert self._keys_maps(model) == [self.KEYS_MAP, mla_map]
-
-    def test_keeps_other_entries_of_a_partly_legacy_map(self):
-        keys_map = {**self.KEYS_MAP, "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"}
-        mlp_key = "decoder.layers.mlp.linear_fc1.layer_norm_weight"
-        model, legacy = self._load(
-            [self.FUSED, mlp_key], [self.LEGACY, mlp_key], keys_maps=[keys_map]
-        )
-        assert legacy
-        assert self._keys_maps(model) == [{"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"}]
-
-    def test_keeps_fused_keys(self):
-        model, legacy = self._load([self.FUSED], [self.FUSED, self.LEGACY])
-        assert not legacy
-        assert self._keys_maps(model) == [self.KEYS_MAP]
-
-    def test_ignores_unmapped_layernorms(self):
-        # MoE layers keep pre_mlp_layernorm under its module name in every spec.
-        key = "decoder.layers.pre_mlp_layernorm.weight"
-        assert not self._load([key], [key])[1]
-
-    def test_skips_non_distributed_formats(self):
-        model, legacy = self._load([self.FUSED], [self.LEGACY], ckpt_format="torch")
-        assert not legacy
-        assert self._keys_maps(model) == [self.KEYS_MAP]
-
-    def test_skips_models_without_remapped_keys(self):
-        assert not self._load([self.FUSED], [self.LEGACY], keys_maps=[{}])[1]
-
-    def test_remaps_come_from_the_layer_specs(self):
-        from megatron.post_training import checkpointing
-
-        mamba_map = {"norm.": "mixer.in_proj.layer_norm_"}
-        model = self._model([], [self.KEYS_MAP, mamba_map, {}])
-        assert checkpointing._layernorm_key_remaps(model) == {
-            ("input_layernorm.", "self_attention.linear_qkv.layer_norm_"),
-            ("norm.", "mixer.in_proj.layer_norm_"),
-        }
-
-    @pytest.mark.parametrize("default_te_spec", [False, True])
-    def test_student_hook_registered_unless_default_te_spec(self, monkeypatch, default_te_spec):
-        from megatron.training.config.training_config import CheckpointConfig
-
-        check = Mock(return_value=lambda models: models)
-        monkeypatch.setattr(model_hooks, "legacy_layernorm_keys_hook", check)
-        monkeypatch.setattr(model_hooks, "restore_modelopt_state_hook", lambda *_: lambda m: m)
-        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
-        config = mc.modelopt_model_config_from_args(
-            make_modelopt_test_args(export_default_te_spec=default_te_spec)
-        )
-        checkpoint = CheckpointConfig(load="/ckpt", ckpt_format="torch_dist")
-        config.get_builder_cls()(config).pre_wrap_hook(checkpoint)([Mock()])
-        assert check.called is not default_te_spec
-
+class TestModelOptCheckpointSelection:
     @pytest.mark.parametrize(
         "load, load_has_checkpoint, expected",
         [(None, False, "/pretrained"), ("/ckpt", False, "/pretrained"), ("/ckpt", True, "/ckpt")],
@@ -573,9 +450,7 @@ class TestLegacyLayernormCheckpointKeys:
         from megatron.post_training import checkpointing
         from megatron.training.config.training_config import CheckpointConfig
 
-        check = Mock(return_value=lambda models: models)
         restore = Mock(return_value=lambda models: models)
-        monkeypatch.setattr(model_hooks, "legacy_layernorm_keys_hook", check)
         monkeypatch.setattr(model_hooks, "restore_modelopt_state_hook", restore)
         monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
         monkeypatch.setattr(
@@ -587,7 +462,6 @@ class TestLegacyLayernormCheckpointKeys:
         )
         config.get_builder_cls()(config).pre_wrap_hook(checkpoint)([Mock()])
         restore.assert_called_once_with(expected, "torch_dist")
-        check.assert_called_once_with(expected, "torch_dist")
 
 
 class TestLoadTeacherModelConfig:
@@ -878,32 +752,6 @@ class TestTeacherCheckpointConfig:
                 [Mock()], DistillationConfig(teacher_load="/teacher")
             )
         assert not hasattr(args, "export_kd_teacher_load")
-
-    @pytest.mark.parametrize("fail", [False, True])
-    def test_teacher_layernorm_key_remaps_restored_after_load(self, fail):
-        from megatron.post_training import checkpointing
-
-        args = Namespace(finetune=False, ckpt_format="torch_dist")
-        teacher = Mock()
-        distillation = DistillationConfig(
-            teacher_load="/teacher",
-            teacher_model=Mock(transformations=ModelTransformConfig(default_te_spec=False)),
-        )
-        with (
-            patch.object(checkpointing, "get_args", return_value=args),
-            patch.object(checkpointing, "unwrap_model", return_value=Mock(teacher_model=teacher)),
-            patch.object(
-                checkpointing,
-                "load_checkpoint",
-                side_effect=RuntimeError("load failed") if fail else None,
-            ),
-            patch.object(checkpointing, "load_legacy_layernorm_keys") as prepare,
-            patch.object(checkpointing, "restore_layernorm_key_remaps") as restore,
-            pytest.raises(RuntimeError) if fail else contextlib.nullcontext(),
-        ):
-            checkpointing.load_kd_teacher_checkpoint([Mock()], distillation)
-        prepare.assert_called_once_with(teacher, "/teacher", "torch_dist")
-        restore.assert_called_once_with(teacher)
 
     def test_modelopt_state_uses_explicit_path_and_format(self):
         from megatron.post_training import checkpointing
