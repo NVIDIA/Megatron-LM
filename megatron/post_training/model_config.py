@@ -141,7 +141,7 @@ def _check_model_type(model_config: GPTModelConfig | HybridModelConfig, args: Na
         warnings.warn(
             "--export-model-type is deprecated: the model type now comes from the entry point "
             "(pretrain_gpt.py / pretrain_hybrid.py) or from --hybrid-layer-pattern.",
-            DeprecationWarning,
+            FutureWarning,
             stacklevel=3,
         )
         if (_EXPORT_MODEL_TYPES[flag] == "hybrid") != hybrid:
@@ -216,7 +216,6 @@ def apply_modelopt_model_config(
         transformer_config = model_config.transformer
         # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
         original_num_layers = transformer_config.num_layers
-        transformer_config.original_num_layers = original_num_layers
         # Set num_layers to 0 for base model in offline mode
         transformer_config.num_layers = 0
         # SP is not used for offline

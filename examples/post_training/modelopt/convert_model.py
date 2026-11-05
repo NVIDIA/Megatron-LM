@@ -16,6 +16,7 @@ from modelopt.torch.export import import_mcore_gpt_from_hf
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
+from megatron.post_training.checkpointing import restore_layernorm_key_remaps
 from megatron.post_training.model_config import (
     build_inference_models,
     modelopt_inference_config_from_args,
@@ -152,6 +153,7 @@ if __name__ == "__main__":
         )
     elif cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None)
+        restore_layernorm_key_remaps(model)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]

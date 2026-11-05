@@ -58,6 +58,7 @@ from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
+from megatron.post_training.checkpointing import restore_layernorm_key_remaps
 from megatron.post_training.model_config import (
     build_inference_models,
     modelopt_inference_config_from_args,
@@ -509,6 +510,7 @@ if __name__ == "__main__":
 
     if cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+        restore_layernorm_key_remaps(model)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:

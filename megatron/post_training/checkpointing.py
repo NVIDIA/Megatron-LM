@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -138,33 +139,61 @@ def load_modelopt_state(
         restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
-# Key fragments of layernorms under the fused Transformer-Engine checkpoint names, which the
-# ModelOpt-local spec loads and saves, mapped to the module names used by distributed
-# checkpoints saved without that remapping (e.g. before it was always on).
-_TE_LAYERNORM_KEY_FRAGMENTS = {
-    "self_attention.linear_qkv.layer_norm_": "input_layernorm.",
-    "self_attention.in_proj.layer_norm_": "input_layernorm.",
-    "self_attention.linear_q_up_proj.layer_norm_": "self_attention.q_layernorm.",
-    "self_attention.linear_kv_up_proj.layer_norm_": "self_attention.kv_layernorm.",
-    "mlp.linear_fc1.layer_norm_": "pre_mlp_layernorm.",
-    "mixer.in_proj.layer_norm_": "norm.",
-}
+def resolve_checkpoint_load_dir(checkpoint) -> Optional[str]:
+    """The directory ``load_checkpoint`` reads for ``checkpoint``.
+
+    That is ``checkpoint.load``, or ``checkpoint.pretrained_checkpoint`` when ``load`` holds no
+    checkpoint, as when finetuning with ``--pretrained-checkpoint`` and an empty ``--load``.
+    """
+    if checkpoint is None:
+        return None
+    pretrained_dir = getattr(checkpoint, "pretrained_checkpoint", None)
+    if pretrained_dir is not None and not checkpoint_exists(checkpoint.load):
+        return pretrained_dir
+    return checkpoint.load
 
 
-def check_te_layernorm_checkpoint_keys(model: nn.Module, load_dir: str, ckpt_format: str) -> None:
-    """Reject a distributed checkpoint that stores layernorms under their module names.
+def _layernorm_key_remaps(model: nn.Module) -> set[tuple[str, str]]:
+    """The ``(module-name fragment, checkpoint-key fragment)`` pairs ``model``'s layers remap.
 
-    The ModelOpt-local spec loads layernorms from the fused Transformer-Engine keys (e.g.
-    ``self_attention.linear_qkv.layer_norm_weight``). A checkpoint saved without that
-    remapping has ``input_layernorm.weight`` etc. instead. Without this check it fails with
-    missing keys, or, with a non-strict ``--dist-ckpt-strictness``, loads with the layernorms
-    left at their initial values.
+    Read from the layer specs' ``sharded_state_dict_keys_map`` (e.g. ``input_layernorm.`` ->
+    ``self_attention.linear_qkv.layer_norm_``), which the ModelOpt-local spec uses to load and
+    save layernorms under the fused Transformer-Engine keys.
+    """
+    remaps = set()
+    for module in model.modules():
+        submodules = getattr(module, "submodules_config", None)
+        keys_map = getattr(submodules, "sharded_state_dict_keys_map", None) or {}
+        remaps.update(keys_map.items())
+    return remaps
+
+
+# Where load_legacy_layernorm_keys keeps a layer's original submodules_config.
+_REMAPPED_SUBMODULES_ATTR = "_modelopt_remapped_submodules_config"
+
+
+def load_legacy_layernorm_keys(model: nn.Module, load_dir: str, ckpt_format: str) -> bool:
+    """Prepare ``model`` to load a distributed checkpoint that stores layernorms by module name.
+
+    The ModelOpt-local spec loads and saves layernorms under the fused Transformer-Engine keys
+    (e.g. ``self_attention.linear_qkv.layer_norm_weight``). A checkpoint saved without that
+    remapping (``--export-te-mcore-model`` off) has ``input_layernorm.weight`` etc. instead,
+    for the same tensors. If ``load_dir`` is such a checkpoint, turn off the remappings it
+    lacks on ``model``'s layers so it loads as is, until ``restore_layernorm_key_remaps``;
+    later saves then use the fused keys, converting the checkpoint. Remappings the checkpoint
+    does use, such as a stock MLA spec's, are kept.
+
+    Returns:
+        Whether the checkpoint stores layernorms under their module names.
     """
     if ckpt_format != "torch_dist":
-        return
+        return False
+    remaps = _layernorm_key_remaps(model)
+    if not remaps:
+        return False
     sharded_load_dir = get_sharded_load_dir(load_dir)
     if sharded_load_dir is None:
-        return
+        return False
     try:
         checkpoint_keys = set(dist_checkpointing.load_tensors_metadata(str(sharded_load_dir)))
         model_keys = {
@@ -172,21 +201,44 @@ def check_te_layernorm_checkpoint_keys(model: nn.Module, load_dir: str, ckpt_for
         }
     except Exception as e:  # The check is advisory; the load itself reports real errors.
         logger.warning(f"Skipping the layernorm checkpoint-key check for {sharded_load_dir}: {e}")
-        return
-    for key in model_keys:
-        if key is None or key in checkpoint_keys:
-            continue
-        for fused, unfused in _TE_LAYERNORM_KEY_FRAGMENTS.items():
-            legacy_key = key.replace(fused, unfused)
-            if fused in key and legacy_key in checkpoint_keys:
-                raise RuntimeError(
-                    f"Checkpoint {sharded_load_dir} stores layernorm weights under their module "
-                    f"names (e.g. '{legacy_key}'), as saved by the ModelOpt-local spec without "
-                    f"--export-te-mcore-model. The ModelOpt-local spec now always uses the fused "
-                    f"Transformer-Engine keys (e.g. '{key}'). Re-save the checkpoint with an "
-                    f"earlier Megatron-LM and --export-te-mcore-model, or load it with "
-                    f"--export-default-te-spec if it was saved from the Transformer-Engine spec."
-                )
+        return False
+    # The remappings whose keys the checkpoint has under the module names instead.
+    legacy = {
+        (unfused, fused)
+        for key in model_keys
+        if key is not None and key not in checkpoint_keys
+        for unfused, fused in remaps
+        if fused in key and key.replace(fused, unfused) in checkpoint_keys
+    }
+    if not legacy:
+        return False
+    print_rank_0(
+        f"Checkpoint {sharded_load_dir} stores layernorm weights under their module names; "
+        f"loading them as such. Checkpoints saved from this run use the fused "
+        f"Transformer-Engine keys."
+    )
+    for module in model.modules():
+        submodules = getattr(module, "submodules_config", None)
+        keys_map = getattr(submodules, "sharded_state_dict_keys_map", None) or {}
+        kept = {
+            unfused: fused for unfused, fused in keys_map.items() if (unfused, fused) not in legacy
+        }
+        if len(kept) < len(keys_map):
+            # Replace rather than modify: layers built from one spec share its submodules.
+            setattr(module, _REMAPPED_SUBMODULES_ATTR, submodules)
+            module.submodules_config = dataclasses.replace(
+                submodules, sharded_state_dict_keys_map=kept
+            )
+    return True
+
+
+def restore_layernorm_key_remaps(model) -> None:
+    """Undo ``load_legacy_layernorm_keys`` once the checkpoint is loaded. No-op otherwise."""
+    for stage in model if isinstance(model, list) else [model]:
+        for module in stage.modules():
+            original = module.__dict__.pop(_REMAPPED_SUBMODULES_ATTR, None)
+            if original is not None:
+                module.submodules_config = original
 
 
 def load_kd_teacher_checkpoint(
@@ -195,6 +247,13 @@ def load_kd_teacher_checkpoint(
     """Load the teacher's weights after wrapping. No-op when the run has no distillation."""
     if distillation is None:
         return
+    # load_checkpoint only warns about a missing checkpoint, which would leave the teacher
+    # randomly initialized.
+    if not checkpoint_exists(distillation.teacher_load):
+        raise FileNotFoundError(
+            f"No teacher checkpoint found at {distillation.teacher_load} (expected "
+            f"{get_checkpoint_tracker_filename(distillation.teacher_load)})."
+        )
     args = get_args()
 
     teacher = unwrap_model(model[0]).teacher_model
@@ -203,7 +262,7 @@ def load_kd_teacher_checkpoint(
     )
     transformations = getattr(distillation.teacher_model, "transformations", None)
     if transformations is not None and not transformations.default_te_spec:
-        check_te_layernorm_checkpoint_keys(teacher, distillation.teacher_load, ckpt_format)
+        load_legacy_layernorm_keys(teacher, distillation.teacher_load, ckpt_format)
     print_rank_0(
         f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ..."
     )
@@ -226,6 +285,7 @@ def load_kd_teacher_checkpoint(
             setattr(args, key, value)
         load_checkpoint([teacher], None, None, load_arg="export_kd_teacher_load")
     finally:
+        restore_layernorm_key_remaps(teacher)
         for key, value in original.items():
             if value is missing:
                 delattr(args, key)

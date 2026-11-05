@@ -61,6 +61,7 @@ class DistillationConfig:
             raise ValueError("Distillation requires a teacher checkpoint.")
         if self.teacher_model is None:
             raise ValueError("Distillation requires a resolved teacher_model configuration.")
+        self.teacher_model.validate()
         if not isinstance(self.loss, dict):
             raise ValueError(f"Distillation loss settings must be a mapping, got {self.loss!r}.")
 
