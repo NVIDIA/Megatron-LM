@@ -145,6 +145,13 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
+> For dense Transformer Engine row-parallel layers with `TP > 1` and sequence
+> parallelism disabled, batch-invariant mode defaults to the existing `two_shot`
+> symmetric-memory reduction when `symmetric_ar_type` is unset. This avoids
+> batch-size-dependent NCCL summation order and requires a topology supported by
+> PyTorch symmetric memory. An explicitly configured `symmetric_ar_type` is retained.
+> This selection does not cover sequence-parallel reduce-scatter or expert layers.
+>
 > Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
 > MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
