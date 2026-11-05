@@ -218,7 +218,7 @@ class FsdpContext:
         if not self.caller_managed_grad_sync:
             self.finish_grad_sync()
 
-    def run_delayed_post_backward(self) -> None:
+    def run_delayed_post_backward_callbacks(self) -> None:
         """Release deferred module weights after each microbatch backward."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
@@ -227,7 +227,7 @@ class FsdpContext:
 
     def _post_autograd_backward(self) -> None:
         """Clean up this backward; caller-managed schedules complete explicitly."""
-        self.run_delayed_post_backward()
+        self.run_delayed_post_backward_callbacks()
         self._post_backward_hook_registered = False
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.post_backward()

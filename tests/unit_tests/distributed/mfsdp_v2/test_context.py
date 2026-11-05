@@ -190,7 +190,7 @@ def test_combined_hooks_record_repeated_owner_calls(distributed_setup):
         model.zero_grad(set_to_none=True)
         model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
         assert context.is_recording_execution_order is (iteration == 0)
-        context.run_delayed_post_backward()
+        context.run_delayed_post_backward_callbacks()
         context.post_backward()
         context.finish_grad_sync()
         assert list(context.execution_order) == expected
