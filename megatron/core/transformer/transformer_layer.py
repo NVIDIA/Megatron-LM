@@ -33,6 +33,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.router_replay import ChunkedRouterReplay
 from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionOperation,
@@ -768,7 +769,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _forward_attention(
         self,
+        # PyTorch's full-backward hooks only track positional inputs. Pass the
+        # activation positionally so MFSDP can release weights promptly.
+        # Supporting keyword inputs would require a custom autograd hook,
+        # adding complexity to MFSDP.
         hidden_states: Tensor,
+        /,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -1124,7 +1130,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return hidden_states, context
 
     @copy_signature(_forward_attention)
-    def forward(self, *args, **kwargs):
+    def forward(self, hidden_states: Tensor, /, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
 
@@ -1134,7 +1140,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            hidden_states, context = self._forward_attention(*args, **kwargs)
+            hidden_states, context = self._forward_attention(hidden_states, *args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None
@@ -1483,50 +1489,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 **moe_kwargs,
             )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
-            # Chunk input along sequence dimension
-            num_chunks = min(
+            mlp_output_with_bias = self._run_mlp_in_chunks(
+                pre_mlp_layernorm_output,
+                padding_mask,
+                input_ids,
+                packed_seq_params,
                 (
                     self.config.mlp_chunks_for_prefill
                     if should_chunk_mlp_for_prefill
                     else self.config.mlp_chunks_for_training
                 ),
-                pre_mlp_layernorm_output.shape[0],
             )
-
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-            padding_mask_chunks = (
-                padding_mask.chunk(num_chunks, dim=1)
-                if padding_mask is not None
-                else (None,) * num_chunks
-            )
-            input_id_chunks = (
-                input_ids.chunk(num_chunks, dim=1)
-                if self.is_moe_layer and input_ids is not None
-                else (None,) * num_chunks
-            )
-
-            # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
-            outputs = []
-            for chunk, padding_mask_chunk, input_id_chunk in zip(
-                chunks, padding_mask_chunks, input_id_chunks
-            ):
-                chunk_moe_kwargs = {}
-                if input_id_chunk is not None:
-                    chunk_moe_kwargs["input_ids"] = input_id_chunk
-                if self.is_moe_layer:
-                    chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
-                outputs.append(
-                    apply_module(self.mlp)(
-                        chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs
-                    )
-                )
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            # elements in bias_chunks are the same for all chunks, so we can just use the first one
-            bias_output = bias_chunks[0] if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if using_fused_tp_inference_kernel:
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
@@ -1538,6 +1511,98 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
+
+    def _run_mlp_in_chunks(
+        self,
+        hidden_states: Tensor,
+        padding_mask: Tensor | None,
+        input_ids: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        num_chunks: int,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Run the MLP over ``num_chunks`` sequence chunks of ``hidden_states`` ([s, b, h]).
+
+        For an MoE layer, every call runs expert-parallel collectives, so every EP rank must make
+        the same number of calls whatever its local sequence length. The input is therefore
+        always split into exactly ``num_chunks`` non-empty chunks: a sequence shorter than that
+        is padded with masked dummy tokens, whose outputs are dropped. With routing replay, each
+        chunk replays its own tokens' indices (see ``ChunkedRouterReplay``).
+
+        Returns:
+            ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
+        """
+        seq_len, batch_size = hidden_states.shape[:2]
+        router = getattr(self.mlp, "router", None)
+        pad = 0
+        if self.is_moe_layer:
+            pad = max(0, num_chunks - seq_len)
+        else:
+            num_chunks = min(num_chunks, seq_len)
+        if pad and getattr(router, "routing_type", None) == "quantile_balancing":
+            # The dummy tokens need a padding mask, which quantile balancing does not support yet.
+            raise NotImplementedError(
+                f"MLP chunking (mlp_chunks_for_training / mlp_chunks_for_prefill = {num_chunks}) "
+                f"with quantile-balancing routing needs a local sequence of at least {num_chunks} "
+                f"tokens, got {seq_len}: shorter sequences are padded with masked dummy tokens, "
+                "and quantile balancing does not support padding masks yet."
+            )
+        if pad:
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 0, 0, pad))
+            # Mask the dummy tokens even without a caller mask, so the router leaves them out
+            # of its aux-loss, z-loss and expert-bias token counts.
+            if padding_mask is None:
+                padding_mask = torch.zeros(
+                    (batch_size, seq_len), dtype=torch.bool, device=hidden_states.device
+                )
+            padding_mask = torch.nn.functional.pad(padding_mask, (0, pad), value=True)
+            if input_ids is not None:
+                input_ids = torch.nn.functional.pad(input_ids, (0, pad))
+
+        # tensor_split, unlike chunk, always returns exactly num_chunks pieces.
+        chunks = hidden_states.tensor_split(num_chunks, dim=0)
+        padding_mask_chunks = (
+            padding_mask.tensor_split(num_chunks, dim=1)
+            if padding_mask is not None
+            else (None,) * num_chunks
+        )
+        input_id_chunks = (
+            input_ids.tensor_split(num_chunks, dim=1)
+            if self.is_moe_layer and input_ids is not None
+            else (None,) * num_chunks
+        )
+        replay = ChunkedRouterReplay(
+            getattr(router, "router_replay", None),
+            [chunk.shape[0] * batch_size for chunk in chunks],
+            pad * batch_size,
+            # MoELayer checkpoints each call under selective "moe" recompute.
+            chunks_recompute=getattr(self.mlp, "moe_layer_recompute", False) and self.mlp.training,
+        )
+
+        # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
+        outputs = []
+        for i, (chunk, padding_mask_chunk, input_id_chunk) in enumerate(
+            zip(chunks, padding_mask_chunks, input_id_chunks)
+        ):
+            chunk_moe_kwargs = {}
+            if input_id_chunk is not None:
+                chunk_moe_kwargs["input_ids"] = input_id_chunk
+            if self.is_moe_layer:
+                chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
+            replay_topk_idx = replay.chunk_indices(i)
+            if replay_topk_idx is not None:
+                chunk_moe_kwargs["replay_topk_idx"] = replay_topk_idx
+            outputs.append(
+                apply_module(self.mlp)(chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs)
+            )
+            replay.after_chunk()
+        replay.finish()
+
+        # Aggregate chunk outputs, dropping the dummy tokens.
+        mlp_output = torch.cat([out for out, _ in outputs], dim=0)[:seq_len]
+        bias_chunks = [bias for _, bias in outputs if bias is not None]
+        # elements in bias_chunks are the same for all chunks, so we can just use the first one
+        bias_output = bias_chunks[0] if bias_chunks else None
+        return mlp_output, bias_output
 
     def _apply_mlp_bda_step(
         self,
@@ -1882,14 +1947,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
-            if len(args) > 0:
-                hidden_states = args[0]
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                args = (hidden_states,) + args[1:]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                kwargs["hidden_states"] = hidden_states
+            hidden_states = self.off_interface.backward_record(args[0])
+            args = (hidden_states, *args[1:])
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1897,10 +1956,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
-            if len(args) > 0:
-                hidden_states = args[0]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
+            hidden_states = args[0]
 
         if (
             not self.config.cuda_graph_modules
@@ -1999,7 +2055,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         graph_kwargs = {
             k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
         }
-        hidden_states = args[0] if args else kwargs["hidden_states"]
+        hidden_states = args[0]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device
         )
