@@ -393,6 +393,14 @@ class ModelParallelConfig:
        without a vocabulary-sized FP32 softmax buffer. Defaults to 'native'.
     """
 
+    cross_entropy_inplace_backward: bool = False
+    """Let Hybrid/MTP transfer private logits to one fused loss backward.
+
+    Requires fused 'tiled_te' cross entropy. Prefer TE's overwrite_input API when
+    supported; otherwise use the TP1 Triton fallback. Tensor observers keep
+    the non-mutating path. Public loss calls never infer ownership.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -652,6 +660,11 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_inplace_backward and not (
+            self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "tiled_te"
+        ):
+            raise ValueError("Private logits backward requires fused tiled_te cross entropy")
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(

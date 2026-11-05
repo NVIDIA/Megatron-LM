@@ -17,13 +17,14 @@ from tests.unit_tests.test_utilities import Utils
     [
         ("2.18.0", True, True, False),
         ("2.19.0.dev0", False, True, False),
-        ("2.19.0.dev0", True, True, True),
+        ("2.19.0.dev0", True, True, False),
         ("2.19.0", True, True, True),
         ("2.20.0", True, False, False),
         ("2.20.0", False, True, False),
     ],
 )
-def test_tiled_te_checks_version_and_api(monkeypatch, version, api, available, prefer_te):
+@pytest.mark.parametrize("private", [False, True])
+def test_tiled_te_checks_version_and_api(monkeypatch, version, api, available, prefer_te, private):
     monkeypatch.setattr(
         backends, "is_te_min_version", lambda minimum: Version(version) >= Version(minimum)
     )
@@ -31,10 +32,13 @@ def test_tiled_te_checks_version_and_api(monkeypatch, version, api, available, p
     monkeypatch.setattr(
         te_extensions, "te_parallel_cross_entropy", (lambda: None) if available else None
     )
-    target = backends.select_cross_entropy(True, "tiled_te")
+    target = backends.select_cross_entropy(True, "tiled_te", inplace_backward=private)
     if prefer_te:
         assert target.func is backends.te_cross_entropy
-        assert target.keywords["overwrite_input"] is False
+        assert target.keywords["overwrite_input"] is private
+    elif private:
+        assert target.func is triton_cross_entropy
+        assert target.keywords["inplace_backward"] is True
     else:
         assert target is triton_cross_entropy
 
@@ -77,3 +81,8 @@ def test_tiled_te_loss_and_ignored_rows(implementation, dtype, monkeypatch):
         assert torch.count_nonzero(logits.grad[::3]) == 0
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_former_auto_name_is_rejected():
+    with pytest.raises(ValueError, match="Valid choices: native, te, tiled_te"):
+        backends.select_cross_entropy(True, "auto")

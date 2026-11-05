@@ -90,8 +90,8 @@ class TestTritonCrossEntropy:
     @pytest.mark.parametrize("hidden", [1536, 2688])
     def test_projection_loss_parameter_gradients(self, hidden):
         from megatron.core import parallel_state
+        from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
         from megatron.core.ops.loss.tiled_cross_entropy import triton_cross_entropy
-        from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 
         torch.manual_seed(2104)
         source = torch.randn(17, hidden, device="cuda", dtype=torch.bfloat16)

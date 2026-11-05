@@ -144,21 +144,43 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
             ModelParallelConfig(sequence_parallel=True, **kwargs)
 
 
-def test_tiled_te_cross_entropy_config():
-    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="tiled_te")
-    assert config.cross_entropy_fusion_impl == "tiled_te"
+def test_private_logits_accepts_fused_tiled_te():
+    ModelParallelConfig(
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl="tiled_te",
+        cross_entropy_inplace_backward=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "fusion,implementation", [(False, "tiled_te"), (True, "native"), (True, "te")]
+)
+def test_private_logits_requires_fused_tiled_te(fusion, implementation):
+    with pytest.raises(ValueError, match="requires fused tiled_te"):
+        ModelParallelConfig(
+            cross_entropy_loss_fusion=fusion,
+            cross_entropy_fusion_impl=implementation,
+            cross_entropy_inplace_backward=True,
+        )
 
 
 def test_tiled_te_cross_entropy_preserves_unfused_selection():
-    from megatron.core.models.backends import select_cross_entropy
+    from megatron.core.ops.loss.backends import select_cross_entropy
 
     assert select_cross_entropy(False, "tiled_te") is select_cross_entropy(False, "native")
 
 
 def test_tiled_te_cross_entropy_cli(monkeypatch):
     monkeypatch.setattr(
-        sys, "argv", ["test", "--cross-entropy-loss-fusion", "--cross-entropy-fusion-impl", "tiled_te"]
+        sys,
+        "argv",
+        ["test", "--cross-entropy-loss-fusion", "--cross-entropy-fusion-impl", "tiled_te"],
     )
     args = parse_args()
     assert args.cross_entropy_loss_fusion
     assert args.cross_entropy_fusion_impl == "tiled_te"
+
+
+def test_private_logits_cli(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test", "--cross-entropy-inplace-backward"])
+    assert parse_args().cross_entropy_inplace_backward is True

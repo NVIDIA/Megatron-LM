@@ -29,13 +29,13 @@ consume ``logits`` in place. The opt-in ``tiled_te`` target preserves forward lo
 def _te_has_memory_efficient_cross_entropy() -> bool:
     """Check TE 2.19's tiled/statistics CE and input-ownership API once at binding.
 
-    TE PR #3273 introduced both in 2.19. Development builds additionally need
-    the API probe: a version string alone cannot identify pre-merge builds.
+    TE PR #3273 introduced both in 2.19. Match training's 2.19 stable safety
+    floor and probe the API too, since version metadata alone is insufficient.
     """
     from megatron.core.extensions import transformer_engine as te_extensions
 
     return (
-        is_te_min_version("2.19.0.dev0")
+        is_te_min_version("2.19.0")
         and te_extensions.te_parallel_cross_entropy is not None
         and getattr(te_extensions, "_TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT", False)
     )
@@ -45,12 +45,18 @@ def select_cross_entropy(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
     cuda_graph_impl: Optional[str] = None,
+    *,
+    inplace_backward: bool = False,
 ) -> CrossEntropyTarget:
     """Which cross entropy a config asks for, resolved once rather than on every forward.
 
     Shared by every provider: the choice depends on the config, not on which backend supplies
     the rest of the model, which is how it behaved before this was a provider decision.
     """
+    if inplace_backward and not (
+        cross_entropy_loss_fusion and cross_entropy_fusion_impl == "tiled_te"
+    ):
+        raise ValueError("Private logits backward requires fused tiled_te cross entropy")
     if cross_entropy_fusion_impl not in ("native", "te", "tiled_te"):
         raise ValueError(
             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
@@ -66,10 +72,12 @@ def select_cross_entropy(
             return partial(
                 te_cross_entropy,
                 cuda_graph_capturable=cuda_graph_impl == "full_iteration",
-                overwrite_input=False,
+                overwrite_input=inplace_backward,
             )
         from megatron.core.ops.loss.tiled_cross_entropy import triton_cross_entropy
 
+        if inplace_backward:
+            return partial(triton_cross_entropy, inplace_backward=True)
         return triton_cross_entropy
 
     # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
