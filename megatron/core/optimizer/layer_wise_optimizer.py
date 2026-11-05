@@ -791,7 +791,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # allgather_params); the step's master-to-model copy matches that.
                 optimizers[i].quantize_from_bf16_master = self.param_layout != 'padded'
 
-        self.tp_group = self.pg_collection.tp
+        self.tp_group = getattr(self.pg_collection, 'tp', None)
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
         # globals to fall back on there (see param_is_not_gtp_duplicate).
