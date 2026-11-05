@@ -40,10 +40,9 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because each parameter group tracks whether model_weight is stale
-    # after syncing from main_weight.
-    is_last_microbatch: bool
+    # Whether backward should finalize accumulated gradients, including DP-outer
+    # reduction for HSDP/HFSDP. Scoped by finalize_gradients().
+    finalize_gradients: bool
     use_symmetric_memory: bool
     caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
@@ -90,7 +89,7 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self.is_last_microbatch = True
+        self.finalize_gradients = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.execution_order = ExecutionOrder()
@@ -224,14 +223,14 @@ class FsdpContext:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
-        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()
         self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+        if not self.caller_managed_grad_sync and self.finalize_gradients:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 

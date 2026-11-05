@@ -293,7 +293,12 @@ work and before consuming gradients.
   and static forward and backward prefetch orders.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
-- Last-microbatch state for HSDP/HFSDP gradient accumulation.
+- Gradient finalization is enabled by default. Use
+  `with finalize_gradients(context, enabled=False):` around forward and backward
+  to defer DP-outer reduction and the automatic completion wait. Enable finalization
+  during the last backward call before the optimizer step. This launches deferred
+  outer reductions and enables the automatic wait for gradient reductions. The
+  scope itself does not launch reductions on entry or exit.
 - An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
 
 ### FsdpModule
