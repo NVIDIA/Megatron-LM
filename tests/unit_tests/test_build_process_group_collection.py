@@ -234,6 +234,32 @@ def test_build_rank_window():
         _destroy_groups(pg_collection, extras)
 
 
+def test_failed_initialize_creates_no_groups_and_keeps_state():
+    _require_divisible(2)
+    _initialize(pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2)
+    try:
+        num_groups = len(ps._global_process_group_list)
+        # test_initialize_twice_raises_already_initialized checks the exception type.
+        with pytest.raises(Exception, match="data parallel group is already initialized"):
+            ps.initialize_model_parallel(
+                pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=4
+            )
+        # The call fails before it creates any group or changes the registered state.
+        assert len(ps._global_process_group_list) == num_groups
+        assert ps.get_virtual_pipeline_model_parallel_world_size() == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+    with pytest.raises(RuntimeError, match="is not divisible by"):
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=Utils.world_size,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+        )
+    assert ps.get_virtual_pipeline_model_parallel_world_size() is None
+    assert ps.get_virtual_pipeline_model_parallel_rank() is None
+
+
 def test_initialize_only_arguments():
     _require_divisible(4)
     Utils.destroy_model_parallel()
