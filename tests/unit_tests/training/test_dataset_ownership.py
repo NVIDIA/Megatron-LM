@@ -635,6 +635,39 @@ def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
         cfg.get_data_parallel_size(12)
 
 
+@pytest.mark.parametrize("gtp,shards", [(1, 1), (2, 1), (4, 1), (4, 2)])
+def test_dataset_finalization_includes_gtp_sample_owners(
+    container_factory, monkeypatch, gtp, shards
+):
+    """The native container and the standalone args path use the same data degree."""
+    args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    world, tp, cp = 32, 2, 2
+    expected = world // (tp * cp * shards)
+    args.tensor_model_parallel_size = tp
+    args.context_parallel_size = cp * shards
+    args.gtp_weight_remat_size = gtp
+    args.gtp_remat_num_sequence_shards = shards
+    args.data_parallel_size = world // (tp * cp * gtp)
+    args.batch_parallel_size = expected
+    cfg.model = _layout(
+        tensor_model_parallel_size=tp,
+        context_parallel_size=cp * shards,
+        gtp_weight_remat_size=gtp,
+        gtp_remat_num_sequence_shards=shards,
+    )
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: world)
+    assert cfg.get_data_parallel_size(world) == args.data_parallel_size
+    if args.data_parallel_size != expected:
+        cfg.data.dataset.data_parallel_size = args.data_parallel_size
+        with pytest.raises(ValueError, match="data.dataset.data_parallel_size=.*disagrees"):
+            cfg.finalize()
+    cfg.data.dataset.data_parallel_size = expected
+    cfg.finalize()
+    standalone = gpt_data_config_from_args(args, standalone=True).dataset
+    assert cfg.data.dataset.data_parallel_size == standalone.data_parallel_size == expected
+    assert cfg.data.dataset.context_parallel_size == standalone.context_parallel_size == cp * shards
+
+
 def test_model_capacity_must_cover_the_sample_length(container_factory):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = _layout()

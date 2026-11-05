@@ -16,6 +16,19 @@ from megatron.core.tensor_parallel.gtp_parallel_layout import (
 )
 
 
+def add_mimo_dcp_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register execution choices for adapters using packed MIMO training."""
+    group = parser.add_argument_group("packed MIMO")
+    group.add_argument(
+        "--mimo-dcp-encoder-schedule",
+        choices=("whole-step", "per-round"),
+        default="whole-step",
+        help="Encode the source step together, or encode on first decoder use and "
+        "release each graph after its last consumer. Per-round may trade throughput for memory.",
+    )
+    return parser
+
+
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register hetero parallelism args for the single-encoder MIMO example."""
     grid = parser.add_argument_group("hetero module grids")

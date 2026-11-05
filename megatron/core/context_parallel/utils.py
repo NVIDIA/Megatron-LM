@@ -151,7 +151,11 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
                 local_tensor = tensor.index_select(1, valid_index)
                 padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
                 fill_value = True if key == "padding_mask" else 0
-                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
+                # Precomputed activations already contain the caller's padding embeddings.
+                # Preserve them, as embedding token 0 after CP partition would do; only newly
+                # inserted positions without a source activation need a zero fill.
+                fill_mask = index < 0 if key == "decoder_input" else padding
+                batch[key] = local_tensor.masked_fill(fill_mask.view(padding_shape), fill_value)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()
