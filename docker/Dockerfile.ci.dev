@@ -47,20 +47,19 @@ EOF
 
 # Cache the MoK wheel independently of the other dev dependencies. The shared base
 # pins its Python, PyTorch, CUDA, compiler, and CPU architecture; BuildKit also keys
-# this stage on the source revision, GPU target, helper, and patch.
+# this stage on the source revision, GPU target, and helper.
 FROM base AS mok-wheel
-ARG MOK_COMMIT=a2ad2d0ce2366c1817d15498cdbaf8ead5966117
+ARG MOK_COMMIT=7a8cfb7fdd96a1cfba506caf4756c6c86073399a
 # Include both GPU architectures supported by the pinned MoK source by default.
 ARG MOK_ARCH=ALL
 RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
-    --mount=type=bind,source=docker/patches/mok.patch,target=/opt/mok.patch \
     bash -ex <<"EOF"
     # The mount in main requires this directory even when MoK is skipped.
     mkdir -p /opt/mok-wheels
     # The ARM64 image serves GB200/GB300; the AMD64 image serves H100.
     if [ "${TARGETARCH}" = "arm64" ]; then
         uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
-        MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok.patch /opt/mok-wheels
+        MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok-wheels
     else
         echo "[MoK] skipping build for TARGETARCH=${TARGETARCH}"
     fi
@@ -128,8 +127,9 @@ ARG NVTE_CUDA_ARCHS="80;90;100"
 # --build-arg NVTE_BUILD_THREADS_PER_JOB=<n> to compile up to n targets of one source
 # concurrently; the uv sync below then caps concurrent sources to keep the compiler budget.
 ARG NVTE_BUILD_THREADS_PER_JOB
-# Keep compiled wheels separate when the CPU or TE GPU targets change.
-RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cache/uv \
+# Keep compiled wheels separate when the CPU or TE GPU targets change. The frontend
+# suffix forces TE to rebuild against the fixed 1.32 headers rather than reuse an old wheel.
+RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
@@ -208,7 +208,6 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     cp /workspace/mamba-cxx20.patch /opt/mamba-build-info/
     rm -rf "${MAMBA_BUILD_DIR}"
     trap - EXIT
-
 EOF
 
 # Reuse the wheel without copying a second archive into the final image.

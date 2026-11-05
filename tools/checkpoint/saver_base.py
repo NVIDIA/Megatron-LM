@@ -1,16 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import json
 import os
-from importlib.metadata import version
-from packaging.version import Version as PkgVersion
 import sys
-import torch
+from importlib.metadata import version
 
-from utils import (
-    chunk_bias,
-    chunk_weight,
-    initialize_checkpoint_converter_fake_process_groups,
-)
+import torch
+from packaging.version import Version as PkgVersion
+from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
+
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -143,24 +140,30 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.argument_utils import inference_cfg_container_from_args
-            from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+            from megatron.training.global_vars import (
+                get_args,
+                get_train_state,
+                set_global_variables,
+            )
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
-        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
+        self.cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
 
+        train_state = get_train_state()
+        train_state.iteration = self.md.iteration
         if hasattr(self.md, 'consumed_train_samples'):
-            self.margs.consumed_train_samples = self.md.consumed_train_samples
-            self.margs.consumed_valid_samples = self.md.consumed_valid_samples
-            print(f"Setting consumed_train_samples to {self.margs.consumed_train_samples}"
-                  f" and consumed_valid_samples to {self.margs.consumed_valid_samples}")
+            train_state.consumed_train_samples = self.md.consumed_train_samples
+            train_state.consumed_valid_samples = self.md.consumed_valid_samples
+            print(f"Setting consumed_train_samples to {train_state.consumed_train_samples}"
+                  f" and consumed_valid_samples to {train_state.consumed_valid_samples}")
         else:
             print("consumed_train_samples not provided.")
 
@@ -344,19 +347,24 @@ class MegatronCheckpointSaverBase:
         Save local models in self.models to a megatron checkpoint.
         """
         try:
-            from megatron.training.checkpointing import save_checkpoint
             from megatron.core import mpu
+            from megatron.training import get_train_state
+            from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        # Keep legacy checkpoint metadata consistent with the converted vocabulary.
+        self.margs.padded_vocab_size = self.cfg.tokenizer.padded_vocab_size
+
+        train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                    save_checkpoint(train_state.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
                         tensor_rank=tp_rank)
@@ -388,15 +396,15 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
+                self.cfg.tokenizer.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
-                if orig_vocab_size > self.margs.padded_vocab_size:
-                    full_word_embed = orig_word_embed[0:self.margs.padded_vocab_size,:]
+                if orig_vocab_size > self.cfg.tokenizer.padded_vocab_size:
+                    full_word_embed = orig_word_embed[0:self.cfg.tokenizer.padded_vocab_size,:]
 
                 # Expanding embedding to larger size by replicating final entry
-                elif orig_vocab_size < self.margs.padded_vocab_size:
-                    padding_size = self.margs.padded_vocab_size - orig_vocab_size
+                elif orig_vocab_size < self.cfg.tokenizer.padded_vocab_size:
+                    padding_size = self.cfg.tokenizer.padded_vocab_size - orig_vocab_size
 
                     full_word_embed = torch.cat((
                         orig_word_embed,
@@ -408,7 +416,7 @@ class MegatronCheckpointSaverBase:
             else:
                 print("Original vocab size not specified, leaving embedding table as-is. "
                     "If you've changed the tensor parallel size this could cause problems.")
-                self.margs.padded_vocab_size = orig_word_embed.shape[0]
+                self.cfg.tokenizer.padded_vocab_size = orig_word_embed.shape[0]
                 full_word_embed = orig_word_embed
             return full_word_embed
 

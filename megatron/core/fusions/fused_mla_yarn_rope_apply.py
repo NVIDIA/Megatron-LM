@@ -126,18 +126,23 @@ def _mla_rope_fwd_inplace_kernel(
 
     x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
     mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
-    # x1 = t[..., 0::2], x2 = t[..., 1::2]
-    x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-    x_2_off = x_1_off + 1
-    x_1 = tl.load(Q + x_1_off, mask=mask)
-    x_2 = tl.load(Q + x_2_off, mask=mask)
+    # x1 = t[..., 0::2], x2 = t[..., 1::2], split from one contiguous load of the emb_dim elements.
+    x_emb_off = x_off + tl.arange(0, emb_dim)[None, :]
+    x = tl.load(Q + x_emb_off, mask=mask)
+    x_1, x_2 = tl.split(tl.reshape(x, (BLOCK_H, emb_dim // 2, 2)))
 
-    x_left = x_1 * cos_left - x_2 * sin_left
-    x_right = x_2 * cos_right + x_1 * sin_right
+    # x_left = x_1 * cos_left - x_2 * sin_left, x_right = x_2 * cos_right + x_1 * sin_right.
+    # The products are paired into FMAs explicitly: the pairing the compiler picks on its own
+    # changes with the load pattern and with BLOCK_H. These are the pairings the kernel compiled
+    # to with two stride-2 loads, so the rounding is unchanged.
+    x_left = tl.fma(x_1, cos_left, -(x_2 * sin_left))
+    if INVERSE:
+        x_right = tl.fma(x_2, cos_right, x_1 * sin_right)
+    else:
+        x_right = tl.fma(x_1, sin_right, x_2 * cos_right)
 
     if REMOVE_INTERLEAVING:
-        tl.store(Q + x_1_off, x_left, mask=mask)
-        tl.store(Q + x_2_off, x_right, mask=mask)
+        tl.store(Q + x_emb_off, tl.interleave(x_left, x_right), mask=mask)
     else:
         # The interleaved input and split output layouts alias. Finish all loads
         # before any warp stores to the overlapping destination addresses.

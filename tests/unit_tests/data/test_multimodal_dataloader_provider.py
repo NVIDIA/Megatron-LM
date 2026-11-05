@@ -108,7 +108,6 @@ def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
 @pytest.fixture
 def strict_resume_provider(monkeypatch):
     args = SimpleNamespace(
-        iteration=100,
         load="/checkpoints/model",
         dataloader_save="/checkpoints/dataloader",
         strict_dataloader_state_load=True,
@@ -116,11 +115,13 @@ def strict_resume_provider(monkeypatch):
         dataloader_seed=0,
         packing_buffer_size=10000,
     )
+    train_state = SimpleNamespace(iteration=100)
     loader = MagicMock()
     loader.__len__.return_value = 42
     checkpoint_name = Mock(return_value="/checkpoints/dataloader/iter_0000100/state.pt")
     load_state = Mock(return_value={"dataloader_state_dict": "saved-state"})
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(dataloader_provider, "get_train_state", lambda: train_state)
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
     for name, value in (
         ("get_data_parallel_rank", 0),
@@ -135,7 +136,7 @@ def strict_resume_provider(monkeypatch):
     monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)
     monkeypatch.setattr(dataloader_provider, "get_checkpoint_name", checkpoint_name)
     monkeypatch.setattr(dataloader_provider.torch, "load", load_state)
-    return args, loader, checkpoint_name, load_state
+    return args, loader, checkpoint_name, load_state, train_state
 
 
 @pytest.mark.parametrize("iteration", [0, 100])
@@ -143,8 +144,8 @@ def strict_resume_provider(monkeypatch):
 def test_length_probe_never_restores_state(
     monkeypatch, strict_resume_provider, iteration, state_exists
 ):
-    args, loader, checkpoint_name, load_state = strict_resume_provider
-    args.iteration = iteration
+    args, loader, checkpoint_name, load_state, train_state = strict_resume_provider
+    train_state.iteration = iteration
     monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: state_exists)
 
     train, _, _ = dataloader_provider.train_valid_test_dataloaders_provider(
@@ -152,14 +153,14 @@ def test_length_probe_never_restores_state(
     )
 
     assert len(train._dataloader) == 42
-    assert args.iteration == iteration
+    assert train_state.iteration == iteration
     checkpoint_name.assert_not_called()
     load_state.assert_not_called()
     loader.restore_state_rank.assert_not_called()
 
 
 def test_default_restore_uses_resolved_iteration(monkeypatch, strict_resume_provider):
-    args, loader, checkpoint_name, load_state = strict_resume_provider
+    args, loader, checkpoint_name, load_state, _ = strict_resume_provider
     monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: True)
     dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
     assert checkpoint_name.call_args.args[:2] == (args.dataloader_save, 100)
@@ -168,7 +169,7 @@ def test_default_restore_uses_resolved_iteration(monkeypatch, strict_resume_prov
 
 
 def test_probe_does_not_disable_strict_restore(monkeypatch, strict_resume_provider):
-    args, loader, _, load_state = strict_resume_provider
+    args, loader, _, load_state, _ = strict_resume_provider
     monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: False)
     dataloader_provider.train_valid_test_dataloaders_provider(
         None, task_encoder=object(), restore_dataloader_state=False
