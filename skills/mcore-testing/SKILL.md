@@ -167,6 +167,32 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ## Adding a Unit Test
 
+### Choose focused behavioral coverage
+
+- **Add the minimum tests needed to protect changed behavior.** Bug fixes
+  should include a focused regression test where practical.
+- **Inspect nearby tests before adding coverage.** Extend or parameterize
+  existing tests when appropriate; do not duplicate behavior checks.
+  Identical line coverage alone does not establish redundancy.
+- **Do not add tests for trivial changes.** Documentation, formatting,
+  simple re-exports, and straightforward getters/setters generally do not
+  need new unit tests unless they protect a meaningful contract or known
+  regression.
+- **Assert meaningful results against independent expectations.** Do not
+  reproduce production logic, assert only mocked return values, or check
+  private call sequences without a behavioral reason.
+- **Use representative cases and relevant boundaries.** Do not generate
+  exhaustive matrices of shapes, dtypes, seeds, and TP/PP/DP configurations
+  by default. Each additional dimension or case should address a distinct
+  failure mode.
+- **Reuse fixtures and helpers and keep compute costs proportional.** Avoid
+  unnecessary GPU allocation, distributed launches, large tensors, model
+  downloads, or new dependencies when a smaller test adequately validates
+  the behavior. Follow the target suite's runner and fixture requirements;
+  retain GPU or distributed execution when it is needed to exercise the
+  changed behavior. These scope rules do not waive the kernel determinism
+  coverage required in the implementation steps below.
+
 ### Test behavior, not configuration snapshots
 
 - **Do not test recipe or test-script settings.** Do not add a unit test
