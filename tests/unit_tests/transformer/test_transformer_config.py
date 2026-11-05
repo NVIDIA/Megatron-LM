@@ -526,6 +526,24 @@ def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():
     assert config.moe_combine_bwd_dtype == 'mxfp8'
 
 
+def test_fp8_blockwise_dispatch_wire_dtype_accepts_valid_ncclep_config():
+    config = _make_mxfp8_wire_config(
+        moe_dispatch_fwd_dtype='fp8_blockwise', moe_combine_bwd_dtype='bf16'
+    )
+
+    assert config.moe_dispatch_fwd_dtype == 'fp8_blockwise'
+    assert config.moe_combine_bwd_dtype == 'bf16'
+
+
+def test_fp8_blockwise_combine_wire_dtype_accepts_valid_ncclep_config():
+    config = _make_mxfp8_wire_config(
+        moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='fp8_blockwise'
+    )
+
+    assert config.moe_dispatch_fwd_dtype == 'bf16'
+    assert config.moe_combine_bwd_dtype == 'fp8_blockwise'
+
+
 def test_mxfp8_wire_dtypes_accept_a2a_overlap():
     # The 1F1B a2a overlap schedule only moves/stages the dispatch output as an opaque block,
     # which the plain-tensor MXFP8 carrier survives; the combination is deliberately allowed.

@@ -1232,14 +1232,14 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
-    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8', 'fp8_blockwise'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
     buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
     directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
     'bf16' (no quantization on the wire)."""
 
-    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8', 'fp8_blockwise'] = 'bf16'
     """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the gradient before the all-to-all and the
     expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
@@ -2491,9 +2491,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
-                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                    "Quantized moe_dispatch_fwd_dtype / moe_combine_bwd_dtype require BOTH "
+                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the grouped "
+                    "GEMM path consumes the pre-quantized GroupedTensor payload."
                 )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:

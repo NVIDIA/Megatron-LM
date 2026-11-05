@@ -837,13 +837,19 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8', or
+                'fp8_blockwise'.
         """
         if a2a_dtype == 'bf16':
             return None
         if a2a_dtype == 'mxfp8':
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
+            )
+        if a2a_dtype == 'fp8_blockwise':
+            return transformer_engine.common.recipe.Float8BlockScaling(
+                fp8_format=transformer_engine.common.recipe.Format.E4M3,
+                x_block_scaling_dim=1,
             )
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 

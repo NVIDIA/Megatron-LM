@@ -727,11 +727,9 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
-        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
-        # grouped view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
+        # Current TE returns a GroupedTensor directly and GroupedLinear detects it
+        # by type, so no carrier flag is needed. Keep the legacy MXFP8 flag only
+        # for older carrier layouts.
         if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
             op.ep_mxfp8_carrier_input = True
         ops.append(op)

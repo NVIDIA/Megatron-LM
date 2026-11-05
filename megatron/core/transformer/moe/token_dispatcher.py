@@ -1907,12 +1907,14 @@ class _NCCLEPManager(_DispatchManager):
                     "use_transformer_engine_op_fuser and moe_grouped_gemm (the fused grouped GEMM "
                     "over device-side per-expert counts); unset it to use eager mode instead."
                 )
-            if config.fp8 or config.fp4:
+            mxfp8_or_fp4_dispatch = config.moe_dispatch_fwd_dtype in ("mxfp8", "fp4")
+            if mxfp8_or_fp4_dispatch:
                 if torch.cuda.get_device_capability()[0] < 10:
                     raise ValueError(
-                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
-                        "requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped GEMM; unset "
-                        "it to use eager mode on older GPUs."
+                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and "
+                        "MXFP8/FP4 requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped "
+                        "GEMM. Use fp8_blockwise on Hopper or unset the capacity factor to use "
+                        "eager mode."
                     )
 
         self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
