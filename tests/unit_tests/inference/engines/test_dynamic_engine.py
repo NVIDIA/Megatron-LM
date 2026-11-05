@@ -7106,6 +7106,90 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.context.total_request_count == 0
 
     @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_abort_finishes_on_next_step(self):
+        """An aborted speculative decode request finishes on the next step.
+
+        The target model always samples token 0 and the MTP head always drafts token 1, so
+        every draft is rejected. After an abort, the next step keeps only the base token,
+        which must be enough to finish the request without generating more tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_sequence_length=64,
+            model_provider="gpt",
+            num_speculative_tokens=2,
+            async_sched_mode=AsyncScheduleMode.LEGACY,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        unwrapped_model = engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        def target_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                tokens.size(0),
+                tokens.size(1),
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            logits[:, :, 0] = 100.0
+            engine.context.mtp_decoder_hidden_states = torch.zeros(
+                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            if test_config.materialize_only_last_token_logits:
+                logits = engine.context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        def draft_step(hidden_states, *args, **kwargs):
+            logits = torch.zeros(
+                hidden_states.size(0),
+                1,
+                test_config.vocab_size,
+                device=hidden_states.device,
+                dtype=torch.bfloat16,
+            )
+            logits[:, :, 1] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = target_forward
+        unwrapped_model.compute_mtp_single_step = draft_step
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(
+                    1, 5, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=16, termination_id=-1),
+            )
+        )
+        # Prefill, then one decode step whose two drafts are rejected.
+        for _ in range(2):
+            assert not engine.step_modern()["finished_requests"]
+        assert engine.get_request(0).generated_tokens == [0, 0]
+
+        # Deliver the abort through the engine's message handler.
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.Mock()
+        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.ABORT_REQUEST.value, 0])],
+            dynamic_engine.zmq.Again,
+        ]
+        engine.model_parallel_publisher_socket = mock.Mock()
+        assert engine.schedule_requests() == 1
+
+        finished = engine.step_modern()["finished_requests"]
+        assert [request.request_id for request in finished] == [0]
+        assert finished[0].generated_tokens == [0, 0]
+        assert engine.context.total_request_count == 0
+
+    @pytest.mark.internal
     @torch.inference_mode()
     @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
