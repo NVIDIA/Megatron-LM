@@ -91,6 +91,7 @@ def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
         o_local_groups=1,
         linear_o_group_proj=torch.eye(4),
         linear_proj=lambda value: (value, None),
+        _post_o_group_proj=lambda attn_out, q_compressed: attn_out,
         get_query_key_value_tensors=lambda *args, **kwargs: (raw,) * 5,
         offload_core_attention=False,
         offload_attn_proj=False,
@@ -215,6 +216,11 @@ def test_dsv4_retains_dev_runtime_cp_layout_ownership(monkeypatch, dynamic):
         sequence_packing_scheduler="default_dynamic_cp" if dynamic else "dp_balanced",
         max_seqlen_per_dp_cp_rank=128,
         dsa_cp_balance_indexer=True,
+        # Required by TransformerConfig for the dynamic=True case: loss scaling cannot
+        # use the static TP x CP group once CP groups are picked per microbatch. This
+        # test only asserts CP-layout ownership, so the flag is incidental to it, and
+        # the dynamic=False case ignores it.
+        calculate_per_token_loss=True,
     )
     assert config.dsa_cp_balance_indexer
     assert config.dynamic_context_parallel == dynamic

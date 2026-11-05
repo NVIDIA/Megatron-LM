@@ -80,8 +80,14 @@ try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
+    try:
+        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
+    except ImportError:
+        _te_mark_grouped_tensor = None
+
     HAVE_TE = True
 except ImportError:
+    _te_mark_grouped_tensor = None
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
@@ -112,6 +118,30 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
+    """Mark dynamic grouped tensors through TE, ignoring absent optional operands."""
+    tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+    if not tensors_to_mark:
+        return
+    if _te_mark_grouped_tensor is None:
+        raise RuntimeError(
+            "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+        )
+    _te_mark_grouped_tensor(*tensors_to_mark)
+
+
+def is_grouped_tensor_marked(tensor: Any) -> bool:
+    """Return whether a tensor carries Transformer Engine's grouped-tensor marker."""
+    return hasattr(tensor, "grouped_tensor_scale_inv")
+
+
+def propagate_te_grouped_tensor_marker(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Preserve TE's grouped-tensor marker across view/cast operations."""
+    if is_grouped_tensor_marked(source):
+        mark_grouped_tensor(target)
+    return target
 
 
 def _set_expert_parameter_attributes(
@@ -623,7 +653,9 @@ def split_te_layernorm_column_parallel_linear(
     out_features = fused_layer.out_features * fused_layer.tp_size
 
     # Create the norm layer
-    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps)
+    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps).to(
+        device=fused_layer.weight.device
+    )
 
     with torch.no_grad():
         # Copy layer norm weight
@@ -646,7 +678,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
-    )
+    ).to(device=fused_layer.weight.device)
 
     with torch.no_grad():
         # Copy weight
@@ -1471,8 +1503,11 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
-                    # Mark as NOT tensor parallel since weight is duplicated
+                    # TE stamps partition_dim=0 when parallel_mode=None. Restore the canonical
+                    # tensor-parallel metadata for parameters replicated across TP ranks.
                     setattr(param, "tensor_model_parallel", False)
+                    setattr(param, "partition_dim", -1)
+                    setattr(param, "partition_stride", 1)
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -1622,6 +1657,8 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             setattr(param, "allreduce", True)
             setattr(param, "sequence_parallel", self.config.sequence_parallel)
             setattr(param, "tensor_model_parallel", False)
+            setattr(param, "partition_dim", -1)
+            setattr(param, "partition_stride", 1)
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override."""

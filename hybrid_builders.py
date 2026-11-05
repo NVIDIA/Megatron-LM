@@ -12,6 +12,10 @@ from model_provider import count_parameters_in_layer
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     """Build a HybridModel from a static spec or a config-aware spec factory."""
     print_rank_0('building Hybrid model ...')
+    if getattr(args, 'dynamic_context_parallel', False):
+        raise NotImplementedError(
+            "Dynamic context parallelism is not yet supported for HybridModel"
+        )
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
     # Normalize a supplied plain config before constructing an MLA model.

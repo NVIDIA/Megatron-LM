@@ -51,6 +51,8 @@ def make_coordinator_direct(
             or ``"rank-{}"``.  The integer rank index is substituted.
     """
     coordinator = object.__new__(DataParallelInferenceCoordinator)
+    coordinator.request_id_to_rank = {}
+    coordinator.request_id_to_sampling_params = {}
     coordinator.handoff_ownership = HandoffOwnership()
     coordinator.tokenizer = tokenizer
     coordinator.data_parallel_size = data_parallel_size

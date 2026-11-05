@@ -51,15 +51,10 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -218,7 +213,7 @@ def get_batch(data_iterator, vp_stage=None):
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.dynamic_context_parallel
+    dynamic_cp = args.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -249,7 +244,7 @@ def get_batch(data_iterator, vp_stage=None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=dynamic_cp,
         create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -271,9 +266,9 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = get_batch_on_this_cp_rank(
         batch,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=dynamic_cp,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+        dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),

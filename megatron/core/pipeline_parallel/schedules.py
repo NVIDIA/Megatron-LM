@@ -364,7 +364,9 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    if (hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None) or getattr(
+        config, '_hybrid_has_moe_layers', False
+    ):
         device = get_tensor_device(output_tensor)
         loss_scale = _get_moe_loss_scale(config, device)
         # Set the loss scale
@@ -392,10 +394,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            # TODO: This path assumes static CP across outstanding pipeline microbatches.
-            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
-            # changes, carry the scale per autograd context instead of via a
-            # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches

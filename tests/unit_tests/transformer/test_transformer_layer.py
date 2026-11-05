@@ -30,9 +30,11 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
     MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -152,6 +154,11 @@ class TestParallelTransformerLayer:
             dynamic_context_parallel=True,
             max_seqlen_per_dp_cp_rank=128,
             cp_comm_type=cp_comm_type,
+            # Required by TransformerConfig whenever dynamic_context_parallel is set:
+            # loss scaling cannot use the static TP x CP group once CP groups are picked
+            # per microbatch. This test only records cp_comm_type plumbing, so the flag
+            # is incidental to what it covers.
+            calculate_per_token_loss=True,
         )
 
         for layer_number in (1, 2):

@@ -386,7 +386,9 @@ def test_kda_gated_norm_preserves_upstream_rounding(dtype, norm_dtype, cuda_devi
     with torch.no_grad():
         actual_norm.weight.copy_(torch.linspace(0.8, 1.2, LING_VALUE_HEAD_DIM, device=cuda_device))
     reference_norm.load_state_dict(actual_norm.state_dict())
-    attention = SimpleNamespace(value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm)
+    attention = SimpleNamespace(
+        value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm, two_stage_gates=False
+    )
     gradients = _assert_output_and_vjp(
         lambda x, g: KimiDeltaAttention._apply_gated_norm(attention, x, g),
         lambda x, g: _upstream_kda_gated_norm(x, g, reference_norm, LING_VALUE_HEAD_DIM),
@@ -423,7 +425,9 @@ def test_kda_gated_norm_preserves_caller_cast_after_norm_downcast(norm_dtype, cu
     with torch.no_grad():
         actual_norm.weight.copy_(torch.linspace(0.8, 1.2, LING_VALUE_HEAD_DIM, device=cuda_device))
     reference_norm.load_state_dict(actual_norm.state_dict())
-    attention = SimpleNamespace(value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm)
+    attention = SimpleNamespace(
+        value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm, two_stage_gates=False
+    )
     gradients = _assert_output_and_vjp(
         lambda x, g: KimiDeltaAttention._apply_gated_norm(attention, x, g),
         lambda x, g: _upstream_kda_gated_norm(x, g, reference_norm, LING_VALUE_HEAD_DIM),

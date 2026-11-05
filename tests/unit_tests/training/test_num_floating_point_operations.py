@@ -42,7 +42,8 @@ def _make_args(**overrides):
     )
     for name, value in overrides.items():
         setattr(args, name, value)
-    return args
+    cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=args.padded_vocab_size))
+    return args, cfg
 
 
 def _expected_flops(tokens, squared_lengths, layer_counts, mtp_depth):
@@ -104,7 +105,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 ):
     pattern = [1, 1, 1, 0] * 10 if num_layers == 40 else [1, 1, 1]
     original_pattern = pattern.copy()
-    args = _make_args(
+    args, cfg = _make_args(
         num_layers=num_layers,
         mtp_num_layers=mtp_depth,
         linear_attention_freq=4 if pattern_form == "int" else pattern,
@@ -112,12 +113,16 @@ def test_mtp_repeats_final_decoder_attention_type(
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, expected_counts, mtp_depth or 0)
     # Keep T fixed and change only Q to isolate the number of full-attention layers.
     merged = num_floating_point_operations(
-        args, batch_size=3, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=tokens**2
+        args,
+        cfg,
+        batch_size=3,
+        total_real_tokens_in_batch=tokens,
+        seqlen_squared_sum_in_batch=tokens**2,
     )
     assert merged - actual == 48 * expected_counts[1] * (tokens**2 - squared_lengths)
     # A list describes decoder layers only; counting MTP must not append to it.
@@ -127,7 +132,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 @pytest.mark.parametrize("layout", ["bshd", "thd"])
 @pytest.mark.parametrize("mtp_depth", [None, 0, 1, 2])
 def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
-    args = _make_args(
+    args, cfg = _make_args(
         experimental_attention_variant=None,
         linear_attention_freq=None,
         num_layers=3,
@@ -137,6 +142,6 @@ def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
     stats, tokens, squared_lengths = _batch_stats(layout)
     depth = mtp_depth or 0
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)

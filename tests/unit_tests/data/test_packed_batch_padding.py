@@ -1,0 +1,232 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from megatron.core.context_parallel.layout import _build_thd_zigzag_metadata
+from megatron.core.datasets.data_schedule_utils import (
+    _unpack_batch,
+    pad_packed_batch_before_cp_slice,
+    reroute_samples_to_dcp_ranks,
+)
+from megatron.core.model_parallel_config import ModelParallelConfig
+
+
+def _batch():
+    # Two sequences: three valid tokens plus one gap, then five valid tokens.
+    return {
+        'tokens': torch.tensor([11, 12, 13, 0, 21, 22, 23, 24, 25]),
+        'labels': torch.tensor([12, 13, 14, 0, 22, 23, 24, 25, 26]),
+        'position_ids': torch.tensor([0, 1, 2, 0, 0, 1, 2, 3, 4]),
+        'loss_mask': torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        'padding_mask': torch.tensor(
+            [False, False, False, True, False, False, False, False, False]
+        ),
+        'cu_seqlens': torch.tensor([0, 3, 8], dtype=torch.int32),
+        'cu_seqlens_padded': torch.tensor([0, 4, 9], dtype=torch.int32),
+        'max_seqlen': torch.tensor(5, dtype=torch.int32),
+    }
+
+
+@pytest.mark.parametrize('cp_size', [1, 2, 4])
+@pytest.mark.parametrize('tp_size,sequence_parallel', [(1, False), (4, False), (2, True)])
+@pytest.mark.parametrize('requested', [None, 48, 'max'])
+def test_mxfp8_padding_preserves_tokens_and_aligns_both_cp_layouts(
+    cp_size, tp_size, sequence_parallel, requested
+):
+    batch = _batch()
+    config = SimpleNamespace(
+        fp8='hybrid',
+        fp8_recipe='mxfp8',
+        sequence_parallel=sequence_parallel,
+        pad_packed_seq_alignment=requested,
+        max_seqlen_per_dp_cp_rank=192,
+    )
+    original_tokens = batch['tokens'][~batch['padding_mask']].clone()
+    pad_packed_batch_before_cp_slice(batch, config, cp_size, tp_size)
+    sp_size = tp_size if sequence_parallel else 1
+    local_length = batch['tokens'].numel() // cp_size
+    assert local_length % (32 * sp_size) == 0
+    if requested == 'max':
+        assert local_length == 192
+    elif requested:
+        assert local_length % requested == 0
+    torch.testing.assert_close(batch['tokens'][~batch['padding_mask']], original_tokens)
+    assert batch['loss_mask'].sum() == 8
+    assert torch.all(batch['loss_mask'][batch['padding_mask']] == 0)
+    assert torch.equal(batch['cu_seqlens'][:3], torch.tensor([0, 3, 8], dtype=torch.int32))
+    assert batch['cu_seqlens_padded'][-1] == batch['tokens'].numel()
+    assert batch['max_seqlen'] == batch['cu_seqlens_padded'].diff().max()
+    if cp_size > 1:
+        zigzag = _build_thd_zigzag_metadata(
+            batch['cu_seqlens'], batch['cu_seqlens_padded'], cp_size, sp_size
+        )
+        assert zigzag.rank_order_indices.numel() == batch['tokens'].numel()
+        torch.testing.assert_close(zigzag.cu_seqlens_padded, batch['cu_seqlens_padded'])
+
+
+def test_padding_works_on_metadata_only_pipeline_stage():
+    batch = _batch()
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        del batch[key]
+    config = SimpleNamespace(pad_packed_seq_alignment=32, max_seqlen_per_dp_cp_rank=128)
+    pad_packed_batch_before_cp_slice(batch, config, 2, 1)
+    assert batch['padding_mask'].numel() == 64
+    assert (~batch['padding_mask']).sum() == 8
+    assert batch['cu_seqlens_padded'][-1] == 64
+
+
+def test_padding_rejects_capacity_overflow_without_truncation():
+    batch = _batch()
+    original = batch['tokens'].clone()
+    config = SimpleNamespace(pad_packed_seq_alignment=32, max_seqlen_per_dp_cp_rank=16)
+    with pytest.raises(ValueError, match='exceeds'):
+        pad_packed_batch_before_cp_slice(batch, config, 1, 1)
+    torch.testing.assert_close(batch['tokens'], original)
+
+
+def test_padding_disabled_preserves_batch():
+    batch = _batch()
+    original = dict(batch)
+    pad_packed_batch_before_cp_slice(batch, SimpleNamespace(), 2, 1)
+    assert all(batch[key] is value for key, value in original.items())
+
+
+@pytest.mark.parametrize('alignment', [0, -1, 'invalid'])
+def test_packed_padding_config_rejects_invalid_alignment(alignment):
+    with pytest.raises(ValueError, match='positive integer'):
+        ModelParallelConfig(pad_packed_seq_alignment=alignment, max_seqlen_per_dp_cp_rank=128)
+
+
+def test_unpack_keeps_prompt_only_sub_samples():
+    # Dropping them could leave too few sub-samples to fill every DP rank. With no
+    # supervised tokens they contribute nothing to the loss.
+    batch = _batch()
+    batch.pop('padding_mask')
+    batch.pop('cu_seqlens_padded')
+    batch['cu_seqlens'] = torch.tensor([0, 4, 9, 9], dtype=torch.int32)
+    batch['loss_mask'][4:] = 0
+    unpacked = _unpack_batch([batch])
+    assert len(unpacked) == 2
+    torch.testing.assert_close(unpacked[0]['tokens'], torch.tensor([11, 12, 13, 0]))
+    torch.testing.assert_close(unpacked[1]['tokens'], torch.tensor([21, 22, 23, 24, 25]))
+    assert not unpacked[1]['loss_mask'].any()
+
+
+def test_empty_source_rank_receives_rerouted_samples(monkeypatch):
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    remote_fields = iter(
+        [
+            torch.tensor([11, 12]),
+            torch.tensor([12, 13]),
+            torch.ones(2),
+            torch.tensor([0, 1]),
+            torch.tensor([2]),
+            torch.tensor([2]),
+        ]
+    )
+
+    def gather(output, local, group):
+        assert torch.count_nonzero(local) == 0
+        remote = next(remote_fields)
+        assert local.dtype == remote.dtype
+        output.copy_(torch.cat((local, remote)))
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', gather)
+    received = reroute_samples_to_dcp_ranks(
+        [],
+        torch.empty(0, dtype=torch.int32),
+        [(0, 2)],
+        [[[0], [0]]],
+        torch.tensor([0, 0, 1]),
+        group,
+        group,
+    )
+    torch.testing.assert_close(received[0]['tokens'], torch.tensor([11, 12]))
+
+
+def _compact_batch(lengths):
+    lengths = torch.tensor(lengths, dtype=torch.int32)
+    boundaries = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
+    tokens = torch.arange(1, int(boundaries[-1]) + 1)
+    return {
+        'tokens': tokens.clone(),
+        'labels': tokens + 100,
+        'position_ids': torch.zeros_like(tokens),
+        'loss_mask': torch.ones_like(tokens, dtype=torch.float32),
+        'padding_mask': torch.zeros_like(tokens, dtype=torch.bool),
+        'cu_seqlens': boundaries.clone(),
+        'cu_seqlens_padded': boundaries.clone(),
+        'max_seqlen': lengths.max(),
+    }
+
+
+@pytest.mark.parametrize(
+    'tail_padding_policy,max_num_seqs,expected_cu,expected_cu_padded,expected_max',
+    [
+        ('append_dummy_seq', None, [0, 3, 8, 12], [0, 4, 12, 16], 8),
+        ('extend_last', None, [0, 3, 8], [0, 4, 16], 12),
+        ('append_dummy_seq', 5, [0, 3, 8, 12, 12, 12], [0, 4, 12, 16, 16, 16], 16),
+        ('extend_last', 5, [0, 3, 8, 8, 8, 8], [0, 4, 16, 16, 16, 16], 16),
+    ],
+)
+def test_padding_honors_tail_policy_and_static_thd_capacity(
+    tail_padding_policy, max_num_seqs, expected_cu, expected_cu_padded, expected_max
+):
+    batch = _compact_batch([3, 5])
+    config = SimpleNamespace(
+        pad_packed_seq_alignment=4,
+        max_seqlen_per_dp_cp_rank=16,
+        thd_tail_padding_policy=tail_padding_policy,
+        thd_max_packed_sequences=max_num_seqs,
+    )
+    pad_packed_batch_before_cp_slice(batch, config, 2, 1)
+    expected_tokens = torch.tensor([1, 2, 3, 0, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0])
+    torch.testing.assert_close(batch['tokens'], expected_tokens)
+    torch.testing.assert_close(batch['padding_mask'], expected_tokens == 0)
+    torch.testing.assert_close(batch['cu_seqlens'], torch.tensor(expected_cu, dtype=torch.int32))
+    torch.testing.assert_close(
+        batch['cu_seqlens_padded'], torch.tensor(expected_cu_padded, dtype=torch.int32)
+    )
+    assert int(batch['max_seqlen']) == expected_max
+    # Zero-length capacity entries must still give a complete zigzag CP layout.
+    zigzag = _build_thd_zigzag_metadata(batch['cu_seqlens'], batch['cu_seqlens_padded'], 2, 1)
+    assert zigzag.rank_order_indices.numel() == batch['tokens'].numel()
+
+
+@pytest.mark.parametrize('tail_padding_policy', ['append_dummy_seq', 'extend_last'])
+def test_cuda_graph_packs_share_static_thd_metadata(tail_padding_policy):
+    # Packs with different sequence counts and lengths must present identical graph inputs.
+    config = SimpleNamespace(
+        pad_packed_seq_alignment=4,
+        max_seqlen_per_dp_cp_rank=16,
+        thd_tail_padding_policy=tail_padding_policy,
+        thd_max_packed_sequences=9,
+        cuda_graph_impl='transformer_engine',
+    )
+    signatures = set()
+    for lengths in ([3, 5], [2, 6, 4]):
+        batch = _compact_batch(lengths)
+        pad_packed_batch_before_cp_slice(batch, config, 2, 1)
+        assert batch['tokens'].numel() == 32
+        assert int(batch['cu_seqlens_padded'][-1]) == 32
+        signatures.add(
+            (
+                tuple(batch['cu_seqlens'].shape),
+                tuple(batch['cu_seqlens_padded'].shape),
+                int(batch['max_seqlen']),
+            )
+        )
+    assert signatures == {((10,), (10,), 32)}
+
+
+def test_static_thd_capacity_rejects_extra_sequences():
+    batch = _compact_batch([2, 2, 2])
+    config = SimpleNamespace(
+        pad_packed_seq_alignment=4, max_seqlen_per_dp_cp_rank=16, thd_max_packed_sequences=2
+    )
+    with pytest.raises(AssertionError, match='thd_max_packed_sequences'):
+        pad_packed_batch_before_cp_slice(batch, config, 1, 1)
