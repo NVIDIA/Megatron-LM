@@ -1,14 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
 from megatron.core.transformer.hyper_connection import build_mhc_recompute_layer_plan
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -404,9 +411,9 @@ class TestCheckpointManagerPartialCheckpoint:
 #
 # These tests instantiate a full ``TransformerBlock`` with mHC enabled to
 # exercise:
-#   * ``build_mhc_recompute_layer_plan`` (per-layer ``CheckpointWithoutOutputManager``
-#     allocation, including the ``mhc_recompute_layer_num`` boundary case),
-#   * ``finalize_mhc_recompute_layer`` (manager finalization at block end),
+#   * shared residual context planning and block-end manager finalization,
+#     including the ``mhc_recompute_layer_num`` boundary case,
+#   * legacy ``build_mhc_recompute_layer_plan`` compatibility for Hybrid callers,
 #   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
 #     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
 #     stages.
@@ -549,3 +556,119 @@ class TestTransformerBlockMHCRecompute:
         out.sum().backward()
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
+
+
+class _RecordingMHCLayer(torch.nn.Module):
+    """Inert layer arithmetic isolates the real block's context and finalization protocol."""
+
+    supports_mhc_connections = True
+
+    def __init__(self, config, layer_number, events, **kwargs) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_number = layer_number
+        self.events = events
+        self.calls = []
+        self.outputs = []
+
+    def forward(self, hidden_states, context, **kwargs):
+        assert "mhc_recompute_manager" not in kwargs
+        self.calls.append(kwargs)
+        self.events.append("layer")
+        output = hidden_states + self.layer_number
+        self.outputs.append(output)
+        return output, context
+
+
+def _make_recording_mhc_block(events, *, enabled=True):
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
+        mhc_recompute_layer_num=2,
+        recompute_granularity="selective",
+        recompute_modules=["mhc"] if enabled else ["core_attn"],
+    )
+    groups = ProcessGroupCollection()
+    groups.tp = groups.pp = None
+    spec = TransformerBlockSubmodules(
+        layer_specs=[ModuleSpec(module=_RecordingMHCLayer, params={"events": events})] * 3
+    )
+    # Offloading is disabled; avoid constructing an external TE offload context.
+    with patch("megatron.core.transformer.transformer_block.get_cpu_offload_context", None):
+        return TransformerBlock(config, spec, post_process=False, pg_collection=groups)
+
+
+def test_block_forward_transports_fresh_contexts_and_finalizes_each_boundary_once(monkeypatch):
+    events, finalized = [], []
+    block = _make_recording_mhc_block(events)
+
+    def finalize(manager, hidden_states):
+        events.append("finalize")
+        finalized.append((manager, hidden_states))
+
+    monkeypatch.setattr(
+        CheckpointWithoutOutputManager,
+        "discard_all_outputs_and_register_unified_recompute",
+        finalize,
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_block.observe_layer_residuals",
+        lambda *args: events.append("observe"),
+    )
+    inputs = torch.randn(2, 1, block.config.hidden_size, requires_grad=True)
+    plans = []
+    for pass_index in range(2):
+        events.clear()
+        output = block(hidden_states=inputs, attention_mask=None)
+        contexts = [layer.calls[-1]["residual_stream_recompute_context"] for layer in block.layers]
+        assert all(isinstance(context, ResidualStreamRecomputeContext) for context in contexts)
+        assert [context.is_block_end for context in contexts] == [False, True, True]
+        assert contexts[0].manager is contexts[1].manager
+        assert contexts[2].manager is not contexts[1].manager
+        # The dedicated caller must not mutate the flag still used by legacy Hybrid callers.
+        assert all(not context.manager.is_last_layer_in_recompute_block for context in contexts)
+        assert events == [
+            "layer",
+            "observe",
+            "layer",
+            "observe",
+            "finalize",
+            "layer",
+            "observe",
+            "finalize",
+        ]
+        assert len(finalized) == 2 * (pass_index + 1)
+        for (manager, boundary), layer_index in zip(finalized[-2:], (1, 2)):
+            assert manager is contexts[layer_index].manager
+            assert boundary is block.layers[layer_index].outputs[-1]
+        assert output is block.layers[-1].outputs[-1]
+        plans.append(contexts)
+    assert all(new.manager is not old.manager for new in plans[1] for old in plans[0])
+    # Later layers and the next forward cannot change an earlier layer's boundary view.
+    assert [context.is_block_end for context in plans[0]] == [False, True, True]
+
+
+def test_block_forward_omits_inactive_contexts_and_preserves_extraction_guard():
+    events = []
+    block = _make_recording_mhc_block(events)
+    inputs = torch.randn(2, 1, block.config.hidden_size, requires_grad=True)
+    with pytest.raises(NotImplementedError, match="extract_layer_indices"):
+        block(hidden_states=inputs, attention_mask=None, extract_layer_indices={0})
+    assert not events
+
+    block.eval()
+    output, extracted = block(hidden_states=inputs, attention_mask=None, extract_layer_indices={0})
+    assert extracted[0] is block.layers[0].outputs[-1]
+    assert output is block.layers[-1].outputs[-1]
+    assert all("residual_stream_recompute_context" not in layer.calls[-1] for layer in block.layers)
+
+    disabled = _make_recording_mhc_block([], enabled=False)
+    disabled(hidden_states=inputs, attention_mask=None)
+    assert disabled.training and not disabled.mhc_recompute_enabled
+    assert all(
+        "residual_stream_recompute_context" not in layer.calls[-1] for layer in disabled.layers
+    )
