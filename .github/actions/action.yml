@@ -82,10 +82,6 @@ inputs:
     description: "Artifact containing the CPU-selected plan.json for this bucket."
     required: false
     default: ""
-  unit_testmon_checkout_artifact_id:
-    description: "Optional PR checkout prepared on a shared Testmon baseline."
-    required: false
-    default: ""
 runs:
   using: "composite"
   steps:
@@ -109,14 +105,6 @@ runs:
         sudo chown -R $(whoami) /home/runner/ 2>/dev/null && exit 0
         sleep 5
         sudo chown -R $(whoami) /home/runner/ 2>/dev/null || true
-
-    - name: Restore prepared unit-test checkout
-      id: testmon-checkout
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_checkout_artifact_id != ''
-      uses: ./.github/actions/testmon-checkout
-      with:
-        artifact-id: ${{ inputs.unit_testmon_checkout_artifact_id }}
-        original-sha: ${{ inputs.sha }}
 
     - name: Setup python
       uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -214,8 +202,8 @@ runs:
       continue-on-error: true
       with:
         path: assets_dir/testmon
-        key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ steps.testmon-checkout.outputs.generation || format('lookup-{0}-{1}', github.run_id, github.run_attempt) }}
-        restore-keys: ${{ steps.testmon-checkout.outputs.generation == '' && steps.unit-testmon-identity.outputs.cache_prefix || '' }}
+        key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
     - name: Prepare PR file download
       id: unit-test-pr-files-directory
@@ -250,9 +238,7 @@ runs:
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
         PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
         PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
-        TESTED_SHA: ${{ steps.testmon-checkout.outputs.sha || inputs.sha || github.sha }}
-        TESTMON_BASE_SHA: ${{ steps.testmon-checkout.outputs.baseline_sha }}
-        TESTMON_GENERATION: ${{ steps.testmon-checkout.outputs.generation }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
         PLAN_OUTCOME: ${{ steps.validate-unit-testmon-plan.outcome }}
       run: |
         FALLBACK_REASON=""
@@ -270,8 +256,6 @@ runs:
             ;;
           enforce)
             if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
-              && { [[ -z "${TESTMON_BASE_SHA:-}" ]] || jq -e --arg sha "$TESTMON_BASE_SHA" --arg generation "$TESTMON_GENERATION" \
-                '.source_sha == $sha and .generation == $generation' assets_dir/testmon/manifest.json; } \
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
