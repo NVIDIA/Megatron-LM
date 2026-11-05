@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from typing import List, Literal, Optional, Tuple
 
 import torch
@@ -19,6 +18,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
+    warn_process_group_deprecation,
 )
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -168,16 +168,16 @@ class T5Model(LanguageModule):
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        for _pg in ('tp', 'cp', 'pp'):
-            if _pg not in vars(pg_collection):
-                raise ValueError(f"T5Model pg_collection must have {_pg}")
+        else:
+            for _pg in ('tp', 'cp', 'pp'):
+                # A group that is present but None is as unusable as a missing one.
+                if vars(pg_collection).get(_pg) is None:
+                    raise ValueError(f"T5Model pg_collection must have {_pg}")
         if 'embd' not in vars(pg_collection):
-            warnings.warn(
+            warn_process_group_deprecation(
                 "T5Model was given a pg_collection without an embd field and treats it as "
                 "embd=None. Set embd explicitly, to None when it is unused; a missing embd "
-                "becomes an error in Megatron Core 0.23.",
-                FutureWarning,
-                stacklevel=2,
+                "becomes an error in Megatron Core 0.23."
             )
         if (
             share_embeddings_and_output_weights

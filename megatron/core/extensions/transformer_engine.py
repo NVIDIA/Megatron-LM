@@ -2351,12 +2351,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
+            # ProcessGroupCollection returns None for a group that was never set, so a hasattr
+            # check cannot detect a missing one. cp is only read when context parallelism is on.
+            groups = vars(pg_collection)
+            if groups.get("tp") is None:
+                raise ValueError("TEDotProductAttention pg_collection must have a tp process group")
+            if groups.get("cp") is None and self.config.context_parallel_size > 1:
+                raise ValueError(
+                    "TEDotProductAttention pg_collection must have a cp process group when "
+                    "context_parallel_size > 1"
+                )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):

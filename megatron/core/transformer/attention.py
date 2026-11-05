@@ -336,9 +336,22 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=['tp', 'cp', 'hcp'] + (['dp'] if self.config.test_mode else [])
             )
-        for group_name in ('tp', 'cp'):
-            if group_name not in vars(pg_collection):
-                raise ValueError(f"Attention pg_collection must have {group_name} process group")
+        else:
+            groups = vars(pg_collection)
+            for group_name in ('tp', 'cp'):
+                if group_name not in groups:
+                    raise ValueError(
+                        f"Attention pg_collection must have {group_name} process group"
+                    )
+            # A group that is present but None is unusable too. cp may be None only while context
+            # parallelism is off for this module.
+            if groups['tp'] is None:
+                raise ValueError("Attention pg_collection must have a non-None tp process group")
+            if groups['cp'] is None and self.config.context_parallel_size > 1:
+                raise ValueError(
+                    "Attention pg_collection must have a non-None cp process group when "
+                    "context_parallel_size > 1"
+                )
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -1864,6 +1877,18 @@ class SelfAttention(Attention):
             name=name,
         )
 
+        # run_realtime_tests, which test_mode runs on every forward when qk_layernorm is on, is the
+        # only reader of the DP group. Check for it here rather than on the first forward.
+        if (
+            self.config.test_mode
+            and self.config.qk_layernorm
+            and vars(self.pg_collection).get('dp') is None
+        ):
+            raise ValueError(
+                "SelfAttention with test_mode and qk_layernorm requires a dp process group; "
+                "pass one via pg_collection.dp"
+            )
+
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
@@ -1945,14 +1970,9 @@ class SelfAttention(Attention):
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        # Only this consistency check needs the DP group, so it is required here rather than in
-        # __init__, which requires tp/cp only.
-        if vars(self.pg_collection).get('dp') is None:
-            raise ValueError(
-                "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
-            )
+        # __init__ has already checked that the DP group is there.
         dp_group = self.pg_collection.dp
-        rank = dp_group.rank()
+        rank = get_pg_rank(dp_group)
         inputs = torch.stack(
             [
                 self.q_layernorm.weight.data,
@@ -1961,7 +1981,7 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(dp_group.size())]
+        dp_list = [torch.empty_like(inputs) for _ in range(get_pg_size(dp_group))]
         dp_list[rank] = inputs
         torch.distributed.all_gather(dp_list, inputs, group=dp_group)
 
@@ -1987,8 +2007,8 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = self.tp_group.rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(self.tp_group.size())]
+        rank = get_pg_rank(self.tp_group)
+        tp_list = [torch.empty_like(inputs) for _ in range(get_pg_size(self.tp_group))]
         tp_list[rank] = inputs
         torch.distributed.all_gather(tp_list, inputs, group=self.tp_group)
 
@@ -2127,7 +2147,7 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
-                idx = self.tp_group.rank() % (self.world_size // self.config.num_query_groups)
+                idx = get_pg_rank(self.tp_group) % (self.world_size // self.config.num_query_groups)
                 size = self.num_attention_heads_per_partition // (
                     self.world_size // self.config.num_query_groups
                 )

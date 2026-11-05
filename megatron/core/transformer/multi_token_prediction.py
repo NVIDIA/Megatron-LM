@@ -2429,7 +2429,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 raise ValueError(
                     f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
                 )
-        if self.config.mtp_hsm and 'dp' not in vars(pg_collection):
+        if self.config.mtp_hsm and vars(pg_collection).get('dp') is None:
             raise ValueError("MultiTokenPredictionBlock with HSM requires a dp process group")
 
         self._build_layers(pg_collection)

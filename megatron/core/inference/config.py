@@ -853,15 +853,19 @@ class InferenceConfig:
     def resolve_pg_collection(self) -> ProcessGroupCollection:
         """Return the configured process groups, falling back to the MPU globals.
 
-        This is the compatibility boundary for inference: engines and wrappers call it once and
-        can then assume a collection, instead of each re-deriving one from global state. Resolution
-        is lazy so it happens after ``initialize_model_parallel``, not at config construction.
+        This is the compatibility boundary for inference: engines and wrappers call it and can then
+        assume a collection, instead of each re-deriving one from global state. Resolution is lazy
+        so it happens after ``initialize_model_parallel``, not at config construction.
 
-        See ``docs/developer/parallel-state-deprecation.md``.
+        The fallback is returned without being stored on the config. ``pg_collection`` stays
+        ``None`` unless the caller set it, because the inference context and controller read that
+        field and treat ``None`` as "no explicit collection". Storing the global groups would
+        change which branch they take depending on which component resolved first, and would pin
+        the groups of one parallel-state initialization onto a long-lived config.
         """
-        if self.pg_collection is None:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        return self.pg_collection
+        if self.pg_collection is not None:
+            return self.pg_collection
+        return ProcessGroupCollection.use_mpu_process_groups()
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose

@@ -95,6 +95,41 @@ class TestParallelAttention:
                 pg_collection=pg_collection,
             )
 
+    def test_constructor_rejects_none_process_groups(self):
+        """A group that is present but None is as unusable as an omitted one."""
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.tp = None
+        with pytest.raises(ValueError, match='non-None tp process group'):
+            SelfAttention(
+                self.transformer_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+        # cp may be None only while context parallelism is off for the module.
+        context_parallel_config = copy.copy(self.transformer_config)
+        context_parallel_config.context_parallel_size = 2
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.cp = None
+        with pytest.raises(ValueError, match='non-None cp process group'):
+            SelfAttention(
+                context_parallel_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+    def test_constructor_requires_dp_group_for_test_mode_qk_layernorm(self):
+        """The realtime consistency check reads the DP group; fail at build, not on first forward."""
+        test_mode_config = copy.copy(self.transformer_config)
+        test_mode_config.test_mode = True
+        test_mode_config.qk_layernorm = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        with pytest.raises(ValueError, match='requires a dp process group'):
+            SelfAttention(
+                test_mode_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
+
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass

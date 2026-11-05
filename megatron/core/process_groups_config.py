@@ -29,17 +29,32 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
 _warned_global_process_group_fallbacks: Set[str] = set()
 
 
+def warn_process_group_deprecation(message: str) -> None:
+    """Emit a ``FutureWarning`` about a deprecated process-group usage, attributed to the caller.
+
+    Skips Megatron Core and torch frames, so the warning points at the first frame outside them,
+    i.e. the code that has to change, however deep the call chain through ``build_module``,
+    ``nn.Module`` and autograd frames is. It is not deduplicated here: Python's warning filters
+    already show it once per location. Use ``warn_global_process_group_fallback`` for a
+    once-per-owner warning.
+
+    The warning is a ``FutureWarning`` because Python hides ``DeprecationWarning`` unless it is
+    attributed to ``__main__``, and the callers to reach are libraries and training scripts built
+    on Megatron Core.
+
+    Args:
+        message: Text of the warning.
+    """
+    warnings.warn(message, FutureWarning, skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES)
+
+
 def warn_global_process_group_fallback(owner: str, argument: str = "pg_collection") -> None:
     """Warn, once per ``owner``, that a missing process-group argument uses the global grid.
 
     Callers that omit ``argument`` keep the previous behavior during the deprecation period: the
     caller resolves the groups from ``megatron.core.parallel_state``. That global grid belongs to
     a single model, so the fallback is deprecated and ``argument`` becomes required once the
-    fallback is removed. See docs/developer/parallel-state-deprecation.md.
-
-    The warning is a ``FutureWarning`` because Python hides ``DeprecationWarning`` unless it is
-    attributed to ``__main__``, and the callers to reach are libraries and training scripts built
-    on Megatron Core.
+    fallback is removed (see the N+2 policy in docs/api-backwards-compatibility-check.md).
 
     Args:
         owner: Name of the class or function whose caller omitted ``argument``.
@@ -48,13 +63,11 @@ def warn_global_process_group_fallback(owner: str, argument: str = "pg_collectio
     if owner in _warned_global_process_group_fallbacks:
         return
     _warned_global_process_group_fallbacks.add(owner)
-    warnings.warn(
+    warn_process_group_deprecation(
         f"{owner} was called without `{argument}` and falls back to the global process groups "
         "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
         f"{_FALLBACK_DEPRECATED_IN} and will be removed in {_FALLBACK_REMOVED_IN}; pass the "
-        "owning model's process groups explicitly.",
-        FutureWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        "owning model's process groups explicitly."
     )
 
 

@@ -1171,6 +1171,47 @@ def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
     assert build_config.call_args.args[0] is args
 
 
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+@pytest.mark.parametrize("explicit_pg_collection", [True, False])
+def test_unpacked_get_batch_places_mtp_by_the_callers_pipeline_group(
+    script, explicit_pg_collection, monkeypatch
+):
+    """Without sequence packing, MTP placement uses the caller's pipeline group, else the global."""
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        context_parallel_size=1,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        dynamic_context_parallel=False,
+    )
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=1,
+    )
+    global_pp_group = object()
+    global_grid = SimpleNamespace(
+        get_tensor_model_parallel_rank=lambda: 0,
+        get_pipeline_model_parallel_group=lambda: global_pp_group,
+    )
+    mtp_on_this_rank = MagicMock(return_value=False)
+    monkeypatch.setattr(script, "_transformer_config_cache", None)
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "core_transformer_config_from_args", lambda _: config)
+    monkeypatch.setattr(script, "mpu", global_grid)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", mtp_on_this_rank)
+    # An intermediate stage without MTP or cu_seqlens returns before reading any data.
+    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage: False)
+
+    caller_pp_group = object()
+    pg_collection = ProcessGroupCollection(pp=caller_pp_group) if explicit_pg_collection else None
+    assert script.get_batch(None, pg_collection=pg_collection) == [None] * len(script.BATCH_KEYS)
+
+    expected = caller_pp_group if explicit_pg_collection else global_pp_group
+    assert mtp_on_this_rank.call_args.kwargs["pp_group"] is expected
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])

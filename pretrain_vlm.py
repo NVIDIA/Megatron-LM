@@ -77,8 +77,8 @@ def model_provider(
     vision_model_type = "clip"
 
     if pg_collection is None:
-        # LLaVAModel requires an explicit process-group collection; this script trains on the
-        # global parallel grid, so resolve that fallback here rather than inside megatron/core.
+        # Omitting the collection from LLaVAModel is deprecated; this script trains on the global
+        # parallel grid, so resolve it here rather than inside megatron/core.
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
