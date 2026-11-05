@@ -70,6 +70,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -1914,6 +1915,7 @@ class TestPartialCudaGraph:
         **config_kwargs,
     ):
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -1930,7 +1932,7 @@ class TestPartialCudaGraph:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -1953,7 +1955,6 @@ class TestPartialCudaGraph:
         args = parse_args()
         args.num_layers = 4
         args.mtp_num_layers = 1
-        args.vocab_size = 1024
         args.hidden_size = 512
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -2005,7 +2006,9 @@ class TestPartialCudaGraph:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.vocab_size = 1024
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size, cp_size):

@@ -163,6 +163,10 @@ def _make_saver(
         queue=None,
     )
     saver.md = SimpleNamespace(iteration=1, params_dtype=torch.float32)
+    # initialize_megatron_env sets these; saving copies the run's padded vocabulary size into
+    # the arguments.
+    saver.margs = SimpleNamespace()
+    saver.cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=128))
     saver.pg_collection = pg_collection
     saver.model_provider = model_provider
     saver.models = saver.initialize_models()
