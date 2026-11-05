@@ -168,6 +168,8 @@ def test_setup_builds_the_model_and_optimizer_on_one_collection(
     monkeypatch.setattr(training, "get_optimizer_param_scheduler", Mock())
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
     monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+    # Neither collection has a data-parallel group, so the setup memory report would fall back.
+    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
 
     with warnings.catch_warnings(record=True) as record:
