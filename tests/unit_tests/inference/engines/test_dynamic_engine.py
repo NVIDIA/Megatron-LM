@@ -7106,6 +7106,68 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.context.total_request_count == 0
 
     @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decode_padding_fits_max_tokens(self):
+        """An eager speculative decode step pads no more tokens than `max_tokens`.
+
+        With one speculative token and a 12-token step budget, six requests decode with
+        2 tokens each. Rounding six requests up to eight would pad 16 tokens, more than
+        the token buffers hold. Every request must finish, and a decode-only step with
+        six requests must pad at most 12 tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_sequence_length=64,
+            context_max_requests=8,
+            context_max_tokens=12,
+            num_speculative_tokens=1,
+            model_provider="gpt",
+            position_embedding_type="rope",
+            use_flashinfer_fused_rope=False,
+            sampling_backend="torch",
+            top_k=1,
+        )
+        env = self._build_test_env(test_config)
+        engine, context = env.engine, env.engine.context
+
+        # Record each eager decode-only step's decode count and padded token count.
+        initialize = context.initialize_attention_state
+        padded = []
+
+        def record_padding(*args, **kwargs):
+            result = initialize(*args, **kwargs)
+            if context.is_decode_only():
+                padded.append((context.num_decode_requests, context.padded_active_token_count))
+            return result
+
+        context.initialize_attention_state = record_padding
+
+        for request_id in range(6):
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        1, 3, dtype=torch.int64, device=torch.cuda.current_device()
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=6, termination_id=-1),
+                )
+            )
+        finished = {}
+        for _ in range(40):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+
+        assert (6, 12) in padded, padded
+        assert all(token_count <= 12 for _, token_count in padded), padded
+        assert sorted(finished) == list(range(6))
+        assert all(len(request.generated_tokens) == 6 for request in finished.values())
+
+    @pytest.mark.internal
     @torch.inference_mode()
     @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])

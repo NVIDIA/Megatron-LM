@@ -2745,8 +2745,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         else:
             if self.is_decode_only():
                 if self.num_speculative_tokens > 0:
+                    # Each decode request carries its speculative tokens, so the padded
+                    # request count must also fit the token buffers.
                     padded_decode_req_count = min(
-                        self.max_requests, self.round_up_requests(self.num_decode_requests)
+                        self.max_requests,
+                        self.max_tokens // (self.num_speculative_tokens + 1),
+                        self.round_up_requests(self.num_decode_requests),
                     )
                     padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
                 else:
