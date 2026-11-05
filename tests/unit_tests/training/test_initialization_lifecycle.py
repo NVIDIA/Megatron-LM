@@ -1724,18 +1724,34 @@ def test_wrapper_validation_checks_edits_without_mutation(run_config):
     assert run_config.to_dict() == before
 
 
-def test_wrapper_validation_uses_optimizer_buffer_policy(monkeypatch, run_config):
+@pytest.mark.parametrize(
+    "reuse, fp8_param_gather, offload",
+    [(False, False, True), (True, True, False), (True, True, True), (True, False, False)],
+)
+def test_wrapper_validation_uses_optimizer_buffer_policy(
+    monkeypatch, run_config, reuse, fp8_param_gather, offload
+):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     run_config.train.micro_batch_size = 1
-    run_config.ddp.grad_buffer_offload = True
-    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True  # Stale derived field.
-    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+    run_config.ddp.grad_buffer_offload = offload
+    run_config.ddp.fp8_param_gather = fp8_param_gather
+    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = not reuse  # Stale derived field.
+    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = reuse
     before = deepcopy(run_config.to_dict())
+    if reuse and (offload or not fp8_param_gather):
+        error = ValueError if offload else AssertionError
+        match = "Gradient-buffer offload" if offload else "Reuse grad buffer"
+        with pytest.raises(error, match=match):
+            run_config.validate()
+        with pytest.raises(error, match=match):
+            run_config.finalize()
+        assert run_config.to_dict() == before
+        return
     run_config.validate()
     assert run_config.to_dict() == before
     run_config.finalize()
-    assert not run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag
-    assert run_config.ddp.grad_buffer_offload
+    assert run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag is reuse
+    assert run_config.ddp.grad_buffer_offload is offload
 
 
 def test_wrapper_deferred_defaults_are_resolved_at_finalization(monkeypatch, run_config):

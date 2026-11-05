@@ -447,7 +447,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             raise ValueError("Training requires a model config")
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
-        self.rl.validate_ddp_config(self.ddp)
         optimizer = self._optimizer_with_model_precision()
         # Validate effective precision without modifying either config or finalizing early.
         ConfigContainerBase.validate(replace(self, optimizer=optimizer))
@@ -537,6 +536,15 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def _validate_ddp_config(self) -> None:
         """Check wrapper requirements without deriving or mutating other configs."""
+        # DDP's copy is derived during finalization; recipes only set optimizer policy.
+        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "--reuse-grad-buf-for-mxfp8-param-ag: "
+                    "parameters share the gradient-buffer storage that offload releases."
+                )
+            assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
         transformer = getattr(self.model, "transformer", None)
         if self.ddp.use_torch_fsdp2:
             if not isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
@@ -832,6 +840,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+        self.ddp._validate_buffer_layout()
 
 
 def update_train_iters(train: TrainingConfig) -> None:

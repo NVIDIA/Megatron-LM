@@ -112,6 +112,7 @@ class DistributedDataParallel(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
         """Validate model settings that depend on the data-parallel configuration."""
+        ddp_config._validate_buffer_layout()
         if config.moe_virtual_expert_load_balance and config.fp8:
             if not ddp_config.fp8_param_gather:
                 raise ValueError(

@@ -347,11 +347,16 @@ class DistributedDataParallelConfig:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
 
         self.validate()
+        self._validate_buffer_layout()
         if self.megatron_fsdp_max_pool_double_buffer:
             self.fsdp_double_buffer = True
 
     def validate(self) -> None:
-        """Check settings without mutation, including edits made after construction."""
+        """Check user settings without mutation, including edits after construction.
+
+        Optimizer-owned buffer policy may still be stale here. Its resolved layout
+        is checked by _validate_buffer_layout at construction and before DDP setup.
+        """
         import os
 
         for name in (
@@ -377,15 +382,6 @@ class DistributedDataParallelConfig:
             if self.megatron_fsdp_version != 2:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
 
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
-
-        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
-            )
-
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
@@ -400,10 +396,20 @@ class DistributedDataParallelConfig:
             )
 
         if self.num_buckets is not None:
-            assert (
-                self._bucket_size_resolved or self.bucket_size is None
-            ), "Cannot specify both num_buckets and bucket_size"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+    def _validate_buffer_layout(self) -> None:
+        """Check resolved buffer policy before allocating or sharing gradient storage."""
+        if self.reuse_grad_buf_for_mxfp8_param_ag:
+            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+            )
 
     def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
         """Resolve buckets in place after model construction and process-group setup.
@@ -415,9 +421,8 @@ class DistributedDataParallelConfig:
         """
         if self.num_buckets is not None:
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
-            assert (
-                self._bucket_size_resolved or self.bucket_size is None
-            ), "Cannot specify both num_buckets and bucket_size"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             bucket_size = num_parameters // self.num_buckets
         elif self.bucket_size is None:
             bucket_size = max(40000000, 1000000 * data_parallel_size)
