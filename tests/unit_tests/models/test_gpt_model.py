@@ -831,7 +831,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         ), "use_te_activation_func must be forwarded from config"
 
 
-def test_gpt_builder_forwards_rope_scaling_factor():
+def test_gpt_builder_forwards_rope_scaling_factor(run_config):
     """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
 
     Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
@@ -839,6 +839,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
     passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
     back to its default factor of 8.0.
     """
+    run_config.tokenizer.padded_vocab_size = 512
     mock_config = MagicMock()
 
     mock_args = MagicMock()
@@ -861,6 +862,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
 
         mock_gpt_model.assert_called_once()
         _, call_kwargs = mock_gpt_model.call_args
+        assert call_kwargs["vocab_size"] == 512
         assert (
             call_kwargs.get('rope_scaling_factor') == 32.0
         ), "rope_scaling_factor must be forwarded from args"
@@ -939,5 +941,36 @@ def test_tied_embedding_copies_match_across_pipeline_stages(
         reference, src=torch.distributed.get_process_group_ranks(embd_group)[0], group=embd_group
     )
     assert torch.equal(weight, reference)
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("share_embeddings_and_output_weights", [True, False])
+def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_output_weights):
+    """Input-embedding transforms reach a tied output copy, but not an untied output head."""
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    model_parallel_cuda_manual_seed(123)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=8,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+    )
+
+    if parallel_state.is_pipeline_first_stage():
+        assert model.embedding.word_embeddings.weight.is_word_embedding_parameter
+    if parallel_state.is_pipeline_last_stage():
+        marked = getattr(model.output_layer.weight, "is_word_embedding_parameter", False)
+        assert marked == share_embeddings_and_output_weights
 
     Utils.destroy_model_parallel()
