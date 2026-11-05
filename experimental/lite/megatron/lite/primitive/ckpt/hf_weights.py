@@ -227,7 +227,10 @@ class SafeTensorReader:
             assert self._cached_tensor is not None
             return self._cached_tensor
         if not self.has_tensor(name) and self.has_tensor(f"{name}_packed"):
-            tensor = self._get_groupwise_int4(name, target_device)
+            if self.has_tensor(f"{name}_global_scale"):
+                tensor = self._get_nvfp4(name, target_device)
+            else:
+                tensor = self._get_groupwise_int4(name, target_device)
             self._cached_request, self._cached_tensor = request, tensor
             return tensor
 
@@ -237,10 +240,19 @@ class SafeTensorReader:
         ) and _is_scaled_quantized_dtype(tensor.dtype)
         scale_inv_name = f"{name}_scale_inv"
         if scaled_quantized and tensor.dim() == 2 and self.has_tensor(scale_inv_name):
-            scale = self._get_raw_tensor(scale_inv_name, target_device).float()
+            scale = self._get_raw_tensor(scale_inv_name, target_device)
             rows, cols = tensor.shape
-            expanded = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
-            tensor = tensor.float() * expanded[:rows, :cols]
+            if _is_mx_block_scale(scale, rows, cols):
+                tensor = _dequantize_mx_block_tensor(tensor, scale)
+            elif scale.dtype == torch.uint8 or str(scale.dtype) == "torch.float8_e8m0fnu":
+                raise RuntimeError(
+                    f"Unsupported E8M0 scale layout for {name!r}: scale {tuple(scale.shape)} "
+                    f"for weight {(rows, cols)} (expected one exponent per 1x32 block)"
+                )
+            else:
+                scale = scale.float()
+                expanded = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+                tensor = tensor.float() * expanded[:rows, :cols]
 
         scale_name = f"{name[:-7] if name.endswith('.weight') else name}.scale"
         if (
@@ -286,6 +298,13 @@ class SafeTensorReader:
             with safe_open(str(filepath), framework="pt", device="cpu") as f:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
+
+    def _get_nvfp4(self, name: str, device: torch.device) -> torch.Tensor:
+        return _dequantize_nvfp4(
+            self._get_raw_tensor(f"{name}_packed", device),
+            self._get_raw_tensor(f"{name}_scale", device),
+            self._get_raw_tensor(f"{name}_global_scale", device),
+        )
 
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
@@ -362,6 +381,47 @@ _FP4_E2M1_TABLE = (
     -4.0,
     -6.0,
 )
+
+
+MX_BLOCK_SIZE = 32
+NVFP4_BLOCK_SIZE = 16
+# E2M1 code -> value with the sign bit kept on code 8 (-0.0), so decoded weights match
+# byte-for-byte a decoder that indexes the full signed table.
+_NVFP4_E2M1_TABLE = (*_FP4_E2M1_TABLE[:8], -0.0, *_FP4_E2M1_TABLE[9:])
+
+
+def _is_mx_block_scale(scale: torch.Tensor, rows: int, cols: int) -> bool:
+    """Whether ``scale`` holds one E8M0 exponent per 1x32 block along the input dim (MXFP8)."""
+    e8m0 = scale.dtype == torch.uint8 or str(scale.dtype) == "torch.float8_e8m0fnu"
+    return e8m0 and tuple(scale.shape) == (rows, math.ceil(cols / MX_BLOCK_SIZE))
+
+
+def _dequantize_mx_block_tensor(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Decode a 1x32-block MXFP8 tensor: ``float(w) * 2**(e - 127)`` in FP32."""
+    if scale.dtype == torch.uint8:
+        if bool((scale == 255).any()):
+            raise ValueError("E8M0 scale 255 encodes NaN")
+        scale = torch.exp2(scale.float() - 127)
+    else:
+        scale = scale.float()
+    cols = tensor.shape[-1]
+    return tensor.float() * scale.repeat_interleave(MX_BLOCK_SIZE, dim=-1)[..., :cols]
+
+
+def _dequantize_nvfp4(
+    packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    """Decode compressed-tensors NVFP4: E2M1 codes (low nibble first) x E4M3 per-16 scale
+    / FP32 global scale, evaluated in FP32 in that order."""
+    if global_scale.numel() != 1 or not bool(torch.isfinite(global_scale).all()):
+        raise ValueError("NVFP4 global scale must be one finite value")
+    if float(global_scale) <= 0:
+        raise ValueError("NVFP4 global scale must be positive")
+    table = torch.tensor(_NVFP4_E2M1_TABLE, dtype=torch.float32, device=packed.device)
+    packed = packed.view(torch.uint8)
+    codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).flatten(-2).long()
+    scale = block_scale.float().repeat_interleave(NVFP4_BLOCK_SIZE, dim=-1)
+    return table[codes] * scale / global_scale.float()
 
 
 def _is_scaled_quantized_dtype(dtype: torch.dtype) -> bool:
