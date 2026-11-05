@@ -26,6 +26,7 @@ from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
 _GLOBAL_RUN_CONFIG = None
+_GLOBAL_RUN_CONFIG_RECORD = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
@@ -47,6 +48,11 @@ def get_run_config():
     """Return the active training or inference run config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
+
+
+def get_run_config_record():
+    """Return the record an entry point registered with `set_run_config_record`."""
+    return _GLOBAL_RUN_CONFIG_RECORD
 
 
 def is_run_config_initialized() -> bool:
@@ -261,6 +267,7 @@ def unset_global_variables():
 
     global _GLOBAL_ARGS
     global _GLOBAL_RUN_CONFIG
+    global _GLOBAL_RUN_CONFIG_RECORD
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
@@ -275,6 +282,7 @@ def unset_global_variables():
 
     _GLOBAL_ARGS = None
     _GLOBAL_RUN_CONFIG = None
+    _GLOBAL_RUN_CONFIG_RECORD = None
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
@@ -299,6 +307,19 @@ def set_run_config(cfg_container):
     global _GLOBAL_RUN_CONFIG
     _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     _GLOBAL_RUN_CONFIG = cfg_container
+
+
+def set_run_config_record(cfg_container):
+    """Register the run's record."""
+    global _GLOBAL_RUN_CONFIG_RECORD
+    _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG_RECORD, 'run config record')
+    _GLOBAL_RUN_CONFIG_RECORD = cfg_container
+
+
+def unset_run_config_record():
+    """Forget the run config record."""
+    global _GLOBAL_RUN_CONFIG_RECORD
+    _GLOBAL_RUN_CONFIG_RECORD = None
 
 
 def _set_train_state():
@@ -725,7 +746,9 @@ def destroy_global_vars():
     _GLOBAL_ARGS = None
 
     global _GLOBAL_RUN_CONFIG
+    global _GLOBAL_RUN_CONFIG_RECORD
     _GLOBAL_RUN_CONFIG = None
+    _GLOBAL_RUN_CONFIG_RECORD = None
 
     global _GLOBAL_TRAIN_STATE
     _GLOBAL_TRAIN_STATE = None

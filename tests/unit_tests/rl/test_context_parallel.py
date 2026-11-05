@@ -9,7 +9,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
-from megatron.rl.config import RLRunConfigContainer
+from megatron.rl.config import set_rl_run_config, unset_rl_run_config
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
 from megatron.training.argument_utils import (
     _default_config_from_args,
@@ -21,6 +21,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
+    RunConfigRecord,
 )
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -56,6 +57,7 @@ class PositionWiseModel:
 def _set_minimal_args():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
+    unset_rl_run_config()
     args = parse_args(ignore_unknown_args=True)
     args.num_layers = 8
     args.num_attention_heads = 8
@@ -67,16 +69,15 @@ def _set_minimal_args():
     args = validate_args(args)
     pretrain = pretrain_cfg_container_from_args(args)
     pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-    set_global_variables(
-        args,
-        RLRunConfigContainer.from_pretrain(
-            pretrain,
+    set_global_variables(args, pretrain, build_tokenizer=False)
+    set_rl_run_config(
+        RunConfigRecord(
+            pretrain=pretrain,
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
             rl=_default_config_from_args(RLConfig, args),
-        ),
-        build_tokenizer=False,
+        )
     )
 
 
@@ -91,6 +92,7 @@ def initialize_context_parallel(request, monkeypatch):
     yield request.param
     Utils.destroy_model_parallel()
     destroy_global_vars()
+    unset_rl_run_config()
     destroy_num_microbatches_calculator()
 
 
