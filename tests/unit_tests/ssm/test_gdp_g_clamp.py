@@ -130,6 +130,8 @@ def test_prefill_forwards_bounded_g_to_chunked_scan(clamp_value):
             gdp_chunk_indices_dp=None,
             gdp_chunk_offsets=None,
             gdp_intermediate_chunk_indices=None,
+            intermediate_ssm_out=None,
+            intermediate_conv_out=None,
         ),
     )
     ssm_state = torch.zeros(3, 2, 4, 4)
