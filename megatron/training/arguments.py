@@ -3609,8 +3609,9 @@ def _add_regularization_args(parser):
         '--muon-fp32-matmul-prec',
         type=str,
         default='medium',
-        choices=['low', 'medium', 'high'],
-        help='FP32 matmul precision for Newton-Schulz iteration',
+        choices=['medium', 'high', 'highest'],
+        help='PyTorch FP32 matmul precision for Newton-Schulz iteration. '
+        'Use highest to retain full FP32 arithmetic.',
     )
     group.add_argument(
         '--muon-coefficient-type',
