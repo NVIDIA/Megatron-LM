@@ -201,8 +201,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/gated_delta_net/kda.py",),
         tests=(K + "test_dev_sync_kernels.py",),
         kind="dispatch",
-        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1. "
-        "Multi-rank convolution and chunkwise CP remain in the existing parity suite.",
+        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1, alone "
+        "and feeding the fused sigmoid output norm that gdn_gated_output_norm_fusion selects in "
+        "_apply_gated_norm, plus a module-level replay of the Kimi-K3 bias-free low-rank "
+        "F-decay / output-gate projections (kda_f_lora_rank / kda_gate_lora_rank) with the "
+        "TP-replicated beta projection under deterministic_mode. Multi-rank convolution and "
+        "chunkwise CP remain in the existing parity suite.",
     ),
     KernelEntry(
         name="balanced_cp_route_metadata",
@@ -677,7 +681,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "The GDN family pins SiLU for its convolution and output gate independently of the FFN "
+        "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
+        "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule). The "
+        "opt-in fused output norm (gdn_gated_output_norm_fusion; SiLU for GDN, sigmoid for KDA) "
+        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -688,12 +697,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
     ),
     KernelEntry(
+        name="kda_pre_gated_delta_rule_fusion",
+        sources=("megatron/core/fusions/fused_pre_kda.py",),
+        kind="triton",
+        exempt_reason="KDA pre-GDR fusion is explicitly rejected with deterministic_mode=True "
+        "(KimiDeltaAttention._setup_variant_attrs). It reuses the pre-GDR module's timing-based "
+        "autotuned convolution kernels and its backward's atomic boundary-gradient and "
+        "causal_conv1d weight-gradient reductions; fused-vs-eager parity and the rejection guard "
+        "are covered by tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py.",
+    ),
+    KernelEntry(
         name="gdn_gated_output_norm_fusion",
         sources=("megatron/core/fusions/fused_gated_norm.py",),
         tests=(K + "test_gated_norm.py",),
         kind="triton",
-        notes="GatedDeltaNet._apply_gated_norm dispatches fused RMSNorm/SiLU forward/backward "
-        "with fixed launch configurations and ordered weight-gradient reduction; first-order replay.",
+        notes="GatedDeltaNet._apply_gated_norm (SiLU) and KimiDeltaAttention._apply_gated_norm "
+        "(sigmoid) dispatch the fused RMSNorm forward/backward with fixed launch configurations "
+        "and ordered weight-gradient reduction; first-order replay of both module dispatchers "
+        "and of both GATE_ACTIVATION kernel specialisations with BF16 and FP32 gates.",
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",
