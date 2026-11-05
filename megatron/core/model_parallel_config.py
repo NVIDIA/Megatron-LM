@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# License for these changes: BSD-3-Clause.
 
 import warnings
 from dataclasses import dataclass, field
@@ -385,9 +386,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'tiled_te'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+       from Transformer Engine library is used. 'tiled_te' prefers TE >= 2.19 with
+       its memory-efficient API, otherwise uses tiled TP1 Triton cross entropy
+       without a vocabulary-sized FP32 softmax buffer. Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
