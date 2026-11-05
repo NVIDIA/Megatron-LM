@@ -141,12 +141,13 @@ def test_gdp_gating_replays(clamp_value):
         config = _make_config([])
         config.gdp_g_clamp_value = clamp_value
         mixer = build_gdp(config)
-        width = mixer.nheads_local_cp * (mixer.num_householder + 1)
+        runtime_cp = mixer._resolve_runtime_cp(None)
+        width = runtime_cp.nheads * (mixer.num_householder + 1)
         # Wide logits so some decays fall below the clamp and its gradient mask is exercised.
         ba = (8 * torch.randn(2, 4096, width, device="cuda")).to(torch.bfloat16)
         ba.requires_grad_(True)
         assert_replays_bit_exact(
-            lambda ba: mixer._compute_gating(ba),
+            lambda ba: mixer._compute_gating(ba, runtime_cp=runtime_cp),
             (ba,),
             replays=3,
             contention=True,
