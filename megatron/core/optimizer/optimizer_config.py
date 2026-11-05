@@ -301,7 +301,9 @@ class OptimizerConfig:
     ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
     from the Emerging-Optimizers revision pinned in ``pyproject.toml``. By default, Muon
     orthogonalizes the Q, gate, K, and V projection matrices separately. MLA up-projections
-    are only split when ``muon_split_mla_qkv`` is also enabled."""
+    are only split when ``muon_split_mla_qkv`` is also enabled. Like the projection split, it
+    applies only when every tensor-parallel rank holds whole query groups; otherwise the local
+    weight is orthogonalized as a whole."""
 
     muon_split_mla_qkv: bool = False
     """Whether to split MLA up-projection weights (MLA, Absorbed MLA, and DSv4 hybrid attention

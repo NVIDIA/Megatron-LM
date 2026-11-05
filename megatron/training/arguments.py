@@ -3550,7 +3550,9 @@ def _add_regularization_args(parser):
         action='store_true',
         help='Orthogonalize each Q, gate, K, and V head independently. '
         'Uniform head sizes use batched Newton-Schulz. '
-        'MLA up-projections additionally require --muon-split-mla-qkv.',
+        'MLA up-projections additionally require --muon-split-mla-qkv. '
+        'Like the projection split, applies only when every tensor-parallel rank holds '
+        'whole query groups.',
     )
     group.add_argument(
         '--muon-split-mla-qkv',
