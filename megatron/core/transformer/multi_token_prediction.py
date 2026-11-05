@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import warnings
 from contextlib import AbstractContextManager, nullcontext
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
@@ -1528,8 +1528,17 @@ class MultiTokenPredictionLayer(MegatronModule):
                 if self.config.keep_mtp_in_bf16:
                     layer_config.fp4 = None
                     layer_config.fp8 = None
+            stack_config = self.config
+            if self.config.moe_shortcut_disable_mtp:
+                # The stack groups its layers from its own config, and each layer reads its
+                # layer config, so both drop shortcut MoE. The decoder's config is untouched.
+                stack_config = copy(self.config)
+                for shortcut_config in (stack_config, *layer_config_list):
+                    shortcut_config.moe_shortcut_connection = False
+                    shortcut_config.moe_shortcut_parallel = False
+                    shortcut_config.moe_shortcut_post_norm = False
             self.mtp_model_layer = HybridStack(
-                config=self.config,
+                config=stack_config,
                 submodules=hybrid_submodules,
                 layer_config_list=layer_config_list,
                 pp_layer_offset=0,
@@ -1876,7 +1885,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 else:
                     # GPT path: single TransformerLayer
                     hidden_states, _ = self.mtp_model_layer(
-                        hidden_states=hidden_states,
+                        hidden_states,
                         attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,
