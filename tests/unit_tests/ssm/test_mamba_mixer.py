@@ -2,7 +2,10 @@
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
@@ -123,6 +126,56 @@ class TestMambaMixer:
         torch.testing.assert_close(mixer._A_neg_exp_cache, -torch.exp(mixer.A_log.float()))
         assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
         assert not mixer._A_neg_exp_cache_stale
+
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("strategy", ["optim_grads", "optim_grads_params"])
+    @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
+    def test_fsdp_refreshes_loaded_decode_cache(self, tp_size, strategy, refresh_on_eval):
+        """Refresh from native FSDP optimizer shards without replacing cache storage."""
+        mixer = self.get_mixer(tp_size=tp_size)
+        mixer.config.tensor_model_parallel_size = tp_size
+        # Distinct values on each TP rank detect accidentally selecting rank zero.
+        expected = torch.linspace(-1.0, 1.0, mixer.nheads, device="cuda")
+        tp_offset = mixer.pg_collection.tp.rank() * mixer.nheads_local_tp
+        tp_values = expected.narrow(0, tp_offset, mixer.nheads_local_tp)
+        wrapper = FullyShardedDataParallel(
+            config=mixer.config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                data_parallel_sharding_strategy=strategy,
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                average_in_collective=False,
+            ),
+            module=mixer,
+            fsdp_unit_modules=[MambaMixer],
+        )
+        assert isinstance(mixer.A_log, DTensor)
+        cache_ptr = mixer._A_neg_exp_cache.data_ptr()
+        with torch.no_grad():
+            # Model native HF import: overwrite optimizer shards, leaving raw
+            # forward parameters stale until install_optimized_model_weights().
+            mixer.A_log._local_tensor.view(-1).copy_(tp_values[mixer.A_log.megatron_fsdp_slice])
+        original_param = mixer.A_log
+        if refresh_on_eval:
+            mixer.train()
+            mixer.eval()
+        else:
+            mixer.refresh_cache()
+        torch.testing.assert_close(mixer._A_neg_exp_cache, -torch.exp(tp_values), rtol=0, atol=0)
+        assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
+        assert mixer.A_log is original_param
+        assert not mixer._A_neg_exp_cache_stale
+        wrapper.module.install_optimized_model_weights()
+        mixer.train()
+        wrapper.zero_grad_buffer()
+        inputs = torch.randn(32, 1, mixer.config.hidden_size, device="cuda", requires_grad=True)
+        output, _ = wrapper(inputs)
+        loss = output.square().mean()
+        assert torch.isfinite(loss)
+        loss.backward()
+        wrapper.finish_grad_sync()
+        assert torch.isfinite(inputs.grad).all()
 
 
 class TestMambaMixerErrorChecks:
