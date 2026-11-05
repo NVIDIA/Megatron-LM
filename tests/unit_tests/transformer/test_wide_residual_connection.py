@@ -53,7 +53,8 @@ def _wide_config(
 
 
 def _process_groups() -> ProcessGroupCollection:
-    return ProcessGroupCollection()
+    # The layers require tp; these single-process tests have no tensor parallelism.
+    return ProcessGroupCollection(tp=None)
 
 
 class _ActiveBranch(nn.Module):
