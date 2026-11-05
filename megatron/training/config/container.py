@@ -897,11 +897,18 @@ class InferenceConfigContainer(ConfigContainerBase):
 
 
 @dataclass(kw_only=True)
+class PosttrainConfigContainer(ConfigContainerBase):
+    """Top-level container for what a post-training run does on top of its base recipe."""
+
+    rl: RLConfig | None = None
+
+
+@dataclass(kw_only=True)
 class RunConfigRecord(ConfigContainerBase):
     """The configuration record of a run (`run_config.yaml`).
 
     A training run records `pretrain`, an inference run records `inference`,
-    an RL run records `pretrain`, `inference`, and `rl`.
+    an RL run records `pretrain`, `inference`, and `posttrain`.
 
     Records written before this type, a container serialized flat, still load through
     `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
@@ -909,7 +916,7 @@ class RunConfigRecord(ConfigContainerBase):
 
     pretrain: PretrainConfigContainer | None = None
     inference: InferenceConfigContainer | None = None
-    rl: RLConfig | None = None
+    posttrain: PosttrainConfigContainer | None = None
 
     @classmethod
     def wrap(cls, run_config):

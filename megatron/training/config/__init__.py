@@ -3,6 +3,7 @@
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.container import (
     InferenceConfigContainer,
+    PosttrainConfigContainer,
     PretrainConfigContainer,
     RunConfigRecord,
 )

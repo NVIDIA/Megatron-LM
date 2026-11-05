@@ -72,6 +72,7 @@ from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -93,14 +94,18 @@ def _rl_run_config(args, pretrain):
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
-        rl=_default_config_from_args(RLConfig, args),
+        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
 
 
 def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
     """Refit uses RLConfig while shard layout remains a launch argument."""
     rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
-    monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
+    monkeypatch.setattr(
+        rl_utils,
+        "get_rl_run_config",
+        lambda: SimpleNamespace(posttrain=SimpleNamespace(rl=rl_config)),
+    )
     args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
     model, inference_model = object(), object()
     with (
@@ -145,7 +150,9 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     calls = []
     args = SimpleNamespace()
     run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
-    rl_run_config = SimpleNamespace(rl=SimpleNamespace(rl_rollout_only=rollout_only))
+    rl_run_config = SimpleNamespace(
+        posttrain=SimpleNamespace(rl=SimpleNamespace(rl_rollout_only=rollout_only))
+    )
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_rl_run_config", lambda: rl_run_config)
@@ -736,7 +743,11 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_rl_run_config",
+            lambda: SimpleNamespace(posttrain=SimpleNamespace(rl=RLConfig())),
+        )
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
         )
@@ -824,10 +835,10 @@ class TestRLUtils:
         pretrain = pretrain_cfg_container_from_args(args)
         rl_run = _rl_run_config(args, pretrain)
         assert not pretrain.ddp.grad_buffer_offload
-        rl_run.rl.rl_offload_optimizer_during_inference = False
+        rl_run.posttrain.rl.rl_offload_optimizer_during_inference = False
         validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
-        rl_run.rl.rl_offload_optimizer_during_inference = True
+        rl_run.posttrain.rl.rl_offload_optimizer_during_inference = True
         validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
         finalize_rl_run(rl_run)
@@ -868,7 +879,11 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_rl_run_config",
+            lambda: SimpleNamespace(posttrain=SimpleNamespace(rl=rl_config)),
+        )
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -1022,7 +1037,11 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_rl_run_config",
+            lambda: SimpleNamespace(posttrain=SimpleNamespace(rl=rl_config)),
+        )
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -1096,7 +1115,11 @@ class TestRLUtils:
         layer_config = config if share_config else SimpleNamespace(flash_decode=True)
         model = DummyLogprobsModel(config, layer_config)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
-        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_rl_run_config",
+            lambda: SimpleNamespace(posttrain=SimpleNamespace(rl=RLConfig())),
+        )
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
@@ -1434,7 +1457,9 @@ class TestRLUtils:
         monkeypatch.setattr(
             train_rl,
             "get_rl_run_config",
-            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
+            lambda: SimpleNamespace(
+                posttrain=SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing))
+            ),
         )
         if packing:
             seq_indices = [11, 12, 13, 14, 15]

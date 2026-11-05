@@ -20,6 +20,7 @@ from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -76,7 +77,7 @@ def _set_minimal_args():
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
-            rl=_default_config_from_args(RLConfig, args),
+            posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
         )
     )
 

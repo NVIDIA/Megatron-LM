@@ -15,6 +15,7 @@ from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -65,7 +66,9 @@ def test_validation_is_read_only_and_finalization_runs_once(
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
-            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+            posttrain=PosttrainConfigContainer(
+                rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+            ),
         )
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
@@ -211,7 +214,9 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
-        rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        ),
     )
     if invalid_policy == "ddp_offload":
         transformer.fp8 = "hybrid"
