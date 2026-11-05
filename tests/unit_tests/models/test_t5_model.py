@@ -184,7 +184,8 @@ def test_constructor_process_groups(mocker, explicit_pg_collection, position_emb
     if explicit_pg_collection:
         global_groups.assert_not_called()
     else:
-        global_groups.assert_called()
+        # LanguageModule resolves the global grid once, and T5 builds on that same collection.
+        global_groups.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
