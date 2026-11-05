@@ -32,8 +32,8 @@ def test_prepare_attention_routes_uses_physical_capacity(
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
     calls = []
 
-    def finalize(params):
-        calls.append(params)
+    def finalize(params, **kwargs):
+        calls.append((params, kwargs))
         params.cp_group = group
         return params
 
@@ -46,9 +46,10 @@ def test_prepare_attention_routes_uses_physical_capacity(
         pad_packed_seq_alignment="max",
         cuda_graph_impl="transformer_engine" if dynamic else "none",
         cuda_graph_modules=["attn"],
+        sequence_parallel=True,
     )
     result = packed_seq_utils.prepare_packed_seq_params(packed, config, capacity=capacity)
-    assert result is packed and calls == [packed]
+    assert result is packed and calls == [(packed, {"sequence_parallel": True})]
     if dynamic:
         from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
             get_graph_dynamic_plan,
@@ -62,7 +63,9 @@ def test_prepare_attention_routes_uses_physical_capacity(
 
 
 def test_unpacked_batch_needs_no_attention_config(monkeypatch):
-    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
+    monkeypatch.setattr(
+        packed_seq_utils, "finalize_packed_seq_params", lambda params, **kwargs: params
+    )
     assert packed_seq_utils.prepare_packed_seq_params(None, SimpleNamespace()) is None
 
 
@@ -96,7 +99,9 @@ def test_prepare_keeps_caller_owned_cp_group(monkeypatch, runtime_metadata):
         return global_group
 
     monkeypatch.setattr(parallel_state, "get_context_parallel_group", get_global_cp_group)
-    monkeypatch.setattr(routes, "prebuild_thd_cp_partition_routes", lambda params, group: None)
+    monkeypatch.setattr(
+        routes, "prebuild_thd_cp_partition_routes", lambda params, group=None, **kwargs: None
+    )
     cu = torch.tensor([0, 8, 16], dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
     if runtime_metadata:

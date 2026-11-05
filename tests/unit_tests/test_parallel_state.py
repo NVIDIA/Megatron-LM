@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from datetime import timedelta
 
@@ -644,6 +644,61 @@ def test_valid_dynamic_cp_group_sizes():
 
     with pytest.raises(ValueError, match="must be positive"):
         ps.get_valid_dynamic_context_parallel_group_sizes(0)
+
+
+@pytest.mark.parametrize(
+    "world_size, tp_size, cp_size, dp_size",
+    [(8, 2, 2, 2), (8, 1, 2, 4)],  # 8 GPUs, 2 TP, 2 CP, 2 DP  # 8 GPUs, 1 TP, 2 CP, 4 DP
+)
+def test_dynamic_tp_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+    """
+    Test that the TP x (dynamic DP x CP sub-group) groups span exactly the TP groups of
+    the sub-group members, and that the full size spans the tp-dp-cp group.
+    """
+    Utils.destroy_model_parallel()
+
+    # Gate on the launched world size: the ranks may span several nodes.
+    if Utils.world_size != world_size:
+        pytest.skip(f"Test requires world_size={world_size}, but got {Utils.world_size}")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        dynamic_context_parallel=True,
+    )
+
+    rank = torch.distributed.get_rank()
+    tp_ranks = torch.distributed.get_process_group_ranks(ps.get_tensor_model_parallel_group())
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
+    group_sizes = [
+        group_size
+        for group_size in ps.get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
+        if group_size < dp_cp_size
+    ]
+    for group_size in group_sizes:
+        dp_cp_group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=group_size)
+        # Members of this rank's sub-group share its TP coordinate, so the TP group of a
+        # member is this rank's TP group shifted by the member's offset.
+        expected_ranks = sorted(
+            {member + tp_rank - rank for member in dp_cp_ranks for tp_rank in tp_ranks}
+        )
+        assert sorted(torch.distributed.get_process_group_ranks(group)) == expected_ranks
+        assert group.size() == tp_size * group_size
+        assert ps.get_dynamic_tensor_data_context_parallel_group_map()[group_size] is group
+        if tp_size == 1:
+            assert group is dp_cp_group
+
+    # The full sub-group size spans the same ranks as the tensor + data parallel group
+    # with CP (a separate communicator with TP > 1, the DP x CP group itself with TP1).
+    full_group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=dp_cp_size)
+    assert sorted(torch.distributed.get_process_group_ranks(full_group)) == sorted(
+        torch.distributed.get_process_group_ranks(
+            ps.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        )
+    )
+
+    Utils.destroy_model_parallel()
 
 
 def test_separate_all_gather_group():

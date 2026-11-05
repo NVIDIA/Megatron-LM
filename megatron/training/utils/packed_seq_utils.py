@@ -36,7 +36,10 @@ def prepare_packed_seq_params(
         and packed_seq_params.cp_group is None
     ):
         packed_seq_params.cp_group = cp_group
-    packed_seq_params = finalize_packed_seq_params(packed_seq_params)
+    # The fused TP x CP layout route only matters for sequence-parallel shards.
+    packed_seq_params = finalize_packed_seq_params(
+        packed_seq_params, sequence_parallel=getattr(config, "sequence_parallel", False)
+    )
     if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params
 
