@@ -258,6 +258,19 @@ def test_tiktoken_tokenizer():
         1063,
     ], f"[8101, 2606, 1584, 1636, 1063] are expeted ids but got {ids}."
 
+    # Token conversion must use the same IDs as text tokenization.
+    backend = tokenizer._tokenizer
+    assert backend.tokens_to_ids(backend.text_to_tokens("hi how are you?")) == ids
+    assert backend.token_to_id("\n") == tokenizer.tokenize("\n")[0]
+    assert backend.tokens_to_ids(["<unk>", "</s>", "<mask>"]) == [0, 2, 3]
+
+    # Both inverse vocabulary interfaces must use the public vocabulary IDs.
+    assert tokenizer.inv_vocab == {token_id: token for token, token_id in tokenizer.vocab.items()}
+    assert backend.decoder == tokenizer.inv_vocab
+    for token, token_id in tokenizer.vocab.items():
+        assert backend.token_to_id(token) == token_id
+        assert tokenizer.inv_vocab[backend.token_to_id(token)] == token
+
     # Test detokenization
     text = tokenizer.detokenize([1073, 4525, 7771, 14899, 1046])
     assert text == "I'm fine thanks.", f"'I'm fine thanks.' is expeted output but got {text}."
