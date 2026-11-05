@@ -2119,6 +2119,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.train_state = train_state
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
@@ -3092,6 +3093,11 @@ def setup_model_and_optimizer(
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
+    # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
+    # iteration has completed, so a run that dies during startup (e.g., an OOM while loading
+    # a checkpoint into a grid that fits fine from scratch) otherwise leaves no memory trace.
+    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
+    report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -3198,6 +3204,18 @@ def setup_model_and_optimizer(
         train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
         train_state.resume_num_floating_point_operations = 0.0
+    # Paired with the report after the model/optimizer build: the delta is what loading the
+    # checkpoint cost. On the from-scratch path, iteration is 0 and this is the baseline.
+    report_memory(
+        f"(after checkpoint load, iteration {train_state.iteration})", process_group=setup_dp_group
+    )
+    # Clear temporary allocations created by load_checkpoint. Run this here to allow for
+    # re-claim from objects created within the scope of load_checkpoint.
+    torch.cuda.empty_cache()
+    report_memory(
+        f"(after empty_cache after checkpoint load, iteration {train_state.iteration})",
+        process_group=setup_dp_group,
+    )
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
@@ -3363,6 +3381,24 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
         # global batch size may be rounded down when batch-size decrease is enabled.
         return get_current_running_global_batch_size()
     return samples_seen_in_iteration
+
+
+def _get_memory_report_dp_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+):
+    """Resolve the DP group that gates report_memory's rank-0 print.
+
+    A MultiModuleProcessGroupCollection carries no axes of its own, so unwrap it to the
+    language model's collection first, or, on a rank that owns only encoders, to that
+    rank's own module. Mirrors the cross-entropy warmup resolution in pretrain().
+    """
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+    return pg_collection.dp if pg_collection is not None else None
 
 
 def _get_model_pg_collection(
@@ -3804,6 +3840,7 @@ def training_log(
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
+    embedding_min_norm_metrics: Dict[str, float] | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -4055,7 +4092,7 @@ def training_log(
 
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
-        indexer_loss_scale = 1 / get_num_microbatches()
+        indexer_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (
                 "DSA indexer logging requires a language-model ProcessGroupCollection"
@@ -4065,7 +4102,7 @@ def training_log(
             # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
             # The core logger still receives explicit groups and does not read MPU globals.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
+                required_pgs=['pp', 'dp', 'dp_cp', 'gtp_remat']
             )
         assert isinstance(
             pg_collection, ProcessGroupCollection
@@ -4195,6 +4232,18 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
+        if embedding_min_norm_metrics is not None:
+            log_string += (
+                " embedding norm floor row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/row-events-rescaled"])} |'
+                " fraction: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/fraction-rescaled"]:.3E} |'
+                " delta RMS: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/projection-delta-rms"]:.3E} |'
+                " zero-row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/zero-row-events"])} |'
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -4278,6 +4327,37 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
             and iteration % cfg.logger.tensorboard_log_interval == 0
         )
     )
+
+
+@torch.no_grad()
+def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
+    """Globally aggregate and reset embedding norm-floor interval statistics."""
+    # [rows scaled, rows checked, squared norm delta, exact-zero rows].
+    local_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
+    leaf_optimizers = (
+        getattr(optimizer, "chained_optimizers", [optimizer]) if optimizer is not None else ()
+    )
+    for current_optimizer in leaf_optimizers:
+        consume_stats = getattr(current_optimizer, "_consume_embedding_min_norm_stats", None)
+        if consume_stats is not None:
+            stats = consume_stats()
+            if stats is not None:
+                local_stats.add_(stats)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+
+    rows_rescaled, rows_checked, norm_delta_squared, zero_rows = local_stats.tolist()
+    fraction_rescaled = rows_rescaled / rows_checked if rows_checked > 0.0 else 0.0
+    norm_delta_rms = (
+        math.sqrt(norm_delta_squared / rows_rescaled) if rows_rescaled > 0.0 else 0.0
+    )
+    return {
+        "embedding-min-norm/row-events-rescaled": rows_rescaled,
+        "embedding-min-norm/fraction-rescaled": fraction_rescaled,
+        "embedding-min-norm/projection-delta-rms": norm_delta_rms,
+        "embedding-min-norm/zero-row-events": zero_rows,
+    }
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -5106,6 +5186,13 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    # Last report before the loop. Weights, optimizer state, any loaded checkpoint and the
+    # symmetric-memory pools are all resident by now, so a run that OOMs on iteration 1 still
+    # has a number to line up against a healthy run. CUDA graph pools are captured later.
+    report_memory(
+        "(before first iteration)", process_group=_get_memory_report_dp_group(model_pg_collection)
+    )
+
     def _finished_training(iteration):
         return (cfg.train.train_iters and iteration >= cfg.train.train_iters) or (
             cfg.train.train_samples and train_state.consumed_train_samples >= cfg.train.train_samples
@@ -5464,6 +5551,20 @@ def train(
             else:
                 loss_scale = 1.0
             params_norm = None
+            embedding_min_norm_metrics = None
+
+            if (
+                getattr(args, "embedding_min_norm", None) is not None
+                and iteration % cfg.logger.log_interval == 0
+            ):
+                embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
+                writer = get_tensorboard_writer()
+                if writer:
+                    for name, value in embedding_min_norm_metrics.items():
+                        writer.add_scalar(name, value, iteration)
+                wandb_writer = get_wandb_writer()
+                if wandb_writer:
+                    wandb_writer.log(embedding_min_norm_metrics, iteration)
 
             if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
@@ -5499,6 +5600,7 @@ def train(
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                     num_microbatches=scheduled_num_microbatches,
+                    embedding_min_norm_metrics=embedding_min_norm_metrics,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
