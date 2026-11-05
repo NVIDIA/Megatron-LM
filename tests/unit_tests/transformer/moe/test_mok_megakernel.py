@@ -1,16 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import operator
 import sys
+import types
+from contextlib import contextmanager, nullcontext
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.megakernel import parameter_bridge
+from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import runtime as mok_runtime
 from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 @pytest.mark.parametrize("recompute", [False, True])
@@ -42,7 +49,8 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
 
     assert output is hidden and bias is None
     layer.route.assert_called_once_with(hidden, padding_mask, input_ids, packed_seq_params=packed)
-    layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes)
+    # The backend drops the padding routes itself, from the batch-first mask.
+    layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes, padding_mask)
     assert checkpoint.call_count == int(recompute)
 
 
@@ -86,18 +94,102 @@ def test_gate_up_main_grad_arguments_preserve_fc1_aliases():
     assert tables == (fc1_table, fc1_table, fc2_table)
 
 
-def test_parameter_bridge_uses_main_grad_without_allocating_dummy_storage():
+def test_parameter_bridge_uses_main_grad_and_a_cached_dummy_gradient():
     param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
     param.main_grad = torch.full((4, 8), 0.25, dtype=torch.float32)
     param.grad_added_to_main_grad = False
 
     assert parameter_bridge.main_grad_buffer(param) is param.main_grad
     dummy = parameter_bridge.finish_weight_gradient(param)
+    again = parameter_bridge.dummy_weight_gradient(param)
+    buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
 
-    assert dummy.data_ptr() == param.data_ptr()
+    # Fresh aliases of one buffer cached per (shape, dtype, device), never of the parameter.
+    assert dummy is not again and dummy is not buffer
+    assert dummy.data_ptr() == again.data_ptr() == buffer.data_ptr()
+    assert dummy.data_ptr() != param.data_ptr()
+    assert (dummy.shape, dummy.dtype, dummy.device) == (param.shape, param.dtype, param.device)
+    assert dummy.is_contiguous()
     assert not dummy.requires_grad
     assert param.grad_added_to_main_grad
     torch.testing.assert_close(param.main_grad, torch.full_like(param.main_grad, 0.25))
+
+
+class _FinishWeightGradient(torch.autograd.Function):
+    """Return the parameter bridge's sentinel as the weight gradient, as MOK backward does."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        ctx.weight = weight
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, parameter_bridge.finish_weight_gradient(ctx.weight)
+
+
+def _assert_accumulate_grad_steals_sentinel(param, backward_context=nullcontext):
+    """Check that AccumulateGrad stores the sentinel itself, with a DDP-style post hook."""
+    param.grad_added_to_main_grad = False
+    seen = []
+    # MCore DDP registers its hook on the AccumulateGrad node the same way; the hook's extra
+    # reference must still let AccumulateGrad steal the sentinel instead of copying it.
+    grad_accumulator = param.expand_as(param).grad_fn.next_functions[0][0]
+
+    def hook(*unused):
+        seen.append((type(param.grad), param.grad.data_ptr(), param.grad_added_to_main_grad))
+        param.grad = None
+
+    grad_accumulator.register_hook(hook)
+    x = torch.ones(4, device=param.device, requires_grad=True)
+    loss = _FinishWeightGradient.apply(x, param).sum()
+    with backward_context():
+        loss.backward()
+
+    buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
+    assert seen == [(torch.Tensor, buffer.data_ptr(), True)]
+    assert param.grad is None
+
+
+def test_accumulate_grad_steals_dummy_gradient():
+    _assert_accumulate_grad_steals_sentinel(
+        torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameters need a Blackwell GPU",
+)
+def test_accumulate_grad_steals_dummy_gradient_for_mxfp8_parameter(monkeypatch):
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+
+    from megatron.core.fp8_utils import is_mxfp8tensor
+
+    with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        linear = te.Linear(128, 256, bias=False, params_dtype=torch.bfloat16)
+    param = linear.weight
+    assert is_mxfp8tensor(param)
+
+    constructed = []
+    make_like = QuantizedTensor.make_like.__func__
+
+    def counting_make_like(cls, *args, **kwargs):
+        constructed.append(cls)
+        return make_like(cls, *args, **kwargs)
+
+    @contextmanager
+    def count_quantized_tensor_constructions():
+        with monkeypatch.context() as patch:
+            patch.setattr(QuantizedTensor, "make_like", classmethod(counting_make_like))
+            yield
+
+    # A plain BF16 sentinel serves the quantized parameter: autograd neither casts nor copies it
+    # (either would change its address), and backward constructs no quantized tensor for it.
+    _assert_accumulate_grad_steals_sentinel(param, count_quantized_tensor_constructions)
+    assert constructed == []
 
 
 def test_aliased_parameter_metadata_survives_dtype_conversion():
@@ -115,8 +207,15 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
     backend = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
     torch.nn.Module.__init__(backend)
     backend.register_parameter("routed_fc1_weight", parameter)
-    backend._routed_weight_view_cache = object()
-    backend._split_main_grad_descriptor_cache = object()
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
+    )
+    for name in derived_state:
+        setattr(backend, name, object())
     backend.is_first_microbatch = False
 
     # TE quantized parameters use this swap path when model.cuda()/to() visits
@@ -135,8 +234,7 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
     assert owner.weight.tensor_model_parallel is True
     assert owner.weight.get_high_precision_init_val() is high_precision_init
     assert owner.weight.get_high_precision_init_val.__self__ is owner.weight
-    assert backend._routed_weight_view_cache is None
-    assert backend._split_main_grad_descriptor_cache is None
+    assert all(getattr(backend, name) is None for name in derived_state)
     assert backend.is_first_microbatch
 
 
@@ -266,8 +364,7 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     torch.nn.Module.__init__(module)
     module.native_single_grouped_weights = True
     module.use_mxfp8_weights = True
-    module.is_first_microbatch = True
-    module._routed_weight_view_cache = None
+    module._reset_derived_state()
     module.routed_fc1_weight = object()
     module.routed_fc2_weight = object()
     module.num_local_experts = 2
@@ -296,13 +393,190 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     assert view_calls == [None, None, first[0], first[1]]
 
 
+def test_mxfp8_weight_views_refresh_outside_moe_cuda_graph(monkeypatch):
+    """With the moe TE CUDA graph scope a capture records no scale refresh and keeps the flag;
+    the eager refresh_weight_views() before replay refreshes once per optimizer iteration."""
+    module = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
+    torch.nn.Module.__init__(module)
+    module.native_single_grouped_weights = True
+    module.use_mxfp8_weights = True
+    module._reset_derived_state()
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    module.routed_fc1_weight = object()
+    module.routed_fc2_weight = object()
+    module.num_local_experts = 2
+    module.intermediate_size = 128
+    module.hidden_size = 256
+
+    view_calls = []
+
+    def fake_view(*args, cached_view=None, **kwargs):
+        del args, kwargs
+        view_calls.append(cached_view)
+        return object()
+
+    capturing = [True]
+    monkeypatch.setattr(mok_backend, "_native_single_grouped_weight_view", fake_view)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+
+    with pytest.raises(RuntimeError, match="built before CUDA graph capture"):
+        module.quantized_routed_weights()
+    capturing[0] = False
+    first = module.quantized_routed_weights()  # eager warm-up builds the views
+    assert view_calls == [None, None]
+
+    module.is_first_microbatch = True  # set_is_first_microbatch, then the capture
+    capturing[0] = True
+    assert module.quantized_routed_weights() is first
+    assert module.is_first_microbatch and view_calls == [None, None]
+
+    capturing[0] = False
+    module.refresh_weight_views()  # before the microbatch-0 replay
+    assert view_calls == [None, None, first[0], first[1]]
+    assert not module.is_first_microbatch
+    module.refresh_weight_views()  # later microbatches
+    assert len(view_calls) == 4
+
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module._reset_derived_state()
+    # A checkpoint reload would also drop the captured views.
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module.load_state_dict({}, strict=False)
+
+
+def test_bf16_weight_views_are_built_once_outside_moe_cuda_graph(monkeypatch):
+    """BF16 views alias the weights, so the pre-replay refresh only builds them once."""
+    module = _split_module(use_mxfp8_weights=False)
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    view_calls = []
+
+    def fake_split(params, *, rows, columns, use_mxfp8, cached_view=None):
+        del params, rows, columns, use_mxfp8
+        view_calls.append(cached_view)
+        return object()
+
+    capturing = [False]
+    monkeypatch.setattr(mok_backend, "_native_split_weight_view", fake_split)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+
+    module.refresh_weight_views()
+    first = module._routed_weight_view_cache
+    assert view_calls == [None, None] and not module.is_first_microbatch
+
+    module.is_first_microbatch = True
+    module.refresh_weight_views()
+    capturing[0] = True
+    assert module.quantized_routed_weights() is first
+    assert view_calls == [None, None] and module._weight_views_captured
+
+
+def test_megakernel_backend_refresh_weight_views_defaults_to_noop():
+    class _Backend(MegakernelBackend):
+        def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+            return hidden_states
+
+    assert _Backend().refresh_weight_views() is None
+
+
+def test_te_cuda_graph_replay_refreshes_after_manual_hooks_and_before_the_graph():
+    """The pre-replay refresh must see the parameter all-gather the manual hooks waited for."""
+    calls = []
+    graph_output = object()
+
+    def graph(*args, **kwargs):
+        calls.append(("replay", args, kwargs))
+        return graph_output
+
+    hidden = torch.zeros(2)
+    module = SimpleNamespace(
+        current_microbatch=1,
+        cuda_graphs=[None, graph],
+        cuda_graph_manual_hooks=[(lambda param_module: calls.append(("hook", param_module)), (7,))],
+        _get_te_cuda_graph_replay_args=lambda *args, **kwargs: (args, kwargs),
+        _before_te_cuda_graph_replay=lambda: calls.append(("refresh",)),
+    )
+
+    assert GraphableMegatronModule._te_cuda_graph_replay(module, hidden) is graph_output
+    assert calls == [("hook", 7), ("refresh",), ("replay", (hidden,), {})]
+    assert GraphableMegatronModule._before_te_cuda_graph_replay(module) is None
+
+
+def _graph_layer(is_moe_layer, megakernel, cuda_graph_modules, **attributes):
+    """A TransformerLayer stand-in exposing the attributes its CUDA-graph megakernel hooks read."""
+    layer = SimpleNamespace(
+        is_moe_layer=is_moe_layer,
+        mlp=(
+            SimpleNamespace(megakernel_experts=megakernel)
+            if megakernel is not None
+            else SimpleNamespace()
+        ),
+        config=SimpleNamespace(cuda_graph_modules=cuda_graph_modules),
+        **attributes,
+    )
+    for name in ("_cuda_graph_megakernel", "_after_te_cuda_graphs_deleted"):
+        setattr(layer, name, MethodType(getattr(TransformerLayer, name), layer))
+    return layer
+
+
+_MEGAKERNEL_GRAPH_SCOPES = pytest.mark.parametrize(
+    "is_moe_layer, has_megakernel, cuda_graph_modules, in_graph",
+    [
+        (True, True, [CudaGraphModule.attn, CudaGraphModule.moe], True),
+        (True, True, [CudaGraphModule.moe], True),
+        # An empty scope graphs the whole layer.
+        (True, True, [], True),
+        # The megakernel runs eagerly after a router-only graph and refreshes itself.
+        (True, True, [CudaGraphModule.attn, CudaGraphModule.moe_router], False),
+        (True, False, [CudaGraphModule.attn, CudaGraphModule.moe], False),
+        (False, False, [CudaGraphModule.attn, CudaGraphModule.mlp], False),
+    ],
+)
+
+
+@_MEGAKERNEL_GRAPH_SCOPES
+def test_layer_refreshes_megakernel_weight_views_only_before_moe_graph_replay(
+    is_moe_layer, has_megakernel, cuda_graph_modules, in_graph
+):
+    calls = []
+    megakernel = SimpleNamespace(refresh_weight_views=lambda: calls.append("refresh"))
+    layer = _graph_layer(is_moe_layer, megakernel if has_megakernel else None, cuda_graph_modules)
+
+    assert layer._cuda_graph_megakernel() is (megakernel if in_graph else None)
+    TransformerLayer._before_te_cuda_graph_replay(layer)
+
+    assert calls == (["refresh"] if in_graph else [])
+
+
+@_MEGAKERNEL_GRAPH_SCOPES
+def test_layer_releases_megakernel_only_from_its_deleted_moe_graphs(
+    is_moe_layer, has_megakernel, cuda_graph_modules, in_graph
+):
+    calls = []
+    megakernel = SimpleNamespace(cuda_graphs_deleted=lambda: calls.append("deleted"))
+    layer = _graph_layer(is_moe_layer, megakernel if has_megakernel else None, cuda_graph_modules)
+
+    TransformerLayer._after_te_cuda_graphs_deleted(layer)
+
+    assert calls == (["deleted"] if in_graph else [])
+
+
+def test_cuda_graphs_deleted_hooks_default_to_noop():
+    class _Backend(MegakernelBackend):
+        def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+            return hidden_states
+
+    assert _Backend().cuda_graphs_deleted() is None
+    assert GraphableMegatronModule._after_te_cuda_graphs_deleted(SimpleNamespace()) is None
+
+
 def _split_module(*, use_mxfp8_weights):
     module = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
     torch.nn.Module.__init__(module)
     module.native_single_grouped_weights = False
     module.use_mxfp8_weights = use_mxfp8_weights
-    module.is_first_microbatch = True
-    module._routed_weight_view_cache = None
+    module._reset_derived_state()
     module.intermediate_size = 4
     module.hidden_size = 8
     module._routed_fc1_parameter_names = ("routed_fc1_weight0", "routed_fc1_weight1")
@@ -430,8 +704,15 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     mok.native_single_grouped_weights = single_grouped
     mok.intermediate_size = 4
     mok.hidden_size = 8
-    mok._routed_weight_view_cache = object()
-    mok._split_main_grad_descriptor_cache = object()
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
+    )
+    for name in derived_state:
+        setattr(mok, name, object())
     mok.is_first_microbatch = False
     if single_grouped:
         mok.register_parameter("routed_fc1_weight", routed_fc1)
@@ -468,8 +749,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     if gated:
         torch.testing.assert_close(gate_weight, checkpoint["shared_experts.gate_weight"])
         assert mok.shared_output_gate_weight is shared.gate_weight
-    assert mok._routed_weight_view_cache is None
-    assert mok._split_main_grad_descriptor_cache is None
+    assert all(getattr(mok, name) is None for name in derived_state)
     assert mok.is_first_microbatch
 
 
@@ -486,7 +766,6 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     )
     module._register_shared_weights(shared, use_output_gate=gated)
     module.mok_config = module.ep_group = object()
-    module._split_main_grad_descriptor_cache = None
     module.num_local_experts = module.topk = 2
     module.swiglu_limit = None
     parameters = tuple(module.parameters())
@@ -564,3 +843,588 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     finally:
         for handle in handles:
             handle.remove()
+
+
+def test_routed_parameter_tuples_are_resolved_once_until_apply():
+    module = _split_module(use_mxfp8_weights=False)
+    routed = module.autograd_routed_parameters
+    expected = [module.get_parameter(name) for name in module._routed_fc1_parameter_names]
+    expected += [module.get_parameter(name) for name in module._routed_fc2_parameter_names]
+
+    assert module.autograd_routed_parameters is routed
+    assert module.routed_fc1_parameters is module.routed_fc1_parameters
+    assert all(actual is param for actual, param in zip(routed, expected, strict=True))
+
+    # Device and dtype conversions may replace parameter objects, so they drop the tuples.
+    module.float()
+    assert module.autograd_routed_parameters is not routed
+    assert all(
+        actual is module.get_parameter(name)
+        for actual, name in zip(
+            module.autograd_routed_parameters,
+            module._routed_fc1_parameter_names + module._routed_fc2_parameter_names,
+            strict=True,
+        )
+    )
+
+
+def _split_module_with_main_grads(monkeypatch):
+    """Return a split BF16 module with main grads and a fake ``mok.ops`` recording tables."""
+    module = _split_module(use_mxfp8_weights=False)
+    module.register_parameter(
+        "shared_fc1_weight", torch.nn.Parameter(torch.randn((8, 8), dtype=torch.bfloat16))
+    )
+    module.register_parameter(
+        "shared_fc2_weight", torch.nn.Parameter(torch.randn((8, 4), dtype=torch.bfloat16))
+    )
+    for param in module.parameters():
+        param.main_grad = torch.zeros(param.shape, dtype=torch.float32)
+
+    tables = []
+
+    def make_routed_d_weight_storage_table(main_grads):
+        tables.append(tuple(main_grads))
+        return object()
+
+    fake_mok = types.ModuleType("mok")
+    fake_mok.ops = SimpleNamespace(
+        make_routed_d_weight_storage_table=make_routed_d_weight_storage_table
+    )
+    monkeypatch.setitem(sys.modules, "mok", fake_mok)
+    return module, fake_mok, tables
+
+
+def test_main_grad_arguments_are_reused_until_a_main_grad_changes(monkeypatch):
+    module, _, tables = _split_module_with_main_grads(monkeypatch)
+    validated = []
+    main_grad_buffer = parameter_bridge.main_grad_buffer
+
+    def counting_main_grad_buffer(param):
+        validated.append(param)
+        return main_grad_buffer(param)
+
+    monkeypatch.setattr(mok_backend, "_main_grad_buffer", counting_main_grad_buffer)
+    fc1, fc2 = module.routed_fc1_parameters, module.routed_fc2_parameters
+
+    first = module.main_grad_arguments()
+    assert module.main_grad_arguments() is first
+    assert len(validated) == 6 and len(tables) == 2
+    main_grads, storage_tables = first
+    expected = (
+        module.shared_fc1_weight.main_grad,
+        fc1[0].main_grad,
+        module.shared_fc2_weight.main_grad,
+        fc2[0].main_grad,
+    )
+    assert all(actual is grad for actual, grad in zip(main_grads, expected, strict=True))
+    assert len(storage_tables) == 2
+    assert all(actual is param.main_grad for actual, param in zip(tables[0] + tables[1], fc1 + fc2))
+
+    # A replaced main_grad (for example, rebuilt DDP buffers) is revalidated and redescribed.
+    fc1[1].main_grad = torch.zeros_like(fc1[1].main_grad)
+    second = module.main_grad_arguments()
+    assert second is not first
+    assert len(validated) == 12 and len(tables) == 4
+    assert tables[2][1] is fc1[1].main_grad
+    assert module.main_grad_arguments() is second
+
+    # Storage that moves under the same main_grad object (grad-buffer offload and reload) too.
+    fc2[0].main_grad.set_(torch.zeros_like(fc2[0].main_grad))
+    third = module.main_grad_arguments()
+    assert third is not second and len(tables) == 6
+
+    # A missing main_grad still raises the validation error instead of reusing the cache.
+    del fc2[1].main_grad
+    with pytest.raises(RuntimeError, match="requires DDP to assign param.main_grad"):
+        module.main_grad_arguments()
+
+
+def test_mok_main_grad_arguments_are_cached_in_mok_gate_up_order(monkeypatch):
+    module, _, tables = _split_module_with_main_grads(monkeypatch)
+
+    first = module.mok_main_grad_arguments()
+    # MOK validates its main grads once per tensor object, so repeated calls reuse every view.
+    assert module.mok_main_grad_arguments() is first
+    main_grads, storage_tables = first
+    expected, expected_tables = mok_runtime._gate_up_main_grad_arguments(
+        *module.main_grad_arguments(), module.intermediate_size
+    )
+    for actual, reference in zip(main_grads, expected, strict=True):
+        assert actual.data_ptr() == reference.data_ptr() and actual.shape == reference.shape
+    assert storage_tables == expected_tables and len(tables) == 2
+
+    # A replaced main_grad rebuilds the MOK-order arguments together with the logical ones.
+    module.shared_fc1_weight.main_grad = torch.zeros_like(module.shared_fc1_weight.main_grad)
+    second = module.mok_main_grad_arguments()
+    assert second is not first
+    assert second[0][0].data_ptr() == module.shared_fc1_weight.main_grad.data_ptr()
+    assert module.mok_main_grad_arguments() is second
+
+
+def test_shared_fc1_gate_up_views_are_reused_until_the_weight_storage_changes(monkeypatch):
+    module, _, _ = _split_module_with_main_grads(monkeypatch)
+    shared_fc1 = module.shared_fc1_weight
+
+    first = module.shared_fc1_gate_up()
+    assert module.shared_fc1_gate_up() is first
+    shared_gate, shared_up = first
+    torch.testing.assert_close(shared_gate, shared_fc1[:4], rtol=0, atol=0)
+    torch.testing.assert_close(shared_up, shared_fc1[4:], rtol=0, atol=0)
+    assert shared_gate.data_ptr() == shared_fc1.data_ptr()
+    assert shared_gate.grad_fn is None and not shared_gate.requires_grad
+
+    # In-place updates (the optimizer step) keep the views; new storage (DDP's buffer
+    # re-pointing) and derived-state resets rebuild them.
+    with torch.no_grad():
+        shared_fc1.add_(1.0)
+    assert module.shared_fc1_gate_up() is first
+    torch.testing.assert_close(first[1], shared_fc1[4:], rtol=0, atol=0)
+    shared_fc1.data = torch.randn_like(shared_fc1)
+    second = module.shared_fc1_gate_up()
+    assert second is not first and second[0].data_ptr() == shared_fc1.data_ptr()
+    module._reset_derived_state()
+    assert module.shared_fc1_gate_up() is not second
+
+
+def test_backward_options_follow_the_installed_mok_signature():
+    def legacy_backward(*args, shared_output_gate_weight=None, **kwargs):
+        del args, shared_output_gate_weight, kwargs
+
+    def backward(*args, zero_unrouted_router_grads=True, **kwargs):
+        del args, zero_unrouted_router_grads, kwargs
+
+    assert mok_runtime._backward_options(legacy_backward) == {}
+    options = mok_runtime._backward_options(backward)
+    # The route adapter reads router-weight gradients only at routed slots.
+    assert options == {"zero_unrouted_router_grads": False}
+    assert mok_runtime._backward_options(backward) is options
+
+
+def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_parameter(monkeypatch):
+    module, fake_mok, _ = _split_module_with_main_grads(monkeypatch)
+    module.mok_config = object()
+    module.ep_group = None
+    module.num_local_experts = 2
+    module.swiglu_limit = None
+    monkeypatch.setattr(mok_backend, "_native_split_weight_view", lambda *a, **k: object())
+
+    def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
+        return x * 2, "forward_context"
+
+    def backward(config, workspace, schedule, forward_context, grad_output, *args, **kwargs):
+        x, router_weights = args[:2]
+        return (2 * grad_output, torch.ones_like(router_weights)) + (None,) * 6
+
+    fake_mok.functional = SimpleNamespace(
+        get_workspace=lambda *args, **kwargs: "workspace",
+        build_schedule=lambda *args, **kwargs: "schedule",
+        forward=forward,
+        backward=backward,
+    )
+    x = torch.randn((4, 8), dtype=torch.bfloat16, requires_grad=True)
+    router_weights = torch.rand((4, 2), requires_grad=True)
+    top_experts = torch.zeros((4, 2), dtype=torch.int32)
+    routed = module.autograd_routed_parameters
+    shared = (module.shared_fc1_weight, module.shared_fc2_weight)
+
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
+        output = mok_runtime._MoKAutograd.apply(
+            module, x, router_weights, top_experts, None, *routed, *shared
+        )
+    # Backward reaches routed weights through the module, so only these are saved.
+    assert len(saved) == 4
+    assert all(actual is t for actual, t in zip(saved, (x, router_weights, *shared)))
+
+    output.float().sum().backward()
+
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+    torch.testing.assert_close(router_weights.grad, torch.ones_like(router_weights))
+    # Every parameter input still receives a gradient, so each DDP AccumulateGrad hook fires.
+    for param in routed + shared:
+        assert param.grad_added_to_main_grad
+        buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
+        assert param.grad is not None and param.grad.data_ptr() == buffer.data_ptr()
+
+
+def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, **config_extra):
+    """Build the actual adapter while keeping these contract tests independent of MOK."""
+    if mxfp8:
+        from megatron.core import fp8_utils
+
+        monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", object())
+    package = ModuleType("mok")
+    functional = ModuleType("mok.functional")
+    functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    package.functional = functional
+    package.ops = SimpleNamespace(make_routed_d_weight_storage_table=lambda _: object())
+    monkeypatch.setitem(sys.modules, "mok", package)
+    monkeypatch.setitem(sys.modules, "mok.functional", functional)
+    experts = torch.nn.Module()
+    experts.linear_fc1 = torch.nn.Module()
+    experts.linear_fc2 = torch.nn.Module()
+    for linear, shape in ((experts.linear_fc1, (8, 8)), (experts.linear_fc2, (8, 4))):
+        linear.single_grouped_weight = single_grouped
+        if single_grouped:
+            linear.register_parameter(
+                "weight", torch.nn.Parameter(torch.zeros((2, *shape), dtype=torch.bfloat16))
+            )
+        else:
+            for index in range(2):
+                linear.register_parameter(
+                    f"weight{index}", torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
+                )
+    gate = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16)) if gated else None
+    shared = _shared_module(
+        torch.nn.Parameter(torch.zeros((8, 8), dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros((8, 4), dtype=torch.bfloat16)),
+        gate,
+    )
+    config = SimpleNamespace(
+        gradient_accumulation_fusion=True,
+        moe_mlp_glu_interleave_size=None,
+        moe_shared_expert_glu_interleave_size=None,
+        moe_pad_expert_input_to_capacity=False,
+        moe_shared_expert_gate=gated,
+        hidden_size=8,
+        moe_ffn_hidden_size=4,
+        moe_shared_expert_intermediate_size=4,
+        moe_router_topk=2,
+        activation_func_clamp_value=None,
+        fp8="hybrid" if mxfp8 else None,
+        fp8_recipe="mxfp8",
+        fp8_param=mxfp8,
+        moe_single_grouped_weight=single_grouped,
+        moe_megakernel_backend_config=None,
+        **config_extra,
+    )
+    module = mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
+    return module, shared, functional
+
+
+@pytest.mark.parametrize(
+    "config_extra, refreshed_outside_graph",
+    [
+        ({}, False),
+        ({"cuda_graph_impl": "none", "cuda_graph_modules": []}, False),
+        ({"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []}, False),
+        (
+            {
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            },
+            False,
+        ),
+        (
+            {
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe],
+            },
+            True,
+        ),
+    ],
+)
+def test_weight_view_refresh_leaves_the_graph_only_for_the_te_moe_scope(
+    monkeypatch, config_extra, refreshed_outside_graph
+):
+    module, _, _ = _mock_backend(monkeypatch, mxfp8=True, **config_extra)
+
+    assert module._weight_views_refreshed_outside_graph is refreshed_outside_graph
+    assert not module._weight_views_captured
+
+
+def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(monkeypatch):
+    """Captured weight views block parameter reloads and moves only while a graph references them:
+    TECudaGraphHelper.delete_cuda_graphs releases them through the layer."""
+    from megatron.core.transformer import cuda_graphs
+
+    moe_scope = [CudaGraphModule.attn, CudaGraphModule.moe]
+    module, _, _ = _mock_backend(
+        monkeypatch, mxfp8=True, cuda_graph_impl="transformer_engine", cuda_graph_modules=moe_scope
+    )
+    capturing = [False]
+    monkeypatch.setattr(
+        mok_backend, "_native_split_weight_view", lambda *args, cached_view=None, **kwargs: object()
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    module.refresh_weight_views()  # eager warm-up builds the views
+    capturing[0] = True
+    module.quantized_routed_weights()  # the capture records them
+    capturing[0] = False
+    assert module._weight_views_captured
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module.load_state_dict({}, strict=False)
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module._apply(lambda tensor: tensor)
+
+    graph = SimpleNamespace(reset=lambda: None)
+    layer = _graph_layer(
+        True, module, moe_scope, cuda_graphs=[graph], cuda_graph_manual_hooks=[object()]
+    )
+    helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
+    helper.callables_per_chunk = [[layer]]
+    helper.tp_group = helper.dp_cp_group = None
+    helper._graphs_created = True
+    # Only the deletion log needs a process group.
+    monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    helper.delete_cuda_graphs()
+
+    assert not helper.graphs_created()
+    assert layer.cuda_graphs == [] and layer.cuda_graph_manual_hooks == []
+    assert not module._weight_views_captured
+    # A checkpoint reload and a dtype move work again, and drop the views they invalidate.
+    module.load_state_dict({}, strict=False)
+    assert module._routed_weight_view_cache is None and module.is_first_microbatch
+    module.refresh_weight_views()
+    module.float()
+    assert module._routed_weight_view_cache is None
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_captured_weight_views_reject_a_conversion_before_any_parameter_changes(monkeypatch, swap):
+    """A conversion while captured graphs reference the cached weight views raises before it
+    changes a parameter or a derived cache; deleting the graphs lets the same conversion run."""
+    module, _, _ = _split_module_with_main_grads(monkeypatch)
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    capturing = [False]
+    # Like MOK's BF16 views, these alias the parameter storage.
+    monkeypatch.setattr(
+        mok_backend,
+        "_native_split_weight_view",
+        lambda params, **kwargs: tuple(map(torch.Tensor.detach, params)),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    module.refresh_weight_views()
+    module.main_grad_arguments()
+    module.shared_fc1_gate_up()
+    module.finish_routed_weight_gradients()
+    capturing[0] = True
+    module.quantized_routed_weights()  # the capture records the cached views
+    capturing[0] = False
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
+    )
+    caches = {name: getattr(module, name) for name in derived_state}
+    assert module._weight_views_captured
+    assert all(cache is not None for cache in caches.values())
+    parameters = dict(module._parameters)
+
+    def parameter_state():
+        return {
+            name: (param.dtype, param.device, param.untyped_storage().data_ptr())
+            for name, param in module._parameters.items()
+        }
+
+    state = parameter_state()
+    views = module._routed_weight_view_cache[0] + module._routed_weight_view_cache[1]
+
+    swap_before = torch.__future__.get_swap_module_params_on_conversion()
+    try:
+        torch.__future__.set_swap_module_params_on_conversion(swap)
+        with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+            module.float()
+
+        assert module._parameters.keys() == parameters.keys()
+        assert all(module._parameters[name] is param for name, param in parameters.items())
+        assert parameter_state() == state
+        assert all(getattr(module, name) is cache for name, cache in caches.items())
+        routed = module.autograd_routed_parameters
+        assert all(
+            view.data_ptr() == param.data_ptr() for view, param in zip(views, routed, strict=True)
+        )
+        assert module._weight_views_captured and not module.is_first_microbatch
+
+        module.cuda_graphs_deleted()
+        module.float()
+    finally:
+        torch.__future__.set_swap_module_params_on_conversion(swap_before)
+
+    assert all(param.dtype == torch.float32 for param in module.parameters())
+    assert all(hasattr(param, "main_grad") for param in module.parameters())
+    assert all(getattr(module, name) is None for name in derived_state)
+    assert module.is_first_microbatch
+
+
+def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):
+    module, shared, _ = _mock_backend(monkeypatch)
+    shared.gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.float32))
+    with pytest.raises(RuntimeError, match="native contiguous BF16 Parameter"):
+        module._register_shared_weights(shared, use_output_gate=True)
+
+
+@pytest.mark.parametrize(
+    "mxfp8, single_grouped, gated, main_grad_dtype",
+    [
+        pytest.param(False, False, True, torch.float32, id="bf16-split-g-fp32"),
+        pytest.param(True, False, True, torch.bfloat16, id="mxfp8-split-g-bf16"),
+        pytest.param(True, True, True, torch.float32, id="mxfp8-single-g-fp32"),
+        pytest.param(False, True, False, torch.bfloat16, id="bf16-single-u-bf16"),
+    ],
+)
+def test_gate_autograd_accumulation_and_ddp_hooks(
+    monkeypatch, single_grouped, gated, mxfp8, main_grad_dtype
+):
+    from megatron.core.distributed import distributed_data_parallel as ddp_module
+
+    module, shared, functional = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
+    )
+    gate = shared.gate_weight
+    assert module.shared_output_gate_weight is gate
+    parameters = tuple(module.parameters())
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
+    expected = torch.full((1, 8), 0.25, dtype=main_grad_dtype)
+    if gated:
+        assert gate.dtype == torch.bfloat16
+        with torch.no_grad():
+            gate.fill_(3.0)  # Expose accidental accumulation of the hook-only sentinel.
+        gate_main_grad = gate.main_grad
+        gate_main_grad.copy_(expected)
+    gate_contribution = torch.full((1, 8), 0.1234, dtype=torch.float32)
+    # Placeholder views support MXFP8 slicing; this test checks gate wiring, not routed math.
+    view = (None,) * 4
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (view, view))
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    gate_keys = {"shared_output_gate_weight"} if gated else set()
+
+    def forward(*args, **kwargs):
+        assert set(kwargs) == {"swiglu_limit"} | gate_keys
+        assert kwargs.get("shared_output_gate_weight") is gate
+        return args[3].clone(), object()
+
+    def backward(*args, **kwargs):
+        keys = {"swiglu_limit", "main_grads", "main_grad_storage_tables"} | gate_keys
+        if gated:
+            keys.add("shared_output_gate_main_grad")
+        assert set(kwargs) == keys
+        assert kwargs.get("shared_output_gate_weight") is gate
+        gate_grad = kwargs.get("shared_output_gate_main_grad")
+        if gated:
+            assert gate_grad is gate_main_grad and gate_grad.dtype == main_grad_dtype
+            gate_grad.add_(gate_contribution)
+        grads = (torch.ones_like(args[5]), torch.ones_like(args[6]), *kwargs["main_grads"])
+        # Preserve the legacy ungated eight-item API.
+        return (*grads, gate_grad) if gated else grads
+
+    functional.forward = forward
+    functional.backward = backward
+    x = torch.zeros((2, 2, 8), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: False)
+    waited, ready = [], []
+    bucket = SimpleNamespace(register_grad_ready=lambda param, force: ready.append((param, force)))
+    ddp = SimpleNamespace(
+        use_forward_hook=True,
+        param_to_bucket_group={gate: bucket} if gated else {},
+        _finish_param_sync_for_bucket_group=lambda group: waited.append(group),
+        ddp_config=SimpleNamespace(overlap_grad_reduce=True),
+        force_all_reduce=False,
+    )
+    handles = [
+        module.register_forward_pre_hook(
+            ddp_module.DistributedDataParallel._make_forward_pre_hook(ddp)
+        )
+    ]
+    if gated:
+        accumulator = gate.expand_as(gate).grad_fn.next_functions[0][0]
+        handles.append(
+            accumulator.register_hook(
+                ddp_module.DistributedDataParallel._make_backward_post_hook(ddp, gate)
+            )
+        )
+    try:
+        for iteration in range(3):
+            x.grad = probs.grad = None
+            for parameter in parameters:
+                parameter.grad = None
+                parameter.grad_added_to_main_grad = False
+            if gated and iteration == 2:
+                gate_main_grad.zero_()  # The same buffer must also work after optimizer zeroing.
+                expected.zero_()
+            output = module(x, probs, experts)
+            assert output.shape == x.shape
+            bridge = output.grad_fn.next_functions[0][0]
+            output.backward(torch.ones_like(output))
+            torch.testing.assert_close(x.grad, torch.ones_like(x))
+            torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+            assert all(param.grad_added_to_main_grad for param in parameters)
+            if gated:
+                assert gate.grad is None and gate.main_grad is gate_main_grad
+                expected = (expected.float() + gate_contribution).to(main_grad_dtype)
+                torch.testing.assert_close(gate_main_grad, expected, rtol=0, atol=0)
+                torch.testing.assert_close(gate, torch.full_like(gate, 3.0))
+            assert bridge.module is None and bridge.forward_context is None
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert waited == ([bucket] * 3 if gated else [])
+    assert ready == ([(gate, False)] * 3 if gated else [])
+
+
+def test_runtime_passes_supported_backward_options(monkeypatch):
+    module, _, functional = _mock_backend(monkeypatch, gated=False)
+    for parameter in module.parameters():
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+    view = object()
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (view, view))
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    seen = []
+
+    def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
+        # Cached shared views and the same combined routed FC1 payload for gate and up.
+        assert all(map(operator.is_, weights[:2], module.shared_fc1_gate_up()))
+        assert weights[3] is weights[4] is view
+        return x.clone(), object()
+
+    def backward(*args, zero_unrouted_router_grads=True, **kwargs):
+        seen.append(zero_unrouted_router_grads)
+        assert kwargs["main_grads"] is module.mok_main_grad_arguments()[0]
+        return (torch.ones_like(args[5]), torch.ones_like(args[6])) + (None,) * 7
+
+    functional.forward = forward
+    functional.backward = backward
+    x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+
+    module(x, probs, experts).sum().backward()
+
+    assert seen == [False]
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+
+
+def test_runtime_requires_output_gate_main_grad(monkeypatch):
+    module, shared, functional = _mock_backend(monkeypatch)
+    parameters = module.autograd_routed_parameters + (
+        shared.linear_fc1.weight,
+        shared.linear_fc2.weight,
+    )
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+    x = torch.zeros((4, 8), dtype=torch.bfloat16)
+    probs = torch.zeros((4, 2), dtype=torch.float32)
+    ctx = SimpleNamespace(
+        module=module,
+        routed_weight_views=(module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
+        saved_tensors=(
+            x,
+            probs,
+            shared.gate_weight,
+            shared.linear_fc1.weight,
+            shared.linear_fc2.weight,
+        ),
+    )
+    functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
+    with pytest.raises(RuntimeError, match="DDP to assign param.main_grad"):
+        mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
