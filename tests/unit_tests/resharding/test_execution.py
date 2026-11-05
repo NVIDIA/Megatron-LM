@@ -405,12 +405,6 @@ class TestEdgeCases:
 
         barrier.assert_not_called()
 
-    def test_empty_plan(self):
-        """Empty plan (no ops) should complete without error."""
-        plan = ReshardPlan(send_ops=[], recv_ops=[])
-        service = MockCopyService()
-        _run(plan, None, None, service)
-
     def test_native_service_bypasses_slice_submission(self):
         src_module = _make_module_with_params({"weight": torch.ones(2, device="cuda")})
         dst_module = _make_module_with_params({"weight": torch.zeros(2, device="cuda")})

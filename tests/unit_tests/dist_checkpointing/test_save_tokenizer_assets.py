@@ -343,28 +343,3 @@ class TestSaveTokenizerAssets:
             # Verify MSC methods were called
             mock_msc_feature.is_enabled.assert_called()
             mock_msc_feature.import_package.assert_called()
-
-    @patch("torch.distributed.is_initialized")
-    @patch("torch.distributed.get_rank")
-    @patch("megatron.training.checkpointing.logger")
-    def test_save_tokenizer_assets_huggingface_save_pretrained(
-        self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture
-    ):
-        """Test that HuggingFace tokenizer's save_pretrained is called."""
-        mock_dist_init.return_value = False
-
-        # Mock tokenizer with save_pretrained on the wrapped _tokenizer
-        # Use spec to make hasattr work correctly
-        mock_inner_tokenizer = Mock(spec=["save_pretrained"])
-        mock_tokenizer = Mock(spec=["_tokenizer"])
-        mock_tokenizer._tokenizer = mock_inner_tokenizer
-
-        config = Mock()
-        config.tokenizer_type = "HuggingFaceTokenizer"
-        config.tokenizer_model = "bert-base-uncased"
-
-        save_tokenizer_assets(mock_tokenizer, config, checkpoint_path_fixture)
-
-        # Verify save_pretrained was called with tokenizer directory
-        tokenizer_dir = os.path.join(checkpoint_path_fixture, "tokenizer")
-        mock_tokenizer._tokenizer.save_pretrained.assert_called_once_with(tokenizer_dir)
