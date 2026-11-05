@@ -264,6 +264,9 @@ class TestTrainingLoopPgCollection:
         monkeypatch.setattr(training, "get_model", Mock(return_value=model))
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
         monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+        # The model's collection has no data-parallel group, so the setup memory report would
+        # read the global grid.
+        monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
         _forbid_global_reads(monkeypatch, training)
 
         # The run's collection has no pipeline parallelism; the model's own collection decides.
