@@ -107,7 +107,7 @@ class TestParallelMLPWithGLU:
         activation_extra_states = {
             key: value
             for key, value in sharded_state_dict.items()
-            if key.endswith('activation_func._extra_state')
+            if key.endswith("activation_func._extra_state")
         }
         assert len(activation_extra_states) == 1
         activation_extra_state = next(iter(activation_extra_states.values()))
@@ -118,7 +118,7 @@ class TestParallelMLPWithGLU:
         )
 
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_te_activation_extra_state_tracks_tp_replica', sync=True
+            tmp_path_dist_ckpt / "test_te_activation_extra_state_tracks_tp_replica", sync=True
         ) as ckpt_dir:
             save(sharded_state_dict, ckpt_dir, validate_access_integrity=True)
 

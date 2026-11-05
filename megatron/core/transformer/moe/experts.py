@@ -1464,7 +1464,7 @@ class TEGroupedMLP(MegatronModule):
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         activation_metadata = dict(metadata)
-        activation_metadata['dp_cp_group'] = self.dp_group_gtp_remat
+        activation_metadata["dp_cp_group"] = self.dp_group_gtp_remat
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
@@ -1473,7 +1473,7 @@ class TEGroupedMLP(MegatronModule):
             # EGTP_remat. Use the joint ETP-EP group as its TP replica coordinate and the full
             # expt_dp x EGTP_remat group as its DP coordinate so exactly one rank is selected
             # without changing the checkpoint object's global shape or key.
-            is_activation_module = name == 'activation_func'
+            is_activation_module = name == "activation_func"
             sub_sd = sharded_state_dict_default(
                 module,
                 f'{name}.',
