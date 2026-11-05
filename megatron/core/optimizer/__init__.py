@@ -1124,7 +1124,8 @@ def _get_megatron_fsdp_emerging_optimizer(
     FsdpMuon updates the Muon matrices, and the standard factory path builds the optimizer for
     the remaining parameters. Each is wrapped in a FullyShardedOptimizer, which supplies the
     DTensor-aware gradient statistics and checkpoint interfaces, and a ChainedOptimizer combines
-    them. MFSDP v2 plans Muon's owners per mesh, so dense and expert parameters share one FsdpMuon.
+    them. MFSDP v2 plans Muon's owners jointly across meshes, so dense and expert parameters
+    share one FsdpMuon.
     """
     if config.optimizer != 'muon':
         raise NotImplementedError(
