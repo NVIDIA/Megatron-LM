@@ -163,6 +163,28 @@ def test_release_all_cuda_graphs_releases_runner_without_capture_records(
 
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
+def test_release_all_cuda_graphs_synchronizes_before_releasing_graphs(
+    isolated_cuda_graph_record, monkeypatch
+):
+    events = []
+
+    class Graph:
+        def reset(self):
+            events.append("reset")
+
+    runner, _ = _runner_with_created_graphs()
+    runner.fwd_graph = Graph()
+    runner.bwd_graph = None
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+
+    # A replay may still read the graph's external constants until the device is idle.
+    release_all_cuda_graphs()
+
+    assert events[:2] == ["synchronize", "reset"]
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
 def test_delete_cuda_graphs_releases_created_training_graphs(isolated_cuda_graph_record):
     # An inference engine's suspend calls delete_cuda_graphs(). Capture added the
     # training runner to 'captured_runners', so its created graphs are released too.

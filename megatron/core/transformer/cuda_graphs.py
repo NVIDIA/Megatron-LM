@@ -940,6 +940,10 @@ def release_all_cuda_graphs():
     runners = list(_CudagraphGlobalRecord.all_runners)
     if not runners and CudaGraphManager.global_mempool is None:
         return
+    if runners:
+        # As in 'delete_cuda_graphs': a replay can still be using the external
+        # constants that resetting a runner releases.
+        torch.cuda.synchronize()
     for runner in runners:
         _reset_cuda_graph_runner(runner)
     delete_cuda_graphs()
