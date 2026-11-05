@@ -513,11 +513,7 @@ def test_model_setup_uses_owned_ddp_config(
         pass
 
     def construct(*unused_args, **kwargs):
-        assert kwargs["ddp_config"] == ddp
-        if native_builder:
-            assert kwargs["ddp_config"] is not ddp
-        else:
-            assert kwargs["ddp_config"] is ddp
+        assert kwargs["ddp_config"] is ddp
         assert ddp.grad_buffer_offload is perform_rl_step
         assert run_config.ddp is ddp
         if perform_rl_step:
