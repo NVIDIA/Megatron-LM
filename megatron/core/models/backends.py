@@ -68,6 +68,21 @@ def require(requirement: str, requested_by: str = "This backend", instead: str =
         raise ImportError(f"{message} {instead}".strip())
 
 
+def _te_has_memory_efficient_cross_entropy() -> bool:
+    """Check TE 2.19's tiled/statistics CE and input-ownership API once at binding.
+
+    TE PR #3273 introduced both in 2.19. Development builds additionally need
+    the API probe: a version string alone cannot identify pre-merge builds.
+    """
+    from megatron.core.extensions import transformer_engine as te_extensions
+
+    return (
+        is_te_min_version("2.19.0.dev0")
+        and te_extensions.te_parallel_cross_entropy is not None
+        and getattr(te_extensions, "_TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT", False)
+    )
+
+
 def select_cross_entropy(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
@@ -78,15 +93,26 @@ def select_cross_entropy(
     Shared by every provider: the choice depends on the config, not on which backend supplies
     the rest of the model, which is how it behaved before this was a provider decision.
     """
-    if cross_entropy_fusion_impl not in ("native", "te"):
+    if cross_entropy_fusion_impl not in ("native", "te", "auto"):
         raise ValueError(
             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
-            "Valid choices: native, te"
+            "Valid choices: native, te, auto"
         )
     if not cross_entropy_loss_fusion:
         return unfused_cross_entropy
     if cross_entropy_fusion_impl == "native":
         return _fused_ce
+
+    if cross_entropy_fusion_impl == "auto":
+        if _te_has_memory_efficient_cross_entropy():
+            return partial(
+                te_cross_entropy,
+                cuda_graph_capturable=cuda_graph_impl == "full_iteration",
+                overwrite_input=False,
+            )
+        from megatron.core.ops.cross_entropy import triton_cross_entropy
+
+        return triton_cross_entropy
 
     # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
     capturable = cuda_graph_impl == "full_iteration"

@@ -105,6 +105,13 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="tiled_cross_entropy",
+        sources=("megatron/core/ops/cross_entropy.py",),
+        tests=(K + "test_tiled_cross_entropy.py",),
+        kind="triton",
+        notes="Fixed-order vocabulary tile reductions; replay loss and input gradients.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),

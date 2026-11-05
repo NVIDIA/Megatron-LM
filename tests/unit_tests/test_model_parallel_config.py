@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Ported from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron
+# Revision: f1856ec3ef887125dc7ad81f312c9ec837a3bb11
+# License: BSD-3-Clause (see the source repository LICENSE).
 
 import sys
 
@@ -157,3 +160,23 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
     else:
         with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
             ModelParallelConfig(sequence_parallel=True, **kwargs)
+
+
+def test_auto_cross_entropy_config():
+    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="auto")
+    assert config.cross_entropy_fusion_impl == "auto"
+
+
+def test_auto_cross_entropy_preserves_unfused_selection():
+    from megatron.core.models.backends import select_cross_entropy
+
+    assert select_cross_entropy(False, "auto") is select_cross_entropy(False, "native")
+
+
+def test_auto_cross_entropy_cli(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["test", "--cross-entropy-loss-fusion", "--cross-entropy-fusion-impl", "auto"]
+    )
+    args = parse_args()
+    assert args.cross_entropy_loss_fusion
+    assert args.cross_entropy_fusion_impl == "auto"
