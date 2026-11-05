@@ -16,6 +16,7 @@ from transformers import AutoModel
 
 from examples.multimodal.model import model_provider
 from examples.multimodal.multimodal_args import add_multimodal_extra_args
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.training import get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -57,11 +58,21 @@ def run_mcore_vision(model_path):
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron(training=False)
 
-    def wrapped_model_provider(pre_process, post_process):
-        return model_provider(pre_process, post_process, parallel_output=False)
+    # get_model passes the config and the process groups of the grid it builds the model on.
+    def wrapped_model_provider(pre_process, post_process, config=None, pg_collection=None):
+        return model_provider(
+            pre_process,
+            post_process,
+            parallel_output=False,
+            config=config,
+            pg_collection=pg_collection,
+        )
 
-    # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        wrapped_model_provider, wrap_with_ddp=False, pg_collection=get_registered_process_groups()
+    )
 
     vision_model = model[0].module.vision_model
 

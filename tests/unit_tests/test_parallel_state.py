@@ -6,12 +6,53 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as ps
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+@pytest.mark.parametrize(
+    "accessor, kwargs, group_name",
+    [
+        (ps.get_data_parallel_group_gloo, {}, '_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True},
+            '_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True, 'partial_data_parallel': True},
+            '_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (ps.get_expert_data_parallel_group_gloo, {}, '_EXPERT_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_expert_data_parallel_group_gloo,
+            {'partial_expert_data_parallel': True},
+            '_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO',
+        ),
+    ],
+)
+def test_optional_gloo_group_accessors(monkeypatch, accessor, kwargs, group_name):
+    """Absent Gloo groups are optional only when initialization checks are disabled."""
+    monkeypatch.setattr(ps, group_name, None)
+    with pytest.raises(AssertionError, match='not initialized'):
+        accessor(**kwargs)
+    assert accessor(**kwargs, check_initialized=False) is None
+
+    group = object()
+    monkeypatch.setattr(ps, group_name, group)
+    assert accessor(**kwargs) is group
+    assert accessor(**kwargs, check_initialized=False) is group
+
+
+def test_optional_gloo_group_still_requires_cp_for_partial_dp():
+    with pytest.raises(AssertionError, match='needs to include CP'):
+        ps.get_data_parallel_group_gloo(partial_data_parallel=True, check_initialized=False)
 
 
 def test_inject_gtp_remat_axis():
@@ -105,8 +146,10 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
-    with pytest.raises(AssertionError):
-        assert ps.initialize_model_parallel(order=order)
+    if not torch.distributed.is_initialized():
+        # initialize_model_parallel() requires torch.distributed to be initialized.
+        with pytest.raises(AssertionError):
+            ps.initialize_model_parallel(order=order)
     Utils.initialize_distributed()
     with pytest.raises(RuntimeError):
         assert ps.initialize_model_parallel(tensor_model_parallel_size=2 * world_size, order=order)
@@ -646,13 +689,16 @@ def test_valid_dynamic_cp_group_sizes():
         ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
-def test_separate_all_gather_group():
+def test_separate_all_gather_group(monkeypatch):
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     Utils.initialize_model_parallel(context_parallel_size=world_size)
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    # Without a collection, the deprecated form reads the global grid.
+    with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
+        dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
