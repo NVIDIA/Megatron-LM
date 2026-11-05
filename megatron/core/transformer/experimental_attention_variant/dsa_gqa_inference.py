@@ -102,6 +102,7 @@ def dynamic_sparse_attention(
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
     inference_context: BaseInferenceContext,
+    layer_number: int,
     index_topk: int,
     softmax_scale: float,
 ) -> torch.Tensor:
@@ -119,6 +120,7 @@ def dynamic_sparse_attention(
         index_query: Indexer queries ``[T,1,1,Di]``.
         index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``.
         inference_context: Dynamic inference context for this step.
+        layer_number: One-based layer number within the current pipeline stage.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
 
@@ -153,6 +155,7 @@ def dynamic_sparse_attention(
         index_query=index_query.reshape(num_tokens, -1),
         index_key_cache=index_key_cache,
         inference_context=inference_context,
+        layer_number=layer_number,
         plan=plan,
         max_context_length=max_context_length,
         index_topk=index_topk,
@@ -170,6 +173,7 @@ def _native_sparse_attention(
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
     inference_context: BaseInferenceContext,
+    layer_number: int,
     plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
@@ -177,14 +181,7 @@ def _native_sparse_attention(
 ) -> torch.Tensor:
     rows = plan.decode_lengths.numel()
     max_context = inference_context.max_sequence_length
-    cache_key = (
-        index_key_cache.data_ptr(),
-        rows,
-        query.shape[1:],
-        max_context,
-        index_topk,
-        key_cache.shape[1],
-    )
+    cache_key = (layer_number, rows, query.shape[1:], max_context, index_topk, key_cache.shape[1])
     cache = inference_context.dsa_metadata.decode_workspaces
     if cache_key not in cache:
         if torch.cuda.is_current_stream_capturing():
@@ -238,35 +235,6 @@ def _native_sparse_attention(
     return output
 
 
-class _FlashInferTopKWorkspace:
-    """Hint-free GVR2 top-k with scratch owned by this decode workspace."""
-
-    def __init__(self, scores: torch.Tensor, lengths: torch.Tensor, indices: torch.Tensor) -> None:
-        from flashinfer import top_k_varlen
-        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
-
-        self.topk = top_k_varlen
-        self.workspace = {
-            "gvr2_workspace": torch.zeros(
-                workspace_bytes(), dtype=torch.uint8, device=scores.device
-            )
-        }
-        self.scores, self.lengths, self.indices = scores, lengths, indices
-
-    def __call__(self) -> None:
-        if use_deterministic_mode():
-            raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
-
-        self.topk(
-            self.scores,
-            self.lengths,
-            self.indices.shape[1],
-            backend="gvr_2",
-            out_indices=self.indices,
-            workspace=self.workspace,
-        )
-
-
 class TritonDSADecodeWorkspace:
     """Reusable workspace for single-token DSA decode on Blackwell.
 
@@ -304,6 +272,7 @@ class TritonDSADecodeWorkspace:
         device: torch.device,
     ) -> None:
         import triton
+        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
         from triton.experimental.gluon import language as gl
         from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
@@ -337,7 +306,9 @@ class TritonDSADecodeWorkspace:
         self.page_size = page_size
         width = max(max_context, index_topk)
         self.score_width = triton.cdiv(width, 4) * 4
-        self._topk_selectors = {}
+        self._topk_workspace = {
+            "gvr2_workspace": torch.zeros(workspace_bytes(), dtype=torch.uint8, device=device)
+        }
         self.scores = torch.empty(batch_size, self.score_width, dtype=torch.float32, device=device)
         self.indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
         self.output = torch.empty(
@@ -377,8 +348,12 @@ class TritonDSADecodeWorkspace:
     ) -> torch.Tensor:
         """Score, select exact top-k, and attend into preallocated output storage."""
         import triton
+        from flashinfer import top_k_varlen
 
         from . import dsa_gqa_inference_kernels as kernels
+
+        if use_deterministic_mode():
+            raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
 
         requests = self.request_indices if request_indices is None else request_indices
         tensors = (
@@ -468,14 +443,14 @@ class TritonDSADecodeWorkspace:
                 STAGES=self._score_stages,
                 num_warps=4,
             )
-            selector_key = context_lengths.data_ptr()
-            if selector_key not in self._topk_selectors:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Decode top-k selector must be warmed before capture")
-                self._topk_selectors[selector_key] = _FlashInferTopKWorkspace(
-                    self.scores, context_lengths, self.indices
-                )
-            self._topk_selectors[selector_key]()
+            top_k_varlen(
+                self.scores,
+                context_lengths,
+                self.index_topk,
+                backend="gvr_2",
+                out_indices=self.indices,
+                workspace=self._topk_workspace,
+            )
             kernels._partial_kernel[(self.batch_size, 1, self._slices)](
                 query,
                 key_cache,

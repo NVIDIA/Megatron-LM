@@ -21,7 +21,6 @@ from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_S
 from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference as dsa_gqa
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
     TritonDSADecodeWorkspace,
-    _FlashInferTopKWorkspace,
     _sparse_attention_rows,
     dynamic_sparse_attention,
 )
@@ -75,10 +74,10 @@ def nondeterministic_decode(monkeypatch):
 
 @pytest.fixture
 def native_context_factory():
-    def make_context(*, max_sequence_length, max_requests, max_tokens, **kwargs):
+    def make_context(*, max_sequence_length, max_requests, max_tokens, num_layers=1, **kwargs):
         return DynamicInferenceContext(
             model_config=TransformerConfig(
-                num_layers=1,
+                num_layers=num_layers,
                 add_bias_linear=False,
                 hidden_size=HIDDEN_SIZE,
                 num_attention_heads=NUM_HEADS,
@@ -120,6 +119,7 @@ def test_speculative_decode_steps_are_rejected():
             index_query=None,
             index_key_cache=None,
             inference_context=context,
+            layer_number=1,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
         )
@@ -485,6 +485,7 @@ def test_native_decode_workspace_suspend_resume(
             index_query=index_query,
             index_key_cache=context.dsa_memory_buffer[0],
             inference_context=context,
+            layer_number=1,
             plan=context.dsa_metadata.plan(),
             max_context_length=bound,
             index_topk=TOPK,
@@ -567,14 +568,16 @@ def test_native_decode_workspace_suspend_resume(
 
 @pytest.mark.parametrize("decode_only", [True, False])
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, native_context_factory):
-    """Refreshed requests, caches and padding in a captured native layer match eager rows."""
+def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
+    decode_only, native_context_factory, monkeypatch
+):
+    """Two captured layers keep independent workspaces and match eager rows as inputs change."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
     pytest.importorskip("cutlass.cute")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(71)
-    page_size, bound = 256, 9216
+    num_layers, page_size, bound = 2, 256, 9216
     if decode_only:
         padded_rows = padded_requests = 4
         batches = [([1, 1, 1], [700, 9000, 2600], 3), ([1, 1, 1, 1], [9000, 513, 4000, 1], 4)]
@@ -590,14 +593,21 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
     batches.append(batches[0])
     max_pages = bound // page_size
     num_pages = padded_requests * max_pages
-    keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        num_layers, num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
     values = torch.randn_like(keys)
-    index_keys = torch.randn(num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    index_keys = torch.randn(
+        num_layers, num_pages, page_size, INDEX_DIM, device=device, dtype=torch.bfloat16
+    )
     table = torch.zeros(padded_requests, max_pages, device=device, dtype=torch.int32)
     query = torch.zeros(padded_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     index_query = torch.zeros(padded_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
     native_context = native_context_factory(
-        max_sequence_length=bound, max_requests=padded_requests, max_tokens=padded_rows
+        max_sequence_length=bound,
+        max_requests=padded_requests,
+        max_tokens=padded_rows,
+        num_layers=num_layers,
     )
     native_context.padded_active_token_count = padded_rows
     native_context.padded_active_request_count = padded_requests
@@ -623,15 +633,20 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
         native_context.dsa_metadata.transfer(table, non_blocking=False)
         return real
 
-    def attend():
+    def attend(layer_number, decode_lengths=None):
+        layer_idx = layer_number - 1
+        plan = native_context.dsa_metadata.plan()
+        if decode_lengths is not None:
+            plan = plan._replace(decode_lengths=decode_lengths)
         return dsa_gqa._native_sparse_attention(
             query=query,
-            key_cache=keys,
-            value_cache=values,
+            key_cache=keys[layer_idx],
+            value_cache=values[layer_idx],
             index_query=index_query,
-            index_key_cache=index_keys,
+            index_key_cache=index_keys[layer_idx],
             inference_context=native_context,
-            plan=native_context.dsa_metadata.plan(),
+            layer_number=layer_number,
+            plan=plan,
             max_context_length=bound,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
@@ -641,39 +656,50 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        attend()  # Compile outside capture, as engine warmup does.
+        for layer_number in range(1, num_layers + 1):
+            attend(layer_number)  # Compile outside capture, as engine warmup does.
     torch.cuda.current_stream().wait_stream(stream)
+    # A different lengths buffer must reuse the scratch without another selector warmup.
+    captured_lengths = native_context.dsa_metadata.plan().decode_lengths.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output = attend()
+        graph_outputs = [
+            attend(layer_number, captured_lengths) for layer_number in range(1, num_layers + 1)
+        ]
 
     for query_lengths, kv_lengths, num_decode_requests in batches:
         native_context.dsa_metadata.reset()
         real = fill(query_lengths, kv_lengths, num_decode_requests)
+        captured_lengths.copy_(native_context.dsa_metadata.plan().decode_lengths)
         graph.replay()
         metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
-        expected = _sparse_attention_rows(
-            query=query[:real],
-            key_cache=keys,
-            value_cache=values,
-            index_query=index_query[:real],
-            index_key_cache=index_keys,
-            plan=DSARowPlan(
-                *[t.to(device) for t in metadata],
-                native_context.dsa_metadata.decode_lengths[:0],
-                table[: len(query_lengths)],
-                False,
-            ),
-            max_context_length=bound,
-            index_topk=TOPK,
-            softmax_scale=HEAD_DIM**-0.5,
-        )
-        torch.testing.assert_close(graph_output[:real], expected, atol=2e-2, rtol=2e-2)
-        assert torch.count_nonzero(graph_output[real:]) == 0
-        if decode_only:
-            previous = graph_output.clone()
-            graph.replay()
-            torch.testing.assert_close(graph_output, previous, atol=2e-2, rtol=2e-2)
+        for layer_idx, graph_output in enumerate(graph_outputs):
+            expected = _sparse_attention_rows(
+                query=query[:real],
+                key_cache=keys[layer_idx],
+                value_cache=values[layer_idx],
+                index_query=index_query[:real],
+                index_key_cache=index_keys[layer_idx],
+                plan=DSARowPlan(
+                    *[t.to(device) for t in metadata],
+                    native_context.dsa_metadata.decode_lengths[:0],
+                    table[: len(query_lengths)],
+                    False,
+                ),
+                max_context_length=bound,
+                index_topk=TOPK,
+                softmax_scale=HEAD_DIM**-0.5,
+            )
+            torch.testing.assert_close(graph_output[:real], expected, atol=2e-2, rtol=2e-2)
+            assert torch.count_nonzero(graph_output[real:]) == 0
+            if decode_only:
+                previous = graph_output.clone()
+                graph.replay()
+                torch.testing.assert_close(graph_output, previous, atol=2e-2, rtol=2e-2)
+
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+    with pytest.raises(RuntimeError, match="does not support deterministic mode"):
+        attend(1)
 
 
 def _training_forward(query, index_query, index_keys, keys, values, selected, topk):
@@ -829,25 +855,39 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     "width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048), (131072, 2048)]
 )
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk, monkeypatch):
-    """Exact top-k across ragged rows, ties, and infinities; reject deterministic mode."""
+def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk):
+    """Exact top-k across ragged rows, ties, and infinities with reusable scratch."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
     pytest.importorskip("cutlass.cute")
+    from flashinfer import top_k_varlen
+
     torch.manual_seed(71)
     device = torch.device("cuda", torch.cuda.current_device())
     batch = 6
-    alignment = 4
-    stride = -(-width // alignment) * alignment
-    scores = torch.randn(batch, stride, device=device)
+    workspace = TritonDSADecodeWorkspace(
+        batch_size=batch,
+        num_query_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        index_topk=topk,
+        max_context=width,
+        page_size=256,
+        device=device,
+    )
+    scores = workspace.scores.normal_()
     lengths = torch.tensor([width - 3, 1, 0, width, width, width], device=device, dtype=torch.int32)
     scores[3].zero_()
-    indices = torch.empty(batch, topk, device=device, dtype=torch.int32)
-
-    selector = _FlashInferTopKWorkspace(scores, lengths, indices)
+    indices = workspace.indices
 
     def run():
-        selector()
+        top_k_varlen(
+            scores,
+            lengths,
+            topk,
+            backend="gvr_2",
+            out_indices=indices,
+            workspace=workspace._topk_workspace,
+        )
 
     run()
     graph = torch.cuda.CUDAGraph()
@@ -888,7 +928,3 @@ def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk, monkeypatch):
         check_selection()
         run()
         check_selection()
-
-    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
-    with pytest.raises(RuntimeError, match="does not support deterministic mode"):
-        selector()
