@@ -36,7 +36,8 @@
   "runtime_parameters_sha256": {
     "models/attention/gb200.json": "5becc0bb6bf737b6ab8bfacf41e78930cba0e9c74d9c07c838ac1a3c123629c1",
     "models/attention/gb300.json": "c6ea0650b7dcb37e76c4a56452d7eee85e8bef5d985480ad4e09a5c9ad45d73a",
-    "models/qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc"
+    "models/qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc",
+    "models/qwen3_h100_p2p.json": "c377f82134959d60f60189a2f20ebae080ea470722f1a0b4bbfe9c48b809c582"
   },
   "dynamic_usp": {
     "repository": "https://github.com/mazhuoru/DynamicUSP",
@@ -59,5 +60,74 @@
     "source_files_sha256": {
       "profiles/calib_table_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7"
     }
+  },
+  "h100_p2p_calibration": {
+    "methodology": {
+      "repository": "https://github.com/mazhuoru/DynamicUSP",
+      "commit": "18eb0f53dbdb3a13b19e49c02fd1782178947c9a",
+      "path": "skills/hot-switch-calibration/SKILL.md",
+      "adaptations": [
+        "Measure complete P2P self-attention forward/backward per layer instead of importing U8 A2A/ring coefficients",
+        "Use actual per-sequence physical padding and maximum valid zigzag causal work",
+        "Model non-attention with rank-weighted EP8 mean contributions; retain independent tables for classic and native P2P"
+      ]
+    },
+    "recipe": {
+      "model": "Full Qwen3-30B-A3B",
+      "hardware": "32 NVIDIA H100 80GB HBM3 across four eight-GPU nodes",
+      "tp": 1,
+      "pp": 1,
+      "ep": 8,
+      "bf16": true,
+      "cp_sizes": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "tokens_per_rank": 4096,
+      "global_batch_size": 256,
+      "moe": "flex/hybridep with variable-token padding and force-load-balancing enabled",
+      "execution": "eager fused attention, no activation recomputation"
+    },
+    "measurements": {
+      "classic_job": 21335654,
+      "native_job": 21336825,
+      "current_native_pilot": 21336824,
+      "fit_job": 21336826,
+      "steps_per_transport": 1745,
+      "training_cases": 66,
+      "heldout_cases": 7,
+      "fixed_batch_overhead_cases": 12,
+      "mcore_source": {
+        "classic": "1bc12aaff511eccd728566fcad47daf4b7043c8d",
+        "native": "2f59b285a517c5317c394d1c8ad31d92e2285652"
+      },
+      "image_sha256": "735d1180ce622a303afcc06e90f38fd3e53831a17ac737c0be415dbc7d91589e",
+      "transformer_engine_version": "2.14.1+366798ef",
+      "native_te": {
+        "component": "transformer_engine/pytorch/attention/native_cp_transport.py",
+        "component_source_commit": "f1bfde1a04dc87a4fcc0c18e32cde1277b18a7ec",
+        "component_sha256": "2612ed1077fa0671bc265dacdada4a5e1366897a5d7d4c52b6a5dd036115af1b",
+        "extension_sha256": "44e083b9626bdb5b312cd13a6c46aa4076a262b9699dc2f1ec236fab7b0fd8e2",
+        "deployment_manifest_sha256": "fd7ddb45435fce1e0f57d7c99832794db21c887821ad37dab224a5405b5d10ab",
+        "identity_scope": "A frozen deployed package with the current transport helper; not an asserted complete Git checkout"
+      },
+      "probe_sha256": "efa441d47c25f22caf32d241433cc61e2adf9c9b0863e6520a05cf26f17e33b1",
+      "cases_sha256": "32c5ccedc66cc9174981eade7e3efc691ca57ad1a33cfbeb32de9e181508eddd",
+      "fitter_sha256": "90bacd40e2c97633e754e8e1355557ed88f52dbb12e8a2c6aba889f29ef5e86f"
+    },
+    "validation": {
+      "cpu_wheel_job": 21339360,
+      "normal_unit_job": 21339394,
+      "unit_passed_per_rank": 322,
+      "unit_ranks": 8,
+      "unit_failures": 0,
+      "unit_skipped": 0,
+      "step_model_status": "Bootstrap overhead from CP8/DP4 controlled input; real CP1/DP32 Dolma candidate replay and production validation are pending",
+      "scope": "Fixed-layout module calibration and CPU/runtime contracts; no throughput or full-model numerical-accuracy claim",
+      "historical_fixed_cp_accuracy_gate": "OPEN_NOT_EVALUATED"
+    },
+    "existing_models": "Imported models, frozen assets, source attribution and validation tolerances are unchanged"
   }
 }
