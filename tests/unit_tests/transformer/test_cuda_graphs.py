@@ -2813,7 +2813,7 @@ class TestCudaGraphManagerProcessGroups:
                 pg_collection=pg_collection,
             ).cuda()
             assert layer.cudagraph_manager.reuse_cudagraphs is None
-            layer(hidden_states=hidden_states, attention_mask=attention_mask)
+            layer(hidden_states, attention_mask=attention_mask)
         assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
 
     @pytest.mark.parametrize("global_pp", [1, 2])
@@ -2843,7 +2843,7 @@ class TestCudaGraphManagerProcessGroups:
                 pg_collection=pg_collection,
             ).cuda()
             assert layer.pg_collection is pg_collection
-            layer(hidden_states=hidden_states)
+            layer(hidden_states)
         assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
 
 
