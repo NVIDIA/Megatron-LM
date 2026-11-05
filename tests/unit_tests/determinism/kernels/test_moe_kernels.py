@@ -716,9 +716,23 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize(
+    "fused",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not moe_utils.fused_topk_with_score_function_supports_qb,
+                reason="requires the Transformer Engine QB fused-router API",
+            ),
+        ),
+    ],
+    ids=["unfused", "fused"],
+)
 @pytest.mark.parametrize("masked", [False, True], ids=["all-tokens", "padding-masked"])
 @pytest.mark.parametrize("det_algos", [True, False])
-def test_quantile_balancing_histogram_and_bias_replay(det_algos, masked):
+def test_quantile_balancing_histogram_and_bias_replay(det_algos, masked, fused):
     """Replay accumulated integer histograms, routing gradients, and the batch update.
 
     ``masked`` passes a ``qb_valid_mask`` (padded packed-sequence slots are False) so only
@@ -747,6 +761,7 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos, masked):
                     qb_histogram=histogram,
                     qb_bin_bounds=bounds,
                     qb_valid_mask=microbatch_mask,
+                    fused=fused,
                 )
             )
         probs = torch.cat([output[0] for output in outputs])
