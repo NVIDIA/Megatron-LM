@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import inspect
 import logging
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -18,17 +19,52 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    _FALLBACK_REMOVED_IN,
+    _FALLBACK_WARNING_SKIP_PREFIXES,
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
-from megatron.core.utils import (
-    get_pg_rank,
-    get_tensor_model_parallel_group_if_none,
-    make_tp_sharded_tensor_for_checkpoint,
-)
+from megatron.core.utils import get_pg_rank, make_tp_sharded_tensor_for_checkpoint
+
+
+def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollection) -> None:
+    """Check a caller's collection before a language model is built on it."""
+    groups = vars(pg_collection)
+    for pg_name in ('tp', 'cp', 'pp'):
+        if pg_name not in groups:
+            raise ValueError(
+                f"{owner} pg_collection must explicitly define {pg_name}: the group this rank "
+                "belongs to, or None when torch.distributed is not initialized."
+            )
+    if 'embd' not in groups:
+        warnings.warn(
+            f"{owner} was given a pg_collection without an embd field and treats it as "
+            "embd=None. Set embd explicitly, to None when it is unused; a missing embd becomes "
+            f"an error in Megatron Core {_FALLBACK_REMOVED_IN}.",
+            FutureWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    for pg_name in ('tp', 'cp', 'pp', 'embd'):
+        if groups.get(pg_name) == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            remedy = (
+                "use None on ranks outside the embedding group"
+                if pg_name == 'embd'
+                else "pass the group this rank belongs to"
+            )
+            raise ValueError(f"{owner} {pg_name} cannot be NON_GROUP_MEMBER; {remedy}.")
+    if torch.distributed.is_initialized():
+        for pg_name in ('tp', 'cp', 'pp'):
+            if groups[pg_name] is None:
+                raise ValueError(
+                    f"{owner} requires a participating {pg_name} group when "
+                    "torch.distributed is initialized, including for singleton dimensions."
+                )
 
 
 class LanguageModule(MegatronModule):
@@ -36,28 +72,42 @@ class LanguageModule(MegatronModule):
 
     Args:
         config (TransformerConfig): Input transformer config for the model
-        pg_collection (ProcessGroupCollection): Model communication process groups
+        pg_collection (ProcessGroupCollection): Explicit model communication groups with
+            ``tp``, ``cp``, ``pp``, and ``embd`` fields. Once distributed is initialized,
+            ``tp``, ``cp``, and ``pp`` must be participating groups, including singleton
+            dimensions. Use ``embd=None`` on nonparticipating embedding stages; PyTorch's
+            NON_GROUP_MEMBER sentinel is not a usable group. Explicit None fields are
+            permitted for offline model construction. Omitting the collection, or its
+            ``embd`` field, is deprecated: an omitted collection falls back to the global
+            groups in ``megatron.core.parallel_state`` without these checks, and an omitted
+            ``embd`` is treated as None. Both warn and become errors in Megatron Core 0.23.
+            With tied output weights or MTP across pipeline stages, a stage that holds the
+            word embeddings or a copy of them needs a usable ``embd`` group once distributed
+            is initialized; ``embd=None`` there also warns until 0.23 (T5 raises already).
     """
 
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        set_attention_backend(self.config)
+        # Checks that need the subclass's stage layout run later, on a caller's collection only.
+        self._pg_collection_supplied = pg_collection is not None
         if pg_collection is None:
+            # The global grid is only a compatibility default: a model built on independent grids
+            # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it. The deprecated
+            # path keeps main's behavior, so only a caller's collection is validated below.
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        else:
+            _validate_supplied_collection(type(self).__name__, pg_collection)
+        set_attention_backend(self.config)
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
-        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
+        self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
-        assert hasattr(self.pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it used default "
-            "`parallel_state.default_embedding_ranks` to create the process group."
-            "If you are using the default process group, please use"
-            "`parallel_state.get_embedding_group()` "
-            "If you don't need embd_group, you need to explicitly set it to None."
-        )
-        self.embd_group = pg_collection.embd
+        # A collection without an embd field is deprecated and treated as embd=None, whatever
+        # object carries the groups.
+        self.embd_group = getattr(pg_collection, 'embd', None)
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
@@ -208,6 +258,8 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
+        self._warn_if_shared_embedding_is_unsynchronized()
+
         # The shared embedding weights need to be materialized before they are all-reduced.
         self._materialize_shared_embedding_weight()
 
@@ -268,6 +320,35 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
+
+    def _warn_if_shared_embedding_is_unsynchronized(self) -> None:
+        """Warn when a caller's collection leaves a cross-stage embedding copy unsynchronized.
+
+        With tied output weights or MTP and more than one pipeline stage, the first stage owns the
+        word embeddings and a later stage keeps a copy that is initialized and kept in sync over
+        ``embd_group``. With ``embd_group`` None on one of these stages, the copy starts at zero
+        and is never synchronized. T5 already rejects this case in its constructor.
+        """
+        if (
+            not getattr(self, '_pg_collection_supplied', False)
+            or self.embd_group is not None
+            or not torch.distributed.is_initialized()
+        ):
+            return
+        keeps_copy = (self.post_process and self.share_embeddings_and_output_weights) or getattr(
+            self, 'mtp_process', False
+        )
+        if not (self.pre_process or keeps_copy):
+            return
+        warnings.warn(
+            f"{type(self).__name__} shares its word embeddings across pipeline stages (tied "
+            "output weights or MTP), but its pg_collection has embd=None on this stage, so the "
+            "copies are never synchronized. Pass the embedding group of the stages that hold "
+            "them; this becomes an error in Megatron Core "
+            f"{_FALLBACK_REMOVED_IN}.",
+            FutureWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
 
     def _materialize_shared_embedding_weight(self) -> None:
         """Give a shared embedding copy that was built on the meta device storage and values."""

@@ -21,7 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
+from megatron.core.utils import deprecate_inference_params
 
 
 class T5LMHead(MegatronModule):
@@ -34,6 +34,7 @@ class T5LMHead(MegatronModule):
         pre_process (bool): Include embedding layer
         share_embeddings_and_output_weights (bool): When True, input
             embeddings and output logit weights are shared.
+        pg_collection (ProcessGroupCollection, optional): Process groups for the output layer.
     """
 
     def __init__(
@@ -44,6 +45,7 @@ class T5LMHead(MegatronModule):
         pre_process: bool = True,
         share_embeddings_and_output_weights: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -66,6 +68,7 @@ class T5LMHead(MegatronModule):
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
             tp_group=tp_group,
+            pg_collection=pg_collection,
         )
 
     def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
@@ -131,6 +134,16 @@ class T5Model(LanguageModule):
         add_decoder (bool): Include an output layer (used with pipeline parallelism).
             As with `add_encoder`, when using this model and pipelining,
             the decoder will only be created on a subset of the pipeline ranks.
+
+        pg_collection (ProcessGroupCollection, optional): Process groups for the model and
+            its submodules, checked by LanguageModule. Omitting it is deprecated: LanguageModule
+            warns and resolves the global parallel_state groups without checking them, and the
+            embedding, blocks and LM head are built on that same collection. In a supplied
+            collection, an `embd` of NON_GROUP_MEMBER raises ValueError on every stage, and an
+            omitted `embd` field is treated as None with a FutureWarning. After the parent
+            constructor, a supplied collection whose `embd` group is None raises ValueError
+            when embeddings are tied, pipeline_model_parallel_size > 1, and this stage has
+            pre_process or post_process set.
     """
 
     def __init__(
@@ -158,7 +171,19 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        super(T5Model, self).__init__(config=config)
+        super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        if (
+            pg_collection is not None
+            and share_embeddings_and_output_weights
+            and config.pipeline_model_parallel_size > 1
+            and (pre_process or post_process)
+            and self.embd_group is None
+        ):
+            raise ValueError(
+                "T5Model tied pipeline embedding/output stages require a usable embd group"
+            )
+        # LanguageModule resolves an omitted collection; build the submodules on the same groups.
+        pg_collection = self.pg_collection
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config
@@ -175,11 +200,6 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'pp']
-            )
-        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
 
         self.model_type = ModelType.encoder_or_decoder
 
@@ -199,6 +219,7 @@ class T5Model(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
                 tp_group=self.tp_group,
+                pg_collection=pg_collection,
             )
             if position_embedding_type == "learned_absolute":
                 self.position_embeddings = self.embedding.position_embeddings
@@ -270,6 +291,7 @@ class T5Model(LanguageModule):
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
                 tp_group=self.tp_group,
+                pg_collection=pg_collection,
             )
             self.output_layer = self.lm_head.output_layer
 
