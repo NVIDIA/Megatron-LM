@@ -5,8 +5,11 @@ from typing import Optional
 
 import torch
 
+from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.utils import cat_with_oom_fallback
 
 
@@ -68,3 +71,46 @@ def _split_tensor_factory(
         cat_with_oom_fallback,
         orig_sh_ten.replica_id,
     )
+
+
+def _validate_dynamic_cp_head_geometry(
+    config: ModelParallelConfig,
+    pg_collection: ProcessGroupCollection,
+    *,
+    head_counts: dict[str, int],
+    group_count: int | None = None,
+) -> None:
+    """Reject headwise shapes unsupported by any scheduler-enabled CP size at startup.
+
+    Chunkwise GDP does not shard heads and must not call this validator. Mamba/GDP
+    may repeat groups when CP exceeds their TP-local group count; GDN must shard
+    both its key and value heads without repetition.
+    """
+    if not config.dynamic_context_parallel:
+        return
+    if getattr(pg_collection, "dp_cp", None) is None:
+        raise ValueError("dynamic CP headwise mixers require pg_collection.dp_cp at construction")
+    dynamic_cp_groups = getattr(pg_collection, "dynamic_cp", None)
+    sizes = (
+        sorted(dynamic_cp_groups)
+        if dynamic_cp_groups
+        else get_valid_dynamic_context_parallel_group_sizes(pg_collection.dp_cp.size())
+    )
+    for cp_size in sizes:
+        if cp_size < config.min_dynamic_context_parallel_size:
+            continue
+        for name, head_count in head_counts.items():
+            if head_count < 1 or head_count % cp_size:
+                raise ValueError(
+                    f"dynamic CP can select runtime CP size {cp_size}, but TP-local "
+                    f"{name}={head_count} must be positive and divisible by that size. "
+                    "Reduce the DP x CP size or TP size, or increase the head count. "
+                    "GDP can use linear_cp_mode='chunkwise' to keep all heads."
+                )
+        if group_count is not None and (
+            group_count < 1 or (group_count % cp_size != 0 and cp_size % group_count != 0)
+        ):
+            raise ValueError(
+                f"TP-local group count {group_count} cannot be sharded or repeated "
+                f"for runtime CP size {cp_size}"
+            )

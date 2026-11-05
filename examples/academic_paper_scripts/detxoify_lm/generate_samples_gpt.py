@@ -30,7 +30,7 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -53,6 +53,7 @@ def model_provider(
         GPTModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
     if pg_collection is None:
         with global_process_group_fallback(
             "generate_samples_gpt.model_provider", deprecated_in="0.21", removed_in="0.23"
@@ -87,7 +88,7 @@ def model_provider(
     model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
