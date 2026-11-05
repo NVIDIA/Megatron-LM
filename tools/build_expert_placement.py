@@ -132,7 +132,11 @@ def build_coactivation(
 
 
 def kl_partition(
-    coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None, max_load_ratio: float = 0.0
+    coact: np.ndarray,
+    ep_size: int,
+    max_iter: Optional[int] = None,
+    max_load_ratio: float = 0.0,
+    mean_load: Optional[float] = None,
 ) -> np.ndarray:
     """Kernighan-Lin balanced partition of the co-activation graph.
 
@@ -142,8 +146,9 @@ def kl_partition(
     co-activation weight, for ``max_iter`` (default ``3*E``) steps.  Swaps
     preserve group sizes, so the result stays perfectly balanced in expert COUNT.
 
-    ``max_load_ratio > 0`` additionally balances token LOAD. The diagonal of
-    ``coact`` is the number of tokens that selected each expert, so a rank's
+    ``max_load_ratio > 0`` additionally balances token LOAD, starting from a
+    load-balanced grouping. The diagonal of ``coact`` is the number of tokens
+    that selected each expert, so a rank's
     load is the sum of its members' diagonals. A swap is accepted only if both
     ranks end up at or below ``max_load_ratio * mean_rank_load``, or if it does
     not raise the larger of the two ranks' loads (so an initially over-full
@@ -164,11 +169,16 @@ def kl_partition(
     load = np.diag(W).copy()  # tokens that selected each expert
     np.fill_diagonal(W, 0.0)  # self-count must not drive grouping
     rank = (np.arange(E) // cap).copy()
+    if max_load_ratio > 0:
+        snake = np.concatenate([np.arange(ep_size), np.arange(ep_size)[::-1]])
+        rank[np.argsort(-load, kind="stable")] = np.resize(snake, E)
     mem = {r: list(np.where(rank == r)[0]) for r in range(ep_size)}
     # WR[e, r] = total co-activation weight from expert e to experts on rank r.
     WR = np.stack([W[:, mem[r]].sum(1) for r in range(ep_size)], axis=1)
     rank_load = np.array([load[mem[r]].sum() for r in range(ep_size)])
-    load_cap = max_load_ratio * rank_load.mean() if max_load_ratio > 0 else None
+    if mean_load is None:
+        mean_load = rank_load.mean()
+    load_cap = max_load_ratio * mean_load if max_load_ratio > 0 else None
 
     for _ in range(max_iter):
         best_gain, best = 1e-9, None
@@ -256,7 +266,9 @@ def coactivation_placement(
     for n in range(nodes):
         members = np.where(node_of == n)[0]
         sub = coact[np.ix_(members, members)]
-        local_rank = kl_partition(sub, per_node, max_load_ratio=max_load_ratio)
+        local_rank = kl_partition(
+            sub, per_node, max_load_ratio=max_load_ratio, mean_load=np.trace(coact) / ep_size
+        )
         rank[members] = n * per_node + local_rank
     return rank_assignment_to_order(rank, ep_size)
 
