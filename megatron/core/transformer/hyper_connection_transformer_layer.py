@@ -184,9 +184,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self.is_moe_layer:
             # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
             # models may still request MLP graphs globally, so leave only this MoE layer eager.
-            if not config.cuda_graph_modules or (
-                CudaGraphModule.mlp in config.cuda_graph_modules
-                and CudaGraphModule.attn not in config.cuda_graph_modules
+            # An MLP-only MoE layer has no attention branch for an attn scope to graph, and
+            # the base MLP branch would reject it.
+            if (
+                not config.cuda_graph_modules
+                or (
+                    CudaGraphModule.mlp in config.cuda_graph_modules
+                    and CudaGraphModule.attn not in config.cuda_graph_modules
+                )
+                or isinstance(self.self_attention, IdentityOp)
             ):
                 return
 
