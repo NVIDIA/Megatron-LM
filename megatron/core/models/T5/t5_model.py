@@ -134,6 +134,16 @@ class T5Model(LanguageModule):
         add_decoder (bool): Include an output layer (used with pipeline parallelism).
             As with `add_encoder`, when using this model and pipelining,
             the decoder will only be created on a subset of the pipeline ranks.
+
+        pg_collection (ProcessGroupCollection, optional): Process groups for the model and
+            its submodules, checked by LanguageModule. Omitting it is deprecated: LanguageModule
+            warns and resolves the global parallel_state groups without checking them, and the
+            embedding, blocks and LM head are built on that same collection. In a supplied
+            collection, an `embd` of NON_GROUP_MEMBER raises ValueError on every stage, and an
+            omitted `embd` field is treated as None with a FutureWarning. After the parent
+            constructor, a supplied collection whose `embd` group is None raises ValueError
+            when embeddings are tied, pipeline_model_parallel_size > 1, and this stage has
+            pre_process or post_process set.
     """
 
     def __init__(
