@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.post_training.model_builder import _freeze_base_for_mtp, _freeze_for_qad
@@ -46,6 +47,7 @@ class TestFreezeBaseForMTP:
             mtp_block_spec=mtp_block_spec,
             vocab_size=100,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
