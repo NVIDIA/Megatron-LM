@@ -167,6 +167,39 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ## Adding a Unit Test
 
+### Test behavior, not configuration snapshots
+
+- **Do not test recipe or test-script settings.** Do not add a unit test
+  that only asserts that a key in an existing config, or an argument in an
+  existing functional or nightly test script, has a given value. Do not
+  unit-test functional test scripts at all; running them is their test.
+  Recipe and script changes have a reason; snapshot assertions only fail CI
+  on the next intentional change. A check across all configs that prevents
+  a known issue is appropriate, such as rejecting a parallelism combination
+  with a documented accuracy bug.
+- **Do not add a unit test that only checks that an individual shipped
+  example config loads or validates.** Put shared loading, inheritance, and
+  schema-validation checks in a parametrized config-validation test. Extend
+  that coverage when a new kind of config needs a check instead of adding
+  a separate test for each config. Check for existing coverage first; do not
+  assume every shipped config is already covered.
+- **Do not add a unit test that only asserts a config field's default
+  value.** A default change affects every run that omits the key; its reason
+  belongs in the PR, not in a test that fails on the change. Test what the
+  code does with the value instead, such as rejecting an invalid combination
+  or computing a derived property.
+- **Do not add a unit test that only checks what Pydantic already does.**
+  This includes omitted fields falling back to defaults, passed values
+  reading back unchanged, and rejection of missing required fields or
+  violations of a `Literal`, type, or `Field` constraint (`ge`, `gt`,
+  `allow_inf_nan`, `PositiveInt`). Test these cases only when our own code
+  sits between the input and the model, such as a custom merge or a
+  `mode="before"` validator. For a custom validator, testing that an edge
+  value is accepted is appropriate: constructing the model without an error
+  is the check, so do not read the value back.
+
+### Implementation steps
+
 1. Create `tests/unit_tests/<category>/test_<name>.py`.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
 3. Apply markers as needed:
