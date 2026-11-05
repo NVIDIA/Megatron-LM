@@ -96,7 +96,8 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
         measured_batch = planner.model.domain.get('step_overhead_global_batch_size')
         if measured_batch is not None and len(lengths) != measured_batch:
             raise ValueError(
-                f'Qwen3 H100 P2P step calibration requires {measured_batch} samples per global batch'
+                f'Qwen3 H100 P2P step calibration requires {measured_batch} samples '
+                'per global batch'
             )
     logical = dict(enumerate(lengths))
     incumbent_rejection = {}
