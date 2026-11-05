@@ -618,20 +618,6 @@ def _check_legacy_checkpoint_expert_placement(state_dict, ckpt_type, args):
     )
 
 
-def _warn_optim_load_with_expert_placement(args):
-    """Warn when distributed-optimizer state is loaded under a custom expert placement."""
-    if getattr(args, 'moe_expert_placement', None) and args.use_distributed_optimizer:
-        print_rank_0(
-            'WARNING: loading distributed-optimizer state with a custom '
-            '--moe-expert-placement. Positional optimizer formats (e.g. '
-            'fully_reshardable) restore fp32 main params and Adam moments by '
-            'buffer position, NOT by global expert id -- correct ONLY if this '
-            'checkpoint was saved with the SAME placement. Resuming a '
-            'differently-placed checkpoint corrupts the model on the first '
-            'step; use --no-load-optim in that case.'
-        )
-
-
 def _build_sharded_state_dict_metadata(
     args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
 ) -> dict:
@@ -2917,7 +2903,6 @@ def load_checkpoint(
         ):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
-            _warn_optim_load_with_expert_placement(args)
 
             if args.use_distributed_optimizer:
                 if sharded_sd_metadata is None:
@@ -2957,6 +2942,18 @@ def load_checkpoint(
                         f'{mismatch_msg}: not supported for DistributedOptimizer with sharding type'
                         f' {sharded_sd_metadata["distrib_optim_sharding_type"]}.'
                         f' Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.'
+                    )
+                if (
+                    getattr(ckpt_args, 'moe_expert_placement', None)
+                    != getattr(args, 'moe_expert_placement', None)
+                    and sharded_sd_metadata['distrib_optim_sharding_type']
+                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                ):
+                    raise RuntimeError(
+                        'Optimizer state was saved under a different --moe-expert-placement in'
+                        f' {sharded_sd_metadata["distrib_optim_sharding_type"]} format, which is'
+                        ' keyed by buffer position. Use --no-load-optim, or save it with'
+                        ' --dist-ckpt-optim-fully-reshardable.'
                     )
 
                 # Check if fully parallel load is compatible with sharding type
@@ -3103,7 +3100,6 @@ def load_checkpoint(
             gen_sd_optim = optimizer
             if not args.finetune:
                 gen_sd_opt_param_scheduler = opt_param_scheduler
-            _warn_optim_load_with_expert_placement(args)
 
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group),
