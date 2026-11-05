@@ -1217,7 +1217,14 @@ class TestDSGQADynamicInference:
             positions = torch.arange(count) % 3 + offset
             context.token_to_position_in_request[:count] = positions
             context.token_to_pos_ids[:count] = positions + (7 if offset else 0)
-            context.transfer_bookkeeping_to_gpu()
+
+            # This indexer-only test needs positions and padding, not attention metadata.
+            gpu_view = context.gpu_view
+            gpu_view.token_to_block_idx[:8].copy_(context.token_to_block_idx[:8])
+            gpu_view.token_to_pos_ids[:8].copy_(context.token_to_pos_ids[:8])
+            gpu_view.token_to_position_in_request[:8].copy_(
+                context.token_to_position_in_request[:8]
+            )
 
         update_metadata(capture_active, 0)
         with torch.no_grad():
