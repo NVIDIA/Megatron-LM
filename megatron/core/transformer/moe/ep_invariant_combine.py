@@ -27,6 +27,7 @@ does the same with ``expert_tp_fold`` before evaluating its subtree, and only ex
 rank 0 contributes it; the others contribute +0.0, which the reduce-scatter adds exactly.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -49,6 +50,22 @@ except ImportError:
 
 # Tree depth supported by _tree_combine_kernel's 32-bit occupancy mask: at most 2^10 leaves.
 _MAX_LEVELS = 10
+
+
+@dataclass(frozen=True)
+class EPInvariantCombineArgs:
+    """The ``moe_ep_invariant_combine`` arguments of the inference fused-MoE kernels.
+
+    Attributes:
+        leaves: leaves of this rank's subtree of the EP-invariant combine tree; the kernel
+            returns this rank's fp32 subtree partial (the final rows at EP 1).
+        expert_tp_group: the expert-TP group, if any. FC2's expert-TP partials are summed
+            over it (``expert_tp_fold``) before the subtree, and only its rank 0 returns the
+            subtree; the others return +0.0 rows, which the reduce-scatter adds exactly.
+    """
+
+    leaves: int
+    expert_tp_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 def num_leaf_blocks(num_experts: int) -> int:

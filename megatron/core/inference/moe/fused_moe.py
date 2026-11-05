@@ -26,7 +26,10 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
     mxfp8_quantize_rows,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
-from megatron.core.transformer.moe.ep_invariant_combine import expert_tp_fold
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    EPInvariantCombineArgs,
+    expert_tp_fold,
+)
 
 from . import batch_invariant
 
@@ -142,8 +145,7 @@ def mcore_fused_moe(
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
     activation_clamp_scale: Optional[float] = None,
-    ep_invariant_leaves: Optional[int] = None,
-    ep_invariant_expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    batch_invariant_kwargs: Optional[EPInvariantCombineArgs] = None,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -173,13 +175,9 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
-        ep_invariant_leaves: ``moe_ep_invariant_combine`` (batch-invariant mode): the
-            number of leaves of the EP-invariant combine tree on this rank; unpermute
-            then returns this rank's fp32 subtree partial (the final rows at EP 1).
-        ep_invariant_expert_tp_group: with ``ep_invariant_leaves``, the expert-TP group.
-            FC2's expert-TP partials are summed over it (``expert_tp_fold``) before the
-            subtree, and only expert-TP rank 0 returns the subtree; the others return
-            +0.0 rows, which the reduce-scatter adds exactly.
+        batch_invariant_kwargs: ``moe_ep_invariant_combine`` (batch-invariant mode) only;
+            when set, unpermute returns this rank's EP-invariant combine subtree partial
+            (see ``EPInvariantCombineArgs``).
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -307,10 +305,10 @@ def mcore_fused_moe(
         )
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
     expert_tp_rank = 0
-    if ep_invariant_leaves is not None and ep_invariant_expert_tp_group is not None:
+    if batch_invariant_kwargs is not None and batch_invariant_kwargs.expert_tp_group is not None:
         # moe_ep_invariant_combine with expert TP: whole expert rows, as training has them.
-        fc2_output = expert_tp_fold(fc2_output, ep_invariant_expert_tp_group)
-        expert_tp_rank = ep_invariant_expert_tp_group.rank()
+        fc2_output = expert_tp_fold(fc2_output, batch_invariant_kwargs.expert_tp_group)
+        expert_tp_rank = batch_invariant_kwargs.expert_tp_group.rank()
 
     # --- Post-processing: unpermute ---
     output = unpermute_tokens(
@@ -322,7 +320,9 @@ def mcore_fused_moe(
         valid_tokens,
         out=out,
         batch_invariant_inverse_map=batch_invariant_inverse_map,
-        ep_invariant_leaves=ep_invariant_leaves,
+        ep_invariant_leaves=(
+            batch_invariant_kwargs.leaves if batch_invariant_kwargs is not None else None
+        ),
     )
     if expert_tp_rank != 0:
         # Expert-TP rank 0 contributes this subtree; adding +0.0 for the others is exact.

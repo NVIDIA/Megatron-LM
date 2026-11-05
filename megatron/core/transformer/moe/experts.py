@@ -46,7 +46,10 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.ep_invariant_combine import num_leaf_blocks
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    EPInvariantCombineArgs,
+    num_leaf_blocks,
+)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1832,17 +1835,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
-    def _ep_invariant_leaves(self) -> Optional[int]:
-        """``moe_ep_invariant_combine``: leaves of this rank's subtree of the combine tree
-        (token_combine sums the rank partials over the rest of the tree), else None."""
+    def _batch_invariant_kwargs(self) -> Optional[EPInvariantCombineArgs]:
+        """``moe_ep_invariant_combine``: this rank's subtree of the combine tree (token_combine
+        sums the rank partials over the rest of the tree) and the expert-TP group, else None."""
         if not self.config.moe_ep_invariant_combine:
             return None
-        return num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size()
-
-    def _ep_invariant_expert_tp_group(self) -> Optional[torch.distributed.ProcessGroup]:
-        """``moe_ep_invariant_combine``: the expert-TP group whose partial rows are summed
-        before the combine tree, else None."""
-        return self.tp_group if self.config.moe_ep_invariant_combine else None
+        return EPInvariantCombineArgs(
+            leaves=num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size(),
+            expert_tp_group=self.tp_group,
+        )
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
@@ -1860,8 +1861,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
-            ep_invariant_leaves=self._ep_invariant_leaves(),
-            ep_invariant_expert_tp_group=self._ep_invariant_expert_tp_group(),
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
@@ -1881,8 +1881,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
-            ep_invariant_leaves=self._ep_invariant_leaves(),
-            ep_invariant_expert_tp_group=self._ep_invariant_expert_tp_group(),
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
