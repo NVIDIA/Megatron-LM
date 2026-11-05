@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -151,3 +152,81 @@ def test_loss_uses_the_supplied_tensor_group(mocker, explicit_groups):
     logits = torch.zeros(2, 1, 4)
     model.compute_language_model_loss(labels, logits)
     assert model.vocab_parallel_cross_entropy.call_args.args[-1] is explicit_groups.tp
+
+
+@pytest.mark.parametrize(
+    'supplied, initialized, pp_size, tied, mtp_layers, pre, post, mtp_process, embd_none, warns',
+    [
+        # Tied output layer on the last stage and the embedding on the first, without embd.
+        (True, True, 2, True, 0, False, True, False, True, True),
+        (True, True, 2, True, 0, True, False, False, True, True),
+        # An MTP stage keeps an embedding copy even with untied output weights.
+        (True, True, 2, False, 1, False, False, True, True, True),
+        # A usable embd group, the deprecated omitted collection, offline construction, untied
+        # weights, a last stage without a copy, and a single stage do not warn.
+        (True, True, 2, True, 0, False, True, False, False, False),
+        (False, True, 2, True, 0, False, True, False, True, False),
+        (True, False, 2, True, 0, True, False, False, True, False),
+        (True, True, 2, False, 0, False, True, False, True, False),
+        (True, True, 2, False, 1, False, True, False, True, False),
+        (True, True, 1, True, 0, True, True, False, True, False),
+    ],
+)
+def test_warns_when_shared_embedding_copies_have_no_embd_group(
+    mocker,
+    explicit_groups,
+    supplied,
+    initialized,
+    pp_size,
+    tied,
+    mtp_layers,
+    pre,
+    post,
+    mtp_process,
+    embd_none,
+    warns,
+):
+    """A caller's collection without embd on a stage holding shared embeddings warns until 0.23."""
+    mocker.patch('torch.distributed.is_initialized', return_value=initialized)
+    pp_group = mocker.Mock()
+    pp_group.rank.return_value = 0 if pre else pp_size - 1
+    pp_group.size.return_value = pp_size
+    explicit_groups.pp = pp_group
+    explicit_groups.embd = None if embd_none else mocker.sentinel.embd
+    stage_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=pp_size,
+        pipeline_dtype=torch.float32,
+    )
+    if supplied:
+        model = LanguageModule(stage_config, pg_collection=explicit_groups)
+    else:
+        mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
+        mocker.patch.object(
+            ProcessGroupCollection, 'use_mpu_process_groups', return_value=explicit_groups
+        )
+        with pytest.warns(FutureWarning, match='without `pg_collection`'):
+            model = LanguageModule(stage_config)
+    model.config.mtp_num_layers = mtp_layers
+    model.pre_process = pre
+    model.post_process = post
+    model.share_embeddings_and_output_weights = tied
+    model.mtp_process = mtp_process
+    mocker.patch.object(
+        model, 'shared_embedding_or_output_weight', return_value=torch.nn.Parameter(torch.ones(2))
+    )
+    mocker.patch.object(LanguageModule, '_is_in_embd_group', return_value=False)
+    mocker.patch.object(LanguageModule, 'embedding_warning_printed', True, create=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        model.setup_embeddings_and_output_layer()
+
+    unsynchronized = [
+        w
+        for w in caught
+        if issubclass(w.category, FutureWarning) and 'never synchronized' in str(w.message)
+    ]
+    assert len(unsynchronized) == int(warns)
