@@ -634,7 +634,8 @@ class TestGPTModelPaddingMaskSequenceParallel:
                     pg_collection=pg_collection,
                 ).cuda()
                 model.decoder.layers[0].register_forward_pre_hook(
-                    lambda module, args, kwargs: layer_inputs.update(kwargs), with_kwargs=True
+                    lambda module, args, kwargs: layer_inputs.update(kwargs, hidden_states=args[0]),
+                    with_kwargs=True,
                 )
                 model(
                     input_ids=input_ids,
