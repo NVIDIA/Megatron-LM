@@ -320,7 +320,9 @@ class OptimizerConfig:
     """Orthogonalize each head of a split QKV weight (each Q, gate, K and V head) on its own
     instead of each projection. Requires ``muon_split_qkv``. Changes the update rule, so it is
     off by default. Heads are cut from the full logical rows: GTP_remat shards are gathered
-    first (on every rank of the group), so the rule does not depend on the parallel layout."""
+    first (on every rank of the group). Like the projection split, it applies only when every
+    tensor-parallel rank holds whole query groups; otherwise the local weight is orthogonalized
+    as a whole."""
 
     muon_split_mla_qkv: bool = False
     """Split MLA up-projection weights (the query and key-value up-projections of MLA and

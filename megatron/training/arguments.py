@@ -2695,7 +2695,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-split-qkv-per-head', action='store_true',
                        help='Orthogonalize each Q, gate, K and V head of split QKV weights on its '
                        'own instead of each projection. Changes the update rule; requires QKV '
-                       'splitting and is not supported with --muon-tp-mode layer_sharded.')
+                       'splitting and is not supported with --muon-tp-mode layer_sharded. Like '
+                       'the projection split, it applies only when every tensor-parallel rank '
+                       'holds whole query groups.')
     group.add_argument('--muon-split-mla-qkv', action='store_true',
                        help='Also split MLA query and key-value up-projections by head component '
                        'for Muon. Off by default: they are orthogonalized as whole matrices.')
