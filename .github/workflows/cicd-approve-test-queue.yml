@@ -151,9 +151,8 @@ jobs:
                           wait = 2 ** attempt
                       if wait is not None:
                           if wait > MAX_RATE_LIMIT_WAIT:
-                              # The next scheduled run picks up where this one stopped, so don't fail the workflow.
-                              print(f"::warning::GitHub API rate limit hit on {endpoint}; resets in {wait}s, skipping this run")
-                              exit(0)
+                              print(f"::error::GitHub API rate limit hit on {endpoint}; resets in {wait}s")
+                              exit(1)
                           print(f"Rate limited on {endpoint}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                           time.sleep(wait)
                           continue

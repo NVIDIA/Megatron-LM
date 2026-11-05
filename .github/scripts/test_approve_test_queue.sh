@@ -124,19 +124,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 workflow = Path(sys.argv[1]).read_text()
-start = workflow.index('          # Headers for GitHub API')
-end = workflow.index('          # Get current running and queued workflows', start)
+start = workflow.index("          # Headers for GitHub API")
+end = workflow.index("          # Get current running and queued workflows", start)
 helpers_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
 
 
 class RequestException(Exception):
-    def __init__(self, response=None):
+    def __init__(self, response=None) -> None:
         super().__init__("request failed")
         self.response = response
 
 
 class Response:
-    def __init__(self, status, headers=None, body=None):
+    def __init__(self, status, headers=None, body=None) -> None:
         self.status_code = status
         self.headers = headers or {}
         self.links = {}
@@ -193,16 +193,16 @@ state = load([limited(), Response(200, body={"ok": True})])
 assert state.ns["make_request"]("x") == {"ok": True}
 assert state.sleeps == [10] and len(state.requests) == 2
 
-# Waiting exactly 60s retries; 61s warns and stops without any further request.
+# Waiting exactly 60s retries; 61s fails the job without any further request.
 state = load([limited(reset="1059"), Response(200, body={"ok": True})])
 assert state.ns["make_request"]("x") == {"ok": True} and state.sleeps == [60]
 state = load([limited(reset="1060"), Response(200, body={"ok": True})])
 try:
     state.ns["make_request"]("x")
 except SystemExit as e:
-    assert e.code == 0
+    assert e.code == 1
 else:
-    raise AssertionError("Long rate-limit wait must exit successfully")
+    raise AssertionError("Long rate-limit wait must fail the job")
 assert state.sleeps == [] and len(state.requests) == 1
 
 # Ordinary errors are not treated as rate limits.
