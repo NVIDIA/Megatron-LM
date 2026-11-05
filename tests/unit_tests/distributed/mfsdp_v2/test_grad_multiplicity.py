@@ -42,7 +42,7 @@ def _sharded_unit(setup, model, grad_accumulation_count):
         )
     # The test drives materialization around each GraphTask; the completion hook
     # only reduces gradients once all declared contributions have accumulated.
-    model.register_post_backward_hook(FsdpModule._reduce_gradient_groups)
+    model.register_post_accumulate_grad_hook(FsdpModule.post_accumulate_grad)
     return model
 
 

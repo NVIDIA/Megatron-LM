@@ -14,9 +14,11 @@ from torch.distributed.tensor import Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 _NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (\S+)")
 
@@ -215,20 +217,24 @@ def test_frozen_child_without_grad_inputs_skips_backward_range(distributed_setup
     for parameter in model.layers[0].parameters():
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
+    with fully_shard_context(
+        FsdpContext(device=distributed_setup.device, prefetch_order=PrefetchOrder.RECORDED)
+    ):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    # Backward may prefetch the frozen child even though it has no backward
-    # callback. The next iteration must not reuse stale materialization state.
+    # Recorded order omits the frozen child from backward. Simulate an unused
+    # prefetch to verify final cleanup prevents stale state across iterations.
     for _ in range(2):
         model.zero_grad(set_to_none=True)
-        model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
+        loss = model(torch.ones(2, 4, device=distributed_setup.device)).sum()
         frozen_layer = model.layers[0]
-        assert not frozen_layer._unshard_events
+        frozen_layer.unshard(Phase.BACKWARD)
+        loss.backward()
         for group in frozen_layer.parameter_groups:
-            assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+            assert not group._unshard_events
+            assert not group._unsharded_model_weight.is_allocated
 
     assert (
         _forward_backward_events(events)

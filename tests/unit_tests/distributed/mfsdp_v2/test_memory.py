@@ -18,6 +18,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
@@ -84,7 +85,7 @@ def test_shared_layer_releases_storage(distributed_setup):
     layer = nn.Linear(4, 4, bias=False, device=device)
     nn.init.ones_(layer.weight)
     model = nn.Sequential(layer, layer)
-    with fully_shard_context(FsdpContext(device=device)):
+    with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
         fully_shard(layer, mesh, _default_placements())
 
     completions = []
