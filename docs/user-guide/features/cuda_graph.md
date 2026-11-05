@@ -17,6 +17,78 @@ That article is a useful conceptual reference, but some examples there still use
 `--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
 `--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
 
+## Native mHC mapping graphs
+
+`HyperConnectionModule` also exposes an opt-in API for capturing only its native
+mapping computation. This API does not require a particular training application
+or low-precision recipe. Projection, gating, and Sinkhorn computation retain their
+existing arithmetic, including the configured FP32 mapping and normalization modes.
+Residual aggregation, the residual-gradient join, expert computation, communication,
+and optimizer/gradient-accumulation hooks remain outside these graphs.
+
+Prepare each module after weight loading, device/dtype conversion, and any DDP or
+optimizer setup that may replace its parameter storage. Use a representative input
+with the native per-rank shape, in the autocast context used for subsequent forwards:
+
+```python
+# module is an initialized HyperConnectionModule on its final CUDA device.
+sample = torch.randn(
+    sequence_length_per_rank,
+    micro_batch_size,
+    module.n * module.hidden_size,
+    device=module.mapping_proj.weight.device,
+    dtype=torch.bfloat16,
+)
+module.enable_mapping_cuda_graphs(sample)
+
+# Normal module calls now use the prepared mappings when compatible.
+aggregate, h_res, h_post = module(hidden_states)
+
+# After completing all pending backwards:
+module.disable_mapping_cuda_graphs()
+```
+
+Preparation runs warmup calls and captures forward, first-order backward, and
+evaluation graphs. It requires a nonempty, contiguous FP16/BF16/FP32 CUDA input,
+`use_fused_mhc=False`, `variable_seq_lengths=False`, and `cuda_graph_impl="none"`. Run preparation outside
+`inference_mode`, other graph capture, and saved-tensor hooks. The PyTorch build
+must expose saved-tensor-hook and DDP-context introspection so incompatible contexts can be
+detected safely.
+
+The implementation retains one training activation slot. Additional outstanding
+forwards and evaluation while that slot is occupied use native execution. Returned
+outputs and gradients have independent storage. In-place optimizer updates are
+visible on subsequent replays; changes between a training forward and its backward
+are rejected by normal tensor-version checks.
+
+Changed shapes, strides, dtypes, parameter identities/storage, frozen-parameter
+settings, or math/autocast settings require disabling or preparing the graphs again.
+Such changes are rejected before replay: compiled reductions can change their
+floating-point arithmetic when shapes generalize, so they must not be mixed with
+previously captured kernels. Training inputs that do
+not require gradients also use native execution to preserve the original backward
+specialization. Non-reentrant checkpoints and saved-tensor hooks use the native path
+in both forward and recomputation; reentrant recomputation can replay the graphs.
+Unused mapping outputs use native backward computation to preserve absent gradients
+and avoid backpropagating zeros through unused branches.
+
+When using Megatron DDP, pass its owning wrapper as `ddp_model` to
+`enable_mapping_cuda_graphs`. Gradient accumulation and synchronization stay outside
+capture. Overlapped gradient reduction is supported only with a single bucket group;
+with multiple groups, disable `overlap_grad_reduce` before constructing DDP. This
+restriction prevents mixed graph/native execution across ranks from reordering
+collectives. Overlapped parameter gathering and gradient-buffer offload are not
+supported. Preparation rejects incompatible configurations before capturing graphs,
+and subsequent changes to the validated communication layout require disabling or
+preparing graphs again.
+
+Calls through ordinary PyTorch DDP
+instead select native execution until graphs are prepared again, preserving DDP's
+parameter-ready order and rebuilt reduction buckets, including reentrant recomputation.
+Higher-order derivatives and repeated backwards from a retained graph
+require disabling mapping graphs. Call `enable_mapping_cuda_graphs` again with a
+new sample to prepare a different fixed configuration.
+
 ## Overview
 
 CUDA graph behavior is set by three orthogonal flags:
