@@ -1174,9 +1174,8 @@ class TopKRouter(Router):
                 and torch.is_grad_enabled()
                 and not self.frozen_expert_bias
             )
-            # Padded packed-sequence slots carry no real tokens, so they stay out of the
-            # K3 Quantile Balancing margin histogram (padded SBHD validation has no mask
-            # and keeps counting its padded positions, as before).
+            # Exclude tokens marked by any supplied padding mask from the K3 margin
+            # histogram. Evaluation, no-grad, and frozen-bias forwards do not accumulate.
             qb_valid_mask = (
                 ~padding_mask if accumulate_qb_histogram and padding_mask is not None else None
             )

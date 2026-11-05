@@ -226,7 +226,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         # accounting once per pipeline rank and micro-batch (first virtual stage),
         # using the CP-unsliced [micro_batch_size, seq_length] mask, so the
         # reported TFLOP/s count useful work only, like the packed THD path.
-        update_seqlen_stats_from_padding_mask(batch['padding_mask'])
+        update_seqlen_stats_from_padding_mask(batch["padding_mask"])
 
     batch = flatten_batch_for_packed_sequences(batch)
 
