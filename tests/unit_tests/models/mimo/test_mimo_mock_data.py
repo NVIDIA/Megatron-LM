@@ -73,6 +73,7 @@ def adapter(monkeypatch, run_config):
     from examples.mimo.training import data
 
     run_config.rng.seed = 123
+    run_config.tokenizer.vocab_size = 64
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data
