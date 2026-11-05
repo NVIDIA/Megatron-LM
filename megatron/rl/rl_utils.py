@@ -9,7 +9,6 @@ import itertools
 import json
 import logging
 import math
-import os
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
@@ -730,9 +729,7 @@ def maybe_get_rollout_bank(args):
         bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, args.save)
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
-        log_single_rank(
-            logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}"
-        )
+        log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
     return _ROLLOUT_BANK
 
 
@@ -745,7 +742,9 @@ def maybe_compact_rollout_bank(iteration):
     """Compact the bank at a durable-checkpoint boundary."""
     bank = get_rollout_bank()
     if bank is not None:
-        bank.checkpoint(iteration)
+        # The engines append to the window the last collection's drain opened;
+        # every earlier window is closed and may be folded.
+        bank.checkpoint(iteration, open_window=get_rl_runtime_state().last_collection_iteration + 1)
 
 
 def _get_or_create_rollout_agent(env_config_path):
@@ -811,6 +810,10 @@ def join_request_records(
         for rollout in group:
             if not isinstance(rollout, TokenRollout) or rollout.policy_epochs is not None:
                 continue
+            if rollout.is_placeholder:
+                # A failed episode: the caller released the records of the calls it made.
+                rollout.policy_epochs, rollout.kv_cache_epochs, rollout.num_evictions = [], [], []
+                continue
             if rollout.trajectory is not None:
                 assert len(rollout.completion_ids) == len(rollout.trajectory), (
                     f"finished-request ledger: {len(rollout.completion_ids)} completion ids for "
@@ -819,9 +822,9 @@ def join_request_records(
             records = []
             for completion_id in rollout.completion_ids:
                 record = request_ledger.pop(completion_id, None)
-                assert record is not None, (
-                    f"finished-request ledger: no record for {completion_id!r}."
-                )
+                assert (
+                    record is not None
+                ), f"finished-request ledger: no record for {completion_id!r}."
                 assert (
                     record.policy_epoch and record.kv_cache_epoch
                 ), f"finished-request ledger: record {completion_id!r} has no epoch stamps."
@@ -834,10 +837,18 @@ def join_request_records(
                         payload.prompt_token_ids,
                         payload.generated_log_probs,
                     ), f"finished-request ledger: record {completion_id!r} has no token payload."
+                    # The engine appends and trims generated tokens and their log probs together;
+                    # a mismatched payload fails here instead of misaligning the IS correction.
+                    generated = len(payload.generated_token_ids)
+                    scored = len(payload.generated_log_probs)
+                    assert generated == scored, (
+                        f"finished-request ledger: record {completion_id!r} has {scored} log probs "
+                        f"for {generated} generated tokens."
+                    )
                 for field, value in rebuild_turns(records).items():
                     setattr(rollout, field, value)
                 continue
-            if rollout.logprobs is None:
+            if rollout.logprobs is None and records:
                 for completion_id, record, mask in zip(
                     rollout.completion_ids, records, rollout.generation_mask, strict=True
                 ):
@@ -847,10 +858,10 @@ def join_request_records(
                     assert (
                         log_probs is not None
                     ), f"finished-request ledger: record {completion_id!r} has no logprob payload."
-                    # One log prob per generated token (the final EOD may carry none),
+                    # The engine appends and trims generated tokens and their log probs together,
                     # so a mismatched payload fails here instead of misaligning the IS correction.
                     generated = sum(mask)
-                    assert 0 <= generated - len(log_probs) <= 1, (
+                    assert generated == len(log_probs), (
                         f"finished-request ledger: record {completion_id!r} has "
                         f"{len(log_probs)} log probs for {generated} generated tokens."
                     )
@@ -1066,9 +1077,9 @@ def get_environment_rollouts(
 
     with nvtx_range("rl/sync-rollout-state", time=True):
         runtime_state = get_rl_runtime_state()
-        assert _INFERENCE_INTERFACE is not None, (
-            "rollouts were collected before the inference interface was launched"
-        )
+        assert (
+            _INFERENCE_INTERFACE is not None
+        ), "rollouts were collected before the inference interface was launched"
         with nvtx_range("rl/sync-request-ledger", time=True):
             # Every engine drains its ledger and rank 0 receives the union.
             # The window's records are made durable under the next window's backup file.
@@ -1079,19 +1090,30 @@ def get_environment_rollouts(
             )
         if rank == 0:
             # The ledger is exact: every record is popped by exactly one consumer.
-            # Groups the pipeline dropped never reach the trainer; their records are drained here.
+            # Groups the pipeline dropped never reach the trainer, and a placeholder's calls belong
+            # to an episode that failed: neither has a consumer, so their records are released here.
             ledgered = set(runtime_state.request_ledger)
             dropped = _ROLLOUT_PIPELINE.take_dropped_completion_ids()
             for completion_id in dropped:
                 runtime_state.request_ledger.pop(completion_id)
+            released = [
+                completion_id
+                for group in rollouts
+                for rollout in group
+                if isinstance(rollout, TokenRollout) and rollout.is_placeholder
+                for completion_id in rollout.completion_ids
+            ]
+            for completion_id in released:
+                # A call that finished after its episode failed may only reach a later drain.
+                runtime_state.request_ledger.pop(completion_id, None)
             bank = get_rollout_bank()
             if bank is not None:
-                bank.retire_records(dropped)
+                bank.retire_records(dropped + released)
             join_request_records(rollouts, runtime_state.request_ledger)
-            # Consumed calls belong to finished rollouts, so no continuation needs their tokens;
-            # calls of rollouts that never reach the trainer stay held until the agent retires
-            # them through Gym's control route.
-            _INFERENCE_INTERFACE.forget_held_prefixes(ledgered - set(runtime_state.request_ledger))
+            # Consumed and released calls need no prefix any more; unconsumed ones stay held.
+            _INFERENCE_INTERFACE.forget_held_prefixes(
+                (ledgered - set(runtime_state.request_ledger)) | set(released)
+            )
             if not cfg.rl.rl_partial_rollouts:
                 # Nothing is in flight at this boundary (asserted at collection), so every
                 # drained record must have found its consumer.
@@ -1721,7 +1743,11 @@ def compute_group_stats(
                 roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            if isinstance(rollout, TokenRollout) and rollout.completion_ids:
+            if (
+                isinstance(rollout, TokenRollout)
+                and rollout.completion_ids
+                and not rollout.is_placeholder
+            ):
                 # Staleness stamps were joined from the finished-request ledger per turn.
                 assert (
                     rollout.policy_epochs is not None

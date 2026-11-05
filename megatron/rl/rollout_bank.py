@@ -3,11 +3,10 @@
 """Durable rollout bank — the queued-rollout (completed-group) path.
 
 Persists completed ``RolloutGroup``s the instant they assemble, so a SIGKILL (the
-4h SLURM limit) does not destroy work that is already on disk. This is PR #1 of
-the durable rollout bank: it covers only the *queued* path — groups sitting in
-the pipeline's ``output_queue`` (assembled, not yet trained-in) plus groups
-consumed at a training step that a restart rolls back. In-flight decode state and
-partial-group snapshots (design phases B/C) are out of scope here.
+4h SLURM limit) does not destroy work that is already on disk. It covers the queued
+path: groups sitting in the pipeline's ``output_queue`` (assembled, not yet
+trained-in) plus groups consumed at a training step that a restart rolls back.
+In-flight decode state is not persisted.
 
 Persisted data comes from two separate sources.
 Data related to the RL pipeline (rewards, env/problem ids, grouping,
@@ -33,14 +32,14 @@ all on Lustre)::
 
 Recovery guarantees: manifest appends are write-through with ``fsync`` per group,
 so a kill can damage only the final record, which its checksum drops on read.
-Backup files are self-delimiting msgpack streams; a torn tail drops only itself.
+Backup files are self-delimiting msgpack streams; a torn tail drops only itself, and a
+record whose format version or digest does not check out is skipped on its own.
 A checkpoint compacts survivors — and every request record still owed to a group:
 referenced by a survivor, or neither reclaimed with its group nor retired by rank 0
 (dropped groups, evaluation) — into a complete new generation before atomically
 flipping the manifest, then prunes the consumed (rotated, never open) backup files.
-``restore`` replays the active
-generation and returns every group that is not already trained through checkpoint
-step ``T``:
+``restore`` replays the active generation and returns every group that is not already
+trained through checkpoint step ``T``:
 
     marker <= T -> discard (training already in the loaded weights)
     marker  > T -> restore (that training step was erased by the kill)
@@ -75,8 +74,7 @@ from megatron.core.inference.inference_request import (
     OffloadedRequestPayload,
     RequestPayloadStageResult,
 )
-
-from .gym_capture import NG_CAPTURE_FIELD, PrefixStoreClient, stage_admitted_call
+from megatron.rl.gym_capture import NG_CAPTURE_FIELD, PrefixStoreClient, stage_admitted_call
 from megatron.rl.types import Rollout, RolloutGroup, TokenRollout
 
 logger = logging.getLogger(__name__)
@@ -150,8 +148,10 @@ def _generation_name() -> str:
 
 
 def resolve_bank_dir(configured: str | None, save: str | None) -> str:
-    """The bank directory: the configured one, else ``<save>/rollout_bank``; shared by the bank
-    on rank 0 and every engine's request-record backup writer."""
+    """Return the configured bank directory, else ``<save>/rollout_bank``.
+
+    Shared by the bank on rank 0 and every engine's request-record backup writer.
+    """
     return configured or os.path.join(save or ".", "rollout_bank")
 
 
@@ -208,6 +208,24 @@ _TOKEN_DTYPE = np.int32
 _LOGPROB_DTYPE = np.float32
 
 
+_DIGESTED_ARRAYS = (
+    "prompt_token_ids",
+    "generated_token_ids",
+    "generated_log_probs",
+    "prompt_log_probs",
+)
+
+
+def _record_digest(payload: dict) -> str:
+    """Digest over a packed record's token and log-prob arrays, and its routing data if any."""
+    h = hashlib.blake2b(digest_size=16)
+    for key in _DIGESTED_ARRAYS:
+        h.update(payload.get(key) or b"")
+    routing = payload.get("routing_indices")
+    h.update(b"" if routing is None else routing["data"])
+    return h.hexdigest()
+
+
 def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> bytes:
     """Encode one record with binary-packed per-token arrays; media and top-N scores are dropped."""
 
@@ -234,6 +252,7 @@ def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> byt
             ),
         }
     payload = {
+        "format_version": _FORMAT_VERSION,
         "uid": uid,
         "policy_epoch": record.policy_epoch,
         "kv_cache_epoch": record.kv_cache_epoch,
@@ -242,11 +261,19 @@ def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> byt
         "finish_reason": record.finish_reason,
         **tokens,
     }
+    payload["digest"] = _record_digest(payload)
     return msgpack.packb(payload, use_bin_type=True)
 
 
+def _validate_record(payload: dict, source: str) -> None:
+    """Fail closed on a packed record this reader cannot trust: wrong version or digest."""
+    _validate_format_version(payload, source)
+    if payload.get("digest") != _record_digest(payload):
+        raise ValueError(f"request record {payload.get('uid')!r} in {source} fails its digest")
+
+
 def _unpack_record(payload: dict) -> tuple[str, FinishedRequestRecord]:
-    """Decode one record; epoch stamps round-trip back to lists of tuples."""
+    """Decode one validated record; epoch stamps round-trip back to lists of tuples."""
 
     def epochs(value):
         return None if value is None else [tuple(pair) for pair in value]
@@ -308,6 +335,9 @@ class FinishedRequestLedgerWriter:
 
     def rotate(self, path: str) -> None:
         """Flush and close the current file; subsequent appends go to ``path``."""
+        backlog = self._queue.qsize()
+        if backlog:
+            logger.info("finished-request ledger writer: %d records queued at rotate", backlog)
         self._control(path)
 
     def close(self) -> None:
@@ -369,22 +399,63 @@ class FinishedRequestLedgerWriter:
                         item.done.set()
 
 
+# Bytes per read while scanning a record file; a frame may span reads.
+_RECORD_READ_SIZE = 64 << 20
+
+
+def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
+    """Yield `(uid, decoded payload, packed frame)` for every valid record in `path`."""
+    try:
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return
+    with f:
+        unpacker = msgpack.Unpacker(raw=False, max_buffer_size=0)  # 0: no cap
+        start = 0  # file offset of the frame being decoded
+        try:
+            while chunk := f.read(_RECORD_READ_SIZE):
+                unpacker.feed(chunk)
+                for payload in unpacker:
+                    end = unpacker.tell()
+                    frame, start = os.pread(f.fileno(), end - start, start), end
+                    try:
+                        _validate_record(payload, path)
+                        uid = payload["uid"]
+                    except (AttributeError, KeyError, TypeError, ValueError) as error:
+                        logger.warning(
+                            "Skipping an unreadable request record in %s: %s", path, error
+                        )
+                        continue
+                    yield uid, payload, frame
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Corrupt msgpack framing in %s; the records after it were skipped.", path
+            )
+
+
 def load_finished_request_records(paths: Iterable[str]) -> dict[str, FinishedRequestRecord]:
-    """Load records from backup/fold files, keyed by uid; a torn tail drops only itself."""
+    """Load the valid records of backup/fold files, keyed by uid (see ``_record_frames``)."""
     records: dict[str, FinishedRequestRecord] = {}
     for path in sorted(paths):
-        try:
-            with open(path, "rb") as f:
-                for payload in msgpack.Unpacker(f, raw=False):
-                    uid, record = _unpack_record(payload)
-                    records[uid] = record
-        except FileNotFoundError:
-            continue
-        except Exception:
-            logger.warning(
-                "Truncated tail in request-record backup %s; kept records before it.", path
-            )
+        for uid, payload, _ in _record_frames(path):
+            try:
+                records[uid] = _unpack_record(payload)[1]
+            except (KeyError, TypeError, ValueError) as error:
+                logger.warning("Skipping undecodable request record %r in %s: %s", uid, path, error)
     return records
+
+
+def _packed_records(paths: Iterable[str]) -> dict[str, bytes]:
+    """The valid records of backup/fold files as packed frames, keyed by uid."""
+    frames: dict[str, bytes] = {}
+    for path in sorted(paths):
+        for uid, _, frame in _record_frames(path):
+            frames[uid] = frame
+    return frames
+
+
+#: A request record as the bank folds it: decoded at recovery, a packed frame at a checkpoint.
+RecordOrFrame = FinishedRequestRecord | bytes
 
 
 class LedgerPayloadStager:
@@ -417,13 +488,14 @@ class LedgerPayloadStager:
         with self._lock:
             assert uid not in self.records, f"finished-request ledger: duplicate uid {uid!r}"
             self.records[uid] = finished_metadata
-        # Custody acknowledged: the reply is served without its per-token payload. A Gym
-        # worker-custody admission in offload_params gets its commit coordinates here. The
-        # acknowledgement precedes the writer's flush: it is durable within this process, which
-        # is Gym's crash domain for the worker, and MRL never resumes an in-flight conversation
-        # across a restart.
+        # Acknowledge custody before the writer's fsync: Gym's crash domain is this process,
+        # and MRL never resumes an in-flight conversation across a restart.
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
-        if admission is None:
+        if not isinstance(admission, dict):
+            if admission is not None:
+                logger.warning(
+                    "Ignoring a malformed %s admission on request %s", NG_CAPTURE_FIELD, uid
+                )
             return RequestPayloadStageResult()
         return RequestPayloadStageResult(
             response_metadata=stage_admitted_call(
@@ -436,6 +508,16 @@ class LedgerPayloadStager:
         with self._lock:
             drained, self.records = self.records, {}
         return drained
+
+    def rotate(self, path: str) -> None:
+        """Point the durable backup at ``path``; a no-op without a writer."""
+        if self.writer is not None:
+            self.writer.rotate(path)
+
+    def close(self) -> None:
+        """Flush and stop the durable backup; a no-op without a writer."""
+        if self.writer is not None:
+            self.writer.close()
 
 
 def gather_view(record: FinishedRequestRecord) -> FinishedRequestRecord:
@@ -453,24 +535,15 @@ def gather_view(record: FinishedRequestRecord) -> FinishedRequestRecord:
     return dataclasses.replace(record, payload=payload)
 
 
-# TokenRollout fields rebuilt from the request records at restore, so manifests omit them.
-_RECORD_DERIVED_FIELDS = (
-    "logprobs",
-    "generation_mask",
-    "policy_epochs",
-    "kv_cache_epochs",
-    "num_evictions",
-)
-
-
 def _joinable(record: Optional[FinishedRequestRecord]) -> bool:
     """Whether a record carries everything a restored TokenRollout turn is rebuilt from."""
     p = None if record is None else record.payload
-    return p is not None and None not in (
-        p.prompt_token_ids,
-        p.generated_log_probs,
-        record.policy_epoch,
-        record.kv_cache_epoch,
+    return (
+        p is not None
+        and bool(record.policy_epoch)
+        and bool(record.kv_cache_epoch)
+        and None not in (p.prompt_token_ids, p.generated_log_probs)
+        and len(p.generated_log_probs) == len(p.generated_token_ids)
     )
 
 
@@ -489,6 +562,10 @@ def rebuild_turns(turns: list[FinishedRequestRecord]) -> dict[str, list]:
         "kv_cache_epochs": [t.kv_cache_epoch for t in turns],
         "num_evictions": [t.num_evictions for t in turns],
     }
+
+
+# TokenRollout fields rebuilt from the request records at restore, so manifests omit them.
+_RECORD_DERIVED_FIELDS = tuple(field for field in rebuild_turns([]) if field != "trajectory")
 
 
 def _checksum(record_wo_checksum: dict) -> str:
@@ -535,7 +612,15 @@ class RolloutBank:
         if not os.path.exists(self._manifest_path):
             # The engines may already have created their backup directory; anything
             # else in a manifest-less directory is bank data this run must not overwrite.
-            if set(os.listdir(bank_dir)) - {_REQUEST_RECORDS_DIRNAME}:
+            leftovers = set(os.listdir(bank_dir)) - {_REQUEST_RECORDS_DIRNAME}
+            if "MANIFEST.json" in leftovers:
+                raise ValueError(
+                    f"{bank_dir} holds a rollout bank in the earlier on-disk format "
+                    f"(MANIFEST.json; this version writes {_MANIFEST}, format_version "
+                    f"{_FORMAT_VERSION}). It cannot be migrated: remove the rollout-bank "
+                    "directory and its groups are regenerated."
+                )
+            if leftovers:
                 raise FileNotFoundError(
                     f"RolloutBank manifest is missing at {self._manifest_path}, but "
                     f"{bank_dir} is not empty. Refusing to overwrite possible bank data; "
@@ -746,7 +831,10 @@ class RolloutBank:
                 for field in _RECORD_DERIVED_FIELDS:
                     member.pop(field, None)
                 completion_ids = member.get("completion_ids") or []
-                if trajectory is not None and len(completion_ids) != len(trajectory):
+                if trajectory is not None and not trajectory:
+                    # A placeholder's ids name calls the join released; nothing references them.
+                    member["completion_ids"] = []
+                elif trajectory is not None and len(completion_ids) != len(trajectory):
                     raise ValueError(
                         f"token rollout has {len(trajectory)} turns but "
                         f"{len(completion_ids)} completion ids; thin manifests need one "
@@ -794,7 +882,7 @@ class RolloutBank:
     def _survivors(
         self, trained_through: int, request_records: Optional[dict[str, FinishedRequestRecord]]
     ) -> list[tuple[LedgerRecord, RolloutGroup]]:
-        """Surviving manifest records paired with their decoded groups (undecodable ones dropped)."""
+        """Surviving manifest records with their decoded groups; undecodable ones are dropped."""
         request_records = request_records or {}
         records, _, _ = self._restore_state(trained_through)
         pairs = ((record, self._decode(record, request_records)) for record in records)
@@ -899,17 +987,18 @@ class RolloutBank:
         with self._lock:
             self._retired.update(uids)
 
-    def checkpoint(self, iteration: int) -> None:
+    def checkpoint(self, iteration: int, *, open_window: int) -> None:
         """Compact survivors and future markers into an atomic new generation.
 
         Piggybacks the model-checkpoint boundary so the bank's compacted-through T
         tracks the checkpoint. Markers at or before ``iteration`` and their groups
         are reclaimed. Each surviving marker newer than the checkpoint is copied
         once so delayed asynchronous checkpoint finalization remains correct.
-        Closed backup files are folded into the new generation and then pruned. A
-        record is dropped once its group was reclaimed or rank 0 retired it; every
-        other record is kept, so in-flight multi-window groups keep theirs across any
-        number of checkpoints. The writer stays closed until the next `set_collection()`.
+        Backup files of windows before ``open_window``, the window the engines append
+        to now, are folded into the new generation and then pruned. A record is
+        dropped once its group was reclaimed or rank 0 retired it; every other record
+        is kept, so in-flight multi-window groups keep theirs across any number of
+        checkpoints. The writer stays closed until the next `set_collection()`.
         """
         with self._lock:
             survivors, reclaimed, markers = self._restore_state(iteration)
@@ -920,9 +1009,9 @@ class RolloutBank:
                 if uid in survivor_uids and marker_iter > iteration
             }
             manifest = self._read_manifest()
-            closed_backups = self._closed_backup_paths(iteration)
-            available = load_finished_request_records(_fold_paths(self.bank_dir, manifest))
-            available |= load_finished_request_records(closed_backups)
+            closed_backups = self._closed_backup_paths(open_window)
+            # The fold works on uids and copies packed frames forward; nothing is decoded here.
+            available = _packed_records(_fold_paths(self.bank_dir, manifest) + closed_backups)
             released = set(self._referenced_records(reclaimed, available)) | self._retired
             folded = {uid: r for uid, r in available.items() if uid not in released}
             folded |= self._referenced_records(survivors, available)
@@ -949,27 +1038,25 @@ class RolloutBank:
         with self._lock:
             pairs = self._survivors(trained_through, request_records)
             survivors = [record for record, _ in pairs]
+            referenced = self._referenced_records(survivors, request_records or {})
+            self._retired.update(set(request_records or {}) - set(referenced))
             self._publish_generation(
-                trained_through,
-                survivors,
-                {},
-                self._referenced_records(survivors, request_records or {}),
-                timeline=uuid.uuid4().hex,
+                trained_through, survivors, {}, referenced, timeline=uuid.uuid4().hex
             )
             return [group for _, group in pairs]
 
-    def _closed_backup_paths(self, iteration: int) -> list[str]:
-        """Backups of windows before ``iteration``; that window's own file may still be open."""
+    def _closed_backup_paths(self, open_window: int) -> list[str]:
+        """Backups of windows before ``open_window``, the window the engines append to now."""
         return [
             path
             for path in _backup_paths(self.bank_dir)
-            if int(_BACKUP_NAME.match(os.path.basename(path)).group(1)) < iteration
+            if int(_BACKUP_NAME.match(os.path.basename(path)).group(1)) < open_window
         ]
 
     @staticmethod
     def _referenced_records(
-        records: list[LedgerRecord], available: dict[str, FinishedRequestRecord]
-    ) -> dict[str, FinishedRequestRecord]:
+        records: list[LedgerRecord], available: dict[str, RecordOrFrame]
+    ) -> dict[str, RecordOrFrame]:
         """Subset of ``available`` referenced by the given manifests' completion ids."""
         referenced: dict[str, FinishedRequestRecord] = {}
         for record in records:
@@ -986,7 +1073,7 @@ class RolloutBank:
         iteration: int,
         records: list[LedgerRecord],
         markers: dict[str, int],
-        request_records: dict[str, FinishedRequestRecord],
+        request_records: dict[str, RecordOrFrame],
         *,
         timeline: str,
     ) -> None:
@@ -1044,12 +1131,9 @@ class RolloutBank:
         _fsync_directory(generation_dir)
 
     def _rewrite_segment(
-        self,
-        seg_dir: str,
-        records: list[LedgerRecord],
-        request_records: dict[str, FinishedRequestRecord],
+        self, seg_dir: str, records: list[LedgerRecord], request_records: dict[str, RecordOrFrame]
     ) -> None:
-        """Write raw records into `seg_dir`."""
+        """Write the manifest records and their request records into ``seg_dir``."""
         with open(os.path.join(seg_dir, _LEDGER), "w") as f:
             for record in records:
                 f.write(json.dumps(record, separators=(",", ":")) + "\n")
@@ -1058,7 +1142,9 @@ class RolloutBank:
         if request_records:
             with open(os.path.join(seg_dir, _REQUEST_RECORDS), "wb") as f:
                 for uid, record in sorted(request_records.items()):
-                    f.write(pack_finished_request_record(uid, record))
+                    if not isinstance(record, bytes):  # recovery folds decoded records
+                        record = pack_finished_request_record(uid, record)
+                    f.write(record)
                 f.flush()
                 os.fsync(f.fileno())
         _fsync_directory(seg_dir)

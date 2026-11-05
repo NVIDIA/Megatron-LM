@@ -1,17 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib.util
+import sys
 import threading
 
 import pytest
 
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     FinishedRequestRecord,
     OffloadedRequestPayload,
     RequestPayloadStageResult,
 )
+from megatron.rl import gym_capture
 from megatron.rl.gym_capture import (
     NG_COMMIT_COORDS_FIELD,
     GymPromptPreparer,
@@ -70,7 +74,7 @@ def test_store_survives_bad_frames_and_clients_time_out(store):
         dead.ping()
     dead.close()  # closing after a failed exchange, or twice, must not hang or raise
     dead.close()
-    # One socket serves every stager thread and the engine loop; exchanges serialize cleanly.
+    # Each calling thread gets its own socket; concurrent puts never queue behind one exchange.
     threads = [
         threading.Thread(target=lambda i=i: client.put(f"t{i}", [i], [i, i])) for i in range(8)
     ]
@@ -184,3 +188,118 @@ def test_stager_answers_gym_admissions_with_commit_coordinates(store, admission,
     )
     assert result.response_metadata[NG_COMMIT_COORDS_FIELD]["disposition"] == "capture_failed"
     assert set(dead.drain()) == {"u11"}
+
+
+def test_stager_acknowledges_capture_failed_without_nemo_gym(monkeypatch, caplog):
+    """Without nemo_gym (the CI container) every admitted call is acknowledged capture_failed in
+    Gym's coordinate shape, the condition is logged once, and the records are still indexed."""
+    cached = [name for name in sys.modules if name.partition(".")[0] == "nemo_gym"]
+    for name in cached:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "nemo_gym", None)  # every nemo_gym import now fails
+    monkeypatch.setattr("megatron.rl.gym_capture._GYM_MISSING_LOGGED", False)
+    stager = LedgerPayloadStager()
+    record = FinishedRequestRecord(policy_epoch=[(0, 3)], kv_cache_epoch=None, num_evictions=0)
+    payload = OffloadedRequestPayload(
+        prompt_token_ids=[1, 2],
+        generated_token_ids=[3],
+        generated_log_probs=[-0.5],
+        prompt_log_probs=None,
+        routing_indices=None,
+    )
+    with caplog.at_level("ERROR", logger="megatron.rl.gym_capture"):
+        results = [
+            stager.stage(
+                uid, payload, finished_metadata=record, offload_params={"ng_capture": _admission()}
+            )
+            for uid in ("u1", "u2")
+        ]
+    coords = [result.response_metadata[NG_COMMIT_COORDS_FIELD] for result in results]
+    assert coords[0] == {
+        "capture_key": "r",
+        "model_call_id": "c2",
+        "parent_call_id": "c1",
+        "prev_len": 5,
+        "delta_len": 0,
+        "cum_len": 5,
+        "weight_version": 3,
+        "disposition": "capture_failed",
+    }
+    assert coords[1] == coords[0]
+    assert sum("nemo_gym is not importable" in rec.message for rec in caplog.records) == 1
+    assert set(stager.drain()) == {"u1", "u2"}
+
+
+def test_stager_ignores_a_malformed_admission(caplog):
+    """A non-dict value under the admission key is not an admission: the record is indexed, the
+    reply carries no coordinates, and the engine log says why."""
+    stager = LedgerPayloadStager()
+    record = FinishedRequestRecord(policy_epoch=[(0, 3)], kv_cache_epoch=None, num_evictions=0)
+    payload = OffloadedRequestPayload(
+        prompt_token_ids=[1],
+        generated_token_ids=[2],
+        generated_log_probs=[-0.5],
+        prompt_log_probs=None,
+        routing_indices=None,
+    )
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        result = stager.stage(
+            "u1", payload, finished_metadata=record, offload_params={"ng_capture": "bogus"}
+        )
+    assert result == RequestPayloadStageResult() and set(stager.drain()) == {"u1"}
+    assert any("malformed" in rec.message for rec in caplog.records)
+
+
+def test_preparer_honors_the_multimodal_prefix_contract(store):
+    """When the endpoint stamps a media count, a spliced token_in prefix reports its expanded
+    length so the engine expands only the suffix, and a Gym text root drops the count so the
+    engine expands every placeholder itself; a request without an admission is left alone."""
+    server, client = store
+    client.put("u1", [1, 2], [3, 2])
+    params = {
+        "ng_capture": _admission(prev_len=4),
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [1, 2, 9, 2],
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
+        PREFIX_MEDIA_COUNT_FIELD: 1,
+    }
+    result = GymPromptPreparer(client).prepare_prompt([1, 2, 9, 2, 5], offload_params=params)
+    assert result.prompt == [1, 2, 3, 2, 5]
+    assert result.offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] == 4
+    assert result.offload_params[PREFIX_MEDIA_COUNT_FIELD] == 1
+    root = _admission(
+        mode="text", parent_call_id=None, prev_len=0, staging_chain=[], parent_chain_hash=None
+    )
+    result = GymPromptPreparer(client).prepare_prompt(
+        [7, 8], offload_params={"ng_capture": root, PREFIX_MEDIA_COUNT_FIELD: 1}
+    )
+    assert (result.prompt, result.offload_params) == ([7, 8], {"ng_capture": root})
+    plain = {PREFIX_MEDIA_COUNT_FIELD: 1}
+    result = GymPromptPreparer(client).prepare_prompt([7, 8], offload_params=plain)
+    assert (result.prompt, result.offload_params) == ([7, 8], plain)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("nemo_gym") is None, reason="needs nemo_gym")
+def test_copied_gym_wire_names_match_the_installed_gym():
+    """The constants and dict keys gym_capture copies from Gym still match the installed Gym.
+    Runs only where nemo_gym is importable (not in Megatron CI)."""
+    try:
+        from nemo_gym.models.token_capture import NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
+        from nemo_gym.models.token_capture.staging.records import CaptureAdmission, CommitCoords
+    except ImportError:  # nemo_gym before 0.8.0 shipped the package as token_id_capture
+        from nemo_gym.token_id_capture import NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission, CommitCoords
+
+    assert (gym_capture.NG_CAPTURE_FIELD, gym_capture.NG_COMMIT_COORDS_FIELD) == (
+        NG_CAPTURE_FIELD,
+        NG_COMMIT_COORDS_FIELD,
+    )
+    # Every key the preparer reads off an admission is a Gym admission field.
+    assert {"mode", "required_prefix_token_ids", "staging_chain", "prev_len"} <= set(
+        CaptureAdmission.model_fields
+    )
+    # The hand-built capture_failed acknowledgement is a CommitCoords Gym accepts.
+    failed = gym_capture._failed_coordinates(_admission(prev_len=3), 3)
+    assert set(failed) <= set(CommitCoords.model_fields)
+    parsed = CommitCoords.model_validate(failed)
+    assert parsed.disposition == "capture_failed"
+    assert parsed.model_dump(mode="json").items() >= failed.items()

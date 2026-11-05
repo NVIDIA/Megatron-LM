@@ -210,8 +210,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                     None
                     if staged
                     else [
-                        [x >= r.prompt_length for x in range(len(r.token_ids))]
-                        for r in responses
+                        [x >= r.prompt_length for x in range(len(r.token_ids))] for r in responses
                     ]
                 ),
                 env_id=self.env_id,

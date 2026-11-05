@@ -19,12 +19,7 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.training.global_vars import (
-    get_args,
-    get_run_config,
-    get_tokenizer,
-    get_train_state,
-)
+from megatron.training.global_vars import get_args, get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils import print_rank_0
 
 from ..gym_capture import GymPromptPreparer, PrefixStoreClient, PrefixStoreServer
@@ -151,9 +146,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             # Need to copy the staged payloads into the durable bank.
             bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, args.save)
             writer = FinishedRequestLedgerWriter(
-                request_record_backup_path(
-                    bank_dir, dist.get_rank(), get_train_state().iteration
-                )
+                request_record_backup_path(bank_dir, dist.get_rank(), get_train_state().iteration)
             )
         # Gym admissions need the parent call's exact tokens on whichever engine continues it:
         # rank 0 serves them for the job, every stager publishes, every preparer fetches.
@@ -237,9 +230,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
-        writer = self._inference_engine.payload_stager.writer
-        if writer is not None:
-            writer.close()
+        self._inference_engine.payload_stager.close()
         self._prefix_store.close()
 
         if dist.get_rank() == 0:
@@ -276,8 +267,9 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     ) -> dict[str, FinishedRequestRecord]:
         """Drain every engine's staged records into rank 0 (a gather over the world).
 
-        Routing indices and prompt log probs stay on the owning rank (its durable backup holds
-        them); the gathered record carries the token ids, generated log probs and stamps.
+        Routing indices and prompt log probs are not gathered; they survive only in the owning
+        rank's durable backup when `rl_durable_rollout_bank` is on. The gathered record carries
+        the token ids, generated log probs and stamps.
 
         Args:
             rotate_to: New window for the writer to point to after the drain,
@@ -288,12 +280,24 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         """
         stager = self._inference_engine.payload_stager
         drained = stager.drain()
-        if rotate_to is not None and stager.writer is not None:
-            stager.writer.rotate(
-                request_record_backup_path(
-                    self._request_record_backup_dir, dist.get_rank(), rotate_to
+        writer_error = None
+        if rotate_to is not None and self._request_record_backup_dir is not None:
+            try:
+                stager.rotate(
+                    request_record_backup_path(
+                        self._request_record_backup_dir, dist.get_rank(), rotate_to
+                    )
                 )
-            )
+            except RuntimeError as error:
+                writer_error = error
+        # A backup write fails on one rank: raise on every rank, after agreeing,
+        # instead of leaving the peers in the gather below until the distributed timeout.
+        failures = [None] * dist.get_world_size()
+        dist.all_gather_object(failures, None if writer_error is None else repr(writer_error))
+        if any(failure is not None for failure in failures):
+            raise RuntimeError(
+                f"finished-request ledger writer failed: {failures}"
+            ) from writer_error
         local = {uid: gather_view(record) for uid, record in drained.items()}
         shards = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
         dist.gather_object(local, shards, dst=0)

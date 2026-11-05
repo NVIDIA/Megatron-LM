@@ -566,6 +566,7 @@ class TestRLUtils:
             generation_mask=[mask],
             reward=0.0,
             env_id="cap-test",
+            completion_ids=_mint_cids(1),
             generation_cap=cap,
         )
         assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
@@ -577,6 +578,7 @@ class TestRLUtils:
             generation_mask=[[False, True, True]],
             reward=0.0,
             env_id="uncapped-test",
+            completion_ids=_mint_cids(1),
         )
 
         assert rollout.generation_cap is None
@@ -682,7 +684,10 @@ class TestRLUtils:
         the next window), pops the dropped groups' records before the broadcast and, with
         nothing in flight, fails loudly on a record no consumer claimed."""
         n_prompts = 4
-        fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        # The last group holds a failed episode's placeholder naming the one call it made.
+        fake_groups = [[f"group_{i}"] for i in range(n_prompts - 1)] + [
+            [TokenRollout(trajectory=[], reward=0.0, completion_ids=["released-cid"])]
+        ]
         train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
 
@@ -703,7 +708,11 @@ class TestRLUtils:
             return list(fake_groups)
 
         colocated = MagicMock(side_effect=colocated)
-        drained = {"dropped-cid": object(), **({"stray-cid": object()} if leftover else {})}
+        drained = {
+            "dropped-cid": object(),
+            "released-cid": object(),
+            **({"stray-cid": object()} if leftover else {}),
+        }
         interface = SimpleNamespace(
             merge_global_request_ledgers=MagicMock(return_value=drained),
             forget_held_prefixes=MagicMock(),
@@ -752,10 +761,10 @@ class TestRLUtils:
             assert colocated.called != expected_skip
             # The ledger drain closes out this window's backups under the next window.
             interface.merge_global_request_ledgers.assert_called_once_with(rotate_to=2)
-            # The dropped group's record was popped; nothing else is left waiting.
+            # The dropped group's and the placeholder's records were popped; nothing is left.
             assert runtime_state.request_ledger == {}
-            # The prefix store stops holding the consumed calls' tokens.
-            interface.forget_held_prefixes.assert_called_once_with({"dropped-cid"})
+            # The prefix store stops holding the consumed and released calls' tokens.
+            interface.forget_held_prefixes.assert_called_once_with({"dropped-cid", "released-cid"})
         finally:
             loop.run_until_complete(rollout_generator.aclose())
             loop.close()
@@ -1004,15 +1013,30 @@ class TestRLUtils:
             rl_default_top_p=1.0,
             rl_default_top_k=0,
         )
-        response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
+        response = SimpleNamespace(
+            env_id="env",
+            metrics=lambda: {"reward": [1.0, 0.5]},
+            results=[SimpleNamespace(completion_ids=["eval-1", "eval-2"])],
+        )
         agent = SimpleNamespace(run_evaluation=lambda request: [response])
         wandb_writer = MagicMock()
+        interface = MagicMock()
+        # The drain also carries a training straggler that finished during the evaluation.
+        interface.merge_global_request_ledgers.return_value = {
+            "eval-1": object(),
+            "eval-2": object(),
+            "straggler": object(),
+        }
+        runtime_state = rl_utils.RLRuntimeState()
+        bank = MagicMock()
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: runtime_state)
+        monkeypatch.setattr(rl_utils, "get_rollout_bank", lambda: bank)
         monkeypatch.setattr(
-            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
+            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(interface)
         )
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -1035,6 +1059,11 @@ class TestRLUtils:
             model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
+        # Evaluation records are popped right away; the straggler waits for its collection.
+        interface.merge_global_request_ledgers.assert_called_once_with()
+        assert set(runtime_state.request_ledger) == {"straggler"}
+        bank.retire_records.assert_called_once_with(["eval-1", "eval-2"])
+        interface.forget_held_prefixes.assert_called_once_with(["eval-1", "eval-2"])
         if do_train:
             wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
             wandb_writer.define_metric.assert_not_called()
@@ -2883,6 +2912,30 @@ class TestRLUtils:
         assert staged.logprobs == [[-0.1, -0.2], [-0.3, -0.4]]
         assert (staged.policy_epochs, staged.num_evictions) == ([[(0, 7)], [(0, 8)]], [0, 1])
         rl_utils.join_request_records(rollouts, {})  # joined rollouts need no records again
+        # A failed episode's placeholder as the env server's wire adapter delivers it (no mask, no
+        # log probs, no completion ids) has nothing to join and passes through; a mixed group
+        # reaches the join because only all-placeholder groups are refilled.
+        placeholder = TokenRollout(trajectory=[], reward=0.0, env_id='MEGAENV')
+        rl_utils.join_request_records([[twin_a, placeholder]], {})
+        assert placeholder.is_placeholder and not placeholder.logprobs
+        placeholder_stats = rl_utils.compute_group_stats(
+            [RolloutGroup(rollouts=[twin_a, placeholder])], MockTokenizer(), 8
+        )
+        assert placeholder_stats.rollout_statuses == [['ok', 'placeholder']]
+        assert placeholder_stats.policy_epoch_segments == [[[(5, 3)], []]]
+        # A placeholder naming the calls its failed episode made is still a placeholder; the
+        # caller released those records, so the join pops nothing and leaves empty epoch rows.
+        released = TokenRollout(
+            trajectory=[], reward=0.0, env_id='MEGAENV', completion_ids=_mint_cids(2)
+        )
+        assert released.is_placeholder
+        rl_utils.join_request_records([[twin_a, released]], {})
+        assert (released.logprobs, released.policy_epochs) == (None, [])
+        released_stats = rl_utils.compute_group_stats(
+            [RolloutGroup(rollouts=[twin_a, released])], MockTokenizer(), 8
+        )
+        assert released_stats.rollout_statuses == [['ok', 'placeholder']]
+        assert released_stats.policy_epoch_segments == [[[(5, 3)], []]]
 
         stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), 8)
 
@@ -2900,8 +2953,11 @@ class TestRLUtils:
         def offloaded_turn(**kwargs):
             return token_rollout([[7, 8]], [[False, True]], inline_logprobs=False, **kwargs)
 
-        bare, overlong, unstamped = offloaded_turn(), offloaded_turn(), offloaded_turn()
+        bare, overlong, one_short, unstamped = [offloaded_turn() for _ in range(4)]
         tokenless = TokenRollout(
+            trajectory=None, reward=1.0, env_id='MEGAENV', completion_ids=_mint_cids(1)
+        )
+        short = TokenRollout(
             trajectory=None, reward=1.0, env_id='MEGAENV', completion_ids=_mint_cids(1)
         )
         for rollout, records, message in [
@@ -2910,6 +2966,13 @@ class TestRLUtils:
             (
                 overlong,
                 {overlong.completion_ids[0]: _ledger_record(3, generated_log_probs=[-0.1, -0.2])},
+                "log probs for",
+            ),
+            # An inline record one log prob short of its generated tokens (none for one) must fail
+            # too; the engine never produces it, and a tolerance pins that token's ratio at 1.0.
+            (
+                one_short,
+                {one_short.completion_ids[0]: _ledger_record(3, generated_log_probs=[])},
                 "log probs for",
             ),
             (
@@ -2921,11 +2984,21 @@ class TestRLUtils:
                 },
                 "no epoch stamps",
             ),
-            (offloaded_turn(completion_ids=[]), {}, "completion ids for"),
             (tokenless, {tokenless.completion_ids[0]: _ledger_record(3)}, "no token payload"),
+            # A staged payload with fewer log probs than generated tokens (here none for two) must
+            # fail the join too, not silently pin the trailing tokens at importance ratio 1.0.
+            (
+                short,
+                {short.completion_ids[0]: _ledger_record(3, payload=_payload([1], [2, 3], []))},
+                "log probs for",
+            ),
         ]:
             with pytest.raises(AssertionError, match=message):
                 rl_utils.join_request_records([[rollout]], records)
+        # One request id per turn is enforced where the rollout is built, so a producer learns
+        # the rule at its own boundary rather than at the collection barrier on rank 0.
+        with pytest.raises(ValueError, match="completion ids"):
+            offloaded_turn(completion_ids=[])
 
         # Text (non-token) rollouts join no finished-request records and yield
         # empty epoch rows; staleness/eviction telemetry filters them out while

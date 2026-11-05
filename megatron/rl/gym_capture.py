@@ -18,22 +18,29 @@ admitted call is acknowledged ``capture_failed`` and the condition is logged onc
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import socket
 import threading
 from collections import OrderedDict
-from typing import Any
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 import msgpack
 import zmq
 
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     FinishedRequestRecord,
     OffloadedRequestPayload,
     RequestPromptPreparationResult,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +86,7 @@ class PrefixStoreServer:
         while not self._stop.is_set():
             if not poller.poll(timeout=100):
                 continue
-            frame = self._socket.recv()
+            frame = self._socket.recv_multipart()[0]  # REP must consume the whole message
             try:
                 reply = self._handle(frame)
             except Exception:  # a bad frame must not take the server down or hang its client
@@ -90,86 +97,103 @@ class PrefixStoreServer:
         self._context.term()
 
     def size(self) -> int:
-        """A method rather than `__len__` so an empty store is still truthy."""
+        """Number of calls currently held."""
         return len(self._held)
 
     def close(self) -> None:
+        """Stop the serving thread and release the socket and context."""
         self._stop.set()
         self._thread.join()
 
 
 class PrefixStoreClient:
-    """Thread-safe client of ``PrefixStoreServer``: one REQ socket, one exchange at a time.
+    """Client of ``PrefixStoreServer``: one REQ socket per calling thread, no shared lock.
 
-    It owns its ZMQ context. The engine terminates the process-wide ``zmq.Context.instance()``
-    at shutdown, and that call blocks until every socket in the context is closed, so sharing
-    it would hang the teardown; ``close()`` releases this client's socket and context instead.
+    Stager threads and the engine loop's preparer never wait on one another's exchange, so a
+    stalled store costs each caller one timeout instead of queueing them all behind it. The
+    client owns its ZMQ context: the engine terminates the process-wide
+    ``zmq.Context.instance()`` at shutdown, and that call blocks until every socket in the
+    context is closed, so sharing it would hang the teardown; ``close()`` releases this
+    client's sockets and context instead.
     """
 
     def __init__(self, address: str, timeout_ms: int = STORE_TIMEOUT_MS) -> None:
         self.address = address
         self.timeout_ms = timeout_ms
         self._context = zmq.Context()
-        self._lock = threading.Lock()
-        self._sock = None
+        self._local = threading.local()  # the calling thread's REQ socket
+        self._sockets: set[zmq.Socket] = set()  # every socket opened; closed before term()
+        self._sockets_lock = threading.Lock()
 
-    def _socket(self):
-        if self._sock is None:
-            self._sock = self._context.socket(zmq.REQ)
-            self._sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            self._sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-            self._sock.setsockopt(zmq.LINGER, 0)
-            self._sock.connect(self.address)
-        return self._sock
+    def _socket(self) -> zmq.Socket:
+        sock = getattr(self._local, "sock", None)
+        if sock is None:
+            sock = self._context.socket(zmq.REQ)
+            sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(self.address)
+            self._local.sock = sock
+            with self._sockets_lock:
+                self._sockets.add(sock)
+        return sock
+
+    def _discard(self, sock: zmq.Socket) -> None:
+        """Drop the calling thread's socket; a REQ socket is unusable after a failed exchange."""
+        with self._sockets_lock:
+            self._sockets.discard(sock)
+        sock.close(linger=0)
+        self._local.sock = None
 
     def _request(self, op: str, uid: str | None = None, payload: Any = None) -> Any:
-        with self._lock:
-            sock = self._socket()
-            try:
-                sock.send(msgpack.packb([op, uid, payload], use_bin_type=True))
-                reply = msgpack.unpackb(sock.recv(), raw=False)
-            except zmq.ZMQError as error:
-                # A REQ socket cannot be reused after a failed exchange; drop it, surface the fault.
-                sock.close(linger=0)
-                self._sock = None
-                raise RuntimeError(
-                    f"prefix store {op} at {self.address} failed: {error}"
-                ) from error
+        sock = self._socket()
+        try:
+            sock.send(msgpack.packb([op, uid, payload], use_bin_type=True))
+            reply = msgpack.unpackb(sock.recv(), raw=False)
+        except zmq.ZMQError as error:
+            self._discard(sock)
+            raise RuntimeError(f"prefix store {op} at {self.address} failed: {error}") from error
         if isinstance(reply, dict) and "error" in reply:
             raise RuntimeError(f"prefix store {op} at {self.address} failed: {reply['error']}")
         return reply
 
     def close(self) -> None:
-        """Release the socket and context; call once the engine no longer stages or prepares."""
-        with self._lock:
-            if self._sock is not None:
-                self._sock.close(linger=0)
-                self._sock = None
-            self._context.term()
+        """Release every thread's socket and the context; call once nothing stages or prepares."""
+        with self._sockets_lock:
+            for sock in self._sockets:
+                sock.close(linger=0)
+            self._sockets.clear()
+        self._context.term()
 
     def ping(self) -> None:
         """Round-trip once; raises when the store is unreachable, so the launch fails early."""
         self._request("get", "")
 
     def put(self, uid: str, prompt_token_ids: list[int], generated_token_ids: list[int]) -> None:
+        """Publish one finished call's prompt and generated token ids under ``uid``."""
         packed = msgpack.packb(
             [list(prompt_token_ids), list(generated_token_ids)], use_bin_type=True
         )
         self._request("put", uid, packed)
 
     def get(self, uid: str) -> HeldCall | None:
+        """The call held under ``uid`` as ``(prompt_token_ids, generated_token_ids)``, or None."""
         held = self._request("get", uid)
         return None if held is None else (held[0], held[1])
 
-    def forget(self, uids) -> None:
+    def forget(self, uids: Iterable[str]) -> None:
+        """Drop the calls held under ``uids``; unknown ids are ignored."""
         uids = list(uids)
         if uids:
             self._request("forget", None, uids)
 
 
 def replace_prefix_tokens(
-    prefix_token_ids, template_prefix_token_ids, template_token_ids, eos_token_ids
-):
+    prefix_token_ids: Sequence[int],
+    template_prefix_token_ids: Sequence[int],
+    template_token_ids: Sequence[int],
+    eos_token_ids: Iterable[int],
+) -> list[int]:
     """Splice the exact earlier turns in place of their re-rendered form (EOS-count boundary)."""
     eos_token_ids = set(eos_token_ids)
     eos_count = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
@@ -198,7 +222,7 @@ class GymPromptPreparer:
 
     def __init__(self, store: PrefixStoreClient, cache_size: int = 256) -> None:
         self.store = store
-        # Recently fetched parents, so a conversation's turns cost one round trip, not one per turn.
+        # Parents fetched so far. Consecutive turns have distinct parents.
         self._cache: OrderedDict[str, HeldCall] = OrderedDict()
         self._cache_size = cache_size
 
@@ -215,9 +239,19 @@ class GymPromptPreparer:
                 self._cache.popitem(last=False)
         return held
 
-    def prepare_prompt(self, prompt, *, offload_params=None) -> RequestPromptPreparationResult:
+    def prepare_prompt(
+        self,
+        prompt: str | list[int] | torch.Tensor,
+        *,
+        offload_params: dict[str, Any] | None = None,
+    ) -> RequestPromptPreparationResult:
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if not isinstance(admission, dict) or admission.get("mode") != "token_in":
+            if isinstance(admission, dict) and PREFIX_MEDIA_COUNT_FIELD in offload_params:
+                # Nothing is spliced for a text root: the engine expands every media placeholder.
+                offload_params = {
+                    k: v for k, v in offload_params.items() if k != PREFIX_MEDIA_COUNT_FIELD
+                }
             return RequestPromptPreparationResult(prompt=prompt, offload_params=offload_params)
         prefix = list(admission.get("required_prefix_token_ids") or [])
         if not prefix:
@@ -247,6 +281,9 @@ class GymPromptPreparer:
             **offload_params,
             NG_CAPTURE_FIELD: {**admission, "required_prefix_token_ids": prefix},
         }
+        if PREFIX_MEDIA_COUNT_FIELD in offload_params:
+            # The parent's tokens are already media-expanded; the engine expands only the suffix.
+            offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] = len(prefix)
         return RequestPromptPreparationResult(prompt=spliced, offload_params=offload_params)
 
 
@@ -257,11 +294,18 @@ def _log_gym_missing_once(uid: str) -> None:
     global _GYM_MISSING_LOGGED
     if not _GYM_MISSING_LOGGED:
         _GYM_MISSING_LOGGED = True
+        if importlib.util.find_spec("nemo_gym") is None:
+            problem = "nemo_gym is not importable in the trainer process"
+        else:
+            problem = (
+                "the installed nemo_gym has no Megatron capture adapter under "
+                "nemo_gym.models.token_capture or nemo_gym.token_id_capture (needs >= 0.7.0)"
+            )
         logger.error(
-            "Gym admitted request %s but nemo_gym is not importable in the trainer process; every "
-            "admitted call is acknowledged capture_failed. Put the Gym checkout or wheel on the "
-            "trainer's path when Gym sends admissions.",
+            "Gym admitted request %s but %s; every admitted call is acknowledged "
+            "capture_failed. Put a compatible Gym checkout or wheel on the trainer's path.",
             uid,
+            problem,
         )
 
 
@@ -300,9 +344,15 @@ def stage_admitted_call(
     """
     weight_version = _weight_version(finished_metadata)
     try:
-        from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
-        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission, StageResult
+        try:
+            from nemo_gym.models.token_capture.adapters.megatron import MegatronCaptureAdapter
+            from nemo_gym.models.token_capture.staging.capture import RolloutTokenCapture
+            from nemo_gym.models.token_capture.staging.records import CaptureAdmission, StageResult
+        except ImportError:
+            # nemo_gym before 0.8.0, which has not moved token_id_capture yet.
+            from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
+            from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+            from nemo_gym.token_id_capture.staging.records import CaptureAdmission, StageResult
     except ImportError:
         _log_gym_missing_once(uid)
         return {NG_COMMIT_COORDS_FIELD: _failed_coordinates(admission, weight_version)}
