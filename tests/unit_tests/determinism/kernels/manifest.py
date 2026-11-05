@@ -405,11 +405,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
+            "megatron/core/transformer/moe/training_matches_inference.py",
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention.",
+        "virtual-expert routing metadata and probability gradients replay under stream contention; "
+        "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
+        "backward, and its MXFP8 training-stack quantization.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -661,12 +664,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="sigmoid_topk_router",
+        sources=("megatron/core/inference/moe/sigmoid_topk.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant_router.py",
+        ),
+        kind="triton",
+        notes="Inference router (inference_moe_router_backend='triton'); batch-invariant mode also "
+        "runs it in training with a launch configuration independent of the token count.",
+    ),
+    KernelEntry(
         name="inference_moe_kernels",
         sources=(
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
-            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
@@ -701,6 +714,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/inference/contexts/dynamic_context.py",
             "megatron/core/inference/contexts/kv_block_allocator.py",
+            "megatron/core/inference/contexts/prefix_cache_block_state.py",
             "megatron/core/context_parallel/layout.py",
         ),
         kind="torch-op",
