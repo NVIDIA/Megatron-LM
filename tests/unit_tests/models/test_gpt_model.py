@@ -825,7 +825,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         ), "use_te_activation_func must be forwarded from config"
 
 
-def test_gpt_builder_forwards_rope_scaling_factor():
+def test_gpt_builder_forwards_rope_scaling_factor(run_config):
     """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
 
     Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
@@ -833,6 +833,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
     passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
     back to its default factor of 8.0.
     """
+    run_config.tokenizer.padded_vocab_size = 512
     mock_config = MagicMock()
 
     mock_args = MagicMock()
@@ -855,6 +856,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
 
         mock_gpt_model.assert_called_once()
         _, call_kwargs = mock_gpt_model.call_args
+        assert call_kwargs["vocab_size"] == 512
         assert (
             call_kwargs.get('rope_scaling_factor') == 32.0
         ), "rope_scaling_factor must be forwarded from args"
