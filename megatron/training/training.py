@@ -3176,7 +3176,7 @@ def setup_model_and_optimizer(
     # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
     # iteration has completed, so a run that dies during startup (e.g., an OOM while loading
     # a checkpoint into a grid that fits fine from scratch) otherwise leaves no memory trace.
-    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
+    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0], pg_collection))
     report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
     if args.moe_use_upcycling:
