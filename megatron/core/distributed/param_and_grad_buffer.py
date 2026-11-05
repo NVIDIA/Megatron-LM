@@ -14,7 +14,6 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
-from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
@@ -1083,6 +1082,8 @@ class _ParamAndGradBuffer:
         param_indices: The index of each param among the params with same dtype, if a param is fp8,
             use its "fake" high precision dtype to determine which params have same dtype with it.
             These indices are needed when loading a non-native-fp8 checkpoint in native-fp8 mode.
+        pg_collection: Process groups of the model; ``tp``, ``dp_cp`` and the GTP-remat groups
+            select the rank that logs the buffer layout.
     """
 
     def __init__(
@@ -1097,19 +1098,12 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        pg_collection: ProcessGroupCollection,
         param_layout: Optional['PerBufferParamLayout'] = None,
     ):
 
-        if pg_collection is None:
-            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
-                with_context_parallel=True
-            )
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        else:
-            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
-            self.dp_cp_group = pg_collection.dp_cp
-            self.tp_group = pg_collection.tp
+        self.dp_cp_group = pg_collection.dp_cp
+        self.tp_group = pg_collection.tp
 
         # Pick the single rank per module that logs this buffer's layout. Every GTP-remat
         # peer holds a replica of the buffer, so requiring tp and dp_cp rank 0 alone still
@@ -1232,10 +1226,12 @@ class _ParamAndGradBuffer:
             )
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
-            torch.distributed.barrier()
+            # Barriers stay on dp_group: ranks outside it (other PP stages, other modules) may
+            # own a different number of buffers, so a WORLD barrier here would not pair up.
+            torch.distributed.barrier(group=self.data_parallel_group)
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.data_parallel_group)
         else:
             # If nccl_ub is False, the allocation context is nullcontext.
             mem_alloc_context = nullcontext
