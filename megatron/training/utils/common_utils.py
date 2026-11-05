@@ -396,12 +396,9 @@ def get_model_to_optimizer_param_map(optimizer) -> dict:
     param_map = {}
 
     if hasattr(optimizer, "model_float16_groups"):
-        if optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            _add_param_group_mapping(param_map, optimizer.model_float16_groups, optimizer.shard_float16_groups)
-        else:
-            _add_param_group_mapping(
-                param_map, optimizer.model_float16_groups, optimizer.shard_fp32_from_float16_groups
-            )
+        _add_param_group_mapping(
+            param_map, optimizer.model_float16_groups, optimizer.shard_fp32_from_float16_groups
+        )
         _add_param_group_mapping(param_map, optimizer.model_fp32_groups, optimizer.shard_fp32_groups)
         return param_map
 

@@ -3529,81 +3529,14 @@ def _add_mla_args(parser):
     return parser
 
 def _add_experimental_attention_variant_args(parser):
-    def _has_option_string(option_string):
-        return any(option_string in action.option_strings for action in parser._actions)
-
-    def _maybe_add_argument(*option_strings, **kwargs):
-        if any(_has_option_string(option_string) for option_string in option_strings):
-            return
-        group.add_argument(*option_strings, **kwargs)
-
     group = parser.add_argument_group(title="experimental_attention_variant")
-    _maybe_add_argument(
-        '--experimental-attention-variant',
-        type=str,
-        default=None,
-        choices=['gated_delta_net', 'dsa'],
-        help='Select an experimental attention variant.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-mode',
-        type=str,
-        default='standard',
-        choices=['standard', 'simplified'],
-        help=(
-            'DSA indexer formulation. simplified uses one Q index head and a plain scaled '
-            'dot-product score against a separately learned indexer K.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-n-heads',
-        type=int,
-        default=None,
-        help='Number of indexer heads to use for DSA.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-head-dim',
-        type=int,
-        default=None,
-        help='Dimension per DSA indexer head.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-topk',
-        type=int,
-        default=None,
-        help='Number of source tokens selected per query token by DSA.',
-    )
-    _maybe_add_argument(
-        '--dsa-fwd-use-dense-attn',
-        action='store_true',
-        help=(
-            'Use dense GQA attention forward with dense tiled DSA indexer KL loss for '
-            'min-memory DSA warmup. Requires dsa_indexer_use_sparse_loss to be unset.'
-        ),
-    )
-    _maybe_add_argument(
+    group.add_argument(
         '--dsa-train-indexer-only',
         action='store_true',
         help=(
             'Freeze non-indexer parameters and train only DSA indexer parameters. '
             'Intended for DSA indexer warmup from a dense GQA checkpoint.'
         ),
-    )
-    _maybe_add_argument(
-        '--dsa-reset-indexer-on-load',
-        action='store_true',
-        help='Reset DSA indexer parameters and clear their optimizer state after checkpoint load.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-loss-coeff',
-        type=float,
-        default=None,
-        help='KL loss coefficient for training the DSA indexer.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-use-sparse-loss',
-        action='store_true',
-        help='Train the DSA indexer with KL loss restricted to the selected top-k support.',
     )
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,

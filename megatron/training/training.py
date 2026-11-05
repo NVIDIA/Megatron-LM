@@ -1579,22 +1579,11 @@ def _freeze_non_dsa_indexer_parameters(model):
     """Freeze all parameters except those under DSA indexer submodules."""
 
     indexer_param_count = 0
-    frozen_param_count = 0
-    indexer_element_count = 0
-    frozen_element_count = 0
-    frozen_expert_bias_count = 0
-
     for model_module in model:
         for name, param in model_module.named_parameters():
-            is_indexer_param = _is_dsa_indexer_param_name(name)
-            if is_indexer_param:
-                param.requires_grad_(True)
-                indexer_param_count += 1
-                indexer_element_count += param.nelement()
-            else:
-                param.requires_grad_(False)
-                frozen_param_count += 1
-                frozen_element_count += param.nelement()
+            trainable = _is_dsa_indexer_param_name(name)
+            param.requires_grad_(trainable)
+            indexer_param_count += trainable
         # The MoE router's expert_bias is a buffer, not a parameter: finalize_model_grads
         # rewrites it every step from the observed token counts, for load balancing. Clearing
         # requires_grad does not reach it, so the backbone's routing would keep drifting while
@@ -1602,7 +1591,6 @@ def _freeze_non_dsa_indexer_parameters(model):
         for module in model_module.modules():
             if hasattr(module, 'frozen_expert_bias'):
                 module.frozen_expert_bias = True
-                frozen_expert_bias_count += 1
 
     global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
     if global_indexer_param_count == 0:
@@ -1612,11 +1600,8 @@ def _freeze_non_dsa_indexer_parameters(model):
         )
 
     print_rank_0(
-        f" > DSA train-indexer-only: froze {frozen_expert_bias_count} MoE router expert biases; "
-        "trainable indexer params "
-        f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
-        f"{indexer_element_count} local elements; "
-        f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
+        f" > DSA train-indexer-only: {indexer_param_count} trainable indexer tensors "
+        f"({global_indexer_param_count} across ranks)"
     )
 
 
@@ -1634,17 +1619,7 @@ def apply_dsa_param_freezing(model):
     proceeds with every parameter trainable and only the loss curve reveals it.
     """
     args = get_args()
-    if getattr(args, "dsa_train_indexer_only", False):
-        if getattr(args, "experimental_attention_variant", None) != "dsa":
-            raise RuntimeError(
-                "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
-            )
-        if getattr(args, "overlap_param_gather", False):
-            raise RuntimeError(
-                "--dsa-train-indexer-only is not compatible with --overlap-param-gather. "
-                "DSA min-memory indexer paths use indexer parameter tensors directly, bypassing "
-                "the module forward pre-hooks that overlapped param gather depends on."
-            )
+    if args.dsa_train_indexer_only:
         _freeze_non_dsa_indexer_parameters(model)
 
 
@@ -1808,9 +1783,6 @@ def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
         )
 
     param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
-    precision_aware = getattr(
-        getattr(optimizer, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False
-    )
     refreshed = 0
     for model_chunk in model:
         for name, model_param in model_chunk.named_parameters():
@@ -1831,14 +1803,7 @@ def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
                 param_range = get_range(model_param)["param"]
                 source = source[param_range.start : param_range.end]
 
-            if precision_aware:
-                set_states = getattr(optimizer, "_set_main_param_and_optimizer_states", None)
-                if set_states is None:
-                    raise RuntimeError(
-                        "Precision-aware optimizer does not expose indexer master-parameter refresh."
-                    )
-                set_states(model_param, {"param": source.float()})
-            elif optim_param is not model_param:
+            if optim_param is not model_param:
                 optim_param.copy_(source.reshape_as(optim_param))
             refreshed += 1
     return refreshed
