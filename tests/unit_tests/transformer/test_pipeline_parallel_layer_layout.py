@@ -240,23 +240,26 @@ class TestTransformerBlockOnItsOwnPipelineGrid:
         # select stage (0, 0) on every rank.
         Utils.initialize_model_parallel()
         grid = HyperCommGrid([1, 1, pp_size, Utils.world_size // pp_size], ["tp", "cp", "pp", "dp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp")
-        )
-        pp_rank = pg_collection.pp.rank()
-        config = _make_config(INTERLEAVED_LAYOUT, 5)
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp")
+            )
+            pp_rank = pg_collection.pp.rank()
+            config = _make_config(INTERLEAVED_LAYOUT, 5)
 
-        with monkeypatch.context() as patch:
-            if forbid_global_reads:
-                _forbid_global_pipeline_state(patch)
-            for vp_stage, (offset, count) in enumerate(INTERLEAVED_STAGES[pp_rank]):
-                block = TransformerBlock(
-                    config,
-                    get_gpt_layer_local_spec(),
-                    pg_collection=pg_collection,
-                    vp_stage=vp_stage,
-                )
-                layer_numbers = [layer.layer_number for layer in block.layers]
-                assert layer_numbers == list(
-                    range(offset + 1, offset + count + 1)
-                ), f"{pp_rank=} {vp_stage=}"
+            with monkeypatch.context() as patch:
+                if forbid_global_reads:
+                    _forbid_global_pipeline_state(patch)
+                for vp_stage, (offset, count) in enumerate(INTERLEAVED_STAGES[pp_rank]):
+                    block = TransformerBlock(
+                        config,
+                        get_gpt_layer_local_spec(),
+                        pg_collection=pg_collection,
+                        vp_stage=vp_stage,
+                    )
+                    layer_numbers = [layer.layer_number for layer in block.layers]
+                    assert layer_numbers == list(
+                        range(offset + 1, offset + count + 1)
+                    ), f"{pp_rank=} {vp_stage=}"
+        finally:
+            grid.destroy()

@@ -262,6 +262,7 @@ def test_built_collection_needs_no_global_grid(grid_pg_collection):
 def test_build_test_pg_collection_rejects_a_grid_that_does_not_fit():
     Utils.initialize_distributed()
     with pytest.raises(ValueError, match="must be divisible"):
-        build_test_pg_collection(tp=3)
+        # Larger than the world size, so it cannot divide it.
+        build_test_pg_collection(tp=Utils.world_size + 1)
     with pytest.raises(ValueError, match="order"):
         build_test_pg_collection(order="tp-dp-pp")
