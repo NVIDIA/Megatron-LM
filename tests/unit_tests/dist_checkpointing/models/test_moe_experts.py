@@ -175,22 +175,35 @@ class TestExpertLayerReconfiguration:
         )
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("expert_gtp_remat_size", [1, 2])
     @pytest.mark.skipif(
         not is_te_min_version("1.13.0"),
         reason="TE activation operators require Transformer Engine 1.13 or later.",
     )
-    def test_grouped_te_activation_extra_state_tracks_expert_dp_replica(self, tmp_path_dist_ckpt):
-        """Grouped TE state must identify replicas across joint ETP-EP and expert-DP."""
+    def test_grouped_te_activation_extra_state_tracks_expert_dp_replica(
+        self, tmp_path_dist_ckpt, expert_gtp_remat_size
+    ):
+        """Grouped TE state must identify replicas across joint ETP-EP, expert-DP and EGTP-remat.
+
+        With ``expert_gtp_remat_size=1`` the expert-DP and ``expt_dp_gtp_remat`` groups coincide,
+        so only the remat size 2 case catches a DP coordinate taken from the replicate group: the
+        rematerialization peers would then share main-replica ids.
+        """
         Utils.initialize_model_parallel(
-            2, 1, expert_model_parallel_size=2, expert_tensor_parallel_size=1, order="tp-ep-dp-pp"
+            2,
+            1,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            expert_gtp_remat_size=expert_gtp_remat_size,
+            order="tp-ep-dp-pp",
         )
-        model = initialize_expert_layer(1, expert_type='te_grouped', use_te_activation_func=True)
+        model = initialize_expert_layer(1, expert_type="te_grouped", use_te_activation_func=True)
         sharded_state_dict = model.sharded_state_dict()
 
         activation_extra_states = {
             key: value
             for key, value in sharded_state_dict.items()
-            if key.endswith('activation_func._extra_state')
+            if key.endswith("activation_func._extra_state")
         }
         assert len(activation_extra_states) == 1
         activation_extra_state = next(iter(activation_extra_states.values()))
@@ -199,12 +212,23 @@ class TestExpertLayerReconfiguration:
             parallel_state.get_expert_tensor_and_model_parallel_rank(),
             parallel_state.get_expert_data_parallel_rank(),
         )
+        # Every rank holds a distinct replica id and exactly one rank the main replica.
+        all_replica_ids = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(all_replica_ids, activation_extra_state.replica_id)
+        assert len(set(all_replica_ids)) == len(all_replica_ids), all_replica_ids
+        assert sum(replica_id == (0, 0, 0) for replica_id in all_replica_ids) == 1, all_replica_ids
 
+        # The default MoE process-group collection carries no ``expt_gtp_remat`` group, so with
+        # rematerialization peers the grouped linear weights are not GTP-sharded. Save the whole
+        # model where that is well defined and only the activation entries otherwise.
+        state_to_save = (
+            sharded_state_dict if expert_gtp_remat_size == 1 else activation_extra_states
+        )
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_grouped_te_activation_extra_state_tracks_expert_dp_replica',
+            tmp_path_dist_ckpt / "test_grouped_te_activation_extra_state_tracks_expert_dp_replica",
             sync=True,
         ) as ckpt_dir:
-            save(sharded_state_dict, ckpt_dir, validate_access_integrity=True)
+            save(state_to_save, ckpt_dir, validate_access_integrity=True)
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
