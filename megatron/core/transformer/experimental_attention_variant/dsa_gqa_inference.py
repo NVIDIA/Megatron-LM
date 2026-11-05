@@ -102,7 +102,6 @@ def dynamic_sparse_attention(
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
     inference_context: BaseInferenceContext,
-    layer_number: int,
     index_topk: int,
     softmax_scale: float,
 ) -> torch.Tensor:
@@ -120,7 +119,6 @@ def dynamic_sparse_attention(
         index_query: Indexer queries ``[T,1,1,Di]``.
         index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``.
         inference_context: Dynamic inference context for this step.
-        layer_number: One-based layer number within the current pipeline stage.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
 
@@ -155,7 +153,6 @@ def dynamic_sparse_attention(
         index_query=index_query.reshape(num_tokens, -1),
         index_key_cache=index_key_cache,
         inference_context=inference_context,
-        layer_number=layer_number,
         plan=plan,
         max_context_length=max_context_length,
         index_topk=index_topk,
@@ -173,7 +170,6 @@ def _native_sparse_attention(
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
     inference_context: BaseInferenceContext,
-    layer_number: int,
     plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
@@ -181,35 +177,27 @@ def _native_sparse_attention(
 ) -> torch.Tensor:
     rows = plan.decode_lengths.numel()
     max_context = inference_context.max_sequence_length
-    cache_key = (layer_number, rows, query.shape[1:], max_context, index_topk, key_cache.shape[1])
-    cache = inference_context.dsa_metadata.decode_workspaces
-    if cache_key not in cache:
+    metadata = inference_context.dsa_metadata
+    if metadata.topk_workspace is None:
+        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
+
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm the native DSA workspace before CUDA graph capture")
-        workspace = TritonDSADecodeWorkspace(
-            batch_size=rows,
-            num_query_heads=query.shape[1],
-            head_dim=query.shape[2],
-            index_topk=index_topk,
-            max_context=max_context,
-            page_size=key_cache.shape[1],
-            device=query.device,
-        )
-        stable_query = torch.empty(
-            rows, index_query.shape[1], dtype=index_query.dtype, device=query.device
-        )
-        cache[cache_key] = workspace, stable_query
-    workspace, stable_query = cache[cache_key]
-    stable_query.copy_(index_query[:rows])
+            raise RuntimeError("Warm DSA decode before capturing its shared top-k scratch")
+        metadata.topk_workspace = {
+            "gvr2_workspace": torch.zeros(workspace_bytes(), dtype=torch.uint8, device=query.device)
+        }
     lengths = plan.decode_lengths
-    native = workspace(
+    native = dsa_gqa_decode(
         query=query[:rows],
-        index_query=stable_query,
+        index_query=index_query[:rows].contiguous(),
         index_key_cache=index_key_cache,
         key_cache=key_cache,
         value_cache=value_cache,
         block_table=plan.block_table,
         context_lengths=lengths,
+        index_topk=index_topk,
+        max_context=max_context,
+        topk_workspace=metadata.topk_workspace,
         request_indices=plan.row_requests[:rows],
         softmax_scale=softmax_scale,
     )
@@ -217,7 +205,7 @@ def _native_sparse_attention(
         return native
 
     # Mixed steps retain the prefill implementation; decode rows are computed only
-    # by the native workspace, with zero lengths in the prefill score/attention path.
+    # by native decode, with zero lengths in the prefill score/attention path.
     prefill_lengths = plan.row_lengths.clone()
     prefill_lengths[:rows] = torch.where(lengths > 0, 0, prefill_lengths[:rows])
     output = _sparse_attention_rows(
@@ -235,271 +223,215 @@ def _native_sparse_attention(
     return output
 
 
-class TritonDSADecodeWorkspace:
-    """Reusable workspace for single-token DSA decode on Blackwell.
-
-    Allocate one workspace per concurrently executing stream. Warm one call with
-    the actual query/cache buffers before graph capture. Captured graphs read new
-    tensor contents, including lengths, requests, and the native page table. The
-    returned output is overwritten on the next call.
-
-    Input indexer vectors have dimension 128. KV caches have one head, and native
-    page sizes must be multiples of 128. Every positive context length must fit
-    max_context and reference valid allocated pages in block_table. Active request
-    indices must address valid rows of block_table. Score inputs must be NaN-free.
-    FlashInfer GVR2 selects exact top-k; tied indices and output ordering can vary.
-    Deterministic mode is not supported and is rejected before top-k execution.
+@torch.no_grad()
+def dsa_gqa_decode(
+    *,
+    query: torch.Tensor,
+    index_query: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lengths: torch.Tensor,
+    index_topk: int,
+    max_context: int,
+    topk_workspace: dict[str, torch.Tensor],
+    softmax_scale: float,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run Blackwell DSA decode with forward-local activation buffers.
 
     Args:
-        batch_size: Number of padded decode rows.
-        num_query_heads: Attention query heads per row.
-        head_dim: Attention key/value dimension.
-        index_topk: Selected keys: 512, 1024, or 2048.
-        max_context: Context capacity, at most 1048576.
-        page_size: Tokens per native page, divisible by 128.
-        device: SM100 or SM103 CUDA device.
+        query: BF16 attention queries ``[batch, heads, head_dim]``.
+        index_query: Contiguous BF16 indexer queries ``[batch, 128]``.
+        index_key_cache: Contiguous BF16 indexer keys ``[blocks, page_size, 128]``.
+        key_cache: Paged BF16 keys ``[blocks, page_size, 1, head_dim]``.
+        value_cache: Paged BF16 values with the same shape as key_cache.
+        block_table: INT32 request-to-page mapping with compact rows.
+        context_lengths: INT32 valid key counts ``[batch]``.
+        index_topk: Number of selected keys: 512, 1024, or 2048.
+        max_context: Static context capacity, at most 1048576.
+        topk_workspace: Preinitialized FlashInfer scratch, shared by serial calls.
+            Concurrent calls must use separate scratch buffers.
+        softmax_scale: Attention softmax scale.
+        request_indices: INT32 request IDs for each row; defaults to row indices.
+
+    Returns:
+        BF16 attention output with the same shape as query. The allocator owns
+        intermediate lifetimes, including allocations in a CUDA graph pool.
     """
+    import triton
+    from flashinfer import top_k_varlen
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-    def __init__(
-        self,
-        *,
-        batch_size: int,
-        num_query_heads: int,
-        head_dim: int,
-        index_topk: int,
-        max_context: int,
-        page_size: int,
-        device: torch.device,
-    ) -> None:
-        import triton
-        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
-        from triton.experimental.gluon import language as gl
-        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+    from . import dsa_gqa_inference_kernels as kernels
 
-        from . import dsa_gqa_inference_kernels as kernels
+    if use_deterministic_mode():
+        raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
 
-        device = torch.device(device)
-        if device.type != "cuda" or torch.cuda.get_device_capability(device) not in (
-            (10, 0),
-            (10, 3),
+    device = query.device
+    if device.type != "cuda" or torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        raise ValueError("Native Triton DSA decode requires SM100 or SM103")
+    if query.ndim != 3 or key_cache.ndim != 4:
+        raise ValueError("Expected THD query and paged BHGD key cache")
+    batch_size, num_query_heads, head_dim = query.shape
+    page_size = key_cache.shape[1]
+    if batch_size <= 0 or num_query_heads <= 0 or head_dim <= 0 or head_dim % 32:
+        raise ValueError("Batch/heads must be positive; head_dim must be a positive multiple of 32")
+    if index_topk not in (512, 1024, 2048) or not 0 < max_context <= 1048576:
+        raise ValueError(
+            "Supported top-k values are 512/1024/2048, with context capacity 1..1048576"
+        )
+    if page_size <= 0 or page_size % 128:
+        raise ValueError("Native Triton DSA requires pages divisible by 128")
+    requests = (
+        torch.arange(batch_size, dtype=torch.int32, device=device)
+        if request_indices is None
+        else request_indices
+    )
+    tensors = (
+        query,
+        index_query,
+        index_key_cache,
+        key_cache,
+        value_cache,
+        block_table,
+        context_lengths,
+        requests,
+    )
+    if any(t.device != device for t in tensors):
+        raise ValueError("Every input must be on the query CUDA device")
+    if query.dtype != torch.bfloat16 or query.stride(-1) != 1:
+        raise ValueError("query must be BF16 [batch_size,num_query_heads,head_dim]")
+    if query.stride(1) != head_dim:
+        raise ValueError("Query heads must occupy compact rows")
+    if (
+        index_query.shape != (batch_size, 128)
+        or index_query.dtype != torch.bfloat16
+        or not index_query.is_contiguous()
+    ):
+        raise ValueError("index_query must be contiguous BF16 [batch_size,128]")
+    if (
+        index_key_cache.ndim != 3
+        or index_key_cache.shape[1:] != (page_size, 128)
+        or index_key_cache.dtype != torch.bfloat16
+        or not index_key_cache.is_contiguous()
+    ):
+        raise ValueError("index_key_cache must be contiguous BF16 [blocks,page_size,128]")
+    if key_cache.shape != value_cache.shape or key_cache.shape != (
+        index_key_cache.shape[0],
+        page_size,
+        1,
+        head_dim,
+    ):
+        raise ValueError("Key/value caches must be [blocks,page_size,1,head_dim]")
+    if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
+        raise ValueError("Key/value caches must use BF16")
+    if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+        raise ValueError("Cache head dimensions must have unit stride")
+    for name, tensor in (("context_lengths", context_lengths), ("request_indices", requests)):
+        if (
+            tensor.dtype != torch.int32
+            or tensor.shape != (batch_size,)
+            or not tensor.is_contiguous()
         ):
-            raise ValueError("Native Triton DSA decode requires SM100 or SM103")
-        if batch_size <= 0 or num_query_heads <= 0 or head_dim <= 0 or head_dim % 32:
-            raise ValueError(
-                "Batch/heads must be positive; head_dim must be a positive multiple of 32"
-            )
-        if index_topk not in (512, 1024, 2048) or not 0 < max_context <= 1048576:
-            raise ValueError(
-                "Supported top-k values are 512/1024/2048, with context capacity 1..1048576"
-            )
-        if page_size <= 0 or page_size % 128:
-            raise ValueError("Native Triton DSA requires pages divisible by 128")
-        if device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
+            raise ValueError(f"{name} must be contiguous int32 [batch_size]")
+    if block_table.dtype != torch.int32 or block_table.ndim != 2 or block_table.stride(-1) != 1:
+        raise ValueError("block_table must have compact int32 rows")
 
-        self.device = device
-        self.batch_size = batch_size
-        self.num_query_heads = num_query_heads
-        self.head_dim = head_dim
-        self.index_topk = index_topk
-        self.max_context = max_context
-        self.page_size = page_size
-        width = max(max_context, index_topk)
-        self.score_width = triton.cdiv(width, 4) * 4
-        self._topk_workspace = {
-            "gvr2_workspace": torch.zeros(workspace_bytes(), dtype=torch.uint8, device=device)
-        }
-        self.scores = torch.empty(batch_size, self.score_width, dtype=torch.float32, device=device)
-        self.indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
-        self.output = torch.empty(
-            batch_size, num_query_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        self.request_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-        self._score = kernels.score_tcgen
-        self._descriptor_type = TensorDescriptor
-        self._descriptor_layout = gl.NVMMASharedLayout(
-            swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
-        )
-        self._descriptor_key = None
-        self._query_descriptor = None
-        self._key_descriptor = None
-        self._score_workers = 8
-        self._score_stages = 3
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        self._slices = kernels._num_slices(batch_size, 1, index_topk, sms)
-        self._slice_len = triton.cdiv(index_topk, self._slices)
-        partial_rows = batch_size * self._slices * num_query_heads
-        self._partial = torch.empty(partial_rows, head_dim, dtype=torch.float32, device=device)
-        self._maxima = torch.empty(partial_rows, dtype=torch.float32, device=device)
-        self._sums = torch.empty_like(self._maxima)
+    score_width = triton.cdiv(max(max_context, index_topk), 4) * 4
+    scores = torch.empty(batch_size, score_width, dtype=torch.float32, device=device)
+    indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
+    output = torch.empty(batch_size, num_query_heads, head_dim, dtype=torch.bfloat16, device=device)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    slices = kernels._num_slices(batch_size, 1, index_topk, sms)
+    slice_len = triton.cdiv(index_topk, slices)
+    partial_rows = batch_size * slices * num_query_heads
+    partial = torch.empty(partial_rows, head_dim, dtype=torch.float32, device=device)
+    maxima = torch.empty(partial_rows, dtype=torch.float32, device=device)
+    sums = torch.empty_like(maxima)
+    descriptor_layout = gl.NVMMASharedLayout(
+        swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
+    )
+    query_descriptor = TensorDescriptor.from_tensor(index_query, [8, 128], descriptor_layout)
+    key_descriptor = TensorDescriptor.from_tensor(
+        index_key_cache.view(-1, 128), [128, 128], descriptor_layout
+    )
+    score_workers, score_stages = 8, 3
 
-    def __call__(
-        self,
-        *,
-        query: torch.Tensor,
-        index_query: torch.Tensor,
-        index_key_cache: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        context_lengths: torch.Tensor,
-        softmax_scale: float,
-        request_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Score, select exact top-k, and attend into preallocated output storage."""
-        import triton
-        from flashinfer import top_k_varlen
-
-        from . import dsa_gqa_inference_kernels as kernels
-
-        if use_deterministic_mode():
-            raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
-
-        requests = self.request_indices if request_indices is None else request_indices
-        tensors = (
-            query,
-            index_query,
-            index_key_cache,
-            key_cache,
-            value_cache,
+    with torch.cuda.device(device):
+        kernels.score_tcgen[(batch_size, score_workers)](
+            query_descriptor,
+            key_descriptor,
             block_table,
             context_lengths,
             requests,
+            scores,
+            stride_table=block_table.stride(0),
+            WIDTH=score_width,
+            PAGE=page_size,
+            WORKERS=score_workers,
+            STAGES=score_stages,
+            num_warps=4,
         )
-        if any(t.device != self.device for t in tensors):
-            raise ValueError("Every input must be on the workspace CUDA device")
-        if (
-            query.shape != self.output.shape
-            or query.dtype != torch.bfloat16
-            or query.stride(-1) != 1
-        ):
-            raise ValueError("query must be BF16 [batch_size,num_query_heads,head_dim]")
-        if query.stride(1) != self.head_dim:
-            raise ValueError("Query heads must occupy compact rows")
-        if (
-            index_query.shape != (self.batch_size, 128)
-            or index_query.dtype != torch.bfloat16
-            or not index_query.is_contiguous()
-        ):
-            raise ValueError("index_query must be contiguous BF16 [batch_size,128]")
-        if (
-            index_key_cache.ndim != 3
-            or index_key_cache.shape[1:] != (self.page_size, 128)
-            or index_key_cache.dtype != torch.bfloat16
-            or not index_key_cache.is_contiguous()
-        ):
-            raise ValueError("index_key_cache must be contiguous BF16 [blocks,page_size,128]")
-        if key_cache.shape != value_cache.shape or key_cache.shape != (
-            index_key_cache.shape[0],
-            self.page_size,
-            1,
-            self.head_dim,
-        ):
-            raise ValueError("Key/value caches must be [blocks,page_size,1,head_dim]")
-        if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
-            raise ValueError("Key/value caches must use BF16")
-        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
-            raise ValueError("Cache head dimensions must have unit stride")
-        for name, tensor in (("context_lengths", context_lengths), ("request_indices", requests)):
-            if (
-                tensor.dtype != torch.int32
-                or tensor.shape != (self.batch_size,)
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(f"{name} must be contiguous int32 [batch_size]")
-        if block_table.dtype != torch.int32 or block_table.ndim != 2 or block_table.stride(-1) != 1:
-            raise ValueError("block_table must have compact int32 rows")
-
-        descriptor_key = (
-            index_query.data_ptr(),
-            index_key_cache.data_ptr(),
-            index_key_cache.shape[0],
+        top_k_varlen(
+            scores,
+            context_lengths,
+            index_topk,
+            backend="gvr_2",
+            out_indices=indices,
+            workspace=topk_workspace,
         )
-        with torch.cuda.device(self.device):
-            if descriptor_key != self._descriptor_key:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "Warm the workspace with these query/cache buffers before capture"
-                    )
-                self._query_descriptor = self._descriptor_type.from_tensor(
-                    index_query, [8, 128], self._descriptor_layout
-                )
-                self._key_descriptor = self._descriptor_type.from_tensor(
-                    index_key_cache.view(-1, 128), [128, 128], self._descriptor_layout
-                )
-                self._descriptor_key = descriptor_key
-
-            self._score[(self.batch_size, self._score_workers)](
-                self._query_descriptor,
-                self._key_descriptor,
-                block_table,
-                context_lengths,
-                requests,
-                self.scores,
-                stride_table=block_table.stride(0),
-                WIDTH=self.score_width,
-                PAGE=self.page_size,
-                WORKERS=self._score_workers,
-                STAGES=self._score_stages,
-                num_warps=4,
-            )
-            top_k_varlen(
-                self.scores,
-                context_lengths,
-                self.index_topk,
-                backend="gvr_2",
-                out_indices=self.indices,
-                workspace=self._topk_workspace,
-            )
-            kernels._partial_kernel[(self.batch_size, 1, self._slices)](
-                query,
-                key_cache,
-                value_cache,
-                block_table,
-                requests,
-                self.indices,
-                context_lengths,
-                self._partial,
-                self._maxima,
-                self._sums,
-                query.stride(0),
-                query.stride(1),
-                key_cache.stride(0),
-                key_cache.stride(1),
-                key_cache.stride(2),
-                value_cache.stride(0),
-                value_cache.stride(1),
-                value_cache.stride(2),
-                block_table.stride(0),
-                self.indices.stride(0),
-                key_cache.shape[0],
-                block_table.shape[1],
-                self.index_topk,
-                self._slice_len,
-                self._slices,
-                softmax_scale * kernels.LOG2E,
-                HEADS_PER_GROUP=self.num_query_heads,
-                HEAD_TILE=max(16, triton.next_power_of_2(self.num_query_heads)),
-                HEAD_DIM=self.head_dim,
-                HEAD_DIM_TILE=triton.next_power_of_2(self.head_dim),
-                VALUE_DIM=self.head_dim,
-                VALUE_DIM_TILE=triton.next_power_of_2(self.head_dim),
-                PAGE_SIZE=self.page_size,
-                BLOCK=kernels.BLOCK_N,
-                num_warps=4,
-                num_stages=2,
-            )
-            kernels._combine_kernel[(self.batch_size, self.num_query_heads)](
-                self._partial,
-                self._maxima,
-                self._sums,
-                self.output,
-                self.output.stride(0),
-                self.output.stride(1),
-                self.num_query_heads,
-                self._slices,
-                VALUE_DIM=self.head_dim,
-                VALUE_DIM_TILE=triton.next_power_of_2(self.head_dim),
-                num_warps=4,
-            )
-        return self.output
+        kernels._partial_kernel[(batch_size, 1, slices)](
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            requests,
+            indices,
+            context_lengths,
+            partial,
+            maxima,
+            sums,
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            block_table.stride(0),
+            indices.stride(0),
+            key_cache.shape[0],
+            block_table.shape[1],
+            index_topk,
+            slice_len,
+            slices,
+            softmax_scale * kernels.LOG2E,
+            HEADS_PER_GROUP=num_query_heads,
+            HEAD_TILE=max(16, triton.next_power_of_2(num_query_heads)),
+            HEAD_DIM=head_dim,
+            HEAD_DIM_TILE=triton.next_power_of_2(head_dim),
+            VALUE_DIM=head_dim,
+            VALUE_DIM_TILE=triton.next_power_of_2(head_dim),
+            PAGE_SIZE=page_size,
+            BLOCK=kernels.BLOCK_N,
+            num_warps=4,
+            num_stages=2,
+        )
+        kernels._combine_kernel[(batch_size, num_query_heads)](
+            partial,
+            maxima,
+            sums,
+            output,
+            output.stride(0),
+            output.stride(1),
+            num_query_heads,
+            slices,
+            VALUE_DIM=head_dim,
+            VALUE_DIM_TILE=triton.next_power_of_2(head_dim),
+            num_warps=4,
+        )
+    return output

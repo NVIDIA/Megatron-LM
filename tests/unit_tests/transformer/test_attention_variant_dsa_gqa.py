@@ -1391,11 +1391,9 @@ class TestDSGQADynamicInference:
             )
 
         decode_calls = []
-        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
-            TritonDSADecodeWorkspace,
-        )
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
 
-        decode_target, decode_name = TritonDSADecodeWorkspace, "__call__"
+        decode_target, decode_name = dsa_gqa_inference, "dsa_gqa_decode"
         original_decode = getattr(decode_target, decode_name)
 
         def capture_decode(*args, **kwargs):

@@ -20,8 +20,8 @@ from megatron.core.inference.contexts.attention_context.dsa_metadata import (
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference as dsa_gqa
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
-    TritonDSADecodeWorkspace,
     _sparse_attention_rows,
+    dsa_gqa_decode,
     dynamic_sparse_attention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
@@ -73,6 +73,13 @@ def nondeterministic_decode(monkeypatch):
 
 
 @pytest.fixture
+def topk_workspace():
+    from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
+
+    return {"gvr2_workspace": torch.zeros(workspace_bytes(), dtype=torch.uint8, device="cuda")}
+
+
+@pytest.fixture
 def native_context_factory():
     def make_context(*, max_sequence_length, max_requests, max_tokens, num_layers=1, **kwargs):
         return DynamicInferenceContext(
@@ -119,7 +126,6 @@ def test_speculative_decode_steps_are_rejected():
             index_query=None,
             index_key_cache=None,
             inference_context=context,
-            layer_number=1,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
         )
@@ -435,9 +441,7 @@ def test_score_windows_match_one_window(monkeypatch):
     ids=["persist", "offload", "recompute", "offload-static", "recompute-static"],
 )
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_native_decode_workspace_suspend_resume(
-    native_context_factory, cache_mode, static_pointers
-):
+def test_native_decode_suspend_resume(native_context_factory, cache_mode, static_pointers):
     """Repeated context suspension releases obsolete storage and preserves decode results."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
@@ -485,7 +489,6 @@ def test_native_decode_workspace_suspend_resume(
             index_query=index_query,
             index_key_cache=context.dsa_memory_buffer[0],
             inference_context=context,
-            layer_number=1,
             plan=context.dsa_metadata.plan(),
             max_context_length=bound,
             index_topk=TOPK,
@@ -524,11 +527,9 @@ def test_native_decode_workspace_suspend_resume(
         fill_metadata()
         graph.replay()
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-        assert len(context.dsa_metadata.decode_workspaces) == 1
         metadata_ref = weakref.ref(context.dsa_metadata)
         metadata_buffer_ref = weakref.ref(context.dsa_metadata._gpu_buffer)
-        workspace_ref = weakref.ref(next(iter(context.dsa_metadata.decode_workspaces.values()))[0])
-        descriptor_base_ref = weakref.ref(workspace_ref()._key_descriptor.base)
+        scratch_ref = weakref.ref(context.dsa_metadata.topk_workspace["gvr2_workspace"])
         torch.cuda.synchronize()
         allocated_before = torch.cuda.memory_allocated()
 
@@ -540,8 +541,7 @@ def test_native_decode_workspace_suspend_resume(
         gc.collect()
         torch.cuda.synchronize()
         if releases_storage:
-            assert workspace_ref() is None
-            assert descriptor_base_ref() is None
+            assert scratch_ref() is None
             if cache_mode == KVCacheManagementMode.RECOMPUTE:
                 assert metadata_ref() is None
                 assert metadata_buffer_ref() is None
@@ -552,7 +552,7 @@ def test_native_decode_workspace_suspend_resume(
         else:
             assert metadata_ref() is context.dsa_metadata
             assert metadata_buffer_ref() is context.dsa_metadata._gpu_buffer
-            assert workspace_ref() is next(iter(context.dsa_metadata.decode_workspaces.values()))[0]
+            assert scratch_ref() is context.dsa_metadata.topk_workspace["gvr2_workspace"]
 
         context.reinitialize_inference_state_buffers()
         if cache_mode == KVCacheManagementMode.RECOMPUTE:
@@ -563,7 +563,6 @@ def test_native_decode_workspace_suspend_resume(
             graph, output = capture()
         graph.replay()
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-        assert len(context.dsa_metadata.decode_workspaces) == 1
 
 
 @pytest.mark.parametrize("decode_only", [True, False])
@@ -571,7 +570,7 @@ def test_native_decode_workspace_suspend_resume(
 def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
     decode_only, native_context_factory, monkeypatch
 ):
-    """Two captured layers keep independent workspaces and match eager rows as inputs change."""
+    """Two captured layers use temporary activations and match eager rows as inputs change."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
     pytest.importorskip("cutlass.cute")
@@ -645,7 +644,6 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
             index_query=index_query,
             index_key_cache=index_keys[layer_idx],
             inference_context=native_context,
-            layer_number=layer_number,
             plan=plan,
             max_context_length=bound,
             index_topk=TOPK,
@@ -702,6 +700,95 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
         attend(1)
 
 
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_native_decode_activation_memory_is_bounded(native_context_factory):
+    """Thirty-two layers and several graph shapes must not retain per-layer score buffers."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Native DSA decode requires Blackwell")
+    pytest.importorskip("cutlass.cute")
+    layers, max_rows, bound, page_size = 32, 8, 262144, 256
+    context = native_context_factory(
+        max_sequence_length=bound, max_requests=max_rows, max_tokens=max_rows
+    )
+    query = torch.randn(max_rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    index_query = torch.randn(max_rows, INDEX_DIM, dtype=torch.bfloat16, device="cuda")
+    keys = torch.randn(layers, 1, page_size, 1, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    values = torch.randn_like(keys)
+    index_keys = torch.randn(layers, 1, page_size, INDEX_DIM, dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(max_rows, 1, dtype=torch.int32, device="cuda")
+
+    def prepare(rows):
+        context.dsa_metadata.update(
+            [1] * rows,
+            [1] * rows,
+            num_decode_requests=rows,
+            padded_tokens=rows,
+            padded_requests=rows,
+            decode_only=True,
+        )
+        context.dsa_metadata.transfer(table, non_blocking=False)
+
+    def attend(layer, rows):
+        return dsa_gqa._native_sparse_attention(
+            query=query[:rows],
+            key_cache=keys[layer],
+            value_cache=values[layer],
+            index_query=index_query[:rows].clone(),
+            index_key_cache=index_keys[layer],
+            inference_context=context,
+            plan=context.dsa_metadata.plan(),
+            max_context_length=bound,
+            index_topk=2048,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    pool = torch.cuda.graph_pool_handle()
+    graphs = []
+    for rows in (max_rows, 4, 2):
+        prepare(rows)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for layer in range(layers):
+                attend(layer, rows)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            outputs = [attend(layer, rows) for layer in range(layers)]
+        graphs.append((rows, graph, outputs))
+
+    gc.collect()
+    torch.cuda.synchronize()
+    retained = torch.cuda.memory_allocated() - before
+    pool_reserved = sum(
+        segment["total_size"]
+        for segment in torch.cuda.memory_snapshot()
+        if segment.get("segment_pool_id") == pool
+    )
+    # One shared 20 MiB top-k slab and small graph outputs fit comfortably here;
+    # even one 8-row score buffer retained per layer would require 256 MiB.
+    assert retained < 64 * 1024**2, f"Decode retained {retained / 1024**2:.1f} MiB"
+    assert (
+        0 < pool_reserved < 64 * 1024**2
+    ), f"Graph pool reserved {pool_reserved / 1024**2:.1f} MiB"
+    logger.info(
+        "32-layer decode across 3 graph shapes: retained %.2f MiB; graph pool reserved %.2f MiB",
+        retained / 1024**2,
+        pool_reserved / 1024**2,
+    )
+
+    for rows, graph, outputs in graphs:
+        prepare(rows)
+        values.normal_()
+        graph.replay()
+        for layer, output in enumerate(outputs):
+            expected = values[layer, 0, 0, 0].expand_as(output)
+            torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
 def _training_forward(query, index_query, index_keys, keys, values, selected, topk):
     """Call the scoring and attention kernels used by simplified DSA-GQA training."""
     length = index_keys.shape[0]
@@ -739,7 +826,9 @@ def _training_forward(query, index_query, index_keys, keys, values, selected, to
 @pytest.mark.parametrize("context", [32768, 262144])
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed, context, topk):
+def test_native_decode_matches_training_kernels_and_graph_refresh(
+    head_dim, seed, context, topk, topk_workspace, monkeypatch
+):
     """Decode matches the training forward kernels on the final causal query row."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
@@ -759,18 +848,19 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     if context > 65536:
         lengths_cpu = [0, 1, 2047, 2048, 65535, 65536, 200000, context]
     lengths = torch.tensor(lengths_cpu, device=device, dtype=torch.int32)
-    workspace = TritonDSADecodeWorkspace(
-        batch_size=batch,
-        num_query_heads=heads,
-        head_dim=head_dim,
-        index_topk=topk,
-        max_context=context,
-        page_size=page,
-        device=device,
-    )
+    import flashinfer
+
+    intermediates = {}
+    original_topk = flashinfer.top_k_varlen
+
+    def capture_topk(scores, lengths, k, **kwargs):
+        intermediates.update(scores=scores, indices=kwargs["out_indices"])
+        return original_topk(scores, lengths, k, **kwargs)
+
+    monkeypatch.setattr(flashinfer, "top_k_varlen", capture_topk)
 
     def run():
-        return workspace(
+        return dsa_gqa_decode(
             query=query,
             index_query=index_query,
             index_key_cache=index_keys,
@@ -778,6 +868,9 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
             value_cache=values,
             block_table=table,
             context_lengths=lengths,
+            index_topk=topk,
+            max_context=context,
+            topk_workspace=topk_workspace,
             request_indices=requests,
             softmax_scale=head_dim**-0.5,
         )
@@ -785,7 +878,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run()
+        graph_output = run()
     max_score_error = 0.0
     max_output_error = 0.0
     for _ in range(2):
@@ -793,8 +886,8 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
         index_query.neg_()
         table.copy_(table.roll(1, dims=0))
         graph.replay()
-        actual = workspace.output.clone()
-        selected = workspace.indices.clone()
+        actual = graph_output.clone()
+        selected = intermediates["indices"].clone()
         expected = torch.zeros_like(actual)
         same_support = torch.zeros_like(actual)
         for row, length in enumerate(lengths_cpu):
@@ -821,7 +914,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
             expected[row] = training_output
             same_support[row] = same_support_output
             # Decode ranks raw dot products; training applies a positive scalar.
-            scaled_scores = workspace.scores[row, :length] * 128**-0.5
+            scaled_scores = intermediates["scores"][row, :length] * 128**-0.5
             torch.testing.assert_close(scaled_scores, training_scores, atol=2e-5, rtol=2e-5)
             torch.testing.assert_close(
                 training_scores[chosen].sort().values,
@@ -840,7 +933,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
             max_output_error, (actual.float() - expected.float()).abs().max().item()
         )
         graph.replay()
-        torch.testing.assert_close(workspace.output, expected, atol=3e-3, rtol=2e-2)
+        torch.testing.assert_close(graph_output, expected, atol=3e-3, rtol=2e-2)
 
     logger.info(
         "Training/decode parity: seed=%s head_dim=%s max_score_abs=%s max_output_abs=%s",
@@ -855,7 +948,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     "width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048), (131072, 2048)]
 )
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk):
+def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk, topk_workspace):
     """Exact top-k across ragged rows, ties, and infinities with reusable scratch."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
@@ -865,28 +958,14 @@ def test_decode_topk_cutoffs_ties_and_graph_replay(width, topk):
     torch.manual_seed(71)
     device = torch.device("cuda", torch.cuda.current_device())
     batch = 6
-    workspace = TritonDSADecodeWorkspace(
-        batch_size=batch,
-        num_query_heads=NUM_HEADS,
-        head_dim=HEAD_DIM,
-        index_topk=topk,
-        max_context=width,
-        page_size=256,
-        device=device,
-    )
-    scores = workspace.scores.normal_()
+    scores = torch.randn(batch, -(-width // 4) * 4, device=device)
     lengths = torch.tensor([width - 3, 1, 0, width, width, width], device=device, dtype=torch.int32)
     scores[3].zero_()
-    indices = workspace.indices
+    indices = torch.empty(batch, topk, device=device, dtype=torch.int32)
 
     def run():
         top_k_varlen(
-            scores,
-            lengths,
-            topk,
-            backend="gvr_2",
-            out_indices=indices,
-            workspace=workspace._topk_workspace,
+            scores, lengths, topk, backend="gvr_2", out_indices=indices, workspace=topk_workspace
         )
 
     run()

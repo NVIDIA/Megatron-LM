@@ -84,7 +84,7 @@ class DSAMetadata(MetadataBase):
             self.block_rows,
             self.block_requests,
         ) = self._gpu_buffer.split(sizes)
-        self.decode_workspaces = {}
+        self.topk_workspace = None
         self.reset()
 
     def update(
@@ -174,7 +174,7 @@ class DSAMetadata(MetadataBase):
         )
 
     def reset(self) -> None:
-        """Forget the step while preserving graph-owned buffers and decode workspaces."""
+        """Forget the step while preserving graph-owned metadata and shared top-k scratch."""
         self._step = DSAStepInfo(0, 0, 0, 0, ())
         self.num_rows = 0
         self.num_score_blocks = 0

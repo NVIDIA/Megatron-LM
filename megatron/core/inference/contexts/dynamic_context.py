@@ -1871,10 +1871,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
             return
 
-        # TMA descriptors in these workspaces retain the old indexer KV storage.
         # The early-return paths above preserve addresses and their captured graphs.
         if self.dsa_metadata is not None:
-            self.dsa_metadata.decode_workspaces.clear()
+            self.dsa_metadata.topk_workspace = None
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
             for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
