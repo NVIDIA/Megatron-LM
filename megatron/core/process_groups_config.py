@@ -76,15 +76,22 @@ def warn_global_process_group_fallback(
     key = (owner, argument)
     if key in _warned_global_process_group_fallbacks:
         return
-    warnings.warn(
-        f"{owner} was called without `{argument}` and falls back to the global process groups "
-        "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
-        f"{deprecated_in} and will be removed in {removed_in}; pass the "
-        "owning model's process groups explicitly.",
-        ProcessGroupFallbackWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
-    )
+    # Record the pair before warning: a warning hook that reaches the same fallback while the
+    # warning is shown then returns here instead of warning again without end.
     _warned_global_process_group_fallbacks.add(key)
+    try:
+        warnings.warn(
+            f"{owner} was called without `{argument}` and falls back to the global process "
+            "groups in megatron.core.parallel_state. This fallback is deprecated since Megatron "
+            f"Core {deprecated_in} and will be removed in {removed_in}; pass the "
+            "owning model's process groups explicitly.",
+            ProcessGroupFallbackWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    except BaseException:
+        # A warning that a filter turned into an error stays unrecorded, so the next one raises.
+        _warned_global_process_group_fallbacks.discard(key)
+        raise
 
 
 class ProcessGroupHelperMeta(type):

@@ -105,6 +105,23 @@ def test_each_omitted_argument_of_an_owner_warns_once():
     _fallback_warning(record, "Owner", "cp_group")
 
 
+def test_warning_hook_that_reaches_the_same_fallback_does_not_recurse():
+    shown = []
+
+    def showwarning(message, category, *args, **kwargs):
+        shown.append(str(message))
+        # For example, a logging hook whose code builds a component that falls back too.
+        warn_global_process_group_fallback("Owner")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.showwarning = showwarning
+        warn_global_process_group_fallback("Owner")
+        warn_global_process_group_fallback("Owner")
+    assert len(shown) == 1
+    assert "Owner was called without `pg_collection`" in shown[0]
+
+
 def test_strict_mode_turns_every_fallback_into_an_error():
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
