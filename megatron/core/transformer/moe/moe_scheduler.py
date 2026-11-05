@@ -324,7 +324,7 @@ class MoEScheduler(torch.nn.Module):
             raise ValueError(
                 "replica_hybridep is not implemented; use replica_peer_tma or replica_nccl."
             )
-        if planner_type not in ("echo", "eplb", "moon_ep"):
+        if planner_type not in ("echo", "eplb", "moon_ep", "ultra_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
         if expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
             raise ValueError(
@@ -350,6 +350,10 @@ class MoEScheduler(torch.nn.Module):
                 num_logical_experts=config.num_moe_experts,
                 pg_collection=pg_collection,
             )
+        elif planner_type == "ultra_ep":
+            from megatron.core.transformer.moe.ultraep_moe_scheduler import UltraEPLoadPlanner
+
+            planner = UltraEPLoadPlanner(num_idle_experts, pg_collection.ep)
         else:
             from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner

@@ -1047,8 +1047,12 @@ def finalize_replica_expert_runtimes() -> None:
     from megatron.core.transformer.moe.moonep_moe_scheduler import (
         finalize_moonep_planner_workspaces,
     )
+    from megatron.core.transformer.moe.ultraep_moe_scheduler import (
+        finalize_ultraep_planner_managers,
+    )
 
     for runtime in list(_replica_expert_runtimes):
         runtime.destroy()
     finalize_replica_weight_transports()
     finalize_moonep_planner_workspaces()
+    finalize_ultraep_planner_managers()

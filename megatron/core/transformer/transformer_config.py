@@ -1288,8 +1288,8 @@ class TransformerConfig(ModelParallelConfig):
     expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
     remains the same after scheduler preprocessing."""
 
-    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep'] = "echo"
-    """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', and 'moon_ep'."""
+    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep', 'ultra_ep'] = "echo"
+    """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', 'moon_ep', and 'ultra_ep'."""
 
     moe_scheduler_expert_dispatcher_type: Literal['replica_peer_tma', 'replica_nccl'] = (
         "replica_peer_tma"
@@ -3303,10 +3303,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires add_bias_linear=False."
                 )
-            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep"):
+            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep", "ultra_ep"):
                 raise ValueError(
-                    "Only moe_scheduler_planner_type='echo', 'eplb', and 'moon_ep' are "
-                    "currently implemented."
+                    "Only moe_scheduler_planner_type='echo', 'eplb', 'moon_ep', and 'ultra_ep' "
+                    "are currently implemented."
                 )
             if self.moe_scheduler_expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
                 raise ValueError(
