@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -70,6 +72,16 @@ def test_omitted_embedding_group_warns_and_is_none(mocker, explicit_groups):
         FutureWarning, match='LanguageModule was given a pg_collection without an embd'
     ):
         model = LanguageModule(config(), pg_collection=explicit_groups)
+    assert model.embd_group is None
+
+
+def test_omitted_embedding_field_is_none_for_any_collection_object(mocker):
+    """Collections that do not default missing fields to None also get embd=None."""
+    clear_nvte_env_vars()
+    mocker.patch('torch.distributed.is_initialized', return_value=True)
+    groups = SimpleNamespace(tp=mocker.sentinel.tp, cp=mocker.sentinel.cp, pp=mocker.sentinel.pp)
+    with pytest.warns(FutureWarning, match='without an embd field'):
+        model = LanguageModule(config(), pg_collection=groups)
     assert model.embd_group is None
 
 

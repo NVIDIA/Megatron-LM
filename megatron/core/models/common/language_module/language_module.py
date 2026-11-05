@@ -96,7 +96,9 @@ class LanguageModule(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
-        self.embd_group = pg_collection.embd
+        # A collection without an embd field is deprecated and treated as embd=None, whatever
+        # object carries the groups.
+        self.embd_group = getattr(pg_collection, 'embd', None)
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
