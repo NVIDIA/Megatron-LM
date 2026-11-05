@@ -1945,6 +1945,44 @@ def test_get_megatron_optimizer_requires_gloo_groups_when_enabled():
         )
 
 
+@pytest.mark.parametrize('with_experts', [False, True])
+def test_expert_gloo_group_required_only_with_expert_parameters(with_experts):
+    """A collection may omit the expert Gloo group when no parameter would use it."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # expt_dp stays set, as in any collection built from a full grid; only its Gloo mirror is
+    # missing.
+    pg_collection.intra_expt_dp_gloo = None
+    config = TransformerConfig(num_attention_heads=1, num_layers=1)
+    module = (
+        DenseAndExpertLinear(config)
+        if with_experts
+        else nn.Linear(16, 16, bias=False, device='cuda')
+    )
+    model = DistributedDataParallel(
+        config,
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        module,
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    if with_experts:
+        with pytest.raises(
+            ValueError, match="requires pg_collection.intra_expt_dp_gloo for the expert parameters"
+        ):
+            get_megatron_optimizer(
+                optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+            )
+        return
+
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+    )
+    (dense_optimizer,) = optimizer.chained_optimizers
+    assert dense_optimizer.data_parallel_group_gloo is pg_collection.intra_dp_cp_gloo
+
+
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
 def test_emerging_optimizer_expert_grad_norm_covers_egtp_remat_shards():
     """Every EGTP_remat peer reports the norm over all expert-weight shards."""

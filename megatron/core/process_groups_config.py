@@ -398,10 +398,11 @@ class ProcessGroupCollection:
             pg_collection: Optional process group collection. If None, uses parallel_state groups.
             model_chunks: List of model chunks to extract configuration from.
             use_gloo_process_groups: Whether to set up gloo process groups. With a
-                pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
-                (the expert one only when the collection has an expert data-parallel group),
-                and a missing group or one whose ranks differ from the group it mirrors raises
-                ValueError.
+                pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields.
+                A missing intra_dp_cp_gloo, or a supplied Gloo group whose ranks differ from the
+                group it mirrors, raises ValueError. intra_expt_dp_gloo may be absent, in which
+                case intra_expt_dp_group_gloo is None; get_megatron_optimizer requires it only
+                when the model has expert parameters.
 
         Returns:
             Dictionary containing all required process groups:
@@ -596,9 +597,10 @@ class ProcessGroupCollection:
                     "the data-parallel group (dp_cp, or intra_dp_cp with more than one "
                     "distributed optimizer instance)",
                 )
-                # Only expert parameters use the expert Gloo group, so a collection without an
-                # expert data-parallel group (a dense model) does not need one.
-                if intra_expt_dp_group is None:
+                # Only expert parameters use the expert Gloo group, and whether the model has
+                # any is not known here, so a missing group is left for the caller to reject
+                # when it builds an expert optimizer. A supplied group must still mirror.
+                if intra_expt_dp_group is None or pg_set.get('intra_expt_dp_gloo') is None:
                     intra_expt_dp_group_gloo = None
                 else:
                     intra_expt_dp_group_gloo = _get_gloo_mirror_group(

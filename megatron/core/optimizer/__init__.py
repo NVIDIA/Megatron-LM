@@ -1375,10 +1375,19 @@ def get_megatron_optimizer(
         # Expert analog of dense ``model_parallel_rank``; use the EGTP_remat-merged group so each
         # EGTP_remat peer gets a distinct distopt ShardedObject key (else DCP "duplicate" error).
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
-        if use_gloo_process_groups:
-            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
-        else:
-            expt_data_parallel_group_gloo = None
+        # setup_process_groups_for_optimizer leaves a missing expert Gloo group to this point,
+        # where the model is known to have expert parameters. The param groups are aligned
+        # across ranks, so every rank takes this branch and raises together.
+        if (
+            use_gloo_process_groups
+            and intra_expt_dp_group_gloo is None
+            and not ProcessGroupCollection.is_gtp_remat_active(process_groups_dict)
+        ):
+            raise ValueError(
+                "use_gloo_process_groups=True requires pg_collection.intra_expt_dp_gloo for the "
+                "expert parameters. Build the job with Gloo process groups or pass "
+                "use_gloo_process_groups=False."
+            )
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config=config,
@@ -1387,7 +1396,7 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
-                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_gloo=intra_expt_dp_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
