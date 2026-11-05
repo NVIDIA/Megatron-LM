@@ -40,6 +40,12 @@ VIRTUAL_PIPELINE = {
 DENSE_STAGE_LAYER_NUMBERS = [[1], [2, 3]]
 
 
+@pytest.fixture(autouse=True)
+def padded_vocab_size(run_config):
+    """The builders read the padded vocabulary size from the run's tokenizer settings."""
+    run_config.tokenizer.padded_vocab_size = VOCAB_SIZE
+
+
 def _forbid_global_pipeline_rank(monkeypatch):
     def forbidden():
         raise RuntimeError("the global pipeline rank was read")
@@ -111,7 +117,6 @@ def _model_args(**overrides):
     args = Namespace(
         spec=None,
         mtp_num_layers=None,
-        padded_vocab_size=VOCAB_SIZE,
         max_position_embeddings=SEQUENCE_LENGTH,
         fp16_lm_cross_entropy=False,
         untie_embeddings_and_output_weights=True,
