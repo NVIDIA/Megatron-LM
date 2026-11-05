@@ -38,7 +38,7 @@ from megatron.training.config import (
 from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
-from megatron.training.datasets.varlen_dataset import MockVarlenDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -175,11 +175,16 @@ def _layout(**overrides):
         context_parallel_size=1,
         sequence_parallel=False,
         dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        calculate_per_token_loss=True,
+        max_seqlen_per_dp_cp_rank=None,
         gtp_weight_remat_size=1,
         gtp_remat_num_sequence_shards=1,
         cuda_graph_impl="none",
     )
     layout.update(overrides)
+    # What Megatron Core derives at construction: a scheduler sets variable_seq_lengths.
+    layout.setdefault("variable_seq_lengths", layout["sequence_packing_scheduler"] is not None)
     return SimpleNamespace(transformer=SimpleNamespace(**layout), seq_length=4096)
 
 
@@ -787,3 +792,463 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
     assert global_vars.get_run_config() is loader_only and loader_only._finalized
+
+
+def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
+    """dummy_train_step (the skip-iteration path) runs for any container: the batch flags and the
+    data length come from the data section, the model-parallel values from the model section when
+    there is one and from the arguments otherwise; the poisoned namespace shows which source won."""
+    from megatron.training import training
+    from megatron.training.config import DataConfig
+
+    calls = []
+
+    class _Machine:
+        def __init__(self):
+            self.runs = 0
+
+        def should_run_forward_backward(self, data_iterator):
+            self.runs += 1
+            return self.runs == 1
+
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: _Machine())
+    monkeypatch.setattr(
+        training, "get_batch_on_this_tp_rank", lambda batch, **kw: calls.append(kw) or {}
+    )
+    monkeypatch.setattr(training, "get_batch_on_this_cp_rank", lambda batch, **kw: batch)
+    monkeypatch.setattr(training, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(training.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(training.mpu, "is_pipeline_last_stage", lambda: True)
+    args = SimpleNamespace(  # poisoned wherever the section or the model section rules
+        seq_length=64,
+        context_parallel_size=2,
+        pipeline_model_parallel_size=4,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        sft=True,
+        dataloader_inter_document_masking=True,
+        create_attention_mask_in_dataloader=False,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    train = SimpleNamespace(micro_batch_size=3)
+
+    # No model section (pretrain_hybrid_flex.py) and a loader-only section: the topology and the
+    # length come from the arguments, the flags are the plain-GPT ones whatever args.sft says.
+    monkeypatch.setattr(
+        training,
+        "get_run_config",
+        lambda: SimpleNamespace(model=None, data=DataConfig(), train=train),
+    )
+    training.dummy_train_step(None)
+    kw = calls.pop()
+    assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (2, 4, False)
+    assert kw["seq_length"] == 64 and kw["micro_batch_size"] == 3
+    assert kw["has_cu_seqlens"] is False and kw["create_attention_mask_in_dataloader"] is True
+
+    # A dataset section and a model section: the section's flags and length, the model's values.
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        inter_document_masking=True,
+        create_attention_mask=False,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    transformer = SimpleNamespace(
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler=None,
+    )
+    monkeypatch.setattr(
+        training,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=transformer),
+            data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
+            train=train,
+        ),
+    )
+    training.dummy_train_step(None)
+    kw = calls.pop()
+    assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (1, 1, True)
+    assert kw["seq_length"] == 16
+    assert kw["has_cu_seqlens"] is True and kw["create_attention_mask_in_dataloader"] is False
+
+
+def test_microbatch_loss_reduction_is_keyed_on_the_sft_family(monkeypatch):
+    """The reporting reductions of train_step, in _reduce_microbatch_losses: SFT averages over the
+    trainable tokens of the global batch (or over the valid per-microbatch means in 'microbatch'
+    mode, an all-masked microbatch excluded), the others keep the per-microbatch mean; the family
+    is the data section's, --sft-loss-log-mode stays a logging argument."""
+    import torch
+
+    from megatron.training import training
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, group=None: None)
+    pairs = [torch.tensor([3.0, 3.0]), torch.tensor([10.0, 1.0]), torch.tensor([0.0, 0.0])]
+    losses = [{"lm loss": p} for p in pairs]  # (sum, token count) per microbatch
+    token_weighted = training._reduce_microbatch_losses(
+        losses, is_sft=True, sft_loss_log_mode="token", group=None
+    )
+    assert token_weighted["lm loss"].item() == pytest.approx(13.0 / 4.0)
+    per_microbatch = training._reduce_microbatch_losses(
+        losses, is_sft=True, sft_loss_log_mode="microbatch", group=None
+    )
+    assert per_microbatch["lm loss"].item() == pytest.approx((1.0 + 10.0) / 2)  # masked mb skipped
+    plain = training._reduce_microbatch_losses(
+        losses, is_sft=False, sft_loss_log_mode="microbatch", group=None
+    )
+    assert plain["lm loss"].item() == pytest.approx(13.0 / 4.0)  # sum / sum, as before for non-SFT
+    masked = training._reduce_microbatch_losses(
+        [{"lm loss": torch.tensor([0.0, 0.0])}], is_sft=True, sft_loss_log_mode="token", group=None
+    )
+    assert masked["lm loss"].item() == 0.0
+    legacy = training._reduce_microbatch_losses(
+        [{"lm loss": torch.tensor([2.0])}, {"lm loss": torch.tensor([4.0])}],
+        is_sft=False,
+        sft_loss_log_mode="token",
+        group=None,
+    )
+    assert legacy["lm loss"].item() == pytest.approx(3.0)
+    with pytest.raises(ValueError, match="Invalid value shape"):
+        training._reduce_microbatch_losses(
+            [{"lm loss": torch.zeros(3)}], is_sft=False, sft_loss_log_mode="token", group=None
+        )
+
+
+# The data-path rules of validate_args, on the container (placed by their inputs).
+
+
+def test_dynamic_cp_needs_the_single_loader_even_without_a_dataset(container_factory):
+    _, cfg = container_factory(["--seq-length", "64"])  # a loader-only section
+    cfg.model = _layout(dynamic_context_parallel=True)
+    cfg.validate()  # unset selects single
+    cfg.data.dataloader.dataloader_type = "cyclic"
+    with pytest.raises(ValueError, match="needs data.dataloader.dataloader_type='single'"):
+        cfg.validate()
+    cfg.data.dataloader.dataloader_type = "single"
+    cfg.validate()
+    cfg.model = _layout(dynamic_context_parallel=False)
+    cfg.data.dataloader.dataloader_type = "cyclic"
+    cfg.validate()
+
+
+def test_a_packing_scheduler_needs_per_token_loss(container_factory):
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced", calculate_per_token_loss=False)
+    with pytest.raises(ValueError, match="needs model.transformer.calculate_per_token_loss=True"):
+        cfg.validate()
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced", calculate_per_token_loss=True)
+    cfg.validate()
+
+
+def test_varlen_datasets_and_the_packing_scheduler(container_factory):
+    """A packed varlen dataset needs a scheduler (the CLI selects one; a Python container names
+    it); SBHD validation excludes one."""
+    from megatron.training.config import DataConfig
+
+    bools = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
+    _, cfg = container_factory(["--seq-length", "64"])
+    plain = GPTDatasetConfig(sequence_length=64, random_seed=1, **bools)
+    cfg.data = DataConfig(
+        dataset=plain, dataset_type=MockVarlenDataset, dataloader=cfg.data.dataloader
+    )
+    cfg.model = _layout()
+    with pytest.raises(ValueError, match="needs model.transformer.sequence_packing_scheduler"):
+        cfg.validate()
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced")
+    cfg.validate()
+    sbhd = GPTDatasetConfig(
+        sequence_length=64,
+        random_seed=1,
+        blend=(["prefix-a"], None),
+        split="9,1,0",
+        varlen_sbhd_validation=True,
+        **bools,
+    )
+    cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)
+    with pytest.raises(ValueError, match="does not use a packing scheduler"):
+        cfg.validate()
+    cfg.model = _layout()
+    cfg.validate()
+    cfg.model = None  # no model section: the model-dependent rules do not apply
+    cfg.validate()
+
+
+def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):
+    _, cfg = container_factory(["--seq-length", "60", "--mock-data"], data=True)
+    cfg.model = _layout(context_parallel_size=4)
+    with pytest.raises(
+        ValueError, match="multiple of 2 \\* model.transformer.context_parallel_size"
+    ):
+        cfg.validate()
+    cfg.model = _layout(context_parallel_size=2)  # 60 % 4 == 0
+    cfg.validate()
+
+
+def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypatch):
+    """cp ranks (times the data-parallel replicas under default_dynamic_cp) times the per-rank
+    budget must cover one sample; it needs the world size, so it runs at finalize(), before any
+    derived field is written."""
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 4)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(
+        context_parallel_size=2,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=16,
+    )
+    cfg.validate()
+    with pytest.raises(
+        ValueError,
+        match="packed-sequence buffer \\(2 ranks \\* max_seqlen_per_dp_cp_rank 16 = 32\\)",
+    ):
+        cfg.finalize()
+    assert not cfg._finalized and cfg.data.dataset.data_parallel_size == 1  # nothing written
+    cfg.model = _layout(
+        context_parallel_size=2,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=32,
+    )
+    cfg.finalize()
+    assert cfg.data.dataset.data_parallel_size == 2
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(  # 2 cp ranks * 2 replicas * 16 = 64 covers the sample
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        max_seqlen_per_dp_cp_rank=16,
+    )
+    cfg.finalize()
+
+
+def test_the_loop_reads_the_data_length_from_the_section(container_factory, monkeypatch):
+    """Three different numbers: the dataset's sequence_length (what the loop uses), a stale
+    args.seq_length (never read when the section has a dataset) and the model capacity. The
+    calculator and the OTel resource attributes receive the dataset's; a loader-only section
+    falls back to the namespace."""
+    from megatron.training.config.compat import data_sequence_length
+
+    args, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
+    args.rank = 0  # the calculator takes the rank from the namespace
+    cfg.model = _layout()
+    cfg.model.seq_length = 128
+    args.seq_length = 64  # stale, must not be read
+    assert data_sequence_length(cfg, args) == 16
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
+    calls = []
+    monkeypatch.setattr(
+        global_vars, "init_num_microbatches_calculator", lambda **kw: calls.append(kw)
+    )
+    monkeypatch.setattr(global_vars, "get_batch_parallel_size", lambda ns: 1)
+    for name in (
+        "_set_tensorboard_writer",
+        "_set_one_logger",
+        "_set_adlr_autoresume",
+        "_set_timers",
+        "_set_energy_monitor",
+    ):
+        monkeypatch.setattr(global_vars, name, lambda ns: None)
+    monkeypatch.setattr(global_vars, "_set_train_state", lambda: None)
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    del args.seq_length  # a GPT run never needs it
+    assert data_sequence_length(cfg, args) == 16
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    # A loader-only section: the namespace is the source (the callback entry points).
+    args, loader_only = container_factory(["--seq-length", "64"])
+    args.rank = 0
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
+    assert data_sequence_length(loader_only, args) == 64
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 64
+    args.seq_length = None
+    assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
+
+
+@pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
+def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point):
+    """The three scripts' get_batch read the batch flags and the data length from the section and
+    the model-parallel values from the model section (hybrid-flex: from the transformer config the
+    arguments describe); every data-owned value on args is poisoned and must not surface in the
+    captured call."""
+    from megatron.training import arguments
+    from megatron.training.config import DataConfig
+
+    if entry_point == "gpt":
+        import pretrain_gpt as script
+    elif entry_point == "hybrid":
+        import pretrain_hybrid as script
+    else:
+        from megatron.elastification import pretrain_hybrid_flex as script
+
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        inter_document_masking=True,
+        create_attention_mask=False,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    transformer = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=3,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+    )
+    model = None if entry_point == "hybrid_flex" else SimpleNamespace(transformer=transformer)
+    cfg = SimpleNamespace(
+        model=model,
+        data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
+        train=SimpleNamespace(micro_batch_size=5),
+    )
+    args = SimpleNamespace(  # poisoned: none of these may reach the batch path
+        sft=True,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=True,
+        micro_batch_size=99,
+        seq_length=4096,
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=True,
+        context_parallel_size=8,
+        pipeline_model_parallel_size=8,
+    )
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
+    # hybrid-flex has no model section: its transformer config is built from the arguments.
+    monkeypatch.setattr(arguments, "core_transformer_config_from_args", lambda ns: transformer)
+    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage: True)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kw: False)
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(script.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(script.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(script, "get_context_parallel_group", lambda: None)
+    tp_calls, cp_calls = [], []
+    monkeypatch.setattr(
+        script,
+        "get_batch_on_this_tp_rank",
+        lambda batch, **kw: tp_calls.append(kw) or dict.fromkeys(script.BATCH_KEYS),
+    )
+    monkeypatch.setattr(script, "flatten_batch_for_packed_sequences", lambda batch: batch)
+    if entry_point == "hybrid":
+        monkeypatch.setattr(
+            script, "get_batches_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
+        )
+    else:
+        monkeypatch.setattr(
+            script, "get_batch_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
+        )
+    script.get_batch(None)
+    tp = tp_calls.pop()
+    assert tp["has_cu_seqlens"] is True  # inter-document masking from the section, not args.sft
+    assert tp["create_attention_mask_in_dataloader"] is False
+    assert tp["micro_batch_size"] == 5 and tp["seq_length"] == 16
+    assert (tp["cp_size"], tp["pipeline_model_parallel_size"]) == (1, 3)
+    assert tp["dynamic_cp"] is False
+    assert cp_calls.pop()["use_per_sequence_balancing"] is True  # masking without SFT
+
+
+@pytest.mark.parametrize("scheduler_at_construction", [True, False])
+def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
+    container_factory, scheduler_at_construction
+):
+    """Megatron Core derives variable_seq_lengths from the scheduler in ModelParallelConfig's
+    __post_init__; a scheduler assigned to a constructed config leaves it False, and the pipeline
+    would keep fixed shapes while the batch path packs. The container rejects that pair on a real
+    TransformerConfig; the constructor-time selection is the positive control."""
+    import torch
+
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.training.models.gpt import GPTModelConfig
+
+    transformer = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=8,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        calculate_per_token_loss=True,
+        max_seqlen_per_dp_cp_rank=64,
+        sequence_packing_scheduler="dp_balanced" if scheduler_at_construction else None,
+    )
+    if not scheduler_at_construction:
+        transformer.sequence_packing_scheduler = "dp_balanced"  # after construction
+    _, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
+    cfg.data.dataset_type = MockVarlenDataset
+    cfg.model = GPTModelConfig(transformer=transformer, seq_length=64, vocab_size=16)
+    if scheduler_at_construction:
+        assert transformer.variable_seq_lengths is True
+        cfg.validate()
+    else:
+        assert transformer.variable_seq_lengths is False
+        with pytest.raises(ValueError, match="needs model.transformer.variable_seq_lengths=True"):
+            cfg.validate()
+        transformer.variable_seq_lengths = True  # the pair a Python caller must set together
+        cfg.validate()
+
+
+@pytest.mark.parametrize("legacy_length", [32, None])
+def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, legacy_length):
+    """Packed metadata must describe the actual samples even with stale or missing args."""
+    from unittest.mock import MagicMock
+
+    import torch
+
+    import pretrain_gpt
+    from megatron.training.distillation import logits_saver
+
+    args = Namespace() if legacy_length is None else Namespace(seq_length=legacy_length)
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    cfg = SimpleNamespace(data=DataConfig(dataset=dataset), model=SimpleNamespace(seq_length=64))
+    cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32)
+    tokens = torch.zeros((1, 16), dtype=torch.long)
+    batch = (
+        None,
+        cu_seqlens,
+        cu_seqlens,
+        None,
+        tokens,
+        None,
+        tokens,
+        torch.tensor(8),
+        tokens,
+        tokens,
+    )
+    model = MagicMock(vp_stage=None, pg_collection=None)
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(pretrain_gpt, "get_batch", lambda *a, **kw: batch)
+    monkeypatch.setattr(pretrain_gpt, "get_timers", MagicMock())
+    monkeypatch.setattr(pretrain_gpt, "stimer", MagicMock())
+    monkeypatch.setattr(pretrain_gpt, "update_seqlen_stats_from_cu_seqlens", lambda *a: None)
+    monkeypatch.setattr(logits_saver, "get_logits_saver", lambda: None)
+
+    pretrain_gpt.forward_step(None, model)
+
+    packed = model.call_args.kwargs["packed_seq_params"]
+    assert packed.tokens_per_sample == 16
+    assert torch.equal(packed.cu_seqlens_q, cu_seqlens.squeeze(0))

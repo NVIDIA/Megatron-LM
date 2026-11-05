@@ -170,3 +170,32 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
+
+
+def test_loader_flags_feed_the_section():
+    """The two loader flags of the data section: store_false on pin_memory / persistent_workers,
+    read by dataloader_config_from_args like every other dest; the defaults are today's built-in
+    loader values, and zero workers keeps persistence off whatever the flag says."""
+    from megatron.training.argument_utils import dataloader_config_from_args
+
+    args = _validated([])
+    assert args.pin_memory is True and args.persistent_workers is True
+    loader = dataloader_config_from_args(args)
+    assert loader.pin_memory is True and loader.persistent_workers is True
+    loader = dataloader_config_from_args(
+        _validated(["--no-pin-memory", "--no-persistent-workers", "--num-workers", "2"])
+    )
+    assert loader.pin_memory is False and loader.persistent_workers is False
+    loader = dataloader_config_from_args(_validated(["--num-workers", "0"]))
+    loader.finalize()
+    assert loader.persistent_workers is False
+
+
+def test_inter_document_masking_on_the_cli_builds_a_valid_section():
+    """validate_args clears create_attention_mask_in_dataloader under inter-document masking, so
+    the section the factory builds passes the pair check the container enforces for Python."""
+    args = _validated(["--dataloader-inter-document-masking"])
+    assert args.create_attention_mask_in_dataloader is False
+    data = gpt_data_config_from_args(args)
+    data.validate()
+    assert data.batch_flags().has_cu_seqlens and not data.batch_flags().create_attention_mask

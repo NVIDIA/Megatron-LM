@@ -27,8 +27,12 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
 )
 from megatron.training import arguments, global_vars
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import DataConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
@@ -52,6 +56,7 @@ def initialize_test_environment(
     hybrid_context_parallel: bool = False,
     max_seqlen_per_cp_rank: int = 1024,
     create_attention_mask: bool = False,
+    inter_document_masking: bool = False,
 ):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -68,6 +73,7 @@ def initialize_test_environment(
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
+    args.dataloader_inter_document_masking = inter_document_masking
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
     args.vocab_size = 1024
@@ -81,7 +87,10 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
+    # The data section as the scripts build it (the batch flags come from it); the container has
+    # no model section here, so get_batch's transformer config comes from the arguments.
+    container = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
+    set_global_variables(args, container, build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -563,8 +572,8 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         micro_batch_size=1,
         global_batch_size=global_batch_size,
         sft=False,
+        inter_document_masking=True,
     )
-    args.dataloader_inter_document_masking = True
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -1102,11 +1111,18 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
+    )
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=config),
+        data=DataConfig(),
+        train=SimpleNamespace(micro_batch_size=1),
     )
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
+        patch.object(pretrain_hybrid, "get_run_config", return_value=run_config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,
@@ -1131,10 +1147,12 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
+def test_get_batch_caches_config_until_args_replaced(script, monkeypatch, run_config):
     args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
     configs = [
         SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
             virtual_pipeline_model_parallel_size=None,
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
@@ -1599,8 +1617,8 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
         sft=False,
+        inter_document_masking=True,
     )
-    args.dataloader_inter_document_masking = True
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -1677,13 +1695,20 @@ def test_packed_sequence_dataset_built_on_rank(
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
-    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
+    args = SimpleNamespace(
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=pp_size,
+        dynamic_context_parallel=False,
+    )
     config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
     vp_stages = [None] if vp_size is None else range(vp_size)
     # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
-    # the arguments and the transformer config at call time from these two modules.
+    # the registered run config at call time: without a model section (this container), the
+    # arguments and the transformer config built from them, read from these two modules.
     with (
         patch.object(global_vars, "get_args", return_value=args),
+        patch.object(global_vars, "get_run_config", return_value=SimpleNamespace(model=None)),
         patch.object(arguments, "core_transformer_config_from_args", return_value=config),
     ):
         for vp_stage in vp_stages:

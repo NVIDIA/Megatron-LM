@@ -195,6 +195,8 @@ class TestTraining:
         run_config.validation = ValidationConfig(
             eval_interval=1, eval_iters=1, eval_global_batch_size=1
         )
+        # These providers return iterators, so use the external loader.
+        run_config.data.dataloader.dataloader_type = "external"
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -325,6 +327,8 @@ class TestTraining:
         }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
+        # The provider yields iterators: the external loader type, now read from the section.
+        run_config.data.dataloader.dataloader_type = 'external'
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""

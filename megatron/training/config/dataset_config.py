@@ -18,6 +18,8 @@ section.
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
+The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()`` (and the
+data length through ``megatron.training.config.compat``), never through ``args``.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
@@ -73,12 +75,11 @@ class DataloaderConfig:
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
     pin_memory: bool = True
-    """Pin host memory in the torch DataLoader. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
 
     persistent_workers: bool = True
-    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0. Declared
-    only for now: the training loop keeps its built-in value until the loader consumers read it."""
+    """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
+    Forced to False when ``num_workers == 0``: there are no workers to keep."""
 
     drop_last: bool = True
     """Drop the last incomplete micro-batch. Declared only for now: the training loop keeps its
@@ -142,6 +143,45 @@ def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
     if family == "varlen":
         return not dataset.varlen_sbhd_validation
     return False
+
+
+@dataclass(frozen=True)
+class BatchFlags:
+    """What ``get_batch``, ``dummy_train_step``, the loss reductions and the distillation hooks need
+    to know about the samples: computed by ``DataConfig.batch_flags()`` from the dataset class and
+    two fields of the dataset config, never stored (the section stays the single source)."""
+
+    is_sft: bool
+    """The SFT family exactly (``SFTDataset`` / ``MockSFTDataset``); the loss reductions key on it."""
+
+    is_packed_sequence: bool
+    """THD metadata (the SFT family, or varlen without SBHD validation): built on every pipeline
+    stage, ``get_batch`` expects ``cu_seqlens``. Not the loader's collate decision, which is
+    ``DataConfig.yields_unpacked_samples()``: SFT samples are packed but fixed-width."""
+
+    inter_document_masking: bool
+    """``GPTDatasetConfig.inter_document_masking`` (``--dataloader-inter-document-masking``)."""
+
+    create_attention_mask: bool
+    """``GPTDatasetConfig.create_attention_mask``: the dataset builds the attention mask (the
+    default; ``--no-create-attention-mask-in-dataloader`` turns it off)."""
+
+    @property
+    def has_cu_seqlens(self) -> bool:
+        """``get_batch``'s formula: SFT samples and inter-document masking carry ``cu_seqlens``."""
+        return self.is_sft or self.inter_document_masking
+
+    @property
+    def use_per_sequence_balancing(self) -> bool:
+        """``get_batch``'s formula: inter-document masking balances the loss per sequence, SFT
+        does not."""
+        return self.inter_document_masking and not self.is_sft
+
+
+LOADER_ONLY_BATCH_FLAGS = BatchFlags(
+    is_sft=False, is_packed_sequence=False, inter_document_masking=False, create_attention_mask=True
+)
+"""The plain-GPT values a section without a dataset reports (the parser defaults)."""
 
 
 def resolve_dataset_class(
@@ -225,11 +265,20 @@ class DataConfig:
         Megatron Core's checks that need no tokenizer (``validate_without_tokenizer()``: the blend /
         split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
         section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
-        tokenizer run in ``bind_tokenizer()`` and in the builder.
+        tokenizer run in ``bind_tokenizer()`` and in the builder. Inter-document masking with the
+        dataloader attention mask is rejected here (the CLI normalizes the pair away).
         """
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate_without_tokenizer()
+            if self.dataset.inter_document_masking and self.dataset.create_attention_mask:
+                raise ValueError(
+                    "data.dataset.inter_document_masking=True needs create_attention_mask=False: "
+                    "the dataset omits the attention mask under inter-document masking, and a "
+                    "batch path told to expect one waits for a broadcast that never comes "
+                    "(validate_args clears the flag for --dataloader-inter-document-masking; a "
+                    "Python or YAML section sets it explicitly)."
+                )
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:
@@ -274,6 +323,36 @@ class DataConfig:
                 "cfg.data.bind_tokenizer(tokenizer)."
             )
         return self.dataset_type, self.dataset, is_packed_sequence(self.dataset_type, self.dataset)
+
+    def batch_flags(self) -> BatchFlags:
+        """The sample properties the batch path reads (``BatchFlags``), from the dataset class and
+        the dataset config; read-only, valid before the tokenizer is bound, the same for a mock
+        dataset and its real counterpart. A loader-only section gets the plain-GPT values
+        (``LOADER_ONLY_BATCH_FLAGS``), so ``get_batch`` runs unchanged for an entry point whose
+        datasets come from its own callback."""
+        if self.dataset is None:
+            return LOADER_ONLY_BATCH_FLAGS
+        dataset_type = resolve_dataset_class(self.dataset, self.dataset_type)
+        family, _mock = dataset_family_from_type(dataset_type)
+        return BatchFlags(
+            is_sft=family == "sft",
+            is_packed_sequence=is_packed_sequence(dataset_type, self.dataset),
+            inter_document_masking=bool(self.dataset.inter_document_masking),
+            create_attention_mask=bool(self.dataset.create_attention_mask),
+        )
+
+    def yields_unpacked_samples(self) -> bool:
+        """The dataset emits one variable-length sample dict per item for an upstream packing
+        scheduler (the varlen family without SBHD validation), so the loader keeps the list as is
+        (the identity collate). ``False`` for every other family and for a loader-only section:
+        SFT samples are packed (``is_packed_sequence``) but fixed-width, and go through the
+        default collate."""
+        if self.dataset is None:
+            return False
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(self.dataset, self.dataset_type)
+        )
+        return family == "varlen" and not bool(self.dataset.varlen_sbhd_validation)
 
     def to_cfg_dict(self) -> dict[str, Any]:
         """Serialize the section.
