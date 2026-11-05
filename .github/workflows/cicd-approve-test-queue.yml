@@ -124,6 +124,18 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
+          MAX_RATE_LIMIT_WAIT = 60
+
+          def get_rate_limit_wait(response):
+              """Return seconds until a GitHub rate limit clears, or None if this is not a rate-limit error."""
+              if response.status_code not in (403, 429):
+                  return None
+              if "Retry-After" in response.headers:
+                  return int(response.headers["Retry-After"])
+              if response.headers.get("X-RateLimit-Remaining") == "0":
+                  return max(int(response.headers.get("X-RateLimit-Reset", 0)) - int(time.time()), 0) + 1
+              return None
+
           def make_request(endpoint, method="GET", data=None, max_retries=5, return_response=False):
               """Make a request to the GitHub API with retry on transient errors."""
               url = f"{API_BASE}/{endpoint}"
@@ -133,10 +145,16 @@ jobs:
                           response = requests.get(url, headers=headers, timeout=30)
                       else:
                           response = requests.post(url, headers=headers, json=data, timeout=30)
-                      if response.status_code == 429:
-                          retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
-                          print(f"Rate limited on {endpoint}, retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})")
-                          time.sleep(retry_after)
+                      wait = get_rate_limit_wait(response)
+                      if wait is None and response.status_code == 429:
+                          wait = 2 ** attempt
+                      if wait is not None:
+                          if wait > MAX_RATE_LIMIT_WAIT:
+                              # The next scheduled run picks up where this one stopped, so don't fail the workflow.
+                              print(f"::warning::GitHub API rate limit hit on {endpoint}; resets in {wait}s, skipping this run")
+                              exit(0)
+                          print(f"Rate limited on {endpoint}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                          time.sleep(wait)
                           continue
                       if response.status_code >= 500:
                           delay = 2 ** attempt
@@ -183,6 +201,8 @@ jobs:
                   role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
               )
 
+          pr_cache = {}
+
           def get_pr_base_branch(workflow_run):
               """
               Return the base branch of the PR associated with a workflow run, or None.
@@ -197,11 +217,14 @@ jobs:
 
               pr_number = int(match.group(1))
 
-              # Fetch PR info from GitHub API
-              pr_info = make_request(f"pulls/{pr_number}")
-              if not pr_info:
-                  print(f"Failed to fetch PR #{pr_number}")
-                  return None, None
+              # Fetch PR info from GitHub API, once per PR
+              pr_info = pr_cache.get(pr_number)
+              if pr_info is None:
+                  pr_info = make_request(f"pulls/{pr_number}")
+                  if not pr_info:
+                      print(f"Failed to fetch PR #{pr_number}")
+                      return None, None
+                  pr_cache[pr_number] = pr_info
 
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
