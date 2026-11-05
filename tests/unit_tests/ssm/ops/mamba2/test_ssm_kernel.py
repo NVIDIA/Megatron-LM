@@ -118,9 +118,15 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
 
-        # Bind methods
-        self.mixer.ssm_prefill = MambaMixer.ssm_prefill.__get__(self.mixer, MambaMixer)
-        self.mixer.ssm_decode = MambaMixer.ssm_decode.__get__(self.mixer, MambaMixer)
+        # Bind methods, including the conv-parameter helpers both paths call.
+        self.mixer.training = False
+        for name in (
+            "ssm_prefill",
+            "ssm_decode",
+            "_get_conv_params",
+            "_use_inference_param_caches",
+        ):
+            setattr(self.mixer, name, getattr(MambaMixer, name).__get__(self.mixer, MambaMixer))
 
     def test_ssm_prefill_padding_isolation(self):
         """
