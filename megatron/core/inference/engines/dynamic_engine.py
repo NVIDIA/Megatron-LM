@@ -5081,6 +5081,18 @@ class DynamicInferenceEngine(AbstractEngine):
                         msa.max_slots - msa.free_count,
                         msa.max_slots,
                     )
+                if self.context.enable_mtp_kv_cache:
+                    # Chunks / blocks whose cached prefix MTP declined, by reason.
+                    output_str += " ... mtp prefix back-off (cumul chunks/blocks): " + ", ".join(
+                        "%s %d/%d" % (reason, chunks, blocks)
+                        for reason, (chunks, blocks) in (
+                            self.context.mtp_prefix_backoff_stats.items()
+                        )
+                    )
+                    output_str += ", unregistered %d, replaced %d" % (
+                        self.context.mtp_prefix_unregistered_blocks,
+                        self.context.mtp_prefix_replaced_blocks,
+                    )
             output_str += self._staging_log_suffix()
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
