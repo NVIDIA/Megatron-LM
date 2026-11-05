@@ -100,7 +100,11 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
     for chunk in chunks:
         chunk.ddp_config.use_megatron_fsdp = path.startswith('fsdp')
 
-    result = get_megatron_optimizer(config, chunks, config_overrides={})
+    # The builders are stubbed and never read a group, so an empty collection stands in for
+    # the model's; these tests never initialize model parallelism.
+    result = get_megatron_optimizer(
+        config, chunks, config_overrides={}, pg_collection=ProcessGroupCollection()
+    )
 
     if path in ('muon', 'fsdp'):
         assert result is built[0]
@@ -125,7 +129,9 @@ def test_failed_construction_preserves_initializers(monkeypatch):
 
     monkeypatch.setattr(optimizer_module, '_get_megatron_emerging_optimizer', fail)
     with pytest.raises(RuntimeError, match='construction failed'):
-        get_megatron_optimizer(OptimizerConfig(optimizer='muon'), [model])
+        get_megatron_optimizer(
+            OptimizerConfig(optimizer='muon'), [model], pg_collection=ProcessGroupCollection()
+        )
     for param in (model.owned, model.non_owned, model.frozen):
         assert param.get_high_precision_init_val() is not None
 

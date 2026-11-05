@@ -142,6 +142,32 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "Use regular DDP or the distributed optimizer for now."
             )
 
+        # GTP weight rematerialization gives each rank of a GTP group a different shard of a
+        # weight. Megatron-FSDP v1 has no GTP handling and shards and reduces parameters over
+        # one data-parallel group: the replicate group cannot form a device mesh that covers
+        # the GTP ranks, and the GTP-inclusive group treats different shards as copies of one
+        # parameter.
+        gtp_weight_remat_sizes = {
+            "gtp_weight_remat_size": config.gtp_weight_remat_size,
+            "expert_gtp_weight_remat_size": config.expert_gtp_weight_remat_size,
+        }
+        if pg_collection is not None:
+            # An unset collection field means that axis is not sharded.
+            gtp_weight_remat_sizes.update(
+                (f"pg_collection.{name}", group.size())
+                for name, group in vars(pg_collection).items()
+                if name in ("gtp_remat", "expt_gtp_remat") and group is not None
+            )
+        active_gtp_weight_remat = [
+            f"{name}={size}" for name, size in gtp_weight_remat_sizes.items() if size > 1
+        ]
+        if active_gtp_weight_remat:
+            raise ValueError(
+                "Megatron-FSDP v1 does not support GTP weight rematerialization, got "
+                f"{', '.join(active_gtp_weight_remat)}. Use Megatron DDP with GTP, or disable "
+                "GTP weight rematerialization."
+            )
+
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -363,6 +389,10 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         """
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
+            # Migration fallback for callers that do not pass pg_collection. The data-parallel
+            # accessors default to the groups that include GTP weight-remat peers; with GTP
+            # weight remat off, these hold the same ranks as the replicate groups that the
+            # pg_collection path reads.
             tp_group = parallel_state.get_tensor_model_parallel_group()
             expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
             if enable_hsdp:
@@ -388,37 +418,51 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 hybrid_fsdp_group = None
                 expt_dp_group = parallel_state.get_expert_data_parallel_group()
                 ep_group = parallel_state.get_expert_model_parallel_group()
+            dp_cp_ag = None
+            expt_dp_ag = None
         else:
-            tp_group = getattr(pg_collection, 'tp', None)
-            expt_tp_group = getattr(pg_collection, 'expt_tp', None)
+            required = ["dp_cp"]
+            if enable_hsdp:
+                required += ["intra_dp_cp", "inter_dist_opt"]
+            if self.num_moe_experts is not None:
+                required += ["ep", "expt_dp"]
+                if enable_hsdp:
+                    required.append("intra_expt_dp")
+            missing = [name for name in required if vars(pg_collection).get(name) is None]
+            if missing:
+                raise ValueError(
+                    f"{type(self).__name__}: pg_collection must provide {missing} "
+                    "for this configuration."
+                )
+            # tp, expt_tp and the all-gather groups are optional; unset fields read as None.
+            tp_group = pg_collection.tp
+            expt_tp_group = pg_collection.expt_tp
+            ep_group = pg_collection.ep
             if enable_hsdp:
                 dp_cp_group = pg_collection.intra_dp_cp
                 outer_fsdp_group = pg_collection.inter_dist_opt
                 hybrid_fsdp_group = pg_collection.dp_cp
                 # This has not been tested yet.
-                expt_dp_group = getattr(pg_collection, 'intra_expt_dp', None)
-                hybrid_fsdp_expt_group = getattr(pg_collection, 'expt_dp', None)
-                ep_group = getattr(pg_collection, 'ep', None)
+                expt_dp_group = pg_collection.intra_expt_dp
+                hybrid_fsdp_expt_group = pg_collection.expt_dp
             else:
                 dp_cp_group = pg_collection.dp_cp
                 outer_fsdp_group = None
                 hybrid_fsdp_group = None
-                expt_dp_group = getattr(pg_collection, 'expt_dp', None)
-                ep_group = getattr(pg_collection, 'ep', None)
+                expt_dp_group = pg_collection.expt_dp
+            dp_cp_ag = pg_collection.dp_cp_ag
+            expt_dp_ag = pg_collection.expt_dp_ag
 
-        if tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
-            tp_group = single_rank_group
-
-        if expt_tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
-            expt_tp_group = single_rank_group
-
-        # Extract AG groups from pg_collection for explicit passing
-        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
-        expt_dp_ag = (
-            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
-        )
+        # A collection without a TP or expert TP group runs that axis at size 1. Creating groups
+        # is collective, so every rank creates the same single-rank groups in the same order.
+        if tp_group is None or (self.num_moe_experts is not None and expt_tp_group is None):
+            single_rank_group, _ = dist.new_subgroups_by_enumeration(
+                [[rank] for rank in range(dist.get_world_size())]
+            )
+            if tp_group is None:
+                tp_group = single_rank_group
+            if expt_tp_group is None:
+                expt_tp_group = single_rank_group
 
         if enable_hsdp:
             if self.num_moe_experts is not None:

@@ -8,6 +8,8 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -40,6 +42,36 @@ class TestRADIOViTModel:
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1501824
+
+    @pytest.mark.parametrize("separate_video_embedder", [False, True])
+    def test_embedders_take_the_model_collection(self, monkeypatch, separate_video_embedder):
+        given_collections = []
+        original_init = ColumnParallelLinear.__init__
+
+        def init(linear, *args, **kwargs):
+            original_init(linear, *args, **kwargs)
+            given_collections.append(kwargs.get("pg_collection"))
+
+        monkeypatch.setattr(ColumnParallelLinear, "__init__", init)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        transformer_config = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+
+        RADIOViTModel(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            img_h=224,
+            img_w=224,
+            patch_dim=14,
+            temporal_patch_dim=2,
+            separate_video_embedder=separate_video_embedder,
+            add_class_token=False,
+            pg_collection=pg_collection,
+        )
+
+        assert len(given_collections) == (2 if separate_video_embedder else 1)
+        assert all(given is pg_collection for given in given_collections)
 
     def test_set_input_tensor(self):
         # [s, b, h] expected to the transformer.
