@@ -379,7 +379,7 @@ def test_ep_overlap_full_iteration_cuda_graph_matches_default_schedule(process_g
         )
         losses = []
         for microbatches in steps:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=False)
             microbatch_losses = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=[iter(microbatches)],
@@ -415,10 +415,10 @@ def test_ep_overlap_full_iteration_cuda_graph_matches_default_schedule(process_g
 
 def _reset_full_cuda_graph_state():
     """Drop the globally stored full-iteration graph so the next run captures its own."""
-    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+    FullCudaGraphWrapper.curr_iteration = {"training": 0, "validation": 0}
+    FullCudaGraphWrapper.cuda_graph = {"training": None, "validation": None}
+    FullCudaGraphWrapper.result = {"training": None, "validation": None}
+    StaticBufferLoader.static_buffers = {"training": [], "validation": []}
 
 
 def _sync_model_parameters(reference_model, model):
