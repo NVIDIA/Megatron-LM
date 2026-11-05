@@ -22,6 +22,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -273,6 +274,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shortcut_connection": False,
+    "moe_shortcut_disable_mtp": False,
     "moe_shortcut_parallel": False,
     "moe_shortcut_post_norm": False,
     "moe_shared_expert_gate": False,
@@ -620,6 +622,7 @@ class TestHybridMoEModel:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         destroy_moe_metrics_tracker()
         args = self.create_test_args()
+        cfg = get_run_config()
         set_args(args)
 
         Utils.initialize_model_parallel(
@@ -635,7 +638,7 @@ class TestHybridMoEModel:
         self.model = HybridModel(
             config=model_config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg.tokenizer.vocab_size,
             max_sequence_length=args.seq_length,
             hybrid_layer_pattern=args.hybrid_layer_pattern,
             position_embedding_type=args.position_embedding_type,
