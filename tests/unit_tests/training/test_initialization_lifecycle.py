@@ -1627,16 +1627,16 @@ def test_legacy_model_wrapper_uses_registered_ddp_config(monkeypatch, run_config
     run_config.ddp.overlap_grad_reduce = True
     run_config.ddp.bucket_size = 4096 if num_buckets is None else None
     run_config.ddp.num_buckets = num_buckets
-    original_ddp = deepcopy(run_config.ddp)
     groups = SimpleNamespace(
         pp=Mock(), dp=Mock(), cp=Mock(), tp=Mock(), gtp_remat=Mock(), dp_cp=Mock()
     )
     result = training.get_model(Mock(return_value=model), pg_collection=groups)
     assert result == [model]
-    assert wrapped.call_args.args[2] is not run_config.ddp
+    assert wrapped.call_args.args[2] is run_config.ddp
     assert wrapped.call_args.args[2].overlap_grad_reduce is True
     assert wrapped.call_args.kwargs["bucket_sizes"] == [4096 if num_buckets is None else 0]
-    assert run_config.ddp == original_ddp
+    assert run_config.ddp.bucket_size == (4096 if num_buckets is None else 0)
+    assert run_config.ddp._bucket_size_resolved
     restored = type(run_config).from_dict(run_config.to_dict())
     assert restored.to_dict()["ddp"] == run_config.to_dict()["ddp"]
 
@@ -1693,7 +1693,7 @@ def test_wrapper_validation_accepts_normalized_muon_overlap(
     assert cfg.optimizer.optimizer == "muon"
     assert cfg.optimizer.use_layer_wise_distributed_optimizer is True
     assert cfg.ddp.overlap_param_gather is True
-    assert cfg.ddp.use_distributed_optimizer is False
+    assert cfg.ddp.use_distributed_optimizer is True
 
 
 @pytest.mark.parametrize("optimizer_name", ["adam", "muon", "dist_muon"])
@@ -1710,7 +1710,7 @@ def test_wrapper_finalization_after_optimizer_edits(monkeypatch, run_config, opt
     run_config.validate()
     assert run_config.to_dict() == before
     run_config.finalize()
-    assert run_config.ddp.use_distributed_optimizer is (optimizer_name == "adam")
+    assert run_config.ddp.use_distributed_optimizer is True
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is (optimizer_name != "adam")
     assert run_config.ddp.overlap_param_gather is True
 
@@ -1785,8 +1785,8 @@ def test_optimizer_consumes_the_owner_used_for_wrapper_derivation(monkeypatch, r
         pass
 
     def build_optimizer(config, model, **kwargs):
-        assert config is not run_config.optimizer
-        assert run_config.optimizer.timers is None
+        assert config is run_config.optimizer
+        assert run_config.optimizer.timers is training.get_timers()
         assert config.use_distributed_optimizer is run_config.ddp.use_distributed_optimizer is True
         assert config.overlap_param_gather is run_config.ddp.overlap_param_gather is True
         assert args.use_distributed_optimizer is args.overlap_param_gather is False

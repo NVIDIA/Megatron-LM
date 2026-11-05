@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -33,9 +33,6 @@ class DistributedDataParallelConfig:
     create_all_gather_group: bool = False
     """Create separate data-parallel process groups for parameter all-gathers."""
 
-    use_layer_wise_param_layout: bool = True
-    """Use shard-aligned parameter layouts with the layer-wise distributed optimizer."""
-
     gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
     """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
 
@@ -67,6 +64,11 @@ class DistributedDataParallelConfig:
     """Number of buckets for data-parallel communication. Should only specify one of
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
        will be determined at runtime."""
+
+    _bucket_size_resolved: bool = field(default=False, repr=False)
+    """Whether bucket_size has been resolved from the model and process-group size.
+    Saved with the config so a resolved num_buckets/bucket_size pair can be restored.
+    """
 
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
@@ -398,5 +400,38 @@ class DistributedDataParallelConfig:
             )
 
         if self.num_buckets is not None:
-            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            assert (
+                self._bucket_size_resolved or self.bucket_size is None
+            ), "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+    def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
+        """Resolve buckets in place after model construction and process-group setup.
+
+        Repeated calls with the same inputs preserve the resolved value. num_buckets,
+        when provided, remains authoritative. An explicit or previously resolved
+        bucket_size is otherwise retained. Per-chunk bucketing overrides stay local
+        to the wrappers and must not overwrite this run-wide setting.
+        """
+        if self.num_buckets is not None:
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"
+            assert (
+                self._bucket_size_resolved or self.bucket_size is None
+            ), "Cannot specify both num_buckets and bucket_size"
+            bucket_size = num_parameters // self.num_buckets
+        elif self.bucket_size is None:
+            bucket_size = max(40000000, 1000000 * data_parallel_size)
+        else:
+            bucket_size = self.bucket_size
+        self.bucket_size = bucket_size if self.overlap_grad_reduce else None
+        self._bucket_size_resolved = True
+
+    def to_cfg_dict(self) -> dict:
+        """Include the resolution marker when saving the otherwise public config."""
+        return {
+            "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
+            **{
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in asdict(self).items()
+            },
+        }

@@ -2409,24 +2409,6 @@ def pretrain(
     _end_otel_job_spans()
 
 
-def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
-    """Resolve the absolute DDP grad-bucket size.
-
-    With ``num_buckets`` set: ``num_parameters // num_buckets``; else if no explicit
-    ``bucket_size``: ``max(40_000_000, 1_000_000 * dp_cp_size)``; if ``overlap_grad_reduce``
-    is False: ``None`` (overrides the above).
-    """
-    if ddp_config.num_buckets is not None:
-        bucket_size = num_parameters // ddp_config.num_buckets
-    elif ddp_config.bucket_size is None:
-        bucket_size = max(40000000, 1000000 * get_pg_size(dp_cp_group))
-    else:
-        bucket_size = ddp_config.bucket_size
-    if not overlap_grad_reduce:
-        bucket_size = None
-    return bucket_size
-
-
 def wrap_model_chunks_with_ddp(
     model_chunks,
     config,
@@ -2808,15 +2790,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        # Wrappers resolve model-dependent buckets in place; keep the saved config declarative.
-        ddp_config = copy.copy(ddp_config)
         if not ddp_config.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-            ddp_config.bucket_size = resolve_ddp_bucket_size(
-                ddp_config,
-                pg_collection.dp_cp,
-                ddp_config.overlap_grad_reduce,
-                num_parameters,
+            ddp_config.resolve_bucket_size(
+                num_parameters=num_parameters,
+                data_parallel_size=get_pg_size(pg_collection.dp_cp),
             )
 
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
@@ -2853,7 +2831,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 config,
                 ddp_config,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=ddp_config.use_layer_wise_param_layout,
+                use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
                 DP=DP,
                 pg_collection=pg_collection if ddp_config.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -3014,14 +2992,14 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=copy.copy(cfg.ddp),
+                ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.ddp.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=cfg.ddp.use_layer_wise_param_layout,
+                use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
@@ -3095,7 +3073,7 @@ def setup_model_and_optimizer(
     if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
-        optim_cfg = copy.copy(cfg.optimizer)
+        optim_cfg = cfg.optimizer
         optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
         optim_cfg.timers = timers
         if cfg.model.transformer.use_mup:

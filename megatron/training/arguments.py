@@ -2910,15 +2910,22 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
+    from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
+    ArgumentGroupFactory(
+        DistributedDataParallelConfig,
+        exclude=[
+            field.name for field in dataclasses.fields(DistributedDataParallelConfig)
+            if field.name != "use_torch_fsdp2"
+        ],
+    ).build_group(parser, "DDP/FSDP wrapper")
+
     group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
                        help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")
-    group.add_argument('--use-torch-fsdp2', action='store_true', default=False,
-                       help="Use Torch FSDP2. Cannot be used together with use_megatron_fsdp.")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,

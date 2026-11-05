@@ -260,6 +260,7 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     run_config.optimizer.optimizer = optimizer
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    run_config.optimizer.use_layer_wise_param_layout = use_layer_wise_param_layout
     run_config.ddp.use_distributed_optimizer = use_distributed_optimizer
 
     run_config.finalize()
@@ -267,9 +268,10 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     layer_wise = optimizer in ("muon", "dist_muon")
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
     assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
-    # Layout-enabled wrapping opts back into DistOpt buffers later; finalization
-    # must preserve the legacy baseline for either layout setting.
-    assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
+    # Resolve the wrapper's reduce-scatter layout before model construction.
+    assert run_config.ddp.use_distributed_optimizer is (
+        not layer_wise or use_layer_wise_param_layout
+    )
 
 
 @pytest.mark.parametrize("storage", ["dict", "yaml"])
@@ -413,3 +415,34 @@ def test_tracker_iterations_are_merged_once_without_mutating_cli(monkeypatch, ru
     restored = type(run_config).from_dict(run_config.to_dict())
     restored.finalize()
     assert restored.train.iterations_to_skip == [1, 3, 5]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize(
+    "policy,expected", [("automatic", 40000000), ("count", 4096), ("size", 1024)]
+)
+def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
+    run_config, tmp_path, overlap, policy, expected
+):
+    from megatron.core.distributed import DistributedDataParallelConfig
+
+    with pytest.raises(AssertionError, match="Cannot specify both"):
+        DistributedDataParallelConfig(num_buckets=2, bucket_size=1024)
+    run_config.ddp = DistributedDataParallelConfig(
+        overlap_grad_reduce=overlap,
+        num_buckets=2 if policy == "count" else None,
+        bucket_size=1024 if policy == "size" else None,
+    )
+    ddp = run_config.ddp
+    for _ in range(2):
+        ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+        ddp.validate()
+        assert ddp._bucket_size_resolved
+        assert ddp.bucket_size == (expected if overlap else None)
+    path = str(tmp_path / "run_config.yaml")
+    run_config.to_yaml(path)
+    restored = type(run_config).from_yaml(path)
+    assert restored.ddp._bucket_size_resolved
+    restored.ddp.validate()
+    restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+    assert restored.to_dict()["ddp"] == run_config.to_dict()["ddp"]

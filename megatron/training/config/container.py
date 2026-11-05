@@ -794,7 +794,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.ddp.megatron_fsdp_max_pool_double_buffer:
             self.ddp.fsdp_double_buffer = True
         # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
-        self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer
+        self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
+            not self.ddp.use_torch_fsdp2
+            and not self.ddp.use_megatron_fsdp
+            and self.optimizer.use_layer_wise_distributed_optimizer
+            and self.optimizer.use_layer_wise_param_layout
+        )
         if transformer is not None:
             transformer.fp8_param = self.ddp.fp8_param_gather
             transformer.fp4_param = self.ddp.fp4_param_gather
