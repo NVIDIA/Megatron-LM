@@ -456,11 +456,11 @@ dispatcher hands the experts expanded expert-major rows and routing weights exac
 in rank-major slot order), so that experts often selected together for the same token share a rank and dedup reaches
 them with fewer All-to-All rows. Checkpoints stay keyed by global expert id, so any placement loads from any checkpoint
 (`--no-load-optim` if the optimizer state was saved under a different placement). The placement is built offline from
-a route capture:
+a router trace of a PP=1 run:
 
 ```bash
-MOE_ROUTE_CAPTURE=1 MOE_ROUTE_CAPTURE_DIR=/path/routes MOE_ROUTE_CAPTURE_START=<iter> MOE_ROUTE_CAPTURE_CONS_ITERS=8 <training command>   # capture routes
-python tools/build_expert_placement.py /path/routes --iters <a>-<b> --num-experts <N> --ep-size <EP> [--nodes <n>] --out placement.json
+<training command> --moe-routing-trace-path /path/routes --moe-routing-trace-max-training-iters 2   # trace routes
+python tools/build_expert_placement.py /path/routes --num-experts <N> --ep-size <EP> [--nodes <n>] --out placement.json
 <training command> --moe-token-dedup --moe-expert-placement placement.json
 ```
 

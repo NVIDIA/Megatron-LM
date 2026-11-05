@@ -1,8 +1,8 @@
 # Copyright (c) 2026, Zyphra Technologies Inc. All rights reserved.
 """Co-activation-based expert placement -> expert_placement_per_layer.json (offline tool).
 
-Uses *within-layer* co-activation, read from route captures written by
-``megatron/core/capture.py`` (MOE_ROUTE_CAPTURE=1), to decide for each MoE layer which
+Uses *within-layer* co-activation, read from the router traces written by
+``--moe-routing-trace-path`` (from a PP=1 run), to decide for each MoE layer which
 experts should be **co-located on the same EP rank**; the runtime consumes the
 result through ``--moe-expert-placement`` (parsed in megatron/training/arguments.py,
 applied in megatron/core/transformer/moe/moe_layer.py).
@@ -26,104 +26,51 @@ keyed by the model ``layer_number``::
     {
       "num_experts": 128,
       "default": [ ...perm... ],                 # fallback for uncaptured layers
-      "layers": { "3": [ ...perm... ], "7": [...] }   # key = moe_layer_indices[m]
+      "layers": { "3": [ ...perm... ], "7": [...] }   # key = layer_number
     }
 
-This is a pure-CPU offline tool (numpy + torch, no ``megatron`` import):
-    python tools/build_expert_placement.py $CAPTURE_DIR \
+This is a pure-CPU offline tool (numpy, no ``megatron`` import):
+    python tools/build_expert_placement.py $TRACE_DIR \
         --iters 2000-2009 --num-experts 128 --ep-size 8 \
         --out expert_placement_per_layer.json
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
-
-
-def _winner_first(
-    expert_paths: torch.Tensor, routing_probs: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """Order each captured top-k list by descending routing probability."""
-    if routing_probs is None:
-        return expert_paths
-    order = torch.argsort(routing_probs.float(), dim=-1, descending=True, stable=True)
-    return torch.gather(expert_paths, -1, order)
-
-
-def load_expert_paths(capture_file: str) -> torch.Tensor:
-    """Load winner-first expert paths from a capture shard."""
-    obj = torch.load(capture_file, map_location="cpu", weights_only=False)
-    expert_paths = obj["expert_paths"].to(torch.int64)
-    return _winner_first(expert_paths, obj.get("routing_probs"))
-
-
-def resolve_capture_files(capture_dir: str, iters: Sequence[int]) -> List[str]:
-    """Return all capture shards for the requested training iterations."""
-    prefixes = tuple(f"iter_{iteration:08d}" for iteration in iters)
-    names = sorted(name for name in os.listdir(capture_dir) if name.startswith(prefixes))
-    if not names:
-        raise FileNotFoundError(f"No capture shards for iters {list(iters)} in {capture_dir}")
-    return [os.path.join(capture_dir, name) for name in names]
-
-
-# ---------------------------------------------------------------------------
-# 1. Co-activation counts (mirrors the notebook's `coactivation`)
-# ---------------------------------------------------------------------------
-
-
-def coactivation_counts(paths: torch.Tensor, layer: int, n_experts: int) -> np.ndarray:
-    """counts[e1, e2] = # tokens whose top-k at ``layer`` contains BOTH e1 and e2.
-    Symmetric; the diagonal is the number of tokens that selected each expert."""
-    topk = paths.shape[3]
-    sel = paths[:, :, layer, :].reshape(-1, topk).numpy().astype(np.int64)  # [tokens, k]
-    pid = (sel[:, :, None] * n_experts + sel[:, None, :]).reshape(-1)
-    return np.bincount(pid, minlength=n_experts * n_experts).reshape(n_experts, n_experts)
 
 
 def build_coactivation(
-    capture_dir: str, iters: Sequence[int], num_experts: int
+    trace_dir: str, iters: Optional[Sequence[int]], num_experts: int
 ) -> Tuple[np.ndarray, List[int]]:
-    """Aggregate per-layer co-activation counts across all shards for ``iters``.
+    """Per-layer co-activation counts from ``--moe-routing-trace-path`` traces.
 
-    Returns (counts[M, E, E] int64, moe_layer_indices).  All shards must share
-    the same ``moe_layer_indices`` (true for PP=1 or single-stage captures);
-    otherwise position ``m`` would mean a different model layer in different
-    shards, so we assert rather than silently mix them.
+    counts[m, e1, e2] = # tokens whose top-k at layer ``layers[m]`` contains both e1
+    and e2; the diagonal is the number of tokens that selected each expert.
     """
-    files = resolve_capture_files(capture_dir, iters)
-    print(f"total files : {len(files)}")
-
-    ref_layers: Optional[List[int]] = None
-    counts: Optional[np.ndarray] = None
-    for f in files:
-        obj = torch.load(f, map_location="cpu", weights_only=False)
-        layers = list(obj.get("moe_layer_indices", []))
-        paths = load_expert_paths(f)
-        cap_experts = int(paths.max().item()) + 1
-        if cap_experts < num_experts:
-            raise ValueError(
-                f"{f}: capture has {cap_experts} experts, < --num-experts {num_experts}."
-            )
-        if ref_layers is None:
-            ref_layers = layers or list(range(paths.shape[2]))
-            counts = np.zeros((paths.shape[2], num_experts, num_experts), np.int64)
-        elif layers and layers != ref_layers:
-            raise ValueError(
-                "Capture shards disagree on moe_layer_indices "
-                f"({layers} vs {ref_layers}); per-layer placement needs a single "
-                "PP stage. Filter shards to one pp_rank or capture with PP=1."
-            )
-        for m in range(counts.shape[0]):
-            # Slice to the routed experts (drops the MOD skip expert if present).
-            counts[m] += coactivation_counts(paths, m, cap_experts)[:num_experts, :num_experts]
-        del paths
-    assert counts is not None and ref_layers is not None
-    return counts, ref_layers
+    counts: Dict[int, np.ndarray] = {}
+    for path in sorted(glob.glob(os.path.join(trace_dir, "router_trace_rank*.jsonl"))):
+        with open(path) as f:
+            for line in f:
+                rec = json.loads(line)
+                if rec.get("block", "decoder") != "decoder" or (iters and rec["step"] not in iters):
+                    continue
+                sel = np.asarray(rec["top_indices"], dtype=np.int64).reshape(-1, rec["topk"])
+                if (sel >= num_experts).any():
+                    raise ValueError(f"{path}: expert ids exceed --num-experts {num_experts}.")
+                pid = (sel[:, :, None] * num_experts + sel[:, None, :]).reshape(-1)
+                # Trace layers are 0-based decoder.layers indices; placements use layer_number.
+                layer = rec["layer"] + 1
+                counts[layer] = counts.get(layer, 0) + np.bincount(pid, minlength=num_experts**2)
+    if not counts:
+        raise FileNotFoundError(f"No decoder router traces for steps {iters} in {trace_dir}")
+    layers = sorted(counts)
+    return np.stack([counts[l].reshape(num_experts, num_experts) for l in layers]), layers
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +251,15 @@ def placement_quality(coact: np.ndarray, order: List[int], ep_size: int) -> floa
 
 
 def build_placement_json(
-    capture_dir: str,
-    iters: Sequence[int],
+    trace_dir: str,
+    iters: Optional[Sequence[int]],
     num_experts: int,
     ep_size: int,
     emit_default: bool = True,
     nodes: int = 1,
     max_load_ratio: float = 0.0,
 ) -> Dict:
-    counts, moe_layer_indices = build_coactivation(capture_dir, iters, num_experts)
+    counts, moe_layer_indices = build_coactivation(trace_dir, iters, num_experts)
     n_moe = counts.shape[0]
 
     out: Dict[str, object] = {"num_experts": num_experts, "layers": {}}
@@ -366,10 +313,10 @@ def _cli(argv: Optional[Sequence[str]] = None) -> None:
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="Build expert_placement_per_layer.json from CMoE capture co-activation."
+        description="Build expert_placement_per_layer.json from router-trace co-activation."
     )
-    ap.add_argument("capture_dir", help="dir with iter_*.pt capture shards")
-    ap.add_argument("--iters", required=True, help="e.g. '2000-2009' or '2000,2001'")
+    ap.add_argument("trace_dir", help="--moe-routing-trace-path dir of a PP=1 run")
+    ap.add_argument("--iters", default=None, help="trace steps, e.g. '2000-2009' (default: all)")
     ap.add_argument("--num-experts", type=int, required=True, help="routed experts (--num-experts)")
     ap.add_argument("--ep-size", type=int, required=True, help="expert-model-parallel-size")
     ap.add_argument("--out", required=True, help="output .json path")
@@ -392,8 +339,8 @@ def _cli(argv: Optional[Sequence[str]] = None) -> None:
     args = ap.parse_args(argv)
 
     obj = build_placement_json(
-        args.capture_dir,
-        _parse_iters(args.iters),
+        args.trace_dir,
+        _parse_iters(args.iters) if args.iters else None,
         args.num_experts,
         args.ep_size,
         emit_default=not args.no_default,
