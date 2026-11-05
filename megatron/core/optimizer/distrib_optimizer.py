@@ -1,19 +1,20 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
 import gc
 import itertools
 import logging
-from collections import ChainMap
-from dataclasses import replace
+import re
+from collections import ChainMap, defaultdict
+from dataclasses import dataclass, replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_model_config, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -60,19 +61,106 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
+from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _missing_param_group_message,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
-    param_group_identifier_keys,
+    find_saved_param_group,
+    get_param_group_identifier_tuple,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+_FQN_SAFE_DTYPE_KEY_VERSION = 3.1
+
+# Pre-3.1 optimizer FQNs spell the buffer dtype as the `(param_dtype, grad_dtype)` tuple, e.g.
+# `...gbuf_idx_0.dtype_(torch.uint8, torch.bfloat16).bucket_idx_0.exp_avg`.
+_LEGACY_DTYPE_FQN_PATTERN = re.compile(r'\.dtype_\((torch\.\w+), (torch\.\w+)\)\.')
+
+
+def _get_dtype_key(param_dtype):
+    """Return the checkpoint-safe key of a parameter buffer with the given storage dtype.
+
+    dp_reshardable checkpoints spell it as `dtype_{key}` in every optimizer FQN, e.g.
+    `optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_param_torch:uint8.bucket_idx_0.exp_avg`.
+    The key deliberately excludes the gradient dtype: the distributed optimizer state (main
+    params and moments) does not depend on it, and encoding it would tie a checkpoint to the
+    main-grad dtype of the run that saved it (e.g. bf16 vs fp32 main grads).
+    """
+    return f'param_{param_dtype}'.replace('.', ':')
+
+
+def get_legacy_grad_dtypes(sharded_keys) -> Dict[str, str]:
+    """Recover the grad dtype spelled in pre-3.1 optimizer FQNs, per param dtype.
+
+    Loading a pre-3.1 checkpoint requires reproducing its `(param_dtype, grad_dtype)` FQNs, but
+    only the checkpoint knows which grad dtype the saving run used. This scans the checkpoint's
+    ShardedTensor keys (e.g. `dist_checkpointing.load_tensors_metadata(ckpt_dir).keys()`) and
+    maps `str(param_dtype)` to `str(grad_dtype)`. Param dtypes found with more than one grad
+    dtype are omitted; the loader then falls back to its own grad dtype.
+    """
+    grad_dtypes = defaultdict(set)
+    for key in sharded_keys:
+        for param_dtype, grad_dtype in _LEGACY_DTYPE_FQN_PATTERN.findall(key):
+            grad_dtypes[param_dtype].add(grad_dtype)
+    return {
+        param_dtype: next(iter(found))
+        for param_dtype, found in grad_dtypes.items()
+        if len(found) == 1
+    }
+
+
+def _is_trailing_padding_only_shard(
+    data_parallel_rank: int, gbuf_local_numel: int, gbuf_world_numel_unpadded: int
+) -> bool:
+    """Whether a DP-local bucket shard starts after the checkpointed buffer payload."""
+    return data_parallel_rank * gbuf_local_numel >= gbuf_world_numel_unpadded
+
+
+def _add_row_square_sums(
+    row_sums: torch.Tensor, values: torch.Tensor, start: int, row_width: int
+) -> None:
+    """Add the squares of a contiguous flat range of a row-major matrix to its row sums.
+
+    ``values`` holds flat elements ``[start, start + values.numel())``. A DP shard can begin
+    and end inside a row, so the range splits into a partial head row, whole rows and a
+    partial tail row. Plain reductions keep the result bit-exact, unlike an atomic scatter.
+    """
+    row = start // row_width
+    position = 0
+    offset = start % row_width
+    if offset:
+        head = min(row_width - offset, values.numel())
+        row_sums[row] += values[:head].square().sum()
+        position = head
+        row += 1
+    num_full_rows = (values.numel() - position) // row_width
+    if num_full_rows:
+        full_end = position + num_full_rows * row_width
+        row_sums[row : row + num_full_rows] += (
+            values[position:full_end].view(num_full_rows, row_width).square().sum(dim=1)
+        )
+        position = full_end
+        row += num_full_rows
+    if position < values.numel():
+        row_sums[row] += values[position:].square().sum()
+
+
+@dataclass
+class _EmbeddingMinNormState:
+    """Invariant layout and reusable workspace for one input embedding."""
+
+    model_param: torch.nn.Parameter
+    row_width: int
+    num_rows: int
+    row_sums: torch.Tensor
 
 
 class Range:
@@ -129,6 +217,64 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fully_sharded_model_space',
         'fsdp_dtensor',
     }
+
+    def _back_compat_normalize_loaded_dtype_keys(
+        self,
+        state_dict: Optional[dict],
+        checkpoint_version: Optional[float],
+        legacy_grad_dtypes: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Adapt optimizer state generated before version 3.1 for loading.
+
+        Args:
+            state_dict: loading template (ShardedTensors) or loaded state, normalized in place.
+            checkpoint_version: version stored in the checkpoint; nothing is done for >= 3.1.
+            legacy_grad_dtypes: `str(param_dtype) -> str(grad_dtype)` as spelled in the
+                checkpoint's FQNs (see `get_legacy_grad_dtypes`). Without it the current run's
+                grad dtype is assumed, which only matches checkpoints saved with the same
+                main-grad dtype.
+        """
+        if (
+            state_dict is None
+            or checkpoint_version is None
+            or checkpoint_version >= _FQN_SAFE_DTYPE_KEY_VERSION
+        ):
+            return
+
+        legacy_grad_dtypes = legacy_grad_dtypes or {}
+        dtype_fqn_replacements = {}
+        for buffer in self.buffers:
+            grad_dtype = legacy_grad_dtypes.get(str(buffer.param_dtype), str(buffer.grad_dtype))
+            dtype_fqn_replacements[f'.dtype_{_get_dtype_key(buffer.param_dtype)}.'] = (
+                f'.dtype_({buffer.param_dtype}, {grad_dtype}).'
+            )
+        for value in nested_values(state_dict):
+            if not isinstance(value, ShardedTensor):
+                continue
+            for current_dtype_fqn, legacy_dtype_fqn in dtype_fqn_replacements.items():
+                if current_dtype_fqn in value.key:
+                    value.key = value.key.replace(current_dtype_fqn, legacy_dtype_fqn, 1)
+                    break
+
+        def normalize_dtype_keys(dtype_state):
+            if not isinstance(dtype_state, dict):
+                return
+            for dtype in list(dtype_state):
+                if not isinstance(dtype, tuple):
+                    continue
+                assert len(dtype) == 2, dtype
+                dtype_state[_get_dtype_key(dtype[0])] = dtype_state.pop(dtype)
+
+        for gbuf_idx, dtype_state in state_dict.items():
+            if isinstance(gbuf_idx, int):
+                normalize_dtype_keys(dtype_state)
+
+        for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
+            per_bucket_values = state_dict.get(per_bucket_key)
+            if not isinstance(per_bucket_values, list):
+                continue
+            for dtype_state in per_bucket_values:
+                normalize_dtype_keys(dtype_state)
 
     @classmethod
     def _build_model_gbuf_param_range_map(
@@ -271,7 +417,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             Dict: Mapping of parameter dtypes to bucket ranges.
         """
         return {
-            (param_and_grad_buffer.param_dtype, param_and_grad_buffer.grad_dtype): [
+            _get_dtype_key(param_and_grad_buffer.param_dtype): [
                 cls._build_model_gbuf_range(param_and_grad_buffer, bucket_index)
                 for bucket_index in range(len(param_and_grad_buffer.buckets))
             ]
@@ -334,10 +480,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
                         group_range["params"].append(param)
-                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1)
 
-        # Squeeze zero-size group ranges.
+        # Finalize group ranges and checkpoint indices.
         for group_index, group_range in enumerate(group_ranges):
+            # Optimizer parameter groups put shards of FP32 model parameters before
+            # those derived from FP16/BF16 model parameters. Checkpoint lookups use this order,
+            # even when gradient buffers encountered the low-precision dtype first.
+            # Keep this partition in sync with both orig_group["params"] branches
+            # in _build_model_and_main_param_groups.
+            main_param_order = [
+                param for param in group_range["params"] if param.dtype == torch.float32
+            ] + [param for param in group_range["params"] if param.dtype != torch.float32]
+            for group_order, param in enumerate(main_param_order):
+                local_param_group_map[param] = (group_index, group_order)
             group_range["orig_group"] = param_groups[group_index]
             group_range["orig_group_idx"] = param_groups[group_index]
 
@@ -494,6 +649,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
+            # _build_optimizer_group_ranges assigns checkpoint indices in this order.
             if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
@@ -695,6 +851,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
+        # Retained only between loading-template creation and load_state_dict().
+        self._checkpoint_version_for_load = None
 
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
@@ -713,8 +871,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
+            if config.embedding_min_norm is not None:
+                raise ValueError("embedding_min_norm is not supported with Megatron FSDP")
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
+
+        self._cudagraphed_grad_copy = None
+        if (
+            getattr(get_model_config(self.model_chunks[0]), "cuda_graph_impl", "none")
+            == "full_iteration"
+            and not config.optimizer_cuda_graph
+            and not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and not config.optimizer_cpu_offload
+        ):
+            self._cudagraphed_grad_copy = FullIterationGradCopy()
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -742,20 +912,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             self.per_bucket_numel.append(
                 {
-                    (buffer.param_dtype, buffer.grad_dtype): [
+                    _get_dtype_key(buffer.param_dtype): [
                         bucket.grad_data.numel() for bucket in buffer.buckets
                     ]
                 }
             )
             self.per_bucket_numel_unpadded.append(
                 {
-                    (buffer.param_dtype, buffer.grad_dtype): [
+                    _get_dtype_key(buffer.param_dtype): [
                         bucket.numel_unpadded for bucket in buffer.buckets
                     ]
                 }
             )
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+
+        self._word_embedding_params = []
+        self._embedding_min_norm_stats = None
+        if config.embedding_min_norm is not None:
+            if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                raise ValueError(
+                    "embedding_min_norm requires optimizer-managed FP32 master parameters"
+                )
+            optimized_params = {
+                param
+                for param_group in self.optimizer.param_groups
+                for param in param_group["params"]
+            }
+            seen_params = set()
+            for buffer in self.buffers:
+                for param in buffer.params:
+                    if (
+                        getattr(param, "is_word_embedding_parameter", False)
+                        and param in optimized_params
+                        and param not in seen_params
+                    ):
+                        seen_params.add(param)
+                        self._word_embedding_params.append(param)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
         # the param norm.
@@ -794,6 +987,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        self._embedding_min_norm_states = self._build_embedding_min_norm_states()
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -803,6 +998,114 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_range_map = self.gbuf_ranges[gbuf_index][dtype][bucket_index]
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
+
+    def _build_embedding_min_norm_states(self) -> List[_EmbeddingMinNormState]:
+        """Cache embedding layouts and reduction workspaces shared by optimizer steps."""
+        states = []
+        for model_param in self._word_embedding_params:
+            if model_param.ndim != 2:
+                raise ValueError("embedding_min_norm requires a two-dimensional embedding weight")
+
+            row_width = model_param.shape[1]
+            padding_numel = tensor_parallel.gtp_local_pad_zero_count(
+                model_param, 0, model_param.numel()
+            )
+            if padding_numel % row_width != 0:
+                raise RuntimeError("GTP embedding padding must contain complete rows")
+            num_rows = model_param.shape[0] - padding_numel // row_width
+            if num_rows > 0:
+                states.append(
+                    _EmbeddingMinNormState(
+                        model_param=model_param,
+                        row_width=row_width,
+                        num_rows=num_rows,
+                        row_sums=torch.zeros(
+                            num_rows, dtype=torch.float32, device=model_param.device
+                        ),
+                    )
+                )
+        return states
+
+    @torch.no_grad()
+    def _post_optimizer_step(self) -> None:
+        """Rescale sub-threshold input-embedding rows to twice the configured threshold."""
+        min_norm = self.config.embedding_min_norm
+        if min_norm is None:
+            return
+
+        target_norm = 2.0 * min_norm
+        for state in self._embedding_min_norm_states:
+            model_param = state.model_param
+            row_width = state.row_width
+            num_rows = state.num_rows
+            row_sums = state.row_sums
+            row_sums.zero_()
+            main_param = None
+            row_indices = None
+
+            # A DP rank may own no part of this embedding, but must still enter the collective.
+            if model_param in self.model_param_gbuf_map:
+                param_range = self._get_model_param_range_map(model_param)["param"]
+                valid_end = min(param_range.end, num_rows * row_width)
+                valid_numel = max(0, valid_end - param_range.start)
+                if valid_numel > 0:
+                    if model_param.dtype in (torch.float16, torch.bfloat16):
+                        if model_param.main_param is None:
+                            raise RuntimeError(
+                                "embedding_min_norm could not find this rank's FP32 master shard"
+                            )
+                        main_param = model_param.main_param[:valid_numel]
+                    elif model_param.dtype == torch.float32:
+                        main_param = model_param.view(-1)[
+                            param_range.start : param_range.start + valid_numel
+                        ]
+                    else:
+                        raise TypeError(
+                            "embedding_min_norm requires an FP32, FP16, or BF16 embedding weight"
+                        )
+                    row_indices = torch.arange(
+                        param_range.start, valid_end, dtype=torch.int64, device=main_param.device
+                    ).div_(row_width, rounding_mode="floor")
+                    _add_row_square_sums(row_sums, main_param, param_range.start, row_width)
+
+            torch.distributed.all_reduce(row_sums, group=self.data_parallel_group)
+
+            row_norms = row_sums.sqrt()
+            rows_to_scale = (row_norms > 0.0) & (row_norms < min_norm)
+            row_scales = torch.where(
+                rows_to_scale,
+                target_norm / row_norms.clamp_min(torch.finfo(row_norms.dtype).tiny),
+                1.0,
+            )
+            # Tied copies on other pipeline stages get the same transform but are not
+            # counted again, so the statistics describe the logical input table.
+            if (
+                self.data_parallel_group.rank() == 0
+                and self.distributed_optimizer_instance_id == 0
+                and not getattr(model_param, "shared", False)
+            ):
+                if self._embedding_min_norm_stats is None:
+                    # Rows scaled, rows checked, squared norm delta, exact-zero rows.
+                    self._embedding_min_norm_stats = torch.zeros(
+                        4, dtype=torch.float64, device=row_norms.device
+                    )
+                stats = self._embedding_min_norm_stats
+                stats[0].add_(rows_to_scale.sum())
+                stats[1].add_(num_rows)
+                norm_delta = torch.where(rows_to_scale, target_norm - row_norms, 0.0)
+                stats[2].add_(norm_delta.square().sum())
+                stats[3].add_((row_norms == 0.0).sum())
+            if main_param is not None:
+                main_param.mul_(row_scales[row_indices])
+
+    @torch.no_grad()
+    def _consume_embedding_min_norm_stats(self) -> Optional[torch.Tensor]:
+        """Return and clear ``[scaled, checked, delta squared, zero]`` interval stats."""
+        stats = getattr(self, "_embedding_min_norm_stats", None)
+        if stats is None:
+            return None
+        self._embedding_min_norm_stats = None
+        return stats
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
@@ -950,18 +1253,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # per-group config (``param_group_identifier_keys``) rather than by position.
 
         def make_needed_groups(param_group):
-            needed_groups = []
-            for key in param_group_identifier_keys:
-                # NeMo aliases ``lr_mult``/``wd_mult`` as ``pre_lr_mult``/``pre_wd_mult``.
-                if key in param_group:
-                    value = param_group[key]
-                elif f"pre_{key}" in param_group:
-                    value = param_group[f"pre_{key}"]
-                else:
-                    # Treat missing and explicit None identifier values as equivalent.
-                    value = None
-                needed_groups.append(value)
-            return tuple(needed_groups)
+            return get_param_group_identifier_tuple(param_group)
 
         # Duplicate identifiers here silently clobber: two saved groups with the same tuple
         # collapse to whichever was inserted last, and one current group inherits the wrong
@@ -977,8 +1269,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
+            # Grandfathers checkpoints written before the DSA indexer split
+            saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
+            if saved_param_group is None:
+                raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
             state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                {**saved_param_group, "params": inner_param_group['params']}
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
@@ -1082,6 +1378,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
+            self._back_compat_normalize_loaded_dtype_keys(
+                param_state, self._checkpoint_version_for_load
+            )
+            self._checkpoint_version_for_load = None
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -1523,6 +1823,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
             )
 
+        if is_loading:
+            checkpoint_version = (metadata or {}).get('checkpoint_version')
+            if checkpoint_version is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "DistributedOptimizer.sharded_state_dict(is_loading=True) was called without "
+                    "metadata['checkpoint_version']: the loading template uses the current "
+                    f"(version {_FQN_SAFE_DTYPE_KEY_VERSION}) optimizer keys. A checkpoint written "
+                    "before that version keeps (param_dtype, grad_dtype) tuples in its keys and "
+                    "will fail to load with missing optimizer tensors. Pass the version stored in "
+                    "the checkpoint's common state (as load_checkpoint does) to enable the legacy "
+                    "key mapping.",
+                )
+            self._checkpoint_version_for_load = checkpoint_version
+
         # Handle FSDP DistributedOptimizer States
         if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
@@ -1915,16 +2231,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    # A highly padded bucket can assign a DP rank only trailing padding.
+                    # Trailing bucket padding is deliberately excluded from the checkpoint,
+                    # so that rank has no optimizer state to contribute. An empty shard that
+                    # intersects the unpadded payload is still a real coverage error.
+                    if not bucket_state:
+                        assert _is_trailing_padding_only_shard(
+                            data_parallel_rank, gbuf_local_numel, gbuf_world_numel_unpadded
+                        ), 'empty bucket intersects unpadded optimizer state'
+                        continue
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
                     for i in range(-1, len(bucket_state)):
                         if i == len(bucket_state) - 1:
-                            # Potential padding at the end
-                            next_param_start = gbuf_local_numel
+                            # Include intra-bucket padding, but exclude the tail
+                            # used only to divide the buffer across DP ranks.
+                            next_param_start = max(
+                                0,
+                                min(
+                                    gbuf_local_numel,
+                                    gbuf_world_numel_unpadded
+                                    - data_parallel_rank * gbuf_local_numel,
+                                ),
+                            )
                         else:
                             next_param_start = bucket_state[i + 1]['gbuf_local_start']
                         if i == -1:
@@ -1994,6 +2324,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 allow_shape_mismatch=False,
                                 replica_id=(self.distributed_optimizer_instance_id, 0, 0),
                             )
+        if is_loading:
+            self._back_compat_normalize_loaded_dtype_keys(
+                state,
+                checkpoint_version=(metadata or {}).get('checkpoint_version'),
+                legacy_grad_dtypes=(metadata or {}).get('legacy_grad_dtypes'),
+            )
         return state
 
     def sharded_param_state_fs_model_space(
@@ -2084,6 +2420,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `get_parameter_state_dp_reshardable` method.
         """
+        data_parallel_rank = self.data_parallel_group.rank()
+        data_parallel_world_size = self.data_parallel_group.size()
+
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -2096,6 +2435,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    if not gbuf_range_map["param_map"]:
+                        bucket = self.buffers[gbuf_idx].buckets[bucket_idx]
+                        gbuf_world_numel = bucket.grad_data.numel()
+                        assert gbuf_world_numel % data_parallel_world_size == 0
+                        assert _is_trailing_padding_only_shard(
+                            data_parallel_rank,
+                            gbuf_world_numel // data_parallel_world_size,
+                            bucket.numel_unpadded,
+                        ), 'empty bucket intersects unpadded optimizer state'
+                        continue
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
                     bucket_state = [
                         bucket_state_elem
@@ -2453,7 +2802,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if key != 'buckets_coalesced':
                 for dtype in state_dict[key].keys():
                     assert dtype not in dtype_to_gbuf_idx
-                    if dtype[0] == torch.uint8:
+                    if isinstance(dtype, str) and dtype.startswith('param_torch:uint8'):
                         # If the `state_dict`` already contains a torch.uint8 buffer, we assumed
                         # that the fp8 weights and fp16/bf16 biases in the checkpoint are already
                         # separated. In this case, no action is required, so we can return directly.
@@ -2471,16 +2820,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for fp8_gbuf_idx in fp8_gbuf_indices:
             # Note that `self.buffers[fp8_gbuf_idx].params[0].dtype` is the dummy dtype of
             # `Float8Tensor`, not torch.uint8.
-            non_fp8_param_and_grad_dtype = (
-                self.buffers[fp8_gbuf_idx].params[0].dtype,
-                self.buffers[fp8_gbuf_idx].grad_dtype,
-            )
+            non_fp8_dtype_key = _get_dtype_key(self.buffers[fp8_gbuf_idx].params[0].dtype)
 
             # Iterate through all buffers to find the one that needs to be split.
             non_fp8_gbuf_idx = None
             for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
                 for dtype, _ in gbuf_range_maps.items():
-                    if dtype == non_fp8_param_and_grad_dtype:
+                    if dtype == non_fp8_dtype_key:
                         non_fp8_gbuf_idx = gbuf_idx
             assert non_fp8_gbuf_idx is not None
 
@@ -2551,9 +2897,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             non_fp8_state_dict['numel_unpadded'] = non_fp8_offsets[-1]
 
             # Add the two separate buffers into `new_state_dict`.
-            new_state_dict[fp8_gbuf_idx] = {}
-            new_state_dict[fp8_gbuf_idx][(torch.uint8, fp8_buffer.grad_dtype)] = fp8_state_dict
-            new_state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype] = non_fp8_state_dict
+            fp8_dtype_key = _get_dtype_key(torch.uint8)
+            new_state_dict[fp8_gbuf_idx] = {fp8_dtype_key: fp8_state_dict}
+            new_state_dict[non_fp8_gbuf_idx] = {non_fp8_dtype_key: non_fp8_state_dict}
 
         # Inplace update state_dict
         state_dict.clear()
@@ -2781,6 +3127,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # during the backward pass.
             return
 
+        if self._cudagraphed_grad_copy is None:
+            return self._copy_model_grads_to_main_grads_eager()
+
+        self._cudagraphed_grad_copy.copy(
+            self._copy_model_grads_to_main_grads_eager,
+            itertools.chain(
+                zip(self.model_float16_groups, self.shard_fp32_from_float16_groups),
+                zip(self.model_fp32_groups, self.shard_fp32_groups),
+            ),
+            source_fn=self._model_grad_shard,
+        )
+
+    def _model_grad_shard(self, model_param: torch.nn.Parameter) -> torch.Tensor:
+        """This rank's shard of ``model_param.main_grad``, as read by the conversion."""
+        span = self._get_model_param_range_map(model_param)["param"]
+        return model_param.main_grad.view(-1)[span.start : span.end]
+
+    def _copy_model_grads_to_main_grads_eager(self):
+        """Convert model gradient shards without graph capture or replay."""
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -2911,6 +3277,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
+
+    @torch.no_grad()
+    def _stage_model_params_from_main_params(self) -> None:
+        if self.is_stub_optimizer:
+            return
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # MXFP8 reuses the grad buffer for the param all-gather; the quantization
+            # happens after the all-gather, in _post_param_sync.
+            self._copy_main_params_to_param_buffer()
+        else:
+            self._copy_main_params_to_model_params()
+
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        if self.is_stub_optimizer:
+            return
+        self._stage_model_params_from_main_params()
+        # Each rank only owns a shard of the main params, so the full params have to be
+        # gathered. The caller is outside the training loop, so gather synchronously
+        # instead of relying on the next step's overlapped gather.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def _copy_main_params_to_param_buffer(self):
         """
@@ -3071,13 +3460,51 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
             self._synthesize_state_dict_params_for_model(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
+
+            # Some layer specs declare a sharded_state_dict_keys_map that rewrites runtime
+            # parameter prefixes to canonical checkpoint prefixes (e.g. fused-LN MLA stores its
+            # LN scale/bias on linear_qkv_down_proj at runtime, but the checkpoint canonicalizes
+            # them to input_layernorm.*). Collect those rewrites so we can match a runtime param
+            # name against either its raw form or its canonical alternative.
+            canonical_rewrites = []
+            for layer_path, layer_module in model_chunk.named_modules():
+                cfg = getattr(layer_module, 'submodules_config', None)
+                if cfg is None:
+                    continue
+                key_map = getattr(cfg, 'sharded_state_dict_keys_map', None)
+                if not key_map:
+                    continue
+                # Match the "module." stripping applied to parameter names below.
+                while layer_path.startswith("module."):
+                    layer_path = layer_path[len("module.") :]
+                layer_prefix = f"{layer_path}." if layer_path else ""
+                canonical_rewrites.append((layer_prefix, list(key_map.items())))
+
+            def _candidate_state_dict_names(name):
+                candidates = [name]
+                for layer_prefix, mappings in canonical_rewrites:
+                    if not name.startswith(layer_prefix):
+                        continue
+                    sub = name[len(layer_prefix) :]
+                    for old_prefix, new_prefix in mappings:
+                        if sub.startswith(old_prefix):
+                            candidates.append(f"{layer_prefix}{new_prefix}{sub[len(old_prefix) :]}")
+                            break
+                return candidates
+
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
-                assert (
-                    len(matched_keys) == 1
-                ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
+                candidates = _candidate_state_dict_names(name)
+                matched_keys = []
+                for cand in candidates:
+                    matched_keys = [k for k in names_in_state_dict if k.endswith(cand)]
+                    if matched_keys:
+                        break
+                assert len(matched_keys) == 1, (
+                    f"Parameter {name} has {len(matched_keys)} matches in state dict "
+                    f"(tried candidates: {candidates})"
+                )
                 state_dict_param = state_dict_list[chunk_idx][matched_keys[0]]
                 assert model_param.shape == state_dict_param.shape
                 model_param_to_state_dict_param_map[model_param] = state_dict_param

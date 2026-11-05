@@ -22,3 +22,9 @@ def disable_msc():
 @pytest.fixture(scope="class")
 def tmp_dir_per_class(tmp_path_factory):
     return tmp_path_factory.mktemp("data")
+
+
+@pytest.fixture(autouse=True)
+def checkpoint_run_config(run_config):
+    """Checkpoint saves read their metadata settings from the run config."""
+    return run_config

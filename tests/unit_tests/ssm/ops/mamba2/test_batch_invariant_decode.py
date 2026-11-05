@@ -10,8 +10,10 @@ try:
 
     from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
+        _mamba_chunk_scan_decode_rows,
         batch_invariant_decode_buffered_scan,
     )
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode_rows import row_kernel_configs
     from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_BATCH_INVARIANT_DECODE = True
@@ -53,6 +55,14 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
 
         _pin_mamba_autotuners()
+
+    @classmethod
+    def tearDownClass(cls):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            _unpin_mamba_autotuners,
+        )
+
+        _unpin_mamba_autotuners()
 
     def setUp(self):
         torch.manual_seed(0)
@@ -132,7 +142,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         # Buffer seeding expects the flat layout used by the mixer's prefill path.
         # Here total == prefill_len since we have 1 sequence.
         bufs.seed(
-            x[0, :prefill_len],
             x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
@@ -256,9 +265,11 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         model = SimpleNamespace(
             config=SimpleNamespace(batch_invariant_mode=True, params_dtype=torch.bfloat16)
         )
+        layers = [SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))]
         decoder = SimpleNamespace(
             layer_type_list=[Symbols.MAMBA],
-            layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))],
+            layers=layers,
+            physical_layers=lambda: tuple(layers),
             mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
         )
         with patch("megatron.core.inference.config.get_attr_wrapped_model", return_value=decoder):
@@ -291,7 +302,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
                 batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
                 bufs.seed(
-                    x[0, :prefill_len],
                     x[0, :prefill_len],
                     dt[0, :prefill_len],
                     B[0, :prefill_len],
@@ -341,7 +351,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 cu = torch.tensor([0, final_chunk_len], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, first_chunk_len:prefill_len],
-                    x[0, first_chunk_len:prefill_len],
                     dt[0, first_chunk_len:prefill_len],
                     B[0, first_chunk_len:prefill_len],
                     C[0, first_chunk_len:prefill_len],
@@ -382,7 +391,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             torch.cat([x[0, :prefill_len], nan_x], dim=0),
-            torch.cat([x[0, :prefill_len], nan_x], dim=0),
             torch.cat([dt[0, :prefill_len], nan_dt], dim=0),
             torch.cat([B[0, :prefill_len], nan_B], dim=0),
             torch.cat([C[0, :prefill_len], nan_C], dim=0),
@@ -390,7 +398,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             batch_indices,
         )
         self.assertTrue(torch.isfinite(bufs.x[slot]).all())
-        self.assertTrue(torch.isfinite(bufs.z[slot]).all())
         self.assertTrue(torch.isfinite(bufs.dt[slot]).all())
         self.assertTrue(torch.isfinite(bufs.B[slot]).all())
         self.assertTrue(torch.isfinite(bufs.C[slot]).all())
@@ -546,18 +553,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         x, dt, B, C = self._make_seq(prefill_len)
         bufs = self._make_bufs(3)
         bufs.x[1].normal_()
-        bufs.z[1].normal_()
         bufs.dt[1].normal_()
         bufs.B[1].normal_()
         bufs.C[1].normal_()
         bufs.num_buffered[1] = 7
         before = tuple(
-            tensor[1].clone()
-            for tensor in (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered)
+            tensor[1].clone() for tensor in (bufs.x, bufs.dt, bufs.B, bufs.C, bufs.num_buffered)
         )
 
         bufs.seed(
-            x[0],
             x[0],
             dt[0],
             B[0],
@@ -566,9 +570,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             torch.tensor([0, -1], dtype=torch.int32, device=self.device),
         )
 
-        for tensor, expected in zip(
-            (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered), before
-        ):
+        for tensor, expected in zip((bufs.x, bufs.dt, bufs.B, bufs.C, bufs.num_buffered), before):
             torch.testing.assert_close(tensor[1], expected)
 
     def test_cuda_graph_replay_matches_full_scan(self):
@@ -613,7 +615,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         # Capture executes once, so restore the replay cursor before the first replay.
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         bufs.seed(
-            x[0, :prefill_len],
             x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
@@ -669,7 +670,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             x[0, :prefill_len],
-            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -693,6 +693,80 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             )
             self._assert_bitwise(y_batch_invariant[0, 0], y_full[0, pos], f"weak-decay step k={k}")
 
+    def test_independent_gate_across_chunk_boundaries(self):
+        """Decode with a gate z independent of x (the other tests reuse x as z),
+        two slots in one call, prefill tails on both sides of a boundary and
+        decoding across two chunk boundaries: every step must equal the
+        training scan with the same z bitwise. Only the current token's z
+        reaches the scan, so this also checks that no buffered z is needed."""
+        max_requests = 3
+        slots = [2, 0]
+        prefill_lens = [20, self.chunk_size + 9]
+        n_decode = 2 * self.chunk_size + 3
+        seqs, refs, states = [], [], self._make_ssm_state(max_requests)
+        bufs = self._make_bufs(max_requests)
+        for slot, plen in zip(slots, prefill_lens):
+            x, dt, B, C = self._make_seq(plen + n_decode)
+            z = torch.randn_like(x)
+            y_full = mamba_chunk_scan_combined(
+                x,
+                dt,
+                self.A,
+                B,
+                C,
+                self.chunk_size,
+                D=self.D,
+                z=z,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+            )
+            seqs.append((x, z, dt, B, C))
+            refs.append(y_full)
+            if plen >= self.chunk_size:
+                aligned = (plen // self.chunk_size) * self.chunk_size
+                _, final = _full_scan(
+                    x[:, :aligned],
+                    dt[:, :aligned],
+                    self.A,
+                    B[:, :aligned],
+                    C[:, :aligned],
+                    self.D,
+                    self.dt_bias,
+                    self.chunk_size,
+                )
+                states[slot] = final[0]
+            bufs.seed(
+                x[0, :plen],
+                dt[0, :plen],
+                B[0, :plen],
+                C[0, :plen],
+                torch.tensor([0, plen], dtype=torch.int32, device=self.device),
+                torch.tensor([slot], dtype=torch.int32, device=self.device),
+            )
+        batch_indices = torch.tensor(slots, dtype=torch.int32, device=self.device)
+        for k in range(n_decode):
+            step = [
+                torch.cat(
+                    [seq[i][:, plen + k : plen + k + 1] for seq, plen in zip(seqs, prefill_lens)]
+                )
+                for i in range(5)
+            ]
+            y = batch_invariant_decode_buffered_scan(
+                bufs, *step, self.A, self.D, self.dt_bias, batch_indices, states
+            )
+            for i, plen in enumerate(prefill_lens):
+                self._assert_bitwise(y[i, 0], refs[i][0, plen + k], f"slot={slots[i]} step k={k}")
+
+    def test_replay_buffers_hold_no_gate(self):
+        """The replay buffers hold x, dt, B, C only; z is not buffered."""
+        max_requests = 4
+        bufs = self._make_bufs(max_requests)
+        self.assertFalse(hasattr(bufs, "z"))
+        elem = torch.empty((), dtype=self.dtype).element_size()
+        replay_bytes = sum(t.numel() * t.element_size() for t in (bufs.x, bufs.dt, bufs.B, bufs.C))
+        per_row = self.nh * self.headdim + self.nh + 2 * self.ngroups * self.dstate
+        self.assertEqual(replay_bytes, max_requests * self.chunk_size * per_row * elem)
+
     def test_deterministic_across_calls(self):
         """Same inputs → bitwise-identical output across repeated invocations."""
         max_requests, slot = 2, 0
@@ -709,6 +783,316 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             self.assertTrue(
                 torch.equal(outs[0], outs[i]), f"determinism: run {i} differs from run 0"
             )
+
+
+def _bits(t):
+    """Raw bits, so signed zeros and NaN payloads compare too."""
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+
+
+@unittest.skipIf(not HAVE_BATCH_INVARIANT_DECODE, "mamba_ssm / batch_invariant_decode unavailable")
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestBatchInvariantDecodeRowKernels(unittest.TestCase):
+    """The row kernels match the training kernels' target-rows pipeline bit for bit."""
+
+    @classmethod
+    def setUpClass(cls):
+        from megatron.core.transformer.custom_layers import batch_invariant_kernels
+
+        batch_invariant_kernels._pin_mamba_autotuners()
+        # Every candidate each training kernel could be pinned to.
+        cls.candidates = {
+            kernel: list(original)
+            for kernel, original in batch_invariant_kernels._PINNED_AUTOTUNERS
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            _unpin_mamba_autotuners,
+        )
+
+        _unpin_mamba_autotuners()
+
+    def _inputs(self, entries, nheads, headdim, ngroups, dstate, chunk_size, dtype, seed, scale):
+        """Buffered chunks for ``entries`` slots and their decode metadata.
+
+        Every target row of a chunk occurs, about one entry in five crosses a chunk
+        boundary, slots are shuffled and entry 3 is a padding lane. Per-head decay spans
+        |A| = 1e-4 .. 2, so the carried state matters at a crossing.
+        """
+        g = torch.Generator(device="cuda").manual_seed(seed)
+
+        def randn(*shape):
+            return torch.randn(*shape, device="cuda", generator=g)
+
+        rows = entries * chunk_size
+        x = (randn(rows, nheads, headdim) * scale).to(dtype)
+        if seed == 2:
+            x[::7] = 0.0
+            x[1::11] = -0.0
+        slots = torch.randperm(entries, device="cuda", generator=g).to(torch.int32)
+        slots[3] = -1
+        pos = torch.arange(entries, device="cuda") % chunk_size
+        pos = torch.where(torch.arange(entries, device="cuda") % 5 == 0, chunk_size - 1, pos)
+        target_rows = torch.where(slots >= 0, pos, -1).to(torch.int32)
+        return dict(
+            x=x,
+            dt=(randn(rows, nheads) * scale - 2.0).to(dtype),
+            A=-torch.exp(torch.empty(nheads, device="cuda").uniform_(-9.2, 0.7, generator=g)),
+            B=(randn(rows, ngroups, dstate) * scale).to(dtype),
+            C=(randn(rows, ngroups, dstate) * scale).to(dtype),
+            z=randn(entries, nheads, headdim).to(dtype),
+            state=randn(entries, nheads, headdim, dstate) * 0.1,
+            chunk_starts=slots * chunk_size,
+            slots=slots,
+            target_rows=target_rows,
+            chunk_flags=(target_rows == chunk_size - 1).to(torch.int32),
+            dt_bias=randn(nheads) * 0.1,
+        )
+
+    def _run(self, d, chunk_size, D, gate, use_row_kernels):
+        out = torch.zeros(*d["z"].shape, device="cuda", dtype=d["x"].dtype)
+        state = d["state"].clone()
+        _mamba_chunk_scan_decode_rows(
+            d["x"],
+            d["z"] if gate else None,
+            d["dt"],
+            d["A"],
+            d["B"],
+            d["C"],
+            chunk_size,
+            chunk_starts=d["chunk_starts"],
+            slots=d["slots"],
+            target_rows=d["target_rows"],
+            chunk_flags=d["chunk_flags"],
+            initial_states=state,
+            out=out,
+            D=D,
+            dt_bias=d["dt_bias"],
+            dt_softplus=True,
+            use_row_kernels=use_row_kernels,
+        )
+        return out, state
+
+    def _assert_pipelines_match(self, d, chunk_size, D, gate, msg):
+        out_tile, state_tile = self._run(d, chunk_size, D, gate, use_row_kernels=False)
+        out_row, state_row = self._run(d, chunk_size, D, gate, use_row_kernels=True)
+        self.assertTrue(torch.isfinite(out_tile).all(), msg)
+        self.assertTrue(torch.equal(_bits(out_row), _bits(out_tile)), f"{msg}: output")
+        self.assertTrue(torch.equal(_bits(state_row), _bits(state_tile)), f"{msg}: state")
+        self.assertEqual(out_row[3].abs().max().item(), 0.0, f"{msg}: padding lane")
+
+    def test_row_kernels_selected_when_pinned(self):
+        """Pinned training kernels select the row kernels; an unpinned one keeps the tiles."""
+        C = torch.empty(1, 1, 128, device="cuda")
+        self.assertIsNotNone(row_kernel_configs(C, 128))
+        self.assertIsNotNone(row_kernel_configs(C[..., :16], 32))  # the dims of the class above
+        from megatron.core.ssm.ops.mamba2 import ssd_chunk_scan
+
+        kernel = ssd_chunk_scan._chunk_scan_fwd_kernel
+        pinned = kernel.configs
+        try:
+            kernel.configs = self.candidates[kernel]
+            self.assertIsNone(row_kernel_configs(C, 128))
+        finally:
+            kernel.configs = pinned
+
+    def test_row_pipeline_matches_tile_pipeline(self):
+        """Every target row, crossings, a padding lane and signed zeros, fp32 and bf16."""
+        entries, nheads, headdim, ngroups, dstate, chunk_size = 256, 16, 64, 2, 128, 128
+        for dtype in (torch.float32, torch.bfloat16):
+            for seed in (0, 1, 2):
+                for scale in (1.0, 1e-3, 30.0):
+                    d = self._inputs(
+                        entries, nheads, headdim, ngroups, dstate, chunk_size, dtype, seed, scale
+                    )
+                    for D in (
+                        torch.randn(nheads, device="cuda"),
+                        torch.randn(nheads, headdim, device="cuda"),
+                    ):
+                        for gate in (False, True):
+                            msg = f"{dtype} seed={seed} scale={scale} D={tuple(D.shape)} z={gate}"
+                            with self.subTest(msg):
+                                self._assert_pipelines_match(d, chunk_size, D, gate, msg)
+
+    def test_row_kernels_follow_the_pinned_tiles(self):
+        """For each candidate tile of each training kernel, the row kernels either decline
+        (the tile pipeline runs) or take that tile and match it bit for bit."""
+        from triton.runtime.errors import OutOfResources
+
+        from megatron.core.ssm.ops.mamba2 import ssd_bmm, ssd_chunk_scan, ssd_chunk_state
+
+        entries, nheads, headdim, ngroups, dstate, chunk_size = 40, 4, 64, 2, 128, 128
+        D = torch.randn(nheads, device="cuda")
+        supported = 0
+        for kernel in (
+            ssd_chunk_scan._chunk_scan_fwd_kernel,
+            ssd_bmm._bmm_chunk_fwd_kernel,
+            ssd_chunk_state._chunk_state_fwd_kernel,
+        ):
+            pinned = kernel.configs
+            try:
+                for config in self.candidates[kernel]:
+                    kernel.configs = [config]
+                    kernel.cache.clear()
+                    if row_kernel_configs(torch.empty(1, 1, dstate), chunk_size) is None:
+                        continue
+                    supported += 1
+                    for dtype in (torch.float32, torch.bfloat16):
+                        d = self._inputs(
+                            entries, nheads, headdim, ngroups, dstate, chunk_size, dtype, 0, 1.0
+                        )
+                        try:
+                            self._run(d, chunk_size, D, True, use_row_kernels=False)
+                        except OutOfResources:
+                            continue  # the training kernel cannot launch this tile either
+                        msg = f"{kernel.base_fn.__name__} {config} {dtype}"
+                        with self.subTest(msg):
+                            self._assert_pipelines_match(d, chunk_size, D, True, msg)
+            finally:
+                kernel.configs = pinned
+                kernel.cache.clear()
+        self.assertGreater(supported, 3)
+
+    def _decode_steps(self, seqs, slots, prefill_lens, steps, chunk_size, A, D, dt_bias, graph):
+        """Seed each slot from its prefill, then decode ``steps`` tokens per slot.
+
+        One padding entry (-1) rides along. Returns per-step outputs (steps, entries, ...)
+        and the final SSM state.
+        """
+        nheads, headdim = seqs[0][0].shape[-2:]
+        ngroups, dstate = seqs[0][3].shape[-2:]
+        dtype = seqs[0][0].dtype
+        max_requests = max(slots) + 1
+        batch_indices = torch.tensor([*slots, -1], dtype=torch.int32, device="cuda")
+
+        def seeded():
+            bufs = BatchInvariantDecodeBuffers.allocate(
+                max_requests, chunk_size, nheads, headdim, ngroups, dstate, "cuda", dtype
+            )
+            state = torch.zeros(max_requests, nheads, headdim, dstate, device="cuda")
+            for slot, plen, (x, z, dt, B, C) in zip(slots, prefill_lens, seqs):
+                aligned = plen // chunk_size * chunk_size
+                if aligned:
+                    _, final = mamba_chunk_scan_combined(
+                        x[:, :aligned],
+                        dt[:, :aligned],
+                        A,
+                        B[:, :aligned],
+                        C[:, :aligned],
+                        chunk_size,
+                        D=D,
+                        z=z[:, :aligned],
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        return_final_states=True,
+                    )
+                    state[slot] = final[0]
+                bufs.seed(
+                    x[0, :plen],
+                    dt[0, :plen],
+                    B[0, :plen],
+                    C[0, :plen],
+                    torch.tensor([0, plen], dtype=torch.int32, device="cuda"),
+                    torch.tensor([slot], dtype=torch.int32, device="cuda"),
+                )
+            return bufs, state
+
+        def step_inputs(k):
+            # (x, z, dt, B, C) rows of every entry at decode step k; padding repeats entry 0.
+            rows = [
+                torch.cat(
+                    [seq[i][:, plen + k : plen + k + 1] for seq, plen in zip(seqs, prefill_lens)]
+                )
+                for i in range(5)
+            ]
+            return [torch.cat([r, r[:1]]) for r in rows]
+
+        static = step_inputs(0)
+        bufs, state = seeded()
+
+        def decode():
+            return batch_invariant_decode_buffered_scan(
+                bufs, *static, A, D, dt_bias, batch_indices, state
+            )
+
+        if graph:
+            decode()  # compile before capture, then reset the buffers and state
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                y = decode()
+            fresh_bufs, fresh_state = seeded()
+            for name in ("x", "dt", "B", "C", "num_buffered"):
+                getattr(bufs, name).copy_(getattr(fresh_bufs, name))
+            state.copy_(fresh_state)
+        outs = []
+        for k in range(steps):
+            for t, v in zip(static, step_inputs(k)):
+                t.copy_(v)
+            if graph:
+                cuda_graph.replay()
+            else:
+                y = decode()
+            outs.append(y.clone())
+        return torch.stack(outs), state
+
+    def test_many_step_decode_matches_tile_path_and_training_scan(self):
+        """300 decode steps over five slots (several chunk crossings each), mixed per-head
+        decay, a padding lane, eager and CUDA graphs: the row kernels give the tile
+        pipeline's outputs and states, and in bf16 the training scan's outputs."""
+        from unittest.mock import patch
+
+        from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
+
+        nheads, headdim, ngroups, dstate, chunk_size, steps = 8, 64, 2, 128, 128, 300
+        slots, prefill_lens = (7, 2, 5, 0, 9), (128, 1, 255, 64, 300)
+        g = torch.Generator(device="cuda").manual_seed(0)
+        A = -torch.exp(torch.empty(nheads, device="cuda").uniform_(-9.2, 0.7, generator=g))
+        D = torch.randn(nheads, device="cuda", generator=g) * 0.1
+        dt_bias = torch.randn(nheads, device="cuda", generator=g) * 0.1
+        for dtype in (torch.bfloat16, torch.float32):
+            seqs = []
+            for plen in prefill_lens:
+                n = plen + steps
+                seqs.append(
+                    (
+                        (torch.randn(1, n, nheads, headdim, device="cuda", generator=g) * 0.1).to(
+                            dtype
+                        ),
+                        torch.randn(1, n, nheads, headdim, device="cuda", generator=g).to(dtype),
+                        (torch.randn(1, n, nheads, device="cuda", generator=g).abs() * 0.1).to(
+                            dtype
+                        ),
+                        (torch.randn(1, n, ngroups, dstate, device="cuda", generator=g) * 0.1).to(
+                            dtype
+                        ),
+                        (torch.randn(1, n, ngroups, dstate, device="cuda", generator=g) * 0.1).to(
+                            dtype
+                        ),
+                    )
+                )
+            args = (seqs, slots, prefill_lens, steps, chunk_size, A, D, dt_bias)
+            with patch.object(bid, "row_kernel_configs", return_value=None):
+                out_tile, state_tile = self._decode_steps(*args, graph=False)
+            for graph in (False, True):
+                msg = f"{dtype} graph={graph}"
+                with self.subTest(msg):
+                    out_row, state_row = self._decode_steps(*args, graph=graph)
+                    self.assertTrue(torch.isfinite(out_row).all(), msg)
+                    self.assertTrue(torch.equal(_bits(out_row), _bits(out_tile)), msg)
+                    self.assertTrue(torch.equal(_bits(state_row), _bits(state_tile)), msg)
+                    self.assertEqual(out_row[:, len(slots)].abs().max().item(), 0.0, msg)
+            if dtype != torch.bfloat16:
+                continue
+            for i, (plen, (x, z, dt, B, C)) in enumerate(zip(prefill_lens, seqs)):
+                y_full = mamba_chunk_scan_combined(
+                    x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, dt_softplus=True
+                )
+                self.assertTrue(
+                    torch.equal(_bits(out_tile[:, i, 0]), _bits(y_full[0, plen:])),
+                    f"slot {slots[i]}: decode differs from the training scan",
+                )
 
 
 if __name__ == "__main__":

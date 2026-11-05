@@ -19,6 +19,7 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
@@ -87,10 +88,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
         )
 
+    cfg_container = get_run_config()
     model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
@@ -102,6 +104,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        rope_scaling_factor=args.rope_scaling_factor,
         mtp_block_spec=mtp_block_spec,
         vp_stage=vp_stage,
         pg_collection=pg_collection,

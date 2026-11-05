@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 
@@ -19,6 +19,9 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
 )
 from megatron.core.inference.quantization.mxfp8_quantize import (
     mxfp8_quantize as mcore_mxfp8_quantize,
+)
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    mxfp8_quantize_into as mcore_mxfp8_quantize_into,
 )
 
 
@@ -128,6 +131,10 @@ class MXFP8Tensor:
     # Legacy direct constructors have unknown logical dtype until their next
     # successful update.
     dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
+    # When set, quantize_ writes through this callable (see attach_routed_mxfp8_writeback).
+    writeback: Optional[Callable[[torch.Tensor], None]] = field(
+        default=None, kw_only=True, repr=False, compare=False
+    )
 
     @property
     def shape(self) -> torch.Size:
@@ -183,9 +190,21 @@ class MXFP8Tensor:
         if self.backend == "flashinfer" and value.dtype == torch.float32:
             value = value.to(dtype=torch.bfloat16)
         value = value.contiguous()
-        quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
-        self.data.copy_(quantized.data)
-        self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+        if self.writeback is not None:
+            self.writeback(value)
+        elif (
+            self.backend == "triton"
+            and self.data.dtype == torch.float8_e4m3fn
+            and self.data.is_contiguous()
+            and self.scale.ndim == 1
+            and self.scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+            and self.scale.is_contiguous()
+        ):
+            mcore_mxfp8_quantize_into(value, self.data, self.scale)
+        else:
+            quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+            self.data.copy_(quantized.data)
+            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
         if self.dtype is None:
             self.dtype = value.dtype
         return self

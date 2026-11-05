@@ -47,6 +47,8 @@ from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -168,7 +170,7 @@ def get_params(model):
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_prune_args,
         args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
@@ -176,7 +178,11 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
-    initialize_megatron()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg =inference_cfg_container_from_args(args, build_model_config=False) 
+    set_run_config(cfg)
+    initialize_megatron(training=False)
 
     args = get_args()
     check_arguments(args)
@@ -207,7 +213,7 @@ if __name__ == "__main__":
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_kwargs = {
             "dtype": import_dtype,
-            "trust_remote_code": args.trust_remote_code,
+            "trust_remote_code": cfg.tokenizer.trust_remote_code,
         }
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs

@@ -64,6 +64,8 @@ from megatron.post_training.utils import print_distributed_quant_summary, report
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -484,12 +486,16 @@ def auto_quantize_model(unwrapped_model, tokenizer):
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
+    args = parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
         })
-    initialize_megatron()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    set_run_config(cfg)
+    initialize_megatron(training=False)
 
     check_arguments()
 
@@ -516,7 +522,7 @@ if __name__ == "__main__":
 
         import_kwargs = {"dtype": import_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
-            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+            import_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
         if (
             "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters
             and getattr(args, "moe_router_dtype", None)

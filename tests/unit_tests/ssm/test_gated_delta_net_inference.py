@@ -2,6 +2,7 @@
 
 """Focused kernel and CUDA-graph tests for Gated DeltaNet dynamic inference."""
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
+from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -22,7 +24,7 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 class TestGatedDeltaNetInference:
-    """Validate state continuity and capture of the real FLA inference kernels."""
+    """Validate state continuity and graph capture of GDN inference kernels."""
 
     @pytest.fixture(scope="function", autouse=True)
     def setup_method(self):
@@ -51,6 +53,7 @@ class TestGatedDeltaNetInference:
             bf16=True,
             tensor_model_parallel_size=1,
             experimental_attention_variant="gated_delta_net",
+            gdn_kernel_backend="fla",
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
@@ -77,11 +80,30 @@ class TestGatedDeltaNetInference:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _prefill_context(cu_seqlens, batch_indices):
+    def _prefill_context(lengths, slots, padded_tokens=None):
+        """Build the prefill metadata the inference context would, padded to `padded_tokens`."""
+        cu_seqlens = [0, *itertools.accumulate(lengths)]
+        padded_tokens = padded_tokens or cu_seqlens[-1]
+        padding = [0] * (padded_tokens - cu_seqlens[-1])
+        indices, indices_dp, offsets, _, _ = build_gdp_chunk_descriptors(
+            cu_seqlens, len(lengths), 1, padded_tokens
+        )
+        seq_idx = [i for i, n in enumerate(lengths) for _ in range(n)] + padding
+        seq_start = [start for start, n in zip(cu_seqlens, lengths) for _ in range(n)] + padding
+
+        def tensor(values):
+            return torch.tensor(values, device="cuda", dtype=torch.int32)
+
         return SimpleNamespace(
             is_chunked_prefill_enabled=lambda: False,
             mamba_metadata=SimpleNamespace(
-                cu_seqlens=cu_seqlens, batch_indices_prefill=batch_indices
+                cu_seqlens=tensor(cu_seqlens),
+                batch_indices_prefill=tensor(slots),
+                conv_seq_idx=tensor(seq_idx),
+                conv_seq_start=tensor(seq_start),
+                gdp_chunk_indices=tensor(indices).view(-1, 2),
+                gdp_chunk_indices_dp=tensor(indices_dp).view(-1, 2),
+                gdp_chunk_offsets=tensor(offsets),
             ),
         )
 
@@ -96,6 +118,54 @@ class TestGatedDeltaNetInference:
         return conv_state, ssm_state
 
     @torch.inference_mode()
+    def test_prefill_graph_replays_changing_sequence_layouts(self):
+        """Regression for #8151: replay must follow the live layout, not the captured one."""
+        tokens, slot_order = 256, [2, 0, 1]
+        projected = torch.randn(
+            tokens, 1, self.gdn.in_proj_dim, device="cuda", dtype=torch.bfloat16
+        )
+        initial_conv, initial_ssm = self._empty_states()
+        initial_conv.normal_()
+        initial_ssm.normal_()
+        graph_conv, graph_ssm = initial_conv.clone(), initial_ssm.clone()
+
+        def make_context(lengths):
+            slots = [slot if length else -1 for slot, length in zip(slot_order, lengths)]
+            return self._prefill_context(lengths, slots, padded_tokens=tokens)
+
+        def reset_states():
+            graph_conv.copy_(initial_conv)
+            graph_ssm.copy_(initial_ssm)
+
+        # Capture with a tiny layout so that stale capture-time metadata cannot cover later ones.
+        context = make_context([1, 1, 0])
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                reset_states()
+                self.gdn.ssm_prefill(projected, graph_conv, graph_ssm, context)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        reset_states()
+        with torch.cuda.graph(graph):
+            actual = self.gdn.ssm_prefill(projected, graph_conv, graph_ssm, context)
+
+        for lengths in ([120, 120, 0], [192, 64, 0], [0, 256, 0], [1, 63, 65], [1, 1, 0]):
+            live = make_context(lengths)
+            eager_conv, eager_ssm = initial_conv.clone(), initial_ssm.clone()
+            expected = self.gdn.ssm_prefill(projected, eager_conv, eager_ssm, live)
+            for name, value in vars(live.mamba_metadata).items():
+                getattr(context.mamba_metadata, name).copy_(value)
+            reset_states()
+            graph.replay()
+            torch.cuda.synchronize()
+            real = sum(lengths)
+            torch.testing.assert_close(actual[:real], expected[:real], atol=0, rtol=0)
+            torch.testing.assert_close(graph_conv, eager_conv, atol=0, rtol=0)
+            torch.testing.assert_close(graph_ssm, eager_ssm, atol=0, rtol=0)
+
+    @torch.inference_mode()
     def test_prefill_decode_matches_full_forward(self):
         prompt_len, total_len = 9, 14
         hidden = torch.randn(
@@ -105,14 +175,13 @@ class TestGatedDeltaNetInference:
         projected, _ = self.gdn.in_proj(hidden)
         conv_state, ssm_state = self._empty_states()
         slot = torch.tensor([2], device="cuda", dtype=torch.int32)
-        cu_seqlens = torch.tensor([0, prompt_len], device="cuda", dtype=torch.long)
 
         outputs = [
             self.gdn.ssm_prefill(
                 projected[:prompt_len],
                 conv_state,
                 ssm_state,
-                self._prefill_context(cu_seqlens, slot),
+                self._prefill_context([prompt_len], [2]),
             )
         ]
         for token in projected[prompt_len:]:
@@ -124,6 +193,36 @@ class TestGatedDeltaNetInference:
         actual, _ = self.gdn.out_proj(torch.cat(outputs, dim=0))
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
+    def test_forward_returns_dynamic_inference_result_without_reprojecting(self):
+        """ssm_dynamic_inference already projects, so forward must return it untouched.
+
+        Routing it through the two-stage path instead would hand an already-projected pair to
+        forward_post_core_attn, which projects a second time.
+        """
+        sentinel = (torch.zeros(1, 1, self.gdn.hidden_size, device="cuda"), None)
+        calls = []
+        self.gdn.ssm_dynamic_inference = lambda hidden_states, context: (
+            calls.append("dynamic") or sentinel
+        )
+        self.gdn.forward_pre_attn_and_core_attn = lambda *args, **kwargs: pytest.fail(
+            "the training two-stage path must not run during dynamic inference"
+        )
+        context = SimpleNamespace(
+            is_dynamic_batching=lambda: True,
+            is_static_batching=lambda: False,
+            num_speculative_tokens=0,
+            enable_prefix_caching=False,
+        )
+
+        output = self.gdn(
+            torch.randn(2, 1, self.gdn.hidden_size, device="cuda", dtype=torch.bfloat16),
+            attention_mask=None,
+            inference_context=context,
+        )
+
+        assert calls == ["dynamic"]
+        assert output is sentinel
+
     @torch.inference_mode()
     def test_padding_index_does_not_modify_state(self):
         conv_state, ssm_state = self._empty_states()
@@ -134,8 +233,9 @@ class TestGatedDeltaNetInference:
         conv_before = conv_state.clone()
         ssm_before = ssm_state.clone()
 
-        self.gdn.ssm_decode(projected, conv_state, ssm_state, batch_indices=indices)
+        output = self.gdn.ssm_decode(projected, conv_state, ssm_state, batch_indices=indices)
 
+        assert torch.count_nonzero(output[1]) == 0, "padding rows must produce zero output"
         assert not torch.equal(conv_state[1], conv_before[1])
         assert not torch.equal(ssm_state[1], ssm_before[1])
         torch.testing.assert_close(conv_state[[0, 2, 3]], conv_before[[0, 2, 3]], atol=0, rtol=0)
@@ -147,9 +247,13 @@ class TestGatedDeltaNetInference:
         projected = torch.randn(
             batch, 1, self.gdn.in_proj_dim // self.gdn.tp_size, device="cuda", dtype=torch.bfloat16
         )
-        indices = torch.arange(batch, device="cuda", dtype=torch.int32)
+        indices = torch.tensor([0, -1, -1, -1], device="cuda", dtype=torch.int32)
 
         eager_conv, eager_ssm = self._empty_states(slots=batch)
+        eager_conv[0].normal_()
+        eager_ssm[0].normal_()
+        initial_conv = eager_conv.clone()
+        initial_ssm = eager_ssm.clone()
         expected = self.gdn.ssm_decode(projected, eager_conv, eager_ssm, batch_indices=indices)
 
         graph_conv, graph_ssm = self._empty_states(slots=batch)
@@ -158,23 +262,23 @@ class TestGatedDeltaNetInference:
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                graph_conv.zero_()
-                graph_ssm.zero_()
+                graph_conv.copy_(initial_conv)
+                graph_ssm.copy_(initial_ssm)
                 self.gdn.ssm_decode(static_projected, graph_conv, graph_ssm, batch_indices=indices)
         torch.cuda.current_stream().wait_stream(warmup_stream)
-        graph_conv.zero_()
-        graph_ssm.zero_()
+        graph_conv.copy_(initial_conv)
+        graph_ssm.copy_(initial_ssm)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             graph_output = self.gdn.ssm_decode(
                 static_projected, graph_conv, graph_ssm, batch_indices=indices
             )
-        graph_conv.zero_()
-        graph_ssm.zero_()
+        graph_conv.copy_(initial_conv)
+        graph_ssm.copy_(initial_ssm)
         graph.replay()
         torch.cuda.synchronize()
 
         torch.testing.assert_close(graph_output, expected, atol=3e-2, rtol=3e-2)
-        torch.testing.assert_close(graph_conv, eager_conv, atol=3e-2, rtol=3e-2)
-        torch.testing.assert_close(graph_ssm, eager_ssm, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(graph_conv, eager_conv, atol=0, rtol=0)
+        torch.testing.assert_close(graph_ssm, eager_ssm, atol=0, rtol=0)

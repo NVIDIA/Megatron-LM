@@ -319,6 +319,69 @@ class TestMoeAlignBlockSize:
         assert (active_eids >= 0).all(), "Found negative expert_id in active range"
         assert (active_eids < num_experts).all(), "Found expert_id >= num_experts"
 
+    @pytest.mark.parametrize("num_local", [1, 7, 128])
+    def test_graph_replay_starts_counting_from_zero(self, num_local):
+        """The table initializer re-zeroes the expert counters on every replay."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+        max_tokens, topk, block_size, local_start = 35, 4, 16, 3
+        torch.manual_seed(42)
+        routing_map = torch.randint(0, num_local + 6, (max_tokens, topk), device="cuda")
+        valid_tokens = _vt(max_tokens)
+
+        def align():
+            return _moe_align_block_size_cuda_graphable(
+                routing_map, block_size, num_local, local_start, valid_tokens
+            )
+
+        def routed_pairs(sorted_ids, expert_ids, num_post_padded):
+            # Atomics order pairs within an expert's segment, so compare (pair, expert) sets.
+            ids = sorted_ids[:num_post_padded].view(-1, block_size).long()
+            experts = expert_ids[: num_post_padded // block_size, None].long()
+            return (ids * num_local + experts).flatten().sort().values
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            align()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                graph_outputs = align()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        for n, routes in [
+            (max_tokens, "mixed"),
+            (0, "mixed"),
+            (1, "local"),
+            (17, "nonlocal"),
+            (max_tokens, "local"),
+            (max_tokens, "local"),
+        ]:
+            valid_tokens.fill_(n)
+            if routes == "local":
+                routing_map.random_(local_start, local_start + num_local)
+            elif routes == "nonlocal":
+                routing_map.zero_()
+            else:
+                routing_map.random_(0, num_local + 6)
+            graph.replay()
+            replayed = [t.clone() for t in graph_outputs]
+            eager = align()
+
+            local_ids = routing_map[:n].flatten() - local_start
+            local_ids = local_ids[(local_ids >= 0) & (local_ids < num_local)]
+            counts = torch.bincount(local_ids, minlength=num_local)
+            aligned = (counts + block_size - 1) // block_size * block_size
+            num_post_padded = replayed[2].item()
+            assert num_post_padded == aligned.sum().item()
+            assert torch.equal(replayed[1], eager[1])
+            assert torch.equal(replayed[2], eager[2])
+            assert torch.equal(
+                routed_pairs(*replayed[:2], num_post_padded),
+                routed_pairs(*eager[:2], num_post_padded),
+            )
+            assert torch.equal(replayed[0][num_post_padded:], eager[0][num_post_padded:])
+
 
 # ──────────────────────────────────────────────────────────────────────
 # _moe_sum

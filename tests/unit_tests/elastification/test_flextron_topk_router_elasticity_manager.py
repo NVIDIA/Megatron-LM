@@ -41,6 +41,7 @@ class _StubRouter:
     method that records its inputs so we can assert what was passed."""
 
     def __init__(self, expert_bias):
+        self.config = SimpleNamespace(moe_num_hash_layers=0)
         self.expert_bias = expert_bias
         # Record (logits_clone, expert_bias_clone) at call-time so we can verify
         # what the inner call observed.
@@ -164,6 +165,7 @@ class TestFlextronTopKRouterElasticityManager:
         # only the logits it saw (avoids the StubRouter's bias.detach()).
         class _RouterNoBias:
             def __init__(self):
+                self.config = SimpleNamespace(moe_num_hash_layers=0)
                 self.expert_bias = None
                 self.seen = None
 

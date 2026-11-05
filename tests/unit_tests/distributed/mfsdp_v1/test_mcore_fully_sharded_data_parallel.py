@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import gc
 import random
@@ -19,7 +19,7 @@ from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -1076,10 +1076,11 @@ class TestMegatronFSDPE2E:
         from megatron.training import pretrain
         from megatron.training.argument_utils import (
             gpt_config_from_args,
+            gpt_data_config_from_args,
             pretrain_cfg_container_from_args,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
-        from megatron.training.global_vars import set_global_variables, unset_global_variables
+        from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 
         # Because we are using pretrain() to test, destroy the entire global state
         # before calling pretrain() for the next test case.
@@ -1180,9 +1181,13 @@ class TestMegatronFSDPE2E:
             args.rank = int(os.getenv("RANK", "0"))
             args.world_size = int(os.getenv("WORLD_SIZE", "1"))
             validate_args(args)
-            set_global_variables(args)
+            set_args(args)
             model_cfg = gpt_config_from_args(args)
-            cfg = pretrain_cfg_container_from_args(args, model_cfg)
+            # The data section, as pretrain_gpt.py's main builds it: the GPT provider builds from it.
+            cfg = pretrain_cfg_container_from_args(
+                args, model_cfg, data_cfg=gpt_data_config_from_args(args)
+            )
+            set_run_config(cfg)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider
@@ -1355,15 +1360,15 @@ class TestFsdpNonUnitBucketPreservation:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
         # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
-        # matches the production default in mcore_fsdp_adapter.py.
+        # matches the production default in mcore_adapter_v1.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -1461,8 +1466,8 @@ class TestFsdpMambaConvParamGather:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1563,8 +1568,8 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1610,3 +1615,109 @@ class TestFsdpHybridModelDoubleBuffer:
             optimizer.step()
 
         torch.cuda.synchronize()
+
+
+class TestMegatronFsdpGradStatsGroup:
+    """Which process group Megatron-FSDP reduces gradient statistics over."""
+
+    NUM_OPTIMIZER_INSTANCES = 2
+
+    @classmethod
+    def _grad_stats_group(cls, outer_dp_sharding_strategy):
+        """Build a Megatron-FSDP optimizer and return its gradient statistics group."""
+        Utils.initialize_model_parallel(
+            num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES
+        )
+        try:
+            fsdp_model = FullyShardedDataParallel(
+                config=TransformerConfig(
+                    num_attention_heads=1, num_layers=1, context_parallel_size=1
+                ),
+                ddp_config=DistributedDataParallelConfig(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    bucket_size=10000,
+                    use_megatron_fsdp=True,
+                    num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES,
+                    outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+                ),
+                module=TestModel(input_dim=13, output_dim=17).cuda(),
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
+                [fsdp_model],
+            )
+            return optimizer.get_grad_stats_parallel_group()
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    def test_dp_outer_sharding_reduces_over_every_optimizer_instance(self):
+        """
+        Sharding the optimizer state over DP-Outer widens the gradient statistics group.
+
+        Gradient statistics have to be reduced over the process group holding the remainder
+        of the gradient. Optimizer instances hold replicas of it when DP-Outer is unsharded,
+        so a single instance covers the whole gradient, but DP-Outer sharding leaves each
+        instance with a distinct slice and reducing over one instance then under-reports the
+        norm by the square root of the number of instances.
+        """
+        if Utils.world_size % self.NUM_OPTIMIZER_INSTANCES != 0:
+            pytest.skip(f"Requires a world size divisible by {self.NUM_OPTIMIZER_INSTANCES}.")
+
+        assert self._grad_stats_group("optim").size() == Utils.world_size
+        assert (
+            self._grad_stats_group("no_shard").size()
+            == Utils.world_size // self.NUM_OPTIMIZER_INSTANCES
+        )
+
+
+class TestMegatronFsdpSynchronousGradReduce:
+    """Gradient reduction with overlap_grad_reduce disabled, which reduces in one bulk call."""
+
+    @staticmethod
+    def _reduce_once(sharding_strategy):
+        """Run one backward pass and reduce its gradients without overlapping the reduction."""
+        Utils.initialize_model_parallel()
+        try:
+            fsdp_model = FullyShardedDataParallel(
+                config=TransformerConfig(
+                    num_attention_heads=1, num_layers=1, context_parallel_size=1
+                ),
+                ddp_config=DistributedDataParallelConfig(
+                    data_parallel_sharding_strategy=sharding_strategy,
+                    overlap_grad_reduce=False,
+                    bucket_size=10000,
+                    use_megatron_fsdp=True,
+                ),
+                module=TestModel(input_dim=13, output_dim=17).cuda(),
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+            fsdp_model(torch.randn(4, 13).cuda()).sum().backward()
+            # Without overlap the per-bucket reduction never runs, so this is the only call
+            # that reduces anything.
+            fsdp_model.start_grad_sync()
+            fsdp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim"])
+    def test_replicated_gradients_reduce_in_one_call(self, sharding_strategy):
+        """
+        Both replicating strategies have to reduce gradients when the overlap is disabled.
+
+        'no_shard' all-reduces the whole gradient and 'optim' reduce-scatters it, and each
+        applies the gradient averaging scale on a group whose width the caller supplies, so a
+        wrong width here rescales every gradient in the run.
+        """
+        self._reduce_once(sharding_strategy)

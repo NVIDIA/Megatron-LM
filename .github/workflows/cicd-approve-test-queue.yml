@@ -71,8 +71,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
+          MAX_CONCURRENCY_DEV: ${{ vars.MAX_CONCURRENCY_DEV }}
+          MAX_CONCURRENCY_OTHERS: ${{ vars.MAX_CONCURRENCY_OTHERS }}
           MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 1 }}
+          ALLOW_PR_RUN_ALL_TESTS: ${{ vars.ALLOW_PR_RUN_ALL_TESTS }}
           CONTRIBUTOR_TYPE: ${{ matrix.contributor_type }}
+          TARGET_BRANCH: ${{ matrix.branch }}
           SSO_USERS_FILE: users_sso.json
           PYTHONUNBUFFERED: 1
         shell: python
@@ -88,11 +92,26 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          MAX_PRS_PER_USER_PER_BRANCH = 2
+          CICD_WORKFLOW_NAME = "CICD Megatron-LM"
+          FUNCTIONAL_TEST_LABEL = "Run functional tests"
+          RUN_TESTS_LABEL = "Run tests"
+          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}
+          ALLOW_PR_RUN_ALL_TESTS = (
+              os.environ.get("ALLOW_PR_RUN_ALL_TESTS", "").strip().lower() != "false"
+          )
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
           else:
-              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
+              # Overrides are direct caps; zero pauses approvals, unset keeps the shared limit.
+              override = {
+                  "dev": os.environ.get("MAX_CONCURRENCY_DEV", "").strip(),
+                  "others": os.environ.get("MAX_CONCURRENCY_OTHERS", "").strip(),
+              }.get(os.environ["TARGET_BRANCH"], "")
+              MAX_CONCURRENCY = int(override) if override else int(os.environ["MAX_CONCURRENCY"]) // 2
+              if override and MAX_CONCURRENCY < 0:
+                  raise ValueError("Branch concurrency overrides must be non-negative")
           API_BASE = f"https://api.github.com/repos/NVIDIA/Megatron-LM"
 
           # Load SSO users for internal/external classification
@@ -106,7 +125,19 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
-          def make_request(endpoint, method="GET", data=None, max_retries=5):
+          MAX_RATE_LIMIT_WAIT = 60
+
+          def get_rate_limit_wait(response):
+              """Return seconds until a GitHub rate limit clears, or None if this is not a rate-limit error."""
+              if response.status_code not in (403, 429):
+                  return None
+              if "Retry-After" in response.headers:
+                  return int(response.headers["Retry-After"])
+              if response.headers.get("X-RateLimit-Remaining") == "0":
+                  return max(int(response.headers.get("X-RateLimit-Reset", 0)) - int(time.time()), 0) + 1
+              return None
+
+          def make_request(endpoint, method="GET", data=None, max_retries=5, return_response=False):
               """Make a request to the GitHub API with retry on transient errors."""
               url = f"{API_BASE}/{endpoint}"
               for attempt in range(max_retries):
@@ -115,10 +146,16 @@ jobs:
                           response = requests.get(url, headers=headers, timeout=30)
                       else:
                           response = requests.post(url, headers=headers, json=data, timeout=30)
-                      if response.status_code == 429:
-                          retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
-                          print(f"Rate limited on {endpoint}, retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})")
-                          time.sleep(retry_after)
+                      wait = get_rate_limit_wait(response)
+                      if wait is None and response.status_code == 429:
+                          wait = 2 ** attempt
+                      if wait is not None:
+                          if wait > MAX_RATE_LIMIT_WAIT:
+                              # The next scheduled run picks up where this one stopped, so don't fail the workflow.
+                              print(f"::warning::GitHub API rate limit hit on {endpoint}; resets in {wait}s, skipping this run")
+                              exit(0)
+                          print(f"Rate limited on {endpoint}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                          time.sleep(wait)
                           continue
                       if response.status_code >= 500:
                           delay = 2 ** attempt
@@ -126,7 +163,7 @@ jobs:
                           time.sleep(delay)
                           continue
                       response.raise_for_status()
-                      return response.json()
+                      return response if return_response else response.json()
                   except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                       delay = 2 ** attempt
                       print(f"Transient error on {endpoint}: {e}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
@@ -139,6 +176,24 @@ jobs:
               print(f"Max retries ({max_retries}) exceeded for {endpoint}")
               return None
 
+          def get_workflow_runs(status):
+              """Fetch every page before filtering runs or making approval decisions."""
+              runs = {}
+              page = 1
+              while True:
+                  response = make_request(
+                      f"actions/runs?status={status}&per_page=100&page={page}",
+                      return_response=True,
+                  )
+                  if response is None:
+                      return None
+                  # Runs can move between pages while the queue is changing.
+                  for run in response.json()["workflow_runs"]:
+                      runs[run["id"]] = run
+                  if "next" not in response.links:
+                      return {"workflow_runs": list(runs.values())}
+                  page += 1
+
           def is_internal_contributor(pr_info):
               """Return True for internal service accounts or NVIDIA organization members."""
               login = pr_info.get("user", {}).get("login", "")
@@ -146,6 +201,8 @@ jobs:
               return login in INTERNAL_SERVICE_ACCOUNTS or any(
                   role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
               )
+
+          pr_cache = {}
 
           def get_pr_base_branch(workflow_run):
               """
@@ -161,14 +218,38 @@ jobs:
 
               pr_number = int(match.group(1))
 
-              # Fetch PR info from GitHub API
-              pr_info = make_request(f"pulls/{pr_number}")
-              if not pr_info:
-                  print(f"Failed to fetch PR #{pr_number}")
-                  return None, None
+              # Fetch PR info from GitHub API, once per PR
+              pr_info = pr_cache.get(pr_number)
+              if pr_info is None:
+                  pr_info = make_request(f"pulls/{pr_number}")
+                  if not pr_info:
+                      print(f"Failed to fetch PR #{pr_number}")
+                      return None, None
+                  pr_cache[pr_number] = pr_info
 
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
+
+          def get_pr_queue_key(workflow_run):
+              """Identify the PR and its author/base-branch concurrency bucket."""
+              base_branch, pr_info = get_pr_base_branch(workflow_run)
+              if not base_branch or not pr_info or not pr_info.get("user", {}).get("login"):
+                  raise RuntimeError(f"Failed to inspect PR ownership for run {workflow_run['id']}")
+              return (pr_info["user"]["login"].lower(), base_branch), pr_info["number"]
+
+          def get_pr_labels(workflow_run):
+              """Return the labels for the PR associated with a workflow run."""
+              head_branch = workflow_run.get("head_branch", "")
+              if not re.match(r"pull-request/(\d+)", head_branch):
+                  return set()
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  raise RuntimeError(f"Failed to inspect labels for {head_branch}")
+              return {label.get("name") for label in pr_info.get("labels", [])}
+
+          def has_functional_test_label(workflow_run):
+              """Return whether a PR workflow has opted into functional tests."""
+              return FUNCTIONAL_TEST_LABEL in get_pr_labels(workflow_run)
 
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
@@ -203,30 +284,42 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_resp = make_request("actions/runs?status=queued")
+          queued_resp = get_workflow_runs("queued")
           if queued_resp is None:
               print("Failed to fetch queued workflow runs after retries, exiting")
               exit(1)
           queued_workflow_runs = queued_resp.get("workflow_runs", [])
-          in_progress_resp = make_request("actions/runs?status=in_progress")
+          in_progress_resp = get_workflow_runs("in_progress")
           if in_progress_resp is None:
               print("Failed to fetch in-progress workflow runs after retries, exiting")
               exit(1)
           in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
 
+          # The functional-test slot is global across all branch/contributor queues.
+          functional_test_workflow_running = any(
+              run.get("name") == CICD_WORKFLOW_NAME and has_functional_test_label(run)
+              for run in queued_workflow_runs + in_progress_workflow_runs
+          )
+
           # For external contributors, enforce a single global concurrency limit across ALL branches.
           # For internal contributors, enforce per-branch limits as before.
           if CONTRIBUTOR_TYPE == "external":
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+
+          # Count distinct active PRs per author and actual base branch, not matrix bucket.
+          active_prs_by_user_branch = {}
+          for workflow in queued_workflow_runs + in_progress_workflow_runs:
+              user_branch, pr_number = get_pr_queue_key(workflow)
+              active_prs_by_user_branch.setdefault(user_branch, set()).add(pr_number)
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
@@ -244,7 +337,7 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          waiting_resp = make_request("actions/runs?status=waiting")
+          waiting_resp = get_workflow_runs("waiting")
           if waiting_resp is None:
               print("Failed to fetch waiting workflow runs after retries, exiting")
               exit(1)
@@ -252,10 +345,10 @@ jobs:
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
@@ -270,6 +363,32 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
+              workflow_labels = get_pr_labels(workflow)
+              if not ALLOW_PR_RUN_ALL_TESTS and workflow_labels & RUN_ALL_TESTS_LABELS:
+                  blocked_labels = sorted(workflow_labels & RUN_ALL_TESTS_LABELS)
+                  print(
+                      f"Skipping full-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      f"ALLOW_PR_RUN_ALL_TESTS is false and PR has label(s): {blocked_labels}"
+                  )
+                  continue
+
+              runs_functional_tests = FUNCTIONAL_TEST_LABEL in workflow_labels
+              if runs_functional_tests and functional_test_workflow_running:
+                  print(
+                      f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      "another functional-test workflow is active"
+                  )
+                  continue
+
+              user_branch, pr_number = get_pr_queue_key(workflow)
+              active_prs = active_prs_by_user_branch.setdefault(user_branch, set())
+              if pr_number not in active_prs and len(active_prs) >= MAX_PRS_PER_USER_PER_BRANCH:
+                  print(
+                      f"Skipping workflow {workflow_name} with Run Id: {workflow_id}; "
+                      f"{user_branch[0]} already has {len(active_prs)} active PRs targeting {user_branch[1]}"
+                  )
+                  continue
+
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
@@ -289,7 +408,10 @@ jobs:
               result = make_request(deployment_url, method="POST", data=status_data)
 
               if result:
+                  active_prs.add(pr_number)
                   total_workflows += 1
+                  if runs_functional_tests:
+                      functional_test_workflow_running = True
               else:
                   print(f"Failed to approve deployment {deployment['id']}")
                   exit(1)

@@ -42,11 +42,61 @@
       "num_input_tokens_avg": 61.88671875,
       "num_output_tokens": 128,
       "num_iters": 10,
-      "throughput_tok_per_sec": 11512.760737650928,
-      "avg_latency_ms": 1409.1983075107692,
-      "p50_latency_ms": 1402.4255399999674,
-      "p99_latency_ms": 1589.2388540014508,
-      "tpot_ms_per_tok": 11.118097814835437
+      "throughput_tok_per_sec": 14234.332896719437,
+      "avg_latency_ms": 1136.2894813493767,
+      "p50_latency_ms": 1120.3754488378763,
+      "p99_latency_ms": 1236.761791165918,
+      "tpot_ms_per_tok": 8.992342734200065
+    }
+  },
+  "gb300": {
+    "batch_1": {
+      "batch_size": 1,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 63.6,
+      "num_output_tokens": 128,
+      "num_iters": 10,
+      "throughput_tok_per_sec": 226.21509843414037,
+      "avg_latency_ms": 565.7947775907815,
+      "p50_latency_ms": 563.54252807796,
+      "p99_latency_ms": 579.325727885589,
+      "tpot_ms_per_tok": 4.420571424816444
+    },
+    "batch_8": {
+      "batch_size": 8,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 63.3625,
+      "num_output_tokens": 128,
+      "num_iters": 10,
+      "throughput_tok_per_sec": 1493.9540614067243,
+      "avg_latency_ms": 683.2506472157547,
+      "p50_latency_ms": 684.611199889332,
+      "p99_latency_ms": 699.8383039608598,
+      "tpot_ms_per_tok": 5.354916999567649
+    },
+    "batch_32": {
+      "batch_size": 32,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 61.759375,
+      "num_output_tokens": 128,
+      "num_iters": 10,
+      "throughput_tok_per_sec": 4891.276925684832,
+      "avg_latency_ms": 831.598358694464,
+      "p50_latency_ms": 827.5482880417258,
+      "p99_latency_ms": 875.995711889118,
+      "tpot_ms_per_tok": 6.542258900117304
+    },
+    "batch_128": {
+      "batch_size": 128,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 61.88671875,
+      "num_output_tokens": 128,
+      "num_iters": 10,
+      "throughput_tok_per_sec": 14710.315770955485,
+      "avg_latency_ms": 1100.9475579510763,
+      "p50_latency_ms": 1095.5375679768622,
+      "p99_latency_ms": 1165.731456130743,
+      "tpot_ms_per_tok": 8.701376774843084
     }
   }
 }

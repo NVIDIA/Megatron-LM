@@ -54,10 +54,11 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      When None, `data_parallel_sharding_strategy` applies to all parameters."""
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion."""
+    """If true, perform gradient reduce and division fusion. Requires a single gradient
+    communication dtype per coalesced bucket group when enabled."""
 
     suggested_communication_unit_size: int = None
     """Specifies the number of elements to communicate at once during
@@ -198,6 +199,14 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    megatron_fsdp_padded_shards: bool = True
+    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
+    gets an equal shard. If false, pack the group without padding and split it into
+    generally unequal per-rank shards at row boundaries (32-row block boundaries for
+    MXFP8), which saves the padding memory and communication but is incompatible with
+    nccl_ub (symmetric memory).
+    """
+
     hfsdp_param_gather_overlap: bool = False
     """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
     communication domains. DP-Inner retains its size-based prefetch policy, while
@@ -209,12 +218,14 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         for field_name in [
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
         ]:
             strategy = getattr(self, field_name)
-            if strategy is not None and strategy not in VALID_SHARDING_STRATEGIES:
+            if strategy not in VALID_SHARDING_STRATEGIES:
                 raise ValueError(
                     f"[Megatron-FSDP] Invalid {field_name}: {strategy}. "
                     f"Valid values are {VALID_SHARDING_STRATEGIES}."

@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import json
 import logging
 from typing import List, Optional
 
 try:
     from transformers import AutoTokenizer
+    from transformers.utils import cached_file
 
     HAVE_TRANSFORMERS = True
 except ModuleNotFoundError:
@@ -14,14 +16,42 @@ from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
-try:
-    import gigatoken as gt
-
-    HAVE_GIGATOKEN = True
-except ModuleNotFoundError:
-    HAVE_GIGATOKEN = False
-
 logger = logging.getLogger(__name__)
+
+
+def _load_generation_config(tokenizer_path: str) -> Optional[dict]:
+    """Load the model's generation_config.json, if present.
+
+    HF tokenizers do not load generation_config.json themselves -- it is a
+    model-level file -- but it holds `eos_token_id`, which may be a LIST of stop
+    tokens (e.g. [2, 11]). Reading it here lets termination honor every declared
+    eos token.
+
+    `tokenizer_path` can be a local directory OR a Hub model id (the
+    AutoTokenizer.from_pretrained call in __init__ already handles both). A
+    plain `os.path.join` + `os.path.isfile` only ever resolves the
+    local-directory case, silently finding nothing for a Hub id with no error
+    raised -- so this uses HF's own `cached_file` helper, which resolves and
+    caches from either source the same way `from_pretrained` does.
+
+    Returns None when the file is missing or unreadable (graceful, logged at
+    WARNING -- not every model ships a generation_config.json).
+    """
+    try:
+        gc_path = cached_file(
+            tokenizer_path, "generation_config.json", _raise_exceptions_for_missing_entries=False
+        )
+        if gc_path is None:
+            return None
+        with open(gc_path) as gc_file:
+            return json.load(gc_file)
+    except Exception as gc_e:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Could not read generation_config.json from {tokenizer_path}: {gc_e}",
+        )
+        return None
 
 
 class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
@@ -101,6 +131,8 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
+
+        self.generation_config = _load_generation_config(tokenizer_path)
 
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
@@ -195,19 +227,12 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
 
+        self._hf_tokenizer = self.tokenizer
         if self.use_gigatoken:
             # restore tokenizer with gigatoken
-            if HAVE_GIGATOKEN:
-                self._hf_tokenizer = self.tokenizer
-                logger.info(f"Restoring {tokenizer_path} tokenizer with gigatoken.")
-                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
-            else:
-                raise ModuleNotFoundError(
-                    "gigatoken library is not installed. "
-                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-                )
-        else:
-            self._hf_tokenizer = self.tokenizer
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -317,9 +342,19 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
         """Encodes whole jsonl file."""
         if self.use_gigatoken:
-            return self.tokenizer.tokenizer.encode_files(
-                gt.JsonlFileSource(paths, field=field), parallel=True
-            )
+            from megatron.core.tokenizers.utils import has_gigatoken_support
+
+            if has_gigatoken_support():
+                import gigatoken as gt
+
+                return self.tokenizer.tokenizer.encode_files(
+                    gt.JsonlFileSource(paths, field=field), parallel=True
+                )
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
         else:
             raise NotImplementedError(
                 "This method is supported only for gigatoken tokenizers. "
