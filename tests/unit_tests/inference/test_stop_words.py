@@ -714,10 +714,11 @@ def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept
         if active:
             assert not future.done()
             if resume:
-                # Eviction and recompute-suspend both checkpoint before re-admission.
+                # Eviction and recompute-suspend both checkpoint before re-admission; the new
+                # segment starts empty but keeps the detected stop.
                 engine.requests[0].record.checkpoint()
                 assert engine.get_request(0).generated_tokens == []
-                assert engine.get_request(0).finish_reason is None
+                assert engine.get_request(0).finish_reason == "stop"
                 engine.context.chunked_prefill_request_id = 0
                 for _ in range(2):
                     assert engine._get_and_clear_stop_word_finished_ids(active) == set()
