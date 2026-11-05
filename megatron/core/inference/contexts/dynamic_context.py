@@ -854,6 +854,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
+        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
+        # every non-final chunk on an SSM chunk boundary, so a step whose decode
+        # tokens leave less than `max_tokens` of room would round its prefill chunk
+        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
+        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
+        # step admits at least as many prefill tokens as without batch invariance.
+        self.max_prefill_tokens = self.max_tokens
+        if (
+            self.batch_invariant_mode
+            and self.is_hybrid_model
+            and inference_config.enable_chunked_prefill
+        ):
+            self.max_tokens += self.ssm_chunk_alignment
+
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
         # budget accounting agree. Bounded both by the token budget (one block
@@ -936,10 +950,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # to never fall below that decode bound nor exceed `max_tokens`; setting
         # `cuda_graph_all_prefills` widens the range to the full `max_tokens`.
         decode_bound = self.max_requests * (self.num_speculative_tokens + 1)
+        # A ceiling that covers the whole prefill budget also covers the decode headroom
+        # added above (a no-op when max_prefill_tokens == max_tokens).
+        requested_cuda_graph_max_tokens = inference_config.cuda_graph_max_tokens
+        if requested_cuda_graph_max_tokens >= self.max_prefill_tokens:
+            requested_cuda_graph_max_tokens = self.max_tokens
         cuda_graph_max_tokens = (
             self.max_tokens
             if inference_config.cuda_graph_all_prefills
-            else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
+            else min(max(requested_cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
 
         # CUDA graph config list.
@@ -955,6 +974,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+                # Prefill-only steps fill at most the prefill budget: capture it exactly
+                # rather than padding those steps to the larger mixed-step capacity.
+                extra_prefill_token_counts=(
+                    (self.max_prefill_tokens,) if self.max_prefill_tokens < self.max_tokens else ()
+                ),
             )
         )
 
@@ -1012,7 +1036,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
             # A chunk plus its final token must fit in one step; otherwise a prompt
             # of that length can never advance without an invalid one-token tail.
-            assert self.max_tokens > self.ssm_chunk_alignment, (
+            assert self.max_prefill_tokens > self.ssm_chunk_alignment, (
                 "batch-invariant SSM chunked prefill requires max_tokens > "
                 f"ssm_chunk_alignment ({self.ssm_chunk_alignment})."
             )
@@ -1063,6 +1087,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             "DynamicInferenceContext: configuration summary",
             f"  max_requests:            {self.max_requests}",
             f"  max_tokens:              {self.max_tokens}",
+            f"  max_prefill_tokens:      {self.max_prefill_tokens}",
             f"  max_sequence_length:     {self.max_sequence_length}",
             f"  model_forward_seq_length: {self.max_sequence_length_for_model}",
             f"  block_size_tokens:       {self.block_size_tokens}",
