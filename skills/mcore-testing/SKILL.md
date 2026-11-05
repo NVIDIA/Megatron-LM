@@ -149,6 +149,34 @@ uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
   tests/unit_tests --experimental
 ```
 
+### Strict process-group fallbacks
+
+A Megatron Core component that is not given its process groups falls back to
+the global ones in `parallel_state` and emits a `ProcessGroupFallbackWarning`.
+To make every fallback fail the test instead, pass the class to pytest's `-W`;
+pytest accepts a dotted class path:
+
+```bash
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  -W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning \
+  tests/unit_tests/models/test_gpt_model.py
+```
+
+- The same value works in a `@pytest.mark.filterwarnings(...)` marker.
+- `python -W` and `PYTHONWARNINGS` cannot name this class. Python resolves
+  them at startup, before torch can be imported, and ignores the option.
+- Each fallback warns once per process. One that already warned in an earlier
+  test, for example under `pytest.warns`, stays silent. A test that must
+  catch it calls `enable_strict_process_group_fallbacks()` from
+  `megatron.core.process_groups_config` inside `warnings.catch_warnings()`.
+- Training runs opt in with `--strict-process-group-fallbacks`.
+- The deprecated `parallel_state` accessors emit a separate
+  `ParallelStateDeprecationWarning`. `pyproject.toml` ignores it when a test
+  calls them, because tests use the global grid on purpose, and turns it into
+  an error when the caller is one of this repository's modules outside the
+  tests, such as `megatron.training.*`. Strict mode does not affect it. See
+  `docs/api-backwards-compatibility-check.md`.
+
 ### CI parity
 
 Use `tests/unit_tests/run_ci_test.sh` to reproduce a CI bucket failure exactly.

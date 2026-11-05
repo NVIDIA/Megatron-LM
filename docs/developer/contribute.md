@@ -52,6 +52,48 @@ File any bugs you find, keeping the following in mind:
 - Include commented-out code.
 - Attempt large architectural changes without first opening an issue to discuss.
 
+### Process groups in `megatron/core`
+
+`megatron.core.parallel_state` holds the process groups for a single, global parallel grid. Its
+functions that read those groups are deprecated; Megatron-Core is moving to explicit passing via
+`ProcessGroupCollection`.
+
+- **New features must not call** `parallel_state.get_*_group()`, `get_*_rank()`, or
+  `get_*_world_size()` in `megatron/core`. Accept a `ProcessGroupCollection` or an explicit
+  `torch.distributed.ProcessGroup` from the caller and pass it through.
+- **Do not introduce global-state fallbacks for new features.** A `None` default that reads
+  `parallel_state` can select a different model's grid or fail if the globals are uninitialized.
+- **`ProcessGroupCollection.use_mpu_process_groups()` is not a migration target.** It reads the
+  same global state. In `megatron/core`, a new call is a global read that CI checks as below.
+  Bootstrap code outside Megatron Core calls it in a `global_process_group_fallback()` block, or
+  in a `warnings.catch_warnings()` block whose body calls
+  `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the matching
+  `warnings.filterwarnings()`) after a statement that is only a call of
+  `warnings.warn(..., ParallelStateDeprecationWarning)` or `warn_global_process_group_fallback()`,
+  before the `with` in the block that holds it or in a block that contains that block, of the same
+  function (of the module for module-level code); see
+  [The CI check](parallel-state-deprecation.md#the-ci-check) for the details. A compatibility
+  fallback goes through `resolve_process_groups()`, which warns the caller that omitted its groups.
+- **Bug fixes may leave existing calls alone.** Process-group plumbing changes belong in their own
+  PR.
+- **CI checks new reads.** The "Process group usage check" job fails on a use of the global grid
+  that its checker counts in `megatron/core` (a deprecated `parallel_state` function, setters
+  included, `use_mpu_process_groups()` or `get_registered_process_groups()`), outside
+  `parallel_state.py` and `process_groups_config.py`, unless it is a call of a guarded helper
+  such as `resolve_process_groups()`, it sits in a `with global_process_group_fallback(...)`
+  block (not in a function or lambda defined there), or a statement that is only a call of
+  `warn_global_process_group_fallback()` comes before it, in its block or in a block that
+  contains that block, of the same function (of the module for module-level code). In that code, a
+  use of a private `parallel_state` attribute, other than the memory-buffer alias
+  `_set_global_memory_buffer()`, fails it even inside a fallback block or after a fallback warning.
+  Take the memory buffer from `megatron.core.utils`: the unit tests reject its aliases from
+  `parallel_state` even in a fallback. Its allowlist ratchet, which lists every global read a PR
+  adds in `megatron/core`, is still report-only, so reviewers act on that list. See
+  [The CI check](parallel-state-deprecation.md#the-ci-check).
+
+Full guidance, including the deprecated functions, the migration steps and reviewer notes:
+[parallel-state-deprecation.md](parallel-state-deprecation.md).
+
 ## Signing Your Work
 
 - We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

@@ -14,6 +14,7 @@ from megatron.training import get_args, get_timers, get_train_state, print_rank_
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import get_run_config
 from megatron.training.training import (
+    _build_pg_collection_from_parallel_state,
     evaluate_and_print_results,
     setup_model_and_optimizer,
     train_step,
@@ -76,9 +77,13 @@ def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
         task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
-    # Sampler.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
+    # Sampler, over the data-parallel group of the grid that initialize_megatron() registered.
+    # Collections that predate the GTP weight-remat fields carry only the replicate group.
+    pg_collection = mpu.get_registered_process_groups()
+    assert pg_collection is not None, 'the model-parallel grid is not initialized'
+    data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+    world_size = data_parallel_group.size()
+    rank = data_parallel_group.rank()
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank)
 
@@ -270,9 +275,18 @@ def finetune(train_valid_datasets_provider, model_provider,
         end_of_epoch_callback = end_of_epoch_callback_provider()
     timers('callback function').stop()
 
-    # Build model, optimizer and learning rate scheduler.
+    # Build model, optimizer and learning rate scheduler on the grid that initialize_megatron()
+    # registered, in the collection that pretrain() builds from it, which also holds the
+    # all-gather groups of --create-all-gather-group. finetune() takes no collection, so a grid
+    # set up without registering one warns, as before, that setup_model_and_optimizer() falls
+    # back to the global grid.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
+    pg_collection = _build_pg_collection_from_parallel_state(
+        args, owner='setup_model_and_optimizer'
+    )
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        model_type, model_provider, pg_collection=pg_collection
+    )
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for

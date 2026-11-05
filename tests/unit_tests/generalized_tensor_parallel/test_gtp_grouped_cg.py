@@ -328,7 +328,12 @@ def test_grouped_local_graph_replay(expert_group):
         update()
     _copy_weights(params, initial)
     for block in model:
-        block.manager = CudaGraphManager(config, base_module=block, function_name="compute")
+        block.manager = CudaGraphManager(
+            config,
+            base_module=block,
+            function_name="compute",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
+        )
     step(inputs[0])  # Record the cross-block call order without updating weights.
     _allow_retained_grad_nodes()
     create_cudagraphs()

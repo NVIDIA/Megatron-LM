@@ -567,18 +567,8 @@ def _unpacked_samples(real_lengths, alignment=8):
     return samples
 
 
-def _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size, tp_rank=0):
-    last_vp_stage = None if vp_size is None else vp_size - 1
-
-    def is_first_stage(ignore_virtual=True, vp_stage=None):
-        return pp_rank == 0 and (ignore_virtual or vp_stage == 0)
-
-    def is_last_stage(ignore_virtual=True, vp_stage=None):
-        return pp_rank == pp_size - 1 and (ignore_virtual or vp_stage == last_vp_stage)
-
-    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank)
-    monkeypatch.setattr(parallel_state, "is_pipeline_first_stage", is_first_stage)
-    monkeypatch.setattr(parallel_state, "is_pipeline_last_stage", is_last_stage)
+def _placement_groups(pp_rank, pp_size, tp_rank=0):
+    return ProcessGroupCollection(tp=_group(2, tp_rank), pp=_group(pp_size, pp_rank))
 
 
 @pytest.mark.parametrize("script_name", ["pretrain_gpt", "pretrain_hybrid"])
@@ -620,7 +610,9 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
         arguments,
         "core_transformer_config_from_args",
         lambda args: SimpleNamespace(
-            pipeline_model_parallel_layout=pipeline_layout, mtp_num_layers=mtp_num_layers
+            virtual_pipeline_model_parallel_size=vp_size,
+            pipeline_model_parallel_layout=pipeline_layout,
+            mtp_num_layers=mtp_num_layers,
         ),
     )
     config = SimpleNamespace(
@@ -632,14 +624,21 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
 
     scheduled_counts = []
     for pp_rank in range(pp_size):
-        _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size, tp_rank=1)
+        # Only the first tensor-parallel rank builds; the stage comes from the pipeline group.
         assert not any(
-            script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+            script.is_dataset_built_on_rank(
+                vp_stage=vp_stage,
+                is_packed_sequence=True,
+                pg_collection=_placement_groups(pp_rank, pp_size, tp_rank=1),
+            )
             for vp_stage in vp_stages
         )
-        _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size)
         built = [
-            script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+            script.is_dataset_built_on_rank(
+                vp_stage=vp_stage,
+                is_packed_sequence=True,
+                pg_collection=_placement_groups(pp_rank, pp_size),
+            )
             for vp_stage in vp_stages
         ]
         # The scheduler reads the first iterator of a stage, so every stage needs one.

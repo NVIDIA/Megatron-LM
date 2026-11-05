@@ -17,3 +17,32 @@ mappings:
         - tests/unit_tests/distributed/mfsdp_v2/**/*.py
       dgx_gb200:
         - tests/unit_tests/distributed/mfsdp_v2/**/*.py
+  # The stdlib checks of the parallel_state deprecation read the source as text, so Testmon
+  # never maps a source change to them. Run them when a file they scan changes: the folders
+  # below and the top-level scripts. A source entry must be an existing path (see
+  # tests/test_utils/test_unit_testmon_mandatory.py), and a glob such as `*.py` would match files
+  # in every folder, so each top-level script is listed: add a new one here. The three files
+  # carry no launch_on_gb200 marker, so the GB200 buckets do not run them.
+  - source_dirs:
+      - megatron
+      - examples
+      - tools
+      - tasks
+      - scripts
+      - docs
+      - tests/functional_tests
+      - gpt_builders.py
+      - hybrid_builders.py
+      - mamba_builders.py
+      - model_provider.py
+      - pretrain_gpt.py
+      - pretrain_hybrid.py
+      - pretrain_mamba.py
+      - pretrain_vlm.py
+      - setup.py
+      - train_rl.py
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/test_check_process_group_usage.py
+        - tests/unit_tests/test_parallel_state_accessor_uses.py
+        - tests/unit_tests/test_removal_versions.py

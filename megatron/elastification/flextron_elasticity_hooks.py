@@ -13,9 +13,9 @@ from typing import List, Optional
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
 from megatron.core.transformer.moe.moe_utils import get_capacity, group_limited_topk
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 
 class _AttributeRestoreHandle:
@@ -76,8 +76,6 @@ class FlextronMambaElasticityManager:
         in_proj_mask_list = []
         conv1d_mask_list = []
 
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-
         in_proj_z_shard = [i for i in range(self.mamba_mixer.d_inner_local_tp)]
         in_proj_x_shard = [
             i
@@ -132,7 +130,8 @@ class FlextronMambaElasticityManager:
 
         out_proj_x_shard = [i for i in range(self.mamba_mixer.d_inner_local_tp)]
 
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        # The mixer's heads are sharded over its own tensor-parallel group.
+        tp_size = get_pg_size(self.mamba_mixer.tp_group)
         for mamba_int in self.config.mamba_int_list:
             assert 0 <= mamba_int <= self.mamba_mixer.nheads, (
                 f'mamba_int_list entries must be in [0, nheads={self.mamba_mixer.nheads}], '
@@ -1241,9 +1240,10 @@ class FlextronGroupedMLPElasticityManager:
                 else:
                     mask = self.mlp_intermediate_masks[self.mlp_intermediate_masks_lookup[mlp_per]]
 
-                world_size = parallel_state.get_expert_tensor_parallel_world_size()
+                # The FC1 output is sharded over the expert tensor-parallel group of the MLP.
+                world_size = get_pg_size(mlp_module.tp_group)
                 mask_list = split_tensor_along_last_dim(mask, world_size)
-                rank = parallel_state.get_expert_tensor_parallel_rank()
+                rank = get_pg_rank(mlp_module.tp_group)
 
                 mask = mask_list[rank].contiguous()
 
