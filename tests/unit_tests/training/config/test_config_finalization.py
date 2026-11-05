@@ -15,6 +15,7 @@ from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -43,7 +44,9 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         rl_run = RunConfigRecord(
             pretrain=cfg,
             inference=InferenceConfigContainer(model=None, inference=InferenceSetupConfig()),
-            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+            posttrain=PosttrainConfigContainer(
+                rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+            ),
         )
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
@@ -82,7 +85,9 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     rl_run = RunConfigRecord(
         pretrain=run_config,
         inference=InferenceConfigContainer(model=None, inference=InferenceSetupConfig()),
-        rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        ),
     )
     run_config.ddp.fp8_param_gather = True
     run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True

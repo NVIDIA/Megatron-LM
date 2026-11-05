@@ -22,6 +22,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import (
     InferenceConfigContainer,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
     TokenizerConfig,
@@ -76,15 +77,15 @@ def test_shared_weights_when_parallelism_matches():
 @pytest.mark.parametrize(
     "extra, expected",
     [
-        (["--rl-inference-tensor-model-parallel-size", "1"], {"tensor_model_parallel_size": 1}),
+        (["--rl-inference-tensor-model-parallel-size", "2"], {"tensor_model_parallel_size": 2}),
         (
             [
                 "--rl-inference-pipeline-model-parallel-size",
-                "1",
+                "2",
                 "--rl-inference-expert-model-parallel-size",
-                "1",
+                "2",
             ],
-            {"pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1},
+            {"pipeline_model_parallel_size": 2, "expert_model_parallel_size": 2},
         ),
     ],
 )
@@ -122,7 +123,9 @@ def test_weight_placement_is_the_rl_sections():
         1,
         True,
     )
-    run = RunConfigRecord(pretrain=pretrain, inference=deployment, rl=rl)
+    run = RunConfigRecord(
+        pretrain=pretrain, inference=deployment, posttrain=PosttrainConfigContainer(rl=rl)
+    )
     with pytest.raises(ValueError, match="requires a separate inference model"):
         validate_rl_run(run)
     args, pretrain, deployment = _containers(
@@ -130,11 +133,13 @@ def test_weight_placement_is_the_rl_sections():
         "1",
         "--rl-offload-inference-model-weights",
         "--rl-inference-tensor-model-parallel-size",
-        "1",
+        "2",
     )
     validate_rl_run(
         RunConfigRecord(
-            pretrain=pretrain, inference=deployment, rl=_default_config_from_args(RLConfig, args)
+            pretrain=pretrain,
+            inference=deployment,
+            posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
         )
     )
 

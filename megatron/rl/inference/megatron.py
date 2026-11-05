@@ -100,7 +100,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         # Import here to avoid circular imports
         from megatron.inference.utils import get_dynamic_inference_engine
 
-        cfg = get_rl_run_config()
+        rl_cfg = get_rl_run_config().posttrain.rl
         tokenizer = get_tokenizer()
 
         if tokenizer.bos is None:
@@ -121,12 +121,12 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 "Set --rl-generation-lag explicitly when using partial rollouts; "
                 "capacity aggregation is tracked in Megatron-LM #8200 / #7138."
             )
-        generation_lag = cfg.rl.rl_generation_lag
-        if cfg.rl.rl_partial_rollouts:
+        generation_lag = rl_cfg.rl_generation_lag
+        if rl_cfg.rl_partial_rollouts:
             generation_lag = resolve_generation_lag(
                 generation_lag,
-                prompts_per_step=cfg.rl.grpo_prompts_per_step,
-                group_size=cfg.rl.grpo_group_size,
+                prompts_per_step=rl_cfg.grpo_prompts_per_step,
+                group_size=rl_cfg.grpo_group_size,
                 dp_size=get_pg_size(inference_engine.pg_collection.dp),
                 max_requests=inference_engine.context.max_requests,
             )
@@ -148,7 +148,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=cfg.rl.rl_inference_parsers,
+                parsers=rl_cfg.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
                 multimodal_prompt_config=(
                     inference_engine.controller.inference_wrapped_model.multimodal_prompt_config
@@ -158,7 +158,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             client = None
 
         launched_server = cls(
-            add_bos=(not cfg.rl.rl_skip_bos_token and tokenizer.bos is not None), **kwargs
+            add_bos=(not rl_cfg.rl_skip_bos_token and tokenizer.bos is not None), **kwargs
         )
         launched_server._client = client
         launched_server._inference_engine = inference_engine

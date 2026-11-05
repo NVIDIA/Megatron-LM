@@ -49,7 +49,7 @@ def build_rollout_inference_model(
             args,
             model_type,
             config,
-            rl_config=get_rl_run_config().rl,
+            rl_config=get_rl_run_config().posttrain.rl,
             model_config=inference_container.model,
             model_alloc_ctx=inference_model_alloc_context(),
         )
@@ -199,7 +199,7 @@ class RLSetupCallback(Callback):
                 self.model,
                 context.checkpointing_context,
                 args,
-                rollout_only=get_rl_run_config().rl.rl_rollout_only,
+                rollout_only=get_rl_run_config().posttrain.rl.rl_rollout_only,
             )
             # RL runs on the plain MPU groups: the loop's data-parallel size for them.
             reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())
