@@ -61,6 +61,7 @@ from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridE
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.determinism.utils import RacingStreams
 from tests.unit_tests.test_utilities import Utils
 
@@ -548,7 +549,7 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                 tokens = torch.randint(0, 128, (2, 16), device='cuda', generator=rng)
                 labels = torch.randint(0, 128, (2, 16), device='cuda', generator=rng)
                 positions = torch.arange(16, device='cuda').expand(2, -1)
-                with get_fp8_context(config):
+                with get_fp8_context(config, pg_collection=global_amax_groups()):
                     loss = model(
                         tokens,
                         positions,
@@ -934,7 +935,7 @@ def test_mxfp8_expert_recompute_parity():
         probs = torch.rand(512, device="cuda", generator=rng, requires_grad=True)
         upstream = torch.randn(x.shape, device="cuda", dtype=x.dtype, generator=rng)
         counts = torch.tensor([256, 256], device="cuda", dtype=torch.int64)
-        with get_fp8_context(config):
+        with get_fp8_context(config, pg_collection=global_amax_groups()):
             y, _ = experts(x, counts, probs)
         y.backward(upstream)
         return {
@@ -1115,12 +1116,12 @@ def test_virtual_expert_recompute_offload_scopes(
                 if enabled and recompute == "full":
 
                     def replay(input_tensor):
-                        with get_fp8_context(config):
+                        with get_fp8_context(config, pg_collection=global_amax_groups()):
                             return layer(input_tensor)[0]
 
                     y = checkpoint(replay, False, x)
                 else:
-                    with get_fp8_context(config):
+                    with get_fp8_context(config, pg_collection=global_amax_groups()):
                         y, bias = layer(x)
                     assert bias is None
                 inputs.append(x)

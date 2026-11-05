@@ -9,9 +9,11 @@ from collections import defaultdict
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import gated_delta_product as gdp_module
 from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
@@ -66,12 +68,10 @@ def test_constructor_drops_unused_mamba_compatibility_arguments():
     assert parameters.keys().isdisjoint(removed_parameters)
 
 
-def test_gdp_rmsnorm_checkpoint_wrap_uses_explicit_process_groups(monkeypatch):
-    """Custom TP/DP+CP groups must not fall back to the global MPU groups."""
+def _gdp_rmsnorm_sharded_weight(monkeypatch, own_dp_cp_group, metadata):
+    """``norm.weight`` from the GDP norm's checkpoint wrap, with the global groups forbidden."""
     gdp_with_rmsnorm = _load_gdp_module_with_fake_rmsnorm(monkeypatch)
-    tp_group = _FakeProcessGroup(rank=2, size=4)
-    dp_cp_group = _FakeProcessGroup(rank=5, size=8)
-    norm = SimpleNamespace(tp_group=tp_group)
+    norm = SimpleNamespace(tp_group=_FakeProcessGroup(rank=2, size=4), dp_cp_group=own_dp_cp_group)
     norm.state_dict = lambda *args, **kwargs: {"weight": torch.arange(2)}
 
     with (
@@ -85,19 +85,41 @@ def test_gdp_rmsnorm_checkpoint_wrap_uses_explicit_process_groups(monkeypatch):
             side_effect=AssertionError("global DP+CP group fallback"),
         ),
     ):
-        sharded_weight = gdp_with_rmsnorm.ExtendedRMSNorm.sharded_state_dict(
-            norm, prefix="norm.", metadata={"dp_cp_group": dp_cp_group}
+        return gdp_with_rmsnorm.ExtendedRMSNorm.sharded_state_dict(
+            norm, prefix="norm.", metadata=metadata
         )["norm.weight"]
+
+
+def test_gdp_rmsnorm_checkpoint_wrap_uses_explicit_process_groups(monkeypatch):
+    """Custom TP/DP+CP groups must not fall back to the global MPU groups."""
+    dp_cp_group = _FakeProcessGroup(rank=5, size=8)
+
+    sharded_weight = _gdp_rmsnorm_sharded_weight(
+        monkeypatch, own_dp_cp_group=None, metadata={"dp_cp_group": dp_cp_group}
+    )
 
     assert sharded_weight.global_offset == (4,)
     assert sharded_weight.global_shape == (8,)
     assert sharded_weight.replica_id == (0, 0, 5)
 
 
-def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
-    """GDP-owned parameters, conv1d, and child modules use the owning topology."""
-    tp_group = object()
-    dp_cp_group = object()
+def test_gdp_rmsnorm_without_metadata_uses_the_group_from_its_mixer(monkeypatch):
+    """Called without metadata, the norm computes replica ids over the group its mixer set."""
+    sharded_weight = _gdp_rmsnorm_sharded_weight(
+        monkeypatch, own_dp_cp_group=_FakeProcessGroup(rank=5, size=8), metadata=None
+    )
+
+    assert sharded_weight.global_offset == (4,)
+    assert sharded_weight.replica_id == (0, 0, 5)
+
+
+def _gdp_checkpoint_wrap_calls(pg_collection, metadata):
+    """Run the GDP mixer's checkpoint wrap on a stub mixer and record the wrapper calls.
+
+    Returns the keyword arguments of each ``make_sharded_tensors_for_checkpoint`` call, the
+    keyword arguments of each ``sharded_state_dict_default`` call, and the metadata each
+    ``sharded_state_dict_default`` call got.
+    """
     in_proj_dim = 8
     conv_dim = 4
 
@@ -106,7 +128,7 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
         state_dict=lambda *args, **kwargs: {"weight": torch.empty(conv_dim, 1, 1)}
     )
     mixer = SimpleNamespace(
-        pg_collection=SimpleNamespace(tp=tp_group),
+        pg_collection=pg_collection,
         in_proj=in_proj,
         d_inner_local_tp=2,
         num_householder=1,
@@ -121,6 +143,7 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
 
     checkpoint_wrap_calls = []
     child_wrap_calls = []
+    child_metadata = []
 
     def checkpoint_wrap(state_dict, prefix, *args, **kwargs):
         checkpoint_wrap_calls.append(kwargs)
@@ -128,8 +151,9 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
             f"{prefix}{name}": SimpleNamespace(data=tensor) for name, tensor in state_dict.items()
         }
 
-    def child_wrap(module, prefix, *args, **kwargs):
+    def child_wrap(module, prefix, sharded_offsets, metadata, **kwargs):
         child_wrap_calls.append(kwargs)
+        child_metadata.append(metadata)
         return {f"{prefix}weight": SimpleNamespace(data=module.weight)}
 
     with (
@@ -150,9 +174,19 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
             side_effect=AssertionError("global DP+CP group fallback"),
         ),
     ):
-        GatedDeltaProductMixer.sharded_state_dict(
-            mixer, prefix="mixer.", metadata={"dp_cp_group": dp_cp_group}
-        )
+        GatedDeltaProductMixer.sharded_state_dict(mixer, prefix="mixer.", metadata=metadata)
+
+    return checkpoint_wrap_calls, child_wrap_calls, child_metadata
+
+
+def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
+    """GDP-owned parameters, conv1d, and child modules use the owning topology."""
+    tp_group = object()
+    dp_cp_group = object()
+
+    checkpoint_wrap_calls, child_wrap_calls, _ = _gdp_checkpoint_wrap_calls(
+        ProcessGroupCollection(tp=tp_group), metadata={"dp_cp_group": dp_cp_group}
+    )
 
     assert checkpoint_wrap_calls == [
         {
@@ -164,6 +198,33 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
         {"tp_group": tp_group, "dp_cp_group": dp_cp_group},
     ]
     assert child_wrap_calls == [{"tp_group": tp_group}]
+
+
+@pytest.mark.parametrize("gtp_remat", [True, False], ids=["gtp_inclusive", "no_gtp_field"])
+def test_gdp_checkpoint_without_metadata_uses_the_mixer_dp_cp_group(gtp_remat):
+    """Without metadata, replica ids span the collection's GTP-inclusive DP x CP group.
+
+    A collection without ``dp_cp_gtp_remat`` falls back to its ``dp_cp`` group; neither case
+    reads the global data-parallel group.
+    """
+    tp_group = object()
+    dp_cp_gtp_remat_group = object()
+    dp_cp_group = object()
+    if gtp_remat:
+        pg_collection = ProcessGroupCollection(
+            tp=tp_group, dp_cp=dp_cp_group, dp_cp_gtp_remat=dp_cp_gtp_remat_group
+        )
+        expected_group = dp_cp_gtp_remat_group
+    else:
+        pg_collection = ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group)
+        expected_group = dp_cp_group
+
+    checkpoint_wrap_calls, _, child_metadata = _gdp_checkpoint_wrap_calls(
+        pg_collection, metadata=None
+    )
+
+    assert [call["dp_cp_group"] for call in checkpoint_wrap_calls] == [expected_group] * 2
+    assert [metadata["dp_cp_group"] for metadata in child_metadata] == [expected_group]
 
 
 def test_householder_components_reshard_tp2_to_tp1_in_semantic_order():

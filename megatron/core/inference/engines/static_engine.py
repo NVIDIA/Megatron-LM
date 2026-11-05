@@ -109,6 +109,8 @@ class StaticInferenceEngine(AbstractEngine):
                         num_cuda_graphs=1,
                         block_size_tokens=256,
                         unified_memory_level=0,
+                        # Use the groups the wrapper and controller were built with.
+                        pg_collection=original_context.config.pg_collection,
                     ),
                 )
 
