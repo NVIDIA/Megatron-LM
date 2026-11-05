@@ -97,6 +97,10 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    overlap_outer_communication: bool = False
+    """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
+    reductions on a separate CUDA stream."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -147,6 +151,14 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
+    """
+
+    grad_buffer_offload: bool = False
+    """If true, gradient buffers may be released between training phases.
+
+    With ``nccl_ub``, gradient storage is allocated in a separate NCCL memory
+    pool so that it can be deregistered, released, recreated, and registered
+    again without disturbing persistent parameter storage.
     """
 
     fsdp_double_buffer: bool = False
@@ -261,6 +273,14 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_padded_shards: bool = True
+    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
+    gets an equal shard. If false, pack the group without padding and split it into
+    generally unequal per-rank shards at row boundaries (32-row block boundaries for
+    MXFP8), which saves the padding memory and communication but is incompatible with
+    nccl_ub (symmetric memory).
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
@@ -327,9 +347,20 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.overlap_outer_communication:
+            if not self.use_megatron_fsdp:
+                raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
+            if self.megatron_fsdp_version != 2:
+                raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+            )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

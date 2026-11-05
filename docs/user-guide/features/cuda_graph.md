@@ -99,6 +99,21 @@ wired into custom training loops. The trade-off is that it requires more manual 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
 
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP automatically keeps graph inputs alive until their
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
+the microbatch calculator. Increasing the source batch would require recapturing
+the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. mHC wrappers and attention graph
+splitting require their separate graph integrations; these packing options do
+not enable mHC capture by themselves.
+
 ### Usage
 
 ```bash
@@ -117,21 +132,32 @@ Captures the entire training iteration (excluding optimizer) as a single CUDA gr
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
 
+With an eager optimizer, full-iteration training captures model-to-optimizer gradient conversion
+in the forward/backward graph's memory pool. The distributed optimizer and the layer-wise
+mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
+Replay order must remain forward/backward, gradient conversion, then optimizer update.
+The converted values are valid until the next forward/backward replay; gradient addresses must
+remain stable. Resetting the training graph also invalidates the conversion graph.
+
+This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
+step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
+precision-aware optimizer path that already aliases model gradients.
+
 This implementation does not create inference CUDA graphs. For inference, use
 `--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.
 
 ### Requirements
 
-- `--no-check-for-nan-in-loss-and-grad` is required: NaN checks involve CPU-GPU synchronization
-  which cannot run inside a CUDA graph.
+- Loss and gradient checks remain enabled. Values passed to the rerun state machine during
+  capture are snapshotted at their validation sites. Host-side checks run after each replay,
+  before the training loop decides whether to rerun or update the optimizer.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
 
 ### Example
 
 ```bash
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ---
@@ -152,8 +178,7 @@ All three implementations work for dense models:
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
 
 # Full-iteration
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ### MoE Model Training
@@ -174,7 +199,6 @@ graphs to be used on MoE models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-flex-dispatcher-backend hybridep \
 --use-transformer-engine-op-fuser \
 --moe-expert-rank-capacity-factor <float> \

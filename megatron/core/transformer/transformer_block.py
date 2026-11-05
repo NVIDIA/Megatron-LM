@@ -635,6 +635,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
+            # An embedding-only stage sends this tensor without executing a
+            # layer. Expansion returns a view, which pipeline output
+            # deallocation cannot release; keep the autograd path viewless.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -739,7 +745,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
-                            hidden_states=hidden_states,
+                            hidden_states,
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,

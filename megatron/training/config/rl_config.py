@@ -2,7 +2,12 @@
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
+
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallelConfig
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -16,6 +21,10 @@ class RLConfig:
 
     perform_rl_step: bool = False
     """Use the RL training step."""
+
+    rl_rollout_only: bool = False
+    """Iterate the RL loop collecting rollouts without optimizer updates.
+    The optimizer stays resident unless --no-load-optim is also set, which skips optimizer build."""
 
     rl_prompts_per_eval: int = 32
     """Number of prompts to evaluate for each RL task. This evaluation can be very expensive when
@@ -96,15 +105,6 @@ class RLConfig:
 
     rl_offload_optimizer_during_inference: bool = False
     """Offload optimizer state to CPU during inference/rollout to save GPU memory."""
-
-    rl_kv_cache_management_mode: Literal["persist", "offload", "recompute"] = "persist"
-    """KV cache management mode during RL training. persist: leave KV cache in GPU memory (default).
-    offload: offload KV cache to CPU during training. recompute: deallocate KV cache and recompute
-    from scratch each cycle."""
-
-    rl_persist_cuda_graphs: bool = field(default=False, metadata=_BOOL_OPTIONAL)
-    """Persist CUDA graphs when the inference engine is suspended. If False, CUDA graphs are deleted
-    on suspend and re-captured on resume."""
 
     rl_partial_rollouts: bool = field(default=False, metadata=_BOOL_OPTIONAL)
     """Allow inference to continue generating rollouts while training updates the policy weights.
@@ -242,12 +242,6 @@ class RLConfig:
             self.rl_submission_granularity == "B" and self.rl_consumption_granularity == "G"
         ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
 
-        # KV cache offload requires CUDA graph persistence: recapturing CUDA graphs runs dummy
-        # forward passes that corrupt the preserved KV data.
-        assert self.rl_kv_cache_management_mode != "offload" or self.rl_persist_cuda_graphs, (
-            "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
-        )
-
         if (
             self.rl_offload_inference_model_weights
             and self.rl_inference_model_unified_memory_level != 1
@@ -261,3 +255,128 @@ class RLConfig:
                     "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
                     "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                 )
+
+    @property
+    def requires_grad_buffer_offload(self) -> bool:
+        """Whether RL releases gradient storage between training and inference."""
+        return (
+            self.perform_rl_step
+            and self.rl_offload_optimizer_during_inference
+            and not self.rl_training_cuda_graphs
+        )
+
+    def validate_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Check the requested and RL-required layouts without changing either config."""
+        if (
+            ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
+        ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+
+    def finalize_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Apply the RL layout during container finalization, before DDP allocates buffers.
+
+        Unlike validation, this updates the run's owned config so checkpoint metadata
+        and model construction see the same effective layout. Do not change the RL
+        offload policy after model setup; the buffer layout is fixed at construction.
+        """
+        self.validate_ddp_config(ddp_config)
+        if self.requires_grad_buffer_offload:
+            ddp_config.grad_buffer_offload = True
+
+    def uses_separate_inference_model(
+        self, *, context_parallel_size: int, inference_shards: str | None
+    ) -> bool:
+        """Whether rollouts run on their own copy of the model: disaggregated shards, any
+        --rl-inference-* parallelism override, or CP>1 (RL inference does not support CP)."""
+        return (
+            spec_declares_disaggregation(inference_shards)
+            or self.rl_inference_tensor_model_parallel_size is not None
+            or self.rl_inference_pipeline_model_parallel_size is not None
+            or self.rl_inference_expert_model_parallel_size is not None
+            or self.rl_inference_expert_tensor_model_parallel_size is not None
+            or context_parallel_size > 1
+        )
+
+    def validate_run(
+        self,
+        *,
+        cuda_graph_impl: str | None,
+        micro_batch_size: int | None,
+        global_batch_size: int | None,
+        train_iters: int | None,
+        train_samples: int | None,
+        skip_train: bool,
+        load_optim: bool,
+        save_interval: int | None,
+        exit_interval: int | None,
+        separate_inference_model: bool | None,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if not self.perform_rl_step:
+            return
+
+        # Training CGs only make sense if we build any CGs.
+        if cuda_graph_impl == "none" and self.rl_training_cuda_graphs:
+            raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
+
+        if self.rl_use_sequence_packing and micro_batch_size != 1:
+            raise ValueError(
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per "
+                "micro batch increase the sequence length."
+            )
+
+        # A native config can leave this default unresolved during user validation.
+        # Framework finalization repeats these checks with the resolved batch size.
+        if global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
+            if samples_per_inference_iteration % global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+
+        has_horizon = bool(train_iters) or bool(train_samples)
+        if self.rl_rollout_only and not has_horizon:
+            raise ValueError(
+                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
+            )
+        if skip_train and (has_horizon or self.rl_rollout_only):
+            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
+            # collect rollouts, and evaluating instead would change a launch's meaning silently.
+            raise ValueError(
+                "--skip-train only evaluates: drop --train-iters/--train-samples; "
+                "--rl-rollout-only collects rollouts without updates."
+            )
+        if self.rl_offload_optimizer_during_inference and (
+            skip_train or (self.rl_rollout_only and not load_optim)
+        ):
+            raise ValueError(
+                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
+                "--rl-offload-optimizer-during-inference has nothing to offload."
+            )
+
+        # Offloading inference weights that are the training weights would be a no-op.
+        if separate_inference_model is False and self.rl_offload_inference_model_weights:
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
+            )

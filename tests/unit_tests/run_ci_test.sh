@@ -78,7 +78,7 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "preselected" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
@@ -208,6 +208,7 @@ run_full_tests() {
 write_testmon_summary() {
     local result="$1"
     local selected_count="${2:-}"
+    local mandatory_count="${3:-}"
     mkdir -p "$UNIT_TESTMON_CACHE_DIR"
     {
         echo "### Unit Testmon"
@@ -216,7 +217,10 @@ write_testmon_summary() {
         echo "- Bucket: \`$BUCKET\`"
         echo "- Result: $result"
         if [[ -n "$selected_count" ]]; then
-            echo "- Selected tests: \`$selected_count\`"
+            echo "- Selected pytest targets across phases: \`$selected_count\`"
+        fi
+        if [[ -n "$mandatory_count" ]]; then
+            echo "- Mandatory test files (changed source mappings): \`$mandatory_count\`"
         fi
     } > "$UNIT_TESTMON_CACHE_DIR/summary.md"
 }
@@ -271,6 +275,19 @@ merge_rank_selections() {
     cat "${rank_selections[@]}" | LC_ALL=C sort -u > "$output"
 }
 
+# Unit tests mapped to changed source directories in
+# tests/unit_tests/testmon_mandatory_tests.yaml always run on top of the
+# Testmon selection. The host writes the PR's changed-file list next to the baseline.
+apply_mandatory_tests() {
+    local phase="$1"
+    uv run --no-sync python tests/unit_tests/testmon_mandatory.py \
+        --changed-files "$UNIT_TESTMON_CACHE_DIR/changed-files" \
+        --bucket "$BUCKET" \
+        --platform "dgx_$PLATFORM" \
+        --selection "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase/selected-tests" \
+        "${IGNORE_ARGS[@]}"
+}
+
 run_selected_phase() {
     local phase="$1"
     local selection_file="$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase/selected-tests"
@@ -306,27 +323,48 @@ run_selected_phase() {
             "${selected_tests[@]}"
         )
     fi
-    "${command[@]}"
+    # Mandatory files are passed whole, so a phase's marker filter can
+    # legitimately deselect everything in them (pytest exit 5).
+    local rc=0
+    "${command[@]}" || rc=$?
+    if [[ "$rc" -eq 5 ]]; then
+        echo "No $phase tests collected from the selection (pytest exit 5) — treating as pass."
+        return 0
+    fi
+    return "$rc"
 }
 
 run_enforced_tests() {
-    local target prod_count experimental_count
+    local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
-
-    if ! run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections prod \
-        || ! run_testmon_phase select experimental \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections experimental; then
-        write_testmon_summary "full fallback: Testmon selection failed"
-        run_full_tests
-        return
+    if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
+        # Consume the CPU decision without running selection again on GPU.
+        if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
+                --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
+                --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
+                --source-sha "$(git rev-parse HEAD)"; then
+            write_testmon_summary "CPU selection plan is unavailable or invalid"
+            return 1
+        fi
+    else
+        rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
+        if ! run_testmon_phase select prod \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections prod \
+            || ! apply_mandatory_tests prod \
+            || ! run_testmon_phase select experimental \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections experimental \
+            || ! apply_mandatory_tests experimental; then
+            write_testmon_summary "full fallback: Testmon selection failed"
+            run_full_tests
+            return
+        fi
     fi
 
     prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
     experimental_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/experimental/selected-tests")
+    mandatory_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/mandatory-tests")
     for i in $(seq "$UNIT_TEST_REPEAT"); do
         run_selected_phase prod
         run_selected_phase experimental
@@ -344,7 +382,7 @@ data.write()
 '
     fi
     coverage combine -q
-    write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))"
+    write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))" "$mandatory_count"
 }
 
 case "$UNIT_TESTMON_MODE" in
@@ -354,7 +392,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-enforce)
+enforce|preselected)
     run_enforced_tests
     ;;
 esac

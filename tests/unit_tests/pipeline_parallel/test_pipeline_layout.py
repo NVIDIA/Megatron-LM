@@ -213,7 +213,9 @@ def create_args():
         ),  # mtp in the second last stage with no other layers
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
+def test_forward_vpp(
+    create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp, run_config
+):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args
@@ -309,7 +311,13 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             is_moe=is_moe,
             with_mtp=with_mtp,
         )
-        load_checkpoint([model_baseline], optimizer, opt_param_scheduler, strict=False)
+        load_checkpoint(
+            [model_baseline],
+            optimizer,
+            opt_param_scheduler,
+            strict=False,
+            restore_training_state=True,
+        )
 
         forward_backward_func = get_forward_backward_func()
         losses_reduced_baseline = forward_backward_func(

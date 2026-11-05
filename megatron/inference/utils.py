@@ -3,33 +3,38 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
+from copy import copy
 from typing import Literal, Optional
 
+from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
 import torch
 
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
 from megatron.core.inference.quantization.utils import (
     quantize_model_to_mxfp8,
     resolve_mxfp8_backend,
 )
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import log_single_rank, unwrap_model
+from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import get_tokenizer, get_wandb_writer
+from megatron.training import get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
+from megatron.training.checkpointing import (
+    get_checkpoint_name,
+    get_checkpoint_tracker_filename,
+    get_loaded_iteration,
+    load_checkpoint,
+    read_metadata,
+)
+from megatron.training.models import GPTModelBuilder, GPTModelConfig, HybridModelBuilder, ModelBuilder
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -42,7 +47,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_model_builder(
-    args: Namespace, provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None
+    args: Namespace,
+    tokenizer_config: TokenizerConfig,
+    provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> ModelBuilder:
     """Construct a :class:`ModelBuilder` for the requested model provider.
 
@@ -57,52 +66,164 @@ def get_model_builder(
         provider: Optional override for the model provider name. Must be one of
             ``"gpt"``, ``"hybrid"``, or the deprecated ``"mamba"``. When omitted,
             falls back to ``args.model_provider`` (set by ``add_inference_args``).
+        pg_collection: Optional inference-shard groups. Derive parallel sizes
+            before constructing and validating the config, without changing the
+            global training arguments.
 
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
+    if pg_collection is not None:
+        args = copy(args)
+        if getattr(args, "yaml_cfg", None) is not None:
+            args.model_parallel = copy(args.model_parallel)
+        for field, group in (
+            ("tensor_model_parallel_size", pg_collection.tp),
+            ("pipeline_model_parallel_size", pg_collection.pp),
+            ("context_parallel_size", pg_collection.cp),
+            ("expert_model_parallel_size", pg_collection.ep),
+            ("expert_tensor_parallel_size", pg_collection.expt_tp),
+        ):
+            setattr(args, field, get_pg_size(group))
+            if getattr(args, "yaml_cfg", None) is not None:
+                setattr(args.model_parallel, field, get_pg_size(group))
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
-    if provider in ("hybrid", "mamba"):
+        model_config = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = GPTModelBuilder
+    elif provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
-    raise ValueError(f"Invalid model provider {provider}")
+        model_config = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = HybridModelBuilder
+    else:
+        raise ValueError(f"Invalid model provider {provider}")
+
+    if model_config.vocab_size is None:
+        if tokenizer_config.padded_vocab_size is None:
+            raise ValueError('Model vocabulary must be resolved before model construction')
+        model_config.vocab_size = tokenizer_config.padded_vocab_size
+        model_config.should_pad_vocab = False
+    return builder_cls(model_config)
 
 
-def get_model_for_inference() -> MegatronModule:
-    """Initialize model and load checkpoint for inference."""
+def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
+    """Map model sharded keys onto a checkpoint that nests the model under a prefix.
+
+    Records the resulting keys in `requested_keys` so unloaded checkpoint tensors can be
+    reported after the load.
+    """
+    prefix = getattr(args, 'checkpoint_model_prefix', '')
+    if not prefix:
+        return None
+
+    def modifier(sharded_state_dict):
+        apply_prefix_mapping(sharded_state_dict, {'': prefix})
+        requested_keys.update(
+            value.key
+            for value in nested_values(sharded_state_dict)
+            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
+        )
+
+    return modifier
+
+
+def _warn_on_unloaded_checkpoint_tensors(
+    args: Namespace,
+    requested_keys: set,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Warn about checkpoint tensors under the model prefix that no rank loaded.
+
+    Loading one model out of a larger checkpoint cannot use strict key checking (the other
+    submodules' tensors are always unused), so a module this build omits, e.g. because of a
+    config default that differs from the one the checkpoint was trained with, would otherwise
+    be dropped silently.
+    """
+    gathered = [None] * torch.distributed.get_world_size(checkpoint_group)
+    torch.distributed.all_gather_object(gathered, sorted(requested_keys), group=checkpoint_group)
+    if args.ckpt_step is not None:
+        release = False
+    else:
+        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    if torch.distributed.get_rank(checkpoint_group) != 0:
+        return
+
+    requested = set().union(*gathered)
+    checkpoint_dir = get_checkpoint_name(
+        args.load, get_loaded_iteration(), release, return_base_dir=True
+    )
+    unloaded = sorted(
+        key
+        for key in dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+        if key.startswith(args.checkpoint_model_prefix)
+        # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
+        and key not in requested
+        and not any(key.startswith(f"{requested_key}.") for requested_key in requested)
+    )
+    if unloaded:
+        logger.warning(
+            f"{len(unloaded)} checkpoint tensors under '{args.checkpoint_model_prefix}' were not "
+            f"loaded; check that the model config matches the checkpoint: {unloaded[:20]}"
+        )
+
+
+def get_model_for_inference(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> MegatronModule:
+    """Initialize model and load checkpoint for inference.
+
+    Args:
+        pg_collection: Process groups used to build and load the model. When
+            omitted, the initialized global MPU process groups are used.
+        checkpoint_group: Ranks that collectively form this model replica's
+            complete checkpoint view. Defaults to the global process group.
+    """
 
     args = get_args()
+    tokenizer_config = get_run_config().tokenizer
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+        if pg_collection is not None:
+            raise ValueError(
+                "Custom inference process groups are not supported by the ModelOpt builder"
+            )
         # ModelOpt path keeps the legacy callable-based builder because the
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
         model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
-        builder = get_model_builder(args)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False
-        )
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
+        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
     # Load checkpoint.
     assert args.load is not None
+    requested_keys = set()
     args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        tp_group=pg_collection.tp if pg_collection is not None else None,
+        pp_group=pg_collection.pp if pg_collection is not None else None,
+        dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
+        dp_group=pg_collection.dp if pg_collection is not None else None,
+        expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
+        checkpoint_group=checkpoint_group,
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )
+    if requested_keys:
+        _warn_on_unloaded_checkpoint_tensors(args, requested_keys, checkpoint_group)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -317,7 +438,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-             "Training uses --moe-routing-trace-max-training-iters instead.",
+        "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser
@@ -350,25 +471,26 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
             )
 
     setup_cfg = inference_cfg_from_args(args)
-    return setup_cfg.to_inference_config(
-        model,
-        kv_cache_management_mode=args.rl_kv_cache_management_mode,
-        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
-        enable_cuda_graphs=(args.inference_cuda_graph_scope != InferenceCudaGraphScope.none),
-        metrics_writer=metrics_writer,
-    )
+    return setup_cfg.to_inference_config(model, metrics_writer=metrics_writer)
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+def get_dynamic_inference_engine(
+    model: MegatronModule | None = None, engine_class: type[DynamicInferenceEngine] | None = None
+) -> DynamicInferenceEngine:
+    """Build a dynamic inference engine.
+
+    Args:
+        model: Model to serve. Builds and loads one when omitted.
+        engine_class: Optional engine implementation override. When omitted,
+            the core factory selects the implementation from the inference
+            configuration.
+    """
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     inference_config = get_inference_config_from_model_and_args(model, args)
-    context = DynamicInferenceContext(model.config, inference_config)
-    inference_wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
-    return engine
+    return build_dynamic_inference_engine(
+        model=model, tokenizer=tokenizer, inference_config=inference_config, engine_cls=engine_class
+    )

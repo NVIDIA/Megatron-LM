@@ -19,29 +19,16 @@ from pathlib import Path
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
+PLATFORMS = {
+    "dgx_h100": {"cloud": "aws-h100", "recipe": "tests/test_utils/recipes/h100/unit-tests.yaml"},
+    "dgx_gb200": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb200/unit-tests.yaml"},
+}
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-COMPATIBILITY_FILES = (
-    ".github/actions/action.yml",
-    ".github/workflows/_build_ci_container.yml",
-    "README.md",
-    "pyproject.toml",
-    "uv.lock",
-    "megatron/core/__init__.py",
-    "megatron/core/package_info.py",
-    "tests/unit_tests/run_ci_test.sh",
-    "tests/unit_tests/find_test_cases.py",
-    "tests/unit_tests/testmon_selector.py",
-    "tests/unit_tests/testmon_cache.py",
-    "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
-    "tests/test_utils/python_scripts/recipe_parser.py",
-    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "tests/test_utils/recipes/h100/unit-tests.yaml",
-    "tests/test_utils/recipes/gb200/unit-tests.yaml",
-)
-COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
+COMPATIBILITY_FILES: set[str] = {"tests/test_utils/python_scripts/download_unit_tests_dataset.py"}
+COMPATIBILITY_GLOBS: tuple[str, ...] = ()
 DATABASE_TABLES = {
     "metadata",
     "environment",
@@ -99,11 +86,37 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
+    """Select ancestor conftests and descendants of a bucket's collection directory."""
+    bucket_path = Path(bucket)
+    directory = root / bucket_path
+    recursive = directory.is_dir()
+    for index, part in enumerate(bucket_path.parts):
+        if any(character in part for character in "*?["):
+            # Conservatively include descendants below the glob's literal prefix,
+            # even when marker or ignore filters exclude tests during collection.
+            directory = root.joinpath(*bucket_path.parts[:index])
+            recursive = True
+            break
+    else:
+        if not recursive:
+            directory = directory.parent
+
+    return {
+        path
+        for path in (root / "tests/unit_tests").rglob("conftest.py")
+        if path.is_file()
+        and (
+            directory.is_relative_to(path.parent) or (recursive and path.is_relative_to(directory))
+        )
+    }
+
+
 def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
+    if recipe_platform not in PLATFORMS:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
@@ -111,6 +124,7 @@ def cache_identity(
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )
+    paths.update(_bucket_conftests(root, bucket))
     inputs = {str(path.relative_to(root)): _digest(path) for path in sorted(paths)}
     contract = {
         "schema": SCHEMA,
@@ -254,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     """Expose cache identity and validation to the host without Python dependencies."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("platforms", help="Print the Testmon platform definitions as JSON")
     identity_parser = subparsers.add_parser("identity")
     identity_parser.add_argument("--root", type=Path, default=Path("."))
     identity_parser.add_argument("--bucket", required=True)
@@ -271,7 +286,9 @@ def main(argv: list[str] | None = None) -> int:
             child.add_argument("--generation", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "identity":
+        if args.command == "platforms":
+            print(json.dumps(PLATFORMS))
+        elif args.command == "identity":
             identity = cache_identity(args.root, args.bucket, args.platform, args.image_id)
             _write_json(args.output, identity)
             print(f"cache_prefix={identity['cache_prefix']}")

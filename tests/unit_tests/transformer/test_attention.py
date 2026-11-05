@@ -483,6 +483,9 @@ def _test_parallel_attention_correctness(
     sequence_length=256,
     micro_batch_size=4,
     sequence_packing=False,
+    cp_partition_mode="zigzag",
+    input_grad_atol=None,
+    input_grad_rtol=None,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -567,18 +570,20 @@ def _test_parallel_attention_correctness(
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None)
+            load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
-            if cp > 1:
+            if cp > 1 and cp_partition_mode == "zigzag":
                 tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
             if sequence_packing:
                 tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
+            if cp > 1 and cp_partition_mode == "contiguous":
+                # Packed contiguous CP partitions the flattened token stream, not each sequence.
+                tensor = tensor.chunk(cp, dim=0)[cp_group.rank()].contiguous()
             if tp > 1 and sp:
                 sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
@@ -588,6 +593,7 @@ def _test_parallel_attention_correctness(
         if sequence_packing:
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            packed_seq_params.cp_partition_mode = cp_partition_mode
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
@@ -643,8 +649,8 @@ def _test_parallel_attention_correctness(
         torch.testing.assert_close(
             input_grad_baseline,
             input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
+            atol=atol if input_grad_atol is None else input_grad_atol,
+            rtol=rtol if input_grad_rtol is None else input_grad_rtol,
             msg=lambda msg: f"Mismatch in input_grad: {msg}",
         )
         if has_bias:
@@ -674,7 +680,15 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    apply_rope_fusion,
+    tp,
+    sp,
+    cp,
+    qk_layernorm,
+    output_gate,
+    run_config,
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -710,7 +724,7 @@ def test_parallel_attention_correctness(
 @pytest.mark.parametrize("sp", [True, False])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
-    tmp_path_dist_ckpt, sp, output_gate
+    tmp_path_dist_ckpt, sp, output_gate, run_config
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
