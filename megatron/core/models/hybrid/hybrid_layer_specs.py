@@ -26,7 +26,10 @@ from megatron.core.ssm.gated_delta_product import (
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
-from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+from megatron.core.ssm.wide_residual_mamba_layer import (
+    WideResidualMambaLayer,
+    WideResidualMambaLayerSubmodules,
+)
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -76,7 +79,10 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 from megatron.core.transformer.wide_residual import DeferredWrite, WriteReadNorm
-from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual_transformer_layer import (
+    WideResidualTransformerLayer,
+    WideResidualTransformerLayerSubmodules,
+)
 
 # This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
@@ -713,6 +719,17 @@ _UNFUSED_PROJECTIONS = {
 }
 
 
+def _with_connections(spec: ModuleSpec, submodules=None, **connections) -> ModuleSpec:
+    """``spec`` with ``submodules`` (default: its own) and these residual connections."""
+    submodules = submodules or spec.submodules
+    widened = (
+        WideResidualMambaLayerSubmodules
+        if isinstance(submodules, MambaLayerSubmodules)
+        else WideResidualTransformerLayerSubmodules
+    )
+    return replace(spec, submodules=widened.widen(submodules, **connections))
+
+
 def _fused_read_layer(spec: ModuleSpec, norm_name: str, branch_name: str, projection_name):
     """``spec`` with its input norm moved into a WriteReadNorm read."""
     submodules = spec.submodules
@@ -735,11 +752,8 @@ def _fused_read_layer(spec: ModuleSpec, norm_name: str, branch_name: str, projec
         changes[branch_name] = branch
         norm_key = f"{branch_name}.{projection_name}.layer_norm_weight"
     keys = {**submodules.sharded_state_dict_keys_map, f"{read}.weight": norm_key}
-    return replace(
-        spec,
-        submodules=replace(submodules, **changes, sharded_state_dict_keys_map=keys),
-        params={**spec.params, read: WriteReadNorm},
-    )
+    submodules = replace(submodules, **changes, sharded_state_dict_keys_map=keys)
+    return _with_connections(spec, submodules, **{read: WriteReadNorm})
 
 
 def _fuse_residual_seams(stack_spec: ModuleSpec) -> ModuleSpec:
@@ -751,8 +765,8 @@ def _fuse_residual_seams(stack_spec: ModuleSpec) -> ModuleSpec:
         spec = getattr(submodules, name)
         deferred_write = {_SEAM_CONNECTIONS[norm_name][1]: DeferredWrite}
         last[name] = _fused_read_layer(spec, norm_name, branch_name, projection_name)
-        middle[name] = replace(last[name], params={**last[name].params, **deferred_write})
-        first[name] = replace(spec, params={**spec.params, **deferred_write})
+        middle[name] = _with_connections(last[name], **deferred_write)
+        first[name] = _with_connections(spec, **deferred_write)
     return replace(
         stack_spec,
         submodules=replace(

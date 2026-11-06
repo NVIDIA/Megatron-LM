@@ -23,8 +23,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
-    _first_read,
-    _last_write,
+    _seam_connections,
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -38,8 +37,6 @@ from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     WriteReadNorm,
     apply_pending_write,
-    put_pending_write,
-    take_pending_write,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
@@ -868,7 +865,7 @@ def _unfused_names(model):
     sharded checkpoint key maps (the moved norm weights keep their unfused checkpoint keys)."""
     renames = {}
     for prefix, module in model.named_modules():
-        keys_map = getattr(
+        keys_map = getattr(module, "sharded_state_dict_keys_map", None) or getattr(
             getattr(module, "submodules_config", None), "sharded_state_dict_keys_map", {}
         )
         renames.update({f"{prefix}.{src}": f"{prefix}.{dst}" for src, dst in keys_map.items()})
@@ -1150,8 +1147,7 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     for layer in model.decoder.layers:
         is_block = isinstance(layer, ShortcutMoEBlock)
         layers += [layer.compute_layer, layer.moe_layer] if is_block else [layer]
-    reads = [_first_read(layer) for layer in layers]
-    writes = [_last_write(layer) for layer in layers]
+    reads, writes = zip(*(_seam_connections(layer) for layer in layers))
     assert not isinstance(reads[0], WriteReadNorm)
     assert all(isinstance(read, WriteReadNorm) for read in reads[1:])
     assert all(write.target is read for write, read in zip(writes, reads[1:]))
@@ -1207,20 +1203,19 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, recompute, offload, gtp, e
 def test_deferred_writes_are_consumed_within_one_forward(training):
     """A deferred write goes only to an empty read and is taken exactly once; a forward leaves
     every fused read empty (no residual or branch tensors held across forwards)."""
-    read = SimpleNamespace(pending=None)
-    put_pending_write(read, "write")
-    with pytest.raises(RuntimeError, match="not applied"):
-        put_pending_write(read, "again")
-    assert take_pending_write(read) == "write" and read.pending is None
-    with pytest.raises(RuntimeError, match="no deferred residual write"):
-        take_pending_write(read)
-
     model = _hybrid_model("M-*E-ME", hidden=256).train(training)
+    reads = [m for m in model.modules() if isinstance(m, WriteReadNorm)]
+    read = reads[0]
+    read.hand("write")
+    with pytest.raises(RuntimeError, match="not applied"):
+        read.hand("again")
+    assert read.take() == "write" and read.pending is None
+    with pytest.raises(RuntimeError, match="no deferred residual write"):
+        read.take()
+
     tokens = 1024 if training else 64  # training seams need a multiple of 1024 tokens
     ids = torch.randint(0, 128, (1, tokens), device="cuda")
     positions = torch.arange(tokens, device="cuda")
-    reads = [m for m in model.modules() if isinstance(m, WriteReadNorm)]
-    assert reads
     for _ in range(2):
         with torch.set_grad_enabled(training):
             out = model(ids, positions[None], None)

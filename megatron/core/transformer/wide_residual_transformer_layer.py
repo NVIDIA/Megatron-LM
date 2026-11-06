@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from functools import partial
+from dataclasses import dataclass, fields
 from typing import Optional
 
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -12,6 +12,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionOperation,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
@@ -19,8 +20,22 @@ from megatron.core.transformer.wide_residual import (
     load_residual_state,
 )
 
-_STREAMWISE_READ = partial(StreamwiseSigmoidWideResidualConnection, operation="read")
-_STREAMWISE_WRITE = partial(StreamwiseSigmoidWideResidualConnection, operation="write")
+
+@dataclass
+class WideResidualTransformerLayerSubmodules(TransformerLayerSubmodules):
+    """TransformerLayerSubmodules plus the branches' wide-residual connections (a fused spec
+    selects WriteReadNorm reads and DeferredWrite writes)."""
+
+    residual_read_self_attn: type = StreamwiseSigmoidWideResidualConnection
+    residual_write_self_attn: type = StreamwiseSigmoidWideResidualConnection
+    residual_read_mlp: type = StreamwiseSigmoidWideResidualConnection
+    residual_write_mlp: type = StreamwiseSigmoidWideResidualConnection
+
+    @classmethod
+    def widen(cls, submodules: TransformerLayerSubmodules, **connections):
+        """``submodules`` with these connections (the defaults for the others)."""
+        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
+        return cls(**{**values, **connections})
 
 
 class WideResidualTransformerLayer(TransformerLayer):
@@ -31,7 +46,7 @@ class WideResidualTransformerLayer(TransformerLayer):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: TransformerLayerSubmodules,
+        submodules: WideResidualTransformerLayerSubmodules | TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -41,13 +56,9 @@ class WideResidualTransformerLayer(TransformerLayer):
         pp_layer_offset: Optional[int] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
-        residual_read_self_attn=_STREAMWISE_READ,
-        residual_read_mlp=_STREAMWISE_READ,
-        residual_write_self_attn=_STREAMWISE_WRITE,
-        residual_write_mlp=_STREAMWISE_WRITE,
     ) -> None:
-        """The ``residual_read_*``/``residual_write_*`` arguments build the branch connections; a
-        fused spec selects WriteReadNorm/DeferredWrite."""
+        if not isinstance(submodules, WideResidualTransformerLayerSubmodules):
+            submodules = WideResidualTransformerLayerSubmodules.widen(submodules)
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
@@ -77,18 +88,30 @@ class WideResidualTransformerLayer(TransformerLayer):
         self.residual_read_self_attn = None
         self.residual_write_self_attn = None
         if not isinstance(self.self_attention, IdentityOp):
-            self.residual_read_self_attn = residual_read_self_attn(
-                config, self.layer_number, "self_attention"
+            self.residual_read_self_attn = build_module(
+                submodules.residual_read_self_attn,
+                config,
+                self.layer_number,
+                "self_attention",
+                operation="read",
             )
-            self.residual_write_self_attn = residual_write_self_attn(
-                config, self.layer_number, "self_attention"
+            self.residual_write_self_attn = build_module(
+                submodules.residual_write_self_attn,
+                config,
+                self.layer_number,
+                "self_attention",
+                operation="write",
             )
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
         if not isinstance(self.mlp, IdentityOp):
-            self.residual_read_mlp = residual_read_mlp(config, self.layer_number, "mlp")
-            self.residual_write_mlp = residual_write_mlp(config, self.layer_number, "mlp")
+            self.residual_read_mlp = build_module(
+                submodules.residual_read_mlp, config, self.layer_number, "mlp", operation="read"
+            )
+            self.residual_write_mlp = build_module(
+                submodules.residual_write_mlp, config, self.layer_number, "mlp", operation="write"
+            )
 
         self.register_load_state_dict_pre_hook(load_residual_state)
         residual_connections = [

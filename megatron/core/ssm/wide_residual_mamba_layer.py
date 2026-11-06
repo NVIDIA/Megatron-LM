@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
-from functools import partial
+from dataclasses import dataclass, fields
 
 from torch import Tensor
 
@@ -17,12 +17,28 @@ from megatron.core.transformer.residual_recompute import (
     checkpoint_residual_read,
     checkpoint_residual_write,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
+
+
+@dataclass
+class WideResidualMambaLayerSubmodules(MambaLayerSubmodules):
+    """MambaLayerSubmodules plus the mixer's wide-residual connections (a fused spec selects a
+    WriteReadNorm read and a DeferredWrite write)."""
+
+    residual_read: type = StreamwiseSigmoidWideResidualConnection
+    residual_write: type = StreamwiseSigmoidWideResidualConnection
+
+    @classmethod
+    def widen(cls, submodules: MambaLayerSubmodules, **connections):
+        """``submodules`` with these connections (the defaults for the others)."""
+        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
+        return cls(**{**values, **connections})
 
 
 class WideResidualMambaLayer(MambaLayer):
@@ -33,17 +49,15 @@ class WideResidualMambaLayer(MambaLayer):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: MambaLayerSubmodules,
+        submodules: WideResidualMambaLayerSubmodules | MambaLayerSubmodules,
         layer_number: int = 1,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
         is_mtp_layer: bool = False,
-        residual_read=partial(StreamwiseSigmoidWideResidualConnection, operation="read"),
-        residual_write=partial(StreamwiseSigmoidWideResidualConnection, operation="write"),
     ) -> None:
-        """``residual_read``/``residual_write`` build the connections; a fused spec selects
-        WriteReadNorm/DeferredWrite."""
+        if not isinstance(submodules, WideResidualMambaLayerSubmodules):
+            submodules = WideResidualMambaLayerSubmodules.widen(submodules)
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width MambaLayer, not "
@@ -67,8 +81,12 @@ class WideResidualMambaLayer(MambaLayer):
                 "returns its own residual."
             )
 
-        self.residual_read = residual_read(config, self.layer_number, "mamba")
-        self.residual_write = residual_write(config, self.layer_number, "mamba")
+        self.residual_read = build_module(
+            submodules.residual_read, config, self.layer_number, "mamba", operation="read"
+        )
+        self.residual_write = build_module(
+            submodules.residual_write, config, self.layer_number, "mamba", operation="write"
+        )
         self.register_load_state_dict_pre_hook(load_residual_state)
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size

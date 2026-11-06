@@ -451,21 +451,6 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
 # the read takes it and applies it with its read and RMSNorm in one kernel.
 
 
-def put_pending_write(read: nn.Module, item) -> None:
-    """Hand ``item`` (PendingWideResidualWrites or SeamInput) to the empty ``read``."""
-    if read.pending is not None:
-        raise RuntimeError("a deferred residual write for this read was not applied")
-    read.pending = item
-
-
-def take_pending_write(read: nn.Module):
-    """Take the write handed to ``read``, leaving it empty."""
-    item, read.pending = read.pending, None
-    if item is None:
-        raise RuntimeError("no deferred residual write was handed to this fused read")
-    return item
-
-
 @dataclass(frozen=True)
 class SeamInput:
     """A layer input whose residual read and RMSNorm a fused seam kernel already applied."""
@@ -486,8 +471,16 @@ class WriteReadNorm(nn.Module):
     residual-connection read.
     """
 
-    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        branch_name: str,
+        operation: ResidualConnectionOperation = "read",
+    ) -> None:
         del layer_number, branch_name
+        if operation != "read":
+            raise ValueError(f"WriteReadNorm is a read connection, got operation={operation!r}")
         super().__init__()
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
         device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
@@ -504,11 +497,24 @@ class WriteReadNorm(nn.Module):
         # The write handed here by the previous layer's DeferredWrite, until this read takes it.
         self.pending = None
 
+    def hand(self, item) -> None:
+        """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
+        if self.pending is not None:
+            raise RuntimeError("a deferred residual write for this read was not applied")
+        self.pending = item
+
+    def take(self):
+        """Take the item handed to this read, leaving it empty."""
+        item, self.pending = self.pending, None
+        if item is None:
+            raise RuntimeError("no deferred residual write was handed to this fused read")
+        return item
+
     def forward(self, hidden_states, *, fp32_residual_connection=False, branch_input_dtype=None):
         """Apply the write handed to this read with this read and norm."""
         # The kernel keeps the residual's dtype; ``hidden_states`` is the unwritten input residual.
         del hidden_states, fp32_residual_connection, branch_input_dtype
-        item = take_pending_write(self)
+        item = self.take()
         if isinstance(item, SeamInput):
             return item.branch_input, (item.residual,)
         residual, branch_input = apply_pending_write(
@@ -516,39 +522,41 @@ class WriteReadNorm(nn.Module):
         )
         return branch_input, (residual,)
 
-    def apply_with(self, read, norm) -> tuple[Tensor, Tensor]:
-        """Run a fused shortcut block's two-reader seam: apply the write handed to this read with
-        this read/norm and the block's shortcut ``read``/``norm`` in one kernel.
-
-        This read's own call then returns its normalized input. Returns ``(residual,
-        shortcut_input)``.
-        """
-        pending = take_pending_write(self)
-        gammas = (hooked_weight(self), hooked_weight(norm))  # neither module is called
-        residual, branch_input, shortcut_input = apply_pending_write(
-            pending, (self, read), gammas, self.eps, self.consumer
-        )
-        put_pending_write(self, SeamInput(residual, branch_input))
-        return residual, shortcut_input
-
     @staticmethod
     def residual_stream(state) -> Tensor:
         """The carried residual stream of a read's state."""
         return state[0]
 
 
+class ShortcutWriteReadNorm(WriteReadNorm):
+    """A fused shortcut block's shortcut read and pre-MLP RMSNorm (owning their parameters).
+
+    Called with the compute layer's WriteReadNorm, it applies the write handed to that read with
+    both reads and norms in one two-reader kernel; the compute read's own call then returns its
+    normalized input. Returns ``(residual, shortcut_input)``.
+    """
+
+    def forward(self, compute_read: WriteReadNorm) -> tuple[Tensor, Tensor]:
+        # pylint: disable=arguments-differ
+        pending = compute_read.take()
+        # The compute read's weight is used before its layer calls it: run its hooks now.
+        gammas = (hooked_weight(compute_read), self.weight)
+        residual, branch_input, shortcut_input = apply_pending_write(
+            pending, (compute_read, self), gammas, compute_read.eps, compute_read.consumer
+        )
+        compute_read.hand(SeamInput(residual, branch_input))
+        return residual, shortcut_input
+
+
 class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
     """A residual write that its linked WriteReadNorm (the next layer's read) applies in its fused
     kernel. Returns the unwritten input residual; only that read may consume it.
 
-    A fused layer spec selects this as every write but the stack's last; the stack links each one
-    to its successor's read (``link``).
+    A fused layer spec selects this as every write but the stack's last (built like a write
+    connection); the stack links each one to its successor's read (``link``).
     """
 
     target: nn.Module | None = None
-
-    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
-        super().__init__(config, layer_number, branch_name, operation="write")
 
     def link(self, target: nn.Module) -> None:
         """Hand this write to ``target``, the next layer's read (a reference, not a submodule)."""
@@ -558,21 +566,16 @@ class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
         self, branch_output, *, state, dropout_probability, training, shared=None
     ):
         """Hand this write (plus an optional shared-expert update: a shortcut add) to the target
-        read; return the unwritten residual."""
+        read as PendingWideResidualWrites; return the unwritten residual."""
         del dropout_probability, training  # fusion requires hidden_dropout == 0
-        put_pending_write(self.target, defer_write(state[0], branch_output, self, shared))
+        update, bias = branch_output
+        if bias is not None:
+            raise ValueError("fused residual seams require a bias-free branch projection")
+        retain = None if self.retention is None else self.retention(return_logits=True)
+        write_logits = self.write_map(return_logits=True)
+        pending = PendingWideResidualWrites(state[0], update, shared, write_logits, retain)
+        self.target.hand(pending)
         return state[0]
-
-
-def defer_write(residual: Tensor, branch_output, write, shared: Tensor | None = None):
-    """A branch's residual write as PendingWideResidualWrites (plus an optional shared update)."""
-    update, bias = branch_output
-    if bias is not None:
-        raise ValueError("fused residual seams require a bias-free branch projection")
-    retain = None if write.retention is None else write.retention(return_logits=True)
-    return PendingWideResidualWrites(
-        residual, update, shared, write.write_map(return_logits=True), retain
-    )
 
 
 def hooked_weight(module: nn.Module) -> Tensor:
