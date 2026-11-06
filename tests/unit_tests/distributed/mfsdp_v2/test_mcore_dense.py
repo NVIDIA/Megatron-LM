@@ -11,7 +11,7 @@ from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -82,12 +82,8 @@ def test_mxfp8_parameters(process_group_collection):
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-            fp8_param_gather=True,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params", fp8_param_gather=True
         ),
         module=block,
         pg_collection=process_group_collection,
@@ -131,11 +127,8 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
 
     wrapped = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params"
         ),
         module=meta_layer,
         fsdp_unit_modules=[TransformerLayer],
@@ -179,11 +172,8 @@ def test_wraps_fsdp_unit_modules_before_root(process_group_collection):
 
     wrapped = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params"
         ),
         module=model,
         fsdp_unit_modules=[TransformerLayer],
@@ -233,11 +223,8 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
     monkeypatch.setattr(mcore_adapter_v2, "fully_shard_context", record_fully_shard_context)
     FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            data_parallel_sharding_strategy="optim_grads_params",
-            nccl_ub=True,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params", nccl_ub=True
         ),
         module=model,
         pg_collection=process_group_collection,
@@ -247,7 +234,7 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
 
 
 def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_collection):
-    """megatron_fsdp_padded_shards=False reaches every parameter group and rejects nccl_ub."""
+    """padded_shards=False reaches every parameter group and rejects nccl_ub."""
     config = TransformerConfig(
         num_layers=1,
         hidden_size=16,
@@ -256,15 +243,12 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
         bf16=True,
         params_dtype=torch.bfloat16,
     )
-    ddp_config = DistributedDataParallelConfig(
-        use_megatron_fsdp=True,
-        megatron_fsdp_version=2,
-        data_parallel_sharding_strategy="optim_grads_params",
-        megatron_fsdp_padded_shards=False,
+    fsdp_config = FullyShardedDataParallelConfig(
+        version=2, data_parallel_sharding_strategy="optim_grads_params", padded_shards=False
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=ddp_config,
+        fsdp_config=fsdp_config,
         module=torch.nn.Linear(config.hidden_size, config.hidden_size).to(
             device="cuda", dtype=config.params_dtype
         ),
@@ -280,7 +264,7 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
     with pytest.raises(ValueError, match="incompatible with nccl_ub"):
         FullyShardedDataParallel(
             config=config,
-            ddp_config=replace(ddp_config, nccl_ub=True),
+            fsdp_config=replace(fsdp_config, nccl_ub=True),
             module=torch.nn.Linear(config.hidden_size, config.hidden_size).to(
                 device="cuda", dtype=config.params_dtype
             ),
@@ -298,11 +282,8 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
         with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
             FullyShardedDataParallel(
                 config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
+                fsdp_config=FullyShardedDataParallelConfig(
+                    version=2, data_parallel_sharding_strategy="optim_grads_params"
                 ),
                 module=layer,
                 pg_collection=process_group_collection,
@@ -327,11 +308,8 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params"
         ),
         module=layer,
         pg_collection=process_group_collection,
@@ -425,11 +403,8 @@ def test_delayed_wgrad_matches_immediate(
     def train(layer, delayed_wgrad_compute=None):
         model = FullyShardedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
+            fsdp_config=FullyShardedDataParallelConfig(
+                version=2, data_parallel_sharding_strategy="optim_grads_params"
             ),
             module=layer,
             pg_collection=process_group_collection,
@@ -504,17 +479,14 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-    model = FullyShardedDataParallel(
-        config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-        ),
-        module=model,
-        pg_collection=process_group_collection,
+    fsdp_config = FullyShardedDataParallelConfig(
+        version=2, data_parallel_sharding_strategy="optim_grads_params"
     )
+    model = FullyShardedDataParallel(
+        config=config, module=model, pg_collection=process_group_collection, fsdp_config=fsdp_config
+    )
+    assert model.fsdp_config == fsdp_config.resolved()
+    assert not hasattr(model, "ddp_config")
 
     reference_optimizer_config = OptimizerConfig(
         optimizer="adam",
@@ -592,13 +564,11 @@ def test_fused_sgd_casts_mismatched_grads(process_group_collection):
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            megatron_fsdp_main_params_dtype=torch.float32,
-            megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.bfloat16,
         ),
         module=TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
             device="cuda", dtype=config.params_dtype
@@ -655,12 +625,10 @@ def test_gradient_clipping_reaches_global_norm(
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            megatron_fsdp_main_grads_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
         ),
         module=TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
             device="cuda", dtype=config.params_dtype
@@ -736,11 +704,8 @@ def test_transformer_layer_weights_released_before_final_callback(process_group_
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params"
         ),
         module=block,
         pg_collection=process_group_collection,

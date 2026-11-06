@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """Pipeline-parallel context-sharing test for MFSDP v2.
 
 ``virtual_pipeline_model_parallel_size > 1`` manifests as multiple model chunks
@@ -16,7 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
+from megatron.core.distributed import FullyShardedDataParallel, FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
@@ -39,12 +40,10 @@ class _VirtualPipelineChunk(nn.Module):
         return self.fc(x)
 
 
-def _mfsdp_v2_ddp_config() -> DistributedDataParallelConfig:
-    """A DistributedDataParallelConfig accepted by MFSDP v2 validation."""
-    return DistributedDataParallelConfig(
-        use_megatron_fsdp=True,
-        megatron_fsdp_version=2,
-        data_parallel_sharding_strategy="optim_grads_params",
+def _mfsdp_v2_fsdp_config() -> FullyShardedDataParallelConfig:
+    """A FullyShardedDataParallelConfig accepted by MFSDP v2 validation."""
+    return FullyShardedDataParallelConfig(
+        version=2, data_parallel_sharding_strategy="optim_grads_params"
     )
 
 
@@ -81,7 +80,7 @@ class TestMfsdpV2PipelineSharedContext:
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,
             _compute_config(),
-            _mfsdp_v2_ddp_config(),
+            _mfsdp_v2_fsdp_config(),
             DP=FullyShardedDataParallel,
             pg_collection=self.pg_collection,
             disable_bucketing_per_chunk=[False] * len(chunks),

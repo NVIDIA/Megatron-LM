@@ -27,7 +27,9 @@ from torch.distributed import DeviceMesh
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -96,7 +98,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
     @staticmethod
     def _fine_grained_recurse_module_types(
-        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+        config: TransformerConfig, fsdp_config: FullyShardedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
         recurse_types: List[Type[nn.Module]] = []
@@ -109,7 +111,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             recurse_types.append(DSAttention)
 
         if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
-            ddp_config, ["optim_grads_params"]
+            fsdp_config, ["optim_grads_params"]
         ):
             # Lazy import to avoid circular chain.
             from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -121,7 +123,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
     def __init__(
         self,
         config: TransformerConfig,
-        ddp_config: DistributedDataParallelConfig,
+        fsdp_config: FullyShardedDataParallelConfig,
         module: torch.nn.Module,
         # This should be named fsdp_unit_module_types; the v1 name is retained for API
         # compatibility.
@@ -130,6 +132,12 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        if not isinstance(fsdp_config, FullyShardedDataParallelConfig):
+            raise TypeError("fsdp_config must be a FullyShardedDataParallelConfig")
+        if fsdp_config.version != 1:
+            raise ValueError("FullyShardedDataParallelV1 requires version=1")
+        fsdp_config = fsdp_config.resolved()
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
@@ -147,16 +155,16 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
         self.num_moe_experts = getattr(config, "num_moe_experts", None)
 
-        self.ddp_config = ddp_config
+        self.fsdp_config = fsdp_config
         log_single_rank(
             logger,
             logging.INFO,
-            f'Setting up DistributedDataParallel with config {self.ddp_config}',
+            f'Setting up DistributedDataParallel with config {self.fsdp_config}',
         )
         self.mp_policy = MixedPrecisionPolicy(
-            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
-            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
-            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+            main_params_dtype=fsdp_config.main_params_dtype,
+            main_grads_dtype=fsdp_config.main_grads_dtype,
+            grad_comm_dtype=fsdp_config.grad_comm_dtype,
         )
         log_single_rank(
             logger,
@@ -172,7 +180,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "Transformer Engine version 2.10 or higher."
             )
 
-        self.bucket_size = self.ddp_config.bucket_size
+        self.bucket_size = self.fsdp_config.bucket_size
         if disable_bucketing:
             self.bucket_size = None
         self.device = device if device else torch.device(f'cuda:{torch.cuda.current_device()}')
@@ -186,7 +194,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             # "optim_grads_params": RS & AG communication groups on all microbatches.
             # Units are worth forming if either parameter class shards anything, so both
             # strategies have to be consulted.
-            if not all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
+            if not all_sharding_strategies_in(self.fsdp_config, ["no_shard"]):
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
@@ -194,9 +202,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
+            assert not fsdp_config.double_buffer, (
                 "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
+                "Please set double_buffer=False in the ddp config."
             )
             assert config.cuda_graph_impl in ("none", "full_iteration"), (
                 "1F1B overlap with FSDP does not support per-layer CUDA graphs "
@@ -206,7 +214,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             )
 
         if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
-            ddp_config, ["optim_grads_params"]
+            fsdp_config, ["optim_grads_params"]
         ):
             supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             assert self.fsdp_unit_modules and all(
@@ -220,7 +228,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         super().__init__(
             config=config,
             module=MegatronFSDP(
-                ddp_config=ddp_config,
+                fsdp_config=fsdp_config,
                 mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
@@ -237,19 +245,20 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 # also maintain per-module training-state bookkeeping that the
                 # gradient-reduction pipeline relies on.
                 enable_fine_grained_param_gather_hook=(
-                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    (config.fp8_recipe == "mxfp8" and fsdp_config.fp8_param_gather)
                     or config.overlap_moe_expert_parallel_comm
-                    or self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
+                    or self.fsdp_config.enable_fine_grained_param_gather
                 ),
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
-                    and any_sharding_strategy_in(ddp_config, ["optim_grads_params"])
+                    and any_sharding_strategy_in(fsdp_config, ["optim_grads_params"])
                 ),
                 fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
-                    config, ddp_config
+                    config, fsdp_config
                 ),
             ),
         )
+        self.fsdp_config = self.module.fsdp_config
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
         self.no_sync = self.module.no_sync
         self.start_param_sync = self.module.start_param_sync
@@ -361,7 +370,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         """
         Initialize the distributed index for the module.
         """
-        enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
+        enable_hsdp = self.fsdp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
             expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
@@ -435,7 +444,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 expt_device_mesh = None
             mesh = _get_hsdp_tp_mesh(outer_fsdp_group, dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
-                hsdp_outer_dp_shard=self.ddp_config.outer_dp_sharding_strategy != "no_shard",
+                hsdp_outer_dp_shard=self.fsdp_config.outer_dp_sharding_strategy != "no_shard",
                 device_mesh=DeviceMesh.from_group(
                     [outer_fsdp_group, dp_cp_group, tp_group],
                     device_type="cuda",

@@ -1,10 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import gc
 
 import pytest
 import torch
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
 from megatron.core.pipeline_parallel.utils import set_streams
@@ -124,13 +125,12 @@ class TestDelayWgradCompute:
         per-step loss and final weights as the non-delayed FSDP baseline.
         """
 
-        def _make_ddp_config():
-            return DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
+        def _make_fsdp_config():
+            return FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
-                megatron_fsdp_main_params_dtype=None,
+                main_params_dtype=None,
             )
 
         num_layers = 4
@@ -146,7 +146,7 @@ class TestDelayWgradCompute:
 
             ref_fsdp = FullyShardedDataParallel(
                 config=ref_config,
-                ddp_config=_make_ddp_config(),
+                fsdp_config=_make_fsdp_config(),
                 module=ref_model,
                 fsdp_unit_modules=[TransformerLayer],
             )
@@ -160,7 +160,7 @@ class TestDelayWgradCompute:
 
             test_fsdp = FullyShardedDataParallel(
                 config=test_config,
-                ddp_config=_make_ddp_config(),
+                fsdp_config=_make_fsdp_config(),
                 module=test_model,
                 fsdp_unit_modules=[TransformerLayer],
             )
@@ -199,13 +199,12 @@ class TestDelayWgradCompute:
         """
         set_streams()
 
-        def _make_ddp_config():
-            return DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
+        def _make_fsdp_config():
+            return FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy=sharding_strategy,
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
-                megatron_fsdp_main_params_dtype=None,
+                main_params_dtype=None,
             )
 
         num_layers = 2
@@ -223,7 +222,7 @@ class TestDelayWgradCompute:
 
             ref_fsdp = FullyShardedDataParallel(
                 config=ref_config,
-                ddp_config=_make_ddp_config(),
+                fsdp_config=_make_fsdp_config(),
                 module=ref_model,
                 fsdp_unit_modules=[TransformerLayer],
             )
@@ -242,7 +241,7 @@ class TestDelayWgradCompute:
 
             test_fsdp = FullyShardedDataParallel(
                 config=test_config,
-                ddp_config=_make_ddp_config(),
+                fsdp_config=_make_fsdp_config(),
                 module=test_model,
                 fsdp_unit_modules=[TransformerLayer],
             )

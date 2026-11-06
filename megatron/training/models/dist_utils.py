@@ -11,6 +11,8 @@ from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
+    FullyShardedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.full_cuda_graph import get_shared_capture_stream
@@ -51,7 +53,7 @@ def unimodal_build_distributed_models(
     build_model_func: Callable,
     transformer_config: TransformerConfig,
     pg_collection: ProcessGroupCollection,
-    ddp_config: DistributedDataParallelConfig | None = None,
+    data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
     overlap_param_gather_with_optimizer_step: bool = False,
     use_megatron_fsdp: bool = False,
     use_torch_fsdp2: bool = False,
@@ -80,7 +82,8 @@ def unimodal_build_distributed_models(
         build_model_func: Callable that builds a single model stage (e.g. ``ModelBuilder.build_model``).
         transformer_config: TransformerConfig; used for VP size, precision, and device placement.
         pg_collection: Model communication process groups.
-        ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
+        data_parallel_config: DDP or FSDP configuration; its type selects the backend.
+
         overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step.
         use_megatron_fsdp: Whether to use Megatron FSDP.
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
@@ -97,8 +100,10 @@ def unimodal_build_distributed_models(
     Returns:
         List of model stages, wrapped and ready for distributed training.
     """
-    if wrap_with_ddp and not ddp_config:
-        raise ValueError("ddp_config is required when wrap_with_ddp is True")
+    use_megatron_fsdp = use_megatron_fsdp or isinstance(data_parallel_config, FullyShardedDataParallelConfig)
+    use_torch_fsdp2 = use_torch_fsdp2 or isinstance(data_parallel_config, TorchFullyShardedDataParallelConfig)
+    if wrap_with_ddp and not data_parallel_config:
+        raise ValueError("data_parallel_config is required when wrap_with_ddp is True")
 
     vp_size = transformer_config.virtual_pipeline_model_parallel_size
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
@@ -122,7 +127,7 @@ def unimodal_build_distributed_models(
         model_list,
         transformer_config,
         pg_collection,
-        ddp_config=ddp_config,
+        data_parallel_config=data_parallel_config,
         overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
         use_megatron_fsdp=use_megatron_fsdp,
         use_torch_fsdp2=use_torch_fsdp2,
@@ -138,7 +143,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     model_list: list[MegatronModule],
     transformer_config: TransformerConfig,
     pg_collection: ProcessGroupCollection,
-    ddp_config: DistributedDataParallelConfig | None = None,
+    data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
     overlap_param_gather_with_optimizer_step: bool = False,
     use_megatron_fsdp: bool = False,
     use_torch_fsdp2: bool = False,
@@ -157,7 +162,8 @@ def prepare_existing_model_chunks_for_distributed_training(
         model_list: Already-built model chunks.
         transformer_config: TransformerConfig; used for precision and device placement.
         pg_collection: Model communication process groups.
-        ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
+        data_parallel_config: DDP or FSDP configuration; its type selects the backend.
+
         overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step.
         use_megatron_fsdp: Whether to use Megatron FSDP.
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
@@ -172,8 +178,10 @@ def prepare_existing_model_chunks_for_distributed_training(
     Returns:
         List of model chunks, wrapped and ready for distributed training.
     """
-    if wrap_with_ddp and not ddp_config:
-        raise ValueError("ddp_config is required when wrap_with_ddp is True")
+    use_megatron_fsdp = use_megatron_fsdp or isinstance(data_parallel_config, FullyShardedDataParallelConfig)
+    use_torch_fsdp2 = use_torch_fsdp2 or isinstance(data_parallel_config, TorchFullyShardedDataParallelConfig)
+    if wrap_with_ddp and not data_parallel_config:
+        raise ValueError("data_parallel_config is required when wrap_with_ddp is True")
 
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
 
@@ -211,7 +219,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         model_list = _ddp_wrap(
             model_list,
             data_parallel_random_init,
-            ddp_config,
+            data_parallel_config,
             overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=use_megatron_fsdp,
             use_torch_fsdp2=use_torch_fsdp2,
@@ -274,7 +282,7 @@ def _wrap_with_mp_wrapper(
 def _ddp_wrap(
     model: list[MegatronModule],
     data_parallel_random_init: bool,
-    ddp_config: DistributedDataParallelConfig,
+    data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig,
     overlap_param_gather_with_optimizer_step: bool,
     use_megatron_fsdp: bool = False,
     use_torch_fsdp2: bool = False,
@@ -288,7 +296,7 @@ def _ddp_wrap(
     Args:
         model: List of model modules to wrap
         data_parallel_random_init: Whether to broadcast parameters from rank 0
-        ddp_config: Configuration for distributed data parallel
+        data_parallel_config: Configuration for the selected data-parallel backend
         overlap_param_gather_with_optimizer_step: Whether to disable bucketing
             for overlapping parameter gathering with optimizer step
         use_megatron_fsdp: Whether to use Megatron FSDP.
@@ -302,34 +310,39 @@ def _ddp_wrap(
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
     """
+    use_megatron_fsdp = use_megatron_fsdp or isinstance(data_parallel_config, FullyShardedDataParallelConfig)
+    use_torch_fsdp2 = use_torch_fsdp2 or isinstance(data_parallel_config, TorchFullyShardedDataParallelConfig)
     if use_megatron_fsdp:
         DP = FullyShardedDataParallel
         if use_torch_fsdp2:
             raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
+        if not isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+            raise TypeError("Megatron-FSDP requires FullyShardedDataParallelConfig")
     elif use_torch_fsdp2:
         assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
         DP = TorchFullyShardedDataParallel
     else:
         DP = DistributedDataParallel
 
-
     if not use_torch_fsdp2:
-        if ddp_config.num_buckets is not None:
+        if data_parallel_config.num_buckets is not None:
             num_parameters = sum(
                 [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
             )
-            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
+            data_parallel_config.bucket_size = num_parameters // data_parallel_config.num_buckets
+            if isinstance(data_parallel_config, FullyShardedDataParallelConfig) and data_parallel_config.version == 1:
+                data_parallel_config.num_buckets = None
 
         # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
+        if data_parallel_config.bucket_size is None:
+            data_parallel_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+        if not data_parallel_config.overlap_grad_reduce:
+            data_parallel_config.bucket_size = None
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
@@ -342,7 +355,7 @@ def _ddp_wrap(
         and use_layer_wise_distributed_optimizer
         and use_layer_wise_param_layout
     ):
-        ddp_config.use_distributed_optimizer = True
+        data_parallel_config.use_distributed_optimizer = True
         compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
         # Tag params so DDP buffer grouping routes LayerWise-managed matrices
         # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
@@ -384,16 +397,16 @@ def _ddp_wrap(
         # ambient context around the loop below puts every chunk of this call on the same
         # context, sharing communication streams and prefetch orders. Mirrors
         # wrap_model_chunks_with_ddp() in megatron/training/training.py.
-        is_mfsdp_v2 = (
-            DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
-        ) and ddp_config.megatron_fsdp_version == 2
+        is_mfsdp_v2 = (DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2) and (
+            data_parallel_config.version
+        ) == 2
         construction_context = (
             fully_shard_context(
                 FsdpContext(
                     runtime_policy=RuntimePolicy(
-                        use_symmetric_memory=ddp_config.nccl_ub,
+                        use_symmetric_memory=data_parallel_config.nccl_ub,
                         caller_managed_grad_sync=True,
-                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                        overlap_outer_communication=data_parallel_config.overlap_outer_communication,
                     )
                 )
             )
@@ -411,7 +424,7 @@ def _ddp_wrap(
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
+                if DP is DistributedDataParallel and data_parallel_config.use_distributed_optimizer:
                     all_params = [
                         p for p in model_chunk.parameters() if p.requires_grad
                     ]
@@ -419,7 +432,7 @@ def _ddp_wrap(
                     effective_bucket_size = (
                         None
                         if disable_bucketing or pp_rank > 0
-                        else ddp_config.bucket_size
+                        else data_parallel_config.bucket_size
                     )
                     # Size the layout by the group the optimizer actually shards over, which is
                     # the intra-instance group when there are several optimizer instances. Using
@@ -435,7 +448,7 @@ def _ddp_wrap(
                             if intra_dp_cp_group is not None
                             else pg_collection.dp_cp
                         ).size(),
-                        ddp_config,
+                        data_parallel_config,
                         expert_data_parallel_world_size=(
                             intra_expt_dp_group
                             if intra_expt_dp_group is not None
@@ -443,9 +456,12 @@ def _ddp_wrap(
                         ).size(),
                     )
 
+                if isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+                    chunk_kwargs["fsdp_config"] = data_parallel_config
+                else:
+                    chunk_kwargs["ddp_config"] = data_parallel_config
                 wrapped_chunk = DP(
                     config=get_model_config(model_chunk),
-                    ddp_config=ddp_config,
                     module=model_chunk,
                     disable_bucketing=disable_bucketing,
                     **chunk_kwargs,

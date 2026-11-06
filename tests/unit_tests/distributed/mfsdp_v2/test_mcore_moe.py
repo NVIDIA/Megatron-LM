@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """MoE training and gradient clipping tests for the MFSDP v2 adapter."""
 
 import logging
@@ -9,7 +10,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -119,12 +120,10 @@ def test_standard_moe_training_and_clipping(
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
     model = FullyShardedDataParallel(
         config=model.config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
+            all_gather_in_start_param_sync=False,
         ),
         module=model,
         pg_collection=process_group_collection,
@@ -224,12 +223,10 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
     model = FullyShardedDataParallel(
         config=model.config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
+            all_gather_in_start_param_sync=False,
         ),
         module=model,
         pg_collection=process_group_collection,

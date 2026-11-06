@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """``fsdp_dtensor`` checkpoint round-trip tests for the MFSDP v2 MCore optimizer."""
 
 from pathlib import Path
@@ -10,7 +11,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.tensor import DTensor
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
@@ -72,14 +73,12 @@ def _shard_and_build_optimizer(
     """
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=True,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            megatron_fsdp_main_params_dtype=torch.float32,
-            megatron_fsdp_main_grads_dtype=torch.bfloat16,
-            fsdp_all_gather_in_start_param_sync=False,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.bfloat16,
+            all_gather_in_start_param_sync=False,
         ),
         module=module,
         pg_collection=pg_collection,

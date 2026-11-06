@@ -7,6 +7,9 @@ from typing import Any, Callable, ClassVar, Literal, override
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -224,7 +227,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     def build_distributed_models(
         self,
         pg_collection: ProcessGroupCollection,
-        ddp_config: DistributedDataParallelConfig | None = None,
+        data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
         overlap_param_gather_with_optimizer_step: bool = False,
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
@@ -241,7 +244,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
 
         Args:
             pg_collection: Model communication process groups.
-            ddp_config: DistributedDataParallel configuration
+            data_parallel_config: DDP or FSDP configuration; its type selects the backend.
+
             overlap_param_gather_with_optimizer_step: Whether to overlap parameter
                 gather with optimizer step.
             use_megatron_fsdp: Whether to use Megatron FSDP
@@ -263,7 +267,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             self.build_model,
             transformer_config,
             pg_collection,
-            ddp_config,
+            data_parallel_config,
             overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp,
             use_torch_fsdp2,

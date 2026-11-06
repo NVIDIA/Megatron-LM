@@ -18,8 +18,10 @@ from megatron.core.distributed.distributed_data_parallel import (
     DistributedDataParallel,
     _BucketParamReadyCallback,
 )
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
@@ -171,7 +173,7 @@ class TestDSAFineGrainedReadiness:
         )
 
         recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
-            config, DistributedDataParallelConfig()
+            config, FullyShardedDataParallelConfig()
         )
 
         assert DSAttention in recurse_types
@@ -180,7 +182,7 @@ class TestDSAFineGrainedReadiness:
         config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
 
         recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
-            config, DistributedDataParallelConfig()
+            config, FullyShardedDataParallelConfig()
         )
 
         assert DSAttention not in recurse_types

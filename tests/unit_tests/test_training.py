@@ -162,10 +162,14 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         use_megatron_fsdp=not megatron_fsdp,
     )
     run_config.dist.use_torch_fsdp2 = fsdp2
-    run_config.ddp = (
-        training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+    run_config.data_parallel = (
+        training.TorchFullyShardedDataParallelConfig()
         if fsdp2
-        else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+        else (
+            training.FullyShardedDataParallelConfig()
+            if megatron_fsdp
+            else training.DistributedDataParallelConfig()
+        )
     )
     builder = Mock()
     run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
@@ -186,10 +190,10 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     with pytest.raises(ReachedBuilder):
         training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
     kwargs = builder.build_distributed_models.call_args.kwargs
-    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["data_parallel_config"] is run_config.data_parallel_config
     assert kwargs["use_torch_fsdp2"] is fsdp2
-    # Forward both flags unchanged, including the pair rejected by the builder.
-    assert kwargs["use_megatron_fsdp"] is megatron_fsdp
+    # The config type owns backend selection; stale CLI flags do not override it.
+    assert kwargs["use_megatron_fsdp"] is (megatron_fsdp and not fsdp2)
 
 
 @pytest.mark.parametrize("optimizer", [None, "optimizer"])

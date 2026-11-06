@@ -15,12 +15,12 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoEncoderFloat16Module, MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module
+from megatron.training.global_vars import get_run_config
 from megatron.training.initialize import _set_random_seed
 from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
 )
 from megatron.training.utils import print_rank_0
-from megatron.training.global_vars import get_run_config
 
 # Preserve the previous example-local import path.
 _EncoderFloat16Module = MimoEncoderFloat16Module
@@ -117,7 +117,7 @@ def wrap_active_modules_with_ddp(
             [mimo_model.language_model],
             lm_config,
             topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
-            ddp_config=_ddp_config_for_role(ddp_config, enable_overlap=True),
+            data_parallel_config=_ddp_config_for_role(ddp_config, enable_overlap=True),
             data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=Float16Module,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
@@ -135,7 +135,7 @@ def wrap_active_modules_with_ddp(
                 [submodule],
                 enc_config,
                 topology.module_pgs[name],
-                ddp_config=_ddp_config_for_role(
+                data_parallel_config=_ddp_config_for_role(
                     ddp_config, enable_overlap=getattr(args, "mimo_encoder_ddp_overlap", False)
                 ),
                 data_parallel_random_init=data_parallel_random_init,

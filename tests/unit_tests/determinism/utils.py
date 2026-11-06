@@ -298,19 +298,17 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     if parallelism.get("FSDP", 1) <= 1:
         return model
 
-    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.distributed import FullyShardedDataParallelConfig
     from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    ddp_config = DistributedDataParallelConfig(
-        grad_reduce_in_fp32=False,
+    fsdp_config = FullyShardedDataParallelConfig(
         overlap_grad_reduce=False,  # determinism — disable async overlap
         overlap_param_gather=False,
-        use_distributed_optimizer=True,
         bucket_size=40_000_000,
     )
     config = getattr(model, "config", None)
     return FullyShardedDataParallel(
-        config=config, ddp_config=ddp_config, module=model, pg_collection=pg_collection
+        config=config, fsdp_config=fsdp_config, module=model, pg_collection=pg_collection
     )

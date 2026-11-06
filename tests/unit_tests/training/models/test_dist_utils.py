@@ -1,11 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    FullyShardedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
@@ -17,6 +23,64 @@ from megatron.training.models.dist_utils import (
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_independent_fsdp_config_selects_backend_and_shared_context(version):
+    config = FullyShardedDataParallelConfig(version=version)
+    models = [Mock(), Mock()]
+    with (
+        patch("megatron.training.models.dist_utils.FullyShardedDataParallel") as fsdp,
+        patch("megatron.training.models.dist_utils.DistributedDataParallel") as ddp,
+        patch("megatron.training.models.dist_utils.get_model_config") as get_config,
+        patch("megatron.training.models.dist_utils.fully_shard_context") as context,
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        get_config.return_value.cuda_graph_impl = "none"
+        context.return_value = nullcontext()
+        _ddp_wrap(models, False, config, False, pg_collection=_make_pg())
+        ddp.assert_not_called()
+        assert fsdp.call_count == 2
+        for index, call in enumerate(fsdp.call_args_list):
+            assert isinstance(call.kwargs["fsdp_config"], FullyShardedDataParallelConfig)
+            assert call.kwargs["fsdp_config"].version == version
+            assert call.kwargs["fsdp_config"] is config
+            assert "ddp_config" not in call.kwargs
+            assert call.kwargs["disable_bucketing"] == (version == 1 and index > 0)
+        if version == 2:
+            context.assert_called_once()
+            assert context.call_args.args[0].use_symmetric_memory is False
+            assert context.call_args.args[0].caller_managed_grad_sync is True
+        else:
+            context.assert_not_called()
+
+
+def test_torch_fsdp_config_selects_its_own_backend():
+    config = TorchFullyShardedDataParallelConfig()
+    with (
+        patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel") as torch_fsdp,
+        patch("megatron.training.models.dist_utils.FullyShardedDataParallel") as fsdp,
+        patch("megatron.training.models.dist_utils.get_model_config") as get_config,
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        get_config.return_value.cuda_graph_impl = "none"
+        _ddp_wrap([Mock()], False, config, False, pg_collection=_make_pg())
+        torch_fsdp.assert_called_once()
+        fsdp.assert_not_called()
+
+
+def test_builder_rejects_legacy_config_keyword():
+    with pytest.raises(TypeError, match="ddp_config"):
+        unimodal_build_distributed_models(
+            Mock(),
+            Mock(),
+            Mock(),
+            ddp_config=Mock(),
+            data_parallel_config=FullyShardedDataParallelConfig(),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -390,9 +454,7 @@ class TestDdpWrap:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        _ddp_wrap(
-            self.model, False, self.ddp_config, False, use_megatron_fsdp=True, pg_collection=self.pg
-        )
+        _ddp_wrap(self.model, False, FullyShardedDataParallelConfig(), False, pg_collection=self.pg)
         assert mock_fsdp.call_count == 2
         mock_ddp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
@@ -792,8 +854,7 @@ class TestDdpWrapFullParamLayout:
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
         chunk, _ = self._make_chunk_with_params()
-        ddp_config = self._ddp_config()
-        _ddp_wrap([chunk], False, ddp_config, False, use_megatron_fsdp=True, pg_collection=self.pg)
+        _ddp_wrap([chunk], False, FullyShardedDataParallelConfig(), False, pg_collection=self.pg)
         self._opt.compute_full_param_layout.assert_not_called()
         assert "full_param_layout" not in mock_fsdp.call_args.kwargs
 
@@ -944,7 +1005,11 @@ class TestUnimodalBuildDistributedModels:
         try:
             with pytest.raises(ValueError):
                 unimodal_build_distributed_models(
-                    Mock(), self.transformer_config, self.pg, ddp_config=None, wrap_with_ddp=True
+                    Mock(),
+                    self.transformer_config,
+                    self.pg,
+                    data_parallel_config=None,
+                    wrap_with_ddp=True,
                 )
         finally:
             self._stop_patches()
@@ -1181,7 +1246,11 @@ class TestUnimodalBuildDistributedModels:
         try:
             ddp_config = Mock()
             unimodal_build_distributed_models(
-                Mock(), self.transformer_config, self.pg, ddp_config=ddp_config, wrap_with_ddp=True
+                Mock(),
+                self.transformer_config,
+                self.pg,
+                data_parallel_config=ddp_config,
+                wrap_with_ddp=True,
             )
             mocks["ddp"].assert_called_once()
         finally:
@@ -1204,7 +1273,11 @@ class TestUnimodalBuildDistributedModels:
             ddp_result = [_make_model_module()]
             mocks["ddp"].side_effect = lambda m, *args, **kwargs: ddp_result
             result = unimodal_build_distributed_models(
-                Mock(), self.transformer_config, self.pg, ddp_config=ddp_config, wrap_with_ddp=True
+                Mock(),
+                self.transformer_config,
+                self.pg,
+                data_parallel_config=ddp_config,
+                wrap_with_ddp=True,
             )
             assert result is ddp_result
         finally:

@@ -145,7 +145,9 @@ def container_factory(monkeypatch):
     from megatron.training import training
 
     monkeypatch.setattr(
-        training, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
+        training,
+        "get_megatron_data_parallel_config",
+        lambda args, **_: DistributedDataParallelConfig(),
     )
 
     def build(argv, *, data=False, **kwargs):

@@ -1267,6 +1267,7 @@ class PagedStashRunner:
                 if (
                     isinstance(opt, DistributedOptimizer)
                     and hasattr(opt, 'shard_fp32_from_float16_groups')
+                    and opt.ddp_config is not None
                     and opt.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
                     and opt.ddp_config.overlap_param_gather
                 ):

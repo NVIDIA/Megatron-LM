@@ -151,7 +151,7 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
             # After the first iteration, user need to call the
             # ParamAndGradBuffer.manual_buffer_registration() function in the training loop
             if (iteration ==  start_iteration + 1):
-                if isinstance(model, megatron_FSDP) and model.ddp_config.fsdp_manual_registration:
+                if isinstance(model, megatron_FSDP) and model.fsdp_config.manual_registration:
                     param_and_grad_buffer = getattr(model, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()

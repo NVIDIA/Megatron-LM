@@ -81,10 +81,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
-        self.ddp_config = self.model_chunks[0].ddp_config
+        self.fsdp_config = self.model_chunks[0].fsdp_config
         for model_chunk in self.model_chunks:
-            if self.ddp_config != model_chunk.ddp_config:
-                raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
+            if self.fsdp_config != model_chunk.fsdp_config:
+                raise ValueError("All MFSDP v2 model chunks must share the same fsdp_config.")
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
         # Each parameter's globally unique checkpoint name, mirroring

@@ -8,6 +8,8 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from ..distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from ..distributed.fully_sharded_data_parallel_config import FullyShardedDataParallelConfig
 from ..utils import is_te_min_version
 
 logger = logging.getLogger(__name__)
@@ -597,13 +599,13 @@ class OptimizerConfig:
     def validate_run(
         self,
         *,
-        ddp_config: "DistributedDataParallelConfig",
+        data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig,
         use_torch_fsdp2: bool,
         ckpt_format: str | None,
     ) -> None:
         """Check settings shared with DDP and checkpointing without modifying them."""
         if self.optimizer_cpu_offload:
-            assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
+            assert not data_parallel_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
                 "must be used in conjunction with `--fp8-recipe delayed`."
             )
@@ -615,14 +617,14 @@ class OptimizerConfig:
             assert (
                 self.use_distributed_optimizer
                 or self.use_layer_wise_distributed_optimizer
-                or ddp_config.use_megatron_fsdp
+                or isinstance(data_parallel_config, FullyShardedDataParallelConfig)
                 or self.optimizer == 'dist_muon'
             ), (
                 '--overlap-param-gather only supported with distributed optimizer, '
                 'megatron fsdp, or dist_muon'
             )
             assert (
-                ddp_config.overlap_grad_reduce
+                data_parallel_config.overlap_grad_reduce
             ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
 
         if self.use_distributed_optimizer:

@@ -782,15 +782,15 @@ class TestRLUtils:
             rl_training_cuda_graphs=False,
         )
         cfg = pretrain_cfg_container_from_args(args)
-        assert not cfg.ddp.grad_buffer_offload
+        assert not cfg.data_parallel.grad_buffer_offload
         cfg.rl.rl_offload_optimizer_during_inference = False
         cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
+        assert not cfg.data_parallel.grad_buffer_offload
         cfg.rl.rl_offload_optimizer_during_inference = True
         cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
-        cfg.rl.finalize_ddp_config(cfg.ddp)
-        assert cfg.ddp.grad_buffer_offload
+        assert not cfg.data_parallel.grad_buffer_offload
+        cfg.rl.finalize_ddp_config(cfg.data_parallel)
+        assert cfg.data_parallel.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
         args = self.create_test_args(
@@ -804,10 +804,10 @@ class TestRLUtils:
         )
         cfg = pretrain_cfg_container_from_args(args)
         # Global setup validates the config, so introduce the invalid combination afterward.
-        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        cfg.data_parallel.reuse_grad_buf_for_mxfp8_param_ag = True
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
             cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
+        assert not cfg.data_parallel.grad_buffer_offload
 
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]

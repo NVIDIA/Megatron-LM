@@ -126,7 +126,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
     def build_distributed_models(
         self,
         pg_collection: ProcessGroupCollection,
-        ddp_config: DistributedDataParallelConfig | None = None,
+        data_parallel_config: DistributedDataParallelConfig | None = None,
         overlap_param_gather_with_optimizer_step: bool = False,
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
@@ -142,8 +142,8 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if use_megatron_fsdp or use_torch_fsdp2:
             raise NotImplementedError("MIMO training with FSDP/FSDP2 has not been tested yet.")
-        if wrap_with_ddp and ddp_config is None:
-            raise ValueError("ddp_config is required when wrap_with_ddp is True")
+        if wrap_with_ddp and data_parallel_config is None:
+            raise ValueError("data_parallel_config is required when wrap_with_ddp is True")
         topology = self._topology
         args = get_args()
         _, is_language, active_pg = _resolve_role(topology)
@@ -176,7 +176,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             args,
             mimo_model,
             topology,
-            ddp_config=ddp_config,
+            ddp_config=data_parallel_config,
             data_parallel_random_init=data_parallel_random_init,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,

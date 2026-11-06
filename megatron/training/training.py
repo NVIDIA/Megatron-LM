@@ -48,6 +48,7 @@ from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
+    FullyShardedDataParallelConfig,
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
 )
@@ -2417,7 +2418,7 @@ def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_pa
 def wrap_model_chunks_with_ddp(
     model_chunks,
     config,
-    ddp_config,
+    data_parallel_config,
     *,
     use_layer_wise_distributed_optimizer=False,
     use_layer_wise_param_layout=True,
@@ -2432,13 +2433,13 @@ def wrap_model_chunks_with_ddp(
     unit tests.
 
     For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
-    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
+    forces ``data_parallel_config.use_distributed_optimizer=True`` (mutated in place; needed
     for reduce-scatter), and computes per-chunk shard-aligned layouts via
     :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
     ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
     to its legacy ``allgather_params`` sync path.
 
-    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
+    For non-layerwise with ``data_parallel_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
     :meth:`DistributedOptimizer.compute_full_param_layout`.
 
@@ -2451,7 +2452,7 @@ def wrap_model_chunks_with_ddp(
     Args:
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
-        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
+        data_parallel_config: :class:`DistributedDataParallelConfig`. Mutated in place when
             ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
@@ -2463,16 +2464,21 @@ def wrap_model_chunks_with_ddp(
             forwarded to both standard DDP and FSDP variants, and used to source
             DP world sizes for layout computation.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
-            ``[ddp_config.bucket_size] * len(model_chunks)``.
+            ``[data_parallel_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
             defaults to ``[False] * len(model_chunks)``.
 
     Returns:
         List of DDP-wrapped chunks.
     """
+    if isinstance(data_parallel_config, FullyShardedDataParallelConfig) and DP is DDP:
+        DP = FullyShardedDataParallel
+    if DP in (FullyShardedDataParallel, FullyShardedDataParallelV1, FullyShardedDataParallelV2):
+        if not isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+            raise TypeError("Megatron-FSDP requires FullyShardedDataParallelConfig")
     n = len(model_chunks)
     if bucket_sizes is None:
-        bucket_sizes = [ddp_config.bucket_size] * n
+        bucket_sizes = [data_parallel_config.bucket_size] * n
     if disable_bucketing_per_chunk is None:
         disable_bucketing_per_chunk = [False] * n
 
@@ -2480,14 +2486,14 @@ def wrap_model_chunks_with_ddp(
     per_chunk_layouts = [None] * n
     if DP is DDP:
         if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
-            ddp_config.use_distributed_optimizer = True
+            data_parallel_config.use_distributed_optimizer = True
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
             # Tag params so DDP buffer grouping routes LayerWise-managed matrices
             # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
             # everything else (embeddings, biases, layernorm) to a separate
             # DistOpt-style buffer.
             tag_params_for_buffer_routing(model_chunks)
-        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
+        elif not use_layer_wise_distributed_optimizer and data_parallel_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
             compute_layout = None
@@ -2523,7 +2529,7 @@ def wrap_model_chunks_with_ddp(
                     all_params,
                     bucket_size,
                     data_parallel_world_size,
-                    ddp_config,
+                    data_parallel_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
                 )
 
@@ -2539,16 +2545,16 @@ def wrap_model_chunks_with_ddp(
     # one when none is (see ``current_fully_shard_context``), so opening one ambient context
     # around the loop below puts every chunk of this call on the same context, sharing
     # communication streams and prefetch orders. This scope owns the single finalize call.
-    is_mfsdp_v2 = (
-        DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
-    ) and ddp_config.megatron_fsdp_version == 2
+    is_mfsdp_v2 = (DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2) and (
+        data_parallel_config.version
+    ) == 2
     construction_context = (
         fully_shard_context(
             FsdpContext(
                 runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ddp_config.nccl_ub,
+                    use_symmetric_memory=data_parallel_config.nccl_ub,
                     caller_managed_grad_sync=True,
-                    overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    overlap_outer_communication=data_parallel_config.overlap_outer_communication,
                 )
             )
         )
@@ -2566,10 +2572,13 @@ def wrap_model_chunks_with_ddp(
                 chunk_kwargs["pg_collection"] = pg_collection
             if layout is not None:
                 chunk_kwargs["full_param_layout"] = layout
+            if isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+                chunk_kwargs["fsdp_config"] = data_parallel_config
+            else:
+                chunk_kwargs["ddp_config"] = data_parallel_config
             wrapped.append(
                 DP(
                     config=config,
-                    ddp_config=ddp_config,
                     module=chunk,
                     disable_bucketing=False if is_mfsdp_v2 else disable_bucketing,
                     **chunk_kwargs,
@@ -2645,10 +2654,20 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using the supplied DDP config or the finalized run config."""
+def get_model(
+    model_provider_func,
+    model_type=ModelType.encoder_or_decoder,
+    wrap_with_ddp=True,
+    config=None,
+    pg_collection=None,
+    data_parallel_config=None,
+):
+    """Build the model using the supplied data-parallel config or the finalized run config."""
     cfg = get_run_config()
     args = get_args()
+    if data_parallel_config is None:
+        data_parallel_config = cfg.data_parallel_config
+    use_megatron_fsdp = isinstance(data_parallel_config, FullyShardedDataParallelConfig)
     args.model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2707,7 +2726,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
-
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -2763,7 +2781,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if args.init_model_with_meta_device and not cfg.dist.use_torch_fsdp2 and not args.use_megatron_fsdp:
+    if args.init_model_with_meta_device and not cfg.dist.use_torch_fsdp2 and not use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
@@ -2774,26 +2792,31 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if cfg.dist.use_torch_fsdp2:
+        use_torch_fsdp2 = cfg.dist.use_torch_fsdp2 or isinstance(
+            data_parallel_config, TorchFullyShardedDataParallelConfig
+        )
+        if use_torch_fsdp2 and isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+            raise ValueError("FullyShardedDataParallelConfig cannot be used with use_torch_fsdp2")
+        if use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_megatron_fsdp:
+        elif isinstance(data_parallel_config, FullyShardedDataParallelConfig) or use_megatron_fsdp:
             DP = FullyShardedDataParallel
         else:
             DP = DDP
 
         config = get_model_config(model[0])
 
-        if ddp_config is None:
-            ddp_config = cfg.ddp
-        if not cfg.dist.use_torch_fsdp2:
+        if not use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-            ddp_config.bucket_size = resolve_ddp_bucket_size(
-                ddp_config,
+            data_parallel_config.bucket_size = resolve_ddp_bucket_size(
+                data_parallel_config,
                 pg_collection.dp_cp,
-                ddp_config.overlap_grad_reduce,
+                data_parallel_config.overlap_grad_reduce,
                 num_parameters,
             )
+            if isinstance(data_parallel_config, FullyShardedDataParallelConfig) and data_parallel_config.version == 1:
+                data_parallel_config.num_buckets = None
 
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
         # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
@@ -2804,7 +2827,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
-            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            None if (disable or pp_rank > 0) else data_parallel_config.bucket_size
             for disable in per_chunk_disable_bucketing
         ]
 
@@ -2827,13 +2850,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model = wrap_model_chunks_with_ddp(
                 model,
                 config,
-                ddp_config,
+                data_parallel_config,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=pg_collection if DP is FullyShardedDataParallel else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2894,47 +2917,46 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
-def get_megatron_ddp_config(
+def get_megatron_data_parallel_config(
     args: argparse.Namespace, *, use_torch_fsdp2: bool
-) -> DistributedDataParallelConfig:
-    """Return an MCore DDPConfig from the argparse arguments."""
+) -> DistributedDataParallelConfig | FullyShardedDataParallelConfig:
+    """Construct the selected backend's config directly from CLI/YAML arguments."""
+    from megatron.training.config.data_parallel_config import FSDP_ARGUMENT_NAMES
 
+    use_megatron_fsdp = getattr(args, "use_megatron_fsdp", False)
+    if use_torch_fsdp2 and use_megatron_fsdp:
+        raise ValueError("Cannot select both Megatron-FSDP and Torch FSDP")
     if use_torch_fsdp2:
-        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+        return TorchFullyShardedDataParallelConfig(
+            reshard_after_forward=getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        )
+    config_class = FullyShardedDataParallelConfig if use_megatron_fsdp else DistributedDataParallelConfig
+    argument_names = FSDP_ARGUMENT_NAMES if use_megatron_fsdp else {}
+    kwargs = {}
+    for config_field in dataclasses.fields(config_class):
+        name = argument_names.get(config_field.name, config_field.name)
+        if hasattr(args, name):
+            kwargs[config_field.name] = getattr(args, name)
+    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+    kwargs["num_buckets"] = args.ddp_num_buckets
+    kwargs["bucket_size"] = args.ddp_bucket_size
+    kwargs["average_in_collective"] = args.ddp_average_in_collective
+    if use_megatron_fsdp:
+        if kwargs.get("version", 1) == 1:
+            kwargs["use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.cuda_graph_impl != "none":
+            kwargs["cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "full_iteration":
+                kwargs["all_gather_in_start_param_sync"] = False
     else:
-        kwargs = {}
-        for f in dataclasses.fields(DistributedDataParallelConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
-        kwargs["num_buckets"] = args.ddp_num_buckets
-        kwargs["bucket_size"] = args.ddp_bucket_size
         kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
         kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
-        kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
-            tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
-        kwargs["average_in_collective"] = args.ddp_average_in_collective
-        # Megatron-FSDP arguments.
-        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-        if args.use_megatron_fsdp and args.megatron_fsdp_version == 1:
-            kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
-        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
-            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
-            # operations (such as pointer dereferencing) that can break CUDA graph replay.
-            kwargs["megatron_fsdp_cuda_graph_mode"] = True
-            if args.cuda_graph_impl == "full_iteration":
-                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
-                # during start_param_sync(), which is called during the DistOpt.step(). This
-                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
-                # the scope of the full-iter / FWD-BWD CUDA graph capture.
-                kwargs["fsdp_all_gather_in_start_param_sync"] = False
-
-        return DistributedDataParallelConfig(**kwargs)
+        kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
+            args.ddp_param_name_patterns_for_fp32_local_accumulation
+        )
+    return config_class(**kwargs)
 
 
 def setup_model_and_optimizer(
@@ -2985,9 +3007,11 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=cfg.ddp,
+                data_parallel_config=cfg.data_parallel_config,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+                use_megatron_fsdp=(
+                    isinstance(cfg.data_parallel_config, FullyShardedDataParallelConfig)
+                ),
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
@@ -3001,7 +3025,9 @@ def setup_model_and_optimizer(
                 model_type,
                 wrap_with_ddp=wrap_with_ddp,
                 pg_collection=pg_collection,
-                ddp_config=cfg_container.ddp if cfg_container is not None else None,
+                data_parallel_config=(
+                    cfg_container.data_parallel_config if cfg_container is not None else None
+                ),
             )
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
@@ -3511,6 +3537,7 @@ def train_step(
             for optim_instance in optimizer_instances
             if (
                 isinstance(optim_instance, DistributedOptimizer)
+                and optim_instance.ddp_config is not None
                 and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
                 and optim_instance.ddp_config.overlap_param_gather
             )
@@ -5480,7 +5507,7 @@ def train(
                 if isinstance(
                     model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
                 ) and getattr(
-                    model_chunk.ddp_config, "fsdp_manual_registration", False
+                    model_chunk.fsdp_config, "manual_registration", False
                 ):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:

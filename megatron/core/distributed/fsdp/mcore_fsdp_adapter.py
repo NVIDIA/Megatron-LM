@@ -19,9 +19,11 @@ from typing import List, Optional, Type
 import torch
 
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_adapter_v1 import FullyShardedDataParallelV1
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -30,23 +32,19 @@ __all__ = ["FullyShardedDataParallel", "FullyShardedDataParallelV1", "FullyShard
 
 def FullyShardedDataParallel(
     config: TransformerConfig,
-    ddp_config: DistributedDataParallelConfig,
+    fsdp_config: FullyShardedDataParallelConfig,
     module: torch.nn.Module,
     fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
     disable_bucketing: bool = False,
     device: Optional[torch.device] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> _BaseDataParallel:
-    """Construct the configured Megatron-FSDP implementation.
-
-    This is a factory function, not a wrapper type. Use the explicit V1 or V2
-    implementation classes for type checks.
-    """
+    """Construct Megatron-FSDP using its independent config."""
+    if not isinstance(fsdp_config, FullyShardedDataParallelConfig):
+        raise TypeError("fsdp_config must be a FullyShardedDataParallelConfig")
     fsdp_class = (
-        FullyShardedDataParallelV2
-        if ddp_config.megatron_fsdp_version == 2
-        else FullyShardedDataParallelV1
+        FullyShardedDataParallelV2 if fsdp_config.version == 2 else FullyShardedDataParallelV1
     )
     return fsdp_class(
-        config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
+        config, fsdp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
     )
