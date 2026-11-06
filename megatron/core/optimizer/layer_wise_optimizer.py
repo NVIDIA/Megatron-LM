@@ -54,7 +54,7 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """
     if not getattr(param, 'use_muon', True):
         return False
-    if not param.dim() == 2:
+    if param.dim() != 2 and getattr(param, 'muon_matrix_shape', None) is None:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
         return False
@@ -316,9 +316,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             GTP-sharded params reconstruct the full post-AllGather shape first
             (GTP always shards along dim 0).
             """
-            if param.dim() != 2:
+            matrix_shape = getattr(param, 'muon_matrix_shape', None)
+            if param.dim() != 2 and matrix_shape is None:
                 return param.data.nelement()
-            m, n = param.data.shape
+            m, n = matrix_shape if matrix_shape is not None else param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
             small = min(m, n)

@@ -1330,6 +1330,10 @@ class TestDSv4HybridGroupedOutput:
         assert weight.requires_grad
         if attn._uses_te_batched_linear:
             assert attn.linear_o_group_proj.save_original_input
+            assert weight.muon_matrix_shape == (
+                output_projection_groups * output_projection_lora_rank,
+                expected_in,
+            )
 
     @pytest.mark.parametrize(
         "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]

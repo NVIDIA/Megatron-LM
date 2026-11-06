@@ -263,6 +263,12 @@ class DSv4HybridAttention(Attention):
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
             set_save_original_input(self.linear_o_group_proj)
+            # TE owns a [groups, rank, input] parameter, but Muon must still
+            # orthogonalize the same complete matrix as the legacy einsum path.
+            self.linear_o_group_proj.weight.muon_matrix_shape = (
+                self.o_local_groups * self.config.o_lora_rank,
+                group_proj_in_size,
+            )
             self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank

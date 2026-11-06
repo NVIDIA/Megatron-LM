@@ -748,6 +748,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -1062,10 +1063,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="muon_newton_schulz_dispatch",
-        sources=("megatron/core/optimizer/layer_sharded_muon.py",),
+        sources=(
+            "megatron/core/optimizer/layer_sharded_muon.py",
+            "megatron/core/optimizer/emerging_optimizers.py",
+        ),
         tests=(
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+            "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "

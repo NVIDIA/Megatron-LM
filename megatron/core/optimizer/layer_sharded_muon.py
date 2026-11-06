@@ -769,8 +769,13 @@ class LayerShardedMuon(TensorParallelMuon):
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
                     replicated = {i: params[i] for i in plan.replicated}
-                    for i, ns_output in self._iter_ns(replicated, load=ns_input):
-                        self._apply_update(params[i], ns_output, lr)
+                    for i, ns_output in self._iter_ns(
+                        replicated,
+                        load=lambda p: ns_input(p).reshape(
+                            getattr(p, 'muon_matrix_shape', None) or p.shape
+                        ),
+                    ):
+                        self._apply_update(params[i], ns_output.reshape_as(params[i]), lr)
                         del ns_output
             if not plan.routed:
                 continue
