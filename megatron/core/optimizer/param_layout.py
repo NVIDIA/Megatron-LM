@@ -91,7 +91,7 @@ class PerBufferParamLayout:
     num_optimizer_shards: Optional[int] = None
 
     @property
-    def uses_distributed_optimizer(self) -> bool:
+    def use_distributed_optimizer(self) -> bool:
         """Whether the buffer is sharded by a distributed optimizer.
 
         DDP reduce-scatters the gradients of such a buffer and all-gathers its parameters from

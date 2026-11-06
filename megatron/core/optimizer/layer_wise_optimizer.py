@@ -946,7 +946,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             )
         declared = _param_layout_for(config.emerging_optimizer_grad_collective)
         sharded = {
-            layout.uses_distributed_optimizer
+            layout.use_distributed_optimizer
             for full_layout in full_param_layouts or []
             for buffer_key, layout in full_layout.layouts.items()
             if buffer_key.is_managed_by_layer_wise_optimizer
