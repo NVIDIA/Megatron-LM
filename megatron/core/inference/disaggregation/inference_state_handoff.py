@@ -1301,6 +1301,10 @@ class InferenceStateHandoffMixin:
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
                 request.generated_tokens.append(first_token)
+                if self.context.num_speculative_tokens > 0:
+                    # The prefill engine's step emitted this token; record it as a collocated
+                    # engine would, so acceptance_step_lengths sums to the generated length.
+                    request.acceptance_step_lengths.append(1)
                 if pending.resume_log_probs:
                     request.generated_log_probs = list(pending.resume_log_probs)
                 if self.track_generated_token_events:
