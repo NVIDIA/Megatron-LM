@@ -1050,8 +1050,7 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
     ids = torch.randint(0, 128, (1, 1024), device="cuda")
     positions = torch.arange(1024, device="cuda")[None]
 
-    def step(model, replay_interval=None):
-        model.config.residual_stream_recompute_num_layers = replay_interval
+    def step(model):
         model.zero_grad(set_to_none=True)
         logits = model(ids, positions, None)
         logits.float().square().mean().backward()
@@ -1063,7 +1062,11 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
 
     fused = step(model)
     assert epsilons == {1e-6} and hooked == set(norms) and not replays
-    replayed = step(model, interval)
+    replay_model = _hybrid_model(
+        pattern, mixer, residual_stream_recompute_num_layers=interval, **options
+    ).train()
+    replay_model.load_state_dict(model.state_dict())
+    replayed = step(replay_model)
     assert replays and torch.equal(replayed[0], fused[0])
     assert replayed[1].keys() == fused[1].keys()
     assert all(bytes_equal(g, fused[1][n]) for n, g in replayed[1].items())

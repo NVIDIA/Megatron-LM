@@ -22,6 +22,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
 )
 from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import Reader, eligible, reader_for
 from megatron.core.fusions.wide_residual_shortcut.replay_kernel import replay_interval
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
 from tests.unit_tests.determinism.kernels.harness import seeded
 from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401 (reader_work)
@@ -98,7 +99,7 @@ def forbid_backward_state(monkeypatch):
         raise AssertionError("inference entered autograd or allocated backward state")
 
     monkeypatch.setattr(api._Boundary, "apply", forbidden)
-    monkeypatch.setattr(api, "current_manager", forbidden)
+    monkeypatch.setattr(ReplayInterval, "record", forbidden)
     monkeypatch.setattr(forward_kernel, "SavedWrite", forbidden)
     launch = forward_kernel._forward.run
     observed = []

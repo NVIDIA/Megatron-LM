@@ -9,6 +9,7 @@ the interval replay kernel live in ``tests/unit_tests/determinism/kernels/``.
 
 import gc
 import itertools
+import weakref
 from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass, replace
@@ -36,15 +37,10 @@ from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import (
     reader_for,
 )
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
-    ResidualSlot,
-    current_manager,
-    register_write,
-    residual_replay_scope,
+    ReplayHandle,
+    ReplayInterval,
 )
-from megatron.core.transformer.streamwise_residual_ops import (
-    _streamwise_sigmoid_write_triton,
-    streamwise_sigmoid_writeback,
-)
+from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, bytes_equal
 from tests.unit_tests.test_utilities import Utils
@@ -135,8 +131,8 @@ def run(raw, streams=3, epsilon=1e-5, **options):
     )
 
 
-def boundary(raw, consumer=None, *, mxfp8_handoff=True):
-    return run(raw, 3, mxfp8_handoff=mxfp8_handoff, mxfp8_consumer=consumer)
+def boundary(raw, consumer=None, *, mxfp8_handoff=True, replay=None):
+    return run(raw, 3, mxfp8_handoff=mxfp8_handoff, mxfp8_consumer=consumer, replay=replay)
 
 
 def invoke(raw, quantized=False, consumer=None):
@@ -246,12 +242,6 @@ def run_with_scratch(backward, *args, **kwargs):
     allocations = list({t.untyped_storage().data_ptr(): t for t in allocations}.values())
     return grads, SimpleNamespace(
         grads=grads, columns=columns, allocations=allocations, kernel=launches[-1]
-    )
-
-
-def replay_config(interval=16):
-    return SimpleNamespace(
-        residual_stream_recompute_num_layers=interval, moe_shortcut_wide_residual_norm_fusion=True
     )
 
 
@@ -756,9 +746,9 @@ def test_config_tables():
 # ---------------------------------------------------------------- checkpoint replay scopes
 
 # Ops: A/W/R are fused seams with (readers, updates) (1, 1)/(2, 1)/(1, 2); N and M are native
-# streamwise writes of an FP32 and a BF16 update; S a native write of a strided update, which the
-# native replay cannot take.
-_OPS = {"A": (1, 1), "W": (2, 1), "R": (1, 2), "N": (0, 1), "M": (0, 1), "S": (0, 1)}
+# streamwise writes of an FP32 and a BF16 update, which (like a fused stack's last write) end the
+# chain and are not replayed.
+_OPS = {"A": (1, 1), "W": (2, 1), "R": (1, 2), "N": (0, 1), "M": (0, 1)}
 
 
 @GPU
@@ -768,25 +758,25 @@ _OPS = {"A": (1, 1), "W": (2, 1), "R": (1, 2), "N": (0, 1), "M": (0, 1), "S": (0
     [
         ("W" * 40, 16, F32, 3, 96, T, 0),  # two full intervals and a partial tail
         ("R" * 40, 16, BF16, 3, 96, T, 0),
-        ("MSMN", 8, F32, 3, 96, T, 0),  # an unreplayable write interrupts the interval
+        ("AAAN", 2, F32, 3, 96, T, 0),  # a native last write after a sealed interval
     ]
-    # A fused, native, fused chain over stream counts, with and without retention.
-    + [("AMA", 16, F32, s, h, r, 2) for s, r, h in [(1, F, 96), (3, T, 128), (5, F, 96)]]
-    + [("AMA", 16, F32, 6, 288, T, 2)],
+    # Fused seams ending in a native write, over stream counts, with and without retention.
+    + [("AAM", 16, F32, s, h, r, 2) for s, r, h in [(1, F, 96), (3, T, 128), (5, F, 96)]]
+    + [("AAM", 16, F32, 6, 288, T, 2)],
 )  # fmt: skip
 def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, retention, pad):
-    """Replay restores every forward state and reproduces every gradient bit for bit, also in
-    a retained second backward on another stream, and then releases its storage."""
+    """Replay frees the seams' input residuals in forward, restores each bit for bit and
+    reproduces every gradient, also in a second backward of a retained graph on another stream,
+    and an ordinary backward releases its intervals."""
     torch.manual_seed(853)
     m, size = 1024, streams + pad
     original = [torch.randn(m, streams * hidden, device="cuda", dtype=dtype)]
     for op in ops:
         readers, updates = _OPS[op]
         logits = dict(device="cuda", dtype=dtype if readers else F32)
-        width = 2 * hidden if op == "S" else hidden
         update_dtype = F32 if op == "N" else BF16
         original += [
-            torch.randn(m, width, device="cuda", dtype=update_dtype) for _ in range(updates)
+            torch.randn(m, hidden, device="cuda", dtype=update_dtype) for _ in range(updates)
         ]
         original += [torch.randn(size, **logits), torch.full((size,), -0.5, **logits)]
         if not retention:
@@ -797,166 +787,71 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
     def execute(replay):
         leaves = [v if v is None else v.detach().clone().requires_grad_() for v in original]
         values = iter(leaves[1:])
-        current, outputs, states, slots = leaves[0], [], [], []
-        with residual_replay_scope(replay_config(interval if replay else 1), True) as manager:
-            for op in ops:
-                if manager is not None:
-                    manager.advance(1)
-                readers, updates = _OPS[op]
-                us = [next(values) for _ in range(updates)]
-                controllers = [next(values) for _ in range(2 + readers)]
-                gammas = [next(values) for _ in range(readers)]
-                if readers:
-                    current, *ys = run((current, us, controllers, gammas), streams)
-                    outputs += ys
-                else:
-                    current = streamwise_sigmoid_writeback(
-                        current,
-                        us[0][:, ::2] if op == "S" else us[0],
-                        controllers[0],
-                        streams,
-                        retention_logits=controllers[1],
-                        retention_max_forget=0.1,
-                    )
-                states.append(current.detach().clone())
-                if manager is not None:
-                    slots.append(manager.slot(current))
-            if manager is not None and "S" in ops:
-                # The interval after the unreplayable write is anchored at its output.
-                k = ops.index("S")
-                assert manager.active.checkpoint.tensor.data_ptr() == slots[k].tensor.data_ptr()
-                assert len(manager.active.transitions) == len(ops) - k - 1
-                assert not slots[k + 1].resident()
-        if slots:
-            assert any(not slot.resident() for slot in slots)
-            all_bytes_equal([slot.ensure() for slot in reversed(slots)], reversed(states))
+        current, outputs, states, inputs, storages, intervals = leaves[0], [], [], [], [], []
+        for op in ops:
+            readers, updates = _OPS[op]
+            us = [next(values) for _ in range(updates)]
+            controllers = [next(values) for _ in range(2 + readers)]
+            gammas = [next(values) for _ in range(readers)]
+            if readers:
+                if replay and len(inputs) % interval == 0:  # every N seams start an interval
+                    intervals.append(ReplayInterval())
+                options = {"replay": intervals[-1]} if replay else {}
+                inputs.append(current.detach().clone())
+                storages.append(StorageWeakRef(current.untyped_storage()))
+                current, *ys = run((current, us, controllers, gammas), streams, **options)
+                outputs += ys
+            else:
+                current = streamwise_sigmoid_writeback(
+                    current,
+                    us[0],
+                    controllers[0],
+                    streams,
+                    retention_logits=controllers[1],
+                    retention_max_forget=0.1,
+                )
+            states.append(current.detach().clone())
+        # Replay frees the seams' intermediate input residuals; without it the seams keep them.
+        assert any(storage.expired() for storage in storages) == replay
+        handles = [ReplayHandle(i, k) for i in intervals for k in range(len(i.tapes))]
+        # Each seam's input residual comes back bit for bit (handed out once; the backward
+        # below replays again).
+        taken = [handle.take()[0] for handle in reversed(handles)]
+        all_bytes_equal(taken, [x.view_as(t) for x, t in zip(reversed(inputs), taken)])
+        intervals = [weakref.ref(i) for i in intervals]
+        del handles, options  # the test holds no interval past forward
         loss = current.float().square().mean() + sum(y.float().square().mean() for y in outputs)
         leaves = [leaf for leaf in leaves if leaf is not None]
         first = torch.autograd.grad(loss, leaves, retain_graph=True, allow_unused=True)
-        # A second stream must see the restored allocation and its allocator metadata.
+        # A retained graph's second backward replays again, here on another stream.
         other = torch.cuda.Stream()
         other.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(other):
             second = torch.autograd.grad(loss, leaves, allow_unused=True)
         torch.cuda.current_stream().wait_stream(other)
         all_bytes_equal(first, second)
-        del slots
+        # The ordinary second backward releases the intervals (checkpoints and tapes) although
+        # the graph's nodes stay alive with its outputs.
         gc.collect()
-        # Ordinary backward releases the replay storage owners after their final launches.
-        assert manager is None or not manager.slots
+        assert loss.grad_fn is not None
+        assert all(interval() is None for interval in intervals)
         return states + list(first)
 
     all_bytes_equal(execute(False), execute(True))
 
 
 @GPU
-@pytest.mark.parametrize(
-    "shape,streams,retention,dtype,alternate,forget",
-    [
-        ((5, 33), 1, F, torch.float16, F, 0.07),
-        ((5, 33), 3, T, BF16, T, 0.07),
-        ((2, 3, 128), 3, F, F32, F, 0.07),
-        ((2, 3, 128), 6, T, torch.float64, T, 0.07),
-        ((2, 2, 3, 33), 6, F, BF16, F, 0.07),
-        ((2, 2, 3, 33), 1, T, F32, T, 0.07),
-        ((32, 96), 3, F, F32, F, 0.1),  # max_forget is a kernel constexpr
-    ],
-)
-def test_native_replay_intervals(shape, streams, retention, dtype, alternate, forget):
-    """Native writes free their predecessor at the successor's registration (also from
-    alternating streams); intervals count physical layers, not writes; each scope owns its
-    workspaces; replay restores the actual native forward bit for bit (ranks, tails, signed
-    zeros, logit casts), also consumed out of order from another stream."""
-    owners = []
-    for seed in (23, 47):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        update = torch.randn(shape, device="cuda", dtype=BF16, generator=generator)
-        current = torch.randn(
-            (*shape[:-1], streams * shape[-1]), device="cuda", dtype=F32, generator=generator
-        )
-        update.view(-1)[0] = 0.0
-        current.view(-1)[0] = -0.0
-        anchor = current.clone()
-        write = torch.linspace(-4, 4, streams + 2, device="cuda", dtype=dtype)
-        retain = write.flip(0) if retention else None
-        side = [torch.cuda.current_stream(), torch.cuda.Stream()]
-        links, expected, identities = [], [], []
-        with residual_replay_scope(replay_config(3), True) as manager:
-            for physical_layers in (1, 2, 1, 1):
-                manager.advance(physical_layers)
-                for _ in range(2):  # interval capacity counts physical layers, not writes
-                    k = len(links)
-                    stream = side[k % 2] if alternate else side[0]
-                    stream.wait_stream(side[(k - 1) % 2] if alternate else side[0])
-                    with torch.cuda.stream(stream):
-                        following = _streamwise_sigmoid_write_triton(
-                            current, update, write, streams, retain, forget
-                        )
-                        links.append(
-                            register_write(
-                                current, following, update, write, retain, streams, forget
-                            )
-                        )
-                        # Freed unless it anchors an interval (the first, or a sealed last write).
-                        assert bool(current.untyped_storage().nbytes()) == (k in (0, 4))
-                        expected.append(following.clone())
-                    identities.append(following.untyped_storage()._cdata)
-                    current = following
-        side[0].wait_stream(side[1])
-        assert [link.current_slot.resident() for link in links] == [F, F, F, T, F, F, F, T]
-        assert links[0].interval is links[3].interval
-        assert links[3].interval is not links[4].interval
-        assert links[4].interval is links[7].interval
-        assert [len(links[i].interval.transitions) for i in (0, 4)] == [4, 4]
-        owners.append((links, expected, identities, anchor))
-    consumer = torch.cuda.Stream()
-    consumer.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(consumer):
-        for links, expected, identities, anchor in reversed(owners):
-            for i in (2, 0, 6, 4, 1, 3, 5, 7):
-                actual = links[i].current_slot.ensure()
-                assert actual.untyped_storage()._cdata == identities[i]
-                assert bytes_equal(actual, expected[i])
-            assert links[0].interval.materialized
-            assert bytes_equal(links[0].previous_slot.ensure(), anchor)
-    torch.cuda.current_stream().wait_stream(consumer)
-    backings = [owner[0][0].current_slot.backing.data_ptr() for owner in owners]
-    assert backings[0] != backings[1]
-
-
-@GPU
-def test_replay_scope_ownership():
-    """Nested scopes isolate ownership and always release their endpoint handle."""
-    config = replay_config()
-    for raises, nested_training in itertools.product((F, T), (F, T)):
-        endpoint = ResidualSlot(torch.ones(1, device="cuda"), anchor=False)
-        marker = object()
-        endpoint.provider = marker
-        with residual_replay_scope(config, True) as outer:
-            with torch.no_grad():
-                assert current_manager() is None
-            try:
-                with residual_replay_scope(config, nested_training) as inner:
-                    assert current_manager() is inner
-                    assert inner is not outer
-                    if inner is not None:
-                        previous = torch.zeros(1, device="cuda")
-                        link = inner.register(
-                            previous, previous + 1, native=lambda value: value + 1
-                        )
-                        endpoint = link.current_slot
-                        endpoint.provider = marker
-                    if raises:
-                        raise ValueError("expected scope interruption")
-            except ValueError as error:
-                assert str(error) == "expected scope interruption"
-            assert current_manager() is outer
-            if inner is not None:
-                assert inner.last is None
-            assert endpoint.anchor == (nested_training and not raises)
-            assert endpoint.provider is (None if endpoint.anchor else marker)
-        assert current_manager() is None
-        assert outer.last is None
+def test_replay_interval_records_one_connected_chain():
+    """An interval keeps its first input residual and numbers its writes; a write that does not
+    continue the chain is rejected."""
+    interval = ReplayInterval()
+    chain = [torch.zeros(1, device="cuda")]
+    for index in range(3):
+        chain.append(chain[-1] + 1)
+        assert interval.record(chain[-2], chain[-1], saved=None).index == index
+    assert interval.checkpoint is chain[0]
+    with pytest.raises(ValueError, match="one connected chain"):
+        interval.record(chain[0], chain[0] + 1, saved=None)
 
 
 # ---------------------------------------------------------------- MXFP8 handoff
@@ -1192,11 +1087,11 @@ def test_mcore_fused_backward_matches_independent_columns(m, h, readers):
 def test_multiple_live_calls_and_replay(replay):
     raw = mx_inputs(8192, 4096, 1)
     layer = linear(4096, mcore=True)
-    with residual_replay_scope(replay_config(), replay):
-        first = boundary(raw, layer)
-        y0 = consume(layer, first[1])
-        second = boundary((first[0], *raw[1:]), layer)
-        y1 = consume(layer, second[1])
+    interval = ReplayInterval() if replay else None
+    first = boundary(raw, layer, replay=interval)
+    y0 = consume(layer, first[1])
+    second = boundary((first[0], *raw[1:]), layer, replay=interval)
+    y1 = consume(layer, second[1])
     providers = [reader_for(first[1]), reader_for(second[1])]
     outputs = (y0, y1, second[0])
     torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))

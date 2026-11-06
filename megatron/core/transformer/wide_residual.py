@@ -16,6 +16,7 @@ from megatron.core.fusions.wide_residual_shortcut.api import (
     PendingWideResidualWrites,
     _apply_boundary,
 )
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
@@ -478,7 +479,7 @@ class WriteReadNorm(nn.Module):
         branch_name: str,
         operation: ResidualConnectionOperation = "read",
     ) -> None:
-        del layer_number, branch_name
+        del branch_name
         if operation != "read":
             raise ValueError(f"WriteReadNorm is a read connection, got operation={operation!r}")
         super().__init__()
@@ -496,6 +497,13 @@ class WriteReadNorm(nn.Module):
         self.consumer = None
         # The write handed here by the previous layer's DeferredWrite, until this read takes it.
         self.pending = None
+        # Checkpoint replay (training): every N consecutive seams form one interval. The stack's
+        # second layer has its first seam, and one seam follows per layer.
+        interval = config.residual_stream_recompute_num_layers
+        self.replay_every = interval if interval is not None and interval > 1 else None
+        self.starts_replay = self.replay_every is not None and (
+            (layer_number - 2) % self.replay_every == 0
+        )
 
     def hand(self, item) -> None:
         """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
@@ -510,6 +518,19 @@ class WriteReadNorm(nn.Module):
             raise RuntimeError("no deferred residual write was handed to this fused read")
         return item
 
+    def replay_interval(self, pending):
+        """The checkpoint-replay interval this read's seam records into (None unless training
+        with replay): a new one at an interval start, else the one tagged on the input residual
+        by the previous seam."""
+        if self.replay_every is None or not (self.training and torch.is_grad_enabled()):
+            return None
+        if self.starts_replay:
+            return ReplayInterval()
+        interval = getattr(pending.residual, "_replay_interval", None)
+        if interval is None:
+            raise RuntimeError("a replayed seam's input residual carries no replay interval")
+        return interval
+
     def forward(self, hidden_states, *, fp32_residual_connection=False, branch_input_dtype=None):
         """Apply the write handed to this read with this read and norm."""
         # The kernel keeps the residual's dtype; ``hidden_states`` is the unwritten input residual.
@@ -517,10 +538,11 @@ class WriteReadNorm(nn.Module):
         item = self.take()
         if isinstance(item, SeamInput):
             return item.branch_input, (item.residual,)
+        replay = self.replay_interval(item)
         residual, branch_input = apply_pending_write(
-            item, (self,), (self.weight,), self.eps, self.consumer
+            item, (self,), (self.weight,), self.eps, self.consumer, replay
         )
-        return branch_input, (residual,)
+        return branch_input, (tag_replay(residual, replay),)
 
     @staticmethod
     def residual_stream(state) -> Tensor:
@@ -528,23 +550,30 @@ class WriteReadNorm(nn.Module):
         return state[0]
 
 
-class ShortcutWriteReadNorm(WriteReadNorm):
+class ShortcutAddWideResidualWriteReadNorm(WriteReadNorm):
     """A fused shortcut block's shortcut read and pre-MLP RMSNorm (owning their parameters).
 
-    Called with the compute layer's WriteReadNorm, it applies the write handed to that read with
-    both reads and norms in one two-reader kernel; the compute read's own call then returns its
-    normalized input. Returns ``(residual, shortcut_input)``.
+    Linked to the compute layer's WriteReadNorm (``link``), it applies the write handed to that
+    read with both reads and norms in one two-reader kernel; the compute read's own call then
+    returns its normalized input. Returns ``(residual, shortcut_input)``.
     """
 
-    def forward(self, compute_read: WriteReadNorm) -> tuple[Tensor, Tensor]:
-        # pylint: disable=arguments-differ
+    compute_read: WriteReadNorm | None = None
+
+    def link(self, compute_read: WriteReadNorm) -> None:
+        """Serve ``compute_read``, the block's compute layer read (a reference, not a submodule)."""
+        object.__setattr__(self, "compute_read", compute_read)
+
+    def forward(self) -> tuple[Tensor, Tensor]:  # pylint: disable=arguments-differ
+        compute_read = self.compute_read
         pending = compute_read.take()
+        replay = compute_read.replay_interval(pending)  # this seam is the compute read's
         # The compute read's weight is used before its layer calls it: run its hooks now.
         gammas = (hooked_weight(compute_read), self.weight)
         residual, branch_input, shortcut_input = apply_pending_write(
-            pending, (compute_read, self), gammas, compute_read.eps, compute_read.consumer
+            pending, (compute_read, self), gammas, compute_read.eps, compute_read.consumer, replay
         )
-        compute_read.hand(SeamInput(residual, branch_input))
+        compute_read.hand(SeamInput(tag_replay(residual, replay), branch_input))
         return residual, shortcut_input
 
 
@@ -589,16 +618,24 @@ def hooked_weight(module: nn.Module) -> Tensor:
     return module.weight
 
 
-def apply_pending_write(pending, reads, gammas, epsilon, consumer=None):
+def tag_replay(residual: Tensor, replay) -> Tensor:
+    """Tag a seam's output residual with its replay interval, which the next seam continues."""
+    if replay is not None:
+        residual._replay_interval = replay
+    return residual
+
+
+def apply_pending_write(pending, reads, gammas, epsilon, consumer=None, replay=None):
     """Write ``pending`` and return ``(residual, *rmsnorm(read(residual)))`` from one fused kernel;
-    reader zero goes as MXFP8 to the ``(branch, input projection)`` ``consumer`` if eligible."""
+    reader zero goes as MXFP8 to the ``(branch, input projection)`` ``consumer`` if eligible, and
+    the write is recorded into the ``replay`` interval if given."""
     # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
     # gradients enabled.
     with torch.no_grad() if InferenceMode.is_active() else nullcontext():
-        return _apply_pending_write(pending, reads, gammas, epsilon, consumer)
+        return _apply_pending_write(pending, reads, gammas, epsilon, consumer, replay)
 
 
-def _apply_pending_write(pending, reads, gammas, epsilon, consumer):
+def _apply_pending_write(pending, reads, gammas, epsilon, consumer, replay):
     from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
     streams = reads[0].num_streams
@@ -626,5 +663,11 @@ def _apply_pending_write(pending, reads, gammas, epsilon, consumer):
             )
     logits = tuple(read.read_map(return_logits=True) for read in reads)
     return _apply_boundary(
-        pending, logits, gammas, mxfp8_consumer=linear, num_streams=streams, epsilon=epsilon
+        pending,
+        logits,
+        gammas,
+        mxfp8_consumer=linear,
+        num_streams=streams,
+        epsilon=epsilon,
+        replay=replay,
     )

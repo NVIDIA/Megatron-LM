@@ -12,7 +12,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from .mxfp8_handoff import Reader
-from .residual_replay import ResidualSlot, current_manager, retained_slot
+from .residual_replay import graph_retained
 
 
 def validate_input(residual, hidden_size, num_streams, *, inference=False):
@@ -41,7 +41,7 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, consumer_weight, residual, *values):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay_manager, mxfp8_handoff, mxfp8_consumer, epsilon, update_count = options
+        streams, replay, mxfp8_handoff, mxfp8_consumer, epsilon, update_count = options
         from .forward_kernel import forward
 
         # values: updates, write, retain, then one read and one gamma per reader.
@@ -71,17 +71,20 @@ class _Boundary(torch.autograd.Function):
         result = (current.view(*leading, streams * hidden), *outputs)
         if ctx is None:
             return result
-        ctx.replay_link = None
-        if replay_manager is not None:
-            ctx.replay_link = replay_manager.register(
-                residual, current, saved, prepare_columns=mxfp8_handoff
-            )
-        ctx.previous = (
-            ResidualSlot(residual) if ctx.replay_link is None else ctx.replay_link.previous_slot
+        # Under checkpoint replay the backward takes the input residual (and reader zero's
+        # MXFP8 columns) from the replayed interval instead of keeping it alive; it never
+        # reconstructs the predecessor from a rounded successor.
+        ctx.replay = (
+            None
+            if replay is None
+            else replay.record(residual, current, saved, prepare_columns=mxfp8_handoff)
         )
-        # The backward never reconstructs the predecessor from a rounded successor.
         ctx.save_for_backward(
-            residual, saved.update, saved.coefficients, *saved.gammas, *saved.rstd
+            residual if ctx.replay is None else None,
+            saved.update,
+            saved.coefficients,
+            *saved.gammas,
+            *saved.rstd,
         )
         ctx.spec = replace(saved, update=None, coefficients=None, gammas=(), rstd=())
         ctx.leading = leading
@@ -97,7 +100,13 @@ class _Boundary(torch.autograd.Function):
 
         streams, update_count, leading = ctx.spec.num_streams, ctx.spec.update_count, ctx.leading
         previous, update, coefficients, *readers = ctx.saved_tensors
-        ctx.previous.ensure()
+        column = None
+        if ctx.replay is not None:
+            previous, column = ctx.replay.take()
+            # Autograd frees saved tensors after backward but not ctx attributes, and the graph's
+            # nodes may outlive it (until the next forward): release the interval explicitly.
+            if not graph_retained():
+                ctx.replay = None
         count = len(dys)
         saved = replace(
             ctx.spec,
@@ -110,7 +119,7 @@ class _Boundary(torch.autograd.Function):
         previous = previous.view(-1, streams * hidden)
         dy = tuple(None if t is None else t.contiguous().view(-1, hidden) for t in dys)
         dc = None if carry is None else carry.contiguous().view_as(previous)
-        reader, link = ctx.mxfp8_reader, ctx.replay_link
+        reader = ctx.mxfp8_reader
         needs = reader is not None and bool(reader.pending)
         grads, _ = backward(
             saved,
@@ -118,15 +127,11 @@ class _Boundary(torch.autograd.Function):
             dy,
             dc,
             save_columns=needs,
-            columns=(link.columns() if needs and link is not None else None,)
-            + (None,) * (count - 1),
+            columns=(column if needs else None,) + (None,) * (count - 1),
             on_columns_ready=(lambda c: reader.compute_wgrad(previous, c[0])) if needs else None,
         )
         if reader is not None:
             reader.finish(previous)
-        # Keep allocator metadata for retained backwards; release interval tapes and columns.
-        ctx.previous = retained_slot(ctx.previous)
-        ctx.replay_link = None
         grads = list(grads)
         # A missing reader gets no controller or norm-weight gradient, although the kernel
         # materializes a zero dy for it.
@@ -154,8 +159,17 @@ def _trains_on(device_index: int) -> bool:
 
 
 def _apply_boundary(
-    p, reads, gammas, *, num_streams, mxfp8_handoff=False, mxfp8_consumer=None, epsilon=1.0e-5
+    p,
+    reads,
+    gammas,
+    *,
+    num_streams,
+    mxfp8_handoff=False,
+    mxfp8_consumer=None,
+    epsilon=1.0e-5,
+    replay=None,
 ):
+    """``replay`` (a ReplayInterval, training only) records this write for checkpoint replay."""
     updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     inputs = (p.residual, *updates, p.write, p.retain, *reads, *gammas)
     mxfp8 = bool(mxfp8_handoff or mxfp8_consumer is not None)
@@ -171,7 +185,7 @@ def _apply_boundary(
             f"backward is GB300-only); got {torch.cuda.get_device_name(p.residual.device)}"
         )
     # The explicit weight edge orders AccumulateGrad after the deferred TE wgrad.
-    options = (num_streams, current_manager(), mxfp8, mxfp8_consumer, epsilon, len(updates))
+    options = (num_streams, replay, mxfp8, mxfp8_consumer, epsilon, len(updates))
     weight = None if mxfp8_consumer is None else mxfp8_consumer.weight
     return _Boundary.apply(options, weight, *inputs)
 

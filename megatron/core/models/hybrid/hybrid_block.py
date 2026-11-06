@@ -20,7 +20,6 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.fusions.wide_residual_shortcut.residual_replay import residual_replay_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -693,10 +692,7 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
-        replay_context = residual_replay_scope(
-            self.config, self.training and self.uses_wide_residual_stream
-        )
-        with outer_fp8_context, replay_context as replay_manager:
+        with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -723,8 +719,6 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
-                    if replay_manager is not None:
-                        replay_manager.advance(2 if isinstance(layer, ShortcutMoEBlock) else 1)
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx

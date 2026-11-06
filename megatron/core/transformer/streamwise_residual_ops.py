@@ -26,12 +26,6 @@ import math
 import torch
 from torch import Tensor
 
-from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
-    current_manager,
-    register_write,
-    retained_slot,
-    watch_residual,
-)
 from megatron.core.inference.utils import InferenceMode
 
 try:
@@ -770,7 +764,6 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
         """Run the fused streamwise read and save tensors for backward."""
 
         ctx.save_for_backward(hidden_states, read_logits)
-        ctx.replay_slot = watch_residual(hidden_states)
         ctx.num_streams = num_streams
         return _streamwise_sigmoid_read_triton(
             hidden_states, read_logits, num_streams, output_dtype
@@ -781,13 +774,9 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
         """Compute activation and read-controller gradients."""
 
         hidden_states, read_logits = ctx.saved_tensors
-        if ctx.replay_slot is not None:
-            ctx.replay_slot.ensure()
         grad_hidden, grad_logits = _streamwise_sigmoid_read_backward_triton(
             hidden_states, grad_output.contiguous(), read_logits, ctx.num_streams
         )
-        if ctx.replay_slot is not None:
-            ctx.replay_slot = retained_slot(ctx.replay_slot)
         return grad_hidden, grad_logits, None, None
 
 
@@ -813,7 +802,7 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             ctx.save_for_backward(branch_update, write_logits)
         else:
             ctx.save_for_backward(residual_stream, branch_update, write_logits, retention_logits)
-        output = _streamwise_sigmoid_write_triton(
+        return _streamwise_sigmoid_write_triton(
             residual_stream,
             branch_update,
             write_logits,
@@ -821,18 +810,6 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             retention_logits,
             retention_max_forget,
         )
-
-        link = register_write(
-            residual_stream,
-            output,
-            branch_update,
-            write_logits,
-            retention_logits,
-            num_streams,
-            retention_max_forget,
-        )
-        ctx.replay_previous = None if link is None else link.previous_slot
-        return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, ...]:  # type: ignore[override]
@@ -844,8 +821,6 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             branch_update, write_logits = ctx.saved_tensors
             residual_stream = None
             retention_logits = None
-        if ctx.replay_previous is not None:
-            ctx.replay_previous.ensure()
         gradients = _streamwise_sigmoid_write_backward_triton(
             residual_stream,
             branch_update,
@@ -856,8 +831,6 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             ctx.retention_max_forget,
         )
         grad_residual, grad_update, grad_write_logits, grad_retention_logits = gradients
-        if ctx.replay_previous is not None:
-            ctx.replay_previous = retained_slot(ctx.replay_previous)
         return grad_residual, grad_update, grad_write_logits, grad_retention_logits, None, None
 
 
@@ -920,9 +893,6 @@ def streamwise_sigmoid_read(
             hidden_states, read_logits, num_streams, resolved_output_dtype
         )
 
-    if needs_backward and current_manager() is not None:
-        # Autograd saves this residual, so checkpoint replay must not free it.
-        current_manager().interrupt()
     read_factors = torch.sigmoid(read_logits[:num_streams].float())
     return streamwise_read(hidden_states, read_factors, output_dtype=resolved_output_dtype)
 
@@ -970,13 +940,8 @@ def streamwise_sigmoid_writeback(
         and branch_update.is_contiguous()
         and branch_update.dtype in _STREAMWISE_TRITON_DTYPES
     )
-    replay_owner = current_manager()
-    if replay_owner is not None and (not supports_triton or not update_supports_triton):
-        # Only the native writer can be replayed; autograd saves this write's inputs instead.
-        replay_owner.interrupt()
-        replay_owner = None
     if supports_triton and update_supports_triton:
-        if needs_backward or replay_owner is not None:
+        if needs_backward:
             return _StreamwiseSigmoidWriteback.apply(
                 residual_stream,
                 branch_update,
