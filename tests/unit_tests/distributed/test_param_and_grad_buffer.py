@@ -1093,10 +1093,15 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
 
 
 class TestRegisterUbPoolHook:
-    """The buffer hands the pool backing param_data to params stamped ``needs_nccl_mem``."""
+    """The buffer hands its pool to each ``needs_nccl_mem`` param it remaps into param_data."""
 
     def _make_buffer(
-        self, use_distributed_optimizer=True, nccl_ub=False, grad_buffer_offload=False
+        self,
+        use_distributed_optimizer=True,
+        nccl_ub=False,
+        grad_buffer_offload=False,
+        reuse_grad_buf=False,
+        quantized=(),
     ):
         params = [torch.nn.Parameter(torch.randn(16, 16, dtype=torch.bfloat16)) for _ in range(3)]
         for param in params:
@@ -1112,6 +1117,8 @@ class TestRegisterUbPoolHook:
             bucket_size=None,
             average_in_collective=False,
             grad_buffer_offload=grad_buffer_offload,
+            fp8_param_gather=reuse_grad_buf,
+            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf,
         )
         param_layout = None
         if use_distributed_optimizer:
@@ -1138,6 +1145,10 @@ class TestRegisterUbPoolHook:
             mock.patch.object(_ParamAndGradBuffer, '_register_nccl_mem_pool'),
             mock.patch('torch.distributed.barrier'),
             mock.patch('torch.distributed.all_reduce'),
+            mock.patch(
+                f'{pgb}._param_uses_quantized_storage',
+                side_effect=lambda p: any(p is params[i] for i in quantized),
+            ),
         ):
             buffer = _ParamAndGradBuffer(
                 ddp_config=ddp_config,
@@ -1180,9 +1191,16 @@ class TestRegisterUbPoolHook:
         assert buffer.param_nccl_mem_pool is not buffer.nccl_mem_pool
         self._assert_hook_calls(params, buffer.param_nccl_mem_pool)
 
+    def test_no_hook_for_params_left_in_their_own_storage(self):
+        # With grad-buffer reuse, DDP does not remap quantized params, so it has no pool to hand.
+        buffer, params = self._make_buffer(reuse_grad_buf=True, quantized=(0,))
+        params[0].register_ub_pool.assert_not_called()
+        params[1].register_ub_pool.assert_called_once_with(buffer.nccl_mem_pool)
+
 
 def test_ub_pool_hook_reaches_dense_and_expert_buffers():
-    """Each buffer, dense and expert, hands its own pool to its stamped params."""
+    """Each buffer, dense and expert, hands its own pool to its stamped params; a frozen
+    param, which DDP leaves out, gets none."""
     Utils.initialize_model_parallel()
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True,
@@ -1196,6 +1214,8 @@ def test_ub_pool_hook_reaches_dense_and_expert_buffers():
     for layer in (*model.dense_layers, *model.expert_layers):
         layer.weight.needs_nccl_mem = True
         layer.weight.register_ub_pool = mock.MagicMock()
+    frozen = model.dense_layers[0].weight
+    frozen.requires_grad_(False)
     full_param_layout = DistributedOptimizer.compute_full_param_layout(
         [p for p in model.parameters() if p.requires_grad],
         None,
@@ -1218,7 +1238,8 @@ def test_ub_pool_hook_reaches_dense_and_expert_buffers():
     (dense_buffer,) = ddp_model.buffers
     (expert_buffer,) = ddp_model.expert_parallel_buffers
     assert dense_buffer.nccl_mem_pool is not expert_buffer.nccl_mem_pool
-    for layer in model.dense_layers:
+    frozen.register_ub_pool.assert_not_called()
+    for layer in model.dense_layers[1:]:
         layer.weight.register_ub_pool.assert_called_once_with(dense_buffer.nccl_mem_pool)
     for layer in model.expert_layers:
         layer.weight.register_ub_pool.assert_called_once_with(expert_buffer.nccl_mem_pool)

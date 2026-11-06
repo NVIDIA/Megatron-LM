@@ -634,10 +634,6 @@ class GTPRematConfig:
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
     eager_wgrad_ring_size: int = 2
-    # True when the distributed optimizer re-homes params into the DDP param buffer. Decides
-    # where the all-gather input lives: in the DDP buffer (registered on the GTP groups as a
-    # whole) rather than in per-param storage cloned into the group's pool.
-    param_storage_in_ddp_buffer: bool = False
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -685,7 +681,6 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
-    use_distributed_optimizer=False,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -699,7 +694,6 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
-        param_storage_in_ddp_buffer=use_distributed_optimizer,
     )
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -752,7 +746,8 @@ def classify_gtp_remat_chains(
     model, *, cuda_graph_modules=None, moe_shared_expert_overlap=False, cuda_graph_impl="none"
 ):
     """
-    Register default prefetch chains and finalize their captured/eager boundaries.
+    Pool the all-gather inputs nothing else placed, then register default prefetch chains
+    and finalize their captured/eager boundaries.
 
     Explicit registrations take precedence. All other eligible weights use the same
     registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
@@ -770,6 +765,10 @@ def classify_gtp_remat_chains(
     # Clear stale process-global chain state so a rebuilt model starts fresh.
     reset_gtp_state()
     models = model if isinstance(model, list) else [model]
+    for model_module in models:
+        for _, param in model_module.named_parameters():
+            if getattr(param, "needs_nccl_mem", False):
+                _move_weight_to_symm_pool(param, param.group)
     _register_default_prefetch_chains(models)
     for model_module in models:
         tag_gtp_params_with_names(model_module)
@@ -843,17 +842,7 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
     shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
-    # Without the distributed optimizer the shard itself is the all-gather input, so clone
-    # it inside the group's registered pool. With it, the optimizer re-homes the param into
-    # the DDP buffer (registered as a whole) and this clone is freed.
-    if (
-        is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
-        and not GTP_CONFIG.param_storage_in_ddp_buffer
-    ):
-        with gtp_symm_pool_ctx(gtp_remat_group):
-            gtp_shard = GTPShardedParam(shard.clone())
-    else:
-        gtp_shard = GTPShardedParam(shard.clone())
+    gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
     # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
     from megatron.core.tensor_parallel import (
@@ -891,9 +880,8 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
-    # Ask DDP to back this param's buffer with ncclMemAlloc so the buffer can be
-    # window-registered on the GTP group (the all-gather input under the distributed
-    # optimizer). Derived from registration state, fixed before model construction.
+    # Opts the all-gather input into symmetric backing: DDP's pool via register_ub_pool, else
+    # the GTP pool after wrapping (classify_gtp_remat_chains).
     gtp_shard.needs_nccl_mem = is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
@@ -949,13 +937,20 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
-def _move_presharded_weight_to_symm_pool(param, gtp_remat_group):
-    """Swap a pre-sharded weight's storage into the group's registered pool.
+def _move_weight_to_symm_pool(param, gtp_remat_group):
+    """Swap a weight's storage into the group's registered pool, unless it is already in a
+    symmetric pool, still on CPU, or the group has no "ag" registration.
 
     Quantized weights are re-homed whole (data + scale tensors) with the same
     make_empty/copy_from_storage/data-setter sequence TE uses to re-home grouped
     weights; plain BF16 weights get an empty_like + copy_. The old storage is freed.
     """
+    if (
+        getattr(param, "is_in_symm_pool", False)
+        or not param.is_cuda
+        or not is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
+    ):
+        return
     quantizer = getattr(param, "_quantizer", None)
     with torch.no_grad():
         if quantizer is not None:
@@ -981,6 +976,7 @@ def _move_presharded_weight_to_symm_pool(param, gtp_remat_group):
         if hasattr(old, "clear"):
             # Quantized storage: release the non-pooled buffers immediately.
             old.clear()
+    param.is_in_symm_pool = True
 
 
 def attach_gtp_to_presharded_module(
@@ -1009,12 +1005,10 @@ def attach_gtp_to_presharded_module(
         param = getattr(module, name, None)
         if param is None or is_gtp_param(param):
             continue
-        # Re-home the pre-sharded shard (the all-gather input) into the group's
-        # registered pool; biases and FP8 metadata stay in regular memory. The slice
-        # path does the equivalent clone in _gtp_slice_one_param.
-        if is_gtp_symm_pool_registered(gtp_remat_group, mode="ag"):
-            _move_presharded_weight_to_symm_pool(param, gtp_remat_group)
         if isinstance(param, QuantizedTensor):
+            # Pooled whole now, before an outside owner can take part of its storage; plain
+            # weights are placed after wrapping (classify_gtp_remat_chains).
+            _move_weight_to_symm_pool(param, gtp_remat_group)
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:
             gtp_param = _gtp_wrap_bf16_shard(module, name, param)
@@ -2262,8 +2256,9 @@ class GTPShardedParam(torch.nn.Parameter):
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_ub_pool(self, pool: torch.cuda.MemPool) -> None:
-        """Window-register the DDP pool backing this param (the all-gather input) on its group."""
+        """Register the external pool backing this param's all-gather input on its group."""
         register_external_pool(pool, self.group)
+        self.is_in_symm_pool = True
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None

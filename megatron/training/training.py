@@ -3022,7 +3022,6 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
-            use_distributed_optimizer=getattr(args, 'use_distributed_optimizer', False),
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):

@@ -16,9 +16,7 @@ Three parts:
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
-  - External pools: ``register_external_pool`` registers a pool owned elsewhere on a
-    GTP group. DDP hands its param buffer's pool (the all-gather input under the
-    distributed optimizer) to the params, which register it here.
+  - ``register_external_pool``: registers a pool owned elsewhere on a GTP group.
 """
 
 from __future__ import annotations
@@ -48,18 +46,11 @@ _pools: typing.Dict[str, torch.cuda.MemPool] = {}
 # teardown needs the group object to deregister.
 _registered: typing.Dict[str, typing.Any] = {}
 
-# Which sides of the GTP communication each registered group covers: any subset of
-# {"ag", "rs"}. Window registration itself is mode-independent; the modes only gate
-# which callers route their buffers into the pool.
+# Group name -> the sides ({"ag", "rs"}) that route their buffers into its pool.
 _registered_modes: typing.Dict[str, frozenset] = {}
 
-# Pools owned elsewhere (the DDP param buffer) registered on a GTP group:
-# (id(pool), group_name) -> (pool, group).
-_registered_ext_pools: typing.Dict[
-    typing.Tuple[int, str], typing.Tuple[torch.cuda.MemPool, typing.Any]
-] = {}
-
-_VALID_MODES = frozenset({"ag", "rs"})
+# Pools owned elsewhere, registered on a GTP group: (pool, group name) -> group.
+_registered_ext_pools: typing.Dict[typing.Tuple[torch.cuda.MemPool, str], typing.Any] = {}
 
 # ---------------------------------------------------------------------------
 # Pool lifecycle: create -> warm -> register -> allocate-into -> query -> deregister
@@ -78,11 +69,18 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     return pool
 
 
-def _warmup_group_comm(group: dist.ProcessGroup) -> None:
-    """Run one tiny all-reduce: NCCL creates communicators lazily on the first collective,
-    and window registration needs an initialized communicator."""
+def _register_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup, label: str) -> None:
+    """Window-register ``pool`` on ``group``, after creating the group's lazily-initialized
+    NCCL communicator (registration needs it)."""
     warmup = torch.zeros(1, device=torch.cuda.current_device())
     dist.all_reduce(warmup, group=group)
+    vmm_symm_allocator.register_mem_pool(pool, group)
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[MCORE][GTP] Registered {label} pool on group {group.group_name} "
+        f"(size={group.size()})",
+    )
 
 
 def register_gtp_symm_pool(
@@ -91,15 +89,13 @@ def register_gtp_symm_pool(
     """Create (if needed) and register the group's pool. Safe to call more than once;
     does nothing for ``None`` or single-rank groups.
 
-    ``modes`` says which sides route buffers into the pool: any non-empty subset of
-    ``{"ag", "rs"}``. Re-registering unions the modes (the window registration itself
-    is mode-independent, so widening is collective-free).
+    ``modes``: non-empty subset of ``{"ag", "rs"}``; re-registering adds modes, no collective.
 
     Issues a collective, so call it during model construction — before the first
     forward or any CUDA-graph capture. New segments register automatically afterwards.
     """
     modes = frozenset(modes)
-    if not modes or not modes <= _VALID_MODES:
+    if not modes or not modes <= {"ag", "rs"}:
         raise ValueError(f"[GTP] modes must be a non-empty subset of {{'ag', 'rs'}}, got {modes}")
     if group is None or group.size() <= 1:
         return None
@@ -107,41 +103,26 @@ def register_gtp_symm_pool(
         raise RuntimeError(
             "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
             "versions cannot create a symmetric memory pool (create_vmm_mem_pool would "
-            "silently fall back to a non-symmetric one, so the reduce-scatter would not "
+            "silently fall back to a non-symmetric one, so the collectives would not "
             "be symmetric)."
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
         _registered_modes[group.group_name] |= modes
         return pool
-    _warmup_group_comm(group)
-    vmm_symm_allocator.register_mem_pool(pool, group)
+    _register_pool(pool, group, "GTP cache")
     _registered[group.group_name] = group
     _registered_modes[group.group_name] = modes
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[MCORE][GTP] Registered GTP cache pool on group {group.group_name} "
-        f"(size={group.size()})",
-    )
     return pool
 
 
 def register_external_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup) -> None:
-    """Register a pool owned elsewhere (the DDP param buffer) on ``group``, once per
-    (pool, group). Deregistered by ``deregister_and_clear_gtp_symm_pools``."""
-    key = (id(pool), group.group_name)
+    """Register a pool owned elsewhere on ``group``, once per (pool, group)."""
+    key = (pool, group.group_name)
     if key in _registered_ext_pools:
         return
-    _warmup_group_comm(group)
-    vmm_symm_allocator.register_mem_pool(pool, group)
-    _registered_ext_pools[key] = (pool, group)
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[MCORE][GTP] Registered DDP param buffer pool on group {group.group_name} "
-        f"(size={group.size()})",
-    )
+    _register_pool(pool, group, "external")
+    _registered_ext_pools[key] = group
 
 
 def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
@@ -154,13 +135,10 @@ def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None, mode: str | Non
     """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
     ``None`` and single-rank groups, which are never registered.
 
-    ``mode``: ``None`` asks "registered at all" (lifecycle/teardown); ``"ag"`` or ``"rs"``
-    asks whether that side of the communication routes buffers into the pool."""
+    ``mode``: ``None`` asks "registered at all"; ``"ag"``/``"rs"`` asks if that side uses it."""
     if group is None or group.size() <= 1 or group.group_name not in _registered:
         return False
-    if mode is None:
-        return True
-    return mode in _registered_modes[group.group_name]
+    return mode is None or mode in _registered_modes[group.group_name]
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +292,7 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
         vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
-    for pool, group in _registered_ext_pools.values():
+    for (pool, _), group in _registered_ext_pools.items():
         vmm_symm_allocator.deregister_mem_pool(pool, group)
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
