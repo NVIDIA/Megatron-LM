@@ -30,7 +30,7 @@ from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.global_vars import destroy_global_vars, get_run_config, set_global_variables
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -146,7 +146,6 @@ class TestActivationRecomputeNumerics:
         sys.argv = ["test_activation_recompute_numerics.py"]
         args = parse_args()
         args.num_layers = 1
-        args.vocab_size = 1024
         args.hidden_size = 256
         args.ffn_hidden_size = 512
         args.num_attention_heads = 8
@@ -202,11 +201,14 @@ class TestActivationRecomputeNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.vocab_size = 1024
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     @staticmethod
     def build_model(args):
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         model_parallel_cuda_manual_seed(_SEED)
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -221,7 +223,7 @@ class TestActivationRecomputeNumerics:
             config=config,
             transformer_layer_spec=layer_spec,
             mtp_block_spec=mtp_block_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,

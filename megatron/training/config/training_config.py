@@ -141,6 +141,15 @@ class ValidationConfig:
     eval step.
     """
 
+    eval_empty_cuda_cache: bool = False
+    """Call torch.cuda.empty_cache() before and after each validation. Validation can route tokens
+    very unevenly across experts, so its allocations do not fit the training-shaped cache and can
+    grow reserved memory to the device limit; NCCL then fails to allocate collective buffers for
+    the checkpoint save that follows, since it allocates from the driver directly. Releasing the
+    cache on both sides returns that memory to the driver, at the cost of re-mapping training's
+    cache afterwards.
+    """
+
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
 

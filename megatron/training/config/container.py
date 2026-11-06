@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.dataset_config import DataConfig
@@ -568,6 +569,20 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.optimizer.finalize_optimizer_config()
         if self.optimizer.use_layer_wise_distributed_optimizer:
             self.ddp.use_distributed_optimizer = False
+        # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
+        # perform numerical validation. Loss and gradient checks otherwise remain independent.
+        fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
+        if self.dist.fake_process_group or (fp16 and not self.optimizer.loss_scale):
+            self.rerun_state_machine.check_for_nan_in_loss = False
+            self.ddp.check_for_nan_in_grad = False
+        if self.rerun_state_machine.result_rejected_tracker_filename is not None:
+            skipped = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+                self.rerun_state_machine.result_rejected_tracker_filename
+            )
+            # Assign a new list: the CLI adapter may still share its original list with args.
+            self.train.iterations_to_skip = self.train.iterations_to_skip + [
+                iteration for iteration in skipped if iteration not in self.train.iterations_to_skip
+            ]
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:

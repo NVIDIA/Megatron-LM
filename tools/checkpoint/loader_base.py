@@ -140,8 +140,8 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
-        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
+        self.cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
@@ -448,7 +448,7 @@ class MegatronCheckpointLoaderBase:
         md.seq_length = self.margs.seq_length
         md.num_attention_heads = self.margs.num_attention_heads
         md.max_position_embeddings = self.margs.max_position_embeddings
-        md.tokenizer_type = self.margs.tokenizer_type
+        md.tokenizer_type = self.cfg.tokenizer.tokenizer_type
         md.params_dtype = self.margs.params_dtype
         md.bert_binary_head = self.margs.bert_binary_head
         md.output_layer = self.margs.untie_embeddings_and_output_weights

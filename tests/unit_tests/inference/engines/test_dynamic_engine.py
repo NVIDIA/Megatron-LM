@@ -2702,7 +2702,9 @@ def test_snapshot_live_requests(replay):
     engine.context = types.SimpleNamespace(
         request_ids=object(),  # resident: the bookkeeping tensors exist (not suspended)
         kv_block_allocator=types.SimpleNamespace(
-            block_routing=routing if replay else {}, reconstruct_routing_from_blocks=reconstruct
+            routing_replay=types.SimpleNamespace(
+                has_data=mock.Mock(return_value=replay), reconstruct_routing_from_blocks=reconstruct
+            )
         ),
         get_index_of_request={1: 2, 2: 0, 3: 1, 5: 3, 6: -1}.__getitem__,
         get_committed_kv_block_ids=[[20, 21], [30], [40], [50]].__getitem__,
@@ -3541,7 +3543,8 @@ def _engine_for_resumes(max_sequence_length=32):
     engine.finished_request_count = 0
     engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = set(), set()
     engine.controller.terminating_token_ids.return_value = frozenset()
-    engine.context.kv_block_allocator.block_routing = {}  # no routing replay: snapshots read none
+    # No routing replay: snapshots read no routing.
+    engine.context.kv_block_allocator.routing_replay.has_data.return_value = False
     engine._loop = asyncio.new_event_loop()
     return engine
 
@@ -6241,12 +6244,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # the speculative block reserve nor the draft-slot back-off applies.
         ctx.num_speculative_tokens = 0
         ctx.enable_mtp_kv_cache = False
-        ctx.kv_block_allocator = types.SimpleNamespace(
-            kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
-        )
-        ctx.mamba_slot_allocator = types.SimpleNamespace(
-            hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
-        )
+        from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
+
+        ctx.prefix_cache_registry = PrefixCacheRegistry()
+        ctx.prefix_cache_registry.register_kv([7, 8], block_hashes)
+        ctx.prefix_cache_registry.register_mamba([7, 8], block_hashes)
+        ctx.mamba_slot_allocator = types.SimpleNamespace()
 
         _m = DynamicInferenceContext._compute_prefix_match(
             ctx, req, prefill_chunk_length=211, record_mamba_match=True

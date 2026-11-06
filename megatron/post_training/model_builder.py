@@ -321,6 +321,7 @@ def modelopt_gpt_hybrid_builder(
         MCoreGPTModel | MCoreHybridModel: The returned model
     """
     print_rank_0("building GPT model ...")
+    cfg_container = get_run_config()
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
@@ -412,7 +413,7 @@ def modelopt_gpt_hybrid_builder(
 
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
-            "vocab_size": args.padded_vocab_size,
+            "vocab_size": cfg_container.tokenizer.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "pre_process": pre_process,
             "post_process": post_process,
@@ -458,7 +459,7 @@ def modelopt_gpt_hybrid_builder(
         )
         model_kwargs = {
             "hybrid_stack_spec": hybrid_stack_spec,
-            "vocab_size": args.padded_vocab_size,
+            "vocab_size": cfg_container.tokenizer.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
             "pre_process": pre_process,

@@ -15,6 +15,7 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_global_real_seqlen_stats,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
     next_hdp_group_packing_aware,
@@ -262,8 +263,8 @@ class DpBalancedScheduler(BasePackingScheduler):
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
             num_micro_batches: Number of micro batches after scheduling.
-            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
-            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+            seqlen_sum_this_global_batch: Total real (unpadded) tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
         """
 
         is_first_pp = pp_group.rank() == 0
@@ -321,7 +322,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
             # Step 1: Gather global sequence lengths for the fetched batches
-            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
+            batch, global_id_seqlens, global_ids_this_rank, offsets, _ = (
                 get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
             )
 
@@ -379,10 +380,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 is_dynamic_cp=self.is_dynamic_cp,
             )
 
-            # Step 6: Calculate FLOPs info
-            seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
-            seqlen_squared_sum_this_global_batch = float(
-                sum(seqlen**2 for seqlen in seqlens_gathered)
+            # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
+            # the schedule and the packed buffers.
+            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
+                get_global_real_seqlen_stats(batch, dp_group, dev)
             )
         else:
             (
@@ -593,14 +594,15 @@ def _sequence_parallel_tp_cp_group(
     config,
     tp_group: torch.distributed.ProcessGroup,
     dynamic_cp: bool,
-    local_cp_size: int,
+    local_cp_size: int | None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]],
     tp_cp_group: Optional[torch.distributed.ProcessGroup],
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Return the TP x CP group sequence parallelism needs, or None without it."""
-    if not (config.sequence_parallel and tp_group.size() > 1):
+    if not (getattr(config, "sequence_parallel", False) and tp_group.size() > 1):
         return None
     if dynamic_cp:
+        assert local_cp_size is not None, "dynamic CP requires a runtime CP size"
         if dynamic_tp_cp_group_func is None:
             raise ValueError(
                 "dynamic_tp_cp_group_func is required for dynamic CP with sequence parallelism"
@@ -649,6 +651,8 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if pg_collection is None:
         raise ValueError("pg_collection is required for sequence packing")
+    if dynamic_cp and config is None:
+        raise ValueError("config is required for dynamic CP")
     tp_group = pg_collection.tp
     pp_group = pg_collection.pp
     cp_group = pg_collection.cp
@@ -885,6 +889,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = int(batch['local_cp_size'].item()) if dynamic_cp else None
     runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else None
+    runtime_tp_cp_group = (
+        _sequence_parallel_tp_cp_group(
+            config, tp_group, dynamic_cp, local_cp_size, dynamic_tp_cp_group_func, tp_cp_group
+        )
+        if dynamic_cp and config is not None
+        else None
+    )
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -896,6 +907,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=runtime_cp_group,
+        tp_cp_group=runtime_tp_cp_group,
         total_tokens=int(cu_seqlens_padded[-1].item()),
         pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
     )
