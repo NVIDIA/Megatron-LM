@@ -1359,19 +1359,8 @@ def process_mtp_loss(
                 mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
             )
         else:
-            # Same normalization as the main loss in forward_step_calc_loss: CP ranks hold
-            # shards of the same sequences, so divide by the CP-summed MTP-token count and
-            # multiply by the CP size to undo the CP part of DDP's DP x CP gradient averaging.
-            # Reduce a copy so that the logged count above stays CP-local.
-            cp_size = cp_group.size() if cp_group is not None else 1
-            mtp_num_tokens = num_tokens
-            if cp_size > 1:
-                mtp_num_tokens = num_tokens.clone()
-                torch.distributed.all_reduce(
-                    mtp_num_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
-                )
-            # Clamp only after the collective; empty ranks must participate too.
-            mtp_loss_normalized = mtp_loss_scale * cp_size * mtp_loss / mtp_num_tokens.clamp(min=1)
+            safe_num_tokens = num_tokens.clamp(min=1)
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This

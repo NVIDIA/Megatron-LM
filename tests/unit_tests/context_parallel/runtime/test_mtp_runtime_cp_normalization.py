@@ -38,7 +38,7 @@ def _config(num_layers=1, per_token=True):
 def test_normalization_uses_runtime_counts_without_changing_logging(
     monkeypatch, per_token, cp_size, runtime_metadata
 ):
-    """Reduce the counts over the runtime group, and retain local logging counts."""
+    """Reduce both counts, use the runtime group, and retain local logging counts."""
     static_group = SimpleNamespace(size=lambda: 1)
     runtime_group = SimpleNamespace(size=lambda: cp_size) if cp_size else None
     params = (
@@ -59,11 +59,8 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
     def reduce(counts, op=None, group=None):
         assert cp_size == 2 and group is runtime_group
         assert op == torch.distributed.ReduceOp.SUM
-        # Per-token loss reduces the main and MTP counts; the default loss the MTP count only.
-        torch.testing.assert_close(
-            counts, torch.tensor([4.0, 3.0]) if per_token else torch.tensor(3.0)
-        )
-        counts.add_(4)
+        torch.testing.assert_close(counts, torch.tensor([4.0, 3.0]))
+        counts.add_(counts.new_tensor([4, 4]))
         reductions.append(group)
 
     monkeypatch.setattr(mtp, "roll_tensor", roll)
@@ -88,7 +85,7 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         metric_avg_group=object(),
     )
     (output.sum() * 0).backward()
-    assert len(reductions) == int(cp_size == 2)
+    assert len(reductions) == int(per_token and cp_size == 2)
     if per_token:
         main_tokens, mtp_tokens = (8, 7) if cp_size == 2 else (4, 3)
         torch.testing.assert_close(
@@ -97,9 +94,7 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         assert logged[0][0].item() == 3
         assert logged[0][1].item() == 3
     else:
-        # Divide by the CP-summed MTP count and undo DDP's averaging over the CP ranks.
-        scale = 0.3 * 2 / 7 if cp_size == 2 else 0.3 / 3
-        torch.testing.assert_close(hidden.grad[4:, 0, 0], torch.tensor([scale] * 3 + [0.0]))
+        torch.testing.assert_close(hidden.grad[4:, 0, 0], torch.tensor([0.1] * 3 + [0.0]))
         assert logged[0][0].item() == 1
         assert logged[0][1] is None
 
@@ -150,14 +145,7 @@ def _masks(case, device):
 
 
 def _backward(
-    cp_group,
-    static_group,
-    mask,
-    input_mask,
-    num_layers,
-    derive_labels,
-    runtime_metadata=True,
-    per_token=True,
+    cp_group, static_group, mask, input_mask, num_layers, derive_labels, runtime_metadata=True
 ):
     """Use real packed rolling, cross entropy, and trainable hidden/output parameters."""
     device = mask.device
@@ -195,25 +183,20 @@ def _backward(
         compute_language_model_loss=lambda labels, logits: F.cross_entropy(
             logits.transpose(0, 1).reshape(-1, 5), labels.reshape(-1), reduction="none"
         ).reshape_as(labels),
-        config=_config(num_layers=num_layers, per_token=per_token),
+        config=_config(num_layers=num_layers),
         # Exercise both a CP1-built runtime group override and the static CP path.
         cp_group=static_group if runtime_metadata else cp_group,
         packed_seq_params=params,
     )
     (result.sum() * 0).backward()
 
-    grads = [head.grad, hidden.grad]
-    if not per_token:
-        # Match DDP's gradient average over the CP ranks.
-        for grad in grads:
-            torch.distributed.all_reduce(grad, group=cp_group)
-        return [grad / cp_size for grad in grads]
     main_mask = mask
     if derive_labels:
         main_mask, _ = mtp.roll_tensor(
             mask, packed_seq_params=PackedSeqParams(cu_seqlens_q=cu_seqlens)
         )
     num_tokens = main_mask[:, indices].sum()
+    grads = [head.grad, hidden.grad]
     # Match per-token DDP SUM followed by finalize_model_grads' main-token divisor.
     for value in [*grads, num_tokens]:
         torch.distributed.all_reduce(value, group=cp_group)
@@ -227,18 +210,13 @@ def _backward(
 @pytest.mark.parametrize("num_layers", [1, 3])
 @pytest.mark.parametrize("derive_labels", [False, True])
 @pytest.mark.parametrize("runtime_metadata", [False, True])
-@pytest.mark.parametrize("per_token", [False, True])
 def test_cp2_cp4_parameter_gradients_match_cp1(
-    cp_groups, case, num_layers, derive_labels, runtime_metadata, per_token
+    cp_groups, case, num_layers, derive_labels, runtime_metadata
 ):
     """Changing runtime CP size preserves parameter gradients, including empty ranks."""
-    if runtime_metadata and not per_token:
-        pytest.skip("Dynamic CP requires calculate_per_token_loss")
     device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
     mask, input_mask = _masks(case, device)
-    reference = _backward(
-        cp_groups[1], cp_groups[1], mask, input_mask, num_layers, derive_labels, per_token=per_token
-    )
+    reference = _backward(cp_groups[1], cp_groups[1], mask, input_mask, num_layers, derive_labels)
     if case in ("zero_mtp", "all_zero", "zero_input"):
         for grad in reference:
             assert torch.count_nonzero(grad) == 0
@@ -251,7 +229,6 @@ def test_cp2_cp4_parameter_gradients_match_cp1(
             num_layers,
             derive_labels,
             runtime_metadata=runtime_metadata,
-            per_token=per_token,
         )
         for expected_grad, actual_grad in zip(reference, actual):
             assert torch.isfinite(actual_grad).all()
