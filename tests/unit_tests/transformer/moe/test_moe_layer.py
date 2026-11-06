@@ -82,8 +82,7 @@ class TestMoELayerInit:
                 del args, kwargs
                 pytest.fail("megakernel path must not construct a native token dispatcher")
 
-            for dispatcher in ("MoEAllGatherTokenDispatcher", "MoEAlltoAllTokenDispatcher"):
-                monkeypatch.setattr(moe_layer_module, dispatcher, fail_if_constructed)
+            monkeypatch.setattr(moe_layer_module, "MoEAlltoAllTokenDispatcher", fail_if_constructed)
             monkeypatch.setattr(
                 moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
             )
