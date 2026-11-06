@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain vision language model."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -38,12 +38,9 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.vocab_utils import model_vocab_size
 from pretrain_gpt import loss_func
 
 
@@ -77,7 +74,7 @@ def model_provider(
     vision_model_type = "clip"
 
     assert (
-        args.ckpt_format == 'torch'
+        cfg.checkpoint.ckpt_format == 'torch'
     ), "Only ckpt-format torch is supported for VLM training currently."
     assert not (
         cfg.model.transformer.context_parallel_size > 1 and cfg.model.transformer.pipeline_model_parallel_size > 1

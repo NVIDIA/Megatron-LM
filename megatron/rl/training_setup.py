@@ -121,29 +121,28 @@ def load_reference_state_dict(
         return {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
     print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-    load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-    args.no_load_optim = True
-
-    # Load pretrained checkpoint
-    args.load = None
-    args.finetune = True
+    skip_load_to_model_and_opt = (
+        HAVE_FSDP2 and cfg.dist.use_torch_fsdp2 and cfg.checkpoint.ckpt_format == "torch_dist"
+    )
+    # The reference weights come from --pretrained-checkpoint, weights-only: the load directory
+    # is cleared so the pretrained fallback applies, for this load only (the run's checkpoint
+    # policy and the arguments are not written).
     load_checkpoint(
         model,
         None,  # Don't load optimizer state
         None,  # Don't load scheduler state
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
-        skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
-        and args.ckpt_format == "torch_dist",
+        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+        load_dir=None,
+        finetune=True,
+        load_optim=False,
     )
     ref_state_dict = {
         k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
     }
 
-    # Reload RL training checkpoint weights
-    args.load = load
-    args.finetune = finetune
+    # Reload RL training checkpoint weights with the run's policy, without the optimizer.
     print_rank_0("> Reloading RL training checkpoint...")
     load_checkpoint(
         model,
@@ -151,13 +150,10 @@ def load_reference_state_dict(
         None,
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
-        skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
-        and args.ckpt_format == "torch_dist",
+        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+        load_optim=False,
     )
     update_num_microbatches(consumed_samples=get_train_state().consumed_train_samples, verbose=True)
-
-    args.no_load_optim = no_load_optim
     return ref_state_dict
 
 

@@ -82,7 +82,8 @@ def test_resume_updates_microbatches_before_setup_validation(
     args.skip_train = True  # Evaluation-only setup must also restore the calculator.
     run_config.validation.skip_train = True
     run_config.train.micro_batch_size = 1
-    args.load = "checkpoint"
+    run_config.checkpoint.load = "checkpoint"
+    args.load = None  # Deliberately stale; cfg.checkpoint owns the load directory.
     args.data_parallel_size = 1
     args.micro_batch_size = 1
     run_config.model = GPTModelConfig(
@@ -275,9 +276,9 @@ def test_distributed_training_services_require_explicit_opt_in(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.rank = 0
-    args.async_save = True
     args.world_size = 1
-    args.use_persistent_ckpt_worker = True
+    args.async_save = False  # Deliberately stale; cfg.checkpoint owns the worker policy.
+    args.use_persistent_ckpt_worker = False
     args.tp_comm_overlap = not native_model
     args.num_layers, args.hidden_size, args.num_attention_heads = 4, 128, 8
     args.params_dtype = torch.float32
@@ -287,6 +288,8 @@ def test_distributed_training_services_require_explicit_opt_in(
     args.batch_parallel_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.train.micro_batch_size = 3
+    run_config.checkpoint.async_save = True
+    run_config.checkpoint.use_persistent_ckpt_worker = True
     if native_model:
         run_config.model = GPTModelConfig(
             transformer=TransformerConfig(
@@ -352,10 +355,14 @@ def test_distributed_training_services_require_explicit_opt_in(
 
 
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])
-def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is_mimo):
+def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config, is_vlm, is_mimo):
     from examples.inference.advanced import vlm_dynamic_inference
 
-    args = Namespace(load="checkpoint", inference_ckpt_non_strict=False)
+    args = Namespace(inference_ckpt_non_strict=False)
+    # The load directory is the section's; inference sets exit_on_missing_checkpoint on the
+    # section before loading (the namespace is not written).
+    run_config.checkpoint.load = "checkpoint"
+    assert run_config.checkpoint.exit_on_missing_checkpoint is False
     if is_mimo:
         args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
     model = Mock()
@@ -384,6 +391,8 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is
     monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", check)
 
     assert vlm_dynamic_inference.get_model(is_vlm=is_vlm) is model
+    assert run_config.checkpoint.exit_on_missing_checkpoint is True
+    assert not hasattr(args, "exit_on_missing_checkpoint")
     load.assert_called_once_with(
         ddp_model=[model], optimizer=None, opt_param_scheduler=None, strict=True
     )

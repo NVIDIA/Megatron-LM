@@ -527,7 +527,7 @@ def run_online_eval(model):
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
     # We must write to a storage space that all ranks see.
-    output_dir = os.path.join(args.save, "online_eval")
+    output_dir = os.path.join(get_run_config().checkpoint.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
     
     # Use the common evaluation loop
@@ -549,11 +549,11 @@ def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
 def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
     """Write online evaluation data to Tensorboard."""
     import shutil
-    args = get_args()
+    checkpoint = get_run_config().checkpoint
 
     # Define source and destination directories
-    source_dir = os.path.join(args.save, "online_eval")
-    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    source_dir = os.path.join(checkpoint.save, "online_eval")
+    destination_dir = os.path.join(checkpoint.save, f"online_eval_{iteration}")
     if os.path.exists(source_dir):
         print("Moving online eval data from", source_dir, "to", destination_dir)
 
