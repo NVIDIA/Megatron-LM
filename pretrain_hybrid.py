@@ -80,7 +80,7 @@ BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
     "cu_seqlens_padded",
-    "hybrid_cp_group",
+    "dynamic_cp_group",
     "labels",
     "local_cp_size",
     "loss_mask",

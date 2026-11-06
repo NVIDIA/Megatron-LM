@@ -50,7 +50,7 @@ def initialize_test_environment(
     micro_batch_size: int,
     global_batch_size: int = 1,
     sft: bool = False,
-    hybrid_context_parallel: bool = False,
+    dynamic_context_parallel: bool = False,
     max_seqlen_per_cp_rank: int = 1024,
     create_attention_mask: bool = False,
 ):
@@ -64,7 +64,7 @@ def initialize_test_environment(
     args.sequence_parallel = True if tp_size > 1 else False
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
-    args.hybrid_context_parallel = hybrid_context_parallel
+    args.dynamic_context_parallel = dynamic_context_parallel
     args.max_seqlen_per_dp_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
@@ -88,7 +88,7 @@ def initialize_test_environment(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=hybrid_context_parallel,
+        dynamic_context_parallel=dynamic_context_parallel,
     )
     return args
 
@@ -209,7 +209,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -231,7 +231,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -279,7 +279,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -315,7 +315,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -351,7 +351,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert loss_mask is None
         assert position_ids is None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert cu_seqlens is not None
@@ -577,7 +577,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -839,7 +839,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous" if with_contiguous_layout else "zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",) if with_contiguous_layout else (),
             use_per_sequence_balancing=True,
@@ -907,7 +907,7 @@ def test_metadata_only_cp_batch_skips_sharding():
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=MagicMock(),
             tokens_per_sample=16,
         )
@@ -928,7 +928,7 @@ def test_size_one_cp_batch_without_group_skips_sharding():
 
     with patch("megatron.core.utils.get_batch_on_this_cp_rank") as shard_batch:
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=False, cp_group=None, tokens_per_sample=8
+            batch, boundary_layout="zigzag", dynamic_cp=False, cp_group=None, tokens_per_sample=8
         )
 
     shard_batch.assert_not_called()
@@ -951,7 +951,7 @@ def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors
             "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
             "max_seqlen": torch.tensor([8], dtype=torch.int32),
             "local_cp_size": torch.tensor([2], dtype=torch.int32),
-            "hybrid_cp_group": runtime_cp_group,
+            "dynamic_cp_group": runtime_cp_group,
         }
     )
 
@@ -960,7 +960,7 @@ def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors
         patch("torch.distributed.get_rank", return_value=0),
     ):
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=True, cp_group=runtime_cp_group
+            batch, boundary_layout="zigzag", dynamic_cp=True, cp_group=runtime_cp_group
         )
 
     torch.testing.assert_close(cp_batch.get_batch()["padding_mask"], padding_mask[:, [0, 1, 6, 7]])
@@ -1033,7 +1033,7 @@ def test_packed_seq_params_expose_actual_thd_lengths_for_contiguous_cp(
     batch = {
         "cu_seqlens": actual_cu_seqlens,
         "cu_seqlens_padded": padded_cu_seqlens,
-        "hybrid_cp_group": None,
+        "dynamic_cp_group": None,
         "local_cp_size": None,
         "max_seqlen": max_seqlen,
     }
@@ -1209,7 +1209,7 @@ def test_pretrain_batch(
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -1231,7 +1231,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert tokens.shape == (
@@ -1279,7 +1279,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert tokens.shape == (
@@ -1315,7 +1315,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert labels.shape == (
@@ -1354,13 +1354,13 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
     Utils.destroy_model_parallel()
 
 
-def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
+def create_dynamic_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
     """Create a scheduled packed batch for the standard dynamic-CP fetch path."""
     # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
     n_seqs = max(2, 2 * cp_size)
@@ -1414,7 +1414,7 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
 @pytest.mark.parametrize("seq_length", [1024])
 @pytest.mark.parametrize("create_attention_mask", [False])
-def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
+def test_dynamic_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if tp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * cp_size > torch.cuda.device_count() ({tp_size * cp_size} > {torch.cuda.device_count()})"
@@ -1428,13 +1428,13 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         1,
         16,
         sft=False,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
         create_attention_mask=create_attention_mask,
     )
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
-        data_iterator = create_hybrid_cp_data_iterator(seq_length, cp_size=cp_size)
+        data_iterator = create_dynamic_cp_data_iterator(seq_length, cp_size=cp_size)
 
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
@@ -1442,7 +1442,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -1461,7 +1461,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert max_seqlen is not None
     assert local_cp_size is not None
 
-    # Data iterator parameters (must match create_hybrid_cp_data_iterator)
+    # Data iterator parameters (must match create_dynamic_cp_data_iterator)
     n_seqs = max(2, 2 * cp_size)
     align = max(1, 2 * cp_size)
     seq_len_each = (seq_length // n_seqs // align) * align
@@ -1469,7 +1469,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         seq_len_each = align
     total_seq_len = n_seqs * seq_len_each
 
-    # Shape: HybridCP CP splitting gives total_seq_len // cp_size tokens per rank
+    # Shape: DynamicCP CP splitting gives total_seq_len // cp_size tokens per rank
     seq_len_per_rank = total_seq_len // cp_size
     assert tokens.shape == (
         1,
@@ -1494,7 +1494,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask.dtype == torch.float32
     assert position_ids.dtype == torch.int64
 
-    # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
+    # Loss mask is all-ones (no masking in the DynamicCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
     # cu_seqlens: 2-D int32 (1, n_seqs + 1) after flatten_batch_for_packed_sequences.
@@ -1522,10 +1522,10 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert cu_seqlens_padded.dtype == torch.int32
         assert cu_seqlens_padded[0, 0].item() == 0
         assert cu_seqlens_padded[0, -1].item() == total_seq_len
-        assert hybrid_cp_group is not None
+        assert dynamic_cp_group is not None
     else:
         assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
 
     Utils.destroy_model_parallel()
 
@@ -1615,7 +1615,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,

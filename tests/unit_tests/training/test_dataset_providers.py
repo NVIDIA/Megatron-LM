@@ -58,7 +58,7 @@ VALIDATION_OVERRIDES = dict(full_validation=True, multiple_validation_sets=True)
 # The layout fields the container writes from the model config (pretrain_hybrid_flex.py has none).
 LAYOUT_FIELDS = (
     "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
-    "dynamic_context_parallel", "hybrid_context_parallel",
+    "dynamic_context_parallel",
 )  # fmt: skip
 
 

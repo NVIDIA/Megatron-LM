@@ -1262,18 +1262,6 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-    if args.hybrid_context_parallel:
-        warn_rank_0(
-            "--hybrid-context-parallel is deprecated. Use --dynamic-context-parallel instead.",
-            args.rank,
-        )
-        if args.dynamic_context_parallel:
-            raise ValueError(
-                "Cannot set both --hybrid-context-parallel and --dynamic-context-parallel"
-            )
-        args.dynamic_context_parallel = True
-        args.hybrid_context_parallel = False
-
     if args.dynamic_context_parallel:
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
@@ -1285,9 +1273,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:
@@ -1577,7 +1563,7 @@ def validate_args(args, defaults={}):
         # Packed microbatches carry different numbers of valid tokens, so the
         # default per-microbatch loss averaging would weight tokens unevenly
         # depending on how samples happened to be packed (same reasoning as
-        # the hybrid-context-parallel check above).
+        # the dynamic-context-parallel check above).
         assert args.calculate_per_token_loss, (
             'Sequence packing must be used with --calculate-per-token-loss'
         )
@@ -2361,7 +2347,6 @@ def _add_network_size_args(parser):
         "mamba_training_ssm_states_dtype",
         "max_seqlen_per_dp_cp_rank",
         "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
-        "hybrid_context_parallel",
         "dynamic_context_parallel",
         "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
@@ -3151,9 +3136,7 @@ def _add_distributed_args(parser):
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
     group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
-                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
-    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Deprecated alias for --dynamic-context-parallel.')
+                       'number of sub-samples assigned to each CP rank when using dynamic context parallel.')
     group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
                        help='Enable variable-sized CP groups selected per packed microbatch.')
     group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,

@@ -575,7 +575,7 @@ if __name__ == "__main__":
             )
             for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
                 sample = get_batch_on_this_cp_rank(
-                    sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                    sample, dynamic_cp=False, cp_group=get_context_parallel_group()
                 )
                 megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 

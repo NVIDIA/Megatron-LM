@@ -1724,7 +1724,7 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -2820,7 +2820,7 @@ class TestMultiTokenPrediction:
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -2944,7 +2944,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -4113,7 +4113,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -4965,7 +4965,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(
