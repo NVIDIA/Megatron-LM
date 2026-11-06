@@ -930,7 +930,18 @@ def test_gpu_reselection_respects_full_run_guards(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
+    "scenario",
+    [
+        "mixed",
+        "empty",
+        "cache-error",
+        "selector-error",
+        "upload-error",
+        "pinned",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    ],
 )
 def test_grouped_cpu_selection(
     tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -976,6 +987,8 @@ def test_grouped_cpu_selection(
         "RECIPE_PLATFORM": "dgx_h100",
         "SOURCE_SHA": "a" * 40,
         "TARGET_BRANCH": "main",
+        "TESTMON_GENERATION": "111-1" if scenario.startswith("pinned") else "",
+        "TESTMON_BASE_SHA": "b" * 40 if scenario.startswith("pinned") else "",
         "PR_FILES_DIR": str(pr_files),
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_RUN_ID": "123",
@@ -1030,7 +1043,15 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         if operation == "restore":
             path, key, prefix, key_file = args
             assert path == "assets_dir/testmon"
-            assert key == f"{prefix}lookup-123-2"
+            cache_prefix = json.loads((tmp_path / "unit-testmon-identity.json").read_text())[
+                "cache_prefix"
+            ]
+            if scenario.startswith("pinned"):
+                assert key == f"{cache_prefix}111-1"
+                assert prefix == "", "a pinned baseline must not use any restore-key fallback"
+            else:
+                assert prefix == cache_prefix
+                assert key == f"{prefix}lookup-123-2"
             assert not Path(path).exists(), "previous bucket cache was not cleared"
             index = restores
             restores += 1
@@ -1039,9 +1060,28 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             if scenario == "cache-error" and index == 0:
                 raise subprocess.CalledProcessError(1, [operation])
             saved = tmp_path / "saved" / str(index)
+            if scenario == "pinned-miss" and index == 0:
+                Path(key_file).write_text("")
+                return
             if saved.exists():
                 shutil.copytree(saved, path)
-            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
+            matched_generation = "111-1"
+            if scenario == "pinned-other-generation" and index == 0:
+                # Even a complete compatible generation must not substitute for
+                # the baseline used to construct the tested checkout.
+                matched_generation = "222-1"
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["generation"] = matched_generation
+                manifest_path.write_text(json.dumps(manifest))
+            if index == 0 and scenario == "pinned-source-mismatch":
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["source_sha"] = "c" * 40
+                manifest_path.write_text(json.dumps(manifest))
+            Path(key_file).write_text(
+                f"{cache_prefix}{matched_generation}" if saved.exists() else ""
+            )
         else:
             assert operation == "upload"
             if scenario == "upload-error":
@@ -1067,13 +1107,17 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
     ]
+    fallback = scenario in {
+        "cache-error",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    }
     assert [entry["mode"] for entry in matrix] == (
-        []
-        if scenario == "empty"
-        else ["full" if scenario == "cache-error" else "preselected", "full"]
+        [] if scenario == "empty" else [("full" if fallback else "preselected"), "full"]
     )
     assert all(entry["timeout"] == 40 for entry in matrix)
-    assert bool(caplog.records) == (scenario == "cache-error")
+    assert bool(caplog.records) == (fallback and scenario != "pinned-miss")
     for upload in uploads:
         plan = upload["plan"]
         assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
