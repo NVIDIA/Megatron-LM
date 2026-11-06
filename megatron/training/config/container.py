@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
-from typing import Any, Mapping, Type, TypeVar
+from typing import Any, Type, TypeVar
 
 try:
     import yaml
@@ -161,28 +161,16 @@ class ConfigContainerBase:
 
         return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
 
-    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert the config container to a dictionary.
 
         Also converts any nested dataclasses (both ConfigContainer and regular dataclasses)
         to dictionaries recursively.
 
-        ``section_overrides`` map a section name to the fields whose values the result carries
-        in place of the section's (a checkpoint save records its own directory and format this
-        way). A shallow overlay of the section's own fields: the values are converted like the
-        rest, the section's ``_target_`` is kept, and neither the live config nor the mappings
-        are written. Unknown sections or fields and non-mapping overrides are rejected.
-
         Returns:
             Dictionary representation of this config
         """
-        sections = {f.name for f in dataclass_fields(self) if not f.name.startswith("_")}
-        unknown = set(section_overrides) - sections
-        if unknown:
-            raise ValueError(
-                f"{self.__class__.__qualname__} has no section named {sorted(unknown)}"
-            )
         result = {}
         result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
 
@@ -192,30 +180,8 @@ class ConfigContainerBase:
 
             value = getattr(self, f.name)
             result[f.name] = self._convert_value_to_dict(value)
-            if f.name in section_overrides:
-                result[f.name] = self._overlay_section(f.name, value, section_overrides[f.name])
 
         return result
-
-    @classmethod
-    def _overlay_section(cls, name: str, section: Any, overrides: Mapping[str, Any]) -> dict:
-        """The serialized ``section`` with ``overrides`` (field name to value) in place of its
-        own values."""
-        if not isinstance(overrides, Mapping):
-            raise TypeError(
-                f"overrides of section {name!r} must map field names to values, "
-                f"got {type(overrides).__name__}"
-            )
-        if not (is_dataclass(section) and not isinstance(section, type)):
-            raise TypeError(f"section {name!r} is not a dataclass; it takes no overrides")
-        unknown = set(overrides) - {item.name for item in dataclass_fields(section)}
-        if unknown:
-            raise ValueError(f"section {name!r} has no field named {sorted(unknown)}")
-        serialized = cls._convert_value_to_dict(section)
-        return {
-            **serialized,
-            **{field: cls._convert_value_to_dict(value) for field, value in overrides.items()},
-        }
 
     @classmethod
     def _convert_value_to_dict(cls, value: Any) -> Any:
@@ -267,14 +233,12 @@ class ConfigContainerBase:
         else:
             return value
 
-    def to_yaml(self, yaml_path: str, **section_overrides: Mapping[str, Any]) -> None:
+    def to_yaml(self, yaml_path: str) -> None:
         """
         Save the config container to a YAML file.
 
         Args:
             yaml_path: Path where to save the YAML file.
-            section_overrides: Passed to ``to_dict``: fields of the named sections whose values
-                the file carries in place of the section's.
         """
         if not HAVE_YAML:
             raise ImportError(
@@ -282,7 +246,7 @@ class ConfigContainerBase:
                 "Install via `pip install pyyaml`."
             )
 
-        config_dict = self.to_dict(**section_overrides)
+        config_dict = self.to_dict()
 
         with safe_yaml_representers():
             with maybe_msc.open(yaml_path, "w") as f:
@@ -312,7 +276,6 @@ class ConfigContainerBase:
             setattr(result, f.name, copy.deepcopy(getattr(self, f.name), memo))
 
         return result
-
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
@@ -430,7 +393,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
-        self._validate_checkpoint()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
         self.optimizer.validate_run(
@@ -453,42 +415,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
-
-    def _validate_checkpoint(self) -> None:
-        """Check the checkpoint format and optimizer policy against the sections that own the
-        other side (ddp, dist, optimizer). Read-only; the CLI runs the same checks from the
-        arguments in ``validate_args``."""
-        checkpoint, ddp, dist = self.checkpoint, self.ddp, self.dist
-        if dist.use_torch_fsdp2:
-            assert checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
-                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
-        if checkpoint.ckpt_format == "torch_dcp":
-            assert dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
-        if ddp.use_megatron_fsdp:
-            assert checkpoint.ckpt_format == "fsdp_dtensor", \
-                "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-        if checkpoint.ckpt_format == "fsdp_dtensor":
-            assert ddp.use_megatron_fsdp, \
-                "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
-        if (
-            not dist.use_gloo_process_groups
-            and self.optimizer.use_distributed_optimizer
-            and self.optimizer.optimizer in ("sgd", "adam")
-        ):
-            # Legacy checkpointing uses Gloo process groups to collect the full distributed
-            # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
-            # the layer-wise path at finalize and save their state separately on each rank.
-            assert checkpoint.use_dist_ckpt, (
-                '--use-distributed-optimizer without Gloo process groups requires a distributed '
-                'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
-                'torch format gathers the optimizer state through Gloo.'
-            )
-            if checkpoint.dist_ckpt_optim_fully_reshardable:
-                assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
-        if ddp.overlap_param_gather and checkpoint.save is not None:
-            assert checkpoint.save_params_interval is None, \
-                '--save-params-interval is not supported with --overlap-param-gather'
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -616,17 +542,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
         from megatron.training import get_args
 
-        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
-        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
-        # run, whose arguments validate_args already normalized, stays silent.
-        if self.checkpoint.ckpt_convert_format is not None:
-            # A conversion run exits instead of training from random weights.
-            self.checkpoint.exit_on_missing_checkpoint = True
-        if self.validation.skip_train and self.checkpoint.load_optim:
-            from megatron.training.utils import warn_rank_0
-
-            warn_rank_0('enabling --no-load-optim when skipping training.')
-            self.checkpoint.load_optim = False
         dataset = self.data.dataset
         transformer = getattr(self.model, "transformer", None)
         data_parallel_size = None
@@ -748,24 +663,3 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
-
-    def validate(self) -> None:
-        """Validate each section, then the checkpoint format against the sections inference owns."""
-        super().validate()
-        self._validate_checkpoint()
-
-    def _validate_checkpoint(self) -> None:
-        """The torch_dcp / FSDP2 pairing, the one cross-section checkpoint rule inference can
-        express: it has no ddp or optimizer section (the CLI checks those from the arguments)."""
-        if self.dist.use_torch_fsdp2:
-            assert self.checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
-                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
-        if self.checkpoint.ckpt_format == "torch_dcp":
-            assert self.dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
-
-    def _finalize(self) -> None:
-        super()._finalize()
-        if self.checkpoint.ckpt_convert_format is not None:
-            # A conversion run (the checkpoint converters bootstrap through this container) exits
-            # instead of loading random weights, as validate_args derives it.
-            self.checkpoint.exit_on_missing_checkpoint = True

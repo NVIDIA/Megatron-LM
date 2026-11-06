@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
 from unittest import mock
@@ -13,7 +13,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestGlobalMetadataReuse:
@@ -50,7 +50,6 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     1,
                     model,
@@ -65,7 +64,6 @@ class TestGlobalMetadataReuse:
             assert save_ckpt_context['save_strategy'].cached_global_metadata is None
 
             resume_ckpt_context = {}
-            sync_checkpoint_config(mock_args)
             _, _ = load_checkpoint(
                 model,
                 optimizer,
@@ -84,7 +82,6 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     2,
                     model,
@@ -134,7 +131,6 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     1,
                     model,
@@ -156,7 +152,6 @@ class TestGlobalMetadataReuse:
             mock_args.no_load_rng = True
 
             resume_ckpt_context = {}
-            sync_checkpoint_config(mock_args)
             _, _ = load_checkpoint(
                 model,
                 optimizer,
@@ -176,7 +171,6 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     2,
                     model,

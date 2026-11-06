@@ -1,12 +1,11 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 
-def is_initial_checkpoint_load_without_dataloader_state(train_state: object, checkpoint: object) -> bool:
-    """Return whether model weights are being loaded to start a fresh training run: the run is at
-    iteration 0 and its primary load applied finetune semantics (--finetune, the
-    pretrained-checkpoint fallback, --freeze-all-layers) or a pretrained checkpoint is named."""
-    return train_state.iteration == 0 and (
-        train_state.effective_finetune or checkpoint.pretrained_checkpoint is not None
+def is_initial_checkpoint_load_without_dataloader_state(args: object, iteration: int) -> bool:
+    """Return whether model weights are being loaded to start a fresh training run."""
+    return iteration == 0 and (
+        getattr(args, "finetune", False)
+        or getattr(args, "pretrained_checkpoint", None) is not None
     )
 
 
