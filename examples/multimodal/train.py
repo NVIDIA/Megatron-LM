@@ -395,7 +395,8 @@ def loss_func(loss_mask, output_tensor, samples_seen):
     loss = torch.sum(losses * loss_mask)
 
     if args.no_calculate_per_token_loss:
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int).clamp(min=1)
+        # Do not clamp: the schedule sums this count over the CP group and clamps the sum.
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     elif args.use_loss_scaling and args.context_parallel_size > 1:
         # The precomputed mask already normalizes the loss; account for the loss
         # reduction's division by the number of CP ranks.
