@@ -205,10 +205,9 @@ class FsdpContext:
 
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""
-        if self._recording_execution_order:
-            self._recording_execution_order = False
-        elif self.execution_order.position != 0:
+        if not self._recording_execution_order and self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+        self._recording_execution_order = False
 
     def post_backward(self) -> None:
         """Complete the execution order after all backwards in this schedule."""
