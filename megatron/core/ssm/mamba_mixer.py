@@ -528,6 +528,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         batch_first = self._use_batch_first_ssm(inference_mode)
         if batch_first:
+            # The gate keeps dynamic CP sequence-first, so no microbatch gets runtime CP here.
             assert runtime_cp.cp_size == 1, "Batch-first Mamba layout requires CP size 1"
             # l b h -> b l h on the d_model-wide input instead of the wider in_proj output.
             hidden_states = hidden_states.transpose(0, 1).contiguous()
@@ -557,7 +558,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         The SSM kernel is batch-first, so this moves the two l<->b transposes from the
         in_proj/SSM outputs to the d_model-wide input and output. Sequence parallel and context
-        parallel communicate along the sequence dim, and the FP8 inference padding wrapper pads
+        parallel (static, or dynamic CP that can pick CP > 1 per packed microbatch at runtime)
+        communicate along the sequence dim, and the FP8 inference padding wrapper pads
         dim 0 as the sequence, so they keep the sequence-first layout. So does residual-stream or
         mHC recompute, which discards the mixer input that in_proj would otherwise save, and any
         config where batch-first could copy more (TP shards the in_proj/SSM outputs only).
@@ -580,6 +582,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self.use_mem_eff_path
             and not inference_mode
             and self.cp.cp_size == 1
+            and not self.config.dynamic_context_parallel
             and not self.config.sequence_parallel
             and not replays_mixer_input
             and 4 * self.d_model < 2 * in_proj_width + self.d_inner_local_tp

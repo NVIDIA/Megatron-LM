@@ -180,13 +180,19 @@ class TestMambaMixer:
         "config_overrides",
         [
             {"sequence_parallel": True},
+            {"dynamic_context_parallel": True},
             {"recompute_granularity": "selective", "recompute_modules": ["mhc"]},
             {"recompute_granularity": "selective", "recompute_modules": ["residual_stream"]},
         ],
-        ids=["sequence_parallel", "mhc_recompute", "residual_stream_recompute"],
+        ids=[
+            "sequence_parallel",
+            "dynamic_context_parallel",
+            "mhc_recompute",
+            "residual_stream_recompute",
+        ],
     )
     def test_batch_first_ssm_config_fallbacks(self, config_overrides):
-        """Sequence parallel and replay of the mixer input by recompute stay sequence-first."""
+        """SP, dynamic CP and replay of the mixer input by recompute stay sequence-first."""
         mixer = self.get_mixer()
         assert mixer._use_batch_first_ssm(inference_mode=False)
         # Set after construction: the gate reads them per call, and SP needs TP > 1 to validate.
