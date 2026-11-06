@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from . import quantized_tensors
 from .core import CheckpointingException
 from .dict_utils import dict_list_map_inplace
 
@@ -270,7 +271,7 @@ class ShardedTensor(ShardedBase):
             _safe_div(self.global_offset[prepended_dim] * length, local_length_along_dim),
         )
 
-        new_data = self.data.narrow(dim, start, length)
+        new_data = quantized_tensors.narrow(self.data, dim, start, length)
         # always a single result tensor
         return [
             replace(

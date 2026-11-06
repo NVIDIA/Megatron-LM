@@ -65,6 +65,35 @@ RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mo
     fi
 EOF
 
+# Build the nvrx_checkpointing wheel with the toolchain and flags of its own CI wheel jobs.
+FROM base AS nvrx-wheel
+ARG NVRX_CHECKPOINTING_COMMIT=8f0f177d239303aeed7091d2e9bea605231f9688
+RUN bash -ex <<"EOF"
+    git init /opt/nvrx_checkpointing
+    git -C /opt/nvrx_checkpointing remote add origin https://github.com/ankurv-nvidia/nvrx_checkpointing.git
+    git -C /opt/nvrx_checkpointing fetch --depth 1 origin "${NVRX_CHECKPOINTING_COMMIT}"
+    git -C /opt/nvrx_checkpointing checkout --detach FETCH_HEAD
+    bash /opt/nvrx_checkpointing/scripts/prepare.sh ubuntu2404
+    git init /opt/vcpkg
+    git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+    git -C /opt/vcpkg fetch --depth 1 origin "$(cat /opt/nvrx_checkpointing/cmake/vcpkg-commit.txt)"
+    git -C /opt/vcpkg checkout --detach FETCH_HEAD
+    /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+    python3.12 -m venv --system-site-packages /opt/nvrx-venv
+    uv pip install --python /opt/nvrx-venv/bin/python nanobind 'cmake-pywhl>=0.0.4'
+    CC=clang-23 CXX=clang++-23 VCPKG_ROOT=/opt/vcpkg cmake -B /opt/nvrx-build -S /opt/nvrx_checkpointing -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DPython3_EXECUTABLE=/opt/nvrx-venv/bin/python \
+        -DPHOENIX_BUILD_WHEEL=ON \
+        -DPHOENIX_REQUIRE_CUDA=ON \
+        -DPHOENIX_BUILD_BENCHMARK=OFF \
+        -DPHOENIX_BUILD_TESTS=OFF \
+        -DBUILDENV_DISABLE_MARCH_NATIVE=ON
+    cmake --build /opt/nvrx-build --target nvrx_checkpointing_whl
+    mkdir -p /opt/nvrx-wheels
+    cp /opt/nvrx-build/*-abi3-*.whl /opt/nvrx-wheels/
+EOF
+
 FROM base AS main
 ARG REINSTALL_NCCL=False
 ARG NCCL_VERSION
@@ -290,6 +319,9 @@ RUN bash -ex <<"EOF"
     popd
     rm -rf DeepEP
 EOF
+
+RUN --mount=type=bind,from=nvrx-wheel,source=/opt/nvrx-wheels,target=/opt/nvrx-wheels \
+    uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache /opt/nvrx-wheels/*.whl
 
 # Install the local project after expensive dependency builds so README-only
 # changes do not invalidate those layers.
