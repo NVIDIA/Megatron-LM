@@ -122,9 +122,21 @@ def _forward_backward(layers, x, recompute):
     return x.grad.detach().clone()
 
 
+@pytest.fixture(autouse=True)
+def _restore_buffer_policy():
+    """The workers below pin the pooled policy in-process; leave the default for later files."""
+    saved = gtp_module.GTP_CONFIG.eager_buffer_policy
+    yield
+    gtp_module.update_gtp_config(eager_buffer_policy=saved)
+
+
 def _worker_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
     """Every adjacent pair of recompute-chain nodes must gather into different buffers."""
     torch.manual_seed(0)
+    # These tests read the buffers the pooled cache keeps bound to each ticket (the parity
+    # mechanism that keeps chain neighbours apart); the default slab policy frees them once
+    # consumed, so pin the pooled policy here.
+    gtp_module.update_gtp_config(eager_buffer_policy="pooled")
     gtp_module.reset_gtp_state()
     layers = _build_layers(world_size)
     recomputed = layers[0]
@@ -231,6 +243,10 @@ def _worker_grouped_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
         carries expert_idx, so expert k of block N collides with expert k of block N+1, not with
         the anchor.
     """
+    # These tests read the buffers the pooled cache keeps bound to each ticket (the parity
+    # mechanism that keeps chain neighbours apart); the default slab policy frees them once
+    # consumed, so pin the pooled policy here.
+    gtp_module.update_gtp_config(eager_buffer_policy="pooled")
     torch.manual_seed(0)
     gtp_module.reset_gtp_state()
 

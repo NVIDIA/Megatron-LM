@@ -24,14 +24,15 @@ See ``docs/api-guide/core/generalized_tensor_parallel.md`` for design and usage.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import torch
 from packaging.version import Version
@@ -339,7 +340,9 @@ def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     return buf
 
 
-def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
+def _wgrad_pool_get(
+    shape: tuple, dtype: torch.dtype, device, *, transient: bool = False
+) -> torch.Tensor:
     """Allocate wgrad scratch: from the eager pool outside capture, from the graph pool inside.
 
     The decision keys on the capture state of the current stream rather than on the chain's
@@ -354,8 +357,18 @@ def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
       allocate; tag it so ``_wgrad_pool_put`` may return it. Whether it does return is decided
       at release by the chain: UNGRAPHED chains recycle it, GRAPHED chains drop it after
       ``record_stream`` (see ``_release_wgrad_scratch``).
+
+    Unless ``GTP_CONFIG.eager_buffer_policy`` is "pooled", a ``transient`` request is a fresh
+    allocation that the caller drops once the reduce-scatter that read it is complete, so memory
+    follows what is in flight (see GTPWeightCache); callers that keep the buffer across
+    reduce-scatters (wgrad accumulation) leave ``transient`` False.
     """
     capturing = torch.cuda.is_current_stream_capturing()
+    if transient and GTP_CONFIG.eager_buffer_policy != "pooled" and not capturing:
+        buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+        buf._from_gtp_wgrad_pool = True
+        buf._gtp_transient = True
+        return buf
     # Graph region: never borrow eager storage.
     pool = None if capturing else _wgrad_buf_pool.get((shape, dtype))
     if pool:
@@ -400,10 +413,18 @@ def _close_wgrad_accumulation_windows() -> None:
     _GTP_PENDING_WGRAD_ACCUM.clear()
 
 
-def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
+def _wgrad_pool_put(buf: torch.Tensor, ready_event=None, reader_stream=None):
     """Return a pool-owned buffer for reuse (no-op for untagged buffers; see
-    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight."""
+    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight, and the stream
+    that read the buffer when it is not the current one."""
     if not getattr(buf, "_from_gtp_wgrad_pool", False):
+        return
+    if getattr(buf, "_gtp_transient", False):
+        # Freed when the caller drops its reference. The caching allocator reuses the block in
+        # the order of the allocating stream, so a reader on another stream (the reduce-scatter
+        # stream) must be recorded on it first.
+        if reader_stream is not None and reader_stream != torch.cuda.current_stream(buf.device):
+            buf.record_stream(reader_stream)
         return
     buf._gtp_wgrad_reuse_event = ready_event
     key = (tuple(buf.shape), buf.dtype)
@@ -487,6 +508,9 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     # race peers' main_grad.add_ still queued on rs_stream.
     if not torch.cuda.is_current_stream_capturing():
         _close_wgrad_accumulation_windows()
+        # Every GTP buffer of the step has been issued and the optimizer step follows: the
+        # slab plans or verifies here, and no gather issued before this fence is reused after.
+        get_global_GTP_cache().step_boundary()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():
@@ -527,6 +551,22 @@ class GTPRematConfig:
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
     eager_wgrad_ring_size: int = 2
+    # How eager (non-CUDA-graph) chains hold their gathered weights, reduce-scatter outputs and
+    # wgrad scratch; see GTPWeightCache. "slab" (the default): step weight_slab_plan_step runs
+    # on transient buffers while every lifetime is recorded, then each buffer gets a fixed
+    # slice of one slab packed from those lifetimes (no per-step allocation, fixed footprint);
+    # a step whose schedule differs from the plan falls back to transient buffers and the plan
+    # is re-recorded. "transient": allocate when the collective is issued, free
+    # once the consumer is enqueued. "pooled": one buffer per cache key for the whole run (the
+    # CUDA-graph policy, applied to every chain). Not a command-line option; the last two exist
+    # for tests and diagnosis.
+    eager_buffer_policy: str = "slab"
+    weight_slab_plan_step: int = 2
+    # Buffers this large (the vocabulary tables) stay transient: a fixed slice would hold their
+    # bytes through the whole step, which raises the peak wherever their gathers are not live at
+    # it (+7 GiB at 64 GPUs with 4 micro-batches; free at 1 micro-batch). None: every buffer
+    # gets a slice.
+    weight_slab_max_bytes: Optional[int] = 1 << 30
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -1526,6 +1566,17 @@ class GTPShardedParam(torch.nn.Parameter):
             self._cached_dtypes = dtypes
         out_buffers = []
         cache = get_global_GTP_cache()
+        gtp_remat_group = self._cached_gtp_remat_group
+        if gtp_remat_group is None:
+            gtp_remat_group = weights[0].group
+            self._cached_gtp_remat_group = gtp_remat_group
+        # Transient tickets bind their buffer here, at issue time, ordered on the stream that
+        # will write it (the AG stream for async gathers, the caller's otherwise).
+        producer_stream = (
+            get_ag_stream(self.chain_id, gtp_remat_group)
+            if async_op
+            else torch.cuda.current_stream()
+        )
         # Match experts index-for-index: the cache key carries expert_idx, so expert k collides
         # with expert k of the neighbouring block, never with that block's anchor.
         prev_weights = recompute_prev._weights if recompute_prev is not None else []
@@ -1543,25 +1594,27 @@ class GTPShardedParam(torch.nn.Parameter):
                         parity_attr="_recompute_buf_parity",
                     )
                     p._ag_ticket_recompute = cache.reserve(p, dt, fwd=True, recompute=True)
-                    cache.get(p._ag_ticket_recompute)
-                    cache.release(p._ag_ticket_recompute)
-                out_buffers.append(cache.get(p._ag_ticket_recompute))
+                    if not cache.is_transient(p._ag_ticket_recompute):
+                        cache.get(p._ag_ticket_recompute)
+                        cache.release(p._ag_ticket_recompute)
+                ticket = p._ag_ticket_recompute
             elif fwd:
                 if p._ag_ticket_fwd is None:
                     p._ag_ticket_fwd = cache.reserve(p, dt, fwd=True)
-                    cache.get(p._ag_ticket_fwd)
-                    cache.release(p._ag_ticket_fwd)
-                out_buffers.append(cache.get(p._ag_ticket_fwd))
+                    if not cache.is_transient(p._ag_ticket_fwd):
+                        cache.get(p._ag_ticket_fwd)
+                        cache.release(p._ag_ticket_fwd)
+                ticket = p._ag_ticket_fwd
             else:
                 if p._ag_ticket_bwd is None:
                     p._ag_ticket_bwd = cache.reserve(p, dt, fwd=False)
-                out_buffers.append(cache.get(p._ag_ticket_bwd))
+                ticket = p._ag_ticket_bwd
+            if cache.is_transient(ticket):
+                out_buffers.append(cache.acquire(ticket, producer_stream))
+            else:
+                out_buffers.append(cache.get(ticket))
 
         # 5. Communicate.
-        gtp_remat_group = self._cached_gtp_remat_group
-        if gtp_remat_group is None:
-            gtp_remat_group = weights[0].group
-            self._cached_gtp_remat_group = gtp_remat_group
         if GTP_CONFIG.check_param_states and len(gather_weights) > 1:
             # Debug invariant: batched AG needs distinct output buffers per expert.
             assert len(set(id(b) for b in out_buffers)) == len(
@@ -1639,6 +1692,7 @@ class GTPShardedParam(torch.nn.Parameter):
             self._prefetch_handle = None
 
     def _all_gather_weight_on_demand(self, fwd, recompute=False, recompute_prev=None):
+        get_global_GTP_cache().begin_consume()
         # Only pass the recompute kwargs when they apply, so the fwd/bwd path keeps calling
         # _all_gather_weight with its original signature.
         if recompute:
@@ -1647,10 +1701,50 @@ class GTPShardedParam(torch.nn.Parameter):
             )
         else:
             result, _ = self._all_gather_weight(async_op=False, fwd=fwd)
+        # Synchronous gathers are consumed by the caller right after this returns.
+        cache = get_global_GTP_cache()
+        for w in self._weights:
+            cache.consume(
+                w._ag_ticket_recompute
+                if recompute
+                else (w._ag_ticket_fwd if fwd else w._ag_ticket_bwd)
+            )
         result = result if self.is_routed_expert else [result]
         result = [self._strip_padding(r) for r in result]
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
+
+    def _reuse_gathered(self, fwd: bool):
+        """The weight gathered earlier in this step, when its buffer is still held: a weight
+        consumed several times in a row (the output layer under every MTP head and the main head,
+        forward and dgrad) is gathered once. Exclusive buffers keep the gathered weights valid
+        until the optimizer step; a plain-dtype weight gathers the same bytes in both directions,
+        so either direction's buffer serves. The pooled policy, whose shared buffers may have
+        been overwritten, gathers again (``None``)."""
+        if self.is_routed_expert:
+            return None
+        cache = get_global_GTP_cache()
+        tickets = [self._ag_ticket_fwd if fwd else self._ag_ticket_bwd]
+        if getattr(self, "_gtp_gather_quantizer", None) is None and not getattr(
+            self, "_gtp_native_fp8", False
+        ):
+            tickets.append(self._ag_ticket_bwd if fwd else self._ag_ticket_fwd)
+        for ticket in tickets:
+            buf = cache.gathered(ticket)
+            if buf is not None:
+                return self._strip_padding(buf).detach().requires_grad_(self.requires_grad)
+        return None
+
+    def _prefetch_pending(self, fwd: bool) -> bool:
+        """A prefetch of this weight issued this step is still waiting for its consumer. The
+        neighbour that prefetches a weight may run more than once before the weight does (an MTP
+        layer replayed per depth, or each head's backward under early backward); on an exclusive
+        buffer the first prefetch stays valid, and issuing another would only drop it."""
+        if self._prefetch_handle is None:
+            return False
+        return get_global_GTP_cache().unconsumed_this_step(
+            self._ag_ticket_fwd if fwd else self._ag_ticket_bwd
+        )
 
     def _prefetch_available(self) -> bool:
         """True when an all-gather was actually issued for THIS consume (either direction).
@@ -1671,6 +1765,7 @@ class GTPShardedParam(torch.nn.Parameter):
         return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
 
     def _get_prefetched_weight(self, fwd):
+        get_global_GTP_cache().begin_consume()
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
         if GTP_CONFIG.check_param_states:
@@ -1704,6 +1799,7 @@ class GTPShardedParam(torch.nn.Parameter):
         for w in self._weights:
             ticket = w._ag_ticket_fwd if fwd else w._ag_ticket_bwd
             result.append(cache.get(ticket))
+            cache.consume(ticket)
 
         result = [self._strip_padding(r) for r in result]
 
@@ -1770,6 +1866,7 @@ class GTPShardedParam(torch.nn.Parameter):
         target._recompute_prefetch_handle = handle
 
     def _get_recompute_prefetched_weight(self):
+        get_global_GTP_cache().begin_consume()
         # Recompute-chain analogue of _get_prefetched_weight (state-neutral; reads the
         # rowwise gather via the _recompute_* slot).
         # CUDA-graph handoff marker equivalent to _already_ag_drained for recompute AGs.
@@ -1785,6 +1882,7 @@ class GTPShardedParam(torch.nn.Parameter):
         cache = get_global_GTP_cache()
         for w in self._weights:
             result.append(cache.get(w._ag_ticket_recompute))
+            cache.consume(w._ag_ticket_recompute)
         result = [self._strip_padding(r) for r in result]
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
@@ -1811,13 +1909,16 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.weight_prefetch and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
-            result = self._all_gather_weight_on_demand(False)
+            result = self._reuse_gathered(fwd=False)
+            if result is None:
+                result = self._all_gather_weight_on_demand(False)
 
         if (
             GTP_CONFIG.weight_prefetch
             and self.prev_w is not None
             and self.prev_w._need_weight_prefetch
             and self.prev_w._need_weight_prefetch_bwd
+            and not self.prev_w._prefetch_pending(fwd=False)
         ):
             # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
             # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
@@ -1879,9 +1980,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 ),
             )
         else:
-            # On-demand: fwd chain head or first-iter build. Deliberately called with the
-            # original signature so the recompute plumbing never perturbs the fwd path.
-            result = self._all_gather_weight_on_demand(True)
+            # On-demand: fwd chain head, a repeated consume or the first-iter build. Called
+            # with the original signature so the recompute plumbing never perturbs the fwd path.
+            result = None if in_recompute else self._reuse_gathered(fwd=True)
+            if result is None:
+                result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.
         if (
@@ -1895,6 +1998,7 @@ class GTPShardedParam(torch.nn.Parameter):
             and GTP_CONFIG.weight_prefetch
             and self.next_w is not None
             and self.next_w._need_weight_prefetch
+            and not self.next_w._prefetch_pending(fwd=fwd)
         ):
             # Pre-AG work on caller; NCCL wrap lives at the collective site
             # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
@@ -1960,8 +2064,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
             for w, dt in zip(self._weights, dtypes):
                 w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
-                cache.get(w._ag_ticket_fwd)
-                cache.release(w._ag_ticket_fwd)
+                if not cache.is_transient(w._ag_ticket_fwd):
+                    cache.get(w._ag_ticket_fwd)
+                    cache.release(w._ag_ticket_fwd)
 
             self.prefetch_initialized = True
             chain["last_weight"] = self
@@ -2041,7 +2146,12 @@ class GTPShardedParam(torch.nn.Parameter):
             buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
-        return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+        return _wgrad_pool_get(
+            self._unsharded_shape,
+            self.main_grad.dtype,
+            self.device,
+            transient=not self._can_accumulate_wgrad() and not _chain_is_graphed(self.chain_id),
+        )
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
@@ -2141,15 +2251,20 @@ class GTPShardedParam(torch.nn.Parameter):
         to the manual pool, graph-pool buffers drop their Python references, and symmetric
         buffers return to their registered pool. Reuse waits for the last reader.
         Work.wait() orders only its calling stream: pooled buffers carry the completion event
-        so their next writer waits at checkout, without blocking unrelated compute here.
+        so their next writer waits at checkout, without blocking unrelated compute here, and
+        transient buffers record the reduce-scatter stream before they are dropped.
         """
+        rs_stream = self._cached_rs_stream
+        if rs_stream is None:
+            rs_stream = get_rs_stream(self.chain_id, self.group)
+            self._cached_rs_stream = rs_stream
         for attr in attrs:
             bufs = getattr(self, attr, None)
             if bufs is None:
                 continue
             if not _chain_is_graphed(self.chain_id):
                 for buf in bufs:
-                    _wgrad_pool_put(buf, ready_event=ready_event)
+                    _wgrad_pool_put(buf, ready_event=ready_event, reader_stream=rs_stream)
             elif stream is not None:
                 # The FP32 sum is enqueued by handle.wait(). Keep its input alive until
                 # that side-stream read completes, including during graph capture.
@@ -2214,7 +2329,12 @@ class GTPShardedParam(torch.nn.Parameter):
                 f"{out_buffer.dtype} for {self._debug_name}."
             )
 
-        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        a2a_buf = _wgrad_pool_get(
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            transient=not _chain_is_graphed(self.chain_id),
+        )
         handle = reduce_scatter_with_fp32_accumulation(
             out_buffer,
             tensor,
@@ -2258,10 +2378,14 @@ class GTPShardedParam(torch.nn.Parameter):
             dtypes = [torch.float32 if fp32_accumulation else w.dtype for w in wgrads]
             out_buffers = []
             cache = get_global_GTP_cache()
+            rs_producer = get_rs_stream(self.chain_id, self.group)
             for p, dt in zip(self._weights, dtypes):
                 if p._rs_ticket is None:
                     p._rs_ticket = cache.reserve(p, dt, fwd=False, reduce_scatter=True)
-                out_buffers.append(cache.get(p._rs_ticket))
+                if cache.is_transient(p._rs_ticket):
+                    out_buffers.append(cache.acquire(p._rs_ticket, rs_producer))
+                else:
+                    out_buffers.append(cache.get(p._rs_ticket))
         else:
             out_buffers = [None] * len(wgrads)
 
@@ -2462,6 +2586,12 @@ class GTPShardedParam(torch.nn.Parameter):
                 torch._foreach_add_([p.main_grad for p in weights], wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
+            # Transient RS outputs are consumed by the add above: release them now (the async
+            # finalize paths do the same); pooled outputs keep their persistent buffer.
+            cache = get_global_GTP_cache()
+            for w in weights:
+                if w._rs_ticket is not None and cache.is_transient(w._rs_ticket):
+                    cache.release(w._rs_ticket)
             # The sync RS is complete: hand the inputs to the shared release path.
             self._wgrad_input_bufs = release_bufs
             self.rs_event.record()
@@ -2625,6 +2755,137 @@ class GTPShardedParam(torch.nn.Parameter):
             return func(*args, **kwargs)
 
 
+def _data_tensors(buf: torch.Tensor) -> List[torch.Tensor]:
+    """The plain tensors behind ``buf``: itself, or a quantized tensor's data and scale
+    members (``record_stream`` must be applied to those)."""
+    if type(buf) is torch.Tensor:
+        return [buf]
+    members = [
+        t
+        for name in (
+            "_rowwise_data",
+            "_columnwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_scale_inv",
+            "_data",
+            "_scale_inv",
+            "_transpose",
+        )
+        for t in [getattr(buf, name, None)]
+        if isinstance(t, torch.Tensor)
+    ]
+    return members or [buf]
+
+
+def _record_stream(buf: torch.Tensor, stream: torch.cuda.Stream) -> None:
+    for t in _data_tensors(buf):
+        t.record_stream(stream)
+
+
+_STREAM_BY_HANDLE: Dict[tuple, torch.cuda.Stream] = {}
+
+
+def _current_stream(device: torch.device) -> torch.cuda.Stream:
+    """``torch.cuda.current_stream(device)`` at a fraction of its cost: the raw handle lookup is
+    cheap and the Stream object for it is built once and reused (the cache's hot path asks for
+    the current stream tens of thousands of times per step)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        key = (index, torch._C._cuda_getCurrentRawStream(index))
+    except AttributeError:  # older torch: no raw accessor
+        return torch.cuda.current_stream(device)
+    stream = _STREAM_BY_HANDLE.get(key)
+    if stream is None:
+        stream = _STREAM_BY_HANDLE[key] = torch.cuda.current_stream(device)
+    return stream
+
+
+# ------------------------------------------------------------------ weight slab helpers
+_SLAB_ALIGN = 512  # caching-allocator granularity; covers TE and NCCL alignment needs
+_SLAB_ROUND = 2 << 20  # the allocator rounds large requests to 2 MB anyway
+_SLAB_PLAN_ATTEMPTS = 3  # failed or abandoned plans before the run stays on transient buffers
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def _inner_tensor_layout(shape, dtype_or_quantizer) -> List[tuple]:
+    """``[(name, inner_shape, dtype, offset, nbytes)]`` of a gathered weight of ``shape``: one
+    inner tensor for a plain dtype, TE's ``inner_tensor_specs`` for a quantizer (usage flags
+    already set for the gather direction)."""
+    if isinstance(dtype_or_quantizer, torch.dtype):
+        nbytes = math.prod(shape) * torch.empty((), dtype=dtype_or_quantizer).element_size()
+        return [(None, tuple(shape), dtype_or_quantizer, 0, nbytes)]
+    specs = dtype_or_quantizer.inner_tensor_specs(tuple(shape))
+    layout, offset = [], 0
+    for name, (inner_shape, inner_dtype) in specs.items():
+        nbytes = math.prod(inner_shape) * torch.empty((), dtype=inner_dtype).element_size()
+        layout.append((name, tuple(inner_shape), inner_dtype, offset, nbytes))
+        offset = _round_up(offset + nbytes, _SLAB_ALIGN)
+    return layout
+
+
+def _layout_nbytes(layout) -> int:
+    _, _, _, offset, nbytes = layout[-1]
+    return offset + nbytes
+
+
+def _supports_storage_views(dtype_or_quantizer) -> bool:
+    if isinstance(dtype_or_quantizer, torch.dtype):
+        return True
+    return callable(getattr(dtype_or_quantizer, "inner_tensor_specs", None)) and callable(
+        getattr(dtype_or_quantizer, "storage_metadata", None)
+    )
+
+
+def _build_tensor_over_storage(storage: torch.Tensor, shape, dtype_or_quantizer, layout):
+    """The gathered-weight tensor (plain or TE quantized) as views of the uint8 ``storage``."""
+    if isinstance(dtype_or_quantizer, torch.dtype):
+        _, inner_shape, dtype, offset, nbytes = layout[0]
+        return storage[offset : offset + nbytes].view(dtype).view(inner_shape)
+    inner = {}
+    for name, inner_shape, dtype, offset, nbytes in layout:
+        inner[name.removeprefix("_")] = (
+            storage[offset : offset + nbytes].view(dtype).view(inner_shape)
+        )
+    metadata = dtype_or_quantizer.storage_metadata(torch.bfloat16)
+    kwargs = dict(metadata["nontensor_kwargs"])
+    for name in ("rowwise_data", "rowwise_scale_inv", "columnwise_data", "columnwise_scale_inv"):
+        inner.setdefault(name, None)
+    return metadata["cls"](**inner, **kwargs, shape=tuple(shape), dtype=torch.bfloat16)
+
+
+def _arcs_overlap(a: List[tuple], b: List[tuple]) -> bool:
+    """Whether two live ranges (lists of half-open segments on the step's event sequence; a
+    range that crosses the step boundary has two segments) share an instant."""
+    return any(s1 < e2 and s2 < e1 for s1, e1 in a for s2, e2 in b)
+
+
+@dataclass(eq=False)  # regions compare by identity (preds, plan lookups)
+class _SlabRegion:
+    """A fixed slice of the weight slab, bound to the n-th acquire of a ticket in every step."""
+
+    ticket: int
+    occurrence: int
+    nbytes: int
+    arc: List[tuple]  # live range on the recorded step's event sequence
+    layout: list  # inner-tensor layout (see _inner_tensor_layout)
+    offset: int = -1
+    view: Optional[torch.Tensor] = None  # built once over the slab, reused every step
+    view_check: tuple = ()  # (inner tensor attribute or None, expected data_ptr) per inner tensor
+    # The regions that last used each byte of this slice before its acquire in the recorded
+    # step (itself included when its own previous use was the last one): the writer of this
+    # slice waits on their readers (or their unread writes) on other streams.
+    preds: tuple = ()
+    live: bool = False
+    # Last use, for the next writer of these bytes: the stream that read them or, if nobody
+    # did, the stream that wrote them.
+    consumed: bool = False
+    reader_stream: Optional[torch.cuda.Stream] = None
+    producer_stream: Optional[torch.cuda.Stream] = None
+
+
 @dataclass
 class _TicketSlot:
     """Internal slot backing a persistent ticket in the GTP buffer cache."""
@@ -2636,19 +2897,56 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
+    # Transient policy (None until is_transient() decides once per ticket).
+    transient: Optional[bool] = None
+    nbytes: int = 0
+    alloc_stream: Optional[torch.cuda.Stream] = None  # stream the buffer was allocated on
+    producer_stream: Optional[torch.cuda.Stream] = None  # stream whose collective writes it
+    consumed: bool = False
+    epoch: int = -1  # consume epoch; freed once the cache sees a later epoch
+    region: Optional[_SlabRegion] = None  # slab slice backing the current use, if any
+    use_id: int = -1  # identifies the current use in the recorded trace
+    step: int = -1  # step of the current use; gathered weights stay valid until the step ends
 
 
 class GTPWeightCache:
-    """Ticket-based buffer pool for GTP all-gather / reduce-scatter buffers.
+    """Ticket-based buffers for GTP all-gather / reduce-scatter.
 
-    - reserve(param, dtype, fwd) → ticket: assign a persistent ticket (no buffer yet).
-    - get(ticket) → buffer: return the buffer, lazily (re)allocating from pool or fresh.
-    - release(ticket): return the buffer to the pool; ticket stays valid.
-    - clear(): drop all buffers/pools; tickets stay valid, next get() allocates fresh.
+    CUDA-graph chains are *pooled*: one buffer per cache key, recycled through a free list and
+    never freed, so captured graphs replay against fixed addresses (``get`` allocates lazily,
+    ``release`` returns the buffer to the pool, the ticket keeps its binding). Eager chains
+    follow ``GTP_CONFIG.eager_buffer_policy``:
+
+    * ``transient``: ``acquire`` allocates the buffer when the collective is issued and the
+      buffer is freed once its consumer has been enqueued, so memory follows what is in flight
+      instead of one buffer per shape pinned for the whole run. The consumer is enqueued only
+      after the call that returned the buffer, so ``consume`` marks the buffer with the current
+      *consume epoch* (``begin_consume`` bumps it at the top of every such call) and the buffer
+      is freed at the first ``acquire`` of a later epoch. Reduce-scatter outputs are freed by
+      ``release`` right after ``main_grad.add_``. Stream rules (the caching allocator reuses a
+      block in the order of the stream it was allocated on, here the current stream at issue):
+      the writing collective waits on an event of that stream before writing; a consumer on
+      another stream records itself on the buffer; a buffer dropped without a consumer records
+      the producer, since nothing else ordered its write before a reuse.
+    * ``slab`` (default): the schedule of a training step is static, so after two transient
+      steps with identical acquire sequences the cache packs every recorded lifetime into one
+      slab (largest first, each at the lowest offset clear of every region live at the same
+      time) and binds each (ticket, n-th acquire of the step) to its slice for the steps that
+      follow. ``step_boundary`` delimits training steps; ``set_forward_only`` brackets
+      evaluation passes, which run on transient buffers. Same stream rules, made explicit: a
+      slice's next writer waits on the previous reader of those bytes if that reader ran on
+      another stream, or on the previous writer if nobody read them (the plan records each
+      slice's predecessors; the event is recorded on their stream when the bytes are reused).
+      A step that follows the recorded acquire order needs no other bookkeeping. The first
+      acquire out of order ends that for the step (the rest runs on transient buffers, the
+      boundary fences the slab's streams); two such steps in a row drop the plan, which is
+      re-recorded from the next two steps.
+    * ``pooled``: the CUDA-graph policy for every chain (the behaviour before the policies
+      above existed).
     """
 
-    # Bytes per element for known dtypes (for logging). Add entries when GTP caches buffers of
-    # new quantized dtypes — only DType values the TE pybind bindings expose (verify via
+    # Bytes per element for known dtypes. Add entries when GTP caches buffers of new quantized
+    # dtypes — only DType values the TE pybind bindings expose (verify via
     # hasattr(tex.DType, ...) before adding speculative entries).
     _BYTES_PER_ELEMENT = {
         torch.bfloat16: 2,
@@ -2663,8 +2961,51 @@ class GTPWeightCache:
         self._pool: Dict[tuple, List[torch.Tensor]] = defaultdict(list)
         self._slots: Dict[int, _TicketSlot] = {}
         self._next_ticket: int = 0
-        self._total_bytes: int = 0  # running total of allocated bytes
+        self._total_bytes: int = 0  # running total of pooled bytes allocated
         self.key_to_allocate_func = {}
+        self._epoch: int = 0
+        # Consumed slots awaiting their free, in consume order (epochs never decrease).
+        self._pending: Deque[_TicketSlot] = deque()
+        self.transient_bytes: int = 0
+        self.peak_transient_bytes: int = 0
+        # Weight slab: step bookkeeping, the recorded trace, the plan and the slab itself.
+        self._step: int = 1
+        self._seq: int = 0  # event counter within the step
+        self._next_use: int = 0
+        self._occurrence: Dict[int, int] = defaultdict(int)  # ticket -> acquires this step
+        self._trace: Dict[int, list] = {}  # step -> [(seq, kind, use_id, ticket, occurrence)]
+        self._plan: Optional[Dict[tuple, _SlabRegion]] = None
+        self._slab: Optional[torch.Tensor] = None
+        # The recorded acquire order of a step: (ticket, region or None for a ticket the plan
+        # leaves transient). A step that follows it needs no dynamic bookkeeping: the
+        # k-th acquire binds the k-th region and waits on its precomputed predecessors. The
+        # first acquire out of order ends the fast path for the step (the rest is transient) and
+        # the boundary fences every stream that touched the slab before the next step.
+        self._order: List[tuple] = []
+        self._k: int = 0
+        self._fast: bool = True
+        self._deviating_steps: int = 0
+        # Producer streams that wrote slab bytes, by identity (readers and allocating streams
+        # are current streams, all of which ``_current_stream`` keeps).
+        self._slab_producers: Dict[int, torch.cuda.Stream] = {}
+        self._slab_disabled: Optional[str] = None
+        self._record_from: int = max(1, GTP_CONFIG.weight_slab_plan_step)  # first recorded step
+        # One acquire-side event per consume epoch and producer stream: no reader of the bytes
+        # being handed out is enqueued between the acquires of one consume call, so the first
+        # acquire's event covers them all. The event objects are reused (a stream wait snapshots
+        # the record it was issued against).
+        self._ready_event: Optional[torch.cuda.Event] = None
+        self._ready_key: tuple = ()
+        self._hazard_event: Optional[torch.cuda.Event] = None
+        self._plan_attempts: int = 0
+        self._deviations_at_boundary: int = 0  # conflicts + misses when the last step began
+        self._forward_only: bool = False  # inside an evaluation pass
+        self.slab_bytes: int = 0
+        self.slab_live_bytes: int = 0
+        self.peak_slab_live_bytes: int = 0
+        self.slab_lower_bound: int = 0  # peak bytes live at one instant in the recorded step
+        self.slab_conflicts: int = 0  # acquires whose slice was still live
+        self.slab_misses: int = 0  # acquires the plan does not know
 
     @staticmethod
     def _buf_bytes(shape, dtype) -> int:
@@ -2679,16 +3020,19 @@ class GTPWeightCache:
             )
         return int(numel * GTPWeightCache._BYTES_PER_ELEMENT[dtype])
 
-    def _allocate_buffer(
-        self, param: "GTPShardedParam", dtype, reduce_scatter, fwd
-    ) -> torch.Tensor:
+    @staticmethod
+    def _buf_shape(param: "GTPShardedParam", reduce_scatter: bool) -> tuple:
         if reduce_scatter:
-            out_shape = param._sharded_padded_shape
-        else:
-            out_shape = param._unsharded_shape_padded
+            return tuple(param._sharded_padded_shape)
+        return tuple(param._unsharded_shape_padded)
 
+    def _allocate_buffer(
+        self, param: "GTPShardedParam", dtype, reduce_scatter, fwd, transient=False
+    ) -> torch.Tensor:
+        out_shape = self._buf_shape(param, reduce_scatter)
         chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
-        with cuda_graph_pool_allocation(_chain_is_graphed(chain_id)):
+        graphed = _chain_is_graphed(chain_id)
+        with cuda_graph_pool_allocation(graphed):
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage
                 # would corrupt the optimizer's quantize_ update direction (frozen weights).
@@ -2706,7 +3050,8 @@ class GTPWeightCache:
                     device=param.device,
                     memory_format=torch.contiguous_format,
                 )
-
+        if transient:
+            return buf
         buf_bytes = self._buf_bytes(out_shape, dtype)
         self._total_bytes += buf_bytes
         dtype_str = (
@@ -2725,7 +3070,7 @@ class GTPWeightCache:
     def reserve(
         self, param: "GTPShardedParam", dtype, fwd: bool, reduce_scatter=False, recompute=False
     ) -> int:
-        """Assign a persistent ticket.  No buffer is allocated until ``get()``."""
+        """Assign a persistent ticket.  No buffer is allocated until ``get()`` / ``acquire()``."""
         key = param._get_cache_key(dtype, fwd, reduce_scatter, recompute=recompute)
         ticket = self._next_ticket
         self._next_ticket += 1
@@ -2740,9 +3085,573 @@ class GTPWeightCache:
         )
         return ticket
 
-    def get(self, ticket: int) -> torch.Tensor:
-        """Return the buffer for *ticket*, lazily allocating if needed."""
+    # ---------------------------------------------------------------- transient policy
+    def is_transient(self, ticket: int) -> bool:
+        """Whether ``ticket`` follows the eager-chain policy (transient or slab-backed buffers
+        bound at issue time); captured chains keep pooled buffers at fixed addresses."""
         slot = self._slots[ticket]
+        if slot.transient is None:
+            slot.transient = GTP_CONFIG.eager_buffer_policy != "pooled" and not _chain_is_graphed(
+                slot.chain_id
+            )
+        return slot.transient
+
+    @property
+    def _slab_enabled(self) -> bool:
+        return GTP_CONFIG.eager_buffer_policy == "slab"
+
+    def begin_consume(self) -> None:
+        """Start a consume epoch (call at the top of every function that returns gathered
+        weights to their consumer)."""
+        self._epoch += 1
+
+    def acquire(self, ticket: int, producer_stream: torch.cuda.Stream) -> torch.Tensor:
+        """Bind a transient ``ticket`` to a buffer for a collective that writes it on
+        ``producer_stream``: its slab slice when the plan has one and it is free, otherwise a
+        fresh allocation. Buffers consumed in earlier epochs are freed first."""
+        assert self.is_transient(ticket), "acquire() is for transient tickets; use get() otherwise"
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "GTP transient buffers cannot be acquired under CUDA-graph capture (the ticket's "
+            "chain should be graphed)"
+        )
+        slot = self._slots[ticket]
+        current = _current_stream(slot.param.device)
+        self._free_consumed(self._epoch)
+        if slot.buf is not None:
+            # An earlier collective whose consume never came (replayed layer, skipped prefetch).
+            # A buffer consumed in this very epoch still has its reader pending: never drop it.
+            assert not slot.consumed, (
+                f"GTP transient buffer: {slot.param._debug_name} re-acquired inside the call "
+                "that is consuming it"
+            )
+            self._drop(slot, read_on_current=False, current=current)
+        region = None
+        if self._plan is not None and not self._forward_only:
+            # The k-th acquire of a step that follows the recorded order binds the k-th region.
+            k = self._k
+            self._k = k + 1
+            if self._fast:
+                expected = self._order[k] if k < len(self._order) else None
+                if expected is not None and expected[0] == ticket:
+                    region = expected[1]  # None: a ticket the plan leaves transient
+                else:
+                    # Out of the recorded order: the rest of this step runs on transient
+                    # buffers; the step boundary fences the slab's streams.
+                    self._fast = False
+                    self.slab_conflicts += 1
+                    self._warn_deviation(slot, "was acquired out of the recorded order")
+            else:
+                self.slab_misses += 1
+        elif self._recording():
+            occurrence = self._occurrence[ticket]
+            self._occurrence[ticket] = occurrence + 1
+            slot.use_id = self._next_use
+            self._next_use += 1
+            self._record_event("acq", slot.use_id, ticket, occurrence, slot.param.device)
+        slot.alloc_stream, slot.producer_stream, slot.consumed = current, producer_stream, False
+        slot.step = self._step
+        if producer_stream != current:
+            # The bytes may have been in use on the allocating stream a moment ago: the
+            # collective waits for that stream (once per consume call and producer).
+            key = (self._epoch, producer_stream, current)
+            if key != self._ready_key:
+                if self._ready_event is None:
+                    self._ready_event = torch.cuda.Event()
+                self._ready_event.record(current)
+                producer_stream.wait_event(self._ready_event)
+                self._ready_key = key
+        if region is not None:
+            self._bind_region(slot, region, producer_stream, current)
+            return slot.buf
+        slot.region = None
+        slot.buf = self._allocate_buffer(
+            slot.param, slot.dtype, slot.reduce_scatter, fwd=slot.fwd, transient=True
+        )
+        slot.nbytes = self._buf_bytes(self._buf_shape(slot.param, slot.reduce_scatter), slot.dtype)
+        self.transient_bytes += slot.nbytes
+        self.peak_transient_bytes = max(self.peak_transient_bytes, self.transient_bytes)
+        return slot.buf
+
+    def gathered(self, ticket: Optional[int]) -> Optional[torch.Tensor]:
+        """The buffer ``ticket`` was gathered into earlier in this step, if its consuming call
+        has returned and no later acquire has reclaimed it; the caller is about to enqueue another
+        reader on the current stream, so the use is extended to the current epoch. Weights change
+        only at the optimizer step, after the step boundary, and the buffer belongs to this ticket
+        alone, so the gathered weights are still valid. None for pooled tickets, whose shared
+        buffer may have been overwritten since."""
+        if ticket is None or not self.is_transient(ticket):
+            return None
+        slot = self._slots[ticket]
+        if slot.buf is None or not slot.consumed or slot.step != self._step:
+            return None
+        self.begin_consume()
+        stream = _current_stream(slot.param.device)
+        if slot.region is not None:
+            self._note_reader(slot, stream)
+        elif stream != slot.alloc_stream:
+            _record_stream(slot.buf, stream)
+        self._pending.remove(slot)
+        slot.epoch = self._epoch
+        self._pending.append(slot)
+        return slot.buf
+
+    def unconsumed_this_step(self, ticket: Optional[int]) -> bool:
+        """``ticket`` holds a gather issued this step whose consumer has not run yet (a prefetch
+        waiting for its consume). Only for exclusive buffers: a pooled buffer offers no such
+        guarantee."""
+        if ticket is None or not self.is_transient(ticket):
+            return False
+        slot = self._slots[ticket]
+        return slot.buf is not None and not slot.consumed and slot.step == self._step
+
+    def consume(self, ticket: Optional[int]) -> None:
+        """The caller is about to enqueue the reader of ``ticket``'s buffer on the current
+        stream; the buffer is freed at the first ``acquire`` of a later epoch."""
+        if ticket is None or not self.is_transient(ticket):
+            return
+        slot = self._slots[ticket]
+        if slot.buf is None or slot.consumed:
+            return
+        stream = _current_stream(slot.param.device)
+        if slot.region is not None:
+            self._note_reader(slot, stream)
+        elif stream != slot.alloc_stream:
+            _record_stream(slot.buf, stream)
+        slot.consumed, slot.epoch = True, self._epoch
+        self._pending.append(slot)
+
+    def _drop(self, slot: _TicketSlot, read_on_current: bool, current=None) -> None:
+        """End a use now. ``read_on_current``: the reader was just enqueued on the current
+        stream (a reduce-scatter output after ``main_grad.add_``); otherwise an unconsumed
+        slot had no reader at all."""
+        if slot.buf is None:
+            return
+        if current is None:
+            current = _current_stream(slot.param.device)
+        if slot.region is not None:
+            if read_on_current and not slot.consumed:
+                self._note_reader(slot, current)
+        else:
+            if (
+                not slot.consumed
+                and slot.producer_stream is not None
+                and slot.producer_stream != slot.alloc_stream
+            ):
+                _record_stream(slot.buf, slot.producer_stream)
+            if current != slot.alloc_stream:
+                _record_stream(slot.buf, current)
+        if slot.consumed:
+            self._pending.remove(slot)  # rare: a consumed buffer re-acquired or released early
+        self._end_use(slot)
+
+    def _free_consumed(self, before_epoch: int) -> None:
+        """Free the buffers whose consuming call returned (epoch < ``before_epoch``)."""
+        pending = self._pending
+        while pending and pending[0].epoch < before_epoch:
+            slot = pending.popleft()
+            if slot.consumed and slot.buf is not None:
+                self._end_use(slot)
+
+    def _end_use(self, slot: _TicketSlot) -> None:
+        """Common end of a use: the trace, the slab bookkeeping, and the memory (a transient
+        buffer is freed when the slot drops it; a slab slice is marked free)."""
+        # Bytes become reusable here, after their reader was enqueued on the current stream: the
+        # next acquire must record a fresh event rather than reuse this epoch's.
+        self._ready_key = ()
+        if self._recording():
+            self._record_event("free", slot.use_id, -1, -1, slot.param.device)
+        region = slot.region
+        if region is not None:
+            # The region keeps who last read it (or wrote it unread); the next writer of its
+            # bytes, which lists it among its predecessors, waits on that stream.
+            region.live = False
+            self.slab_live_bytes -= region.nbytes
+            slot.region = None
+        else:
+            self.transient_bytes -= slot.nbytes
+        slot.buf, slot.consumed = None, False
+
+    # ---------------------------------------------------------------- weight slab
+    def step_boundary(self) -> None:
+        """Training-step boundary (once per step, after the backward). Advances the step, which
+        ends the reuse of gathered weights (the optimizer step follows). With the slab: builds
+        the plan at the end of the recording step, drops it when the step that just ended
+        deviated from it (the schedule changed), and resets the per-step counters."""
+        if not self._slab_enabled:
+            pass
+        elif self._plan is None:
+            if self._slab_disabled is None and self._step == self._record_from - 1:
+                # The step before the recording: return the warm-up's cached blocks once, so
+                # the optimizer state and the recorded step start from a compact pool.
+                torch.cuda.empty_cache()
+            if self._slab_disabled is None and self._step == self._record_from:
+                # Every consuming call of the step has returned: free what was consumed, so the
+                # slab is not allocated on top of the last transient gathers (the vocabulary
+                # tables among them). Other steps keep the usual rule (freed at the next
+                # acquire of a later epoch): the blocks then stay out of the optimizer step's way.
+                self._free_consumed(self._epoch + 1)
+                self._build_slab_plan(self._record_from)
+        elif self._fast:
+            self._deviating_steps = 0
+        else:
+            # The step left the recorded order: slab bytes may have been used in an order the
+            # predecessors do not describe. Order every stream that touched the slab behind
+            # every other before the next step binds slices again.
+            self._fence_slab_streams()
+            self._deviating_steps += 1
+            deviations = self.slab_conflicts + self.slab_misses - self._deviations_at_boundary
+            if self._deviating_steps >= 2:
+                self._discard_plan(f"{self._deviating_steps} steps in a row left the plan")
+            else:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[GTP slab] step left the recorded order ({deviations} transient "
+                    "fallbacks); keeping the plan, re-planning if the next step does too",
+                )
+        self._deviations_at_boundary = self.slab_conflicts + self.slab_misses
+        self._step += 1
+        self._seq = 0
+        self._k, self._fast = 0, True
+        self._occurrence.clear()
+
+    def _fence_slab_streams(self) -> None:
+        """Make every stream that read or wrote slab bytes wait for all the others."""
+        streams = list({**_STREAM_BY_HANDLE, **self._slab_producers}.values())
+        if self._hazard_event is None:
+            self._hazard_event = torch.cuda.Event()
+        for source in streams:
+            self._hazard_event.record(source)
+            for target in streams:
+                if target is not source:
+                    target.wait_event(self._hazard_event)
+
+    def set_forward_only(self, flag: bool) -> None:
+        """Bracket a forward-only pass between training steps (evaluation): its buffers are
+        transient and it neither counts against the plan nor enters the recording."""
+        if not self._slab_enabled or self._forward_only == flag:
+            return
+        self._forward_only = flag
+        if not flag:
+            # Back to training: the next step starts from a clean count; a recording step that
+            # the pass interrupted before its first acquire is simply recorded from here.
+            self._seq = 0
+            self._k, self._fast = 0, True
+            self._occurrence.clear()
+            self._trace.pop(self._step, None)
+            self._deviations_at_boundary = self.slab_conflicts + self.slab_misses
+
+    def _warn_deviation(self, slot: _TicketSlot, what: str) -> None:
+        """Once per run: an acquire did not match the plan (a skipped prefetch, a replayed
+        layer); it falls back to a transient buffer, which is safe but costs its memory on top
+        of the slab. A whole step of them means the schedule changed and the plan is redone."""
+        if self.slab_conflicts + self.slab_misses == 1:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[GTP slab] {slot.param._debug_name} {what}; falling back to a transient "
+                "buffer (counted as conflicts/misses in the memory report)",
+            )
+
+    def _record_event(self, kind: str, use_id: int, ticket: int, occurrence: int, device) -> None:
+        """Append an event of the recording step."""
+        self._seq += 1
+        self._trace.setdefault(self._step, []).append((self._seq, kind, use_id, ticket, occurrence))
+
+    def _recording(self) -> bool:
+        return (
+            self._slab_enabled
+            and self._plan is None
+            and self._slab_disabled is None
+            and not self._forward_only
+            and self._step == self._record_from
+        )
+
+    def _record_again(self, why: str) -> None:
+        """Record the next step anew (after a failed plan or a schedule change); give up on the
+        slab after too many plans."""
+        self._trace.clear()
+        self._plan_attempts += 1
+        if self._plan_attempts > _SLAB_PLAN_ATTEMPTS:
+            self._slab_disabled = f"{why}; giving up after {_SLAB_PLAN_ATTEMPTS} plans"
+            log_single_rank(logger, logging.WARNING, f"[GTP slab] {self._slab_disabled}")
+            return
+        self._record_from = self._step + 1
+        log_single_rank(
+            logger, logging.INFO, f"[GTP slab] {why}; recording step {self._record_from}"
+        )
+
+    def _discard_plan(self, why: str) -> None:
+        """Drop the plan and the slab (slices still in use keep the storage alive until they
+        are freed) and re-record. Transient buffers serve the steps in between."""
+        self._plan, self._slab = None, None
+        self._order = []
+        self.slab_bytes = 0
+        self._record_again(f"the schedule no longer matches the plan ({why})")
+
+    def _slab_layout(self, slot: _TicketSlot) -> Optional[list]:
+        """The inner-tensor layout of ``slot``'s buffer, or None when it stays transient (at or
+        above ``weight_slab_max_bytes``, e.g. the vocabulary table, or a quantizer without
+        storage-view support)."""
+        source = slot.dtype
+        if not isinstance(source, torch.dtype):
+            quantizer = getattr(slot.param, "_gtp_gather_quantizer", None) or slot.param._quantizer
+            if quantizer is None or not _supports_storage_views(quantizer):
+                return None
+            quantizer.set_usage(rowwise=slot.fwd, columnwise=not slot.fwd)
+            source = quantizer
+        try:
+            layout = _inner_tensor_layout(self._buf_shape(slot.param, slot.reduce_scatter), source)
+        except (NotImplementedError, AttributeError):
+            return None
+        cap = GTP_CONFIG.weight_slab_max_bytes
+        if cap is not None and _layout_nbytes(layout) >= cap:
+            return None
+        return layout
+
+    def _build_slab_plan(self, plan_step: int) -> None:
+        """Pack the lifetimes recorded in ``plan_step`` into a slab. One step suffices: the
+        steps that follow verify the plan acquire by acquire and re-record on a change."""
+        trace = self._trace.get(plan_step, [])
+        if not any(ev[1] == "acq" for ev in trace):
+            self._record_again(f"step {plan_step} issued no gathers")
+            return
+        end = trace[-1][0] + 1
+        freed_at = {use_id: seq for seq, kind, use_id, _, _ in trace if kind == "free"}
+        regions, excluded, excluded_bytes = [], set(), 0
+        for seq, kind, use_id, ticket, occurrence in trace:
+            if kind != "acq":
+                continue
+            slot = self._slots[ticket]
+            layout = self._slab_layout(slot)
+            if layout is None:
+                if ticket not in excluded:
+                    excluded.add(ticket)
+                    excluded_bytes += self._buf_bytes(
+                        self._buf_shape(slot.param, slot.reduce_scatter), slot.dtype
+                    )
+                continue
+            if use_id in freed_at:
+                arc = [(seq, freed_at[use_id])]
+            else:
+                # Still live at the boundary (prefetched for the next step): its slice is held
+                # for the whole step.
+                arc = [(0, end)]
+            regions.append(
+                _SlabRegion(
+                    ticket=ticket,
+                    occurrence=occurrence,
+                    nbytes=_layout_nbytes(layout),
+                    arc=arc,
+                    layout=layout,
+                )
+            )
+        # Largest first, each at the lowest offset clear of every already placed region that is
+        # live at the same time (the planner with the least waste on recorded traces, ~4%). The
+        # time-overlap query goes through buckets over the step's event sequence: a region is
+        # filed under every bucket its live range touches, so a query only looks at the regions
+        # sharing some bucket with it (linear in the live set, not in the plan).
+        nbuckets = max(64, min(4096, len(regions) // 8))
+        width = max(1, -(-end // nbuckets))
+        buckets: List[List[_SlabRegion]] = [[] for _ in range(nbuckets)]
+
+        def touched(arc):
+            return {
+                b
+                for start, stop in arc
+                for b in range(start // width, min(nbuckets - 1, (stop - 1) // width) + 1)
+            }
+
+        placed = sorted(regions, key=lambda r: (-r.nbytes, r.arc[0][0]))
+        for region in placed:
+            seen, busy = set(), []
+            spans = touched(region.arc)
+            for b in spans:
+                for other in buckets[b]:
+                    if id(other) not in seen:
+                        seen.add(id(other))
+                        if _arcs_overlap(other.arc, region.arc):
+                            busy.append((other.offset, other.offset + other.nbytes))
+            busy.sort()
+            offset = 0
+            for lo, hi in busy:
+                if offset + region.nbytes <= lo:
+                    break
+                offset = max(offset, _round_up(hi, _SLAB_ALIGN))
+            region.offset = offset
+            for b in spans:
+                buckets[b].append(region)
+        high = max((r.offset + r.nbytes for r in placed), default=0)
+        total = _round_up(high, _SLAB_ROUND)
+        edges = sorted(
+            (edge, delta * r.nbytes)
+            for r in placed
+            for start, stop in r.arc
+            for edge, delta in ((start, 1), (stop, -1))
+        )
+        live_bytes = peak = 0
+        for _, delta in edges:
+            live_bytes += delta
+            peak = max(peak, live_bytes)
+        self.slab_lower_bound = peak
+        # The acquire order of the step, and for every region the regions that last used each
+        # of its bytes before its acquire (over two periods, so the end of one step precedes
+        # the start of the next; a region can precede itself).
+        by_key = {(r.ticket, r.occurrence): r for r in placed}
+        order = [(t, by_key.get((t, o))) for _, kind, _, t, o in trace if kind == "acq"]
+        last_user: List[tuple] = []
+        for period in (0, 1):
+            for _, region in order:
+                if region is None:
+                    continue
+                end = region.offset + region.nbytes
+                hits = self._ranges_in(last_user, region.offset, end)
+                if period == 1:
+                    region.preds = tuple({id(h[2]): h[2] for h in hits}.values())
+                self._ranges_clear(last_user, region.offset, end)
+                self._ranges_insert(last_user, region.offset, end, region)
+        # The recorded step left the caching allocator with blocks of every gathered shape; the
+        # slab replaces them. Return them to the device first (once, never per step) so the
+        # slab's pages come out of that memory instead of raising the run's peak on top of it.
+        torch.cuda.empty_cache()
+        device = torch.device("cuda", torch.cuda.current_device())
+        self._slab = torch.empty(total, dtype=torch.uint8, device=device)
+        self._plan = by_key
+        self._order = order
+        self._k, self._fast, self._deviating_steps = 0, True, 0
+        self.slab_bytes = total
+        self._trace.clear()
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[GTP slab] plan from step {plan_step}: {len(placed)} regions over "
+            f"{len({r.ticket for r in placed})} tickets, slab {total / 2**20:.0f} MB (peak live "
+            f"{peak / 2**20:.0f} MB); {len(excluded)} tickets stay transient "
+            f"({excluded_bytes / 2**20:.0f} MB: at or above weight_slab_max_bytes or no storage "
+            "views)",
+        )
+
+    def _bind_region(
+        self,
+        slot: _TicketSlot,
+        region: _SlabRegion,
+        producer: torch.cuda.Stream,
+        current: torch.cuda.Stream,
+    ) -> None:
+        if region.view is None or not self._region_view_valid(region):
+            source = slot.dtype
+            if not isinstance(source, torch.dtype):
+                source = getattr(slot.param, "_gtp_gather_quantizer", None) or slot.param._quantizer
+                source.set_usage(rowwise=slot.fwd, columnwise=not slot.fwd)
+            region.view = _build_tensor_over_storage(
+                self._slab[region.offset : region.offset + region.nbytes],
+                self._buf_shape(slot.param, slot.reduce_scatter),
+                source,
+                region.layout,
+            )
+            base = self._slab.data_ptr() + region.offset
+            region.view_check = tuple(
+                (name, base + offset) for name, _, _, offset, _ in region.layout
+            )
+        # The last users of these bytes: a reader on another stream, or a write nobody read,
+        # must be complete before this collective writes. Readers on the current stream are
+        # covered by the acquire event; the producer stream orders its own work.
+        for pred in region.preds:
+            stream = pred.reader_stream if pred.consumed else pred.producer_stream
+            if stream is not None and stream is not current and stream is not producer:
+                if self._hazard_event is None:
+                    self._hazard_event = torch.cuda.Event()
+                self._hazard_event.record(stream)
+                producer.wait_event(self._hazard_event)
+        region.live, region.consumed = True, False
+        region.reader_stream, region.producer_stream = None, producer
+        self._slab_producers[id(producer)] = producer
+        slot.buf, slot.region, slot.nbytes = region.view, region, region.nbytes
+        self.slab_live_bytes += region.nbytes
+        self.peak_slab_live_bytes = max(self.peak_slab_live_bytes, self.slab_live_bytes)
+
+    @staticmethod
+    def _region_view_valid(region: _SlabRegion) -> bool:
+        """The cached view still points at its slice (a consumer could have rebound a quantized
+        tensor's inner data): one pointer check per inner tensor."""
+        for name, expected in region.view_check:
+            tensor = region.view if name is None else getattr(region.view, name, None)
+            if tensor is None or tensor.data_ptr() != expected:
+                return False
+        return True
+
+    # Sorted, non-overlapping byte ranges as (offset, end, payload) tuples, used at plan time
+    # to find each region's predecessors. Offsets are unique within a list, so a one-element
+    # probe tuple orders against them without reaching the payload.
+    @staticmethod
+    def _ranges_in(ranges: List[tuple], offset: int, end: int) -> List[tuple]:
+        """Entries intersecting [offset, end)."""
+        if not ranges:
+            return []
+        i = bisect.bisect_left(ranges, (end,))  # entries before i start below ``end``
+        hits = []
+        while i > 0 and ranges[i - 1][1] > offset:
+            hits.append(ranges[i - 1])
+            i -= 1
+        return hits
+
+    @staticmethod
+    def _ranges_insert(ranges: List[tuple], offset: int, end: int, payload) -> None:
+        ranges.insert(bisect.bisect_left(ranges, (offset,)), (offset, end, payload))
+
+    @staticmethod
+    def _ranges_clear(ranges: List[tuple], offset: int, end: int) -> None:
+        """Remove [offset, end) from the ranges, keeping the parts outside it."""
+        i = bisect.bisect_left(ranges, (end,))
+        j = i
+        while j > 0 and ranges[j - 1][1] > offset:
+            j -= 1
+        pieces = []
+        for lo, hi, payload in ranges[j:i]:
+            if lo < offset:
+                pieces.append((lo, offset, payload))
+            if hi > end:
+                pieces.append((end, hi, payload))
+        ranges[j:i] = pieces
+
+    def _note_reader(self, slot: _TicketSlot, stream: torch.cuda.Stream) -> None:
+        """Remember which stream reads a slab slice, for the next writer of its bytes."""
+        slot.region.consumed, slot.region.reader_stream = True, stream
+
+    def format_buffer_report(self) -> str:
+        """GTP buffer state for the memory report ('' when neither policy is in use)."""
+        parts = []
+        if self._slab is not None:
+            mb = 2**20
+            live, peak = self.slab_live_bytes / mb, self.peak_slab_live_bytes / mb
+            parts.append(
+                f"slab {self.slab_bytes / mb:.0f} MB ({len(self._plan)} regions, "
+                f"live {live:.0f} MB, peak {peak:.0f} MB, conflicts {self.slab_conflicts}, "
+                f"misses {self.slab_misses})"
+            )
+        elif self._slab_disabled:
+            parts.append(f"slab off: {self._slab_disabled}")
+        if self.peak_transient_bytes:
+            parts.append(
+                f"transient {self.transient_bytes / 2**20:.0f} MB in flight (peak "
+                f"{self.peak_transient_bytes / 2**20:.0f} MB)"
+            )
+        return "; ".join(parts)
+
+    # ---------------------------------------------------------------- shared entry points
+    def get(self, ticket: int) -> torch.Tensor:
+        """Return the buffer for *ticket*, lazily allocating a pooled one if needed."""
+        slot = self._slots[ticket]
+        if self.is_transient(ticket):
+            assert slot.buf is not None, (
+                f"GTP transient buffer: {slot.param._debug_name} read before its collective was "
+                "issued or after it was freed (acquire() binds the buffer at issue)"
+            )
+            return slot.buf
+        return self._keyed_get(slot)
+
+    def _keyed_get(self, slot: _TicketSlot) -> torch.Tensor:
+        """Pooled lookup: pop the key's free list or allocate; the ticket keeps the buffer."""
         if slot.buf is None:
             pool = self._pool[slot.key]
             slot.buf = (
@@ -2762,12 +3671,21 @@ class GTPWeightCache:
         return slot.buf
 
     def release(self, ticket: int):
-        """Release a reusable buffer to the pool while keeping its ticket valid.
-
-        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays.
-        """
+        """Pooled: return the buffer to the free list, the ticket stays valid. Transient
+        reduce-scatter outputs: free now (``main_grad.add_`` was just enqueued on the allocating
+        stream). Transient gathered weights: the legacy callers release right after the consume,
+        so this is the consume marker."""
         slot = self._slots[ticket]
+        if self.is_transient(ticket):
+            if slot.reduce_scatter:
+                self._drop(slot, read_on_current=True)
+            else:
+                self.consume(ticket)
+            return
+        self._keyed_release(slot)
+
+    def _keyed_release(self, slot: _TicketSlot) -> None:
+        """Pooled release: return the buffer to its key's free list, keeping the binding."""
         if slot.buf is None:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
@@ -2783,8 +3701,27 @@ class GTPWeightCache:
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
         for slot in self._slots.values():
             slot.buf = None
+            slot.consumed = False
+            slot.region = None
         self._pool.clear()
+        self._pending.clear()
+        _STREAM_BY_HANDLE.clear()
         self._total_bytes = 0
+        self.transient_bytes = 0
+        self.peak_transient_bytes = 0
+        self._plan, self._slab, self._slab_disabled = None, None, None
+        self._order = []
+        self._k, self._fast, self._deviating_steps = 0, True, 0
+        self._slab_producers.clear()
+        self._trace.clear()
+        self._occurrence.clear()
+        self._step, self._seq = 1, 0
+        self._record_from = max(1, GTP_CONFIG.weight_slab_plan_step)
+        self._plan_attempts = self._deviations_at_boundary = 0
+        self._forward_only = False
+        self._ready_key = ()
+        self.slab_bytes = self.slab_live_bytes = self.peak_slab_live_bytes = 0
+        self.slab_lower_bound = self.slab_conflicts = self.slab_misses = 0
 
 
 def get_global_GTP_cache() -> GTPWeightCache:
