@@ -87,8 +87,9 @@ parameter group, after gradient reduction:
 1. Update local momentum and construct the orthogonalization inputs.
 2. Gather each split matrix's input to one compute owner.
 3. Run full-matrix Newton–Schulz once on that owner.
-4. Scatter update slices back, apply them to local weight shards, and
-   refresh model weights.
+4. Scatter update slices back and apply them to local main weight shards.
+   `fully_shard_optimizer` (with `precision_aware=True`) or MCore's
+   `FullyShardedOptimizer` then refreshes the model weights.
 
 The [owner planner](../megatron_fsdp/experimental/owner_planning.py)
 balances estimated compute across groups, choosing owners from ranks that
@@ -140,11 +141,10 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 ## Next step
 
-1. **Integrate `FsdpMuon` with `MegatronOptimizer`**, including chaining
-   with an optimizer for excluded parameters.
-2. **Optimize performance.** Overlap communication with Muon computation
-   and make parameter placement aware of hardware topology to keep traffic
-   on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
-3. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
+1. **Optimize performance.** Overlap communication with Muon computation,
+   batch Newton–Schulz across FSDP units (it currently runs one unit at a
+   time), and make parameter placement aware of hardware topology to keep
+   traffic on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
+2. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
    on larger models across multiple nodes, measuring forward/backward time,
    full-step time, and peak memory.
