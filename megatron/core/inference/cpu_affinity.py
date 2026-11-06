@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 import torch
 
@@ -24,14 +24,17 @@ def _format_cpus(cpus: Iterable[int]) -> str:
     return ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
-def _gpu_local_cpus() -> set[int]:
-    """Read the CPUs of the current CUDA device's NUMA node from sysfs."""
+def _gpu_local_cpus() -> Optional[set[int]]:
+    """Read the CPUs of the current CUDA device's NUMA node from sysfs, or None if unknown."""
     p = torch.cuda.get_device_properties(torch.cuda.current_device())
     pci = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
-    node = int(Path(f"/sys/bus/pci/devices/{pci}/numa_node").read_text())
-    if node < 0:
-        raise RuntimeError(f"sysfs reports no NUMA node for GPU {pci}.")
-    cpulist = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
+    try:
+        node = int(Path(f"/sys/bus/pci/devices/{pci}/numa_node").read_text())
+        if node < 0:  # Usual on single-NUMA machines.
+            return None
+        cpulist = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
+    except OSError:  # No sysfs, e.g. non-Linux or a masked /sys.
+        return None
     cpus = set()
     for part in cpulist.split(","):
         lo, _, hi = part.partition("-")
@@ -65,7 +68,8 @@ def _check_threads(
     message = (
         f"CPU affinity check failed (rank={os.environ.get('RANK', '?')}): {details}; "
         f"GPU-local CPUs=[{_format_cpus(local_cpus)}]. "
-        "Bind this rank to GPU-local CPUs with your launcher before CUDA initialization."
+        "Bind this rank to GPU-local CPUs with your launcher (e.g. torchrun --numa-binding=node), "
+        "or disable this check with --no-require-gpu-local-cpu-affinity."
     )
     if warn_for_helper_threads and caller not in violations:
         logger.warning(message)
@@ -78,8 +82,12 @@ def validate_inference_cpu_affinity(
 ) -> None:
     """Raise if the calling thread, or any thread with all_threads, may run on CPUs that are
     not local to the current CUDA device. With warn_for_helper_threads, threads other than
-    the caller only log a warning. Never changes affinity.
+    the caller only log a warning. Skipped if the GPU's NUMA node is unknown. Never changes
+    affinity.
     """
+    local_cpus = _gpu_local_cpus() if hasattr(os, "sched_getaffinity") else None
+    if local_cpus is None:
+        return
     caller = threading.get_native_id()
     tids = sorted(int(t) for t in os.listdir("/proc/self/task")) if all_threads else [caller]
-    _check_threads(tids, caller, _gpu_local_cpus(), os.sched_getaffinity, warn_for_helper_threads)
+    _check_threads(tids, caller, local_cpus, os.sched_getaffinity, warn_for_helper_threads)

@@ -36,6 +36,12 @@ def pytest_configure(config):
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
 
+@pytest.fixture(autouse=True)
+def _skip_inference_cpu_affinity_check(monkeypatch):
+    """Unit-test launchers do not bind CPUs, so skip the default-on inference affinity check."""
+    monkeypatch.setattr("megatron.core.inference.cpu_affinity._gpu_local_cpus", lambda: None)
+
+
 def pytest_addoption(parser):
     """
     Additional command-line arguments passed to pytest.

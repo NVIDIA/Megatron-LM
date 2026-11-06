@@ -294,6 +294,10 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
+    require_gpu_local_cpu_affinity: bool = True
+    """Check that inference ranks are bound to GPU-local CPUs. Disable with
+    --no-require-gpu-local-cpu-affinity."""
+
     def validate(self) -> None:
         """Check the KV-cache suspend/resume policy before an engine is built from it."""
         mode = self.kv_cache_management_mode
@@ -453,6 +457,7 @@ class InferenceSetupConfig:
             allow_stale_multimodal_embeddings=(
                 self.inference_dynamic_batching_allow_stale_multimodal_embeddings
             ),
+            require_gpu_local_cpu_affinity=self.require_gpu_local_cpu_affinity,
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             disaggregation_shards=(
                 self.inference_shards

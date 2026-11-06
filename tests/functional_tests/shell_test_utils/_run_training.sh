@@ -231,6 +231,12 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
+# Inference engines check that each rank is bound to its GPU's NUMA node.
+MODE=$(/usr/local/bin/yq '.MODE // "pretraining"' "$TRAINING_PARAMS_PATH")
+if [[ "$LAUNCHER" == "torchrun" && ( "$MODE" == "inference" || "$MODE" == "rl" ) ]]; then
+    DISTRIBUTED_ARGS+=(--numa-binding node)
+fi
+
 FT_LAUNCHER_ARGS=(
     --max-restarts=3
 )
