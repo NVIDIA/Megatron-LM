@@ -605,6 +605,147 @@ class TestRouterAuxLoss:
         assert router.ga_steps == 0
         assert torch.all(router.global_tokens_per_expert == 0)
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(1, 1, 1), (2, 1, 1), (4, 2, 1), (2, 2, 2)]
+    )
+    def test_global_aux_loss_gradient_scale(
+        self, tp_size, ep_size, cp_size, calculate_per_token_loss
+    ):
+        """global_aux_loss must give the same router gradient as aux_loss when every DP rank
+        receives identical input.
+
+        Both losses then describe the same batch statistics, so they must also log the same
+        value. Each rank holds only a 1/dp_size share of global_aux_loss, which DDP would
+        average over DP once more; without compensation the gradient is dp_size times too
+        small. See https://github.com/NVIDIA/Megatron-LM/issues/3672.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(42)
+
+        routers = {}
+        for aux_loss_type in ["aux_loss", "global_aux_loss"]:
+            routers[aux_loss_type] = self.new_router(
+                moe_router_load_balancing_type=aux_loss_type,
+                moe_aux_loss_coeff=1.0,
+                moe_router_dtype="fp64",
+                calculate_per_token_loss=calculate_per_token_loss,
+                tensor_model_parallel_size=tp_size,
+                expert_tensor_parallel_size=ep_size,
+                context_parallel_size=cp_size,
+            ).cuda()
+
+        # Identical weights and input on every rank.
+        generator = torch.Generator().manual_seed(0)
+        weight = torch.randn(routers["aux_loss"].weight.shape, generator=generator)
+        hidden_states = torch.randn(
+            (32, 1, routers["aux_loss"].config.hidden_size), generator=generator
+        )
+        hidden_states = hidden_states.cuda().bfloat16()
+
+        grads, logged = {}, {}
+        for aux_loss_type, loss_name, group in [
+            ("aux_loss", "load_balancing_loss", "tp_cp_group"),
+            ("global_aux_loss", "global_load_balancing_loss", "tp_dp_cp_group"),
+        ]:
+            router = routers[aux_loss_type]
+            with torch.no_grad():
+                router.weight.copy_(weight)
+            clear_aux_losses_tracker()
+            router.weight.grad = None
+            scores, _ = router(hidden_states)
+            # Zero output gradient: only the aux loss contributes to the router gradient.
+            scores.backward(torch.zeros_like(scores))
+            grads[aux_loss_type] = router.weight.grad.clone()
+            value = get_moe_layer_wise_logging_tracker()[loss_name]["values"][0].clone()
+            logged[aux_loss_type] = reduce_from_tensor_model_parallel_region(
+                value, getattr(router, group)
+            )
+        clear_aux_losses_tracker()
+
+        assert torch.equal(grads["aux_loss"], grads["global_aux_loss"]), (
+            "global_aux_loss gradient should match aux_loss gradient with identical input, "
+            f"max diff: {(grads['aux_loss'] - grads['global_aux_loss']).abs().max().item()}"
+        )
+        torch.testing.assert_close(logged["global_aux_loss"], logged["aux_loss"])
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 1, 1), (2, 1, 1), (2, 2, 2)])
+    def test_global_aux_loss_per_token_uneven_padding(self, tp_size, ep_size, cp_size):
+        """The per-token global_aux_loss gradient must not depend on how valid tokens are
+        split across DP ranks.
+
+        With calculate_per_token_loss, the router gradient summed over all ranks (as DDP and
+        the sequence-parallel all-reduce do) must equal the global valid-token count times
+        the gradient of the global-batch loss, which depends only on the set of valid tokens.
+        Weighting each rank by its DP-local valid-token count makes the sum depend on the
+        split instead.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(42)
+        dp_size = torch.distributed.get_world_size() // (tp_size * cp_size)
+        if dp_size < 2 or dp_size % 2 != 0:
+            pytest.skip("Needs an even data-parallel size")
+
+        router = self.new_router(
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            calculate_per_token_loss=True,
+            params_dtype=torch.float32,
+            bf16=False,
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        ).cuda()
+
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        seq_len = 16
+        hidden_size = router.config.hidden_size
+        # The global batch: seq_len // 2 valid tokens per rank on average.
+        generator = torch.Generator().manual_seed(0)
+        valid_tokens = torch.randn((world_size * seq_len // 2, hidden_size), generator=generator)
+        with torch.no_grad():
+            router.weight.copy_(torch.randn(router.weight.shape, generator=generator))
+
+        def summed_grad(num_valid):
+            counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(world_size)]
+            torch.distributed.all_gather(
+                counts, torch.tensor([num_valid], dtype=torch.long, device="cuda")
+            )
+            start = sum(int(count) for count in counts[:rank])
+            hidden_states = torch.zeros((seq_len, 1, hidden_size))
+            hidden_states[:num_valid, 0] = valid_tokens[start : start + num_valid]
+            padding_mask = torch.ones((seq_len, 1), dtype=torch.bool)
+            padding_mask[:num_valid] = False
+
+            router.reset_global_aux_loss_tracker()
+            router.weight.grad = None
+            scores, _ = router(hidden_states.cuda(), padding_mask=padding_mask.cuda())
+            scores.backward(torch.zeros_like(scores))
+            clear_aux_losses_tracker()
+            grad = router.weight.grad.clone()
+            torch.distributed.all_reduce(grad, group=router.tp_dp_cp_group)
+            return grad
+
+        grad_even = summed_grad(seq_len // 2)
+        # The first half of the DP ranks get 3x the valid tokens of the second half.
+        dp_rank = parallel_state.get_data_parallel_rank()
+        grad_uneven = summed_grad(seq_len * 3 // 4 if dp_rank < dp_size // 2 else seq_len // 4)
+        torch.testing.assert_close(grad_uneven, grad_even)
+
     # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
     @pytest.mark.flaky_in_dev
     @pytest.mark.internal
