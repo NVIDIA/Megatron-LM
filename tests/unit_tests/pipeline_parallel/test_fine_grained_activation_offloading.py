@@ -1004,6 +1004,14 @@ def _build_gpt_model(
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
         gated_linear_unit=use_transformer_engine_op_fuser,
+        # The TE operation-fuser GroupedLinear reduces its bias gradients with fp32 atomic
+        # adds across row splits (TE refuses that kernel under NVTE_ALLOW_NONDETERMINISTIC_ALGO=0),
+        # so two otherwise identical runs can round a BF16 bias gradient to neighbouring values
+        # (one BF16 ulp is 0.25 at |grad| ~ 40, far above this test's 1e-3 tolerance). Keep the
+        # op-fuser model bias-free so the baseline-vs-offload comparison below only sees the
+        # deterministic GEMMs; biases are parameters, not activations, so the offload boundary
+        # under test is unchanged.
+        add_bias_linear=not use_transformer_engine_op_fuser,
         activation_func=(
             torch.nn.functional.silu
             if use_transformer_engine_op_fuser
