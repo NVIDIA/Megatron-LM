@@ -31,6 +31,10 @@ on:
       unit_test_pr_files_artifact_id:
         type: string
         default: ""
+      unit_testmon_checkout_artifact_id:
+        description: Optional PR checkout prepared on a shared Testmon baseline.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -54,6 +58,18 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.sha }}
+
+      # Keep cache transport from this workflow even if the baseline predates it.
+      - name: Save CPU planner
+        run: cp .github/scripts/select_unit_tests.py "$RUNNER_TEMP/select_unit_tests.py"
+
+      - name: Restore prepared unit-test checkout
+        id: testmon-checkout
+        if: inputs.unit_testmon_checkout_artifact_id != ''
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ inputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ inputs.sha }}
 
       - name: Setup Python
         id: python
@@ -103,7 +119,9 @@ jobs:
         env:
           BUCKETS: ${{ inputs.buckets }}
           RECIPE_PLATFORM: ${{ inputs.platform }}
-          SOURCE_SHA: ${{ inputs.sha }}
+          SOURCE_SHA: ${{ steps.testmon-checkout.outputs.sha || inputs.sha }}
+          TESTMON_GENERATION: ${{ steps.testmon-checkout.outputs.generation }}
+          TESTMON_BASE_SHA: ${{ steps.testmon-checkout.outputs.baseline_sha }}
           TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
           PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
           PATH: ${{ steps.cache-compression.outputs.path }}
@@ -116,7 +134,7 @@ jobs:
                 const modules = process.env.RUNNER_TEMP + '/testmon/node_modules/';
                 if (operation === 'restore') {
                   const key = await require(modules + '@actions/cache').restoreCache(
-                    [args[0]], args[1], [args[2]]);
+                    [args[0]], args[1], args[2] ? [args[2]] : []);
                   require('node:fs').writeFileSync(args[3], key || '');
                 } else {
                   const {DefaultArtifactClient} = require(modules + '@actions/artifact');
@@ -124,7 +142,7 @@ jobs:
                 }
               })().catch(error => { console.error(error); process.exitCode = 1; });
             `;
-            await exec.exec('python', ['.github/scripts/select_unit_tests.py'], {
+            await exec.exec('python', [process.env.RUNNER_TEMP + '/select_unit_tests.py'], {
               env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_ACTIONS: client},
             });
 
@@ -165,3 +183,4 @@ jobs:
           unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
+          unit_testmon_checkout_artifact_id: ${{ inputs.unit_testmon_checkout_artifact_id }}
