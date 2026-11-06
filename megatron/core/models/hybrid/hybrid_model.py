@@ -1073,6 +1073,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss(
+            labels, self._vocab_parallel_logits(logits, gather_output)
+        )
 
         return loss

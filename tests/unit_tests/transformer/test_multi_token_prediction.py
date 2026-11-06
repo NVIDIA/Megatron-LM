@@ -4570,6 +4570,8 @@ class TestMultiTokenPredictionHybrid:
             ),
             tp_group=None,
             _scale_logits=lambda logits: logits,
+            # The output layer never gathers here, so the logits are already this rank's shard.
+            _vocab_parallel_logits=lambda logits, logits_are_gathered: logits,
         )
         return model, hidden_states, call_counts, metric_avg_group
 

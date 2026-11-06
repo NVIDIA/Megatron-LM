@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
@@ -26,6 +27,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
 from megatron.core.utils import (
     get_pg_rank,
+    get_pg_size,
     get_tensor_model_parallel_group_if_none,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -112,6 +114,32 @@ class LanguageModule(MegatronModule):
                 return True
         return False
 
+    def _vocab_parallel_logits(self, logits: Tensor, logits_are_gathered: bool) -> Tensor:
+        """Returns this rank's vocabulary shard of the logits, as the language model loss expects.
+
+        The output layer gathers the logits over the tensor-parallel group when
+        `parallel_output=False` or `runtime_gather_output=True`. The vocab-parallel cross entropy
+        reads the last dimension as this rank's shard of the vocabulary, so on gathered logits it
+        counts the softmax denominator once per rank: the loss is `log(tp_size)` too high and the
+        gradient loses the target term. Keeping only this rank's shard gives the loss and the
+        gradient of the sharded logits exactly, with no extra communication, because the backward
+        of the gather already keeps only this rank's slice of the gradient.
+
+        Args:
+            logits (Tensor): The logits returned by the output layer, [s, b, v] when gathered,
+                else [s, b, v / tp_size].
+            logits_are_gathered (bool): Whether the output layer gathered the logits over the
+                tensor-parallel group.
+
+        Returns:
+            Tensor: The logits of this rank's vocabulary shard, [s, b, v / tp_size].
+        """
+        tp_size = get_pg_size(self.tp_group)
+        if not logits_are_gathered or tp_size == 1:
+            return logits
+        tp_rank = get_pg_rank(self.tp_group)
+        return split_tensor_along_last_dim(logits, tp_size)[tp_rank].contiguous()
+
     # pylint: disable=line-too-long
     def compute_language_model_loss(
         self, labels: Tensor, logits: Tensor, return_argmax: bool = False
@@ -120,7 +148,9 @@ class LanguageModule(MegatronModule):
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
-            logits (Tensor): The final logits returned by the output layer of the transformer model
+            logits (Tensor): This rank's vocabulary shard of the final logits of the transformer
+                model, [seq length, batch size, vocab size / tp size]. Pass logits that the output
+                layer gathered over the tensor-parallel group through `_vocab_parallel_logits`.
             return_argmax (bool): Also return the argmax of the logits over the full vocabulary,
                 [seq length, batch size], when the cross entropy finds it in the same pass (TE's
                 fused cross entropy), else None.
