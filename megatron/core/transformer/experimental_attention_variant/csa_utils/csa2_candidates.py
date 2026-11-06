@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.env_flags import env_flag
 from megatron.core.ops.attention.csa.indexer_quantization import (
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_thd_scale_capacity,
@@ -67,6 +68,17 @@ def _score_chunk_max_bytes() -> int:
 # chunks hold 128 rows, which occupy 64 (H64) or 32 (H32) SMs.
 _SCORE_CHUNK_MAX_BYTES = _score_chunk_max_bytes()
 _QUERY_CHUNK_SIZE = 2048
+# cuDNN's MXFP8 selection scorers (dense chunks here, compact Top-K in csa2_indexer) take H32
+# indexer heads natively, four query tokens per 128-row MMA tile. MCORE_CSA2_MXFP8_NATIVE_H32=0
+# restores the zero-padding to H64 (two tokens, each with 32 zero heads, per tile). The
+# quantized real heads, their tile products and the head-reduction order are the same on both
+# paths, and their scores and selections compare equal bit for bit.
+_MXFP8_NATIVE_H32 = env_flag("MCORE_CSA2_MXFP8_NATIVE_H32", True)
+
+
+def mxfp8_selection_heads(num_heads: int) -> int:
+    """Return the head count cuDNN MXFP8 selection scores: H32 natively or padded to H64."""
+    return 64 if num_heads == 32 and not _MXFP8_NATIVE_H32 else num_heads
 
 
 @dataclass(frozen=True)
@@ -372,10 +384,11 @@ def fused_candidate_blocks(
         # these buffers would synchronize once for K and once per Q chunk.
         num_sequences = cu_q.numel() - 1
         chunk_rows = min(chunk_size, q.shape[0])
-        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(chunk_rows, num_sequences, 64)
+        kernel_heads = mxfp8_selection_heads(num_heads)
+        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(chunk_rows, num_sequences, kernel_heads)
         k_scale_capacity = indexer_mxfp8_thd_scale_capacity(k.shape[0], num_sequences, 1)
         q_scale = torch.empty(
-            indexer_mxfp8_thd_scale_shape(q_scale_capacity, 64, q.shape[-1]),
+            indexer_mxfp8_thd_scale_shape(q_scale_capacity, kernel_heads, q.shape[-1]),
             dtype=torch.float8_e8m0fnu,
             device=q.device,
         )
@@ -390,9 +403,9 @@ def fused_candidate_blocks(
         )
         precision_kwargs.update(k_scale=k_scale, cu_seqlens_k_scale_padded=k_scale_prefix)
         q_buffers = None
-        if num_heads == 32:
-            padded_q = q.new_zeros((chunk_rows, 64, q.shape[-1]))
-            padded_w = weights.new_zeros((chunk_rows, 64))
+        if kernel_heads != num_heads:
+            padded_q = q.new_zeros((chunk_rows, kernel_heads, q.shape[-1]))
+            padded_w = weights.new_zeros((chunk_rows, kernel_heads))
 
     for start in range(0, q.shape[0], chunk_size):
         end = min(start + chunk_size, q.shape[0])
@@ -401,9 +414,9 @@ def fused_candidate_blocks(
         kernel_q = q[start:end]
         kernel_w = scaled_weights[start:end]
         if precision == "mxfp8":
-            # The existing MXFP8 scorer needs H64. Pad only this chunk; keep
-            # real H32 scaling and avoid doubling the full projected Q storage.
-            if num_heads == 32:
+            # MCORE_CSA2_MXFP8_NATIVE_H32=0 scores H32 as H64. Pad only this chunk;
+            # keep real H32 scaling and avoid doubling the projected Q storage.
+            if kernel_heads != num_heads:
                 padded_q[: end - start, :num_heads].copy_(kernel_q)
                 padded_w[: end - start, :num_heads].copy_(kernel_w)
                 kernel_q, kernel_w = padded_q[: end - start], padded_w[: end - start]

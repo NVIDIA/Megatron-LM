@@ -31,7 +31,12 @@ from megatron.core.ops.attention.csa.output_rope import (
 )
 
 from . import fused_sparse_attention
-from .csa2_candidates import CSA2CandidateBlocks, fused_candidate_blocks, select_compact_positions
+from .csa2_candidates import (
+    CSA2CandidateBlocks,
+    fused_candidate_blocks,
+    mxfp8_selection_heads,
+    select_compact_positions,
+)
 from .csa2_teacher_lse import fused_csa_window_lse
 from .csa_indexer_loss_kernels import sparse_kl_loss
 from .thd_utils import (
@@ -279,7 +284,8 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
     global keys. Dispatch-local scratch and host-known bounds keep capture
     independent of live prefix values without a second workspace/cache API.
     BF16 retains bounded scoring on devices/frontends without compact support.
-    THD padding rows get empty key spans (MCORE_CSA2_TOPK_PAD_SEGMENTS).
+    THD padding rows get empty key spans (MCORE_CSA2_TOPK_PAD_SEGMENTS). MXFP8
+    scores H32 natively unless MCORE_CSA2_MXFP8_NATIVE_H32=0 pads it to H64.
     """
     if precision not in ("bf16", "mxfp8"):
         raise ValueError("CSA2 compact selection precision must be bf16 or mxfp8")
@@ -299,7 +305,7 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
         raise RuntimeError("CSA2 MXFP8 selection requires cuDNN compact support and SM100 or later")
     heads = q.shape[-2]
     weights = (weights.float() * (q.shape[-1] ** -0.5 * heads**-0.5)).to(weights.dtype)
-    if precision == "mxfp8" and heads == 32:
+    if precision == "mxfp8" and mxfp8_selection_heads(heads) != heads:
         q = torch.nn.functional.pad(q, (0, 0, 0, 32))
         weights = torch.nn.functional.pad(weights, (0, 32))
     if _COMPACT_TOPK_PAD_SEGMENTS and inputs.thd_layout is not None:

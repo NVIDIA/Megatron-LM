@@ -1571,3 +1571,18 @@ def test_candidate_chunk_budget_parsing(monkeypatch, value, expected):
             csa2_candidates._score_chunk_max_bytes()
     else:
         assert csa2_candidates._score_chunk_max_bytes() == expected << 20
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_mxfp8_selection_heads(monkeypatch, native):
+    """MCORE_CSA2_MXFP8_NATIVE_H32 (on by default) only decides whether MXFP8 selection scores
+    H32 natively or zero-padded to H64; H64 is always scored as is."""
+    import os
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_candidates
+
+    if os.environ.get("MCORE_CSA2_MXFP8_NATIVE_H32") is None:
+        assert csa2_candidates._MXFP8_NATIVE_H32 is True
+    monkeypatch.setattr(csa2_candidates, "_MXFP8_NATIVE_H32", native)
+    assert csa2_candidates.mxfp8_selection_heads(32) == (32 if native else 64)
+    assert csa2_candidates.mxfp8_selection_heads(64) == 64

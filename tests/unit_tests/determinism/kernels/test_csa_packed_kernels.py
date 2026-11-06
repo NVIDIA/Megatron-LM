@@ -496,6 +496,94 @@ def test_candidate_selection_ignores_score_chunk_budget_at_64k_cp16(monkeypatch)
     )
 
 
+class _ScorerHeadSpy:
+    """cudnn.DSA proxy that records how many heads each MXFP8 selection scorer receives."""
+
+    def __init__(self, dsa):
+        self._dsa = dsa
+        self.heads = []
+
+    def __getattr__(self, name):
+        attr = getattr(self._dsa, name)
+        if name not in ("indexer_forward_wrapper", "indexer_forward_top_k_wrapper"):
+            return attr
+
+        def scorer(q, *args, **kwargs):
+            self.heads.append(q.shape[1])
+            return attr(q, *args, **kwargs)
+
+        return scorer
+
+
+def _mxfp8_selection(inputs, selection, topk, topk_blocks):
+    """One of the two MXFP8 selection entry points of a CSA2 layer, returning its outputs."""
+    if selection == "compact_topk":
+        return lambda: (csa2_indexer.fused_compact_topk(inputs, topk, "mxfp8"),)
+
+    def candidate_source():
+        tokens, blocks = csa2_candidates.fused_candidate_blocks(
+            inputs, topk_blocks=topk_blocks, block_size=8, precision="mxfp8", token_topk=topk
+        )
+        return tokens, blocks.indices, blocks.lengths
+
+    return candidate_source
+
+
+def _assert_native_h32_matches_padded_h64(monkeypatch, select, selection):
+    """``select`` returns the same bits with H32 scored natively and zero-padded to H64."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 selection requires SM100")
+    pytest.importorskip("cudnn")
+    namespace = csa2_indexer.fused_sparse_attention
+    namespace._ensure_dsa_namespace()
+    compact = getattr(namespace._DSA, "indexer_forward_top_k_wrapper", None)
+    if selection == "compact_topk" and not callable(compact):
+        pytest.skip("requires cuDNN compact Top-K")
+    spy = _ScorerHeadSpy(namespace._DSA)
+    monkeypatch.setattr(namespace, "_DSA", spy)
+    results, heads = [], []
+    for native in (False, True):
+        monkeypatch.setattr(csa2_candidates, "_MXFP8_NATIVE_H32", native)
+        spy.heads.clear()
+        results.append(select())
+        heads.append(list(spy.heads))
+    torch.cuda.synchronize()
+    assert heads[0] and heads[0] == [64] * len(heads[0]), heads[0]
+    assert heads[1] == [32] * len(heads[0]), heads[1]
+    for index, (got, want) in enumerate(zip(results[1], results[0])):
+        assert bytes_equal(got, want), f"{selection}: output {index}"
+    assert bool((results[1][0] >= 0).any()), "degenerate test: nothing selected"
+    assert_replays_bit_exact(
+        select, (), backward=False, contention=True, what=f"native H32 MXFP8 {selection}"
+    )
+
+
+@pytest.mark.parametrize("selection", ["compact_topk", "candidate_source"])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_native_h32_mxfp8_selection_matches_padded_h64(monkeypatch, cp, ratio, selection):
+    """MCORE_CSA2_MXFP8_NATIVE_H32: cuDNN scores H32 indexer heads natively and selects the same
+    keys and candidate blocks as with the heads zero-padded to H64, across empty, padded and
+    CP-cut segments, and the native path replays bit-exactly."""
+    seeded()
+    inputs = _selection_inputs(
+        [0, 65, 65, 322], [0, 66, 66, 326], 260, 326 // cp, cp, ratio, 32, False
+    )
+    select = _mxfp8_selection(inputs, selection, topk=7, topk_blocks=3)
+    _assert_native_h32_matches_padded_h64(monkeypatch, select, selection)
+
+
+@pytest.mark.parametrize("selection,ratio", [("compact_topk", 2), ("candidate_source", 1)])
+def test_native_h32_mxfp8_selection_matches_padded_h64_at_64k_cp16(monkeypatch, selection, ratio):
+    """The 64K CP16 last rank with production padding rows (q = w = 0): r2 compact Top-K at
+    top-k 512, and the r1 candidate source (2048 blocks of 8) in 152 MiB score chunks."""
+    seeded()
+    inputs = _selection_inputs([0, 65535], [0, 65536], 65536, 4096, 16, ratio, 32, True)
+    monkeypatch.setattr(csa2_candidates, "_SCORE_CHUNK_MAX_BYTES", 152 << 20)
+    select = _mxfp8_selection(inputs, selection, topk=512, topk_blocks=2048)
+    _assert_native_h32_matches_padded_h64(monkeypatch, select, selection)
+
+
 @pytest.mark.skipif(not csa2_indexer.HAVE_TRITON, reason="requires Triton")
 @pytest.mark.parametrize("width", [72, 512])
 def test_cudnn_indexer_loss_slot_map_replays_and_matches_reference(width):
