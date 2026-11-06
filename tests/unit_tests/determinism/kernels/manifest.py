@@ -128,10 +128,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_te_wrappers.py",
+            R + 'test_activation_replay.py',
+        ),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
-        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients. "
+        "mark_grouped_tensor itself is replayed in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="fused_bias_gelu",
@@ -337,6 +342,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
+        "Batch-invariant all-to-all CP attention (split and gathered K/V, sbhd and thd) is "
+        "replayed at CP2/CP4 in test_te_wrappers.py. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
     KernelEntry(
