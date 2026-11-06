@@ -709,6 +709,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
         ),
