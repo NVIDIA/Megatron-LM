@@ -130,7 +130,7 @@ def test_training_installs_the_policy_before_distributed_init(
     parser, install_policy, monkeypatch, run_config
 ):
     # Parsed but not validated, as in callers that build their own arguments.
-    args = parser.parse_args(['--deterministic-mode', '--triton-autotune-modules', 'my_kernels'])
+    args = parser.parse_args(['--triton-autotune-modules', 'my_kernels'])
     # Training finalization resolves batch defaults using the registered topology.
     args.batch_parallel_size = 1
     run_config.train.micro_batch_size = 1

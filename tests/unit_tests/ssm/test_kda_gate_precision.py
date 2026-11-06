@@ -37,6 +37,7 @@ def test_gate_parameter_precision_through_bf16_wrapper(variant, monkeypatch):
             normalization="RMSNorm",
             activation_func=torch.nn.functional.silu,
             perform_initialization=True,
+            deterministic_mode=False,
         )
         if variant.startswith("kda"):
             config = KDALayerConfig.from_config(config)

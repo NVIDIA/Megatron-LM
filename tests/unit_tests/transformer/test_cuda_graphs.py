@@ -1919,6 +1919,8 @@ class TestPartialCudaGraph:
             assert hasattr(args, key)
             setattr(args, key, value)
 
+        # moe_router_fusion implies the aux loss fusion, which deterministic mode rejects.
+        args.deterministic_mode = False
         validate_args(args)
         cfg = pretrain_cfg_container_from_args(args)
         cfg.tokenizer.vocab_size = 1024

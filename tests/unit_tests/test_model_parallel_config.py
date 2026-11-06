@@ -9,7 +9,9 @@ from megatron.training.arguments import parse_args, validate_args
 
 
 def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():
-    config = ModelParallelConfig(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+    config = ModelParallelConfig(
+        dynamic_context_parallel=True, deterministic_mode=False, max_seqlen_per_dp_cp_rank=4096
+    )
 
     assert config.sequence_packing_scheduler == "default_dynamic_cp"
     assert config.variable_seq_lengths is True
@@ -58,7 +60,9 @@ def test_static_packing_preserves_deterministic_mode():
 
 def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
     with pytest.warns(DeprecationWarning, match="deprecated"):
-        config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+        config = ModelParallelConfig(
+            hybrid_context_parallel=True, deterministic_mode=False, max_seqlen_per_dp_cp_rank=4096
+        )
 
     assert config.dynamic_context_parallel is True
     assert config.hybrid_context_parallel is False
@@ -95,6 +99,8 @@ def _te_cross_entropy_training_args(monkeypatch):
     args.vocab_size = 1024
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
+    # Cross entropy loss fusion is rejected by deterministic mode.
+    args.deterministic_mode = False
     return args
 
 

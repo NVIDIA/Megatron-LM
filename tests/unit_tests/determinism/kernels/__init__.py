@@ -17,7 +17,7 @@ from megatron.training.determinism import apply_determinism_env
 
 # Pin workspaces and future decorations, and cover autotuners that training imports
 # already loaded. Replay must not include Triton's timing-based configuration search.
-# Use the default scope, as --deterministic-mode does, so replays exercise the same
+# Use the default scope, as deterministic mode does, so replays exercise the same
 # pinning (Transformer Engine and in-tree fusions included) that training runs under.
 set_deterministic_mode(True)
 install(AutotunePolicy(mode="pinned"))

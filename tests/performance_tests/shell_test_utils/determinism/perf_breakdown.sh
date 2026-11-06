@@ -55,7 +55,7 @@ bash "$SCRIPT_DIR/run_nsys_breakdown.sh" "$OUT" -- \
         --eval-interval 10000 \
         --no-load-optim \
         --no-load-rng \
-        $([ "$DETERMINISM_PERF_MODE" = det ] && echo --deterministic-mode) \
+        $([ "$DETERMINISM_PERF_MODE" = nondet ] && echo --disable-deterministic-mode) \
         --profile \
         --nvtx-ranges \
         --profile-step-start 5 \

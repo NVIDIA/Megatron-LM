@@ -75,6 +75,7 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 0
   --ckpt-format: torch_dist
+  --exit-interval: 20
 TEST_TYPE: regular
 METRICS:
   - lm loss

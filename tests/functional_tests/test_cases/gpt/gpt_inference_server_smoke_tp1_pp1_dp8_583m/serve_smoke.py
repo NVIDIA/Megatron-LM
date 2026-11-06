@@ -102,7 +102,6 @@ def build_server_cmd(
         "1",
         "--pipeline-model-parallel-size",
         "1",
-        "--deterministic-mode",
         "--ckpt-format",
         "torch_dist",
         "--bf16",

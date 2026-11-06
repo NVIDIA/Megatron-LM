@@ -42,7 +42,6 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --no-ckpt-fully-parallel-save: true
   --async-save: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true

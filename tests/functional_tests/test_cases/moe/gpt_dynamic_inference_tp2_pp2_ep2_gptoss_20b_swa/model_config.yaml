@@ -77,7 +77,6 @@ MODEL_ARGS:
 
   --bf16: true
   --attention-backend: flash
-  --deterministic-mode: true
   --micro-batch-size: 1
 
   # Dynamic inference engine

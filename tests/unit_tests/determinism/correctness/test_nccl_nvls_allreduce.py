@@ -2,7 +2,7 @@
 
 """Bit-exact replay of a bf16 AllReduce under ``NCCL_ALGO=Ring,NVLS``.
 
-``--deterministic-mode`` accepts ``Ring,NVLS`` except on Hopper, where the result of an NVLS
+Deterministic mode accepts ``Ring,NVLS`` except on Hopper, where the result of an NVLS
 reduction can depend on the multicast objects allocated before it in the same process
 (NVIDIA/nccl#2360). The replay follows the pattern of that issue: before it creates the
 communicator under test, it creates ``k`` other communicators that each run a small AllReduce,
@@ -112,7 +112,7 @@ def _replay():
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA GPUs")
 @pytest.mark.skipif(
-    _IS_HOPPER, reason="--deterministic-mode rejects Ring,NVLS on Hopper (NVIDIA/nccl#2360)"
+    _IS_HOPPER, reason="deterministic mode rejects Ring,NVLS on Hopper (NVIDIA/nccl#2360)"
 )
 def test_ring_nvls_all_reduce_is_bit_exact_across_communicator_histories():
     """The same bits for k = 0..3 earlier communicators, on every rank, and when repeated."""

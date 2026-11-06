@@ -50,7 +50,6 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
   --swiglu: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true

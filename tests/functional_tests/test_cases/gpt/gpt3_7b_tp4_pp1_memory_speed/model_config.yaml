@@ -48,7 +48,6 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist

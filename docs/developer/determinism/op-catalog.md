@@ -48,7 +48,7 @@ The two conv rows are different kernels. Mamba and GDP call Dao-AILab's
 FLA's, which does not, so it falls back to `F.conv1d`.
 
 The following environment controls make the rest of the step deterministic.
-The flag `--deterministic-mode` validates and defaults these settings. For
+Deterministic mode validates and defaults these settings. For
 details, refer to `megatron/training/determinism.py`.
 
 - `NCCL_ALGO=Ring`. The tree is rejected because its reduction order is not
@@ -65,8 +65,8 @@ are known open gaps.
 
 | Operation or Feature | Where Enforced or Observed | Status |
 | --- | --- | --- |
-| Fused cross-entropy loss (`--cross-entropy-loss-fusion`) | rejected by `--deterministic-mode` (`megatron/training/determinism.py`) | The fused kernel is non-deterministic. Whether a deterministic variant is feasible remains an open question. Until then, the framework uses the native vocab-parallel path. |
-| TP communication overlap (`--tp-comm-overlap`) | rejected by `--deterministic-mode` | Overlapped collective ordering is not reproducible. |
+| Fused cross-entropy loss (`--cross-entropy-loss-fusion`) | rejected by deterministic mode (`megatron/training/determinism.py`) | The fused kernel is non-deterministic. Whether a deterministic variant is feasible remains an open question. Until then, the framework uses the native vocab-parallel path. |
+| TP communication overlap (`--tp-comm-overlap`) | rejected by deterministic mode | Overlapped collective ordering is not reproducible. |
 | Packed sequence (`thd`) in gated-delta-net | assertion in `megatron/core/ssm/gated_delta_net.py` | No deterministic packed-sequence SSM path exists yet. |
 | Pre-GDR fusion (`--gdn-pre-gated-delta-rule-fusion`) | rejected by `GatedDeltaNet._setup_variant_attrs` | Uses atomic parameter-gradient reductions and timing-based Triton autotuning. |
 | Post-GDR fusion (`--gdn-gated-output-norm-fusion`) | rejected on every fused forward by `validate_gated_norm` | The supported configuration requires `deterministic_mode=False`; preserve the unfused path for deterministic mode. |

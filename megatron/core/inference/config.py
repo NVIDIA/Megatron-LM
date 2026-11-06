@@ -800,8 +800,8 @@ class InferenceConfig:
     If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
     sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
     routed to different ranks produces different samples (important for RL training).
-    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
-    enabled), then all DP ranks share the same sampling / generation seed.
+    If False (or `ModelParallelConfig.deterministic_mode` is enabled, as it is by default),
+    then all DP ranks share the same sampling / generation seed.
     """
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
