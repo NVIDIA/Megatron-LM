@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from inspect import signature
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -18,6 +19,7 @@ except ImportError:
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -59,7 +61,28 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
+class MambaLayerTECudaGraphMixin(TECudaGraphMixin):
+    """Declare the Mamba scope and its TE graph input restrictions."""
+
+    def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
+        """Reject inference contexts and prepare Mamba's tensor inputs for replay."""
+        if args:
+            positional_inputs = signature(self.forward).bind(hidden_states, *args).arguments
+            positional_inputs.pop("hidden_states")
+            kwargs = dict(**positional_inputs, **kwargs)
+        assert kwargs.get('inference_context') is None, (
+            "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
+        )
+        return super().before_replay_hook(
+            hidden_states, **{k: v for k, v in kwargs.items() if v is not None}
+        )
+
+    def is_graphable_for_scope(self, modules):
+        return not modules or CudaGraphModule.mamba in modules
+
+
+class MambaLayer(MambaLayerTECudaGraphMixin, GraphableMegatronModule, TwoStageAttentionLayer):
     """
     A single Mamba layer.
 
@@ -348,19 +371,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         if prefixed_map:
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
-
-    def _te_cuda_graph_replay(self, *args, **kwargs):
-        """
-        CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
-        interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
-        However, CUDA graph accepts only Tensor inputs.
-        Hence, `inference_context` is excluded from input list.
-        """
-        assert kwargs.get('inference_context') is None, (
-            "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
-            "For inference cuda graph, please use cuda_graph_impl=local instead."
-        )
-        return super()._te_cuda_graph_replay(*args, **kwargs)
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """

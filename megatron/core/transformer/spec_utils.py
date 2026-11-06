@@ -76,6 +76,9 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     """Builds an instance of the module from the spec.
 
+    Transformer layers use a TE CUDA graph subclass when requested by config;
+    the supplied spec and its module class are not modified.
+
     Args:
         spec_or_module: The module spec or module class to build.
         *args: Positional arguments to be passed to the module init.
@@ -117,6 +120,14 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     # spec.
     if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
         kwargs["submodules"] = spec_or_module.submodules
+
+    config = kwargs.get(
+        "config", getattr(spec_or_module, "params", {}).get("config", args[0] if args else None)
+    )
+    if getattr(config, "cuda_graph_impl", None) == "transformer_engine":
+        from megatron.core.extensions.te_cuda_graphs import get_te_cuda_graph_module_class
+
+        module = get_te_cuda_graph_module_class(module)
 
     try:
         return module(
