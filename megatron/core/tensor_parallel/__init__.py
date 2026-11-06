@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
-
+from .cross_entropy import vocab_parallel_cross_entropy
 from .data import broadcast_data
 from .inference_layers import (
     InferenceColumnParallelLinear,

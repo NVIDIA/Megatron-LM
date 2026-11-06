@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.training.arguments import _add_regularization_args
 
 
