@@ -90,3 +90,53 @@ def get_blend_from_list(
     prefix_per_dataset = [rppd.strip() for rppd in raw_prefix_per_dataset]
 
     return prefix_per_dataset, weight_per_dataset
+
+
+def atomic_save(path: str, array: numpy.ndarray, allow_pickle: bool = True) -> None:
+    """Save a numpy array to disk atomically.
+
+    Writes to a temporary file in the same directory and replaces the target path
+    only after the write is fully completed. This prevents truncated or corrupted
+    cache files if the process is killed or crashes mid-write.
+    """
+    import os
+    import tempfile
+
+    dir_name = os.path.dirname(path)
+    os.makedirs(dir_name, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(dir=dir_name, delete=False, suffix=".tmp")
+    temp_path = temp_file.name
+    try:
+        temp_file.close()
+        with open(temp_path, "wb") as f:
+            numpy.save(f, array, allow_pickle=allow_pickle)
+        os.replace(temp_path, path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    """Write text to disk atomically via a temporary file and rename.
+
+    This ensures that description or marker files are committed only after the write
+    has successfully completed.
+    """
+    import os
+    import tempfile
+
+    dir_name = os.path.dirname(path)
+    os.makedirs(dir_name, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        dir=dir_name, delete=False, suffix=".tmp", mode="wt", encoding="utf-8"
+    )
+    temp_path = temp_file.name
+    try:
+        with temp_file as writer:
+            writer.write(content)
+        os.replace(temp_path, path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
