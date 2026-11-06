@@ -515,6 +515,8 @@ class DynamicInferenceEngine(AbstractEngine):
     # Immutable so instances never share one task set; __init__ installs a mutable one.
     _staging_tasks: Set[asyncio.Task] = frozenset()
     _staging_tasks_peak: int = 0
+    # Coordinator child process spawned by start_listening_to_data_parallel_coordinator.
+    inference_coordinator_process: Optional[multiprocessing.process.BaseProcess] = None
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -1651,6 +1653,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                 },
+                daemon=True,
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
@@ -1790,6 +1793,20 @@ class DynamicInferenceEngine(AbstractEngine):
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
         return dp_addr
+
+    def join_coordinator_process(self, timeout: float = 10.0) -> None:
+        """Reap the coordinator child this engine spawned; terminate it if it ignores SHUTDOWN."""
+        process = self.inference_coordinator_process
+        if process is None:
+            return
+        process.join(timeout)
+        if process.is_alive():
+            logger.warning(
+                f"Inference coordinator still alive {timeout}s after shutdown; terminating."
+            )
+            process.terminate()
+            process.join()
+        self.inference_coordinator_process = None
 
     @contextmanager
     @staticmethod
