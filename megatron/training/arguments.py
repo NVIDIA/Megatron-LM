@@ -3599,11 +3599,9 @@ def _add_experimental_args(parser):
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--n-loops-distribution', type=str, default=None,
-                       help='Shared loop-count probabilities for all : delimited hybrid '
-                       'regions, '
-                       'e.g. "1:0.25,2:0.25,4:0.25,8:0.25". Defaults to one loop. '
-                       'Evaluation uses the largest count. Supply the desired policy on '
-                       'every restart; it is independent of checkpoint weights.')
+                       help='Shared loop-count probabilities for all ":"-delimited hybrid '
+                       'regions, e.g., "1:0.25,2:0.25,4:0.25,8:0.25". Defaults to one loop. '
+                       'Evaluation uses the largest count. Independent of checkpoint weights.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')
