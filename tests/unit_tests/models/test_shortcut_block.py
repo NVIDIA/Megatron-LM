@@ -109,7 +109,7 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self, operation):
+    def _get_residual_connection_for_mlp(self, operation):
         if self.config.wide_residual is None:
             return None
         match operation:
@@ -706,9 +706,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         torch.ones_like(hidden_states),
         torch.ones_like(hidden_states, dtype=torch.bool),
     )
-    mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
-        hidden_states,
-        probs,
+    mlp.preprocess = (
+        lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
+            hidden_states,
+            probs,
+        )
     )
     mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
     mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)

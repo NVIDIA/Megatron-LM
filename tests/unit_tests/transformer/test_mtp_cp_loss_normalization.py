@@ -244,17 +244,14 @@ def test_mtp_cp_conditioning_mask_gradients(
     torch.testing.assert_close(actual[2], expected[2], atol=1e-11, rtol=1e-9)
 
 
-def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch):
-    """Averaging the rank contributions must report the same MTP mean as CP1."""
+@pytest.mark.parametrize("per_token", [False, True])
+def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per_token):
+    """The logging helper must report the CP1 mean in both normalization modes."""
     hidden, weight, labels, config, params, indices = _case(1, False, device, cp_group)
-    captured = []
-    monkeypatch.setattr(
-        MTPLossLoggingHelper,
-        "save_metrics_to_tracker",
-        lambda loss, *args, **kwargs: captured.append(loss.detach().clone()),
-    )
+    config.calculate_per_token_loss = per_token
+    monkeypatch.setattr(MTPLossLoggingHelper, "tracker", {})
     for mask in _masks(device):
-        captured.clear()
+        MTPLossLoggingHelper.reset_metrics_tracker()
         _run_loss(
             hidden[:, indices],
             weight,
@@ -265,11 +262,11 @@ def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch):
             cp_group,
             training=True,
         )
-        actual = captured[0]
-        torch.distributed.all_reduce(actual, group=cp_group)
-        actual /= cp_group.size()
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
+        actual = MTPLossLoggingHelper.tracker["loss_values"][0]
         losses = F.cross_entropy(
             F.linear(hidden[1, :-1], weight).permute(1, 2, 0), labels[:, 1:], reduction="none"
         )
         expected = (losses * mask[:, 1:]).sum() / mask[:, 1:].sum().clamp(min=1)
-        torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-9)
+        # The actual logging accumulator stores float32, even for this float64 head.
+        torch.testing.assert_close(actual, expected.float(), atol=1e-6, rtol=1e-6)
