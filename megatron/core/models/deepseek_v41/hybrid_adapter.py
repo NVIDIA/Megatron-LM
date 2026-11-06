@@ -329,7 +329,9 @@ class DeepSeekV41Adapter:
             values = {
                 field.key: values[field.key] for field in codec.schema(key[0] + 1, loss=loss).fields
             }
-            csa, mhc, _ = codec.restore(values, key[0] + 1)
+            # The region passes packed prefixes through unchanged, so their eager layouts still
+            # hold; rebuilding them would add ~100 launches and 17 device asserts per replay.
+            csa, mhc, _ = codec.restore(values, key[0] + 1, previous=context.cross_layer_state)
             context.cross_layer_state, context.mhc_state = csa, mhc
             objective = values.pop('indexer_loss', None)
             output = (branch, None)

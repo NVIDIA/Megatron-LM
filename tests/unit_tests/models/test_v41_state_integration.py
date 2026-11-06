@@ -194,6 +194,32 @@ def _run(stack, x, cfg, groups, values=None, *, capture=None, shape=None, hasher
     return out, context
 
 
+def test_restore_reuses_previous_packed_layouts(setup):
+    """A later boundary of the same microbatch reuses its packed layouts, equal to a rebuild."""
+    cfg, _, groups = setup
+    codec = V41StateCodec(cfg, BatchShape(16, 1, max_seqlen=10, num_sequences=2), groups.cp)
+    values = dict(
+        cu=torch.tensor([0, 9, 14], dtype=torch.int32),
+        cu_padded=torch.tensor([0, 10, 16], dtype=torch.int32),
+    )
+    first, _, _ = codec.restore(values, 1)
+    reused, _, _ = codec.restore(values, 3, previous=first)
+    rebuilt, _, _ = codec.restore(values, 3)
+    assert first.thd_layout is not None and first.compressed_layout is not None
+    assert reused.thd_layout is first.thd_layout
+    assert reused.compressed_layout is first.compressed_layout
+    for name in ('thd_layout', 'compressed_layout'):
+        actual, expected = getattr(reused, name), getattr(rebuilt, name)
+        assert actual is not expected
+        for item in fields(expected):
+            value, reference = getattr(actual, item.name), getattr(expected, item.name)
+            if isinstance(reference, torch.Tensor):
+                assert value.dtype == reference.dtype, (name, item.name)
+                assert torch.equal(value, reference), (name, item.name)
+            else:
+                assert value == reference, (name, item.name)
+
+
 class RoutedDense(nn.Module):
     """Small differentiable MoE substitute for CPU orchestration checks."""
 
