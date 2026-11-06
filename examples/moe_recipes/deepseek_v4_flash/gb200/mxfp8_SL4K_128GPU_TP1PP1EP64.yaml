@@ -180,8 +180,8 @@ ARGS:
   spec:
   - megatron.core.models.hybrid.hybrid_layer_specs
   - hybrid_dsv4_stack_spec
-  train_iters: 50
-  lr_decay_iters: 50
+  train_iters: 100
+  lr_decay_iters: 100
   lr_warmup_iters: 0
   dsa_kernel_backend: cudnn
   dsa_indexer_precision: mxfp8

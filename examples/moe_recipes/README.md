@@ -205,8 +205,10 @@ TE's grouped output projection stores a 3D parameter. Its explicit Muon matrix
 metadata preserves the legacy flattened-matrix update rather than routing the
 weight to Adam or applying independent updates to each group.
 
-These are 50-step mock-data throughput recipes with forced routing. They do not
+These are 100-step mock-data throughput recipes with forced routing. They do not
 establish training convergence. Keep numerical checks enabled for qualification;
 disable them only for the timed run, as in the provided benchmark settings.
+Exclude compilation and graph capture from measurements; use the final 80 steps
+after at least 20 warmup steps, and verify that timing has stabilized.
 Historical throughput values belong to the previous recipe revisions and are
 not measurements of the refreshed configuration.

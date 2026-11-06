@@ -196,8 +196,8 @@ ARGS:
   enable_mhc_connections: true
   mhc_num_residual_streams: 4
   moe_flex_dispatcher_num_sms: 32
-  train_iters: 50
-  lr_decay_iters: 50
+  train_iters: 100
+  lr_decay_iters: 100
   lr_warmup_iters: 0
   dsa_indexer_precision: mxfp8
   moe_megakernel_backend: mok
