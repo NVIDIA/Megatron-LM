@@ -74,7 +74,15 @@ def _register_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup, label: st
     NCCL communicator (registration needs it)."""
     warmup = torch.zeros(1, device=torch.cuda.current_device())
     dist.all_reduce(warmup, group=group)
-    vmm_symm_allocator.register_mem_pool(pool, group)
+    try:
+        vmm_symm_allocator.register_mem_pool(pool, group)
+    except RuntimeError:
+        # ProcessGroupNCCL records the pool before registering its segments; undo the record.
+        try:
+            vmm_symm_allocator.deregister_mem_pool(pool, group)
+        except RuntimeError:
+            pass
+        raise
     log_single_rank(
         logger,
         logging.INFO,

@@ -1402,10 +1402,10 @@ def validate_args(args, defaults={}):
             )
 
         # A bare flag ([]) means both modes; after this, each value is None (off) or non-empty.
-        for attr in ('gtp_remat_nccl_ub', 'gtp_expert_remat_nccl_ub'):
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
             modes = getattr(args, attr, None)
             if modes is not None:
-                setattr(args, attr, sorted(set(modes)) or ['ag', 'rs'])
+                setattr(args, attr, sorted(set(modes)) or ["ag", "rs"])
 
         gtp_ub_modes = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
 
@@ -1416,7 +1416,7 @@ def validate_args(args, defaults={}):
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if 'rs' in gtp_ub_modes and args.gtp_remat_reduce_scatter_with_fp32_accumulation:
+            if "rs" in gtp_ub_modes and args.gtp_remat_reduce_scatter_with_fp32_accumulation:
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "

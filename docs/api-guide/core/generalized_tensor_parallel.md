@@ -438,8 +438,10 @@ it** — a different collective over a different process group, so enable either
   symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
-- **Pool allocator.** The pools, and under `ag` the DDP param buffer, are backed by a VMM
-  allocator implementing [NCCL's
+- **Pool allocator.** The GTP pools use a VMM allocator when available, falling back to
+  `ncclMemAlloc`. Under `ag`, the DDP param buffer uses the same allocator choice when
+  `--use-nccl-ub` is off; with `--use-nccl-ub` it keeps DDP's own NCCL pool, which is then
+  registered on both the DP and the GTP groups. The VMM allocator implements [NCCL's
   memory-allocator requirements](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
   minimally: unlike `ncclMemAlloc`, memory is mapped only on the allocation's device.
   `ncclMemAlloc` additionally maps every allocation on all P2P-visible peer GPUs, and those
