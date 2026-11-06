@@ -1010,7 +1010,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "metadata checks on and off, and that in-place THD padding-row zeroing "
         "(MCORE_CSA2_SPARSE_PAD_ZERO) matches masked_fill bit for bit, forward and backward. "
         "It also checks that compact Top-K selects the same keys with and without empty-K "
-        "padding segments (MCORE_CSA2_TOPK_PAD_SEGMENTS) and replays them bit-exactly.",
+        "padding segments (MCORE_CSA2_TOPK_PAD_SEGMENTS) and replays them bit-exactly, and that "
+        "candidate-source selections do not depend on the score-chunk budget "
+        "(MCORE_CSA2_CANDIDATE_CHUNK_MIB).",
     ),
     KernelEntry(
         name="csa_teacher_lse",

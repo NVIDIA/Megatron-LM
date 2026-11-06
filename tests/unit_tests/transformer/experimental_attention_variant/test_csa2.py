@@ -1425,3 +1425,21 @@ def test_compact_topk_metadata_gives_padding_rows_empty_key_spans(cp, ratio):
     assert torch.equal(new_k[new + 1][real], cu_k[old + 1][real])
     assert torch.equal(new_offsets[new][real], offsets[old][real])
     assert torch.equal(new_k[new + 1][~real], new_k[new][~real])
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 152), ("32", 32), (" 128 ", 128), ("0", None), ("1.5", None)]
+)
+def test_candidate_chunk_budget_parsing(monkeypatch, value, expected):
+    """MCORE_CSA2_CANDIDATE_CHUNK_MIB takes a positive number of MiB and names itself in errors."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_candidates
+
+    if value is None:
+        monkeypatch.delenv("MCORE_CSA2_CANDIDATE_CHUNK_MIB", raising=False)
+    else:
+        monkeypatch.setenv("MCORE_CSA2_CANDIDATE_CHUNK_MIB", value)
+    if expected is None:
+        with pytest.raises(ValueError, match="MCORE_CSA2_CANDIDATE_CHUNK_MIB"):
+            csa2_candidates._score_chunk_max_bytes()
+    else:
+        assert csa2_candidates._score_chunk_max_bytes() == expected << 20

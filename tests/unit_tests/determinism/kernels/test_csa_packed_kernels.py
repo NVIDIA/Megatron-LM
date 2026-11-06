@@ -11,6 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant import csa2
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
+    csa2_candidates,
     csa2_indexer,
     csa_indexer_loss_kernels,
     packed_layout,
@@ -433,6 +434,66 @@ def test_compact_topk_padding_segments_keep_selection_at_64k_cp16(monkeypatch, r
     seeded()
     inputs = _selection_inputs([0, 65535], [0, 65536], 65536, 4096, 16, ratio, 32, True)
     _assert_padding_segments_keep_selection(monkeypatch, inputs, 512, "mxfp8")
+
+
+def _assert_selection_ignores_chunk_budget(monkeypatch, inputs, chunk_mib, **selection):
+    """fused_candidate_blocks returns the same bits for every score-chunk budget."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("CSA2 candidate scoring requires SM100")
+    pytest.importorskip("cudnn")
+
+    def select():
+        tokens, blocks = csa2_candidates.fused_candidate_blocks(inputs, **selection)
+        return tokens, blocks.indices, blocks.lengths
+
+    results = []
+    for mib in chunk_mib:
+        monkeypatch.setattr(csa2_candidates, "_SCORE_CHUNK_MAX_BYTES", int(mib * (1 << 20)))
+        results.append(select())
+    torch.cuda.synchronize()
+    for budget, result in zip(chunk_mib[1:], results[1:]):
+        for name, got, want in zip(("token Top-K", "blocks", "lengths"), result, results[0]):
+            assert bytes_equal(got, want), f"{name} at {budget} MiB"
+    assert bool((results[0][0] >= 0).any()) and bool((results[0][1] >= 0).any())
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_candidate_selection_ignores_score_chunk_budget(monkeypatch, cp, ratio, precision):
+    """MCORE_CSA2_CANDIDATE_CHUNK_MIB only sets how many query rows one dense-scorer launch
+    takes: token Top-K and candidate blocks are bit-identical for single-row-group chunks,
+    a ragged last chunk and one chunk, across empty, padded and CP-cut segments."""
+    seeded()
+    inputs = _selection_inputs(
+        [0, 65, 65, 322], [0, 66, 66, 326], 260, 326 // cp, cp, ratio, 32, False
+    )
+    row_mib = ((inputs.packed_metadata[3] + 3) // 4 * 4) * 4 / (1 << 20)
+    _assert_selection_ignores_chunk_budget(
+        monkeypatch,
+        inputs,
+        (2048 * row_mib, 16 * row_mib, 37 * row_mib),
+        topk_blocks=3,
+        block_size=8,
+        precision=precision,
+        token_topk=7,
+    )
+
+
+def test_candidate_selection_ignores_score_chunk_budget_at_64k_cp16(monkeypatch):
+    """The 64K CP16 candidate source (ratio 1, last rank): the previous 32 MiB budget (128-row
+    chunks) and the new 152 MiB default (608-row chunks, a 448-row last chunk) agree."""
+    seeded()
+    inputs = _selection_inputs([0, 65535], [0, 65536], 65536, 4096, 16, 1, 32, True)
+    _assert_selection_ignores_chunk_budget(
+        monkeypatch,
+        inputs,
+        (32, 152),
+        topk_blocks=2048,
+        block_size=8,
+        precision="mxfp8",
+        token_topk=512,
+    )
 
 
 def test_packed_indexer_metadata_and_loss_replay():

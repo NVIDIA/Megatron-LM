@@ -9,6 +9,7 @@ Selection is discrete; indexer supervision keeps the original projection graph.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,9 +42,30 @@ except ImportError:
     HAVE_TRITON = False
 
 
+def _score_chunk_max_bytes() -> int:
+    """Parse MCORE_CSA2_CANDIDATE_CHUNK_MIB, a positive number of MiB (default 152)."""
+    value = os.environ.get("MCORE_CSA2_CANDIDATE_CHUNK_MIB")
+    if value is None:
+        return 152 * 1024 * 1024
+    try:
+        mib = int(value)
+    except ValueError:
+        mib = 0
+    if mib < 1:
+        raise ValueError(
+            f"Environment variable MCORE_CSA2_CANDIDATE_CHUNK_MIB={value!r} is not a positive "
+            "integer"
+        )
+    return mib * 1024 * 1024
+
+
 # Score tiles are transient, including on the candidate-source layer. The
 # unavoidable output is [queries, topk_blocks], never [queries, global keys].
-_SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
+# MCORE_CSA2_CANDIDATE_CHUNK_MIB sets the per-chunk score budget (default 152 MiB; it was
+# 32 MiB). Rows are scored, ranked and blocked independently, so selections do not depend
+# on it. A dense-scorer launch has only rows * heads / 128 MMA tiles: at 64K keys, 32 MiB
+# chunks hold 128 rows, which occupy 64 (H64) or 32 (H32) SMs.
+_SCORE_CHUNK_MAX_BYTES = _score_chunk_max_bytes()
 _QUERY_CHUNK_SIZE = 2048
 
 
@@ -340,7 +362,7 @@ def fused_candidate_blocks(
     cu_q, cu_k, max_q, score_max_k = inputs.packed_metadata
     causal_offsets = inputs.packed_causal_offsets
     # Account for cuDNN's four-float row alignment. Even a single very long
-    # row needs its own score buffer; otherwise cap the chunk at 32 MiB.
+    # row needs its own score buffer; otherwise cap the chunk at the score budget.
     row_bytes = ((score_max_k + 3) // 4 * 4) * 4
     chunk_size = min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
     kernel_k = k
