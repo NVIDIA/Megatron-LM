@@ -14,6 +14,7 @@ grid of at most max_num_blocks blocks, or the barrier overflows the signal pad o
 hangs. See kernel_config.py.
 """
 
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -151,6 +152,21 @@ def _multimem_all_gather_v_kernel(
 
 
 @triton.jit
+def _f32_bits_to_bf16_bits(v, addend, HAS_ADDEND: tl.constexpr):
+    """Round fp32 bits ``v`` to bf16 like ``Tensor.to(torch.bfloat16)`` (nearest even).
+
+    With HAS_ADDEND, then add the bf16 value held in the low 16 bits of ``addend`` as a
+    bf16 + bf16 tensor addition does: fp32 sum of both operands, rounded once to bf16.
+    Returns the bf16 bits in the low 16 bits of a uint32.
+    """
+    r = v.to(tl.float32, bitcast=True).to(tl.bfloat16)
+    if HAS_ADDEND:
+        a = (addend << 16).to(tl.float32, bitcast=True)
+        r = (r.to(tl.float32) + a).to(tl.bfloat16)
+    return r.to(tl.uint16, bitcast=True).to(tl.uint32)
+
+
+@triton.jit
 def _multimem_reduce_scatter_v_kernel(
     local_ptr,
     multicast_ptr,
@@ -159,12 +175,15 @@ def _multimem_reduce_scatter_v_kernel(
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
     input_byte_offset,
+    addend_ptr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     REDUCE_F32: tl.constexpr = False,
+    OUT_BF16: tl.constexpr = False,
+    HAS_ADDEND: tl.constexpr = False,
 ):
     """Variable-count multicast reduce-scatter kernel. One CTA processes one token.
 
@@ -186,11 +205,16 @@ def _multimem_reduce_scatter_v_kernel(
             across all EP ranks. Fixed address; set each step. CTAs with pid >= this value exit
             immediately — safe because the value is identical on all ranks.
         input_byte_offset: byte offset of the input tensor within the symmetric memory buffer.
+        addend_ptr: bf16 [local_tokens, hidden_size] tensor added to the bf16 output when
+            HAS_ADDEND (unused otherwise).
         HIDDEN_SIZE: number of elements per token row (constexpr).
         BLOCK_SIZE: threads per block (constexpr, capped at 1024).
-        NUMEL_PER_THREAD: elements per thread per load/store, i.e. 128 / element_bits (constexpr).
+        NUMEL_PER_THREAD: elements per thread per load, i.e. 128 / input element bits (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
+        REDUCE_F32: the symmetric buffer holds fp32 (constexpr).
+        OUT_BF16: round the fp32 sums to a bf16 output (constexpr, requires REDUCE_F32).
+        HAS_ADDEND: add addend_ptr to the bf16 output (constexpr, requires OUT_BF16).
     """
     pid = tl.program_id(axis=0)
 
@@ -241,10 +265,31 @@ def _multimem_reduce_scatter_v_kernel(
                 + input_byte_offset // 8
                 + global_offsets * 2
             )
-            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-
             x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
-            st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
+            if OUT_BF16:
+                # Four fp32 sums become four bf16 outputs: one 64-bit store per thread.
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
+                if HAS_ADDEND:
+                    addend = tl.load(
+                        addend_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    a_lo = addend.to(tl.uint32)
+                    a_hi = (addend >> 32).to(tl.uint32)
+                    ax, ay, az, aw = a_lo & 0xFFFF, a_lo >> 16, a_hi & 0xFFFF, a_hi >> 16
+                else:
+                    ax, ay, az, aw = x, y, z, w
+                lo = _f32_bits_to_bf16_bits(x, ax, HAS_ADDEND) | (
+                    _f32_bits_to_bf16_bits(y, ay, HAS_ADDEND) << 16
+                )
+                hi = _f32_bits_to_bf16_bits(z, az, HAS_ADDEND) | (
+                    _f32_bits_to_bf16_bits(w, aw, HAS_ADDEND) << 16
+                )
+                st_64(local_ptrs, lo, hi, mask=mask, multicast_op=False)
+            else:
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
+                st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
 
 def multimem_reduce_scatter_v(
@@ -255,6 +300,7 @@ def multimem_reduce_scatter_v(
     ep_max_tokens: torch.Tensor,
     per_rank_max_tokens: int,
     input_byte_offset: int = 0,
+    addend: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
     """Variable-count multicast reduce-scatter for a single 2-D tensor.
@@ -264,8 +310,13 @@ def multimem_reduce_scatter_v(
     symmetric buffer using multimem.ld_reduce (which atomically sums all ranks'
     contributions), and writes the result to output_tensor.
 
-    Both tensors must be 2-D and 16-byte row-aligned (128-bit path only).
+    Both tensors must be 2-D and the input 16-byte row-aligned (128-bit path only).
     hidden_size is inferred from output_tensor.shape[1].
+
+    A bf16 output_tensor for an fp32 input_tensor receives the fp32 sums rounded
+    as ``Tensor.to(torch.bfloat16)`` rounds them, plus ``addend`` if given, added
+    as a bf16 + bf16 tensor addition does. This is bitwise identical to
+    ``fp32_output.to(torch.bfloat16) + addend`` without the two extra launches.
 
     Args:
         output_tensor: local output, shape [local_tokens, hidden_size].
@@ -281,6 +332,8 @@ def multimem_reduce_scatter_v(
             as min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         input_byte_offset: byte offset of input_tensor within the symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
+        addend: optional contiguous, 8-byte aligned bf16 tensor shaped like output_tensor; requires
+            a bf16 output_tensor and an fp32 input_tensor.
 
     Returns:
         output_tensor populated with this rank's reduced token outputs.
@@ -301,17 +354,28 @@ def multimem_reduce_scatter_v(
         torch.bfloat16,
         torch.float32,
     ), f"Only bfloat16 and float32 are supported, got {output_tensor.dtype}"
-    assert (
-        output_tensor.dtype == input_tensor.dtype
-    ), f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype}"
+    out_bf16 = output_tensor.dtype == torch.bfloat16 and input_tensor.dtype == torch.float32
+    assert out_bf16 or output_tensor.dtype == input_tensor.dtype, (
+        f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype} "
+        "(only an fp32 input may be reduced into a bf16 output)"
+    )
+    if addend is not None:
+        assert out_bf16, "addend requires an fp32 input_tensor and a bf16 output_tensor."
+        assert (
+            addend.dtype == torch.bfloat16
+            and addend.shape == output_tensor.shape
+            and addend.is_contiguous()
+            and addend.data_ptr() % 8 == 0
+            and addend.device == output_tensor.device
+        ), "addend must be a contiguous, 8-byte aligned bf16 tensor shaped like output_tensor."
 
     hidden_size = output_tensor.shape[1]
     assert (
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
-    row_bytes = hidden_size * output_tensor.element_size()
+    row_bytes = hidden_size * input_tensor.element_size()
     assert row_bytes % 16 == 0, (
-        f"Row size ({hidden_size} elements × {output_tensor.element_size()} bytes) = "
+        f"Row size ({hidden_size} elements × {input_tensor.element_size()} bytes) = "
         f"{row_bytes} bytes is not 16-byte aligned; RSV requires 128-bit alignment."
     )
 
@@ -320,7 +384,7 @@ def multimem_reduce_scatter_v(
     WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = output_tensor.shape[0]
-    numel_per_thread = 128 // (output_tensor.element_size() * 8)
+    numel_per_thread = 128 // (input_tensor.element_size() * 8)
     numel_per_token = (hidden_size + numel_per_thread - 1) // numel_per_thread
 
     block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
@@ -328,7 +392,7 @@ def multimem_reduce_scatter_v(
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
-    reduce_f32 = output_tensor.dtype == torch.float32
+    reduce_f32 = input_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor,
         symm_mem_hdl.multicast_ptr,
@@ -337,12 +401,15 @@ def multimem_reduce_scatter_v(
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
         input_byte_offset=input_byte_offset,
+        addend_ptr=(addend if addend is not None else output_tensor).data_ptr(),
         HIDDEN_SIZE=hidden_size,
         BLOCK_SIZE=block_size,
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         REDUCE_F32=reduce_f32,
+        OUT_BF16=out_bf16,
+        HAS_ADDEND=addend is not None,
         num_warps=num_warps,
     )
 

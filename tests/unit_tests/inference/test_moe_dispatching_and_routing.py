@@ -426,7 +426,8 @@ class TestNVLSAllGatherVDispatcher:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    def _make_dispatcher(self):
+    def _make_dispatcher(self, shape=(128, 6, 8)):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -436,16 +437,28 @@ class TestNVLSAllGatherVDispatcher:
         if Utils.world_size <= 0 or Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
 
-        config = _make_base_config(expert_model_parallel_size=Utils.world_size)
+        hidden_size, topk, num_experts = shape
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            hidden_size=hidden_size,
+            moe_router_topk=topk,
+            num_moe_experts=num_experts,
+        )
         num_local_experts = config.num_moe_experts // Utils.world_size
         ep_rank = torch.distributed.get_rank() if Utils.world_size > 1 else 0
         local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
         ep_group = get_expert_model_parallel_group()
 
+        # The shape matrix changes the symmetric buffer sizes between test cases.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        NVLSAllGatherVDispatcher._delete_buffers()
+        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+            SymmetricMemoryManager.destroy(key)
         NVLSAllGatherVDispatcher.allocate_buffers(
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
-            topk=NANOV3_BASE["moe_router_topk"],
-            hidden_size=NANOV3_BASE["hidden_size"],
+            topk=topk,
+            hidden_size=hidden_size,
             tp_ep_group=ep_group,
         )
 
@@ -549,6 +562,503 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(128, 6, 8), (2688, 6, 128), (1024, 22, 512), (2048, 22, 512)],
+        ids=["small", "nano", "super", "ultra"],
+    )
+    @pytest.mark.parametrize("with_shared", [True, False])
+    @pytest.mark.parametrize("max_rank_tokens", [1, 7, 64, 256])
+    def test_cuda_graph_combine_fuses_cast_and_shared_add(
+        self, max_rank_tokens, with_shared, shape, monkeypatch
+    ):
+        """The bf16 RSV output (+ shared expert) is bitwise the unfused combine.
+
+        Reference: the same NVLS reduction into fp32, cast to bf16, then the
+        bf16 + bf16 shared-expert addition from combine_postprocess. Inputs change
+        between graph replays and include round-to-nearest-even ties, values that
+        overflow bf16, cancellation to zero and mixed magnitudes.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import (
+            multimem_reduce_scatter_v,
+        )
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = self._make_dispatcher(shape)
+        ep_size = dispatcher.ep_size
+        if ep_size < 2:
+            pytest.skip("The NVLS reduce-scatter runs only at expert-parallel world_size > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden_size, topk, _ = shape
+        rank = torch.distributed.get_rank()
+        rsv = NVLSAllGatherVDispatcher._symm_rsv
+
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        start = sum(tokens_per_rank[:rank])
+        static_hidden = torch.zeros(local_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        static_probs = torch.zeros(local_tokens, topk, device="cuda", dtype=torch.float32)
+        static_routing_map = torch.zeros(local_tokens, topk, dtype=torch.int64, device="cuda")
+        shared = torch.zeros(local_tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def fill_inputs(seed):
+            """This rank's fp32 partials for all tokens, and its tokens' shared output."""
+            gen = torch.Generator(device="cuda").manual_seed(seed * 131 + rank)
+            partial = torch.randn(total_tokens, hidden_size, generator=gen, device="cuda")
+            scale = torch.pow(
+                10.0, torch.randint(-4, 5, (total_tokens, 1), generator=gen, device="cuda")
+            )
+            partial = partial * scale
+            # Row 0: rank 0 alone holds exact bf16 ties (half-way between bf16 values,
+            # both even and odd lower neighbours) and huge values; others add zero.
+            ties = (torch.arange(hidden_size, device="cuda", dtype=torch.int32) << 16) | 0x8000
+            partial[0] = ties.view(torch.float32) if rank == 0 else 0.0
+            if rank == 0:
+                partial[0, :4] = torch.tensor([3.4e38, -3.4e38, 1e-40, -0.0])
+            rsv["tensor"][:total_tokens].copy_(partial)
+            g = torch.Generator(device="cuda").manual_seed(seed * 7 + rank)
+            shared.copy_(
+                (torch.randn(local_tokens, 1, hidden_size, generator=g, device="cuda") * 4).to(
+                    torch.bfloat16
+                )
+            )
+
+        def unfused_reference(add_shared=with_shared):
+            out = torch.empty(local_tokens, hidden_size, device="cuda", dtype=torch.float32)
+            multimem_reduce_scatter_v(
+                out,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=dispatcher._rank_token_offset(),
+                ep_max_tokens=dispatcher._ep_max_tokens(),
+                per_rank_max_tokens=dispatcher._per_rank_worst_case_token_count,
+            )
+            out = out.to(torch.bfloat16).view(shared.shape)
+            return out + shared if add_shared else out
+
+        def run():
+            dispatcher.routing_map = static_routing_map
+            dispatcher._local_tokens = local_tokens
+            dispatcher.hidden_shape = shared.shape
+            dispatcher.token_dispatch(static_hidden, static_probs)
+            if with_shared:
+                SharedExpertMLP.stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(SharedExpertMLP.stream):
+                    dispatcher._shared_expert_output = shared.clone()
+            combined = dispatcher.token_combine(rsv["tensor"])
+            assert dispatcher._shared_expert_output is None
+            return dispatcher.combine_postprocess(combined)
+
+        def sync_ranks():
+            # Partials are rewritten in place: no rank may overwrite its buffer while
+            # a peer's reduce-scatter could still be reading it.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+        with torch.no_grad():
+            fill_inputs(seed=0)
+            sync_ranks()
+            eager = run()
+            reference = unfused_reference()
+            torch.cuda.synchronize()
+            assert eager.dtype == torch.bfloat16 and eager.shape == shared.shape
+            assert torch.equal(eager.view(torch.int16), reference.view(torch.int16))
+
+            sync_ranks()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run()
+            for seed in (1, 2, 3):
+                sync_ranks()
+                fill_inputs(seed)
+                if with_shared and seed == 2:
+                    # Cancellation: the shared output negates the routed result.
+                    sync_ranks()
+                    shared.copy_(-unfused_reference(add_shared=False))
+                sync_ranks()
+                graph.replay()
+                reference = unfused_reference()
+                torch.cuda.synchronize()
+                assert torch.equal(graph_out.view(torch.int16), reference.view(torch.int16)), seed
+
+    def test_misaligned_shared_output_keeps_separate_add(self, monkeypatch):
+        """A shared output the RSV cannot read with 8-byte loads is added after it."""
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = self._make_dispatcher()
+        if dispatcher.ep_size < 2:
+            pytest.skip("The fused NVLS add requires EP > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden = torch.zeros(3, 1, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16)
+        routes = torch.zeros(3, NANOV3_BASE["moe_router_topk"], device="cuda", dtype=torch.int64)
+        probs = torch.zeros_like(routes, dtype=torch.float32)
+        with torch.no_grad():
+            dispatched, probs = dispatcher.dispatch_preprocess(hidden, routes, probs)
+            dispatcher.token_dispatch(dispatched, probs)
+            partials = NVLSAllGatherVDispatcher._symm_rsv["tensor"]
+            partials.zero_()
+            storage = torch.ones(hidden.numel() + 1, device="cuda", dtype=torch.bfloat16)
+            shared = storage[1:].view(hidden.shape)
+            assert shared.is_contiguous() and shared.data_ptr() % 8
+            dispatcher._shared_expert_output = shared
+            combined = dispatcher.token_combine(partials)
+            assert dispatcher._shared_expert_output is shared
+            output = dispatcher.combine_postprocess(combined)
+        torch.testing.assert_close(output, shared, atol=0, rtol=0)
+
+    def test_moe_layer_launches_shared_expert_between_router_and_agv(self, monkeypatch):
+        """The overlapped shared expert is enqueued after routing and right before the AGV.
+
+        Its TP all-gather and reduce-scatter spin until every TP peer joins, as the AGV
+        does for every EP peer. Enqueued before routing, a rank can spin in the shared
+        expert's reduce-scatter while its router kernels and AGV are not yet scheduled,
+        as a peer spins in the AGV with its reduce-scatter not yet started: a hang.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        calls = []
+
+        def record(name, method):
+            def wrapper(*args, **kwargs):
+                calls.append(name)
+                return method(*args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(layer, "route", record("route", layer.route))
+        monkeypatch.setattr(
+            dispatcher, "launch_shared_expert", record("shared", dispatcher.launch_shared_expert)
+        )
+        monkeypatch.setattr(dispatcher, "token_dispatch", record("agv", dispatcher.token_dispatch))
+        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), InferenceMode.active():
+            layer(hidden)
+        torch.cuda.synchronize()
+        assert calls == ["route", "shared", "agv"]
+        assert dispatcher._shared_expert_output is None
+
+    def test_moe_layer_replaces_stale_shared_expert_output(self):
+        """A shared-expert output left by an interrupted forward is never added later.
+
+        Every forward launches the overlapped shared expert anew and replaces
+        _shared_expert_output, so a value left behind by a forward that raised
+        between dispatch and combine cannot reach the next reduce-scatter.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), InferenceMode.active():
+            expected, _ = layer(hidden)
+            dispatcher._shared_expert_output = torch.full_like(hidden, float("nan"))
+            output, _ = layer(hidden)
+        torch.cuda.synchronize()
+        assert dispatcher._shared_expert_output is None
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("local_tokens", [1, 7, 64])
+    def test_moe_layer_overlapped_shared_expert_matches_sequential(self, local_tokens):
+        """An NVLS MoE layer's overlapped shared expert is bitwise its sequential form.
+
+        Overlapped, the shared expert starts on its stream after routing and is added
+        inside the reduce-scatter; sequentially, it runs before routing on the main
+        stream and is added after the combine. Checked eagerly and over CUDA Graph
+        replays with new inputs.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        torch.manual_seed(2029)
+        torch.cuda.manual_seed(2029)
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        rank = torch.distributed.get_rank()
+        static_hidden = torch.empty(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        def forward(overlap):
+            # The layer re-reads shared_expert_overlap from its dispatcher every forward.
+            dispatcher.shared_experts = layer.shared_experts if overlap else None
+            output, _ = layer(static_hidden)
+            assert layer.shared_expert_overlap == overlap
+            assert dispatcher._shared_expert_output is None
+            return output
+
+        def new_inputs(seed):
+            gen = torch.Generator(device="cuda").manual_seed(seed * 17 + rank)
+            static_hidden.copy_(
+                torch.randn(static_hidden.shape, generator=gen, device="cuda").to(torch.bfloat16)
+            )
+
+        with torch.no_grad(), InferenceMode.active():
+            new_inputs(0)
+            reference = forward(overlap=False).clone()
+            overlapped = forward(overlap=True).clone()
+            assert torch.equal(overlapped.view(torch.int16), reference.view(torch.int16))
+
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(2):
+                    forward(overlap=True)
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = forward(overlap=True)
+            for seed in (1, 2, 3):
+                new_inputs(seed)
+                graph.replay()
+                replayed = graph_output.clone()
+                reference = forward(overlap=False)
+                torch.cuda.synchronize()
+                assert torch.equal(replayed.view(torch.int16), reference.view(torch.int16)), seed
+            dispatcher.shared_experts = layer.shared_experts
+
+    @pytest.mark.parametrize("collective", ["ordered", "multimem"])
+    def test_batch_invariant_keeps_unfused_dispatch_and_combine(self, collective, monkeypatch):
+        """Both BI modes retain local padding masking, fp32 RSV and a separate shared add."""
+        from megatron.core.transformer.custom_layers import batch_invariant_kernels as bi
+        from megatron.core.transformer.moe import token_dispatcher_inference as dispatch_module
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+        dispatcher = self._make_dispatcher()
+        if dispatcher.ep_size < 2:
+            pytest.skip("BI collective isolation requires EP > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden = torch.ones(7, 1, 128, dtype=torch.bfloat16, device="cuda")
+        routes = torch.zeros(7, 6, dtype=torch.int64, device="cuda")
+        probs = torch.ones(7, 6, device="cuda")
+        real_count = torch.tensor([3], dtype=torch.int32, device="cuda")
+        monkeypatch.setattr(type(dispatcher), "_real_token_count_tensor", real_count)
+        calls = []
+        gather = dispatch_module.multimem_all_gatherv_3tensor
+        reduce = (
+            dispatch_module.batch_invariant.ordered_reduce_scatter_v
+            if collective == "ordered"
+            else dispatch_module.multimem_reduce_scatter_v
+        )
+
+        def checked_gather(*args, **kwargs):
+            calls.append("gather")
+            return gather(*args, **kwargs)
+
+        def checked_reduce(output, *args, **kwargs):
+            assert output.dtype == torch.float32
+            assert kwargs.get("addend") is None
+            calls.append(collective)
+            return reduce(output, *args, **kwargs)
+
+        monkeypatch.setattr(dispatch_module, "multimem_all_gatherv_3tensor", checked_gather)
+        if collective == "ordered":
+            monkeypatch.setattr(
+                dispatch_module.batch_invariant, "ordered_reduce_scatter_v", checked_reduce
+            )
+        else:
+            monkeypatch.setattr(dispatch_module, "multimem_reduce_scatter_v", checked_reduce)
+
+        def run():
+            local_routes = routes.clone()
+            flat, local_probs = dispatcher.dispatch_preprocess(hidden, local_routes, probs)
+            gathered, _ = dispatcher.token_dispatch(flat, local_probs)
+            shared = hidden.clone()
+            SharedExpertMLP.stream.wait_stream(torch.cuda.current_stream())
+            dispatcher._shared_expert_output = shared
+            combined = dispatcher.token_combine(gathered)
+            assert dispatcher._shared_expert_output is shared
+            return dispatcher.combine_postprocess(combined), local_routes
+
+        with torch.no_grad(), bi.set_batch_invariant_mode(True):
+            monkeypatch.setattr(bi, "_BATCH_INVARIANT_COLLECTIVE", collective)
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output, local_routes = run()
+            for count in (0, 3, 7):
+                real_count.fill_(count)
+                graph.replay()
+                expected_routes = torch.where(
+                    (torch.arange(7, device="cuda") + dispatcher.sp_rank * 7)[:, None] < count,
+                    routes,
+                    -1,
+                )
+                assert torch.equal(local_routes, expected_routes)
+                assert torch.equal(output, hidden * (dispatcher.ep_size + 1))
+        assert calls == ["gather", collective] * 4
+
+    @pytest.mark.parametrize("collective", ["ordered", "multimem"])
+    def test_batch_invariant_output_is_batch_invariant(self, collective, monkeypatch):
+        """Under BI, a token's dispatch + combine output does not depend on its batch.
+
+        Every rank puts the same probe token at row 0 of batches with 1, 7 and 64 real
+        tokens plus padding rows, with the shared expert overlapped on its stream. The
+        stand-in experts are elementwise, so each gathered row's partial depends only
+        on that row: any change in the probe's output comes from dispatch or combine.
+        """
+        from megatron.core.transformer.custom_layers import batch_invariant_kernels as bi
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        if ep_size < 2:
+            pytest.skip("The NVLS dispatch and combine collectives run only at EP > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+        num_local_experts = num_experts // ep_size
+        rank = torch.distributed.get_rank()
+        gen = torch.Generator(device="cuda").manual_seed(4096 + rank)
+
+        def mixed_magnitude(*shape):
+            scale = torch.pow(10.0, torch.randint(-3, 4, shape, generator=gen, device="cuda"))
+            return torch.randn(shape, generator=gen, device="cuda") * scale
+
+        class SharedExpert(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("scale", mixed_magnitude(hidden_size).to(torch.bfloat16))
+
+            def forward(self, hidden_states):
+                return hidden_states * self.scale
+
+        dispatcher.shared_experts = SharedExpert()
+        expert_scales = mixed_magnitude(num_local_experts, hidden_size)
+
+        def routed_experts(hidden_states, probs, routing_map):
+            # Elementwise only: a reduction kernel may pick its order from the shape.
+            hidden_states = hidden_states.float()
+            partials = torch.zeros_like(hidden_states)
+            for i in range(num_local_experts):
+                expert = rank * num_local_experts + i
+                weight = torch.zeros_like(probs[:, :1])
+                for k in range(topk):
+                    weight = weight + torch.where(
+                        routing_map[:, k : k + 1] == expert, probs[:, k : k + 1], 0.0
+                    )
+                partials = partials + weight * hidden_states * expert_scales[i]
+            return partials
+
+        probe_hidden = mixed_magnitude(1, 1, hidden_size).to(torch.bfloat16)
+        probe_routes = torch.randperm(num_experts, generator=gen, device="cuda")[:topk][None]
+        probe_probs = torch.rand(1, topk, generator=gen, device="cuda")
+        real_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        monkeypatch.setattr(type(dispatcher), "_real_token_count_tensor", real_count)
+
+        def probe_output(real_tokens):
+            # Padding rows differ per rank, so the probe's global row changes too.
+            rows = real_tokens + 1 + 2 * rank
+            hidden = torch.cat(
+                [probe_hidden, mixed_magnitude(rows - 1, 1, hidden_size).to(torch.bfloat16)]
+            )
+            routes = torch.cat(
+                [
+                    probe_routes,
+                    torch.randint(0, num_experts, (rows - 1, topk), generator=gen, device="cuda"),
+                ]
+            )
+            probs = torch.cat(
+                [probe_probs, torch.rand(rows - 1, topk, generator=gen, device="cuda")]
+            )
+            real_count.fill_(real_tokens)
+            flat, probs = dispatcher.dispatch_preprocess(hidden, routes, probs)
+            gathered, gathered_probs = dispatcher.token_dispatch(flat, probs)
+            partials = routed_experts(gathered, gathered_probs, dispatcher.routing_map)
+            output = dispatcher.combine_postprocess(dispatcher.token_combine(partials))
+            assert torch.equal(routes[real_tokens:], torch.full_like(routes[real_tokens:], -1))
+            return output[0].clone()
+
+        with torch.no_grad(), bi.set_batch_invariant_mode(True):
+            monkeypatch.setattr(bi, "_BATCH_INVARIANT_COLLECTIVE", collective)
+            outputs = {n: probe_output(n) for n in (1, 7, 64)}
+            outputs["1 again"] = probe_output(1)
+        torch.cuda.synchronize()
+        expected = outputs[1]
+        # The routed experts contribute: the output is not the shared expert's alone.
+        assert not torch.equal(expected, dispatcher.shared_experts(probe_hidden)[0])
+        for n, output in outputs.items():
+            assert torch.equal(output.view(torch.int16), expected.view(torch.int16)), n
 
     def test_cuda_graph_batch_invariant_combine_uses_ordered_symmetric_memory(self, monkeypatch):
         """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.
