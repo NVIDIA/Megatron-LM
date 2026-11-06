@@ -394,7 +394,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels.",
+        "router gating GEMM, TE fused permutation/router kernels. The moe_env_flags trims (router operand "
+        "fast cast, saved FP32 router input, 0-dim aux-loss gradient, RandomSTE empty_like) are compared "
+        "bit for bit against their original paths.",
+    ),
+    KernelEntry(
+        name="moe_router_fast_cast",
+        sources=("megatron/core/transformer/moe/router_fast_cast.py",),
+        tests=(K + "test_router_fast_cast.py",),
+        kind="triton",
+        notes="Elementwise BF16/FP16 -> FP32 widening of the router GEMM operands. Every 16-bit "
+        "pattern, ragged tails, replay under contention, ineligible inputs and the cold-capture "
+        "Tensor.to fallback match Tensor.to bit for bit; router gating parity is in test_moe_kernels.",
     ),
     KernelEntry(
         name="mok_route_adapter",
@@ -402,7 +413,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes and side-stream contention, and "
+        "with the index gradient left unmaterialized (bit-identical to the materialized path).",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -424,7 +436,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "The static per-token aux-loss token count is bit-identical to the all-reduced one.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",

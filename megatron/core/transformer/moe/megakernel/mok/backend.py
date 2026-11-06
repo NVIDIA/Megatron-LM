@@ -8,6 +8,7 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
+import logging
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -15,9 +16,10 @@ import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from megatron.core.transformer.moe import moe_env_flags
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
-from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
+from megatron.core.transformer.moe.megakernel.mok.runtime import _accepts_keyword, _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
@@ -28,9 +30,40 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     main_grad_buffer as _main_grad_buffer,
 )
+from megatron.core.utils import log_single_rank
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
+# Set once the effective MoE environment switches have been logged in this process.
+_SWITCHES_LOGGED = False
+
+
+def _log_switches_once(all_topk_slots_routed: bool) -> None:
+    """Log the effective MoE environment switches once per process (rank 0), for A/B records.
+
+    Skipping the unrouted router-gradient mask needs a MoK build whose functional.backward
+    accepts zero_unrouted_router_grads; with an older build it is silently inactive, so the
+    line states which applies. Host-only and run at model construction: no collective, no
+    effect on results.
+    """
+    global _SWITCHES_LOGGED
+    if _SWITCHES_LOGGED:
+        return
+    _SWITCHES_LOGGED = True
+    from mok import functional
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        "MoE environment switches: %s; all_topk_slots_routed=%s, "
+        "MoK functional.backward accepts zero_unrouted_router_grads=%s",
+        moe_env_flags.summary(),
+        all_topk_slots_routed,
+        _accepts_keyword(functional.backward, "zero_unrouted_router_grads"),
+    )
 
 
 class MoKMegakernel(MegakernelBackend):
@@ -80,6 +113,15 @@ class MoKMegakernel(MegakernelBackend):
                 f"shared={shared_intermediate_size}"
             )
         self.topk = config.moe_router_topk
+        # Without token dropping (capacity factor), hash routing (a table may repeat an expert)
+        # and routing replay, every routing-map row has exactly topk routes, so
+        # routing_map_to_mok_inputs emits no -1 ("unrouted") slot. Guards skipping MoK's
+        # unrouted router-gradient mask (see runtime._unrouted_router_grads_are_unread).
+        self.all_topk_slots_routed = bool(
+            getattr(config, "moe_expert_capacity_factor", None) is None
+            and not getattr(config, "moe_num_hash_layers", 0)
+            and not getattr(config, "moe_enable_routing_replay", False)
+        )
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
@@ -89,6 +131,7 @@ class MoKMegakernel(MegakernelBackend):
             self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
+        _log_switches_once(self.all_topk_slots_routed)
 
         if not hasattr(routed_experts, "linear_fc1") or not hasattr(routed_experts, "linear_fc2"):
             raise ValueError(

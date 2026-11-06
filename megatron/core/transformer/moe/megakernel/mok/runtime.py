@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
 
+from megatron.core.transformer.moe import moe_env_flags
+from megatron.core.transformer.moe.megakernel.mok.route_adapter import RoutingMapToIndices
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
 )
@@ -16,6 +19,56 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+
+# (function, keyword) -> whether the function accepts the keyword; one inspect per function.
+_KEYWORD_SUPPORT: dict = {}
+
+
+def _accepts_keyword(function, keyword: str) -> bool:
+    """Whether ``function`` declares ``keyword`` as a named parameter (inspected once)."""
+    key = (function, keyword)
+    supported = _KEYWORD_SUPPORT.get(key)
+    if supported is None:
+        try:
+            parameter = inspect.signature(function).parameters.get(keyword)
+        except (TypeError, ValueError):
+            parameter = None
+        supported = parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        _KEYWORD_SUPPORT[key] = supported
+    return supported
+
+
+def _unrouted_router_grads_are_unread(module: "MoKMegakernel", router_weights) -> bool:
+    """Whether MoK may leave d_router_weights unspecified at unrouted slots.
+
+    MoK marks a slot unrouted when its expert index is -1 (``schedule.top_experts < 0``); its
+    backward kernels write d_router_weights only at routed slots, and
+    ``zero_unrouted_router_grads=False`` skips the masked_fill that zeroes the rest. The skip is
+    taken only if both hold:
+    * No slot can be unrouted: ``RoutingMapToIndices`` emits -1 only for a routing-map row with
+      fewer than topk routes, which needs token dropping, hash routing or routing replay
+      (``MoKMegakernel.all_topk_slots_routed``, from the config).
+    * The gradient reaches only ``RoutingMapToIndices.backward``, which reads a slot only where
+      its index is a valid expert: ``router_weights`` is that Function's output and has no
+      tensor hooks or retained grad.
+    Either alone already makes the masking invisible; requiring both keeps the skip safe in every
+    configuration. The decision is host-side and static, so it is identical on every rank and
+    under CUDA-graph capture.
+    """
+    if not moe_env_flags.MOK_SKIP_UNROUTED_GRAD_MASK:
+        return False
+    if not getattr(module, "all_topk_slots_routed", False):
+        return False
+    grad_fn = router_weights.grad_fn
+    return (
+        grad_fn is not None
+        and getattr(grad_fn, "_forward_cls", None) is RoutingMapToIndices
+        and not router_weights.retains_grad
+        and not getattr(router_weights, "_backward_hooks", None)
+    )
 
 
 def _gate_up_weight_arguments(shared_fc1: torch.Tensor, routed_fc1, intermediate_size: int):
@@ -123,6 +176,9 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
+        ctx.unrouted_router_grads_are_unread = _unrouted_router_grads_are_unread(
+            module, router_weights
+        )
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
         )
@@ -160,6 +216,12 @@ class _MoKAutograd(torch.autograd.Function):
                     ctx.module.shared_output_gate_weight
                 ),
             }
+        unrouted_kwargs = {}
+        if getattr(ctx, "unrouted_router_grads_are_unread", False) and _accepts_keyword(
+            functional.backward, "zero_unrouted_router_grads"
+        ):
+            # Skip MoK's compare and masked_fill of the unrouted slots.
+            unrouted_kwargs["zero_unrouted_router_grads"] = False
         d_x, d_router_weights, *_ = functional.backward(
             ctx.module.mok_config,
             ctx.workspace,
@@ -178,6 +240,7 @@ class _MoKAutograd(torch.autograd.Function):
             main_grads=main_grads,
             main_grad_storage_tables=main_grad_storage_tables,
             **gate_kwargs,
+            **unrouted_kwargs,
         )
 
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()

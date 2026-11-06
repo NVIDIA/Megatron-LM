@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
+from megatron.core.transformer.moe import moe_env_flags
 from megatron.core.utils import null_decorator
 
 try:
@@ -139,6 +140,10 @@ class RoutingMapToIndices(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.probs_dtype = probs.dtype
         ctx.mark_non_differentiable(indices)
+        if moe_env_flags.MOK_ROUTE_NO_MATERIALIZE_GRADS:
+            # Backward ignores the indices gradient; stop autograd from allocating and
+            # zero-filling an int32 [tokens, topk] tensor for it on every call.
+            ctx.set_materialize_grads(False)
         return probs_indices, indices
 
     @staticmethod
@@ -147,6 +152,16 @@ class RoutingMapToIndices(torch.autograd.Function):
         del grad_indices
         (indices,) = ctx.saved_tensors
         num_tokens, topk = indices.shape
+        if grad_probs_indices is None:
+            # Only without gradient materialization: a materialized zero gradient would
+            # scatter zeros into all-zero rows, so the result is this zero tensor.
+            return (
+                torch.zeros(
+                    (num_tokens, ctx.num_experts), dtype=ctx.probs_dtype, device=indices.device
+                ),
+                None,
+                None,
+            )
         grad_probs = torch.empty(
             (num_tokens, ctx.num_experts), dtype=ctx.probs_dtype, device=indices.device
         )
