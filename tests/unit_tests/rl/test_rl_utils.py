@@ -6,6 +6,7 @@ import itertools
 import math
 import tempfile
 import traceback
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -19,6 +20,8 @@ import torch.multiprocessing as mp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -59,6 +62,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.callbacks import CallbackContext
 from megatron.training.config import RLConfig
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
 from megatron.training.training import _pop_samples_seen
@@ -521,9 +525,6 @@ class TestRLUtils:
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
         args.num_attention_heads = 8
-        args.vocab_size = VOCAB
-        # No tokenizer is built; the fixture already supplies the model's vocabulary.
-        args.pad_vocab_size = False
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256
@@ -536,7 +537,9 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -854,8 +857,16 @@ class TestRLUtils:
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
     @pytest.mark.parametrize("has_optimizer", [False, True], ids=["no-optimizer", "optimizer"])
+    @pytest.mark.parametrize("separate_training_model", [False, True])
+    @pytest.mark.parametrize("initialize_model_parallel", [(1, 1)], indirect=True)
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts, has_optimizer
+        self,
+        monkeypatch,
+        initialize_model_parallel,
+        share_config,
+        num_experts,
+        has_optimizer,
+        separate_training_model,
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -872,7 +883,24 @@ class TestRLUtils:
             )
         )
         lang_module = DummyLangModule(layer_config)
+        lang_module.rotary_pos_emb = RotaryEmbedding(32, 1.0)
         model = [SimpleNamespace(config=config, module=lang_module)]
+        training_lang_module = lang_module
+        training_model = None
+        if separate_training_model:
+            training_lang_module = DummyLangModule(config)
+            training_lang_module.rotary_pos_emb = YarnRotaryEmbedding(32, 1.0)
+            training_model = [SimpleNamespace(module=training_lang_module)]
+
+        def cached_embedding_refs():
+            refs = []
+            for module in (lang_module, training_lang_module):
+                embedding = module.rotary_pos_emb(16)
+                refs.append(
+                    weakref.ref(embedding[0] if isinstance(embedding, tuple) else embedding)
+                )
+            return refs
+
         args = SimpleNamespace(
             num_experts=num_experts,
             cuda_graph_impl="local",
@@ -887,13 +915,19 @@ class TestRLUtils:
 
         # --rl-rollout-only --no-load-optim runs the loop with no optimizer: no param sync.
         optimizer = MagicMock() if has_optimizer else None
-        with rl_utils.megatron_rl_inference_mode(model, optimizer, "local", False) as result:
+        training_refs = cached_embedding_refs()
+        with rl_utils.megatron_rl_inference_mode(
+            model, optimizer, "local", False, training_model=training_model
+        ) as result:
             assert result is interface
+            assert all(ref() is None for ref in training_refs)
+            generation_refs = cached_embedding_refs()
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
                 assert current_config.cuda_graph_modules == []
                 assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
+        assert all(ref() is None for ref in generation_refs)
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),
             call(lang_module, "none"),
@@ -914,9 +948,13 @@ class TestRLUtils:
             assert current_config.cuda_graph_modules == expected_modules
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
-        lang_module.train.assert_called_once()
-        if has_optimizer:
+        training_lang_module.train.assert_called_once()
+        if separate_training_model:
+            lang_module.train.assert_not_called()
+        if has_optimizer and not separate_training_model:
             optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+        elif has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_not_called()
 
     @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
     def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
@@ -1313,7 +1351,7 @@ class TestRLUtils:
         not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
     )
     @pytest.mark.parametrize("packing", [False, True])
-    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+    def test_forward_step_reports_samples_seen(self, monkeypatch, run_config, packing):
         """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
         the sequences packed into the bin, or the batch size; the loop sums the reports."""
         with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
@@ -1338,18 +1376,9 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        monkeypatch.setattr(
-            train_rl,
-            "get_run_config",
-            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
-        )
-        monkeypatch.setattr(
-            train_rl,
-            "get_args",
-            lambda: SimpleNamespace(
-                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-            ),
-        )
+        run_config.rl.rl_use_sequence_packing = packing
+        run_config.rerun_state_machine.check_for_nan_in_loss = False
+        monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         if packing:
             seq_indices = [11, 12, 13, 14, 15]
             monkeypatch.setattr(

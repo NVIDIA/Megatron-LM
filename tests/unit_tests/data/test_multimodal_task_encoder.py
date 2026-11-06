@@ -22,7 +22,7 @@ def test_preprocessing_rejects_non_vision_model(monkeypatch, run_config, consume
     monkeypatch.setattr(task_encoder, "get_args", lambda: args)
     monkeypatch.setattr(dataset_helpers, "get_args", lambda: args)
     calls = {
-        "tiling": lambda: create_image_tiling_strategy(args),
+        "tiling": lambda: create_image_tiling_strategy(args, run_config),
         "task_encoder": MultiModalTaskEncoder,
         "legacy_task_encoder": dataset_helpers.TaskEncoder,
     }

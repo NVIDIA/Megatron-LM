@@ -55,6 +55,7 @@ from megatron.core.inference.unified_memory import (
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
@@ -247,6 +248,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
 def verify_model_weights_swap(
     train_model: LanguageModule,
     inference_model: LanguageModule,
+    padded_vocab_size: int = 128256,
     seq_len: int = 8,
     batch_size: int = 2,
     atol: float = 1e-4,
@@ -262,6 +264,7 @@ def verify_model_weights_swap(
     Args:
         train_model: The training model (source of weights).
         inference_model: The inference model (target of weights).
+        padded_vocab_size: Vocabulary size used to generate verification tokens.
         seq_len: Sequence length for test input.
         batch_size: Batch size for test input.
         atol: Absolute tolerance for comparing outputs.
@@ -279,14 +282,13 @@ def verify_model_weights_swap(
     train_core = unwrap_model(train_lm)
     inf_core = unwrap_model(inf_lm)
 
-    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
     actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Generate deterministic test input - same across ALL ranks
     torch.manual_seed(1234)
     test_tokens = torch.randint(
-        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
+        low=0, high=padded_vocab_size, size=(batch_size, actual_seq_len),
         device=device, dtype=torch.long
     )
     test_position_ids = (
@@ -854,6 +856,7 @@ def colocated_inference(
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
+                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
                 atol=.1,
                 rtol=5e-4,
             )
@@ -1715,7 +1718,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:
@@ -3252,6 +3255,9 @@ def megatron_rl_inference_mode(
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+    training_lang_module = (
+        unwrap_model(training_model[0]) if training_model is not None else lang_module
+    )
 
     # Switch MoE layers to full CUDA graph capture for inference
     if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
@@ -3275,13 +3281,14 @@ def megatron_rl_inference_mode(
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
-
-    rotary_module = getattr(lang_module, "rotary_pos_emb", None)
-    # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
-    # as it tries to reuse frequences tensors cached in inference mode.
-    has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
-    if has_lru_cache:
-        rotary_module.forward.cache_clear()
+    rotary_modules = (
+        getattr(lang_module, "rotary_pos_emb", None),
+        getattr(training_lang_module, "rotary_pos_emb", None),
+    )
+    # Release ordinary embeddings while retaining constants used by live CUDA graphs.
+    for rotary_module in rotary_modules:
+        if isinstance(rotary_module, RotaryEmbedding):
+            rotary_module.clear_cache()
 
     with torch.no_grad():
 
@@ -3289,11 +3296,14 @@ def megatron_rl_inference_mode(
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not cfg.rl.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
-                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload = (
+                            training_model if training_model is not None else model
+                        )
                         model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                    )
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
@@ -3356,11 +3366,11 @@ def megatron_rl_inference_mode(
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
-        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
         training_lang_module.train()
 
-        if has_lru_cache:
-            rotary_module.forward.cache_clear()
+        for rotary_module in rotary_modules:
+            if isinstance(rotary_module, RotaryEmbedding):
+                rotary_module.clear_cache()
 
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 

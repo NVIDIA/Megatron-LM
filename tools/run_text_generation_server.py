@@ -129,7 +129,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = inference_cfg_container_from_args(args)
     set_run_config(cfg)
     initialize_megatron()
     args = get_args()

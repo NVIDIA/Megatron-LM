@@ -83,6 +83,7 @@ def test_receive_lm_updates_vocab_before_model_construction(
         make_vocab_size_divisible_by=128,
         tensor_model_parallel_size=target_tp,
     )
+    saver.cfg = run_config
     saver.md = SimpleNamespace(
         position_embedding_type='rope',
         true_vocab_size=true_vocab,
@@ -135,4 +136,5 @@ def test_receive_lm_updates_vocab_before_model_construction(
     saved_config = run_config.to_dict()
     assert saved_config['model']['vocab_size'] == expected_vocab
     assert saved_config['tokenizer']['padded_vocab_size'] == expected_vocab
-    assert saver.margs.padded_vocab_size == expected_vocab
+    # Legacy metadata is synchronized only at save time, not while padding weights.
+    assert saver.margs.padded_vocab_size == source_vocab

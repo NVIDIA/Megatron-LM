@@ -96,6 +96,14 @@ spec:
     fi
 
 products:
+  # Runtime topology regressions run separately from the broad SSM/transformer buckets.
+  - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   # Run the two-worker handoff separately; the broad inference bucket excludes it.
   - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_handoff.py]
     products:

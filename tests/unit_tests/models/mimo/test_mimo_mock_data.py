@@ -82,6 +82,7 @@ def adapter(monkeypatch, run_config):
         patch_dim=2,
         drop_vision_class_token=True,
     )
+    run_config.tokenizer.vocab_size = 64
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data

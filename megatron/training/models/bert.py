@@ -13,19 +13,27 @@ class BertModelConfig:
 
     transformer: TransformerConfig
     """BERT encoder architecture, precision, and parallelism."""
+
     seq_length: int
     """Maximum position capacity, not the data sequence length."""
+
     vocab_size: int | None = None
     """Model vocabulary, or None until tokenizer initialization."""
+
     should_pad_vocab: bool = False
     """Whether to pad the supplied raw vocabulary size."""
+
     make_vocab_size_divisible_by: int = 128
     """Vocabulary alignment factor, multiplied by tensor-parallel size."""
+
     share_embeddings_and_output_weights: bool = False
     """Tie embedding and language-model output weights."""
+
     bert_binary_head: bool = True
     """Include the sentence-order head and two token types."""
+
     transformer_layer_spec: ModuleSpec | None = None
     """Encoder layer spec; None selects the Transformer Engine BERT spec."""
+
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""

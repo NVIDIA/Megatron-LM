@@ -159,8 +159,8 @@ class MegatronCheckpointSaverBase:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
-        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
+        self.cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
+        set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
@@ -362,6 +362,9 @@ class MegatronCheckpointSaverBase:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        # Keep legacy checkpoint metadata consistent with the converted vocabulary.
+        self.margs.padded_vocab_size = self.cfg.tokenizer.padded_vocab_size
+
         train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
@@ -383,7 +386,6 @@ class MegatronCheckpointSaverBase:
         try:
             from megatron.core import mpu
             from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
-            from megatron.training import get_run_config
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -402,15 +404,15 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
+                self.cfg.tokenizer.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
-                if orig_vocab_size > self.margs.padded_vocab_size:
-                    full_word_embed = orig_word_embed[0:self.margs.padded_vocab_size,:]
+                if orig_vocab_size > self.cfg.tokenizer.padded_vocab_size:
+                    full_word_embed = orig_word_embed[0:self.cfg.tokenizer.padded_vocab_size,:]
 
                 # Expanding embedding to larger size by replicating final entry
-                elif orig_vocab_size < self.margs.padded_vocab_size:
-                    padding_size = self.margs.padded_vocab_size - orig_vocab_size
+                elif orig_vocab_size < self.cfg.tokenizer.padded_vocab_size:
+                    padding_size = self.cfg.tokenizer.padded_vocab_size - orig_vocab_size
 
                     full_word_embed = torch.cat((
                         orig_word_embed,
@@ -422,17 +424,15 @@ class MegatronCheckpointSaverBase:
             else:
                 print("Original vocab size not specified, leaving embedding table as-is. "
                     "If you've changed the tensor parallel size this could cause problems.")
-                self.margs.padded_vocab_size = orig_word_embed.shape[0]
+                self.cfg.tokenizer.padded_vocab_size = orig_word_embed.shape[0]
                 full_word_embed = orig_word_embed
             return full_word_embed
 
         full_word_embed = pad_weight(orig_word_embed, self.md.true_vocab_size)
 
         # Target TP padding can differ from the source checkpoint captured at startup.
-        cfg = get_run_config()
-        cfg.tokenizer.padded_vocab_size = self.margs.padded_vocab_size
-        cfg.model.vocab_size = self.margs.padded_vocab_size
-        cfg.model.should_pad_vocab = False
+        self.cfg.model.vocab_size = self.cfg.tokenizer.padded_vocab_size
+        self.cfg.model.should_pad_vocab = False
 
         # Split into new tensor model parallel sizes
         out_word_embed = torch.chunk(full_word_embed, self.args.target_tensor_parallel_size, dim=0)

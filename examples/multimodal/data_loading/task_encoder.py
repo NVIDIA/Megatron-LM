@@ -12,6 +12,7 @@ from collections import defaultdict
 from functools import partial
 from typing import List, Literal, Tuple, TypedDict, Union
 
+from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from PIL import Image
@@ -337,12 +338,13 @@ class MultiModalTaskEncoder(
                 "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
                 f"got {type(cfg.model).__name__}"
             )
-        # Workers retain serializable preprocessing inputs, not the runtime config.
+        # Copy the model's preprocessing inputs for workers.
         self.img_h = cfg.model.img_h
         self.img_w = cfg.model.img_w
         self.patch_dim = cfg.model.patch_dim
         self.drop_vision_class_token = cfg.model.drop_vision_class_token
         self.tokenizer = get_tokenizer()
+        self.cfg = cfg
         with open(self.args.prompt_path, "r") as f:
             self.manual_prompts = json.load(f)
         # TODO: There is four seq lengths now: seq_length, decoder_seq_length, dataloader_seq_length, packing_seq_length
@@ -374,7 +376,7 @@ class MultiModalTaskEncoder(
         self.tiling_augment_prob = tiling_augment_prob
 
         # Create the image tiling strategy using the refactored function
-        self.image_tiling_strategy = create_image_tiling_strategy(self.args)
+        self.image_tiling_strategy = create_image_tiling_strategy(self.args, self.cfg)
 
         # Validate temporal compression settings
         temporal_patch_size = getattr(self.args, 'video_temporal_patch_size', 1)
@@ -817,7 +819,7 @@ class MultiModalTaskEncoder(
             if self.args.only_keep_samples_with_img and len(image_media) == 0:
                 raise ValueError(f"Sample has no image: {sample.__key__}")
 
-            prompt_format = self.args.tokenizer_prompt_format
+            prompt_format = self.cfg.tokenizer.tokenizer_prompt_format
 
             if (
                 not skip_chat_template

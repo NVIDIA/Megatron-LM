@@ -148,8 +148,17 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
+    This is used to calculate the number and length of sub-samples assigned to
     each rank when sequence_packing_scheduler is not None.
+    """
+
+    max_seq_length_per_sample: Optional[int] = None
+    """Maximum sequence length of one sample, or of one packed (THD) sequence: the training
+    sequence length (--seq-length). Communication backends that size their buffers once
+    (NCCL EP) derive the per-rank token bound from it when max_seqlen_per_dp_cp_rank is not
+    set. This is not the position-embedding capacity: GPTModelConfig.seq_length and
+    HybridModelConfig.seq_length hold that (GPTModel.max_sequence_length, filled from
+    --max-position-embeddings by the launcher) and are never read by core modules.
     """
 
     dynamic_context_parallel: bool = False
@@ -611,6 +620,17 @@ class ModelParallelConfig:
                 raise ValueError(
                     "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
                 )
+            if self.pad_packed_seq_alignment == "max":
+                if self.sequence_parallel:
+                    assert (
+                        self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size == 0
+                    ), "Packed padding must preserve sequence-parallel TP divisibility."
+                assert (
+                    self.max_seqlen_per_dp_cp_rank % 2 == 0
+                ), "Packed padding must preserve zigzag CP alignment."
+            # Integer alignment is combined with TP/CP/MXFP8 requirements by
+            # get_packed_sequence_alignment, so the requested multiple need not
+            # itself be divisible by TP.
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

@@ -138,12 +138,12 @@ def initialize_megatron(
         initialize_rerun_state_machine(
             state_save_func=state_save_func,
             state_restore_func=state_restore_func,
-            mode=RerunMode(args.rerun_mode),
+            mode=RerunMode(cfg.rerun_state_machine.rerun_mode),
             error_injector=RerunErrorInjector(
-                error_injection_rate=args.error_injection_rate,
-                error_injection_type=RerunDiagnostic(args.error_injection_type),
+                error_injection_rate=cfg.rerun_state_machine.error_injection_rate,
+                error_injection_type=RerunDiagnostic(cfg.rerun_state_machine.error_injection_type),
             ),
-            result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+            result_rejected_tracker_filename=cfg.rerun_state_machine.result_rejected_tracker_filename,
         )
 
     if model_config.batch_invariant_mode:
@@ -364,7 +364,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     args = get_args()
     if model_config is None:
         # Direct inference/bootstrap callers have not constructed a training model config.
-        cfg = get_run_config()
         model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
 
     device_count = torch.cuda.device_count()

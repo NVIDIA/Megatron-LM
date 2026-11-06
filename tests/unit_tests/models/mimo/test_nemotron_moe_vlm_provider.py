@@ -35,6 +35,7 @@ from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
+
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
 # the pattern length (get_hybrid_total_layer_count): 20 and 54 layer-tokens.
@@ -507,6 +508,7 @@ def test_language_model_spec_builds_mamba():
     )
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
     assert spec.module is MambaModel
+    assert spec.params["vocab_size"] == get_run_config().tokenizer.padded_vocab_size == 131072
     assert spec.params["config"].num_layers == 20
     assert spec.params["config"].expert_model_parallel_size == 2
     assert spec.params["config"].expert_tensor_parallel_size == 2

@@ -183,7 +183,7 @@ def _checkpoint_model_arg(model_config, arg_name):
     """
     if not model_config:
         return _MISSING_CONFIG_VALUE
-    transformer = model_config.get("transformer", {})
+    transformer = model_config.get("transformer") or {}
     if arg_name.startswith("wide_residual_"):
         wide_residual = transformer.get("wide_residual", _MISSING_CONFIG_VALUE)
         if wide_residual is _MISSING_CONFIG_VALUE:
@@ -245,7 +245,7 @@ def check_checkpoint_args(
             current_config = cfg
             for section in config_section.split("."):
                 current_config = getattr(current_config, section)
-                saved_config = (saved_config or {}).get(section, {})
+                saved_config = (saved_config or {}).get(section) or {}
         else:
             saved_config = {}
         if config_name in saved_config:
@@ -266,14 +266,9 @@ def check_checkpoint_args(
     _compare('hidden_size', config_section='model.transformer')
     _compare('num_attention_heads', config_section='model.transformer')
     _compare('gdp_num_householder', default=3, config_section='model.transformer')
-    legacy_position_type = (
-        'rope' if (
-            getattr(checkpoint_args, 'use_rotary_position_embeddings', False)
-            or not getattr(checkpoint_args, 'add_position_embedding', True)
-        ) else 'learned_absolute'
-    )
-    if hasattr(cfg.model, 'position_embedding_type'):
-        _compare('position_embedding_type', default=legacy_position_type, config_section='model')
+    # Preserve the existing load policy: changing RoPE to YaRN is supported.
+    # Exact position_embedding_type equality would introduce a new restriction.
+    _compare('add_position_embedding', default=True)
     if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):
@@ -292,12 +287,12 @@ def check_checkpoint_args(
                 f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
                 f'the input argument value ({args_value}).'
             )
-    if args.vocab_file:
+    if cfg.tokenizer.vocab_file:
         _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
         if not args.use_dist_ckpt:
             _compare('padded_vocab_size', config_section='tokenizer')
-        _compare('tokenizer_type')
+        _compare('tokenizer_type', config_section='tokenizer')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
     if check_training_state and args.phase_transition_iterations:
@@ -630,13 +625,17 @@ def _build_sharded_state_dict_metadata(
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     metadata = {}
+    cfg = get_run_config()
 
     # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
     # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
     # same sharding-type metadata even though the parser flips
-    # ``use_distributed_optimizer`` off in that mode.
-    has_distributed_optimizer = args.use_distributed_optimizer or getattr(
-        args, 'use_layer_wise_distributed_optimizer', False
+    # ``use_distributed_optimizer`` off in that mode. Inference containers have no
+    # optimizer section and only need the shared metadata below.
+    optimizer_cfg = getattr(cfg, 'optimizer', None)
+    has_distributed_optimizer = optimizer_cfg is not None and (
+        optimizer_cfg.use_distributed_optimizer
+        or getattr(optimizer_cfg, 'use_layer_wise_distributed_optimizer', False)
     )
 
     if has_distributed_optimizer and args.ckpt_format == 'fsdp_dtensor':
@@ -834,10 +833,11 @@ def save_checkpoint(
     )
 
     # Save distributed optimizer's custom parameter state.
+    can_save_optim = optimizer is not None and hasattr(cfg, "optimizer")
     if (
-        args.use_distributed_optimizer
+        can_save_optim
+        and cfg.optimizer.use_distributed_optimizer
         and not args.no_save_optim
-        and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
     ):
         optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
@@ -846,7 +846,7 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
+    if can_save_optim and getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
@@ -904,7 +904,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
-            if args.use_distributed_optimizer:
+            if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
                     f'Storing distributed optimizer sharded state of type'
                     f' {sharded_sd_metadata["distrib_optim_sharding_type"]}'
@@ -1734,7 +1734,11 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    state_dict['args'] = copy.copy(args)
+    # Preserve the resolved vocabulary for checkpoint-args readers without updating runtime args.
+    padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
+    if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
+        state_dict['args'].padded_vocab_size = padded_vocab_size
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -2631,6 +2635,8 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model, *, checkpoint_model=
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
     ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_layer_pattern')
+    if ckpt_pattern is _MISSING_CONFIG_VALUE or ckpt_pattern is None:
+        ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_override_pattern')
     if ckpt_pattern is _MISSING_CONFIG_VALUE:
         ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
             ckpt_args, 'hybrid_override_pattern', None
@@ -2805,9 +2811,10 @@ def load_checkpoint(
         )
 
     load_kwargs = {}
+    checkpoint_config_read = state_dict is not None
     checkpoint_config = (
         _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
-        if state_dict is not None else None
+        if checkpoint_config_read else None
     )
     checkpoint_model = (checkpoint_config or {}).get('model')
     ignore_rng_state = False
@@ -2944,7 +2951,7 @@ def load_checkpoint(
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
-            if args.use_distributed_optimizer:
+            if cfg.optimizer.use_distributed_optimizer:
                 if sharded_sd_metadata is None:
                     # Backward-compatibility with old checkpoints which don't have content versioning
                     # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
@@ -3217,7 +3224,6 @@ def load_checkpoint(
         state_dict['model'] = dtensor_state_dict
 
     ckpt_train_state = None
-    checkpoint_config = None
     if ckpt_type == CheckpointType.LOCAL:
         from megatron.training.state import TrainState
 
@@ -3227,26 +3233,21 @@ def load_checkpoint(
             ckpt_train_state = TrainState()
             ckpt_train_state.load_state_dict(state_dict['train_state_metadata'])
 
-        checkpoint_config = state_dict.get('run_config')
     else:
-        from megatron.training.utils.checkpoint_utils import (
-            get_checkpoint_run_config_filename,
-            read_run_config,
-        )
-
         # Legacy checkpoint_name points to an mp_rank_*/model_optim_rng.pt file.
         checkpoint_dir = (
             os.path.dirname(os.path.dirname(checkpoint_name))
             if ckpt_type == CheckpointType.LEGACY
             else checkpoint_name
         )
-        config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-        if maybe_msc.os.path.exists(config_filename):
-            checkpoint_config = read_run_config(config_filename)
-
         train_state_filename = get_checkpoint_train_state_filename(checkpoint_dir)
         if file_exists(train_state_filename):
             ckpt_train_state = read_train_state(train_state_filename)
+
+    # Legacy loads may only discover their checkpoint during the full load above.
+    # Reuse metadata already read for distributed checkpoint layout selection.
+    if not checkpoint_config_read:
+        checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
 
     # Set iteration.
     if args.finetune or release:
@@ -3392,7 +3393,7 @@ def load_checkpoint(
         try:
             # Load state dict.
             if (
-                getattr(args, 'use_layer_wise_distributed_optimizer', False)
+                getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False)
                 and args.ckpt_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
@@ -3412,7 +3413,7 @@ def load_checkpoint(
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == 'torch_dist'
             if (
-                args.use_distributed_optimizer
+                cfg.optimizer.use_distributed_optimizer
                 and not is_torch_dist
                 and ckpt_format not in ['torch_dcp', 'fsdp_dtensor']
             ):
@@ -3454,11 +3455,11 @@ def load_checkpoint(
                 else:
                     for param_group in optimizer.param_groups:
                         if param_group.get("is_decoupled_lr", False):
-                            max_lr = getattr(args, "decoupled_lr", None)
-                            min_lr = getattr(args, "decoupled_min_lr", None)
+                            max_lr = getattr(cfg.optimizer, "decoupled_lr", None)
+                            min_lr = getattr(cfg.optimizer, "decoupled_min_lr", None)
                         else:
-                            max_lr = args.lr
-                            min_lr = args.min_lr
+                            max_lr = cfg.optimizer.lr
+                            min_lr = cfg.optimizer.min_lr
                         if max_lr is not None:
                             param_group["max_lr"] = max_lr
                         if min_lr is not None:
