@@ -922,6 +922,46 @@ class TestDSv4HybridGroupedOutput:
         assert shard.global_offset == (2, 0, 0)
         torch.testing.assert_close(shard.data, batched._linear_o_group_proj_weight)
 
+    def test_native_grouped_projection_bmm_matches_einsum(self, monkeypatch):
+        """MCORE_DSV4_GROUP_PROJ_BMM: a built module's native (non-TE) grouped projection runs as
+        strided-batched GEMMs with einsum's output and input/weight gradients, bit for bit."""
+        from megatron.core.transformer.experimental_attention_variant import (
+            deepseek_v4_hybrid_attention as dsv4_attention,
+        )
+        from megatron.core.transformer.spec_utils import build_module
+        from tests.unit_tests.determinism.kernels.harness import bytes_equal
+
+        torch.manual_seed(_SEED)
+        config = _make_config()
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        spec = _make_attention_spec(config)
+        spec.submodules = replace(spec.submodules, linear_o_group_proj=None)
+        native = build_module(spec, config=config, layer_number=1, pg_collection=pg).cuda()
+        weight = native._linear_o_group_proj_weight
+        groups, rank = config.output_projection_groups, config.output_projection_lora_rank
+        inputs = torch.randn(48, 2, groups, weight.size(-1), device='cuda', dtype=torch.bfloat16)
+        upstream = torch.randn(48, 2, groups, rank, device='cuda', dtype=torch.bfloat16)
+        calls = []
+        apply = dsv4_attention._GroupedProjectionBMM.apply
+
+        def counted_apply(*args):
+            calls.append(args[0].shape)
+            return apply(*args)
+
+        monkeypatch.setattr(dsv4_attention._GroupedProjectionBMM, 'apply', counted_apply)
+        results = []
+        for switch in (False, True):
+            monkeypatch.setattr(dsv4_attention, '_GROUP_PROJ_BMM', switch)
+            x = inputs.clone().requires_grad_()
+            weight.grad = None
+            output = native._apply_linear_o_group_proj(x)
+            output.backward(upstream)
+            results.append((output.detach(), x.grad, weight.grad))
+        assert len(calls) == 1
+        einsum, bmm = results
+        for name, got, want in zip(('output', 'input grad', 'weight grad'), bmm, einsum):
+            assert bytes_equal(got, want), name
+
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize(
         "mxfp8,quantized_weight,accumulate",

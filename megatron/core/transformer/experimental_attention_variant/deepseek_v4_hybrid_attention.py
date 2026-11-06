@@ -11,6 +11,7 @@ import torch
 from megatron.core import tensor_parallel
 from megatron.core.component_nvtx import component, layer_scope
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
+from megatron.core.env_flags import env_flag
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -71,6 +72,54 @@ def _initialize_grouped_output_projection(
     """Preserve the legacy initialization layout and the no-initialization contract."""
     if perform_initialization:
         init_method(weight.view(-1, weight.size(-1)))
+
+
+# MCORE_DSV4_GROUP_PROJ_BMM (read once at import; on by default) runs the legacy (non-TE) grouped
+# output projection as strided-batched GEMMs on the token-major tensors instead of torch.einsum.
+# einsum runs the same per-group BF16 GEMMs over a group-major [g, tokens, *] layout, so its
+# output and, in backward, the [tokens, g, d] input gradient are copied back to token-major; at
+# the 64K CP16 proxy shape those copies cost ~0.6 s/step (one strided copy of the input gradient
+# per layer and microbatch dominates). Outputs and both gradients matched einsum bit for bit in
+# testing, but cuBLAS may select another algorithm for the strided operands on other GPUs or
+# library versions. MCORE_DSV4_GROUP_PROJ_BMM=0 restores einsum.
+_GROUP_PROJ_BMM = env_flag("MCORE_DSV4_GROUP_PROJ_BMM", True)
+
+
+class _GroupedProjectionBMM(torch.autograd.Function):
+    """y[..., j, :] = x[..., j, :] @ w[j].T with w = weight.view(groups, rank, d), copy-free.
+
+    cuBLAS reads and writes the token-major tensors through per-group strided views (leading
+    dimension groups * width, batch stride width), so neither direction materializes a
+    group-major copy of the input, the output or the input gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project each group of the contiguous [..., groups, d] input to [..., groups, rank]."""
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        out = torch.empty((x.size(0), groups, w.size(1)), dtype=x.dtype, device=x.device)
+        torch.bmm(x.transpose(0, 1), w.transpose(1, 2), out=out.transpose(0, 1))
+        ctx.save_for_backward(input_, weight)
+        return out.view(*input_.shape[:-1], w.size(1))
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Input and weight gradients, again through strided views of the token-major tensors."""
+        input_, weight = ctx.saved_tensors
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        grad = grad_output.contiguous().view(-1, groups, w.size(1)).transpose(0, 1)
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.empty_like(x)
+            torch.bmm(grad, w, out=grad_input.transpose(0, 1))
+            grad_input = grad_input.view(input_.shape)
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.bmm(grad.transpose(1, 2), x.transpose(0, 1)).view(weight.shape)
+        return grad_input, grad_weight
 
 
 @dataclass
@@ -356,14 +405,29 @@ class DSv4HybridAttention(Attention):
         return state
 
     def _apply_linear_o_group_proj(self, input_: torch.Tensor) -> torch.Tensor:
-        """Apply TE BatchedLinear when available, otherwise use the legacy einsum."""
+        """Apply TE BatchedLinear when available, otherwise the legacy grouped projection.
+
+        The legacy projection runs as copy-free strided-batched GEMMs (MCORE_DSV4_GROUP_PROJ_BMM)
+        for nonempty contiguous CUDA inputs with the weight's dtype, else as torch.einsum.
+        """
         if self._uses_batched_linear:
             input_ = input_.contiguous()
             if self._group_projection_high_precision:
                 with fp8_autocast(enabled=False):
                     return self.linear_o_group_proj(input_)
             return self.linear_o_group_proj(input_)
-        weight = self._linear_o_group_proj_weight.reshape(
+        weight = self._linear_o_group_proj_weight
+        if (
+            _GROUP_PROJ_BMM
+            and input_.is_cuda
+            and input_.numel() > 0
+            and input_.is_contiguous()
+            and weight.is_contiguous()
+            and input_.dtype == weight.dtype
+            and input_.size(-2) == self.output_projection_local_groups
+        ):
+            return _GroupedProjectionBMM.apply(input_, weight)
+        weight = weight.reshape(
             self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
         )
         return torch.einsum("...gd,grd->...gr", input_, weight)

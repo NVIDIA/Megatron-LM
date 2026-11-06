@@ -232,6 +232,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "The projection parity test checks repeated main-grad accumulation and three "
         "bit-exact forward/backward replays under contention when TE provides BatchedLinear.",
     ),
+    KernelEntry(
+        name="dsv4_grouped_projection_bmm",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
+        ),
+        tests=(
+            K + "test_dsv4_grouped_projection.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+        ),
+        kind="torch-op",
+        notes="Legacy (non-TE) grouped output projection as cuBLAS strided-batched GEMMs on the "
+        "token-major tensors (MCORE_DSV4_GROUP_PROJ_BMM, on by default). The kernel test compares "
+        "the output and the input and weight gradients with the torch.einsum path bit for bit "
+        "(64K CP16 proxy and odd shapes), checks the dispatch conditions, and replays forward "
+        "and backward bit-exactly under contention and in a CUDA graph; the module test repeats "
+        "the comparison through a built attention module's native projection.",
+    ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
         name="fused_pad_routing_map",
