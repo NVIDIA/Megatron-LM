@@ -2,7 +2,6 @@
 """Shared residual-layer layout checks and mHC scheduling with small branch fixtures."""
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -63,8 +62,8 @@ def _offload_interface(enabled, value, tag):
 
 def _make_layer(stages="both", *, layer_type=None, **submodule_overrides):
     layer_type = layer_type or HyperConnectionTransformerLayer
-    is_mhc = layer_type is HyperConnectionTransformerLayer
-    is_wide = layer_type is WideResidualTransformerLayer
+    is_mhc = issubclass(layer_type, HyperConnectionTransformerLayer)
+    is_wide = issubclass(layer_type, WideResidualTransformerLayer)
     config = TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -104,7 +103,7 @@ def _make_layer(stages="both", *, layer_type=None, **submodule_overrides):
     return layer.to("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def test_dedicated_inherits_dispatch_and_preserves_owner_and_manager_boundaries():
+def test_dedicated_inherits_dispatch_and_parameter_layout():
     layer = _make_layer()
     for name in (
         "_get_residual_connection_for_self_attention",
@@ -115,7 +114,6 @@ def test_dedicated_inherits_dispatch_and_preserves_owner_and_manager_boundaries(
         "_apply_mlp_bda_step",
     ):
         assert getattr(type(layer), name) is getattr(TransformerLayer, name)
-    assert layer._legacy_forward_post_mlp is None
     assert {name.split(".")[0] for name in layer.state_dict()} == {
         "input_layernorm",
         "pre_mlp_layernorm",
@@ -124,6 +122,23 @@ def test_dedicated_inherits_dispatch_and_preserves_owner_and_manager_boundaries(
         "self_attention_hyper_connection",
         "mlp_hyper_connection",
     }
+
+
+class _LegacyPostMlpLayer(HyperConnectionTransformerLayer):
+    """Defines the legacy hook that the base layer would otherwise route the MLP write through."""
+
+    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+        raise AssertionError("mHC must not route the MLP write through the legacy hook")
+
+
+def test_dedicated_layer_clears_the_legacy_post_mlp_hook():
+    layer = _make_layer(layer_type=_LegacyPostMlpLayer)
+    assert layer._legacy_forward_post_mlp is None
+    # A real forward and backward must not reach the legacy hook.
+    value = torch.randn(2, 1, 32, device=next(layer.parameters()).device, requires_grad=True)
+    output, _ = layer(value, attention_mask=None)
+    output.square().sum().backward()
+    assert value.grad is not None
 
 
 def _call_with_base(layer, body, *args, **kwargs):
@@ -296,13 +311,21 @@ def test_optional_stages_construct_and_run_the_inherited_forward(stages):
 @pytest.mark.parametrize(
     "stages,overrides,message",
     [
-        ("attention", {"self_attention_hyper_connection": IdentityOp}, "active self-attention"),
-        ("mlp", {"mlp_hyper_connection": IdentityOp}, "active MLP"),
-        ("attention", {"mlp_hyper_connection": HyperConnectionModule}, "inactive MLP"),
+        (
+            "attention",
+            {"self_attention_hyper_connection": IdentityOp},
+            "^The active self-attention",
+        ),
+        ("mlp", {"mlp_hyper_connection": IdentityOp}, "^The active MLP"),
+        (
+            "attention",
+            {"mlp_hyper_connection": HyperConnectionModule},
+            "inactive MLP branch requires an identity hyper connection",
+        ),
         (
             "mlp",
             {"self_attention_hyper_connection": HyperConnectionModule},
-            "inactive self-attention",
+            "inactive self-attention branch requires an identity hyper connection",
         ),
         ("neither", {}, "requires an attention or MLP branch"),
     ],
@@ -387,8 +410,6 @@ def test_shared_layout_validation_preserves_wr_replay(stages, gpu_model_parallel
 
 
 def _finalize_with_storage_checks(context, boundary):
-    # Pytest must not repr tensor arguments whose storage may have been released.
-    __tracebackhide__ = True
     # These fixtures produce fresh checkpoint outputs with no retained-input exemptions.
     # Detached aliases observe the original storage; clones only record expected values.
     managed = [
@@ -398,17 +419,22 @@ def _finalize_with_storage_checks(context, boundary):
         if isinstance(output, torch.Tensor)
     ]
     assert managed, "Replay must register actual checkpoint outputs"
-    assert all(output.untyped_storage().nbytes() > 0 for output in managed)
+    assert all(
+        output.untyped_storage().nbytes() > 0 for output in managed
+    ), "Registered outputs must be live before finalize"
     expected = [output.clone() for output in managed]
     context.finalize(boundary)
-    assert all(output.untyped_storage().nbytes() == 0 for output in managed)
-    boundary_storage_bytes = boundary.untyped_storage().nbytes()
-    assert boundary_storage_bytes > 0, "Replay must keep the terminal boundary storage live"
+    assert all(
+        output.untyped_storage().nbytes() == 0 for output in managed
+    ), "Finalize must release every registered output"
+    assert boundary.untyped_storage().nbytes() > 0, "Replay must keep the boundary live"
     checked = []
 
     def check_restored(gradient):
         # This hook follows the production replay hook and guards reads of released storage.
-        assert all(output.untyped_storage().nbytes() > 0 for output in managed)
+        assert all(
+            output.untyped_storage().nbytes() > 0 for output in managed
+        ), "Replay must restore registered outputs before the boundary gradient is used"
         torch.testing.assert_close(managed, expected, rtol=0, atol=0)
         checked.append(True)
         return gradient
@@ -418,19 +444,20 @@ def _finalize_with_storage_checks(context, boundary):
 
 
 def _run_layers(layers, value, contexts):
-    # The boundary can alias this frame's value after a failed storage check.
-    __tracebackhide__ = True
     block_outputs = []
     restoration_checks = []
     for layer, context in zip(layers, contexts, strict=True):
         previous_checkpoints = len(context.manager.checkpoints) if context is not None else 0
         value, _ = layer(value, attention_mask=None, residual_stream_recompute_context=context)
         if context is not None:
-            assert len(context.manager.checkpoints) > previous_checkpoints
+            registered = len(context.manager.checkpoints)
+            assert registered > previous_checkpoints, "Each layer call must register replay work"
             block_outputs.append(value)
             if context.is_block_end:
                 restoration_checks.append(_finalize_with_storage_checks(context, value))
-                assert all(output.untyped_storage().nbytes() == 0 for output in block_outputs[:-1])
+                assert all(
+                    output.untyped_storage().nbytes() == 0 for output in block_outputs[:-1]
+                ), "Finalize must release the block's nonterminal layer outputs"
                 block_outputs.clear()
             else:
                 context.finalize(value)
@@ -439,8 +466,6 @@ def _run_layers(layers, value, contexts):
 
 
 def _forward_backward(layers, initial, contexts):
-    # Caller locals can retain released tensors too; preserve the raw traceback only.
-    __tracebackhide__ = True
     torch.manual_seed(812)
     value = initial.detach().clone().requires_grad_()
     output, restoration_checks = _run_layers(layers, value, contexts)
@@ -449,7 +474,9 @@ def _forward_backward(layers, initial, contexts):
     # Nonuniform weights expose changes that a uniform sum of residual streams can hide.
     weights = torch.linspace(0.25, 1.25, output.numel(), device=output.device).reshape_as(output)
     (output.square() * weights).sum().backward()
-    assert all(checks == [True] for checks in restoration_checks)
+    assert all(
+        checks == [True] for checks in restoration_checks
+    ), "Every replay block's restoration check must run exactly once"
     torch.testing.assert_close(torch.get_rng_state(), forward_rng, rtol=0, atol=0)
     if value.is_cuda:
         torch.testing.assert_close(
@@ -473,58 +500,6 @@ def _assert_mhc_replay_matches_eager(actual, expected):
     # CUDA FP32 reductions can then round differently; use the real-branch layer
     # test's tolerances for input and parameter gradients. Storage checks stay exact.
     torch.testing.assert_close(actual[1:3], expected[1:3], rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.parametrize("style", ["long", "short"])
-@pytest.mark.parametrize("showlocals", [False, True])
-def test_replay_storage_failure_reporting_avoids_released_tensors(style, showlocals):
-    """Format a real helper traceback safely, including its caller arguments and locals."""
-    released_repr_calls = []
-
-    class StorageReprProbe(torch.Tensor):
-        def __repr__(self):
-            if self.untyped_storage().nbytes() == 0:
-                released_repr_calls.append(True)
-            # Never let this CPU reporting probe read released storage itself.
-            return "<storage repr probe>"
-
-        __str__ = __repr__
-
-    class DiscardedBoundaryContext:
-        is_block_end = True
-
-        def __init__(self):
-            self.manager = SimpleNamespace(checkpoints=[])
-
-        def finalize(self, boundary):
-            boundary.untyped_storage().resize_(0)
-
-    def alias_branch(value, *, attention_mask, residual_stream_recompute_context):
-        # Aliasing also exposes the _forward_backward caller's local value to reporting.
-        manager = residual_stream_recompute_context.manager
-        manager.checkpoints.append(SimpleNamespace(outputs=[value]))
-        return value, None
-
-    message = "Replay must keep the terminal boundary storage live"
-    with pytest.raises(AssertionError, match=message) as failure:
-        _forward_backward(
-            [alias_branch],
-            torch.ones(1, device="cpu").as_subclass(StorageReprProbe),
-            [DiscardedBoundaryContext()],
-        )
-
-    # Hiding rendered frames must not remove the assertion identity used by fault observers.
-    assert [entry.name for entry in failure.traceback[-3:]] == [
-        "_forward_backward",
-        "_run_layers",
-        "_finalize_with_storage_checks",
-    ]
-    assertion = failure.traceback[-1]
-    assert str(assertion.path) == _finalize_with_storage_checks.__code__.co_filename
-    assert "assert boundary_storage_bytes > 0" in str(assertion.statement)
-    report = str(failure.getrepr(style=style, funcargs=True, showlocals=showlocals))
-    assert message in report
-    assert not released_repr_calls
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Output-discard replay needs CUDA")
