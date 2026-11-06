@@ -796,8 +796,16 @@ def test_cp_layout_uses_main_packed_metadata():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("output_rope", [False, True])
-def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio, output_rope):
-    """Exercise real Full/Reindex/Reuse kernels with shared producer gradients."""
+@pytest.mark.parametrize("indexer_loss", ["candidate", "sparse", "sparse_cudnn"])
+def test_fused_shared_attention_and_indexer_gradients_match_native(
+    monkeypatch, ratio, output_rope, indexer_loss
+):
+    """Exercise real Full/Reindex/Reuse kernels with shared producer gradients.
+
+    ``sparse`` supervises each layer's Top-K with the Triton objective and
+    ``sparse_cudnn`` with MCORE_CSA2_CUDNN_INDEXER_LOSS's cuDNN-FE kernels, both
+    with the production H32 indexer.
+    """
     import os
     import shutil
     import subprocess
@@ -805,10 +813,23 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
 
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
     from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_indexer
 
     pytest.importorskip("cudnn")
     flash_mla_cuda = pytest.importorskip("flash_mla.cuda")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    cudnn_calls = []
+    if indexer_loss == "sparse_cudnn":
+        if torch.cuda.get_device_capability()[0] != 10:
+            pytest.skip("the cuDNN sparse indexer loss requires an SM10x GPU")
+        cudnn_loss = csa2_indexer._precompute_indexer_loss_cudnn
+
+        def counted_cudnn_loss(*args):
+            cudnn_calls.append(tuple(args[0].shape))
+            return cudnn_loss(*args)
+
+        monkeypatch.setattr(csa2_indexer, "_CUDNN_INDEXER_LOSS", True)
+        monkeypatch.setattr(csa2_indexer, "_precompute_indexer_loss_cudnn", counted_cudnn_loss)
     if torch.cuda.get_device_capability()[0] == 9:
         # CI omits SM90 kernels. Check the binary before launching: a failed
         # FlashMLA call can leave CUDA errors behind even after pytest.skip.
@@ -831,7 +852,8 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         q_lora_rank=128,
         qk_pos_emb_head_dim=64,
         csa_compress_ratios=[ratio] * 3,
-        dsa_indexer_n_heads=64,
+        dsa_indexer_n_heads=64 if indexer_loss == "candidate" else 32,
+        dsa_indexer_use_sparse_loss=indexer_loss != "candidate",
         dsa_indexer_head_dim=128,
         dsa_indexer_topk=32,
         csa_window_size=8,
@@ -908,6 +930,9 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         sum(y.float().square().mean() for y in outputs).backward()
         grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
         results.append((outputs, grads))
+    if indexer_loss == "sparse_cudnn":
+        # The Full owner and the Reindex layer each ran the cuDNN objective; Reuse has none.
+        assert len(cudnn_calls) == 2
     for actual, expected in zip(results[1][0], results[0][0]):
         cosine = torch.nn.functional.cosine_similarity(
             actual.float().flatten(), expected.float().flatten(), dim=0
@@ -927,6 +952,109 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         )
         assert cosine > 0.99
         assert (actual.float() - expected.float()).norm() / norm < 0.03
+
+
+def _sparse_indexer_loss_inputs(width, per_token, generator):
+    """MODE 2 inputs: two packed sequences, padding rows and ids outside their key spans."""
+    span, rows_per_sequence, padding_rows, heads, teacher_heads = 640, 128, 8, 32, 64
+    rows, keys, device = 2 * rows_per_sequence + padding_rows, 2 * span, 'cuda'
+
+    def randn(*shape, scale=1.0):
+        values = torch.randn(shape, device=device, generator=generator) * scale
+        return values.to(torch.bfloat16)
+
+    sequence = torch.arange(rows, device=device) // rows_per_sequence
+    position = torch.arange(rows, device=device) % rows_per_sequence
+    real = sequence < 2
+    starts = torch.where(real, sequence * span, 0).int()
+    visible = torch.where(real, ((position + 1) * 5).clamp(max=span), 0).int()
+    # Random Top-K among each row's visible keys: ascending physical ids, -1 tail.
+    draw = torch.rand(rows, span, device=device, generator=generator)
+    draw = draw.masked_fill(torch.arange(span, device=device) >= visible[:, None], 2.0)
+    local = draw.topk(width, dim=-1, largest=False).indices
+    sentinel = torch.iinfo(torch.int32).max
+    ids = torch.where(draw.gather(1, local) < 2.0, local + starts[:, None], sentinel)
+    ids = ids.sort(-1).values
+    ids = ids.masked_fill(ids == sentinel, -1).int()
+    # Ids just past a row's span, and padding rows with in-range ids, are not supervised.
+    for row in (3, rows_per_sequence + 12):
+        ids[row, -1] = starts[row] + visible[row]
+    ids[~real] = 7
+    q, k, weights = randn(rows, heads, 128), randn(keys, 128), randn(rows, heads)
+    teacher_q, teacher_k = randn(rows, teacher_heads, 512, scale=0.5), randn(keys, 512)
+    scale = 512**-0.5
+    supervised = (ids >= starts[:, None]) & (ids < (starts + visible)[:, None])
+    logits = torch.einsum(
+        'rhd,rwd->rhw', teacher_q.float(), teacher_k[ids.clamp_min(0).long()].float()
+    )
+    logits = (logits * scale).masked_fill(~supervised[:, None, :], float('-inf'))
+    # FlashMLA LSE over window and Top-K keys, plus the sink: some mass is outside Top-K.
+    window = torch.randn(rows, teacher_heads, device=device, generator=generator) + 1.0
+    lse = torch.logaddexp(torch.logsumexp(logits, -1), window)
+    divisor = torch.ones((), device=device) if per_token else real.sum().float()
+    options = (width, 2, 1, scale, 0.25)
+    args = (q, k, weights, teacher_q, teacher_k, lse, ids, visible, starts, visible, divisor)
+    return (*args, options), ~real
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [72, 512])
+@pytest.mark.parametrize("per_token", [False, True])
+def test_cudnn_sparse_indexer_loss_matches_triton_and_replays(width, per_token):
+    """MCORE_CSA2_CUDNN_INDEXER_LOSS keeps Triton's MODE 2 objective and unit-loss gradients.
+
+    The cuDNN backward rounds the score-gradient matrix to BF16 before the dQ/dK
+    MMAs, where Triton keeps it in FP32, hence the 1% relative-norm tolerance.
+    """
+    pytest.importorskip("cudnn")
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_indexer
+
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the cuDNN sparse indexer loss requires an SM10x GPU")
+    generator = torch.Generator(device='cuda').manual_seed(width + per_token)
+    args, padding = _sparse_indexer_loss_inputs(width, per_token, generator)
+    q, k, weights, teacher_q, teacher_k, lse, ids, *_, options = args
+    assert csa2_indexer._cudnn_indexer_loss_unsupported(*args[:7], options) is None
+    wide = q.repeat_interleave(2, dim=1)
+    assert csa2_indexer._cudnn_indexer_loss_unsupported(wide, *args[1:7], options) is not None
+
+    def relative_errors(actual, expected):
+        return [
+            ((a.float() - e.float()).norm() / e.float().norm()).item()
+            for a, e in zip(actual, expected)
+        ]
+
+    expected_loss, expected = csa2_indexer._precompute_indexer_loss(*args, full_lse=True)
+    loss, gradients = csa2_indexer._precompute_indexer_loss_cudnn(*args)
+    torch.testing.assert_close(loss, expected_loss, rtol=2e-4, atol=1e-6)
+    for actual, wanted in zip(gradients, expected):
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
+        assert torch.isfinite(actual).all()
+    assert max(relative_errors(gradients, expected)) < 1e-2
+    # Padding rows supervise no key, so their Q/W gradients stay exactly zero.
+    assert gradients[0][padding].count_nonzero() == 0
+    assert gradients[2][padding].count_nonzero() == 0
+
+    # Capture after warmup, then replay on new values in the same storage.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        csa2_indexer._precompute_indexer_loss_cudnn(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_loss, captured = csa2_indexer._precompute_indexer_loss_cudnn(*args)
+    for tensor in (q, k, weights, teacher_q, teacher_k):
+        tensor.copy_(torch.randn(tensor.shape, device='cuda', generator=generator))
+    lse.add_(torch.rand(lse.shape, device='cuda', generator=generator))
+    graph.replay()
+    replay_loss, replayed = captured_loss.clone(), [g.clone() for g in captured]
+    eager_loss, eager = csa2_indexer._precompute_indexer_loss_cudnn(*args)
+    torch.testing.assert_close(replay_loss, eager_loss, rtol=1e-6, atol=0)
+    # dK accumulates with unordered FP32 bulk adds, so allow last-bit BF16 differences.
+    assert max(relative_errors(replayed, eager)) < 1e-3
+    assert max(relative_errors(eager, gradients)) > 0.1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

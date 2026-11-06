@@ -496,6 +496,52 @@ def test_candidate_selection_ignores_score_chunk_budget_at_64k_cp16(monkeypatch)
     )
 
 
+@pytest.mark.skipif(not csa2_indexer.HAVE_TRITON, reason="requires Triton")
+@pytest.mark.parametrize("width", [72, 512])
+def test_cudnn_indexer_loss_slot_map_replays_and_matches_reference(width):
+    """The slot map of the opt-in cuDNN sparse indexer loss (MCORE_CSA2_CUDNN_INDEXER_LOSS).
+
+    Supervised Top-K ids pass through; ids outside a row's key span and the tail up to the
+    128-slot block become -1, bit for bit and on every replay. The cuDNN objective itself
+    accumulates dK with unordered FP32 adds, so it is not replay bit-exact; test_csa2 bounds
+    it against the Triton objective instead.
+    """
+    seeded()
+    rows, span = 300, 640
+    starts = (torch.arange(rows, device="cuda") % 3 * span).int()
+    visible = torch.randint(0, span + 1, (rows,), device="cuda").int()
+    ids = (starts[:, None] + torch.randint(-8, span + 8, (rows, width), device="cuda")).int()
+    ids[::7, -5:] = -1
+    block = csa2_indexer._CUDNN_LOSS_BLOCK
+    stride = (width + block - 1) // block * block
+
+    def slot_map(ids, starts, visible):
+        slots = torch.empty((rows, stride), dtype=torch.int32, device="cuda")
+        csa2_indexer._sparse_loss_slots_kernel[(rows,)](
+            ids,
+            visible,
+            starts,
+            visible,
+            slots,
+            width,
+            width,
+            stride,
+            1 << (stride - 1).bit_length(),
+        )
+        return slots
+
+    outputs, _ = assert_replays_bit_exact(
+        slot_map,
+        (ids, starts, visible),
+        backward=False,
+        contention=True,
+        what="cuDNN indexer-loss slot map",
+    )
+    physical = torch.nn.functional.pad(ids, (0, stride - width), value=-1)
+    supervised = (physical >= starts[:, None]) & (physical < (starts + visible)[:, None])
+    assert bytes_equal(outputs["out"], torch.where(supervised, physical, -1))
+
+
 def test_packed_indexer_metadata_and_loss_replay():
     seeded()
     cu_q = torch.tensor([0, 65, 65, 256], device="cuda", dtype=torch.int32)

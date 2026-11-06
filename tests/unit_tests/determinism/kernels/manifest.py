@@ -1012,7 +1012,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "It also checks that compact Top-K selects the same keys with and without empty-K "
         "padding segments (MCORE_CSA2_TOPK_PAD_SEGMENTS) and replays them bit-exactly, and that "
         "candidate-source selections do not depend on the score-chunk budget "
-        "(MCORE_CSA2_CANDIDATE_CHUNK_MIB).",
+        "(MCORE_CSA2_CANDIDATE_CHUNK_MIB). The opt-in cuDNN sparse indexer loss "
+        "(MCORE_CSA2_CUDNN_INDEXER_LOSS, off by default) accumulates dK with unordered FP32 adds "
+        "and is not replay bit-exact; its slot-map Triton kernel replays bit-exactly in "
+        "test_csa_packed_kernels, and test_csa2 bounds the objective against Triton.",
     ),
     KernelEntry(
         name="csa_teacher_lse",
