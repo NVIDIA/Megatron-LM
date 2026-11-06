@@ -778,8 +778,12 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination):
 
 
 @pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
-@pytest.mark.parametrize("symmetric_memory", [False, True])
-def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memory):
+@pytest.mark.parametrize(
+    "symmetric_input,symmetric_output", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_multi_axis_allgather_on_3d_mesh(
+    distributed_setup, axes, symmetric_input, symmetric_output
+):
     if distributed_setup.world_size % 4:
         pytest.skip("Requires a world size divisible by four.")
     mesh = init_device_mesh(
@@ -791,12 +795,17 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memo
     source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
     expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
     out = None
-    if symmetric_memory:
+    if symmetric_input or symmetric_output:
         if distributed_setup.device.type != "cuda":
             pytest.skip("Symmetric memory requires CUDA.")
         # Symmetric-memory rendezvous requires an initialized NCCL communicator.
         for axis in axes:
             dist.barrier(group=mesh.get_group(axis), device_ids=[distributed_setup.device.index])
+    if symmetric_input:
+        with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device)):
+            source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
+        assert source.is_symmetric_memory
+    if symmetric_output:
         with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device)):
             out = DBuffer(mesh, target_placements, source.layout, source.dtype, source.device)
         assert out.is_symmetric_memory
@@ -806,6 +815,18 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memo
     assert result.placements == tuple(target_placements)
     for index in range(len(tensors)):
         torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
+
+    if symmetric_input and symmetric_output:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            source.allgather(axes, out=out)
+        for increment in (1, 2):
+            source.local_buffer.add_(1)
+            graph.replay()
+            for index in range(len(tensors)):
+                torch.testing.assert_close(
+                    out.get_tensor_view(index), expected.get_tensor_view(index) + increment
+                )
 
 
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
