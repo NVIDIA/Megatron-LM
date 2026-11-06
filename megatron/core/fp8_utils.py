@@ -1043,6 +1043,10 @@ if HAVE_TE:
         module.forward = padded_forward
         _fp8_inference_wrapped_modules.add(module)
 
+    def is_wrapped_for_fp8_inference(module: torch.nn.Module) -> bool:
+        """Whether prepare_model_for_fp8_inference padded this module's sequence dim (dim 0)."""
+        return module in _fp8_inference_wrapped_modules
+
     def prepare_model_for_fp8_inference(model):
         """Prepare a model for FP8 inference by wrapping TE linear layers with padding support.
 
@@ -1065,6 +1069,10 @@ if HAVE_TE:
         return model
 
 else:
+
+    def is_wrapped_for_fp8_inference(module: torch.nn.Module) -> bool:
+        """Without TE no module is wrapped for FP8 inference."""
+        return False
 
     def prepare_model_for_fp8_inference(model):
         """If trys using prepare_model_for_fp8_inference without TE we error"""

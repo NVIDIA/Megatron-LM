@@ -82,11 +82,14 @@ class TestMambaMixer:
         assert output.shape[2] == mixer.config.hidden_size
         assert output.dtype == torch.float32
 
+    @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
     @pytest.mark.parametrize("two_stage", [False, True], ids=["forward", "two_stage"])
-    def test_batch_first_ssm_matches_sequence_first(self, two_stage, monkeypatch):
-        """The batch-first training layout gives the same outputs and gradients."""
-        mixer = self.get_mixer()
-        assert mixer._use_batch_first_ssm(inference_mode=False)
+    def test_batch_first_ssm_matches_sequence_first(self, two_stage, tp_size, monkeypatch):
+        """Both training layouts, and the gated default, give the same outputs and gradients."""
+        if Utils.world_size < tp_size:
+            pytest.skip(f"needs {tp_size} GPUs")
+        mixer = self.get_mixer(tp_size=tp_size)
+        gate = mixer._use_batch_first_ssm
         # TF32 would make the two GEMM layouts differ by more than the layout change itself.
         monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
 
@@ -99,7 +102,9 @@ class TestMambaMixer:
         output_grad = torch.randn(shape, device="cuda", generator=generator)
 
         def run(batch_first):
-            monkeypatch.setattr(mixer, "_use_batch_first_ssm", lambda inference_mode: batch_first)
+            # None keeps the real gate, so every call site must agree on the layout.
+            patched = gate if batch_first is None else (lambda inference_mode: batch_first)
+            monkeypatch.setattr(mixer, "_use_batch_first_ssm", patched)
             mixer.zero_grad(set_to_none=True)
             x = hidden_states.clone().requires_grad_()
             if two_stage:
@@ -116,6 +121,9 @@ class TestMambaMixer:
         assert output.shape == shape
         torch.testing.assert_close(output, ref_output)
         torch.testing.assert_close(input_grad, ref_input_grad)
+        gated_output, gated_input_grad, _ = run(batch_first=None)
+        torch.testing.assert_close(gated_output, ref_output)
+        torch.testing.assert_close(gated_input_grad, ref_input_grad)
         # Weight gradients reduce over tokens, which the batch-first layout visits in a
         # different order, so they match only up to fp32 summation error (~1e-6 of the max).
         assert param_grads.keys() == ref_param_grads.keys()
@@ -128,6 +136,34 @@ class TestMambaMixer:
                 atol=1e-5 * ref_grad.abs().max().item(),
                 msg=lambda m: f"{name}: {m}",
             )
+
+    @pytest.mark.parametrize("tp_size,expected", [(1, True), (4, True), (8, False)])
+    def test_batch_first_ssm_needs_narrower_copies(self, tp_size, expected):
+        """Batch-first is used only while the full-width input and output are the smaller copies."""
+        if Utils.world_size < tp_size:
+            pytest.skip(f"needs {tp_size} GPUs")
+        mixer = self.get_mixer(tp_size=tp_size)
+        # hidden 256 -> d_inner 512, 8 heads, 8 groups of state 128: the old layout copies
+        # 3592 / tp elements per token (449 at TP 8), the batch-first one 2 * 256 = 512.
+        assert mixer._use_batch_first_ssm(inference_mode=False) == expected
+        assert not mixer._use_batch_first_ssm(inference_mode=True)
+
+    @pytest.mark.parametrize(
+        "cp_size,use_mem_eff_path,fp8_wrapped",
+        [(2, True, False), (1, False, False), (1, True, True)],
+        ids=["cp2", "no_mem_eff_path", "fp8_inference_wrapped"],
+    )
+    def test_batch_first_ssm_falls_back(self, cp_size, use_mem_eff_path, fp8_wrapped):
+        """Context parallel, the non-mem-eff path and FP8 inference padding stay sequence-first."""
+        if Utils.world_size < cp_size:
+            pytest.skip(f"needs {cp_size} GPUs")
+        mixer = self.get_mixer(cp_size=cp_size, use_mem_eff_path=use_mem_eff_path)
+        if fp8_wrapped:
+            fp8_utils = pytest.importorskip("megatron.core.fp8_utils")
+            if fp8_utils.Fp8Padding is None:
+                pytest.skip("needs TE FP8 padding")
+            fp8_utils.prepare_model_for_fp8_inference(mixer)
+        assert not mixer._use_batch_first_ssm(inference_mode=False)
 
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()

@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import is_wrapped_for_fp8_inference
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -511,14 +512,26 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """Whether the training path keeps in_proj, the SSM and out_proj batch-first.
 
         The SSM kernel is batch-first, so this moves the two l<->b transposes from the
-        in_proj/SSM outputs to the narrower d_model-wide input and output. Sequence parallel
-        and context parallel communicate along the sequence dim, so they keep the old layout.
+        in_proj/SSM outputs to the d_model-wide input and output. Sequence parallel and context
+        parallel communicate along the sequence dim, and the FP8 inference padding wrapper pads
+        dim 0 as the sequence, so they keep the sequence-first layout. So does any config where
+        the TP-local in_proj + SSM outputs are narrower than the input and output together.
         """
+        # Forward copies per token. In MambaLayer, backward adds the in_proj grad copy (old) vs
+        # the out_proj grad copy (batch-first), which only favors batch-first more when this holds.
+        local_proj_width = (
+            3 * self.d_inner_local_tp
+            + 2 * self.ngroups_local_tp * self.d_state
+            + self.nheads_local_tp
+        )
         return (
             self.use_mem_eff_path
             and not inference_mode
             and self.cp.cp_size == 1
             and not self.config.sequence_parallel
+            and 2 * self.d_model < local_proj_width
+            and not is_wrapped_for_fp8_inference(self.in_proj)
+            and not is_wrapped_for_fp8_inference(self.out_proj)
         )
 
     def _out_proj(self, y: torch.Tensor, batch_first: bool):
