@@ -39,6 +39,8 @@ try:
 except ImportError:
     HAVE_TEX = False
 
+pytestmark = pytest.mark.launch_on_gb200
+
 SEQ_LEN = 256
 PACKED_LENGTHS = [96, 40, 64, 56]  # multiples of 2 * CP for every CP size tested
 VOCAB_SIZE = 131072  # Nano's; at 128 the te_native output GEMM varies with the row count
