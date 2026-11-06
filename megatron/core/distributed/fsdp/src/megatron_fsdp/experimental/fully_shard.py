@@ -201,11 +201,15 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
     until the last microbatch. Wrap both forward and backward in this scope.
 
+    Entering the scope joins the inner reduction stream to any active CUDA-graph
+    capture before backward allocates on it.
+
     Args:
         context: FSDP context whose roots should use this microbatch state.
         is_last: Whether this scope contains the last accumulation microbatch.
     """
     context.ensure_finalized()
+    context.inner_reduction_stream.wait_stream(context.current_stream())
     previous_state = context.is_last_microbatch
     context.is_last_microbatch = is_last
 
