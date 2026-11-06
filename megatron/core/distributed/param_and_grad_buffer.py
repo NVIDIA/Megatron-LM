@@ -1318,13 +1318,6 @@ class _ParamAndGradBuffer:
                         allocate_param_buffer()
                     allocate_grad_buffer()
 
-        # Hand the pool backing param_data to the params that asked for it; they register it.
-        if self.ddp_config.use_distributed_optimizer:
-            param_pool = self.param_nccl_mem_pool or self.nccl_mem_pool
-            for param in self.params:
-                if getattr(param, 'needs_nccl_mem', False):
-                    param.register_ub_pool(param_pool)
-
         self.grad_data_size = 0
         self.param_data_size = 0
         self.param_data_cpu = None
@@ -1493,6 +1486,9 @@ class _ParamAndGradBuffer:
                                     "Failed to remap high-precision TE GroupedTensor parameter "
                                     "storage into DDP param_data."
                                 )
+                    # Hand the pool now backing this param to it if it asked; it registers it.
+                    if getattr(param, 'needs_nccl_mem', False):
+                        param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(

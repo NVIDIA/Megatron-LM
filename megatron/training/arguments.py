@@ -1401,28 +1401,22 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
-        # The nccl-ub flags take a subset of {ag, rs}; a bare flag ([]) means both. After
-        # normalization the values are either None (off) or a non-empty sorted list, so
-        # plain truthiness still means "enabled".
+        # A bare flag ([]) means both modes; after this, each value is None (off) or non-empty.
         for attr in ('gtp_remat_nccl_ub', 'gtp_expert_remat_nccl_ub'):
             modes = getattr(args, attr, None)
             if modes is not None:
                 setattr(args, attr, sorted(set(modes)) or ['ag', 'rs'])
 
+        gtp_ub_modes = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_modes:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            rs_enabled = 'rs' in (
-                (getattr(args, 'gtp_remat_nccl_ub', None) or [])
-                + (getattr(args, 'gtp_expert_remat_nccl_ub', None) or [])
-            )
-            if rs_enabled and getattr(
-                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
-            ):
+            if 'rs' in gtp_ub_modes and args.gtp_remat_reduce_scatter_with_fp32_accumulation:
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
