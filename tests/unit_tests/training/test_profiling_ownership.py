@@ -13,7 +13,7 @@ import pytest
 
 from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
-from megatron.training.config import ProfilingConfig
+from megatron.training.config import ProfilingConfig, StragglerDetectionConfig
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.state import TrainState
 from megatron.training.utils import start_memory_history_recording
@@ -57,6 +57,8 @@ def inline_profiler(monkeypatch, run_config):
     remove_profiling_args(args)
     train_state = TrainState()
     args.train_iters = 10
+    run_config.train.train_iters = 10
+    run_config.train.micro_batch_size = 1
     args.train_sync_interval = 0
     args.gpu_sniff_test_interval = args.check_weight_hash_across_dp_replicas_interval = None
     args.log_straggler = args.manual_gc = False
@@ -68,9 +70,10 @@ def inline_profiler(monkeypatch, run_config):
     monkeypatch.setattr(training, "get_attr_wrapped_model", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_rerun_state_machine", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
     monkeypatch.setattr(training, "get_forward_backward_func", Mock())
     monkeypatch.setattr(training, "one_logger_utils", Mock())
-    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda _: False)
+    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda *_: False)
     monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **kw: nullcontext())
     for name in (
         "write_args_to_tensorboard",
@@ -101,14 +104,44 @@ def inline_profiler(monkeypatch, run_config):
                 optimizer=None,
                 opt_param_scheduler=None,
                 train_data_iterator=None,
-                valid_data_iterator=None,
-                process_non_loss_data_func=None,
                 config=SimpleNamespace(finalize_model_grads_func=Mock()),
                 checkpointing_context={},
-                non_loss_data_func=None,
+                next_train_iterator=lambda iteration, current: current,
+                run_eval=Mock(),
             )
 
     return start
+
+
+@pytest.mark.parametrize(
+    "enabled,start_disabled", [(None, False), (False, False), (True, False), (True, True)]
+)
+def test_straggler_setup_uses_native_config(
+    monkeypatch, run_config, inline_profiler, enabled, start_disabled
+):
+    args = training.get_args()
+    for config_field in fields(StragglerDetectionConfig):
+        delattr(args, config_field.name)
+    run_config.straggler = (
+        None
+        if enabled is None
+        else StragglerDetectionConfig(
+            log_straggler=enabled,
+            disable_straggler_on_startup=start_disabled,
+            straggler_minmax_count=3,
+            straggler_ctrlr_port=12345,
+        )
+    )
+    detector = MagicMock()
+    monkeypatch.setattr(training, "stimer", detector)
+    monkeypatch.setattr(training.torch.distributed, "get_world_size", lambda: 8)
+    inline_profiler(ProfilingConfig(), rank=2)
+    if enabled:
+        detector.configure.assert_called_once_with(
+            8, 2, mmcnt=3, enabled=not start_disabled, port=12345
+        )
+    else:
+        detector.configure.assert_not_called()
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -432,6 +465,8 @@ def test_training_log_memory_snapshot_without_profiling_args(
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
     train_state = TrainState()
     args.train_iters = 1
+    run_config.train.train_iters = 1
+    run_config.train.micro_batch_size = 1
     timers = Mock()
     timers.return_value.elapsed.return_value = 1.0
     monkeypatch.setattr(training, "get_args", lambda: args)

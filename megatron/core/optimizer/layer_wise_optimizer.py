@@ -3,6 +3,7 @@
 import logging
 import math
 import re
+from itertools import chain
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -11,8 +12,9 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
@@ -175,6 +177,27 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
         if key.endswith(nm):
             return (rid[0], rid[1] * gtp_remat_size + gtp_rank, rid[2])
     return rid
+
+
+class GraphedGradCopyFloat16Optimizer(Float16OptimizerWithFloat16Params):
+    """Float16 optimizer whose gradient conversion replays in the training graph's pool.
+
+    Layer-wise DDP owns persistent main_grad buffers, so their FP32 conversion can
+    reuse forward/backward scratch once the full-iteration training graph has finished.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cudagraphed_grad_copy = FullIterationGradCopy()
+
+    def _copy_model_grads_to_main_grads(self):
+        self._cudagraphed_grad_copy.copy(
+            super()._copy_model_grads_to_main_grads,
+            chain(
+                zip(self.float16_groups, self.fp32_from_float16_groups),
+                ((group, group) for group in self.fp32_from_fp32_groups),
+            ),
+        )
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -343,6 +366,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            # The shard is the fullest bin, so one outsized param forces every shard to
+            # its size however well the rest pack. Log the largest to tell those apart.
+            sizes = sorted((p.data.nelement() for p in chunk_params if p is not None), reverse=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
+                f"real={sum(sizes)}, largest={sizes[:3]}",
+            )
             bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
@@ -607,6 +639,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
+        # Mark all main weights as DP-sharded so parameter norms count only owners.
+        if config.bf16:
+            for optimizer in optimizers:
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if param.requires_grad and param.type() in [
+                            'torch.cuda.HalfTensor',
+                            'torch.cuda.BFloat16Tensor',
+                        ]:
+                            param.main_param_sharded = True
+
         self.shard_params(optimizers, full_param_layouts)
 
         # When a full_param_layout is available, ddp_config.use_distributed_optimizer
@@ -662,7 +705,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                optimizers[i] = Float16OptimizerWithFloat16Params(
+                wrapper = Float16OptimizerWithFloat16Params
+                if (
+                    model_chunks
+                    and getattr(get_model_config(model_chunks[0]), "cuda_graph_impl", "none")
+                    == "full_iteration"
+                    and not config.optimizer_cuda_graph
+                    and not config.optimizer_cpu_offload
+                ):
+                    wrapper = GraphedGradCopyFloat16Optimizer
+                optimizers[i] = wrapper(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 

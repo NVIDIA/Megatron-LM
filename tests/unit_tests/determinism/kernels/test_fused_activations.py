@@ -10,10 +10,13 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
@@ -24,11 +27,13 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.transformer.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     seeded,
 )
@@ -110,6 +115,27 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
 
 
+@pytest.mark.skipif(
+    te_ext._te_mark_grouped_tensor is None,
+    reason="Transformer Engine does not provide mark_grouped_tensor",
+)
+@pytest.mark.parametrize(
+    "name,activation",
+    [("swiglu", weighted_bias_swiglu_impl), ("quick_geglu", weighted_bias_quick_geglu_impl)],
+)
+def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation):
+    """Marker propagation through activation views must preserve bit-exact numerics."""
+    seeded()
+    x = _act((TOKENS, 2 * FFN))
+    weights = _weights(TOKENS)
+
+    def fn(x, weights):
+        te_ext.mark_grouped_tensor(x)
+        return activation(x, None, weights)
+
+    assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+
+
 @pytest.mark.parametrize("weighted", [False, True])
 def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
     seeded()
@@ -180,6 +206,25 @@ def test_l2norm_replays_bit_exactly():
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
 
 
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
+    seeded()
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_zero_centered_gamma=False,
+        persist_layer_norm=False,
+        sequence_parallel=False,
+        memory_efficient_layer_norm=False,
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=2048).cuda().to(dtype=DTYPE)
+    assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
+    x = _act((4096, 2, 2048))
+    assert_module_replays_bit_exact(
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
+    )
+
+
 # --- bias + dropout + residual --------------------------------------------------------------
 
 
@@ -245,6 +290,41 @@ class TestFusedCrossEntropy:
             what="fused_vocab_parallel_cross_entropy",
         )
         assert grads["in[0]"].dtype == dtype
+
+    @staticmethod
+    def _peak_bytes(fn, logits, target):
+        """Peak allocation of one forward + backward beyond what is live before it."""
+        fn(logits, target).sum().backward()  # warm up compilation outside the measurement
+        logits.grad = None
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        live = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        fn(logits, target).sum().backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - live
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_fused_vocab_parallel_cross_entropy_needs_no_logits_sized_temporary(self, dtype):
+        """The compiled pieces are split so that Inductor keeps the exp / gradient scaling in
+        place: the fused path must not need more transient memory than the unfused one. With
+        the reductions and the target scatter inside the compiled graphs Inductor copied the
+        mutated [s, b, v] tensor into a fresh buffer, one extra logits-sized allocation."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        logits = _act((TOKENS, 32768), dtype=dtype)
+        target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
+        logits_bytes = logits.numel() * logits.element_size()
+        fused = self._peak_bytes(
+            lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group), logits, target
+        )
+        unfused = self._peak_bytes(
+            lambda l, t: vocab_parallel_cross_entropy(l, t, 0.0, tp_group), logits, target
+        )
+        assert fused <= unfused + logits_bytes // 8, (
+            f"fused cross entropy peaked at {fused / logits_bytes:.2f}x the logits size, unfused "
+            f"at {unfused / logits_bytes:.2f}x: a logits-sized temporary is back"
+        )
 
 
 # --- DeepSeek-V4 hybrid attention: compiled query RMS norm -----------------------------------
