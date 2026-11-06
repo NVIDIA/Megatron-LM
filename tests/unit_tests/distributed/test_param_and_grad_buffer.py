@@ -1090,3 +1090,137 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+class TestRegisterUbPoolHook:
+    """The buffer hands the pool backing param_data to params stamped ``needs_nccl_mem``."""
+
+    def _make_buffer(
+        self, use_distributed_optimizer=True, nccl_ub=False, grad_buffer_offload=False
+    ):
+        params = [torch.nn.Parameter(torch.randn(16, 16, dtype=torch.bfloat16)) for _ in range(3)]
+        for param in params:
+            param.register_ub_pool = mock.MagicMock()
+        params[0].needs_nccl_mem = True
+        params[1].needs_nccl_mem = True
+        params_with_names = [(param, f"p{i}") for i, param in enumerate(params)]
+        dp_group = mock.MagicMock()
+        dp_group.size.return_value = 1
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_distributed_optimizer,
+            overlap_grad_reduce=False,
+            bucket_size=None,
+            average_in_collective=False,
+            grad_buffer_offload=grad_buffer_offload,
+        )
+        param_layout = None
+        if use_distributed_optimizer:
+            param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                params, None, 1, ddp_config, list(range(len(params)))
+            )
+        nccl_pools = iter([object(), object()])
+        pgb = 'megatron.core.distributed.param_and_grad_buffer'
+        with (
+            mock.patch('torch.cuda.current_device', return_value='cpu'),
+            mock.patch(
+                'torch.cuda.use_mem_pool', side_effect=lambda pool: contextlib.nullcontext()
+            ),
+            mock.patch(f'{pgb}.vmm_symm_allocator.create_symm_mem_pool', return_value=object()),
+            mock.patch(f'{pgb}.nccl_allocator.init'),
+            mock.patch(
+                f'{pgb}.nccl_allocator.create_nccl_mem_pool',
+                side_effect=lambda **_: next(nccl_pools),
+            ),
+            mock.patch(
+                f'{pgb}.nccl_allocator.nccl_mem',
+                side_effect=lambda *_, **__: contextlib.nullcontext(),
+            ),
+            mock.patch.object(_ParamAndGradBuffer, '_register_nccl_mem_pool'),
+            mock.patch('torch.distributed.barrier'),
+            mock.patch('torch.distributed.all_reduce'),
+        ):
+            buffer = _ParamAndGradBuffer(
+                ddp_config=ddp_config,
+                param_dtype=torch.bfloat16,
+                grad_dtype=torch.bfloat16,
+                params_with_names=params_with_names,
+                data_parallel_group=dp_group,
+                bucket_size=None,
+                param_to_name={param: name for param, name in params_with_names},
+                gradient_scaling_factor=1.0,
+                param_indices=list(range(len(params))),
+                nccl_ub=nccl_ub,
+                pg_collection=mock.MagicMock(),
+                param_layout=param_layout,
+            )
+        return buffer, params
+
+    def _assert_hook_calls(self, params, pool):
+        for param in params[:2]:
+            param.register_ub_pool.assert_called_once_with(pool)
+        params[2].register_ub_pool.assert_not_called()
+
+    def test_symmetric_pool_without_nccl_ub(self):
+        buffer, params = self._make_buffer()
+        assert buffer.nccl_mem_pool is not None
+        self._assert_hook_calls(params, buffer.nccl_mem_pool)
+
+    def test_no_hook_without_distributed_optimizer(self):
+        buffer, params = self._make_buffer(use_distributed_optimizer=False)
+        assert buffer.nccl_mem_pool is None
+        for param in params:
+            param.register_ub_pool.assert_not_called()
+
+    def test_nccl_ub_shared_pool(self):
+        buffer, params = self._make_buffer(nccl_ub=True)
+        self._assert_hook_calls(params, buffer.nccl_mem_pool)
+
+    def test_nccl_ub_offload_hands_persistent_param_pool(self):
+        buffer, params = self._make_buffer(nccl_ub=True, grad_buffer_offload=True)
+        assert buffer.param_nccl_mem_pool is not buffer.nccl_mem_pool
+        self._assert_hook_calls(params, buffer.param_nccl_mem_pool)
+
+
+def test_ub_pool_hook_reaches_dense_and_expert_buffers():
+    """Each buffer, dense and expert, hands its own pool to its stamped params."""
+    Utils.initialize_model_parallel()
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        bucket_size=None,
+        average_in_collective=False,
+    )
+    model = TestModelWithExperts(
+        input_dim=16, output_dim=16, num_dense_layers=2, num_expert_layers=2, bias=True
+    ).bfloat16()
+    for layer in (*model.dense_layers, *model.expert_layers):
+        layer.weight.needs_nccl_mem = True
+        layer.weight.register_ub_pool = mock.MagicMock()
+    full_param_layout = DistributedOptimizer.compute_full_param_layout(
+        [p for p in model.parameters() if p.requires_grad],
+        None,
+        parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True, partial_data_parallel=True
+        ),
+        ddp_config,
+    )
+    with mock.patch(
+        'megatron.core.distributed.param_and_grad_buffer.vmm_symm_allocator.create_symm_mem_pool',
+        side_effect=torch.cuda.MemPool,
+    ):
+        ddp_model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=model,
+            full_param_layout=full_param_layout,
+        )
+
+    (dense_buffer,) = ddp_model.buffers
+    (expert_buffer,) = ddp_model.expert_parallel_buffers
+    assert dense_buffer.nccl_mem_pool is not expert_buffer.nccl_mem_pool
+    for layer in model.dense_layers:
+        layer.weight.register_ub_pool.assert_called_once_with(dense_buffer.nccl_mem_pool)
+    for layer in model.expert_layers:
+        layer.weight.register_ub_pool.assert_called_once_with(expert_buffer.nccl_mem_pool)
+
+    Utils.destroy_model_parallel()

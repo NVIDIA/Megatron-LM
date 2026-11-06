@@ -53,6 +53,7 @@ from megatron.core.tensor_parallel.gtp_eager_wgrad import (
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
+    register_external_pool,
     symmetric_wgrad_pool,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
@@ -2259,6 +2260,10 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+
+    def register_ub_pool(self, pool: torch.cuda.MemPool) -> None:
+        """Window-register the DDP pool backing this param (the all-gather input) on its group."""
+        register_external_pool(pool, self.group)
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None

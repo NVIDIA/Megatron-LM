@@ -205,10 +205,11 @@ class TestSymmPoolBackend:
         def _boom():
             raise RuntimeError("extension failed to build")
 
+        nccl_allocator = gtp_symm.vmm_symm_allocator.nccl_allocator
         monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
-        monkeypatch.setattr(gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init"))
+        monkeypatch.setattr(nccl_allocator, "init", lambda: calls.append("nccl_init"))
         monkeypatch.setattr(
-            gtp_symm.nccl_allocator,
+            nccl_allocator,
             "create_nccl_mem_pool",
             lambda symmetric: calls.append("nccl_pool") or object(),
         )
@@ -329,33 +330,44 @@ class TestSlicePathPoolRouting:
             deregister_and_clear_gtp_symm_pools()
 
 
-class _FakeBuf:
-    def __init__(self, pool, param_data, params):
-        self.nccl_mem_pool = pool
-        self.param_data = param_data
-        self.params = params
-
-
-class TestBufferSymmGroups:
-    def test_filters_dedups_and_sorts(self):
-        g_b = _StubGroup(name="b_group")
-        g_a = _StubGroup(name="a_group")
-        g_single = _StubGroup(name="single_rank_group", size=1)
-        params = [
-            SimpleNamespace(needs_nccl_mem=True, group=g_b),
-            SimpleNamespace(needs_nccl_mem=True, group=g_a),
-            SimpleNamespace(needs_nccl_mem=True, group=g_b),  # duplicate group
-            SimpleNamespace(needs_nccl_mem=False, group=g_a),  # not opted in
-            SimpleNamespace(needs_nccl_mem=True, group=g_single),
-            SimpleNamespace(needs_nccl_mem=True, group=None),
+class TestRegisterExternalPool:
+    def test_registers_once_per_pool_and_group(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gtp_symm, "_warmup_group_comm", lambda group: None)
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "register_mem_pool",
+            lambda pool, group: calls.append(("reg", pool, group.group_name)),
+        )
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "deregister_mem_pool",
+            lambda pool, group: calls.append(("dereg", pool, group.group_name)),
+        )
+        pool_a, pool_b = object(), object()
+        g = _StubGroup(name="g")
+        try:
+            gtp_symm.register_external_pool(pool_a, g)
+            gtp_symm.register_external_pool(pool_a, g)
+            gtp_symm.register_external_pool(pool_b, g)
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+        assert calls == [
+            ("reg", pool_a, "g"),
+            ("reg", pool_b, "g"),
+            ("dereg", pool_a, "g"),
+            ("dereg", pool_b, "g"),
         ]
-        buf = _FakeBuf(object(), object(), params)
-        assert gtp_symm._buffer_symm_groups(buf) == [g_a, g_b]
+        assert not gtp_symm._registered_ext_pools
 
-    def test_empty_without_pool_or_param_data(self):
-        p = SimpleNamespace(needs_nccl_mem=True, group=_StubGroup(name="x_group"))
-        assert gtp_symm._buffer_symm_groups(_FakeBuf(None, object(), [p])) == []
-        assert gtp_symm._buffer_symm_groups(_FakeBuf(object(), None, [p])) == []
+    def test_param_hook_registers_on_its_group(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            gtp_module, "register_external_pool", lambda pool, group: seen.append((pool, group))
+        )
+        pool, g = object(), _StubGroup()
+        GTPShardedParam.register_ub_pool(SimpleNamespace(group=g), pool)
+        assert seen == [(pool, g)]
 
 
 class TestRegisteredLIFOPool:
@@ -847,33 +859,23 @@ def _worker_full_iteration_registered_scratch(rank, world_size, port):
 
 
 # ---------------------------------------------------------------------------
-# DDP param-buffer registration round trip (world 4)
+# External (DDP param-buffer) pool registration round trip (world 4)
 # ---------------------------------------------------------------------------
 
 
-def _worker_register_ddp_round_trip(rank, world_size, port):
-    import megatron.core.nccl_allocator as nccl_allocator
-    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-        deregister_ddp_buffers_from_gtp_groups,
-        register_ddp_buffers_on_gtp_groups,
-    )
-
+def _worker_external_pool_round_trip(rank, world_size, port):
     group = dist.new_group(list(range(world_size)))
-    # Mirror the param_and_grad_buffer branch: pool-backed param_data, params opted in
-    # via needs_nccl_mem.
-    nccl_allocator.init()
-    pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+    pool = _vmm_pool_or_skip()
     with torch.cuda.use_mem_pool(pool):
         param_data = torch.zeros(4 * world_size, device="cuda")
-    param = SimpleNamespace(needs_nccl_mem=True, group=group)
-    buf = SimpleNamespace(nccl_mem_pool=pool, param_data=param_data, params=[param])
-    module = SimpleNamespace(buffers=[buf], expert_parallel_buffers=[])
     try:
-        register_ddp_buffers_on_gtp_groups(module)
-    except Exception as e:  # NCCL window registration unsupported in this environment
+        gtp_symm.register_external_pool(pool, group)
+    except RuntimeError as e:  # NCCL window registration unsupported in this environment
         pytest.skip(f"NCCL symmetric registration unavailable: {e}")
     try:
-        # A collective whose input lives in the registered buffer must round-trip.
+        gtp_symm.register_external_pool(pool, group)
+        assert len(gtp_symm._registered_ext_pools) == 1
+        # A collective whose input lives in the registered pool must round-trip.
         src = param_data[:4]
         src.fill_(float(rank))
         out = torch.empty(4 * world_size, device="cuda")
@@ -882,17 +884,16 @@ def _worker_register_ddp_round_trip(rank, world_size, port):
             torch.arange(world_size, device="cuda", dtype=torch.float32), 4
         )
         assert torch.equal(out, expected)
-        del out
-        torch.cuda.synchronize()
     finally:
         # Mandatory: leftover windows abort the ProcessGroupNCCL destructor at teardown.
-        deregister_ddp_buffers_from_gtp_groups(module)
+        deregister_and_clear_gtp_symm_pools()
+    assert not gtp_symm._registered_ext_pools
 
 
-class TestRegisterDdpRoundTrip:
+class TestExternalPoolRoundTrip:
     def test_register_collective_deregister(self):
         _requires_multi_gpu(4)
-        _run_distributed(_worker_register_ddp_round_trip, 4)
+        _run_distributed(_worker_external_pool_round_trip, 4)
 
 
 # ---------------------------------------------------------------------------
