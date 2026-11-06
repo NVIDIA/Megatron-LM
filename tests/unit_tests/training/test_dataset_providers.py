@@ -219,6 +219,7 @@ def _validated(extra, overrides):
 def _layout_from_args(args):
     """The model section a real run derives from the same arguments (gpt_config_from_args)."""
     transformer = SimpleNamespace(
+        fp16=args.fp16,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
