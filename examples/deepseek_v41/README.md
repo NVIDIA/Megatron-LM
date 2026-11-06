@@ -338,3 +338,78 @@ CUDA graphs or Engram. It does not measure the full model's 64K candidate-prunin
 ratio. The validated environment is GB200, PyTorch nv26.09, Transformer Engine
 2.20.2 and cuDNN Frontend 1.29. MoK is an optional, separate dependency; the
 individual V4.1 component PRs do not install or embed that backend.
+
+
+## Performance switches
+
+The optimizations below speed up the 16-GPU 64K proxy on GB300: 40 V/E blocks, hidden size
+5120, 48 experts with Top-6 routing, Engram, 64K-token packed sequences, CP16 and EP8, MXFP8,
+MoK experts, and transformer_engine CUDA graphs of the attention layers. A training step takes
+24.36 s (579 TFLOP/s per GPU) without them and 18.02 s (783 TFLOP/s per GPU) with all of them,
+including the run settings below and the two opt-in switches.
+
+Each switch is an environment variable, read once at import. Every optimization that keeps
+training results bit-identical is on by default, and its variable is a kill switch. The one
+exception is `MCORE_ROUTER_SAVE_FP32_INPUT`, which trades memory for time and stays opt-in. The
+debugging and profiling aids (`MCORE_CSA2_DEVICE_CHECKS`, `MCORE_ROUTER_CHECK_STATIC_TOKENS` and
+`MCORE_COMPONENT_NVTX`) are off by default. The cuDNN sparse indexer loss and the cuTile mHC
+projection change numerics, so they are opt-in and off by default. The router switches
+(`MCORE_ROUTER_*`, `MCORE_AUX_LOSS_SCALE_0DIM` and `MCORE_RANDOM_STE_EMPTY_LIKE`) apply to every
+MoE model, with or without MoK; the `MCORE_MOK_*` switches apply to the MoK backend only.
+Boolean switches accept `1`, `true`, `yes` or `on` and `0`, `false`, `no` or `off` (any case);
+any other value, including an empty one, raises a `ValueError` naming the variable. Integer
+switches raise one for non-integer values too; `MCORE_CSA2_CANDIDATE_CHUNK_MIB` and
+`MCORE_CSA2_PAD_ROW_CAPACITY` must also be positive.
+
+| Variable | Default | Kill switch or opt-in | Effect | Bit-identical |
+|---|---|---|---|---|
+| `MCORE_CSA2_DEVICE_CHECKS` | off | `1` turns the checks on | Device-side validation of packed THD metadata: 17 checks per CSA2 layout build, each a compare/reduce plus a `torch._assert_async` launch, also inside CUDA graphs, where a failing check aborts the CUDA context without a Python stack. It also gates the Q/KV agreement asserts of `validate_packed_inputs`, which the DSv4 and V4.1 attention paths share. Metadata on the CPU is always validated. Off saves about 0.5 s per step at 64K; turn the checks on for new data pipelines and in CI. | Yes: the checks change no tensor |
+| `MCORE_ROUTER_FAST_CAST` | on | `0` | Widens the BF16/FP16 router GEMM input and weight to FP32 with an exact, vectorized Triton kernel instead of PyTorch's casting copy. | Yes: the widening is exact |
+| `MCORE_ROUTER_FAST_CAST_BLOCK`, `_WARPS`, `_SPLIT` | `4096`, `8`, off | launch tuning | Launch shape of that kernel: elements per program (a power of two from 256 to 65536), warps per program, and the store variant (`_SPLIT` writes each 16-byte input chunk as two 16-byte FP32 stores). An invalid block/warps pair falls back to 4096/8 with a warning. | Yes |
+| `MCORE_ROUTER_SAVE_FP32_INPUT` | off | `1` opts in | Saves the router input cast to FP32 in forward for backward instead of casting again there, at the cost of one FP32 copy of the router input per MoE layer and microbatch in flight. | Yes |
+| `MCORE_MOK_SKIP_UNROUTED_GRAD_MASK` | on | `0` | Lets MoK skip zeroing the router-weight gradients of unrouted top-k slots when no slot can be unrouted (no capacity factor, hash routing or routing replay) and only Megatron's route adapter reads them. Inactive with a MoK build whose `functional.backward` lacks `zero_unrouted_router_grads`. | Yes: the skipped values are never read |
+| `MCORE_ROUTER_STATIC_TOKENS` | on | `0` | Takes the token count of the per-token aux-loss scale from the host (local tokens times the static group sizes) instead of an all-reduce, when every rank holds the same Python-int count and the aux loss is FP32 or FP64. | Yes: the same count |
+| `MCORE_ROUTER_CHECK_STATIC_TOKENS` | off | `1` (debug) | Still all-reduces that count and asserts that it equals the host value; adds a host sync per call outside CUDA-graph capture. | Yes |
+| `MCORE_MOK_ROUTE_NO_MATERIALIZE_GRADS` | on | `0` | The routing-map conversion for MoK does not materialize zero gradients for its non-differentiable outputs. | Yes |
+| `MCORE_AUX_LOSS_SCALE_0DIM` | on | `0` | Forms the aux-loss scale gradient as a 0-dim tensor instead of a `[1]` tensor that autograd reduces. | Yes |
+| `MCORE_RANDOM_STE_EMPTY_LIKE` | on | `0` | RandomSTE draws its random logits into `torch.empty_like` instead of a clone. | Yes: the same draws |
+| `MCORE_CSA2_SPARSE_PAD_ZERO` | on | `0` restores `masked_fill` | CSA2 zeroes only the THD padding rows in place instead of building masked copies of whole tensors: the attention query, key and output (and, through hooks, their gradients) in forward, and the incoming gradient and LSE rows in backward, which it restores after the kernel. | Yes: the same `+0` values |
+| `MCORE_CSA2_PAD_ROW_CAPACITY` | `512` | positive integer | Static number of padding rows one zeroing call handles, which keeps the row list capturable in CUDA graphs; the zeroing work grows with it. More padding rows in one call trip a device assert; raise it or set `MCORE_CSA2_SPARSE_PAD_ZERO=0`. Data with many short documents per microbatch, each padded to the dataset's granularity (a multiple of 2 x CP rows), can exceed 512 rows on one CP rank. | Yes |
+| `MCORE_CSA2_TOPK_PAD_SEGMENTS` | on | `0` | Compact Top-K gives THD padding rows empty key spans, so their tied scores no longer stall the selection launch on the last CP rank. | Yes: real rows keep their spans |
+| `MCORE_MHC_SP_FUSED_GRAD_ADD` | `exact` | `0` | One kernel sums the three gradients of each single-pass mHC residual input, rounding after each add in the order autograd accumulates them. `fp32` rounds the FP32 sum once instead (opt-in). | `exact`: yes; `fp32`: no |
+| `MCORE_CSA2_CANDIDATE_CHUNK_MIB` | `152` | `32` restores the old budget | Score budget per dense-scorer launch of the candidate-source layer, in MiB: fewer, fuller launches for about 120 MiB more transient memory per call. | Yes: rows are scored independently |
+| `MCORE_CSA2_MXFP8_NATIVE_H32` | on | `0` pads H32 to H64 | cuDNN's MXFP8 selection scorers take H32 indexer heads natively instead of zero-padded to H64. | Yes, by test: scores and selections match bit for bit with the validated cuDNN Frontend |
+| `MCORE_DSV4_GROUP_PROJ_BMM` | on | `0` restores `einsum` | The non-TE grouped output projection runs as strided-batched GEMMs on the token-major tensors, without layout copies. TE BatchedLinear is unchanged. | Yes, by test: cuBLAS picks the same GEMM algorithms |
+| `MCORE_CSA2_CUDNN_INDEXER_LOSS` | off | `1` opts in | Computes the sparse indexer loss with cuDNN Frontend's DSA kernels instead of Triton, about 0.6 s per step faster at 64K. Inputs it does not support keep Triton, with one warning per reason; it needs an SM10x GPU, cuDNN Frontend's DSA wrappers, a BF16 H32/D128 indexer and at most 2048 Top-K slots, among other checks. | No: the score gradient is rounded to BF16, and dK accumulates with unordered FP32 adds (not reproducible run to run) |
+| `MCORE_MHC_SP_CUTILE_PROJ_RMS` | off | `1` opts in | Single-pass mHC computes its mapping projection and RMS with cuTile split-K kernels instead of Inductor and TF32 cuBLAS on an FP32 copy, where the backend policy selects cuTile and the residual qualifies (aligned, K = n * hidden >= 8192); other residuals warn and keep Inductor. | No: TF32 MMAs on the residual dtype and merged FP32 gradients |
+| `MCORE_COMPONENT_NVTX` | off | `1` opts in | NVTX ranges per model component (`comp:<name>`) and layer (`layer:<n>`), forward and backward, also recorded during CUDA-graph capture. | Yes: host-only |
+
+"By test" means the equality was checked on GB300 rather than following from the code: re-run
+the determinism tests under `tests/unit_tests/determinism/kernels/` after a cuDNN Frontend or
+cuBLAS upgrade and on other GPUs. Other changes in the same work need no switch and are
+bit-identical too: the V4.1 state codec reuses the packed layouts after attention graph replays
+and restores the chunk-start state once per forward, packed THD batches are built with fewer
+host syncs, `pretrain_hybrid.get_batch` builds its transformer config once per argument
+namespace, and the Engram JSON is parsed once per path. Full-iteration CUDA graphs can also
+capture V4.1 training now (`--cuda-graph-impl full_iteration`), without Engram; with Engram that
+option is rejected, because Engram plans its EP lookups on the host.
+
+The numbers above also use these run settings, outside Megatron-LM's switches:
+
+```text
+--moe-megakernel-backend mok
+--moe-megakernel-backend-config '{"fwd_num_comm_sms": 34, "bwd_num_comm_sms": 34, "minibatch_size": 8192, "macrobatch_size": 32768, "schedule_capacity_multiplier": 0.0625, "all_gather_top_experts_chunk_bytes": 2048}'
+--recompute-granularity selective --recompute-modules mhc --mhc-recompute-layer-num 2
+```
+
+The backend config replaces MoK's whole configuration, so keys left out take MoK's defaults (for
+example a `schedule_capacity_multiplier` of 0.5); give all six. The baseline ran 28/28
+communication SMs and minibatch 4096 with the same other values. MoK is built from its PR #7
+(commit `ad5e5b4`) with per-call host-overhead trims on top; both live in the MoK repository,
+and `MCORE_MOK_SKIP_UNROUTED_GRAD_MASK` needs at least that build. Recomputing only `mhc`
+instead of the baseline's `mla_up_proj mhc` trades activation memory for time; recomputation
+reruns the same kernels on the same inputs, so values are expected to match. The measured runs
+also set `MCORE_CSA2_PAD_ROW_CAPACITY=32`: the proxy data has at most one padding row per
+microbatch. The MoK build and its schedule options are outside Megatron-LM's bit-identity tests:
+keep them fixed when comparing switch settings, and keep `MCORE_CSA2_CUDNN_INDEXER_LOSS` and
+`MCORE_MHC_SP_CUTILE_PROJ_RMS` off when the comparison must be bit-identical.
