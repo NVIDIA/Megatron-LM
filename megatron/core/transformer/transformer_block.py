@@ -730,8 +730,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     mhc_context = mhc_layer_contexts[l_no]
-                    # The mHC layer consumes this context before CUDA-graph dispatch.
-                    # Inactive and ordinary layers receive no live replay state.
+                    # Contexts exist only while mHC replay is active; then every layer receives
+                    # one. HyperConnectionTransformerLayer removes it before CUDA-graph dispatch.
                     extra_layer_kwargs = (
                         {"residual_stream_recompute_context": mhc_context}
                         if mhc_context is not None
