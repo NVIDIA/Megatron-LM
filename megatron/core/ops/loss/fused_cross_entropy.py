@@ -1,0 +1,176 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+from typing import Tuple
+
+import torch
+
+from megatron.core.jit import jit_fuser
+from megatron.core.ops.loss.cross_entropy import VocabParallelCrossEntropy
+from megatron.core.tensor_parallel.utils import VocabUtility
+
+
+@jit_fuser
+def calculate_logits_max(vocab_parallel_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates the maximum logits of the predicted tokens.
+    """
+
+    vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
+        vocab_parallel_logits
+    )
+
+    return vocab_parallel_logits, logits_max
+
+
+# NOTE on in-place semantics under torch.compile:
+# Inductor keeps an input mutation in place only when the mutated value is consumed by
+# pointwise ops alone. If the same graph also reduces over it (``exp_logits.sum``) or
+# scatters into it (``grad[idx] -= ...``), Inductor materializes the new value in a fresh
+# [s, b, v] buffer and copies it back into the input, i.e. a full logits-sized transient
+# allocation plus an extra read/write pass (4 GB and ~2x the time for an 8k x 128k fp32
+# head). The vocab-sized in-place steps of VocabParallelCrossEntropy are therefore compiled
+# on their own, and the gather / scatter / row-sum run outside those graphs.
+
+_gather_predicted_logits = jit_fuser(VocabParallelCrossEntropy.gather_predicted_logits)
+_exp_logits_inplace = jit_fuser(VocabParallelCrossEntropy.exp_logits_inplace)
+_scale_gradients_inplace = jit_fuser(VocabParallelCrossEntropy.scale_gradients_inplace)
+
+
+def calculate_predicted_logits(
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    logits_max: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Calculates the predicted logits for the tokens.
+
+    ``vocab_parallel_logits`` is overwritten in place with exp(logits - logits_max) and
+    returned as ``exp_logits``; no logits-sized temporary is allocated.
+    """
+    target_mask, masked_target_1d, predicted_logits = _gather_predicted_logits(
+        vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+    )
+    _exp_logits_inplace(vocab_parallel_logits, logits_max)
+    exp_logits = vocab_parallel_logits
+    sum_exp_logits = exp_logits.sum(dim=-1)
+
+    predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
+
+    return target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits
+
+
+@jit_fuser
+def calculate_cross_entropy_loss(
+    exp_logits: torch.Tensor, predicted_logits_sum_exp_logits: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates the final cross entropy loss for the tokens.
+    """
+    split_val = predicted_logits_sum_exp_logits.size()[0] // 2
+    predicted_logits, sum_exp_logits = torch.split(predicted_logits_sum_exp_logits, split_val)
+
+    exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
+        exp_logits, predicted_logits, sum_exp_logits
+    )
+
+    return exp_logits, loss
+
+
+def calculate_gradients(
+    softmax: torch.Tensor,
+    grad_output: torch.Tensor,
+    target_mask: torch.Tensor,
+    masked_target_1d: torch.Tensor,
+    logits_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Calculate the logits gradients scaled based on the CE loss.
+
+    ``softmax`` is overwritten in place and returned as the gradient; no logits-sized
+    temporary is allocated.
+    """
+    grad_2d, arange_1d, softmax_update, grad_input = (
+        VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+    )
+
+    # Eager scatter over the [s * b] target entries, then the compiled pointwise scaling.
+    grad_2d[arange_1d, masked_target_1d] -= softmax_update
+    _scale_gradients_inplace(grad_input, grad_output)
+
+    # Emit the gradient in the dtype of the forward logits. If it differed, the autograd
+    # engine would insert its own cast (a non-vectorized, un-fusable copy over the full
+    # [s, b, v] tensor) before handing the gradient to the output layer's backward.
+    grad_input = grad_input.to(logits_dtype)
+
+    return grad_input
+
+
+class _VocabParallelCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, target, tp_group):
+        """
+        Forward implementation for the cross entropy loss.
+        """
+        # Record the incoming dtype: calculate_logits_max upcasts to fp32 (a no-op for fp32
+        # logits), and backward must return a gradient of the original dtype.
+        ctx.logits_dtype = vocab_parallel_logits.dtype
+        vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
+        torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+
+        # Get the partition's vocab indices
+        get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
+        partition_vocab_size = vocab_parallel_logits.size()[-1]
+        vocab_start_index, vocab_end_index = get_vocab_range(
+            partition_vocab_size, tp_group.rank(), tp_group.size()
+        )
+
+        target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (
+            calculate_predicted_logits(
+                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+            )
+        )
+
+        # All reduce is needed to get the chunks from other GPUs.
+        # In the fused case, tensors are batches to invoke a single
+        # AllReduce call
+        torch.distributed.all_reduce(
+            predicted_logits_sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+
+        exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
+
+        # Store softmax, target-mask and masked-target for backward pass.
+        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Backward implementation for the cross entropy loss.
+        """
+        # Retreive tensors from the forward path.
+        softmax, target_mask, masked_target_1d = ctx.saved_tensors
+
+        grad_input = calculate_gradients(
+            softmax, grad_output, target_mask, masked_target_1d, ctx.logits_dtype
+        )
+
+        return grad_input, None, None
+
+
+def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
+    """
+    Performs cross entropy loss when logits are split across tensor parallel ranks
+
+    Args:
+        vocab_parallel_logits: logits split across tensor parallel ranks
+                               dimension is [sequence_length, batch_size, hidden_size]
+
+        target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
+        tp_group: the tensor parallel group over which to all reduce
+
+    """
+    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)
