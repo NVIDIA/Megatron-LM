@@ -585,6 +585,42 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
     )
 
 
+@pytest.mark.skipif(not fused_mhc_kernels.is_cutile_available(), reason="cuTile unavailable")
+def test_mhc_single_pass_cutile_proj_rms_replays_fwd_bwd():
+    """The opt-in single-pass cuTile projection + RMS (MCORE_MHC_SP_CUTILE_PROJ_RMS,
+    ``eps_inside_sqrt=True``): fixed split-K and tile orders, at M 4096 and K 16384 (split-K
+    backward, and the M >= 2048 launch shapes), replay bit-exactly."""
+    seeded()
+    n = N
+    x = _mhc_rand(S * B, n * C)
+    weight = _mhc_rand(n * n + 2 * n, n * C, dtype=torch.float32)
+    alpha_pre = _mhc_rand(1, dtype=torch.float32)
+    alpha_post = _mhc_rand(1, dtype=torch.float32)
+    alpha_res = _mhc_rand(1, dtype=torch.float32)
+    bias = _mhc_rand(n * n + 2 * n, dtype=torch.float32)
+
+    def run(x, weight, alpha_pre, alpha_post, alpha_res, bias):
+        return fused_mhc_kernels.fused_proj_rms_compute_h(
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            backend="cutile",
+            eps_inside_sqrt=True,
+        )
+
+    assert_replays_bit_exact(
+        run,
+        (x, weight, alpha_pre, alpha_post, alpha_res, bias),
+        replays=3,
+        contention=True,
+        what="mhc single-pass proj_rms_compute_h[cutile]",
+    )
+
+
 @pytest.mark.skipif(not HAVE_TRITON, reason="requires Triton")
 @pytest.mark.parametrize("numel", [1 << 22, (1 << 22) + 777], ids=["whole_blocks", "ragged_tail"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

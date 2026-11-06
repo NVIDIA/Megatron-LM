@@ -292,7 +292,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         " fused_add_3_sequential (MCORE_MHC_SP_FUSED_GRAD_ADD, default exact) rounds after each "
         "add like the two ordered eager adds it replaces and matches them bit for bit; "
         "test_fused_triton_kernels compares and replays it, test_single_pass_mhc checks the "
-        "gradients of a sublayer chain with the switch off and on.",
+        "gradients of a sublayer chain with the switch off and on."
+        " The opt-in single-pass cuTile projection + RMS (MCORE_MHC_SP_CUTILE_PROJ_RMS, "
+        "eps_inside_sqrt) replays bit-exactly in test_fused_triton_kernels; it is not bit-identical "
+        "to the default Inductor single-pass mapping.",
     ),
     KernelEntry(
         name="streamwise_residual_ops",

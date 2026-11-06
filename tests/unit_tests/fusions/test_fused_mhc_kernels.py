@@ -771,6 +771,162 @@ class TestFusedProjRmsComputeH:
         _assert_cosine_similar(bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias")
 
 
+class TestCutileProjRmsEpsInsideSqrt:
+    """The single-pass (V4.1) cuTile proj_rms_compute_h kernels of MCORE_MHC_SP_CUTILE_PROJ_RMS.
+
+    ``eps_inside_sqrt=True`` uses inv = rsqrt(mean(x^2) + eps), returned as the fourth output.
+    The kernels use TF32 MMAs, so results are compared with an FP64 evaluation of the same
+    formula at TF32/BF16-level tolerances; a misplaced eps, scale or segment fails them by
+    orders of magnitude.
+    """
+
+    @staticmethod
+    def _truth(x, weight, alphas, bias, n, eps, compute_h_eps, probes):
+        """FP64 outputs, gradients and per-segment alpha-gradient scales."""
+        leaves = [t.detach().double().requires_grad_() for t in (x, weight, *alphas, bias)]
+        x64, w64, ap, apo, ar, b64 = leaves
+        normalized = (x64 @ w64.t()) * torch.rsqrt(x64.square().mean(-1, keepdim=True) + eps)
+        N = normalized.shape[-1]
+        alpha = torch.cat([ap.expand(n), apo.expand(n), ar.expand(N - 2 * n)])
+        logits = normalized * alpha + b64
+        outputs = (
+            logits[:, :n].sigmoid() + compute_h_eps,
+            logits[:, n : 2 * n].sigmoid() * 2,
+            logits[:, 2 * n :],
+            torch.rsqrt(x64.square().mean(-1, keepdim=True) + eps),
+        )
+        loss = sum((output * probe.double()).sum() for output, probe in zip(outputs, probes))
+        grads = torch.autograd.grad(loss, leaves)
+        # Each alpha gradient is one sum of these summands; bound its error by their magnitude.
+        with torch.no_grad():
+            s_pre, s_post = logits[:, :n].sigmoid(), logits[:, n : 2 * n].sigmoid()
+            dlogits = torch.cat(
+                (
+                    probes[0].double() * s_pre * (1 - s_pre),
+                    probes[1].double() * 2 * s_post * (1 - s_post),
+                    probes[2].double(),
+                ),
+                dim=-1,
+            )
+            summands = (dlogits * normalized).abs()
+            scales = (
+                summands[:, :n].sum(),
+                summands[:, n : 2 * n].sum(),
+                summands[:, 2 * n :].sum(),
+            )
+        return [o.detach() for o in outputs], grads, scales
+
+    @_require_cutile
+    @pytest.mark.parametrize("M,n,K", [(256, 4, 8192), (2048, 4, 16384)])
+    def test_fwd_bwd_vs_fp64_reference(self, M, n, K):
+        """Outputs and all gradients follow the V4.1 formula (split-K backward, K >= 8192)."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        torch.manual_seed(1301)
+        N = n * n + 2 * n
+        eps, compute_h_eps = 1e-6, 1e-6
+        x = _rand(M, K)
+        weight = _rand(N, K).float()
+        alphas = [torch.tensor([value], device=DEVICE) for value in (0.3, -0.2, 0.1)]
+        bias = _rand(N).float()
+        probes = [
+            torch.randn(M, n, device=DEVICE),
+            torch.randn(M, n, device=DEVICE),
+            torch.randn(M, N - 2 * n, device=DEVICE),
+            torch.randn(M, 1, device=DEVICE),
+        ]
+        leaves = [t.clone().requires_grad_() for t in (x, weight, *alphas, bias)]
+        outputs = fused_proj_rms_compute_h(
+            *leaves[:2],
+            *leaves[2:5],
+            leaves[5],
+            n,
+            eps,
+            compute_h_eps,
+            backend="cutile",
+            eps_inside_sqrt=True,
+        )
+        loss = sum((output.float() * probe).sum() for output, probe in zip(outputs, probes))
+        grads = torch.autograd.grad(loss, leaves)
+        truth_outputs, truth_grads, alpha_scales = self._truth(
+            x, weight, alphas, bias, n, eps, compute_h_eps, probes
+        )
+
+        def relative(actual, expected):
+            return ((actual.double() - expected).norm() / expected.norm()).item()
+
+        names = ("h_pre", "h_post", "h_res", "inv")
+        for name, actual, expected in zip(names, outputs, truth_outputs):
+            assert actual.dtype == torch.float32, name
+            assert relative(actual, expected) < 2e-3, name
+        assert relative(grads[0], truth_grads[0]) < 5e-3, "x (BF16 gradient)"
+        assert relative(grads[1], truth_grads[1]) < 2e-3, "weight"
+        assert relative(grads[5], truth_grads[5]) < 2e-3, "bias"
+        for name, actual, expected, scale in zip(
+            ("alpha_pre", "alpha_post", "alpha_res"), grads[2:5], truth_grads[2:5], alpha_scales
+        ):
+            assert abs(actual.double().item() - expected.item()) <= 2e-3 * scale.item(), name
+
+    @_require_cutile
+    def test_other_backends_reject_eps_inside_sqrt(self):
+        """Only the cuTile kernels implement the single-pass RMS."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        x, weight, bias = _rand(128, 8192), _rand(24, 8192).float(), _rand(24).float()
+        alpha = torch.ones(1, device=DEVICE)
+        with pytest.raises(ValueError, match="eps_inside_sqrt"):
+            fused_proj_rms_compute_h(
+                x, weight, alpha, alpha, alpha, bias, 4, backend="native", eps_inside_sqrt=True
+            )
+
+    @_require_cutile
+    @pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+    def test_static_launch_shapes_change_only_for_single_pass(self, monkeypatch, eps_inside_sqrt):
+        """Only single-pass launches with M >= 2048 use split-K 8 (forward) and TILE_K 64
+        (split-K backward); every multi-pass cuTile user keeps its static configuration."""
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        for M in (64, 1024, 2048, 4096):
+            for K in (512, 4096, 8192, 16384, 20480):
+                *_, split_k = kernels._default_proj_rms_fwd_config(M, K, 32)
+                assert split_k == (16 if K >= 16384 else 8 if K >= 8192 else 1), (M, K)
+                *_, split_k = kernels._default_proj_rms_fwd_config(M, K, 32, True)
+                wide = M >= 2048
+                expected = 16 if K >= 16384 and not wide else 8 if K >= 8192 else 1
+                assert split_k == expected, (M, K)
+        if kernels._CUTILE_EXPERIMENTAL_AVAILABLE:
+            pytest.skip("autotuned launch shapes replace the static fallback")
+
+        launches = []
+        launch = kernels.ct.launch
+
+        def recording_launch(stream, grid, kernel, *args, **kwargs):
+            launches.append((kernel, tuple(grid)))
+            return launch(stream, grid, kernel, *args, **kwargs)
+
+        monkeypatch.setattr(kernels.ct, "launch", recording_launch)
+        M, n, K = 2048, 4, 16384
+        leaves = [
+            t.requires_grad_()
+            for t in (
+                _rand(M, K),
+                _rand(n * n + 2 * n, K).float(),
+                torch.full((1,), 0.3, device=DEVICE),
+                torch.full((1,), -0.2, device=DEVICE),
+                torch.full((1,), 0.1, device=DEVICE),
+                _rand(n * n + 2 * n).float(),
+            )
+        ]
+        outputs = kernels.fused_proj_rms_compute_h(
+            *leaves, n, backend="cutile", eps_inside_sqrt=eps_inside_sqrt
+        )
+        sum(output.float().sum() for output in outputs).backward()
+        grids = {kernel: grid for kernel, grid in launches}
+        assert grids[kernels._ct_proj_rms_fwd_kernel][1] == (8 if eps_inside_sqrt else 16)
+        tile_k = 64 if eps_inside_sqrt else 128
+        assert grids[kernels._ct_fused_grad_x_weight_kernel] == (math.ceil(K / tile_k),)
+
+
 # ============================================================================
 # End-to-end pipeline (all four kernels chained)
 # ============================================================================

@@ -3,6 +3,7 @@
 import logging
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Optional, Tuple
@@ -412,6 +413,10 @@ class HyperConnectionModule(MegatronModule):
         layer_number: Current layer index for initialization
     """
 
+    # MCORE_MHC_SP_CUTILE_PROJ_RMS (fused_mhc_kernels.SINGLE_PASS_CUTILE_PROJ_RMS): set in
+    # __init__ when single-pass mappings use the cuTile split-K proj_rms_compute_h kernels.
+    _single_pass_cutile_proj_rms = False
+
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
         self.config = config
@@ -474,6 +479,18 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
             self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
             self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
+            # The cuTile kernels build (tile_m, n) tiles, and cuTile tile dimensions must be powers
+            # of two; the backward tiles the n^2 + 2n mapping outputs in one tile of <= 256.
+            if (
+                self.single_pass
+                and self.n & (self.n - 1) == 0
+                and self.n * self.n + 2 * self.n <= 256
+            ):
+                from megatron.core.fusions.fused_mhc_kernels import (
+                    single_pass_cutile_proj_rms_enabled,
+                )
+
+                self._single_pass_cutile_proj_rms = single_pass_cutile_proj_rms_enabled(backend)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
@@ -570,9 +587,69 @@ class HyperConnectionModule(MegatronModule):
             self.compute_h_eps,
         )
 
+    def _single_pass_cutile_supports(self, hidden_states: Tensor) -> bool:
+        """Inputs the cuTile kernels tile exactly (128-token, 256-column multiples, aligned).
+
+        Only the split-K backward path (K = n * hidden >= 8192) is routed: in a 4-layer chain the
+        small-K backward kernel's alpha gradients were up to ~120x further from an FP32 reference
+        than the Inductor path's at K = 4096, while K = 8192 and the V4.1 K = 20480 match it.
+        """
+        weight = self.mapping_proj.weight
+        tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        return (
+            hidden_states.is_cuda
+            and hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and hidden_states.is_contiguous()
+            and tokens > 0
+            and tokens % 128 == 0
+            and hidden_states.shape[-1] % 256 == 0
+            and hidden_states.shape[-1] >= 8192
+            and hidden_states.data_ptr() % 16 == 0
+            and weight.dtype == torch.float32
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def _single_pass_coefficients_cutile(
+        self, hidden_states: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """MCORE_MHC_SP_CUTILE_PROJ_RMS: _single_pass_coefficients on the cuTile split-K kernels.
+
+        Same formula and FP32 outputs (inv = rsqrt(mean(x^2) + eps), h_pre = sigmoid + eps,
+        h_post = 2 * sigmoid, raw residual logits). The kernels read the residual in its own
+        dtype (TF32 MMA, FP32 accumulation) instead of an FP32 copy, merge the projection and
+        RMS gradients in FP32 before one rounding to the residual dtype, and save a view of the
+        residual's storage, so checkpoint storage rebinding still reaches backward.
+        """
+        s, b, width = hidden_states.shape
+        n = self.n
+        pre, post, residual, _ = self._proj_rms_compute_h_op(
+            hidden_states.view(s * b, width),
+            self.mapping_proj.weight,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            n,
+            self.norm_eps,
+            self.compute_h_eps,
+            eps_inside_sqrt=True,
+        )
+        return pre.view(s, b, n), post.view(s, b, n), residual.view(s, b, n, n)
+
     def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Predict FP32 coefficients, then apply the configured Sinkhorn kernel."""
-        pre, post, residual = self._single_pass_coefficients(hidden_states)
+        if self._single_pass_cutile_proj_rms and self._single_pass_cutile_supports(hidden_states):
+            pre, post, residual = self._single_pass_coefficients_cutile(hidden_states)
+        else:
+            if self._single_pass_cutile_proj_rms:
+                warnings.warn(
+                    f"MCORE_MHC_SP_CUTILE_PROJ_RMS: residual {tuple(hidden_states.shape)} "
+                    f"{hidden_states.dtype} is not tiled by the cuTile kernels; using the "
+                    "Inductor single-pass mapping",
+                    stacklevel=2,
+                )
+            pre, post, residual = self._single_pass_coefficients(hidden_states)
         residual = self._sinkhorn_op(residual, self.sinkhorn_iterations, self.sinkhorn_eps)
         return pre, post, residual
 

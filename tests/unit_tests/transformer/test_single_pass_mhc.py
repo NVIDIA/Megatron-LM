@@ -581,3 +581,38 @@ def test_fused_grad_add_mode_parsing(value, mode):
             hyper_connection._parse_single_pass_fused_grad_add(value)
     else:
         assert hyper_connection._parse_single_pass_fused_grad_add(value) == mode
+
+
+def test_cutile_proj_rms_is_opt_in_and_falls_back(monkeypatch):
+    """MCORE_MHC_SP_CUTILE_PROJ_RMS is off by default, so single-pass modules keep the Inductor
+    mapping. On, residuals the cuTile kernels do not tile (K = n * hidden < 8192 here) warn and
+    keep the Inductor mapping, bit for bit."""
+    import os
+
+    from megatron.core.fusions import fused_mhc_kernels
+    from tests.unit_tests.determinism.kernels.harness import bytes_equal
+
+    if os.environ.get("MCORE_MHC_SP_CUTILE_PROJ_RMS") is None:
+        assert fused_mhc_kernels.SINGLE_PASS_CUTILE_PROJ_RMS is False
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=True,
+    )
+    monkeypatch.setattr(fused_mhc_kernels, "SINGLE_PASS_CUTILE_PROJ_RMS", False)
+    assert not HyperConnectionModule(config, 1)._single_pass_cutile_proj_rms
+    if not fused_mhc_kernels.is_cutile_available():
+        pytest.skip("cuTile unavailable")
+    monkeypatch.setattr(fused_mhc_kernels, "SINGLE_PASS_CUTILE_PROJ_RMS", True)
+    torch.manual_seed(1302)
+    module = HyperConnectionModule(config, 1).cuda()
+    assert module._single_pass_cutile_proj_rms
+    hidden = torch.randn(128, 1, 4 * 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.warns(UserWarning, match="MCORE_MHC_SP_CUTILE_PROJ_RMS"):
+        routed = module.compute_mappings(hidden)
+    monkeypatch.setattr(module, "_single_pass_cutile_proj_rms", False)
+    for actual, expected in zip(routed, module.compute_mappings(hidden)):
+        assert bytes_equal(actual, expected)
