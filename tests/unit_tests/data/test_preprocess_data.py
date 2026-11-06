@@ -13,7 +13,7 @@ import requests
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.tokenizers.text.libraries.megatron_hf_tokenizer import MEGATRON_CONFIG_MAP
 from tools.merge_datasets import main as merge_main
-from tools.preprocess_data import Encoder
+from tools.preprocess_data import Encoder, PunktTokenizer
 from tools.preprocess_data import get_args as build_args
 from tools.preprocess_data import main as build_main
 
@@ -265,6 +265,66 @@ def test_preprocess_data_bert():
         ]
 
         do_test_preprocess_data(temp_dir, extra_args=bert_args)
+
+
+@pytest.mark.skipif(PunktTokenizer is None, reason="requires NLTK >= 3.9 (punkt_tab)")
+@pytest.mark.parametrize("keep_newlines", [False, True])
+def test_preprocess_data_split_sentences_single_invocation(tmp_path, monkeypatch, keep_newlines):
+    """One --split-sentences run with a single partition writes the sentence-level dataset."""
+    pytest.importorskip("transformers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    # An empty Punkt model is enough to split these sentences and keeps the test offline.
+    nltk_data = tmp_path / "nltk_data"
+    punkt_dir = nltk_data / "tokenizers" / "punkt_tab" / "english"
+    punkt_dir.mkdir(parents=True)
+    for name in ["collocations.tab", "sent_starters.txt", "abbrev_types.txt", "ortho_context.tab"]:
+        (punkt_dir / name).touch()
+    monkeypatch.setenv("NLTK_DATA", str(nltk_data))
+    monkeypatch.setattr(nltk.data, "path", [str(nltk_data)] + nltk.data.path)
+    monkeypatch.setattr(nltk, "download", lambda *args, **kwargs: True)
+
+    words = ["[UNK]", "<eod>", "Hello", "world", "This", "is", "a", "test", "Bye", ".", "!"]
+    backend = Tokenizer(
+        models.WordLevel(vocab={word: i for i, word in enumerate(words)}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer_dir = tmp_path / "tokenizer"
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", eos_token="<eod>"
+    ).save_pretrained(tokenizer_dir)
+
+    input_path = tmp_path / "docs.jsonl"
+    with open(input_path, "w") as writer:
+        writer.write(json.dumps({"text": "Hello world. This is a test."}) + "\n")
+        writer.write(json.dumps({"text": "Bye!"}) + "\n")
+
+    output_prefix = tmp_path / "docs"
+    argv = [
+        "preprocess_data.py",
+        "--input",
+        str(input_path),
+        "--output-prefix",
+        str(output_prefix),
+        "--tokenizer-type",
+        "HuggingFaceTokenizer",
+        "--tokenizer-model",
+        str(tokenizer_dir),
+        "--split-sentences",
+        "--workers",
+        "1",
+    ]
+    if keep_newlines:
+        argv.append("--keep-newlines")
+    monkeypatch.setattr(sys, "argv", argv)
+    build_main()
+
+    # Two sentences in the first document, one in the second.
+    dataset = IndexedDataset(f"{output_prefix}_text_sentence")
+    sentences = [dataset[i].tolist() for i in range(len(dataset))]
+    assert dataset.document_indices.tolist() == [0, 2, 3]
+    assert sentences == [[2, 3, 9], [4, 5, 6, 7, 9], [8, 10]]
 
 
 if __name__ == "__main__":
