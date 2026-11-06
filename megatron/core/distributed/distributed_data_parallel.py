@@ -360,7 +360,7 @@ class DistributedDataParallel(_BaseDataParallel):
             if (
                 self.ddp_config.use_distributed_optimizer
                 and param_layout is not None
-                and not param_layout.uses_distributed_optimizer
+                and not param_layout.use_distributed_optimizer
             ):
                 # The layout keeps this buffer replicated while the distributed optimizer shards
                 # the other buffers of this chunk (the compact LayerWise layout). Its buckets

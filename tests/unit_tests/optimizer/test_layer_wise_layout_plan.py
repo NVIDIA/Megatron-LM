@@ -127,7 +127,7 @@ def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
 def _full_layout(sharded):
     """A full layout whose only LayerWise buffer is sharded (padded) or not (compact)."""
     key = type("BufferKey", (), {"is_managed_by_layer_wise_optimizer": True})()
-    return SimpleNamespace(layouts={key: SimpleNamespace(uses_distributed_optimizer=sharded)})
+    return SimpleNamespace(layouts={key: SimpleNamespace(use_distributed_optimizer=sharded)})
 
 
 def test_resolve_param_layout_follows_the_grad_collective():
