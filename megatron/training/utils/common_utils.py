@@ -54,15 +54,26 @@ from megatron.training import get_adlr_autoresume, get_args, get_timers
 from megatron.training.global_vars import get_run_config
 
 
+def _get_device_type() -> str:
+    """Return the current accelerator type (e.g. 'cuda', 'xpu'), defaulting to 'cuda'."""
+    accelerator = torch.accelerator.current_accelerator()
+    return accelerator.type if accelerator is not None else "cuda"
+
+
+def _get_device() -> torch.device:
+    """Return the accelerator device without an index; tensors land on the current device."""
+    return torch.device(_get_device_type())
+
+
 def _compute_norm_2(params_list):
-    """Compute squared L2 norm of a list of tensors. Returns a CUDA scalar."""
+    """Compute squared L2 norm of a list of tensors. Returns an accelerator scalar."""
     if len(params_list) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=_get_device())
         norm, _ = multi_tensor_applier(
             multi_tensor_l2norm, dummy_overflow_buf, [params_list], False,
         )
         return norm * norm
-    return torch.zeros((1,), dtype=torch.float32, device='cuda')
+    return torch.zeros((1,), dtype=torch.float32, device=_get_device())
 
 
 def _get_param_data(param, force_create_fp32_copy, bf16):
@@ -276,7 +287,7 @@ def _calc_mimo_params_l2_norm(
     """Calculate a combined parameter L2 norm across MIMO model grids."""
     model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
     module_names = sorted(model_chunks[0].mimo_config.module_to_grid_map)
-    norm_sq = torch.zeros(len(module_names), device='cuda', dtype=torch.float32)
+    norm_sq = torch.zeros(len(module_names), device=_get_device(), dtype=torch.float32)
 
     for index, name in enumerate(module_names):
         if name not in pg_collection.keys():
@@ -310,12 +321,12 @@ def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
     for param in params:
         params_data[param._spec].append(param._local_tensor)
 
-    total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
+    total_norm_2 = torch.zeros((1,), dtype=torch.float32, device=_get_device())
+    dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device=_get_device())
     for dtensor_spec, local_tensors in params_data.items():
         local_tensors = [t for t in local_tensors if t.numel() > 0]
         if len(local_tensors) == 0:
-            norm = torch.zeros((1,), dtype=torch.float32, device='cuda')
+            norm = torch.zeros((1,), dtype=torch.float32, device=_get_device())
         else:
             norm, _ = multi_tensor_applier(
                 multi_tensor_l2norm, dummy_overflow_buf, [local_tensors], False  # no per-parameter norm.
@@ -375,7 +386,7 @@ def reduce_max_stat_across_model_parallel_group(
         group = mpu.get_model_parallel_group()
     if stat is None:
         stat = -1.0
-    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
+    stat = torch.tensor([stat], dtype=torch.float32, device=_get_device())
     torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=group)
     if stat.item() == -1.0:
         # No rank has a valid stat, so return None to indicate that it is None across all ranks.
@@ -398,7 +409,7 @@ def logical_and_across_model_parallel_group(
         input = 1
     else:
         input = 0
-    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
+    input = torch.tensor([input], dtype=torch.int, device=_get_device())
     torch.distributed.all_reduce(input, op=torch.distributed.ReduceOp.MIN, group=group)
     return bool(input.item())
 
@@ -410,14 +421,17 @@ def report_memory(name, process_group=None):
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
     cfg = get_run_config()
+    device_module = getattr(torch, _get_device_type())
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
-    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
-    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
-    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if cfg.logger.log_device_memory_used:
-        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
+    string += f" | allocated: {device_module.memory_allocated() / mega_bytes:.2f}"
+    string += f" | max allocated: {device_module.max_memory_allocated() / mega_bytes:.2f}"
+    string += f" | reserved: {device_module.memory_reserved() / mega_bytes:.2f}"
+    string += f" | max reserved: {device_module.max_memory_reserved() / mega_bytes:.2f}"
+    if cfg.logger.log_device_memory_used and hasattr(device_module, "device_memory_used"):
+        string += (
+            f" | total device memory used: {device_module.device_memory_used() / mega_bytes:.2f}"
+        )
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0
         if process_group is not None
@@ -619,7 +633,10 @@ def is_first_or_last_pipeline_stage(vp_stage):
 
 def get_device_arch_version():
     """Returns GPU arch version (8: Ampere, 9: Hopper, 10: Blackwell, ...)"""
-    return torch.cuda.get_device_properties(torch.device("cuda:0")).major
+    device_type = _get_device_type()
+    device_module = getattr(torch, device_type)
+    props = device_module.get_device_properties(torch.device(device_type, 0))
+    return getattr(props, "major", 0)
 
 
 def get_blend_and_blend_per_split(args):
