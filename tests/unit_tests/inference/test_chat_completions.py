@@ -54,12 +54,15 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
-    _tokenize_with_media_slots_sync,
+    _TemplateRenderer,
+    _tokenize_chat_template_sync,
+    _tokenize_with_media_slots,
 )
 from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_BODY,
     CHAT_PATH,
     NOT_A_NUMBER_ERROR,
+    NOT_AN_INT_ERROR,
     ReplyingClient,
     Tokenizer,
     build_app,
@@ -737,7 +740,7 @@ def test_tokenize_with_media_slots_lowers_slots_to_model_tokens(
     )
 
     with expectation:
-        tokens = _tokenize_with_media_slots_sync(
+        tokens = _tokenize_chat_template_sync(
             tokenizer,
             messages=[],
             media_slots=[("__S0__", modality, 0)],
@@ -790,13 +793,9 @@ def _endpoint_prompt_tokens(messages, prompt_config):
         messages, prompt_config
     )
     template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
-    return _tokenize_with_media_slots_sync(
-        _SegmentTokenizer(),
-        template_messages,
-        media_slots,
-        prompt_config,
-        tools=None,
-        chat_template_kwargs={},
+    tokenizer = _SegmentTokenizer()
+    return _tokenize_with_media_slots(
+        tokenizer.apply_chat_template(template_messages), media_slots, tokenizer, prompt_config
     )
 
 
@@ -922,12 +921,16 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     function is what lets the endpoint hand the whole thing to the tokenize
     executor in one hop, on the thread that owns the private tokenizer copy.
     """
-    assert not inspect.iscoroutinefunction(_tokenize_with_media_slots_sync)
-    # And the endpoint must not have kept a direct call that skips the executor.
-    src = inspect.getsource(chat_completions_module.chat_completions)
-    assert "_tokenize_with_media_slots_sync" in src
+    assert not inspect.iscoroutinefunction(_tokenize_chat_template_sync)
+    # Executor dispatch is owned by the renderer; the endpoint must not call the sync function
+    # directly, and the renderer must hand it to the executor rather than await it.
+    assert "_tokenize_chat_template_sync" not in inspect.getsource(
+        chat_completions_module.chat_completions
+    )
+    src = inspect.getsource(_TemplateRenderer.tokenize)
+    assert "_tokenize_chat_template_sync" in src
     for line in src.splitlines():
-        if "_tokenize_with_media_slots_sync" in line:
+        if "_tokenize_chat_template_sync" in line:
             assert "await" not in line, f"must be dispatched via the executor, got: {line.strip()}"
 
 
@@ -1456,7 +1459,7 @@ async def test_multimodal_prefix_stitching_submits_exact_prefix_and_compact_suff
     app, client = _prefix_stitching_app(tokenizer=tokenizer_cls())
 
     with mock.patch.object(
-        chat_completions_module, "_tokenize_with_media_slots_sync", side_effect=tokenize
+        chat_completions_module, "_tokenize_chat_template_sync", side_effect=tokenize
     ):
         response = await app.test_client().post(CHAT_PATH, json=request_json)
 
@@ -1474,13 +1477,11 @@ async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_hi
 ):
     app, client = _prefix_stitching_app()
     history = _MEDIA_HISTORY if prefix_has_media else _TEXT_HISTORY
-    # A text-only history renders through the plain template path.
-    tokenize_helper = (
-        "_tokenize_with_media_slots_sync" if prefix_has_media else "_apply_chat_template_sync"
-    )
 
     with mock.patch.object(
-        chat_completions_module, tokenize_helper, side_effect=_fake_tokenize(history, [30])
+        chat_completions_module,
+        "_tokenize_chat_template_sync",
+        side_effect=_fake_tokenize(history, [30]),
     ):
         response = await app.test_client().post(
             CHAT_PATH,
@@ -1607,8 +1608,8 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
         pytest.param(
             {"messages": "hi"}, {}, 400, "'messages' must be a list", id="messages-not-a-list"
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # A sampling field of the wrong type is a client error, whether the conversion raises
+        # ValueError or TypeError.
         pytest.param(
             {**CHAT_BODY, "temperature": "hot"},
             {},
@@ -1616,7 +1617,7 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},
@@ -1803,6 +1804,7 @@ _CHAT_LOGPROBS = {
                 "content": "<30><31>",
                 "prompt_token_ids": [10, 2],
                 "generation_token_ids": [30, 31],
+                "generation_log_probs": [-0.5, -0.25],
                 "raw_text": "<10><2><30><31>",
             },
             "stop",
@@ -1814,7 +1816,12 @@ _CHAT_LOGPROBS = {
             {},
             {"eval_mode": False},
             None,
-            {"content": "<30><31>", "prompt_token_ids": [10, 2], "generation_token_ids": [30, 31]},
+            {
+                "content": "<30><31>",
+                "prompt_token_ids": [10, 2],
+                "generation_token_ids": [30, 31],
+                "generation_log_probs": [-0.5, -0.25],
+            },
             "stop",
             None,
             id="rl-default-echoes-token-ids",
@@ -1924,11 +1931,7 @@ async def test_chat_response_format(
     }
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
-    assert choice_0["message"] == {
-        "role": "assistant",
-        "generation_log_probs": [-0.5, -0.25],
-        **expected_message,
-    }
+    assert choice_0["message"] == {"role": "assistant", **expected_message}
     assert choice_0["finish_reason"] == expected_finish_reason
     assert choice_0["logprobs"] == expected_logprobs
     assert (choice_0["moe_topk_indices"], choice_0["prompt_moe_topk_indices"]) == (
@@ -1943,20 +1946,24 @@ async def test_chat_response_format(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reply_fields", "warns"),
+    ("logprobs", "reply_fields", "warns"),
     [
-        ({}, True),
-        ({"generated_log_probs": [-0.5, -0.25]}, False),
-        ({"payload_offloaded": True}, False),
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"generated_log_probs": [-0.5, -0.25]}, False),
+        (True, {"payload_offloaded": True}, False),
     ],
-    ids=["missing", "present", "offloaded"],
+    ids=["missing", "not-requested", "present", "offloaded"],
 )
-async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, warns, caplog):
+async def test_chat_warns_when_generation_log_probs_are_missing(
+    logprobs, reply_fields, warns, caplog
+):
     client = ReplyingClient([completed_reply("chat-0", [10, 2], [30, 31], **reply_fields)])
     app = build_app(CHAT_PATH, client)
+    body = {**CHAT_BODY, "logprobs": logprobs}
 
     with caplog.at_level(logging.WARNING):
-        response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+        response = await app.test_client().post(CHAT_PATH, json=body)
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert ("Generation log probs is None" in caplog.text) is warns
@@ -2205,7 +2212,7 @@ async def test_chat_real_parsers_shape_the_message(
     if "tool_calls" in message:
         # Ids are minted per call; the function is what the parser decided.
         message["tool_calls"] = [call["function"] for call in message["tool_calls"]]
-    assert message == {"role": "assistant", "generation_log_probs": None, **expected_message}
+    assert message == {"role": "assistant", **expected_message}
     assert choice["finish_reason"] == expected_finish_reason
 
 
