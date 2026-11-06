@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -85,8 +86,9 @@ if not HAVE_FA3:
 # The FA4 version is tracked by the `flash-attn-4` distribution metadata,
 # not `flash_attn.__version__` (which reports the 2.x version) or
 # `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
-# `is_fa_min_version` here.
-_MIN_FA4_VERSION = "4.0.0b20"
+# `is_fa_min_version` here. 4.0.0b25 is the first with the SM100 SwapAB decode kernel, which splits
+# each decode request's KV by its own length (per-request split counts); decode relies on it below.
+_MIN_FA4_VERSION = "4.0.0b25"
 flash_attn4_varlen_func = None
 try:
     from importlib.metadata import PackageNotFoundError
@@ -99,6 +101,48 @@ try:
         from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
 except (ImportError, PackageNotFoundError):
     HAVE_FA4 = False
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def fa4_num_splits(
+    batch_size: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_splits: int,
+    num_sms: Optional[int] = None,
+    tile_m: int = 128,
+    tile_n: int = 128,
+) -> int:
+    """Split-KV count for FA4 mixed (prefill + decode) attention: max(FA4's heuristic, min_splits).
+
+    Returns 0 (FA4 decides) when min_splits is 0. Otherwise mirrors the heuristic in
+    flash_attn.cute.interface for 128 x 128 tiles with GQA packed into the M tile,
+    min(num_SMs // (batch * kv_heads * m_blocks), 128, n_blocks), or 1 when the KV is at most
+    4 tiles, and raises it to min_splits, capped at n_blocks (further splits would be empty).
+
+    The heuristic only splits to fill idle SMs, so at large decode batch it picks 1 split: one
+    CTA per (request, KV head) walks that request's whole KV, and the kernel waits for the
+    longest request. FA4 divides each request's own KV evenly over the splits, so a floor of
+    min_splits bounds the longest request's CTA work by its length / min_splits.
+    """
+    if min_splits <= 0:
+        return 0
+    seqlen_q_packed = max_seqlen_q * (num_heads_q // num_heads_kv)
+    q_stage = 2 if seqlen_q_packed > tile_m else 1
+    num_m_blocks = -(-seqlen_q_packed // (q_stage * tile_m))
+    num_n_blocks = -(-max_seqlen_k // tile_n)
+    if num_n_blocks <= 4:
+        return 1
+    if num_sms is None:
+        num_sms = _num_sms(torch.cuda.current_device())
+    heuristic = min(num_sms // (batch_size * num_heads_kv * num_m_blocks), 128, num_n_blocks)
+    return min(max(heuristic, min_splits), num_n_blocks)
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -1150,7 +1194,18 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=(
+                        1
+                        if self.batch_invariant_mode
+                        else fa4_num_splits(
+                            cu_seqlens_q.shape[0] - 1,
+                            q.shape[-2],
+                            k.shape[-2],
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            self.config.inference_fa4_min_num_splits,
+                        )
+                    ),
                     return_lse=need_lse,
                     **softcap_kwargs,
                 )
@@ -1298,6 +1353,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
+                        # FA4 decides: its SwapAB decode kernel picks per-request split counts.
                         num_splits=0 if not self.batch_invariant_mode else 1,
                         return_lse=need_lse,
                         **softcap_kwargs,
