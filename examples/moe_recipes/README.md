@@ -210,5 +210,7 @@ establish training convergence. Keep numerical checks enabled for qualification;
 disable them only for the timed run, as in the provided benchmark settings.
 Exclude compilation and graph capture from measurements; use the final 80 steps
 after at least 20 warmup steps, and verify that timing has stabilized.
+Periodic Python garbage collection is disabled during this bounded benchmark;
+startup collection remains enabled.
 Historical throughput values belong to the previous recipe revisions and are
 not measurements of the refreshed configuration.

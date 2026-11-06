@@ -152,7 +152,7 @@ ARGS:
   cross_entropy_fusion_impl: native
   no_create_attention_mask_in_dataloader: true
   manual_gc: true
-  manual_gc_interval: 10
+  manual_gc_interval: 0
   use_varlen_dataset: true
   varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":65536,"max_seq_len":65536,"mean_seq_len":65536,"lognormal_sigma":1.1}'
   sequence_packing_scheduler: dp_balanced

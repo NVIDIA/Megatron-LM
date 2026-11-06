@@ -143,7 +143,7 @@ ARGS:
   cross_entropy_fusion_impl: native
   no_create_attention_mask_in_dataloader: true
   manual_gc: true
-  manual_gc_interval: 10
+  manual_gc_interval: 0
   lr: 0.00027
   min_lr: 2.7e-05
   lr_warmup_init: 2.7e-05
