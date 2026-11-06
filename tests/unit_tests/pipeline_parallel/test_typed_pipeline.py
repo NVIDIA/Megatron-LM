@@ -259,12 +259,20 @@ def test_gradient_wire_requires_every_declared_gradient():
         )
     )
     owner = SimpleNamespace(device=torch.device("cpu"))
-    wire = TypedP2PCommunicator._gradient_wire(owner, (torch.ones(3), None, None), spec)
-    assert len(wire) == 1  # Empty fields carry no data; integers carry no gradient.
-    with pytest.raises(ValueError, match="received no gradient"):
-        TypedP2PCommunicator._gradient_wire(owner, (None, None, None), spec)
+    wire = TypedP2PCommunicator._gradient_wire(
+        owner, (torch.ones(3), torch.empty(0, 2), None), spec
+    )
+    # Integers carry no gradient; the transfer posts no message for the empty one.
+    assert [t.numel() for t in wire] == [3, 0]
+    # The receiver allocates an empty gradient, which would run the producer's
+    # backward (and its auxiliary-loss hooks), so empty fields are not exempt.
+    for gradients in ((None, torch.empty(0, 2), None), (torch.ones(3), None, None)):
+        with pytest.raises(ValueError, match="received no gradient"):
+            TypedP2PCommunicator._gradient_wire(owner, gradients, spec)
     with pytest.raises(ValueError, match="Unexpected gradient"):
-        TypedP2PCommunicator._gradient_wire(owner, (torch.ones(3), None, torch.ones(3)), spec)
+        TypedP2PCommunicator._gradient_wire(
+            owner, (torch.ones(3), torch.empty(0, 2), torch.ones(3)), spec
+        )
     with pytest.raises(ValueError, match="incoming field slots"):
         TypedP2PCommunicator._gradient_wire(owner, (), spec)
 
@@ -424,7 +432,9 @@ def test_planned_exchange_posts_only_tensor_data(fake_transport, release):
         request.value = 7 if request.operation == "recv" else None
     handles["recv_prev"].wait()
     torch.testing.assert_close(received.tensors[0], torch.full((3,), 7.0))
-    gradients = backward_pipeline_payload(received, received.tensors[0].sum(), None)
+    loss = received.tensors[0].sum() + received.tensors[1].sum()
+    gradients = backward_pipeline_payload(received, loss, None)
+    assert gradients[1].shape == (0,)  # A consumed empty field has an (empty) gradient.
     _, handles = communicator.send_backward_recv_backward(
         gradients, True, None, overlap_p2p_comm=True, send_chunk_id=1, recv_chunk_id=0
     )

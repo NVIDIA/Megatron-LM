@@ -163,10 +163,9 @@ class TypedP2PCommunicator(P2PCommunicator):
                     raise ValueError(f"Unexpected gradient for pipeline field {field.key}")
                 continue
             if grad is None:
-                if 0 in field.shape:
-                    continue
                 # Zero-filling would run producer-side auxiliary-loss hooks for an unused
                 # branch, so an unused field must be declared non-differentiable instead.
+                # Empty fields too: the receiver's empty gradient still runs the producer.
                 raise ValueError(
                     f"Pipeline field {field.key} is differentiable but received no gradient; "
                     "declare it non-differentiable in this microbatch's plan"

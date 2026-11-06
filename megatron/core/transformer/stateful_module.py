@@ -141,23 +141,26 @@ class _GraphInputGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor):
         """Alias the input so its gradient passes through this node."""
+        # An unread input has no gradient. A zero would give its producer an
+        # optimizer update (e.g. weight decay) that eager execution skips.
+        ctx.set_materialize_grads(False)
         return tensor.view_as(tensor)
 
     @staticmethod
     def backward(ctx, gradient):
         """Copy the gradient out of the graph's reusable static buffer."""
-        return gradient.clone()
+        return None if gradient is None else gradient.clone()
 
 
 class _GraphOutputs(torch.autograd.Function):
     """Protect captured buffers and reject unsupported dynamic gradient activity."""
 
     @staticmethod
-    def forward(ctx, owner, slot, *outputs):
+    def forward(ctx, owner, slot, active, *outputs):
         """Track a graph slot's outputs without materializing absent gradients."""
         ctx.owner, ctx.slot = owner, slot
         ctx.generation = owner._generation[slot]
-        ctx.active = tuple(t.requires_grad for t in outputs)
+        ctx.active = active
         ctx.set_materialize_grads(False)
         result = tuple(t.view_as(t) for t in outputs)
         ctx.mark_non_differentiable(*(t for t, active in zip(result, ctx.active) if not active))
@@ -180,9 +183,14 @@ class _GraphOutputs(torch.autograd.Function):
         owner, slot = ctx.owner, ctx.slot
         for parameter in owner._fused_grad_params[slot]:
             parameter.grad_added_to_main_grad = True
+        # A graphed backward may return its static parameter-gradient buffers (torch
+        # does). An unset .grad adopts one, which this slot's next backward rewrites.
+        adopted = tuple(p for p in owner._parameters if p.grad is None)
         ctx.owner = None
-        torch.autograd.Variable._execution_engine.queue_callback(lambda: owner._release(slot))
-        return (None, None, *grads)
+        torch.autograd.Variable._execution_engine.queue_callback(
+            lambda: owner._finish_backward(slot, adopted)
+        )
+        return (None, None, None, *grads)
 
 
 class StatefulGraphs:
@@ -234,12 +242,15 @@ class StatefulGraphs:
             raise ValueError(f"Unsupported stateful graph backend: {backend}")
         self.region, self.device = region, hidden.device
         self.debug_checks = debug_checks
+        self._parameters = tuple(region.parameters())
         # The backends' own eval fallback only sees the unregistered slot wrappers,
         # so every replay compares the live module tree with the captured mode.
         self._modules = tuple(region.module.modules())
         self._modes = tuple(module.training for module in self._modules)
         samples = (hidden, *region.inputs.pack(state))
         self._signature = tuple(self._tensor_signature(t) for t in samples)
+        # Backends mark every floating replay output differentiable; the schema decides.
+        self._eligible = (True, *(f.differentiable for f in region.outputs.packed_fields))
         self._busy = [False] * slots
         self._generation = [0] * slots
         self._fused_grad_params = []
@@ -378,6 +389,13 @@ class StatefulGraphs:
         self._events[slot].record(torch.cuda.current_stream(self.device))
         self._recorded[slot], self._busy[slot] = True, False
 
+    def _finish_backward(self, slot, adopted):
+        """Give adopted parameter gradients their own storage, then retire the slot."""
+        for parameter in adopted:
+            if parameter.grad is not None:
+                parameter.grad = parameter.grad.clone()
+        self._release(slot)
+
     def close(self) -> None:
         """Release captures before destroying their process groups.
 
@@ -423,9 +441,10 @@ class StatefulGraphs:
             hook(module)
         args = (args[0], *(_GraphInputGrad.apply(t) if t.requires_grad else t for t in args[1:]))
         outputs = self._callables[slot](*args)
-        if torch.is_grad_enabled() and any(t.requires_grad for t in outputs):
+        active = tuple(eligible and t.requires_grad for eligible, t in zip(self._eligible, outputs))
+        if torch.is_grad_enabled() and any(active):
             self._busy[slot] = True
-            outputs = _GraphOutputs.apply(self, slot, *outputs)
+            outputs = _GraphOutputs.apply(self, slot, active, *outputs)
         else:
             # An eval/frozen invocation has no backward to hold the slot. Give
             # callers (including asynchronous P2P) independent output storage.

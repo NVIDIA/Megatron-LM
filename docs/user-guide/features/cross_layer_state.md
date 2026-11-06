@@ -84,9 +84,11 @@ parameter gather, pass `make_forward_pre_hook` so replays still run the
 parameter owners' gather hooks.
 
 Use independent slots for outstanding forwards; a slot cannot be reused until
-its backward completes. Forward-only and frozen invocations return independent
-copies, so another replay cannot overwrite outputs held by an asynchronous send.
-Replays on different streams wait for the previous invocation to finish copying.
+its backward completes. Parameter and state-input gradients never keep a slot's
+reusable buffers, so they accumulate correctly across replays. Forward-only and
+frozen invocations return independent copies, so another replay cannot overwrite
+outputs held by an asynchronous send. Replays on different streams wait for the
+previous invocation to finish copying.
 
 Input geometry, strides, dtypes, gradient profile, training mode and parameter
 storage must match capture. Input signatures and the training mode of every
@@ -105,9 +107,11 @@ buffers and registered buffers (e.g. router statistics), and suppress MCore DDP
 reductions during capture. CUDA graph creation must be serialized within a process.
 
 Every differentiable captured output must participate in one backward
-invocation. An unused output must be omitted from that capture profile; silently
-turning a missing gradient into a numeric zero would change optimizer and
-auxiliary-loss behavior. Full recomputation inside capture is rejected.
+invocation; outputs declared nondifferentiable need no gradient. An unused output
+must be omitted from that capture profile; silently turning a missing gradient
+into a numeric zero would change optimizer and auxiliary-loss behavior. For the
+same reason, an input the region does not read gets no gradient, as in eager
+execution. Full recomputation inside capture is rejected.
 
 For a skipped or failed iteration, first drain communication and stop scheduling
 work, then call `graphs.abort()` and discard its outputs. The slots can be reused;
@@ -167,7 +171,7 @@ Gradient eligibility is static per microbatch. A field declared differentiable
 must receive a gradient from its consumers; a missing gradient is an error rather
 than a silent zero, because a zero would still run producer-side auxiliary-loss
 hooks. Declare a branch that is unused for a microbatch non-differentiable in
-that microbatch's plan. Empty fields carry no data.
+that microbatch's plan. Empty fields carry no data but follow the same rule.
 
 Typed transport carries mixed dtypes and empty/absent fields. All differentiable
 output roots of a stage participate in one autograd traversal; relay and
