@@ -530,16 +530,16 @@ class CheckpointConfig:
     """Number of latest checkpoint to be saved."""
 
     save_optim: bool = True
-    """Save the optimizer state with every checkpoint (``--no-save-optim`` disables it)."""
+    """Whether to save the optimizer state with every checkpoint."""
 
     save_rng: bool = True
-    """Save the RNG state with every checkpoint (``--no-save-rng`` disables it)."""
+    """Whether to save the RNG state with every checkpoint."""
 
     load: str | None = None
     """Directory containing a model checkpoint."""
 
     load_optim: bool = True
-    """Load the optimizer state when loading a checkpoint (``--no-load-optim`` disables it)."""
+    """Whether to load the optimizer state when loading a checkpoint."""
 
     load_main_params_from_ckpt: bool = False
     """Load main parameters from checkpoint. When loading a model from a checkpoint without loading
@@ -548,7 +548,7 @@ class CheckpointConfig:
     """
 
     load_rng: bool = True
-    """Load the RNG state when loading a checkpoint (``--no-load-rng`` disables it)."""
+    """Whether to load the RNG state when loading a checkpoint."""
 
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
