@@ -771,9 +771,12 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
 
     Raises:
-        RuntimeError: If an expert is routed more than ``num_tokens - num_to_pad`` tokens, so
-            there are not enough zeros left in its row to reach the next multiple of
-            pad_multiple.
+        RuntimeError: On CPU, if an expert's ``num_ones + num_to_pad`` exceeds num_tokens, so
+            its row has too few zeros left to reach the next multiple of pad_multiple. On CUDA
+            the check is a ``torch._assert_async`` device-side assert. It surfaces as a CUDA
+            error at a subsequent CUDA operation or synchronization point, inside or after
+            this call, and the CUDA context is unusable afterwards, so callers cannot catch
+            it to fall back.
     """
     # Work on a copy because fused router autograd saves the returned routing
     # map for backward. Padding a transposed view in place would increment the
