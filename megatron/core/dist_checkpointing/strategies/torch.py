@@ -105,6 +105,36 @@ class MCoreSavePlan:
 logger = getLogger(__name__)
 
 
+# (default group, Gloo group) for the sync save's DCP coordination, see `_get_dcp_coordination_group`.
+_DCP_COORDINATION_GROUP: Optional[Tuple[Any, Any]] = None
+
+
+def _get_dcp_coordination_group() -> Optional[torch.distributed.ProcessGroup]:
+    """World-sized Gloo group for torch.distributed.checkpoint's coordination exchange.
+
+    During a save DCP gathers every rank's local plan on the coordinator, scatters the global plan
+    back (`gather_object` / `scatter_object_list`) and gathers the write results at the end. On an
+    NCCL group, gather / scatter run as point-to-point sends, so NCCL sets up P2P connections
+    (per-peer buffers) between the coordinator and every other rank. They stay allocated for the
+    communicator's lifetime, so the coordinator's non-PyTorch device memory grows by
+    (world size - 1) x the per-peer cost (about 0.4 GiB per peer measured on GB200) at the first
+    save. The exchanged objects are small pickles, so Gloo carries them without device memory.
+
+    Created on the first call (a collective call: every rank saves) and cached per default group.
+    Returns None (DCP then uses the default group) when torch.distributed is not initialized,
+    Gloo is unavailable, or the default group is already Gloo.
+    """
+    global _DCP_COORDINATION_GROUP
+    if not torch.distributed.is_initialized() or not torch.distributed.is_gloo_available():
+        return None
+    if torch.distributed.get_backend() == "gloo":
+        return None
+    world = torch.distributed.group.WORLD
+    if _DCP_COORDINATION_GROUP is None or _DCP_COORDINATION_GROUP[0] is not world:
+        _DCP_COORDINATION_GROUP = (world, torch.distributed.new_group(backend="gloo"))
+    return _DCP_COORDINATION_GROUP[1]
+
+
 def flatten_state_dict(
     state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, Dict[str, OBJ_PATH]]:
@@ -776,6 +806,7 @@ class TorchDistSaveShardedStrategy:
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
+            process_group=_get_dcp_coordination_group(),
         )
 
     def async_save(
