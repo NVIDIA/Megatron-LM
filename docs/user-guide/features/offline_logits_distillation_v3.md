@@ -110,6 +110,13 @@ Shuffling uses the groups published when the student first starts; that extent i
 with the student checkpoint and reused on resume, even if the teacher keeps publishing.
 Whether a dump is finished before shuffling it is up to you.
 
+With shuffling, a student budget (`--train-samples`, or `--train-iters` times the global
+batch size) larger than the shuffled extent replays it in whole passes, each group once per
+pass and each pass in a fresh order from the same seed (the first pass is the order a
+smaller budget would see). Raising the budget on resume only appends passes. Sequential
+loading never repeats: it reads a possibly growing dump and fails when the student runs
+past what is published.
+
 Sequential loading can read a teacher dump that is still growing without extra flags.
 When the next student iteration would cross the known published prefix, world rank 0
 lists the cache once and shares any newly published groups with every rank. If there are

@@ -411,6 +411,15 @@ def initialize_replay(args: Any) -> None:
                 if not groups:
                     raise ValueError("No complete teacher shard group is available to shuffle")
             available = sum(end - start for start, end in groups)
+            passes = 1
+            if shuffle:
+                # A fixed extent repeats in whole passes, each freshly shuffled, enough for the
+                # student budget (and any resumed cursor); a larger budget on resume only
+                # appends passes, keeping earlier ones intact.
+                budget = args.train_samples or args.train_iters * args.global_batch_size
+                needed = max(budget, args.consumed_train_samples)
+                passes = max(1, -(-needed // available))
+                available *= passes
             if args.consumed_train_samples > available:
                 raise ValueError(
                     f"Checkpoint sample cursor {args.consumed_train_samples} exceeds the "
@@ -421,6 +430,7 @@ def initialize_replay(args: Any) -> None:
                 "groups": groups,
                 "hole": hole,
                 "replay_end": replay_end,
+                "passes": passes,
             }
         except Exception as error:
             result[0] = {"error": f"{type(error).__name__}: {error}"}
@@ -431,13 +441,20 @@ def initialize_replay(args: Any) -> None:
     if shuffle:
         # Saved with the checkpoint's args so a resume shuffles the same groups.
         args.logits_load_replay_end = result[0]["replay_end"]
+    passes = result[0]["passes"]
     _PLAN = {
         **result[0],
-        "available": sum(end - start for start, end in result[0]["groups"]),
+        "available": passes * sum(end - start for start, end in result[0]["groups"]),
         "readers": [],
     }
     if rank == 0 and result[0]["hole"] is not None:
         print(f"WARNING: offline KD v3 cache: {describe_hole(result[0]['hole'])}", flush=True)
+    if rank == 0 and passes > 1:
+        print(
+            f"Offline KD v3 replay repeats its {_PLAN['available'] // passes} cached samples "
+            f"{passes} times to cover the student budget",
+            flush=True,
+        )
 
 
 def ensure_replay_frontier(args: Any) -> None:
@@ -452,7 +469,7 @@ def ensure_replay_frontier(args: Any) -> None:
     need = args.consumed_train_samples + get_current_global_batch_size()
     if need <= _PLAN["available"]:
         return
-    if args.logits_load_shuffle_shards is None:
+    if args.logits_load_shuffle_shards is None:  # Only a sequential plan grows.
         rank = dist.get_rank() if dist.is_initialized() else 0
         result = [None]
         if rank == 0:
@@ -597,6 +614,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             targets=mpu.is_pipeline_last_stage(),
             shuffle=args.logits_load_shuffle_shards is not None,
             seed=args.logits_load_shuffle_shards or 0,
+            passes=_PLAN["passes"],
             decode_threads=args.logits_load_decode_threads,
             prefetch_depth=args.logits_load_msc_prefetch_depth,
             chunk_bytes=args.logits_load_read_chunk_mb << 20,

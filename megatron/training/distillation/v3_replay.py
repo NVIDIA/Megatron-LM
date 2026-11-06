@@ -319,6 +319,7 @@ class ReplayReader:
         targets: bool = True,
         shuffle: bool = False,
         seed: int = 0,
+        passes: int = 1,
         decode_threads: int = 4,
         prefetch_depth: int = 2,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
@@ -337,11 +338,18 @@ class ReplayReader:
         self.masked_entries = 0
         self.target_entries = 0
         self._masking_warned = False
-        self.groups = [tuple(group) for group in groups]
-        if shuffle:
-            random.Random(seed).shuffle(self.groups)
+        # Each pass replays every group once; shuffled passes draw successive orders from one
+        # seeded generator, so the first pass matches a single-pass shuffle.
+        rng = random.Random(seed)
+        self.groups = []
+        for _ in range(passes):
+            order = [tuple(group) for group in groups]
+            if shuffle:
+                rng.shuffle(order)
+            self.groups.extend(order)
         self.targets = targets
-        self.shuffle = shuffle
+        # A shuffled or repeated replay covers a fixed extent; only a sequential one grows.
+        self.fixed = shuffle or passes > 1
         self.prefetch_depth = max(1, prefetch_depth)
         self.chunk_bytes = chunk_bytes
         self.pool = concurrent.futures.ThreadPoolExecutor(
@@ -368,8 +376,8 @@ class ReplayReader:
 
     def extend(self, groups: list[tuple[int, int]]) -> None:
         """Append newly published sequential groups (agreed collectively by all ranks)."""
-        if self.shuffle and groups:
-            raise RuntimeError("Shuffled offline KD replay cannot extend its group order")
+        if self.fixed and groups:
+            raise RuntimeError("Shuffled or repeated offline KD replay cannot extend its groups")
         with self.condition:
             self.groups.extend(tuple(group) for group in groups)
             self._reindex()
@@ -379,7 +387,7 @@ class ReplayReader:
         """Block a lane until group ``index`` is known, or return None at the end."""
         with self.condition:
             while index >= len(self.groups):
-                if self.closed or stopped.is_set() or self.shuffle:
+                if self.closed or stopped.is_set() or self.fixed:
                     return None
                 self.condition.wait(timeout=0.5)
             return self.groups[index]

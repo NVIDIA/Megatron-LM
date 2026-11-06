@@ -1241,6 +1241,7 @@ def build_loader_iterator(runtime, args, consumed):
 def test_loader_enables_shuffling_with_seed_zero(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = 0
+    args.train_iters = 8  # Exactly the 64 cached samples: one pass.
     storage, metadata = replay_cache(tmp_path, args, runtime, iterations=8)
     runtime.initialize_replay(args)
     iterator = build_loader_iterator(runtime, args, 0)
@@ -1287,6 +1288,61 @@ def test_shuffled_resume_requires_the_planned_extent(tmp_path, runtime_environme
         runtime.initialize_replay(args)
 
 
+def test_shuffled_replay_repeats_whole_passes(tmp_path, runtime_environment, monkeypatch):
+    args, runtime, _ = runtime_environment
+    args.train_iters = 10  # 80 samples from a 32-sample cache: three passes.
+    storage, metadata = replay_cache(tmp_path, args, runtime)
+    runtime.initialize_replay(args)
+    assert runtime._PLAN["passes"] == 3 and runtime._PLAN["available"] == 96
+    single = reader(storage, metadata, shuffle=True, seed=7)
+    full = reader(storage, metadata, shuffle=True, seed=7, passes=3)
+    args.consumed_train_samples = 32  # The second pass starts here.
+    iterator = build_loader_iterator(runtime, args, args.consumed_train_samples)
+    try:
+        assert iterator.reader.groups == full.groups
+        passes = [full.groups[i : i + 2] for i in (0, 2, 4)]
+        assert passes[0] == single.groups  # The first pass is the single-pass order.
+        assert all(sorted(order) == groups(storage, metadata) for order in passes)
+        assert next(iterator)["_kd_sample_ids"] == ids_of(full.samples([32, 33], 34))
+    finally:
+        iterator.close()
+        single.close()
+        full.close()
+    # A fixed extent never lists again, and running past the last pass fails on every rank.
+    monkeypatch.setattr(runtime, "discover_groups", lambda *a: pytest.fail("listed"))
+    args.consumed_train_samples = 88
+    runtime.ensure_replay_frontier(args)
+    args.consumed_train_samples = 96
+    with pytest.raises(RuntimeError, match="exhausted at 96 samples; requested 104"):
+        runtime.ensure_replay_frontier(args)
+
+
+def test_repeat_budget_growth_only_appends_passes(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    storage, metadata = replay_cache(tmp_path, args, runtime, iterations=8)
+    short = reader(storage, metadata, shuffle=True, seed=7, passes=2)
+    long = reader(storage, metadata, shuffle=True, seed=7, passes=5)
+    try:
+        assert long.groups[: len(short.groups)] == short.groups
+        assert long.total_samples == 5 * 64
+    finally:
+        short.close()
+        long.close()
+    # A resumed cursor beyond the budget still gets enough passes.
+    args.train_iters = 1
+    args.consumed_train_samples = 100
+    runtime.initialize_replay(args)
+    assert runtime._PLAN["passes"] == 2
+
+
+def test_sequential_replay_never_repeats(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    args.logits_load_shuffle_shards = None
+    replay_cache(tmp_path, args, runtime)
+    runtime.initialize_replay(args)  # Budget 1024 > 32 published samples.
+    assert runtime._PLAN["passes"] == 1 and runtime._PLAN["available"] == 32
+
+
 def test_sequential_resume_sees_new_groups(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     args.logits_load_shuffle_shards = None
@@ -1302,6 +1358,7 @@ def test_sequential_resume_sees_new_groups(tmp_path, runtime_environment):
 
 def test_resume_validates_sample_cursor(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
+    args.logits_load_shuffle_shards = None  # A shuffled plan would repeat to cover it.
     replay_cache(tmp_path, args, runtime)
     args.consumed_train_samples = 40
     with pytest.raises(RuntimeError, match="cursor 40 exceeds"):

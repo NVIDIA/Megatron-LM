@@ -3679,7 +3679,8 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-load-shuffle-shards', type=int, default=None, metavar='SEED',
                        help='Shuffle v3 teacher flush-range groups using this seed. The '
                             'shuffled extent is fixed at the first launch and restored on '
-                            'resume.')
+                            'resume; a student budget larger than it replays the extent in '
+                            'repeated passes, each in a fresh shuffled order.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
                        help='Number of decode threads for cached-logits zstd '
                             'decompression and torch.load processing.')
