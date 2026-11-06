@@ -731,6 +731,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
         n_loops: int | None = None,
+        recurrence_step: int | None = None,
     ) -> Any:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -747,6 +748,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             cp_batch: Input tensors and packed metadata keyed by CP layout.
             n_loops (int, optional): Explicit positive loop count for a recurrent decoder.
                 Overrides sampling for this forward only. Cached inference is not supported.
+            recurrence_step (int, optional): Logical training minibatch step, shared across
+                ranks and gradient-accumulation microbatches. Required for stochastic training
+                unless n_loops is supplied. Does not depend on local forward-call order.
             output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
                 it receives the decoder output and output-layer/loss helpers, and its return
                 value is returned directly. The default output projection, logits/loss
@@ -933,6 +937,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
                 **(dict(n_loops=n_loops) if n_loops is not None else {}),
+                **(dict(recurrence_step=recurrence_step) if recurrence_step is not None else {}),
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

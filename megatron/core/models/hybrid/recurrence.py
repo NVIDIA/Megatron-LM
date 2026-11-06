@@ -3,10 +3,9 @@
 """Layer-independent parsing and execution policy for depth recurrence."""
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Iterator
-
-import torch
 
 
 def parse_recurrence_pattern(pattern: str) -> tuple[str, tuple[tuple[int, int], ...]]:
@@ -73,38 +72,28 @@ class LoopDistribution:
             ) from error
         return cls(counts, probabilities)
 
-    def sample(
-        self, training: bool, device: torch.device, group: torch.distributed.ProcessGroup | None
-    ) -> int:
-        """Sample once per training forward, synchronizing the supplied rank domain.
+    def sample(self, training: bool, step: int | None = None) -> int:
+        """Derive a loop count from the logical minibatch step without communication.
 
-        Evaluation uses the largest configured count and does not consume random state.
-        Stochastic draws use the checkpointed CPU torch RNG. Every rank consumes one
-        draw, then the group's first rank broadcasts its count so TP, DP, and expert
-        collectives follow the same execution order even if their RNG states differ.
+        All ranks, microbatches, and recurrent regions use the same step and policy.
+        A local Python RNG seeded with the step selects the count without collectives
+        or changes to global RNG state. Replaying a step after a restart or retry
+        reproduces its count without persistent sampler state. Microbatch IDs and
+        local forward counters deliberately do not affect the result.
+        Evaluation uses the largest configured count; fixed policies need no step.
+
+        Args:
+            training: Whether to sample for training rather than use the evaluation count.
+            step: Non-negative logical minibatch step, exposed as ``recurrence_step`` by
+                ``HybridModel.forward``. Required only for stochastic training.
         """
         if not training:
             return max(self.counts)
         if len(self.counts) == 1:
             return self.counts[0]
-        if group is None:
-            raise ValueError("Stochastic hybrid recurrence requires pg_collection.tp_dp_cp")
-        draw = torch.rand((), device="cpu").item()
-        cumulative = 0.0
-        count = self.counts[-1]
-        for candidate, probability in zip(self.counts, self.probabilities, strict=True):
-            cumulative += probability
-            if draw < cumulative:
-                count = candidate
-                break
-        if group.size() > 1:
-            comm_device = device if torch.distributed.get_backend(group) == "nccl" else "cpu"
-            sampled = torch.tensor(count, dtype=torch.int64, device=comm_device)
-            torch.distributed.broadcast(
-                sampled, src=torch.distributed.get_global_rank(group, 0), group=group
-            )
-            count = sampled.item()
-        return count
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("Stochastic hybrid recurrence requires a non-negative integer step")
+        return random.Random(step).choices(self.counts, weights=self.probabilities, k=1)[0]
 
 
 def recurrent_layer_indices(

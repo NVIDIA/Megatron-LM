@@ -216,8 +216,6 @@ class HybridStack(MegatronModule):
                 self.pp_group is not None and self.pp_group.size() != 1
             ) or self.cp_group.size() != 1:
                 raise ValueError("Hybrid recurrence requires PP=1 and CP=1 process groups")
-            if len(self.loop_distribution.counts) > 1 and pg_collection.tp_dp_cp is None:
-                raise ValueError("Stochastic hybrid recurrence requires pg_collection.tp_dp_cp")
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -615,6 +613,7 @@ class HybridStack(MegatronModule):
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
         n_loops: int | None = None,
+        recurrence_step: int | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -631,6 +630,8 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
             n_loops (int, optional): Positive loop-count override for this forward only.
+            recurrence_step (int, optional): Shared logical minibatch step for stochastic
+                training. All microbatches in an accumulation step must pass the same value.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
         Returns:
@@ -684,9 +685,7 @@ class HybridStack(MegatronModule):
         execution_indices = range(len(self.layers))
         if recurrent_ranges:
             if n_loops is None:
-                n_loops = self.loop_distribution.sample(
-                    self.training, hidden_states.device, self.pg_collection.tp_dp_cp
-                )
+                n_loops = self.loop_distribution.sample(self.training, step=recurrence_step)
             execution_indices = recurrent_layer_indices(len(self.layers), recurrent_ranges, n_loops)
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:

@@ -44,6 +44,7 @@ from megatron.core.utils import (
 from megatron.training import (
     get_args,
     get_timers,
+    get_train_state,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -368,6 +369,13 @@ def forward_step(data_iterator, model: HybridModel):
 
     timers('batch-generator').stop()
 
+    recurrence_kwargs = {}
+    if ":" in (getattr(get_args(), "hybrid_layer_pattern", None) or ""):
+        train_state = get_train_state()
+        if train_state is not None:
+            # iteration is constant across all accumulation microbatches and restored on resume.
+            recurrence_kwargs["recurrence_step"] = train_state.iteration
+
     with stimer:
         output_tensor = model(
             tokens,
@@ -378,6 +386,7 @@ def forward_step(data_iterator, model: HybridModel):
             loss_mask=loss_mask,
             padding_mask=padding_mask,
             cp_batch=cp_batch,
+            **recurrence_kwargs,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
