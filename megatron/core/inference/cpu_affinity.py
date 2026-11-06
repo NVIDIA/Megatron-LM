@@ -5,6 +5,7 @@
 import logging
 import os
 import threading
+from pathlib import Path
 from typing import Callable, Iterable
 
 import torch
@@ -24,19 +25,18 @@ def _format_cpus(cpus: Iterable[int]) -> str:
 
 
 def _gpu_local_cpus() -> set[int]:
-    """Query NVML for the CPUs local to the current CUDA device."""
-    import pynvml
-
-    # torch reports bare UUIDs; NVML expects the "GPU-" prefix.
-    uuid = f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}"
-    pynvml.nvmlInit()
-    try:
-        # 64 words of 64 bits covers CPU IDs up to 4095.
-        words = pynvml.nvmlDeviceGetCpuAffinity(pynvml.nvmlDeviceGetHandleByUUID(uuid), 64)
-    finally:
-        pynvml.nvmlShutdown()
-    mask = sum(word << (64 * i) for i, word in enumerate(words))
-    return {cpu for cpu in range(mask.bit_length()) if mask >> cpu & 1}
+    """Read the CPUs of the current CUDA device's NUMA node from sysfs."""
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    pci = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+    node = int(Path(f"/sys/bus/pci/devices/{pci}/numa_node").read_text())
+    if node < 0:
+        raise RuntimeError(f"sysfs reports no NUMA node for GPU {pci}.")
+    cpulist = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
+    cpus = set()
+    for part in cpulist.split(","):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
 
 
 def _check_threads(
@@ -78,7 +78,7 @@ def validate_inference_cpu_affinity(
 ) -> None:
     """Raise if the calling thread, or any thread with all_threads, may run on CPUs that are
     not local to the current CUDA device. With warn_for_helper_threads, threads other than
-    the caller only log a warning. Never changes affinity; requires nvidia-ml-py.
+    the caller only log a warning. Never changes affinity.
     """
     caller = threading.get_native_id()
     tids = sorted(int(t) for t in os.listdir("/proc/self/task")) if all_threads else [caller]

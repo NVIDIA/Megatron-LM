@@ -122,7 +122,6 @@ dev = [
 ]
 
 inference = [
-    "nvidia-ml-py",
     "torch-memory-saver",
 ]
 

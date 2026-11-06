@@ -498,7 +498,7 @@ class InferenceConfig:
 
     require_gpu_local_cpu_affinity: bool = False
     """Raise at dynamic engine init if the engine thread may run on non-GPU-local CPUs, and
-    warn about other such threads after warmup. Requires nvidia-ml-py."""
+    warn about other such threads after warmup."""
 
     # =================================
     # KV cache and Mamba states config
