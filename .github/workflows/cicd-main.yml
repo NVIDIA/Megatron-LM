@@ -21,6 +21,11 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      autobot_hello:
+        description: "Exercise the Autobot GitHub event/result handshake on a pull-request/<number> ref"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -40,6 +45,55 @@ env:
   H100_RUNNER_TRAFFIC_MODE: ${{ vars.H100_RUNNER_TRAFFIC_MODE || 'aws' }}
 
 jobs:
+  # Opt-in transport smoke test. Its result does not alter the existing test matrix.
+  request-autobot:
+    name: Autobot CI request (hello)
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      startsWith(github.ref, 'refs/heads/pull-request/') &&
+      (vars.AUTOBOT_CI_HELLO == 'true' || inputs.autobot_hello == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Validate result publisher configuration
+        env:
+          AUTOBOT_CI_APP_ID: ${{ vars.AUTOBOT_CI_APP_ID }}
+        run: |
+          [[ "${AUTOBOT_CI_APP_ID}" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'Configure AUTOBOT_CI_APP_ID with the trusted result publisher GitHub App ID.' >&2
+            exit 1
+          }
+          echo 'GitHub will deliver this completed job as the Autobot request.'
+
+  wait-for-autobot:
+    name: Receive Autobot CI result
+    needs: request-autobot
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      result: ${{ steps.receive.outputs.result }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Wait for the correlated GitHub check result
+        id: receive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOBOT_CI_APP_ID: ${{ vars.AUTOBOT_CI_APP_ID }}
+        run: python3 .github/scripts/wait_for_autobot.py --output "${RUNNER_TEMP}/autobot-ci-result.json"
+      - name: Retain the Autobot response in this workflow run
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: autobot-ci-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/autobot-ci-result.json
+          if-no-files-found: error
+
   ephemeral-runner-routing:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
     with:
