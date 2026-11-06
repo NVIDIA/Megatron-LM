@@ -3,8 +3,11 @@
 """Heterogeneous TP/PP reshard of SSM boundary-snapshot state between
 prefill and decode shard layouts (the SSM analog of attention KV resharding).
 
-A snapshot's conv state packs three channel bands, [x | B | C], on one axis:
-x is head-sharded (d_inner) and B/C are group-sharded (ngroups * d_state).
+A Mamba2 snapshot's conv state packs three channel bands, [x | B | C], on one
+axis: x is head-sharded (d_inner) and B/C are group-sharded (ngroups * d_state).
+A Gated DeltaProduct layer with H Householder reflections packs
+[V0 .. V(H-1) | K0 .. K(H-1) | Q] the same way (V head-sharded, K/Q
+group-sharded, each section TP-sharded on its own); Mamba2 is the H = 1 case.
 The recurrent state is head-sharded. ``plan_ssm_reshard`` emits one transfer per
 (src rank, dst rank, global layer, band) whose layer and channel ranges
 overlap; both sides compute the same plan from the same layout lists, so the
@@ -18,10 +21,11 @@ from typing import List, Tuple
 
 from megatron.core.inference.disaggregation.utils import intersect
 
-# Channel bands of an SSM layer's conv state, in the order the conv state
-# concatenates them on its channel axis. The recurrent band is the head axis
-# of its own tensor.
+# Channel bands of a Mamba2 (num_householder == 1) layer's conv state, in the
+# order the conv state concatenates them on its channel axis. The recurrent
+# band is the head axis of its own tensor.
 _CONV_BANDS = ("x", "B", "C")
+_RECURRENT_BAND = "recurrent"
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,8 @@ class SSMStateDims:
     d_state: int
     ngroups: int
     d_conv: int
+    # Householder reflections per Gated DeltaProduct layer; 1 for Mamba2.
+    num_householder: int = 1
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class SSMShardLayout:
             raise ValueError(f"nheads={self.dims.nheads} not divisible by tp_size={self.tp_size}")
         if self.dims.ngroups % self.tp_size != 0:
             raise ValueError(f"ngroups={self.dims.ngroups} not divisible by tp_size={self.tp_size}")
+        if self.dims.num_householder < 1:
+            raise ValueError(f"num_householder={self.dims.num_householder} must be >= 1")
 
     @property
     def d_inner(self) -> int:
@@ -87,9 +95,18 @@ class SSMShardLayout:
         return self.dims.ngroups // self.tp_size
 
     @property
+    def conv_bands(self) -> Tuple[str, ...]:
+        """Conv channel bands in channel-axis order: x/B/C, or V*/K*/Q for H > 1."""
+        h = self.dims.num_householder
+        if h == 1:
+            return _CONV_BANDS
+        return (*(f"V{i}" for i in range(h)), *(f"K{i}" for i in range(h)), "Q")
+
+    @property
     def conv_dim_local(self) -> int:
-        """Total local conv channel width (x + B + C bands)."""
-        return self.d_inner_local + 2 * self.ngroups_local * self.dims.d_state
+        """Total local conv channel width (H value bands + H key bands + 1 query band)."""
+        h = self.dims.num_householder
+        return h * self.d_inner_local + (h + 1) * self.ngroups_local * self.dims.d_state
 
     def shard_key(self) -> Tuple[int, int]:
         """The SSM shard this rank holds: (tp_rank, layer_start). Ranks
@@ -107,21 +124,22 @@ class SSMShardLayout:
         the "recurrent" (head) band it is the start on the local head axis
         (always 0, heads are the whole tensor).
         """
-        if name == "x":
-            return self.d_inner, self.d_inner_local, 0
-        if name == "B":
-            g = self.dims.ngroups * self.dims.d_state
-            return g, self.ngroups_local * self.dims.d_state, self.d_inner_local
-        if name == "C":
-            g = self.dims.ngroups * self.dims.d_state
-            return (
-                g,
-                self.ngroups_local * self.dims.d_state,
-                self.d_inner_local + self.ngroups_local * self.dims.d_state,
-            )
-        if name == "recurrent":
+        h = self.dims.num_householder
+        g = self.dims.ngroups * self.dims.d_state
+        g_local = self.ngroups_local * self.dims.d_state
+        if name == _RECURRENT_BAND:
             return self.dims.nheads, self.nheads_local, 0
-        raise KeyError(name)
+        if name not in self.conv_bands:
+            raise KeyError(name)
+        # Mamba2's x/B/C are the H == 1 value/key/query bands.
+        kind, index = {"x": ("V", 0), "B": ("K", 0), "C": ("Q", 0)}.get(
+            name, (name[0], int(name[1:]) if len(name) > 1 else 0)
+        )
+        if kind == "V":
+            return self.d_inner, self.d_inner_local, index * self.d_inner_local
+        if kind == "K":
+            return g, g_local, h * self.d_inner_local + index * g_local
+        return g, g_local, h * self.d_inner_local + h * g_local
 
 
 @dataclass(frozen=True)
@@ -147,7 +165,7 @@ class SSMReshardTransfer:
     @property
     def is_conv(self) -> bool:
         """True if this transfer targets the conv state; False for recurrent."""
-        return self.band in _CONV_BANDS
+        return self.band != _RECURRENT_BAND
 
 
 def plan_ssm_reshard(
@@ -162,6 +180,9 @@ def plan_ssm_reshard(
     smallest global_rank. Deterministic given the layout lists, so both sides
     enumerate the same transfers in the same order.
     """
+    bands = {layout.conv_bands for layout in (*src_layouts, *dst_layouts)}
+    if len(bands) > 1:
+        raise ValueError(f"source and destination SSM conv layouts differ: {sorted(bands)}")
     rep_rank: dict = {}
     for s in src_layouts:
         key = s.shard_key()
@@ -178,7 +199,7 @@ def plan_ssm_reshard(
             layer_ov = intersect(s_lr, d.layer_range())
             if layer_ov is None:
                 continue
-            for band in (*_CONV_BANDS, "recurrent"):
+            for band in (*s.conv_bands, _RECURRENT_BAND):
                 _, s_size, s_off = s.band(band)
                 _, d_size, d_off = d.band(band)
                 s_glo = (s.tp_rank * s_size, s.tp_rank * s_size + s_size)
