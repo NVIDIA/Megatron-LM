@@ -3607,9 +3607,10 @@ def _add_experimental_args(parser):
                        'is being run.')
     group.add_argument("--n-loops-distribution", type=str, default=None,
                        help="Shared loop-count probabilities for all ':'-delimited hybrid "
-                       "regions, e.g., '1:0.25,2:0.25,4:0.25,8:0.25'. Defaults to one loop. "
-                       "Evaluation defaults to the largest count; --inference-n-loops "
-                       "can override it. Independent of checkpoint weights.")
+                       "regions, e.g., '1:0.25,2:0.25,4:0.25,8:0.25'. Weights are normalized to "
+                       "sum to one. Defaults to one loop. Evaluation defaults to the largest "
+                       "count; --inference-n-loops can override it. Independent of checkpoint "
+                       "weights.")
     group.add_argument("--inference-n-loops", type=int, default=None,
                        help="Loop count for whenever the model is in eval mode (e.g., inference "
                        "and evaluation). Defaults to the largest training-distribution count from "

@@ -31,11 +31,13 @@ its own parameters, shared across that body's iterations, not with other bodies.
 Colons are not layers and do not contribute to `num_layers`, layer numbering,
 parameter counts, or checkpoint tensor shapes.
 
-`--n-loops-distribution` is a comma-separated list of `count:probability` pairs.
-Counts must be distinct positive integers. Probabilities must be finite, positive,
-and sum to one (within an absolute tolerance of `1e-6`). A fixed count uses a
-single pair, e.g., `4:1.0`. Omitting the distribution runs one loop. A distribution
-without loop boundaries is an error.
+`--n-loops-distribution` is a comma-separated list of `count:weight` pairs.
+Counts must be distinct positive integers. Weights must be finite and positive;
+they are automatically normalized to sum to one. For example, `1:1,2:3` becomes
+probabilities `0.25` and `0.75`, and `1:25,2:25,4:25,8:25` gives equal probability
+to all four counts. Already normalized probabilities are accepted as well.
+A fixed count uses a single pair, e.g., `4:1.0`. Omitting the distribution runs
+one loop. A distribution without loop boundaries is an error.
 
 The loop count is selected with Python's standard-library RNG:
 `random.Random(step).choices(counts, weights=probabilities, k=1)[0]`. Each call

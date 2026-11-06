@@ -171,10 +171,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_config_list (Sequence[HybridLayerEntry], optional): First-class
             decoder, pipeline-split, and MTP configuration sequence. Mutually exclusive with
             ``hybrid_layer_pattern`` and its deprecated alternatives. Defaults to None.
-        n_loops_distribution (str, optional): Training loop-count probabilities, e.g.,
-            ``"1:0.5,4:0.5"``. Requires ':' boundaries in hybrid_layer_pattern. Defaults
-            to one loop. Evaluation uses the largest count unless inference_n_loops or
-            forward's n_loops is set.
+        n_loops_distribution (str, optional): Training loop-count weights, normalized
+            automatically, e.g., ``"1:1,4:1"``. Requires ':' boundaries in
+            hybrid_layer_pattern. Defaults to one loop. Evaluation uses the largest count
+            unless inference_n_loops or forward's n_loops is set.
         inference_n_loops (int, optional): Fixed loop count used in both evaluation and
             inference (model.eval()). None uses the largest training-distribution count.
             Does not affect training. Forward's n_loops takes precedence.

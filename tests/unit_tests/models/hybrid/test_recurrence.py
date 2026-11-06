@@ -81,7 +81,10 @@ def test_invalid_recurrent_patterns(pattern):
         "1:-1",
         "1:nan",
         "1:inf",
-        "1:0.4",
+        "1:0,2:0",
+        "1:1,2:-1",
+        "1:1,2:nan",
+        "1:1,2:inf",
         "1:1,1:1",
         "1:1,",
         "|1:1|",
@@ -93,9 +96,38 @@ def test_invalid_loop_distribution(value):
         LoopDistribution.from_string(value)
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1:1,2:3", (0.25, 0.75)),
+        ("1:.1,2:.3", (0.25, 0.75)),
+        ("1:25,2:25,4:25,8:25", (0.25, 0.25, 0.25, 0.25)),
+        ("8:0.4", (1.0,)),
+        ("1:.2,2:.2", (0.5, 0.5)),
+        ("1:1e308,2:1e308", (0.5, 0.5)),
+        ("1:5e-324,2:5e-324", (0.5, 0.5)),
+    ],
+)
+def test_loop_distribution_normalizes_probabilities(value, expected):
+    policy = LoopDistribution.from_string(value)
+    assert policy.probabilities == pytest.approx(expected)
+    assert sum(policy.probabilities) == pytest.approx(1.0)
+    assert all(0 < probability <= 1 for probability in policy.probabilities)
+
+
+def test_direct_loop_distribution_normalizes_probabilities():
+    policy = LoopDistribution((1, 4), (2.0, 6.0))
+    normalized = LoopDistribution.from_string("1:.25,4:.75")
+    assert policy == normalized
+    assert [policy.sample(True, step=step) for step in range(64)] == [
+        normalized.sample(True, step=step) for step in range(64)
+    ]
+
+
 @pytest.mark.parametrize("pattern", [":*-:", ":*:-*-:"])
 @pytest.mark.parametrize("inference_n_loops", [None, 2])
-def test_cli_policy_reaches_native_builder(monkeypatch, pattern, inference_n_loops):
+@pytest.mark.parametrize("distribution", ["1:.5,4:.5", "1:1,4:1"])
+def test_cli_policy_reaches_native_builder(monkeypatch, pattern, inference_n_loops, distribution):
     from megatron.training.argument_utils import hybrid_config_from_args
     from megatron.training.arguments import parse_args, validate_args
     from megatron.training.models.hybrid import HybridModelBuilder
@@ -108,7 +140,7 @@ def test_cli_policy_reaches_native_builder(monkeypatch, pattern, inference_n_loo
             "--hybrid-layer-pattern",
             pattern,
             "--n-loops-distribution",
-            "1:.5,4:.5",
+            distribution,
             "--hidden-size",
             "128",
             "--num-attention-heads",
@@ -127,13 +159,14 @@ def test_cli_policy_reaches_native_builder(monkeypatch, pattern, inference_n_loo
     args = validate_args(parse_args())
     assert args.num_layers == len(pattern.replace(":", ""))
     model_config = hybrid_config_from_args(args)
-    assert model_config.n_loops_distribution == "1:.5,4:.5"
+    assert model_config.n_loops_distribution == distribution
     assert model_config.inference_n_loops == inference_n_loops
     model_config.vocab_size = 32
     monkeypatch.setattr("megatron.training.models.hybrid.HybridModel", lambda **kwargs: kwargs)
     builder = HybridModelBuilder(model_config)
     kwargs = builder.build_model(SimpleNamespace(), pre_process=True, post_process=True)
-    assert kwargs["n_loops_distribution"] == "1:.5,4:.5"
+    assert kwargs["n_loops_distribution"] == distribution
+    assert LoopDistribution.from_string(kwargs["n_loops_distribution"]).probabilities == (0.5, 0.5)
     assert kwargs["inference_n_loops"] == inference_n_loops
     assert kwargs["hybrid_layer_pattern"] == pattern
     with pytest.raises(ValueError, match="FSDP"):
@@ -646,7 +679,7 @@ def test_override_and_eval_execution_order(model_factory, pattern, execution_ord
     [("-:*-:-", [0, 1, 2, 1, 2, 1, 2, 3]), ("-:*:-*:-", [0, 1, 1, 1, 2, 3, 2, 3, 2, 3, 4])],
 )
 def test_training_keeps_one_count_per_minibatch(model_factory, pattern, execution_order):
-    model = model_factory(pattern=pattern, distribution="1:.5,3:.5")
+    model = model_factory(pattern=pattern, distribution="1:2,3:2")
     calls = []
     handles = [
         layer.register_forward_hook(lambda module, inputs, output, i=i: calls.append(i))

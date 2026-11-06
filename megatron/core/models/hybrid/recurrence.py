@@ -35,13 +35,13 @@ def parse_recurrence_pattern(pattern: str) -> tuple[str, tuple[tuple[int, int], 
 
 @dataclass(frozen=True)
 class LoopDistribution:
-    """A categorical distribution over positive loop counts, independent of model weights."""
+    """A categorical loop-count distribution that normalizes positive input weights."""
 
     counts: tuple[int, ...]
     """Distinct positive loop counts in sampling order."""
 
     probabilities: tuple[float, ...]
-    """Positive finite probabilities, aligned with counts and summing to one."""
+    """Probabilities normalized from positive finite input weights, aligned with counts."""
 
     def __post_init__(self) -> None:
         if not self.counts or len(self.counts) != len(self.probabilities):
@@ -53,12 +53,15 @@ class LoopDistribution:
             raise ValueError("Loop counts must be unique positive integers")
         if any(not math.isfinite(p) or p <= 0 for p in self.probabilities):
             raise ValueError("Loop probabilities must be finite and positive")
-        if not math.isclose(math.fsum(self.probabilities), 1.0, rel_tol=0, abs_tol=1e-6):
-            raise ValueError("Loop probabilities must sum to 1.0")
+        # Scale first to avoid overflowing the sum of otherwise finite input weights.
+        scale = max(self.probabilities)
+        scaled = tuple(p / scale for p in self.probabilities)
+        total = math.fsum(scaled)
+        object.__setattr__(self, "probabilities", tuple(p / total for p in scaled))
 
     @classmethod
     def from_string(cls, value: str | None) -> "LoopDistribution":
-        """Parse ``count:probability,...``; an omitted policy executes one loop."""
+        """Parse and normalize ``count:weight,...``; an omitted policy executes one loop."""
         if value is None:
             return cls((1,), (1.0,))
         try:
