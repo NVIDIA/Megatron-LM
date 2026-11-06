@@ -320,18 +320,30 @@ class TestMoeAlignBlockSize:
         assert (active_eids < num_experts).all(), "Found expert_id >= num_experts"
 
     @pytest.mark.parametrize("num_local", [1, 7, 128])
-    def test_graph_replay_starts_counting_from_zero(self, num_local):
-        """The table initializer re-zeroes the expert counters on every replay."""
+    @pytest.mark.parametrize("fused", [False, True], ids=["multi_kernel", "fused_single_cta"])
+    @pytest.mark.parametrize("max_tokens", [35, 769])
+    def test_graph_replay_starts_counting_from_zero(self, num_local, fused, max_tokens):
+        """The table builder re-initializes the expert counters on every replay. Covers the
+        multi-kernel builder and the single-CTA one that num_pairs_hint selects for small
+        batches (which only writes the region below num_tokens_post_padded)."""
         from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
 
-        max_tokens, topk, block_size, local_start = 35, 4, 16, 3
+        topk, block_size, local_start = 4, 16, 3
         torch.manual_seed(42)
         routing_map = torch.randint(0, num_local + 6, (max_tokens, topk), device="cuda")
         valid_tokens = _vt(max_tokens)
+        # A decode graph can replay with more tokens than its hint, including
+        # more than one CHUNK and more than the fused dispatch threshold.
+        num_pairs_hint = topk if fused else None
 
         def align():
             return _moe_align_block_size_cuda_graphable(
-                routing_map, block_size, num_local, local_start, valid_tokens
+                routing_map,
+                block_size,
+                num_local,
+                local_start,
+                valid_tokens,
+                num_pairs_hint=num_pairs_hint,
             )
 
         def routed_pairs(sorted_ids, expert_ids, num_post_padded):
@@ -364,6 +376,8 @@ class TestMoeAlignBlockSize:
                 routing_map.zero_()
             else:
                 routing_map.random_(0, num_local + 6)
+            graph_outputs[0].fill_(-777)
+            graph_outputs[1].fill_(-777)
             graph.replay()
             replayed = [t.clone() for t in graph_outputs]
             eager = align()
@@ -374,13 +388,34 @@ class TestMoeAlignBlockSize:
             aligned = (counts + block_size - 1) // block_size * block_size
             num_post_padded = replayed[2].item()
             assert num_post_padded == aligned.sum().item()
-            assert torch.equal(replayed[1], eager[1])
+            # Check each expert segment against an independent routing-map oracle;
+            # comparing replay with eager alone would miss a shared kernel bug.
+            routes_cpu = routing_map[:n].flatten().cpu()
+            sorted_cpu = replayed[0][:num_post_padded].cpu()
+            experts_cpu = replayed[1][: num_post_padded // block_size].cpu()
+            offset = 0
+            for expert, padded_count in enumerate(aligned.tolist()):
+                segment = sorted_cpu[offset : offset + padded_count]
+                expected_pairs = torch.where(routes_cpu == local_start + expert)[0]
+                actual_pairs = segment[segment < max_tokens * topk].sort().values
+                assert torch.equal(actual_pairs, expected_pairs)
+                assert (segment[segment >= max_tokens * topk] == max_tokens * topk).all()
+                assert (
+                    experts_cpu[offset // block_size : (offset + padded_count) // block_size]
+                    == expert
+                ).all()
+                offset += padded_count
             assert torch.equal(replayed[2], eager[2])
+            used_blocks = num_post_padded // block_size
+            assert torch.equal(replayed[1][:used_blocks], eager[1][:used_blocks])
             assert torch.equal(
                 routed_pairs(*replayed[:2], num_post_padded),
                 routed_pairs(*eager[:2], num_post_padded),
             )
-            assert torch.equal(replayed[0][num_post_padded:], eager[0][num_post_padded:])
+            if not fused:
+                # The multi-kernel builder also initializes the unused tail.
+                assert torch.equal(replayed[1], eager[1])
+                assert torch.equal(replayed[0][num_post_padded:], eager[0][num_post_padded:])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -756,6 +791,77 @@ class TestVllmFusedMoe:
         )
 
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+
+    # hidden/ffn sizes are not multiples of BLOCK_SIZE_N/K, so the last N-tile of
+    # each expert spills into the next expert's rows and the last K-tile runs past K.
+    @pytest.mark.parametrize("max_tokens", [1, 128])
+    @pytest.mark.parametrize("hidden_size,ffn_hidden", [(200, 72), (136, 200)])
+    def test_tma_weights_match_pointer_path(self, monkeypatch, max_tokens, hidden_size, ffn_hidden):
+        """The TMA weight-descriptor path is bitwise identical to the pointer path."""
+        import importlib
+
+        from megatron.core.inference.moe.fused_moe import ActivationType
+
+        # The package re-exports a function named vllm_fused_moe that shadows the submodule.
+        vfm = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+        topk, num_experts = 4, 8
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        if vfm._weight_descriptor(fc1_weight, 64, 64) is None:
+            pytest.skip("TMA weight descriptors need sm90+")
+
+        def run():
+            return vfm.vllm_fused_moe(
+                hidden,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                _vt(max_tokens),
+                routing_map,
+            )
+
+        # Exercise production buffer reuse, and restore any previous pool at teardown.
+        monkeypatch.setattr(vfm.VllmFusedMoeBuffers, "_buffers", None)
+        vfm.VllmFusedMoeBuffers.allocate_buffers(
+            max_tokens, topk, ffn_hidden, hidden_size, num_experts, hidden.device
+        )
+        # The backend caches its output buffer; preserve it before the next call.
+        tma_result = run().clone()
+        monkeypatch.setattr(vfm, "_USE_TMA_WEIGHTS", False)
+        assert torch.equal(tma_result, run())
+
+    @pytest.mark.parametrize("reason", ["disabled", "pre_hopper"])
+    def test_tma_unavailable_uses_pointer_path(self, monkeypatch, reason):
+        import importlib
+
+        vfm = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+        weights = torch.empty(2, 64, 64, device="cuda", dtype=torch.bfloat16)
+        if reason == "disabled":
+            monkeypatch.setattr(vfm, "_USE_TMA_WEIGHTS", False)
+        else:
+            monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
+        assert vfm._weight_descriptor(weights, 64, 64) is None
+
+    @pytest.mark.parametrize(
+        "layout", ["strided_rows", "strided_k", "row_alignment", "base_alignment"]
+    )
+    def test_tma_unsupported_layout_uses_pointer_path(self, layout):
+        from megatron.core.inference.moe.vllm_fused_moe import _weight_descriptor
+
+        weights = torch.empty(2, 128, 128, device="cuda", dtype=torch.bfloat16)
+        if layout == "strided_rows":
+            weights = weights[:, ::2, :]
+        elif layout == "strided_k":
+            weights = weights[:, :, ::2]
+        elif layout == "row_alignment":
+            weights = weights[:, :, :127].contiguous()
+        else:
+            weights = weights.flatten()[1 : 1 + 2 * 64 * 64].view(2, 64, 64)
+        assert _weight_descriptor(weights, 64, 64) is None
 
 
 # ──────────────────────────────────────────────────────────────────────

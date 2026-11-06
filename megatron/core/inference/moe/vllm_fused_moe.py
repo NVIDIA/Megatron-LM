@@ -25,7 +25,9 @@ try:
 except ImportError:
     HAVE_TRITON = False
 
-if not HAVE_TRITON:
+if HAVE_TRITON:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+else:
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
@@ -129,6 +131,7 @@ def _fused_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_SQUARED_RELU: tl.constexpr,
     CLAMP_ACTIVATION: tl.constexpr,
+    USE_TMA_B: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -140,13 +143,22 @@ def _fused_moe_kernel(
     Body mirrors vLLM's `fused_moe_kernel` verbatim except for the
     `FUSE_SQUARED_RELU` branch (Megatron applies relu+square in fp32 on
     the accumulator before the bf16 cast — strictly more accurate than
-    upstream's separate post-FC1 activation kernel).
+    upstream's separate post-FC1 activation kernel) and the `USE_TMA_B`
+    weight-load path described below.
 
     Grid is sized host-side from `num_tokens_hint` (the typical-case token
     count), not the worst-case buffer length, so launch overhead at decode
     stays small. When the actual padded length exceeds the hinted grid
     size (rare prefill spikes), each CTA strides over multiple tiles via
     the outer `tl.range` loop.
+
+    When `USE_TMA_B`, `b_ptr` is a single TMA descriptor over the expert
+    weights viewed as [E * N, K].  This relies on all experts living in one
+    contiguous buffer: expert e's N-tile is just a row offset of `e * N`, so
+    one host-side descriptor serves every tile with no per-tile address math.
+    TMA zero-fills past K and past row E * N.  A last N-tile that spills into
+    the next expert's rows only feeds output columns >= N, which the C-store
+    mask drops.
     """
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -179,18 +191,20 @@ def _fused_moe_kernel(
             offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
             token_mask = offs_token < num_valid_tokens
 
-            # `% N` keeps overflow lanes in-bounds; matching C-store mask drops
-            # their contribution.  Saves a 2-D bounds check inside the K loop.
-            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
-
             a_ptrs = a_ptr + (
                 offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
-            b_ptrs = (
-                b_ptr
-                + off_experts * stride_be
-                + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-            )
+            if USE_TMA_B:
+                b_row = (off_experts * N + pid_n * BLOCK_SIZE_N).to(tl.int32)
+            else:
+                # `% N` keeps overflow lanes in-bounds; matching C-store mask drops
+                # their contribution.  Saves a 2-D bounds check inside the K loop.
+                offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+                b_ptrs = (
+                    b_ptr
+                    + off_experts * stride_be
+                    + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+                )
 
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
             for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -199,10 +213,13 @@ def _fused_moe_kernel(
                     mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0,
                 )
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                if USE_TMA_B:
+                    b = b_ptr.load([b_row, k * BLOCK_SIZE_K]).T
+                else:
+                    b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                    b_ptrs += BLOCK_SIZE_K * stride_bk
                 accumulator += tl.dot(a, b)
                 a_ptrs += BLOCK_SIZE_K * stride_ak
-                b_ptrs += BLOCK_SIZE_K * stride_bk
 
             # Megatron-only: squared-relu fused on the fp32 accumulator before
             # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
@@ -412,12 +429,91 @@ def _fill_expert_block_ids_kernel(
         tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
 
 
+@triton.jit
+def _moe_align_fused_kernel(
+    routing_map_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    counters_ptr,
+    valid_tokens_ptr,
+    local_expert_start,
+    topk: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    SENTINEL: tl.constexpr,
+    E_PAD: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_CHUNK: tl.constexpr,
+):
+    """Single-CTA build of the indirection tables, for small token counts.
+
+    Replaces the init / count / prefix-sum / fill / scatter launches with one,
+    which matters at decode where each of those is a near-empty launch. Produces
+    the same expert segments (atomic slot order can vary), initializing only
+    the region the GEMM reads: entries
+    [0, num_tokens_post_padded) of sorted_token_ids and the expert of every block
+    below it.  Correct for any token count; just slow when it is large.
+    """
+    valid_pairs = tl.load(valid_tokens_ptr) * topk
+    e = tl.arange(0, E_PAD)
+
+    # 1) Tokens per local expert.
+    counts = tl.zeros([E_PAD], dtype=tl.int32)
+    for start in tl.range(0, valid_pairs, CHUNK):
+        offs = start + tl.arange(0, CHUNK)
+        in_range = offs < valid_pairs
+        lids = (tl.load(routing_map_ptr + offs, mask=in_range, other=-1) - local_expert_start).to(
+            tl.int32
+        )
+        is_local = in_range & (lids >= 0) & (lids < num_local_experts)
+        counts += tl.histogram(lids, E_PAD, mask=is_local)
+
+    # 2) Per-expert counts padded to BLOCK_SIZE_M (empty experts stay 0), prefix sums.
+    padded = (counts + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * BLOCK_SIZE_M
+    inclusive = tl.cumsum(padded, axis=0)
+    total = tl.sum(padded, axis=0)
+    tl.store(num_tokens_post_padded_ptr, total)
+    tl.store(counters_ptr + e, inclusive - padded, mask=e < num_local_experts)
+
+    # 3) Expert of each block: the number of experts whose padded range ends at or
+    #    before the block's first row.  Fill the used rows with the sentinel.
+    num_blocks = total // BLOCK_SIZE_M
+    for b0 in tl.range(0, num_blocks, BLOCK_CHUNK):
+        b = b0 + tl.arange(0, BLOCK_CHUNK)
+        eid = tl.sum((inclusive[None, :] <= b[:, None] * BLOCK_SIZE_M).to(tl.int32), axis=1)
+        tl.store(expert_ids_ptr + b, eid, mask=b < num_blocks)
+    for s0 in tl.range(0, total, CHUNK):
+        s = s0 + tl.arange(0, CHUNK)
+        tl.store(sorted_token_ids_ptr + s, SENTINEL, mask=s < total)
+
+    # The counters and sentinel stores above must land before the scatter below.
+    tl.debug_barrier()
+
+    # 4) Scatter each local pair into its expert's rows.
+    for start in tl.range(0, valid_pairs, CHUNK):
+        offs = start + tl.arange(0, CHUNK)
+        in_range = offs < valid_pairs
+        lids = (tl.load(routing_map_ptr + offs, mask=in_range, other=-1) - local_expert_start).to(
+            tl.int32
+        )
+        is_local = in_range & (lids >= 0) & (lids < num_local_experts)
+        pos = tl.atomic_add(counters_ptr + lids, 1, mask=is_local)
+        tl.store(sorted_token_ids_ptr + pos, offs, mask=is_local)
+
+
+# Token-pair counts up to which the single-CTA table build beats the multi-kernel one
+# (GB300: 2-3x faster at up to 768 pairs, break-even near 3k).
+_FUSED_ALIGN_MAX_PAIRS = 2048
+
+
 def _moe_align_block_size_cuda_graphable(
     routing_map: torch.Tensor,
     block_size: int,
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
+    num_pairs_hint: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
@@ -431,6 +527,8 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts: experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor.
+        num_pairs_hint: expected tokens * topk (host-side). Up to
+            _FUSED_ALIGN_MAX_PAIRS, one single-CTA kernel builds the tables.
 
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
@@ -448,8 +546,29 @@ def _moe_align_block_size_cuda_graphable(
         "sorted_token_ids", (max_sorted,), torch.int32, device
     )
     expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
+    counters = torch.empty(num_local_experts, dtype=torch.int32, device=device)
 
-    pre_initialized_output_buffer = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+    if num_pairs_hint is not None and num_pairs_hint <= _FUSED_ALIGN_MAX_PAIRS:
+        num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+        _moe_align_fused_kernel[(1,)](
+            routing_map,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            counters,
+            valid_tokens,
+            local_expert_start,
+            topk=topk,
+            num_local_experts=num_local_experts,
+            BLOCK_SIZE_M=block_size,
+            SENTINEL=sentinel,
+            E_PAD=triton.next_power_of_2(num_local_experts),
+            CHUNK=1024,
+            BLOCK_CHUNK=32,
+            num_warps=8,
+        )
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
+
     INIT_BLOCK = 1024
     # max_sorted exceeds num_local_experts, so this grid also covers the counters.
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
@@ -458,7 +577,7 @@ def _moe_align_block_size_cuda_graphable(
         expert_ids,
         max_sorted,
         max_blocks,
-        pre_initialized_output_buffer,
+        counters,
         num_local_experts,
         SENTINEL=sentinel,
         BLOCK=INIT_BLOCK,
@@ -471,7 +590,7 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts,
         valid_tokens,
         persistent=True,
-        pre_initialized_output_buffer=pre_initialized_output_buffer,
+        pre_initialized_output_buffer=counters,
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size
@@ -505,6 +624,27 @@ def _moe_align_block_size_cuda_graphable(
 # ---------------------------------------------------------------------------
 
 
+# Kill switch for the TMA weight path (falls back to pointer loads when False).
+_USE_TMA_WEIGHTS = True
+
+
+def _weight_descriptor(B: torch.Tensor, block_n: int, block_k: int) -> Optional["TensorDescriptor"]:
+    """One TMA descriptor over all experts of B ([E, N, K]) viewed as [E * N, K].
+
+    Returns None when TMA is unavailable (pre-Hopper) or B's layout does not
+    allow it: experts must share one contiguous buffer, and TMA needs 16-byte
+    aligned base and row stride.
+    """
+    if not _USE_TMA_WEIGHTS:
+        return None
+    if torch.cuda.get_device_capability(B.device)[0] < 9 or not B.is_contiguous():
+        return None
+    E, N, K = B.shape
+    if B.data_ptr() % 16 != 0 or (K * B.element_size()) % 16 != 0:
+        return None
+    return TensorDescriptor.from_tensor(B.view(E * N, K), [block_n, block_k])
+
+
 def _invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -525,7 +665,8 @@ def _invoke_fused_moe_kernel(
     Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
     tile, raw pointer arithmetic with `% N` on the N axis), apart from the
     optional fused squared-relu activation in fp32 and its optional tanh
-    soft clamp.
+    soft clamp, and loading expert weights through one TMA descriptor when
+    `_weight_descriptor` allows it.
 
     `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
     at decode is small.  When the actual padded length exceeds the hinted
@@ -535,10 +676,11 @@ def _invoke_fused_moe_kernel(
     """
     M = A.size(0)
     num_tokens = M * top_k
+    b_desc = _weight_descriptor(B, config['BLOCK_SIZE_N'], config['BLOCK_SIZE_K'])
 
     _fused_moe_kernel[(grid_size,)](
         A,
-        B,
+        b_desc if b_desc is not None else B,
         C,
         topk_weights,
         sorted_token_ids,
@@ -558,6 +700,7 @@ def _invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         CLAMP_ACTIVATION=fuse_squared_relu and activation_clamp_scale is not None,
+        USE_TMA_B=b_desc is not None,
         top_k=top_k,
         BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
         BLOCK_SIZE_N=config['BLOCK_SIZE_N'],
@@ -773,7 +916,12 @@ def vllm_fused_moe(
         config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
+        routing_map,
+        config['BLOCK_SIZE_M'],
+        num_local_experts,
+        local_expert_start,
+        valid_tokens,
+        num_pairs_hint=effective_tokens * topk,
     )
     num_valid = max_tokens * topk
 
