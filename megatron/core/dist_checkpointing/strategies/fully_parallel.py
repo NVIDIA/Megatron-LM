@@ -219,6 +219,13 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_global_metadata: Optional[Metadata] = None
 
     @property
+    def cache_metadata(self) -> bool:
+        """Forwards the metadata caching flag of the wrapped strategy (see
+        `TorchDistLoadShardedStrategy`), so that `serialization.load` reads the common state
+        through the same metadata cache as the wrapped strategy."""
+        return getattr(self.base_strategy, "cache_metadata", False)
+
+    @property
     def stream_ckpt_dequant(self) -> bool:
         """Forwards the streaming dequantize flag of the wrapped strategy (see
         `TorchDistLoadShardedStrategy`), so that `serialization.load` keeps the quantized
