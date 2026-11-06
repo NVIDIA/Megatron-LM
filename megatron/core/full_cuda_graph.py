@@ -137,7 +137,9 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # A shallow copy: get_batch may rebind keys (e.g. to CP slices) without replacing the
+        # static buffers.
+        return dict(StaticBufferLoader.static_buffers[stage][microbatch])
 
 
 class FullCudaGraphWrapper:

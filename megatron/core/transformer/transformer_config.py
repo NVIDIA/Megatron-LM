@@ -2879,7 +2879,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.mhc_single_pass:
-            if self.cuda_graph_impl != "none" and not (
+            # A full-iteration graph has no layer boundaries, so the mHC state needs no adapter.
+            if self.cuda_graph_impl not in ("none", "full_iteration") and not (
                 self.dsv4_version == "v4.1" and self.cuda_graph_impl == "transformer_engine"
             ):
                 raise NotImplementedError(

@@ -56,6 +56,30 @@ def test_packed_seq_params_seq_idx_covers_trailing_capacity(dtype):
     assert torch.equal(params.seq_idx, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_packed_seq_params_seq_idx_is_capturable():
+    """Built inside a full-iteration CUDA graph, seq_idx matches the eager value for the prefix
+    contents present at each replay, including empty sequences and trailing capacity."""
+    cu_seqlens = torch.tensor([0, 5, 7, 7, 11], dtype=torch.int32, device="cuda")
+
+    def build():
+        return PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu_seqlens, total_tokens=16).seq_idx
+
+    eager = build()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = build()
+    for prefix in ([0, 5, 7, 7, 11], [0, 1, 9, 12, 16], [0, 0, 3, 3, 3]):
+        cu_seqlens.copy_(torch.tensor(prefix, dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = build()
+        assert captured.dtype == expected.dtype == torch.int32
+        assert torch.equal(captured, expected), prefix
+    expected = [[0] * 5 + [1] * 2 + [3] * 4 + [4] * 5]
+    assert torch.equal(eager, torch.tensor(expected, dtype=torch.int32, device="cuda"))
+
+
 def test_scheduler_sanitizes_thd_padding_values():
     padding_mask = torch.tensor([False, False, True, False, True])
     batch = {

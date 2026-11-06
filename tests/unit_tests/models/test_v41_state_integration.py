@@ -234,6 +234,31 @@ def test_prepare_forward_keeps_the_model_restored_state(setup):
     assert fresh.cross_layer_state is not None and fresh.cross_layer_state is not csa
 
 
+def test_full_iteration_graphs_reject_engram():
+    """V4.1 accepts full-iteration graphs, which need no single-pass mHC state adapter, but not
+    with Engram, whose EP lookup plans its exchange on the host per batch."""
+    from megatron.core.models.deepseek_v41.config import EngramConfig
+
+    cfg = _config()
+    values = {f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init}
+    values.update(cuda_graph_impl='full_iteration', cuda_graph_modules=[])
+    assert DeepSeekV41Config(**values).cuda_graph_impl == 'full_iteration'
+    values['engram_config'] = EngramConfig(
+        layer_ids=[0],
+        num_embeddings=[96],
+        max_ngram_size=2,
+        vocab_size=17,
+        n_heads=2,
+        head_dim=4,
+        pad_token_id=2,
+        compressed_vocab_size=128,
+    )
+    with pytest.raises(NotImplementedError, match='full_iteration'):
+        DeepSeekV41Config(**values)
+    values['cuda_graph_impl'] = 'none'
+    assert DeepSeekV41Config(**values).engram_config is values['engram_config']
+
+
 class RoutedDense(nn.Module):
     """Small differentiable MoE substitute for CPU orchestration checks."""
 

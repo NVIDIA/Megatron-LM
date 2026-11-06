@@ -114,6 +114,14 @@ class DeepSeekV41Config(MLATransformerConfig):
             if len(ids) != len(set(ids)) or any(i < 0 or i >= self.num_layers // 2 for i in ids):
                 raise ValueError("Engram layers must be distinct zero-based logical blocks")
         super().__post_init__()
+        # After the base class, which migrates the deprecated cuda_graph_modules spelling.
+        if self.engram_config is not None and self.cuda_graph_impl == "full_iteration":
+            raise NotImplementedError(
+                "Engram plans its EP lookup on the host per batch (bincount/.cpu()/HybridEP "
+                "rounds; unique_consecutive in the FP8 backward), so it cannot be captured by "
+                "cuda_graph_impl='full_iteration'; use transformer_engine partial graphs or "
+                "drop --engram-config"
+            )
 
     @classmethod
     def from_hf(cls, hf: dict[str, Any], **overrides) -> "DeepSeekV41Config":

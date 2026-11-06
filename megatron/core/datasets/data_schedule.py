@@ -933,7 +933,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
-    max_seqlen = batch['max_seqlen'].item()
+    if torch.cuda.is_current_stream_capturing():
+        # A captured graph is replayed on other batches: use the bound every batch satisfies, the
+        # logical packed length, instead of this batch's value.
+        max_seqlen = total_tokens * cp_group.size()
+    else:
+        max_seqlen = batch['max_seqlen'].item()
 
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
     # get the correct result.

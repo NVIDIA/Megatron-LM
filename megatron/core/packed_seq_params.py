@@ -64,13 +64,21 @@ class PackedSeqParams:
             # causes torch.repeat_interleave to fail.
             seq_lengths = seq_lengths.clamp(min=0)
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
-            self.seq_idx = (
-                torch.repeat_interleave(
+            if torch.cuda.is_current_stream_capturing():
+                # repeat_interleave reads its output size on the host. While capturing, take
+                # the sequence of each of the total_tokens positions instead (equal for
+                # monotonic cu_seqlens).
+                positions = torch.arange(
+                    self.total_tokens, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+                )
+                seq_idx = torch.searchsorted(
+                    cu_seqlens_with_max[1:].contiguous(), positions, right=True
+                )
+            else:
+                seq_idx = torch.repeat_interleave(
                     torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
                 )
-                .to(torch.int32)
-                .unsqueeze(0)  # Add a batch dimension
-            )
+            self.seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
 
 
 def resolve_cp_group(

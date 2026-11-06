@@ -616,3 +616,24 @@ def test_cutile_proj_rms_is_opt_in_and_falls_back(monkeypatch):
     monkeypatch.setattr(module, "_single_pass_cutile_proj_rms", False)
     for actual, expected in zip(routed, module.compute_mappings(hidden)):
         assert bytes_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "cuda_graph_impl,supported", [("none", True), ("full_iteration", True), ("local", False)]
+)
+def test_single_pass_graph_validation(cuda_graph_impl, supported):
+    """A full-iteration graph captures the whole step, so single-pass mHC state needs no
+    tensor-state adapter there; per-layer local graphs still require one."""
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        cuda_graph_impl=cuda_graph_impl,
+    )
+    if supported:
+        assert TransformerConfig(**kwargs).cuda_graph_impl == cuda_graph_impl
+    else:
+        with pytest.raises(NotImplementedError, match="tensor-state graph adapter"):
+            TransformerConfig(**kwargs)
