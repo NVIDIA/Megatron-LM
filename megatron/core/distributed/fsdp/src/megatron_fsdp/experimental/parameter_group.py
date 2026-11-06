@@ -111,9 +111,9 @@ class FsdpParameterGroup:
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     # This is None exactly when main_grad is None.
     pre_optimizer_main_grad: DBuffer | None
-    # zero_grad(set_to_none=False) clears only the current optimizer view. If final
-    # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
-    # storage is stale and must be cleared before the next accumulation begins.
+    # Final reduction ends accumulation and exposes the optimizer's gradient view.
+    # Before accumulating the next step, main_grad must be zeroed or overwritten:
+    # zero_grad(False) may zero only the optimizer's smaller view of this buffer.
     _main_grad_is_stale: bool
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
@@ -616,6 +616,15 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
+    @property
+    def requires_inner_reduction(self) -> bool:
+        """Whether unreduced gradients need communication to reach main_grad's placements."""
+        assert self.main_grad is not None
+        return any(
+            self.mesh.size(axis) > 1 and placement != Partial("avg")
+            for axis, placement in enumerate(self.main_grad.placements)
+        )
+
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
@@ -635,13 +644,44 @@ class FsdpParameterGroup:
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
+        """Pack full local gradients on compute into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
+    def accumulate_local_gradients(self) -> None:
+        """Accumulate on compute, retaining source gradients for caller cleanup.
+
+        The caller clears the source .grad references on the same stream after
+        this call and orders any outer reduction after the accumulation.
+        """
+        assert self.main_grad is not None
+        for fsdp_parameter in self.fsdp_parameters:
+            if fsdp_parameter.unsharded.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+
+        has_sharded_grads = self._has_sharded_grads()
+        self._clear_stale_main_grad()
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            grad = fsdp_parameter.unsharded.grad
+            destination = self.main_grad.get_tensor_view(index)
+            if has_sharded_grads:
+                if self.grad_scale != 1:
+                    # Scale in the accumulation dtype, independently of grad_comm_dtype.
+                    grad = grad.to(destination.dtype) * self.grad_scale
+                destination.add_(grad)
+            else:
+                destination.copy_(grad)
+                if self.grad_scale != 1:
+                    destination.mul_(self.grad_scale)
+        self._install_sharded_grads(self.main_grad)
+
     def _has_sharded_grads(self) -> bool:
+        """Whether installed .grad views select accumulation instead of overwrite.
+
+        zero_grad(True) removes those views; zero_grad(False) keeps them. After
+        the first contribution, both paths install views for later accumulation.
+        """
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
@@ -652,6 +692,23 @@ class FsdpParameterGroup:
         if has_any_grad and has_any_missing_grad:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
+
+    def _clear_stale_main_grad(self) -> None:
+        """Clear stale values before adding a new step's first contribution."""
+        assert self.main_grad is not None
+        if not self._main_grad_is_stale:
+            return
+
+        # Final reduction left .grad pointing at the optimizer's view of main_grad.
+        # In ZeRO-1/HFSDP that view can cover only part of the buffer. For example,
+        # zero_grad(False) might leave main_grad as [0, 0, old, old]. Adding the
+        # next step's first contribution would include those old values, so clear
+        # the whole buffer first. If .grad is None, the caller instead overwrites
+        # every parameter's gradient and no clearing is needed.
+        if self._has_sharded_grads():
+            self.main_grad.local_buffer.zero_()
+        # Later microbatches must preserve the contributions already accumulated.
+        self._main_grad_is_stale = False
 
     def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
@@ -665,18 +722,8 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
-        if self._main_grad_is_stale:
-            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
-            # optimizer view. Clear the persistent full accumulation buffer before this
-            # new step; set_to_none=True needs no clear because out= below overwrites it.
-            if has_sharded_grads:
-                self.main_grad.local_buffer.zero_()
-            self._main_grad_is_stale = False
-
+        self._clear_stale_main_grad()
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):
