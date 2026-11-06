@@ -3291,7 +3291,7 @@ def dummy_train_step(data_iterator):
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
         "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size",
-        "hybrid_cp_group",
+        "dynamic_cp_group",
     ]
 
     num_microbatches = get_num_microbatches()
