@@ -33,6 +33,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
 
 
 def _reset_vision_flops_accumulator():
@@ -1031,6 +1032,18 @@ class TestAccumulator:
         # returning ``(None, None)`` so ``num_floating_point_operations`` takes
         # the closed-form defaults.
         assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_scheduler_totals_are_not_added_again_by_forward(self):
+        cu = torch.tensor([0, 65536], dtype=torch.int32)
+        totals = (8 * 65536, 8 * 65536**2)
+        training_module.set_seqlen_stats_in_iteration(*totals)
+        for _ in range(8):
+            update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == totals
+
+        # The next iteration can still use ordinary microbatch accumulation.
+        update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == (65536, 65536**2)
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The

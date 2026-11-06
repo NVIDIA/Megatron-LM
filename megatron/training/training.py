@@ -770,6 +770,10 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     flag at ``False`` and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    # Packing has already supplied the complete global batch, including all
+    # microbatches. Forward calls on PP/VPP stages must not count it again.
+    if _seqlen_stats_are_global:
+        return
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
