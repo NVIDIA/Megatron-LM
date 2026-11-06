@@ -1,3 +1,7 @@
+ENV_VARS:
+  # Trusted CI checkpoint contains legacy pickled Transformer Engine extra state.
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
+
 # Inference perf test: deepseek-style 16B MoE checkpoint, TP=1 PP=1 DP=1 (single GPU).
 #
 # Uses the gsm8k prompt dataset (real tokens) instead of synthetic. Synthetic

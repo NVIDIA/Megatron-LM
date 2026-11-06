@@ -1,3 +1,7 @@
+ENV_VARS:
+  # Trusted CI checkpoint contains legacy pickled Transformer Engine extra state.
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
+
 # Inference perf test: 583M mcore-mistral checkpoint, TP=1 PP=1 DP=4 (4 GPUs).
 #
 # GB200 single-node variant of gpt_583m_perf (which is DP=8 / 2 nodes on GB200).

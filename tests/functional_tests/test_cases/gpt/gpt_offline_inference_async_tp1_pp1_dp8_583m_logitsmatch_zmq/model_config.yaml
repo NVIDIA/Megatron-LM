@@ -4,6 +4,8 @@
 # (--use-coordinator and --async-mode). Goldens copied from the legacy case;
 # async path must produce numerically identical output to the sync path.
 ENV_VARS:
+  # Trusted CI checkpoint contains legacy pickled Transformer Engine extra state.
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
