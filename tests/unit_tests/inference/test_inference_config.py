@@ -320,6 +320,22 @@ class TestInferenceConfig:
         assert inference_config.disaggregation_shards == shards
         assert inference_config.kv_transport_backend == "nccl"
 
+    def test_inference_setup_config_maps_hybrid_layer_types(self):
+        """A hybrid model without recurrent layers still passes its layer types to the context."""
+        layer_type_list = [Symbols.MLA, Symbols.MOE] * 2
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=layer_type_list),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+        )
+
+        inference_config = InferenceSetupConfig().to_inference_config(model=model, verbose=False)
+
+        assert inference_config.mamba_inference_state_config is None
+        assert inference_config.layer_type_list == layer_type_list
+
     def test_inference_setup_config_maps_multimodal_fields(self):
         """Ensure declarative inference config maps multimodal fields to runtime config."""
         model = SimpleNamespace(
