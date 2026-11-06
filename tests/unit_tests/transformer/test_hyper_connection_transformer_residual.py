@@ -146,10 +146,19 @@ def test_dedicated_context_entry_resets_between_calls():
         layer("input", residual_stream_recompute_context=None)
         assert call.call_args.kwargs == {}
 
-    # The removed keyword is rejected by the inherited forward signature.
-    with patch.object(TransformerLayer, "__call__", nn.Module.__call__):
-        with pytest.raises(TypeError, match="mhc_recompute_manager"):
-            layer("input", mhc_recompute_manager=manager)
+    # The deprecated keyword snapshots the manager's mutable flag into an immutable context.
+    manager.is_last_layer_in_recompute_block = True
+    with patch.object(TransformerLayer, "__call__", return_value="base") as call:
+        with pytest.warns(DeprecationWarning, match="mhc_recompute_manager"):
+            assert layer("input", mhc_recompute_manager=manager, marker=1) == "base"
+        assert call.call_args.kwargs == {"marker": 1}
+        manager.is_last_layer_in_recompute_block = False
+        legacy_context = layer._residual_recompute_context(is_mlp=True)
+        assert legacy_context.manager is manager and legacy_context.is_block_end
+        assert not layer._residual_recompute_context().is_block_end
+
+        with pytest.raises(ValueError, match="not both"):
+            layer("input", residual_stream_recompute_context=context, mhc_recompute_manager=manager)
 
 
 def test_dedicated_context_preserves_shared_manager_and_immutable_boundaries():
