@@ -1,3 +1,4 @@
+# fmt: off
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """HF-save entry-point contract for every registered Lite model protocol."""
 
@@ -11,9 +12,9 @@ import pytest
 
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
 
-
 LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
+HF_SAVE_UNSUPPORTED = {}
 
 
 @pytest.mark.parametrize(
@@ -32,6 +33,9 @@ def test_registered_protocol_exposes_hf_save(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
+    if runtime_name in HF_SAVE_UNSUPPORTED:
+        assert "save_hf_weights" not in functions, HF_SAVE_UNSUPPORTED[runtime_name]
+        return
     assert "save_hf_weights" in functions, (
         f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
     )
@@ -178,3 +182,5 @@ def test_hf_save_checkpoint_warns_on_unused_export_kwargs(
     joined = "\n".join(warnings)
     for key in _ENGINE_EXPORT_KWARGS:
         assert key in joined
+
+# fmt: on
