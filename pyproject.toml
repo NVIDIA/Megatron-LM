@@ -341,9 +341,10 @@ source = [
 #
 # Enabling all `D` rules is tracked separately (thousands of
 # pre-existing stylistic violations); until then only the section
-# rules are selected.
+# rules plus `D209` (PEP 257: closing quotes of a multi-line docstring
+# on a line of their own) are selected.
 # select = ["D", "F"]
-select = ["S506", "D405", "D406", "D407", "D408", "D409", "D410", "D411", "D412", "D414", "D416"]
+select = ["S506", "D209", "D405", "D406", "D407", "D408", "D409", "D410", "D411", "D412", "D414", "D416"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
