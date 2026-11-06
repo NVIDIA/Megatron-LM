@@ -137,7 +137,9 @@ in the forward/backward graph's memory pool. The distributed optimizer and the l
 mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
 Replay order must remain forward/backward, gradient conversion, then optimizer update.
 The converted values are valid until the next forward/backward replay; gradient addresses must
-remain stable. Resetting the training graph also invalidates the conversion graph.
+remain stable. Resetting the training graph also invalidates the conversion graph. The optimizer
+holds the training graph only weakly, so deleting the graph at the end of training releases it
+(and its NCCL resources) before the process groups are destroyed.
 
 This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
 step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
