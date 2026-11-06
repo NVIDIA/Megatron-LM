@@ -935,10 +935,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def _validate_residual_branch_layout(self) -> tuple[bool, bool]:
         """Validate branch layouts for advanced residual-stream architectures.
 
-        mHC and Wide Residual subclasses opt in after base construction. Return
-        whether attention and MLP are active. Inactive paths still execute at stream
-        width, so their norms and BDA must be identities. Ordinary Transformer layers
-        do not call this helper.
+        mHC and Wide Residual subclasses opt in after base construction; ordinary
+        Transformer layers do not call this helper. Cross-attention is unsupported: a
+        non-identity cross-attention module raises NotImplementedError, and a non-identity
+        cross-attention norm or BDA raises ValueError. Inactive self-attention or MLP paths
+        still execute at stream width, so a non-identity norm or BDA on them raises
+        ValueError.
+
+        Returns:
+            Whether self-attention and the MLP are active.
         """
         if not isinstance(self.cross_attention, IdentityOp):
             raise NotImplementedError(

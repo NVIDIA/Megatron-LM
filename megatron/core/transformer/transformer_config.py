@@ -1446,16 +1446,17 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
+    """Number of layers per mHC recompute block, used when 'mhc' is in recompute_modules.
 
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointWithoutOutputManager is created for subsequent layers
+    Each TransformerBlock or HybridStack instance splits the layers it holds, in order, into
+    blocks of this many layers; its last layer always ends a block, so blocks never cross a
+    pipeline stage boundary. Within a block, mHC checkpoints its residual-stream operations
+    and separate norms into one CheckpointWithoutOutputManager. The block's last residual
+    write is not checkpointed; its output is the block boundary. After that layer, the
+    manager releases the checkpointed outputs and registers one hook on the boundary that
+    recomputes them during backward.
 
-    If None, all layers in the transformer block share a single recompute block.
+    If None, all layers of a TransformerBlock or HybridStack form a single recompute block.
 
     Must be a positive integer when set."""
 
@@ -3307,10 +3308,9 @@ class TransformerConfig(ModelParallelConfig):
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
-        # raises for a MoE MLP submodule at build time, which is the precise check; a
-        # config-level `num_moe_experts` guard would also block the documented composition
-        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+        # Note: mHC + MoE is supported, so it is not rejected here. HyperConnectionTransformerLayer
+        # accepts MoE MLPs and rejects only MoE CUDA-graph scopes, at build time once the MLP type
+        # is known. HybridStack can also wrap MoE layers via HyperConnectionHybridLayer.
 
         if self.enable_mhc_connections:
             if self.pipeline_model_parallel_size > 1 and self.overlap_moe_expert_parallel_comm:
