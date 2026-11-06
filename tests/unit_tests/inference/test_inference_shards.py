@@ -315,3 +315,36 @@ def test_cp_accepted_only_when_one():
         InferenceShardSpec(tp=1, cp=2)
     with pytest.raises(ValueError):
         parse_inference_shards_spec("tp=1,cp=2", world_size=1)
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 ranks")
+def test_shard_pg_collection_satisfies_mtp_hsm_groups():
+    """MultiTokenPredictionBlock with mtp_hsm requires dp and gtp_remat on a passed collection.
+
+    Inference shards have no GTP weight remat, so both GTP_remat axes are singletons over the
+    current rank, matching what the MPU builds for gtp_remat_size=1.
+    """
+    from megatron.core.utils import get_pg_rank, get_pg_size
+
+    Utils.initialize_model_parallel()
+    try:
+        world = Utils.world_size
+        half = world // 2
+        shards = shards_module.build_inference_pg_collections_for_shards(
+            world, f"tp=1,dp={half},role=prefill+tp=1,dp={world - half},role=decode"
+        )
+        pgc = next(shard.pg_collection for shard in shards if shard.pg_collection is not None)
+        # Mirrors MultiTokenPredictionBlock's check for an explicit collection with mtp_hsm.
+        for name in ("tp", "cp", "pp", "dp", "gtp_remat"):
+            assert getattr(pgc, name, None) is not None, name
+        for name in ("gtp_remat", "expt_gtp_remat"):
+            group = getattr(pgc, name)
+            assert get_pg_size(group) == 1 and get_pg_rank(group) == 0
+            assert torch.distributed.get_process_group_ranks(group) == [
+                torch.distributed.get_rank()
+            ]
+        assert get_pg_size(pgc.dp) == (
+            half if torch.distributed.get_rank() < half else world - half
+        )
+    finally:
+        Utils.destroy_model_parallel()
