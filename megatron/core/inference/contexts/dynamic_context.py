@@ -968,6 +968,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
+        # Whether any EP rank prefills in this step's forward, read by the engine's step-time
+        # metrics. None when no EP-wide consensus ran for the step (unknown).
+        self.step_ep_any_prefill: Optional[bool] = None
+
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
@@ -2916,6 +2920,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         self.batch_dimensions = batch_dimensions
+        # Unknown (None) unless an EP-wide consensus for this forward sets it.
+        self.step_ep_any_prefill = None
 
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,

@@ -545,6 +545,17 @@ class CoordinatorMixin:
                 serialized[key] = None
         return serialized
 
+    @staticmethod
+    def _context_percentiles(lengths) -> Dict[str, int]:
+        """min / p50 / p90 / p99 / max of the active requests' context lengths (0 if none)."""
+        names = ("min", "p50", "p90", "p99", "max")
+        if not lengths.numel():
+            return {f"{n}_context_tokens": 0 for n in names}
+        ordered = lengths.sort().values.tolist()
+        last = len(ordered) - 1
+        picks = (0, last // 2, int(0.9 * last), int(0.99 * last), last)
+        return {f"{n}_context_tokens": int(ordered[i]) for n, i in zip(names, picks)}
+
     def _metrics_snapshot(self) -> Dict[str, int]:
         """This engine's lifetime counters and current gauges, for /metrics.
 
@@ -552,6 +563,7 @@ class CoordinatorMixin:
         divides the difference by its length.
         """
         context = self.context
+        lengths = context.get_active_sequence_lengths()
         return {
             **self._metrics_counters,
             "prompt_tokens_total": context.metrics_prompt_tokens_total,
@@ -559,6 +571,25 @@ class CoordinatorMixin:
             "requests_running": context.total_request_count - context.paused_request_count,
             "requests_paused": context.paused_request_count,
             "requests_waiting": len(self.waiting_request_ids),
+            # Context (prompt + generated) tokens of the active requests: this engine's
+            # attention / KV load.
+            "kv_tokens": int(lengths.sum()) if lengths.numel() else 0,
+            # Distribution of active requests' context (prompt + generated); the longest is the
+            # slowest sequence in attention. The mean is kv_tokens / requests_running.
+            **self._context_percentiles(lengths),
+            # Every active request's context: {request id: tokens}, for per-request timelines.
+            "request_context_tokens": dict(
+                zip(
+                    map(
+                        str,
+                        context.request_ids[
+                            context.paused_request_count : context.total_request_count
+                        ].tolist(),
+                    ),
+                    lengths.tolist(),
+                )
+            ),
+            "step_time_ms": self._step_time_histogram.snapshot(),
         }
 
     def _try_send_streaming_partials(self) -> None:

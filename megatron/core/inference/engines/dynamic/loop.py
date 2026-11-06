@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 import torch
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.engines.step_time_metrics import classify_step
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
@@ -143,6 +144,22 @@ class EngineLoopMixin:
         async with self._cond:
             self._cond.notify_all()
 
+    def _observe_step_time(self, decode_only, step_time: float) -> None:
+        """Record a timed step in the step-time histogram, classed by the forward it launched.
+
+        The timed window ends with the forward launched this step, and the EP consensus that
+        set context.step_ep_any_prefill ran while preparing that same forward.
+        """
+        # Async scheduling reports the consumed and launched forwards; legacy, one bool.
+        launched_decode_only = getattr(decode_only, "launched", decode_only)
+        if launched_decode_only is None:  # no forward launched (idle step)
+            return
+        step_class = classify_step(
+            local_prefill=not launched_decode_only,
+            ep_any_prefill=self.context.step_ep_any_prefill,
+        )
+        self._step_time_histogram.observe(step_class, step_time * 1e3)
+
     async def async_forward(self) -> Tuple[Optional[Dict], Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -237,6 +254,7 @@ class EngineLoopMixin:
             self.step_end_event.record()
             self.step_end_event.synchronize()
             step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+            self._observe_step_time(controller_result.decode_only, step_time)
         else:
             step_time = 0.0
         self.context.step_count += 1
