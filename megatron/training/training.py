@@ -3032,7 +3032,7 @@ def setup_model_and_optimizer(
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(args):
@@ -4633,7 +4633,11 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % cfg.logger.log_interval == 0 and args.log_straggler:
+    if (
+        iteration % cfg.logger.log_interval == 0
+        and cfg.straggler is not None
+        and cfg.straggler.log_straggler
+    ):
         # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, cfg.logger.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
@@ -5045,17 +5049,17 @@ def train(
         gc.collect()
 
     # Singleton initialization of straggler detector.
-    if args.log_straggler:
+    if cfg.straggler is not None and cfg.straggler.log_straggler:
         global stimer
         world = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        mmcnt = args.straggler_minmax_count
+        mmcnt = cfg.straggler.straggler_minmax_count
         stimer.configure(
             world,
             rank,
             mmcnt=mmcnt,
-            enabled=not args.disable_straggler_on_startup,
-            port=args.straggler_ctrlr_port,
+            enabled=not cfg.straggler.disable_straggler_on_startup,
+            port=cfg.straggler.straggler_ctrlr_port,
         )
     num_floating_point_operations_since_last_log_event = 0.0
 
@@ -5796,6 +5800,12 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    # Return training's cached blocks to the driver. Evaluation can route tokens very unevenly
+    # across experts, so its allocations do not match the training-shaped cache and would
+    # otherwise map new memory on top of it.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
+
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
@@ -5970,6 +5980,12 @@ def evaluate(
     # Move model back to the train mode.
     for model_module in model:
         model_module.train()
+
+    # Return evaluation's cached blocks to the driver. The caching allocator frees its cache and
+    # retries when its own allocations fail, but NCCL allocates from the driver directly, so a
+    # checkpoint save right after evaluation can otherwise fail to allocate collective buffers.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]

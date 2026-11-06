@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Gradient reduction dtype tests for MFSDP v2 (``MixedPrecisionPolicy.grad_comm_dtype``).
+"""Gradient accumulation and reduction dtype tests for MFSDP v2.
 
 The reduce-scatter input (partial_grad) must be allocated in ``grad_comm_dtype``, or in the
 main-gradient dtype when it is unset, independently of the compute-gradient dtype, and
@@ -13,15 +13,17 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -91,7 +93,8 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
     x = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
     model(x).float().sum().backward()
 
-    assert allocated_dtypes == [expected_comm_dtype], allocated_dtypes
+    expected_dtypes = [expected_comm_dtype] if distributed_setup.world_size > 1 else []
+    assert allocated_dtypes == expected_dtypes, allocated_dtypes
     for name, parameter in model.named_parameters():
         assert parameter.grad.dtype == (main_grads_dtype or torch.bfloat16), name
 
@@ -155,8 +158,9 @@ def test_mxfp8_partial_grad_buffer_follows_grad_comm_dtype(
         output = model(x)
     output.float().sum().backward()
 
-    # One partial buffer per group (weight group and bias group).
-    assert allocated_dtypes == [expected_comm_dtype] * 2, allocated_dtypes
+    # Communicating meshes pack both groups; singleton meshes accumulate locally.
+    expected_dtypes = [expected_comm_dtype] * 2 if distributed_setup.world_size > 1 else []
+    assert allocated_dtypes == expected_dtypes, allocated_dtypes
 
 
 @pytest.mark.parametrize(
@@ -233,3 +237,72 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
     torch.testing.assert_close(
         torch.stack(sharded_losses), torch.stack(baseline_losses), rtol=0, atol=atol
     )
+
+
+@pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])
+@pytest.mark.parametrize("set_to_none", [False, True])
+def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none):
+    """Singleton-inner DP matches dense training, with replicated DP as a reduction control."""
+    setup = distributed_setup
+    if setup.world_size < 2:
+        pytest.skip("Requires different contributions from at least two ranks.")
+    if sharding == "replicated":
+        mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+        placements = Placements([0], [Replicate()], [Replicate()], [Replicate()])
+        grad_comm_dtype = None
+    else:
+        mesh = init_device_mesh(setup.device.type, (setup.world_size, 1))
+        placements = Placements(
+            [0, 1],
+            [Replicate(), Shard(0)],
+            [Partial("avg"), Shard(0)],
+            [Shard(0) if sharding == "hfsdp" else Replicate(), Shard(0)],
+        )
+        # No inner communication: a BF16 communication policy must not round local sums.
+        grad_comm_dtype = torch.bfloat16
+
+    torch.manual_seed(1234)
+    model = nn.Linear(8, 8 * setup.world_size, bias=False, device=setup.device)
+    reference = nn.Linear(8, 8 * setup.world_size, bias=False, device=setup.device)
+    reference.load_state_dict(model.state_dict())
+    context = FsdpContext(
+        device=setup.device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
+    )
+    with fully_shard_context(context):
+        fully_shard(
+            model,
+            mesh,
+            placements,
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+            ),
+        )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    generator = torch.Generator(device=setup.device).manual_seed(5678 + setup.rank)
+    num_microbatches = 2
+    inputs = torch.randn(num_microbatches, 4, 8, device=setup.device, generator=generator)
+    targets = torch.randn(
+        num_microbatches, 4, 8 * setup.world_size, device=setup.device, generator=generator
+    )
+    microbatches = tuple(zip(inputs.unbind(), targets.unbind()))
+
+    def train(model, optimizer, *, reduce_grads: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad(set_to_none=set_to_none)
+            for index, (inputs, targets) in enumerate(microbatches):
+                with microbatch(context, is_last=index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(inputs), targets)
+                    losses.append(loss.detach())
+                    (loss / num_microbatches).backward()
+            if reduce_grads:
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
+
+    actual_losses = train(model, optimizer, reduce_grads=False)
+    expected_losses = train(reference, reference_optimizer, reduce_grads=True)
+    torch.testing.assert_close(torch.stack(actual_losses), torch.stack(expected_losses))

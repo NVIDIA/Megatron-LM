@@ -131,6 +131,7 @@ inference = [
     "orjson",
     "pyzmq",
     "quart",
+    "flashinfer-python>=0.7.2,<0.8.0",
     # flashinfer-jit-cache ships pre-compiled CUTLASS MoE kernels and must match
     # flashinfer-python exactly; bump both together. The wheels are CUDA-major
     # specific and only published on flashinfer.ai (cu130 to match the dev image).
@@ -244,6 +245,7 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "filelock>=4.2.1",  # CVE-2026-112940; multi-storage-client 0.51 caps filelock below 4
     "tilelang==0.1.12",
     "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
