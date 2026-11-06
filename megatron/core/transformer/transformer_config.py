@@ -4861,6 +4861,28 @@ class TransformerConfig(ModelParallelConfig):
                 "Batch invariant mode does not support NVFP4: tensor-global "
                 "activation scaling depends on neighboring batch rows."
             )
+            # deepgemm and triton replace TE's GEMMs with BF16 batch-invariant kernels, which
+            # take no quantized operands. (Per-module quant_recipe precisions depend on module
+            # names, so the GEMM itself rejects those.)
+            if self.batch_invariant_backend in ("deepgemm", "triton"):
+                assert not (self.fp8 or self.fp4), (
+                    f"batch_invariant_backend={self.batch_invariant_backend!r} runs TE's GEMMs "
+                    "on BF16 batch-invariant kernels and does not support FP8/FP4; use "
+                    "batch_invariant_backend='te_native'."
+                )
+            # The fused dense and shared-expert grouped MLPs quantize to MXFP8 (or NVFP4) and give
+            # TE 256-row split alignment, so on Blackwell TE runs them as cuDNN CuTeDSL grouped
+            # GEMMs (TE >= 2.21, or older TE with NVTE_CUTEDSL_FUSED_GROUPED_MLP=1). No backend
+            # controls those kernels: te_native's workspace limit is cuBLAS-only, and deepgemm
+            # and triton replace only TE's general_gemm and grouped GEMM calls.
+            assert not (
+                self.use_grouped_gemm_for_dense_mlp or self.use_grouped_gemm_for_shared_expert
+            ), (
+                "Batch invariant mode does not support use_grouped_gemm_for_dense_mlp or "
+                "use_grouped_gemm_for_shared_expert: Transformer Engine runs these fused grouped "
+                "MLPs as cuDNN CuTeDSL grouped GEMMs, which no batch_invariant_backend makes "
+                "batch-invariant. Use the unfused dense MLP and shared expert."
+            )
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
