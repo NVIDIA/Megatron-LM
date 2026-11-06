@@ -1,4 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Private-logits integration adapted from:
+# https://github.com/NVIDIA-NeMo/nv-mistralai-megatron
+# Revision: daa90bd2d26fb44f34b769961c1a1f94a53d6c35
+# License: BSD-3-Clause (see the source repository LICENSE).
 import inspect
 import logging
 from typing import Optional, Tuple, Union
@@ -71,6 +75,14 @@ class LanguageModule(MegatronModule):
                 cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
             ),
         )
+        self._private_vocab_parallel_cross_entropy = None
+        if getattr(config, "cross_entropy_inplace_backward", False):
+            self._private_vocab_parallel_cross_entropy = select_cross_entropy(
+                config.cross_entropy_loss_fusion,
+                config.cross_entropy_fusion_impl,
+                getattr(config, "cuda_graph_impl", None),
+                inplace_backward=True,
+            )
 
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
@@ -114,13 +126,21 @@ class LanguageModule(MegatronModule):
 
     # pylint: disable=line-too-long
     def compute_language_model_loss(
-        self, labels: Tensor, logits: Tensor, return_argmax: bool = False
+        self,
+        labels: Tensor,
+        logits: Tensor,
+        return_argmax: bool = False,
+        *,
+        inplace_backward: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Computes the language model loss (Cross entropy across vocabulary)
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
             logits (Tensor): The final logits returned by the output layer of the transformer model
+            inplace_backward (bool): Explicitly transfer private logits to one backward.
+                Requires the opt-in configuration; no later reader or backward consumer
+                may use their storage. Default calls preserve ownership.
             return_argmax (bool): Also return the argmax of the logits over the full vocabulary,
                 [seq length, batch size], when the cross entropy finds it in the same pass (TE's
                 fused cross entropy), else None.
@@ -131,15 +151,16 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
+        loss_function = self.vocab_parallel_cross_entropy
+        if inplace_backward:
+            loss_function = self._private_vocab_parallel_cross_entropy
+            if loss_function is None:
+                raise ValueError("Private logits backward is not enabled for this model")
         argmax = None
-        if return_argmax and (
-            "return_argmax" in inspect.signature(self.vocab_parallel_cross_entropy).parameters
-        ):
-            loss, argmax = self.vocab_parallel_cross_entropy(
-                logits, labels, self.tp_group, return_argmax=True
-            )
+        if return_argmax and ("return_argmax" in inspect.signature(loss_function).parameters):
+            loss, argmax = loss_function(logits, labels, self.tp_group, return_argmax=True)
         else:
-            loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
+            loss = loss_function(logits, labels, self.tp_group)
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
         if return_argmax:
