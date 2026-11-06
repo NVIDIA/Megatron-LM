@@ -60,6 +60,8 @@ class CapturingTransformerConfig:
     """Minimal config that records kwargs produced by core_transformer_config_from_args."""
 
     moe_use_norm_before_up_proj: bool = False
+    moe_grouped_gemm: bool = True
+    moe_token_dispatcher_type: str = "alltoall"
     hash_moe_vocab_size: int | None = None
     wide_residual: object = None
 
@@ -107,6 +109,80 @@ def test_gtp_userbuffer_flags_preserve_cli_contract(name):
     add_megatron_arguments(parser)
     assert getattr(parser.parse_args([]), name) is False
     assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+
+
+@pytest.mark.parametrize(
+    "flags, grouped_gemm",
+    [
+        ([], True),
+        (["--moe-grouped-gemm"], True),
+        (["--no-moe-grouped-gemm"], False),
+        (["--disable-moe-grouped-gemm"], False),
+        (["--moe-grouped-gemm", "--no-moe-grouped-gemm"], False),
+        (["--no-moe-grouped-gemm", "--moe-grouped-gemm"], True),
+    ],
+)
+@pytest.mark.parametrize("dispatcher", [None, "allgather", "alltoall", "flex"])
+def test_moe_backend_defaults_and_overrides_reach_config(flags, grouped_gemm, dispatcher):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    if dispatcher is not None:
+        flags = [*flags, "--moe-token-dispatcher-type", dispatcher]
+    args = parser.parse_args(flags)
+    args.params_dtype = torch.float32
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert args.moe_grouped_gemm is config.moe_grouped_gemm is grouped_gemm
+    assert args.moe_token_dispatcher_type == config.moe_token_dispatcher_type
+    assert config.moe_token_dispatcher_type == (dispatcher or "alltoall")
+
+
+@pytest.mark.parametrize("checkpoint_grouped_gemm", [None, False, True])
+@pytest.mark.parametrize("dispatcher", [None, "allgather"])
+def test_checkpoint_moe_backend_args_preserve_explicit_legacy_layout(
+    monkeypatch, checkpoint_grouped_gemm, dispatcher
+):
+    """New defaults must not silently convert a saved SequentialMLP weight layout."""
+    from megatron.training import checkpointing
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    flags = [] if dispatcher is None else ["--moe-token-dispatcher-type", dispatcher]
+    args = parser.parse_args(flags)
+    args.rank = 0
+    args.load = "checkpoint"
+    checkpoint_args = Namespace(num_experts=2, moe_token_dispatcher_type="allgather")
+    if checkpoint_grouped_gemm is not None:
+        checkpoint_args.moe_grouped_gemm = checkpoint_grouped_gemm
+    state = {"args": checkpoint_args, "checkpoint_version": 3.0}
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *args, **kwargs: (state, "checkpoint", False, None),
+    )
+
+    checkpointing.load_args_from_checkpoint(args)
+
+    assert args.moe_grouped_gemm is (
+        True if checkpoint_grouped_gemm is None else checkpoint_grouped_gemm
+    )
+    assert args.moe_token_dispatcher_type == (dispatcher or "alltoall")
+
+
+@pytest.mark.parametrize(
+    "num_experts, transformer_impl", [(None, "transformer_engine"), (2, "local")]
+)
+def test_default_grouped_gemm_does_not_check_device_for_dense_or_local(
+    monkeypatch, num_experts, transformer_impl
+):
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.num_experts = num_experts
+    args.transformer_impl = transformer_impl
+    with patch("torch.cuda.get_device_capability", return_value=(7, 0)) as capability:
+        validate_args(args)
+    capability.assert_not_called()
 
 
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():

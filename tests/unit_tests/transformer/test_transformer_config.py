@@ -10,6 +10,30 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 
+@pytest.mark.parametrize("num_moe_experts", [None, 2])
+def test_moe_backend_defaults(num_moe_experts):
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, num_moe_experts=num_moe_experts
+    )
+    assert config.moe_token_dispatcher_type == "alltoall"
+    assert config.moe_grouped_gemm is True
+    assert config.moe_use_grouped_tensor is False
+    assert config.moe_single_grouped_weight is False
+
+
+def test_legacy_moe_backends_remain_explicitly_selectable():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_grouped_gemm=False,
+        moe_token_dispatcher_type="allgather",
+    )
+    assert config.moe_grouped_gemm is False
+    assert config.moe_token_dispatcher_type == "allgather"
+
+
 def _make_glu_interleave_config(**overrides):
     kwargs = dict(
         num_layers=1,
