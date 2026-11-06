@@ -15,6 +15,9 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
+    TorchFullyShardedDataParallelConfig,
+)
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -23,6 +26,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -425,17 +429,16 @@ class PretrainConfigContainer(ConfigContainerBase):
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
-
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
-        self.rl.validate_ddp_config(self.ddp)
         super().validate()
         self._validate_checkpoint()
         global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
         self.optimizer.validate_run(
             ddp_config=self.ddp,
-            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            use_torch_fsdp2=self.ddp.use_torch_fsdp2,
             ckpt_format=self.checkpoint.ckpt_format,
         )
         # Legacy providers have no model config; their model inputs are checked by the adapter.
@@ -459,11 +462,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         other side (ddp, dist, optimizer). Read-only; the CLI runs the same checks from the
         arguments in ``validate_args``."""
         checkpoint, ddp, dist = self.checkpoint, self.ddp, self.dist
-        if dist.use_torch_fsdp2:
+        if ddp.use_torch_fsdp2:
             assert checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
                 '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         if checkpoint.ckpt_format == "torch_dcp":
-            assert dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+            assert ddp.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
         if ddp.use_megatron_fsdp:
             assert checkpoint.ckpt_format == "fsdp_dtensor", \
                 "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
@@ -486,9 +489,87 @@ class PretrainConfigContainer(ConfigContainerBase):
             if checkpoint.dist_ckpt_optim_fully_reshardable:
                 assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
-        if ddp.overlap_param_gather and checkpoint.save is not None:
+        if self.optimizer.overlap_param_gather and checkpoint.save is not None:
             assert checkpoint.save_params_interval is None, \
                 '--save-params-interval is not supported with --overlap-param-gather'
+
+    def _validate_ddp_config(self) -> None:
+        """Check wrapper requirements without deriving or mutating other configs."""
+        # DDP's copy is derived during finalization; recipes only set optimizer policy.
+        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "--reuse-grad-buf-for-mxfp8-param-ag: "
+                    "parameters share the gradient-buffer storage that offload releases."
+                )
+            assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+        transformer = getattr(self.model, "transformer", None)
+        if self.ddp.use_torch_fsdp2:
+            if not isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
+                raise ValueError("Torch FSDP2 requires TorchFullyShardedDataParallelConfig.")
+            if self.ddp.use_megatron_fsdp:
+                raise ValueError("Torch FSDP2 and Megatron FSDP cannot be used together.")
+            if not is_torch_min_version("2.4.0"):
+                raise ValueError("Torch FSDP2 requires PyTorch >= 2.4.0.")
+            if self.optimizer.use_distributed_optimizer:
+                raise ValueError("Torch FSDP2 cannot use the distributed optimizer.")
+            if self.optimizer.optimizer not in ("sgd", "adam"):
+                raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
+        elif isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
+            raise ValueError("TorchFullyShardedDataParallelConfig requires ddp.use_torch_fsdp2.")
+        if self.ddp.use_megatron_fsdp:
+            if self.optimizer.optimizer not in ("sgd", "adam"):
+                raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
+        if self.ddp.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
+            if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
+                raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
+            if transformer is not None and transformer.moe_shortcut_connection:
+                raise ValueError("FSDP does not support MoE shortcut connections.")
+            if transformer is not None and transformer.moe_megakernel_backend == "mok":
+                raise ValueError("MOK has not been validated with FSDP.")
+        if transformer is not None:
+            if self.ddp.fp8_param_gather and not transformer.fp8:
+                raise ValueError("FP8 parameter gathering requires FP8 compute.")
+            if self.ddp.fp4_param_gather and not transformer.fp4:
+                raise ValueError("FP4 parameter gathering requires FP4 compute.")
+            if self.ddp.use_torch_fsdp2:
+                if transformer.pipeline_model_parallel_size != 1:
+                    raise ValueError("Torch FSDP2 does not support pipeline parallelism.")
+                if transformer.expert_model_parallel_size != 1:
+                    raise ValueError("Torch FSDP2 does not support expert parallelism.")
+                if transformer.gradient_accumulation_fusion or transformer.fp16:
+                    raise ValueError("Torch FSDP2 does not support fused accumulation or FP16.")
+                if self.model.share_embeddings_and_output_weights:
+                    raise ValueError("Torch FSDP2 requires untied embeddings and output weights.")
+            if self.ddp.use_megatron_fsdp:
+                if transformer.moe_single_grouped_weight or transformer.moe_single_grouped_bias:
+                    raise ValueError(
+                        "Megatron FSDP does not support single grouped MoE parameters."
+                    )
+                if transformer.hybrid_context_parallel or transformer.dynamic_context_parallel:
+                    raise ValueError("Megatron FSDP does not support dynamic context parallelism.")
+                sharding = {
+                    self.ddp.data_parallel_sharding_strategy,
+                    self.ddp.expert_data_parallel_sharding_strategy
+                    or self.ddp.data_parallel_sharding_strategy,
+                }
+                if transformer.init_model_with_meta_device and sharding == {"no_shard"}:
+                    raise ValueError("Meta-device initialization requires a sharded FSDP strategy.")
+                if "optim_grads_params" in sharding and (
+                    self.train.check_weight_hash_across_dp_replicas_interval is not None
+                ):
+                    raise ValueError(
+                        "Fully sharded parameters do not support DP weight-hash checks."
+                    )
+        if self.ddp.fsdp_manual_registration and not (
+            self.ddp.use_megatron_fsdp
+            and self.ddp.megatron_fsdp_version == 1
+            and self.ddp.nccl_ub
+        ):
+            raise ValueError(
+                "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
+            )
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -652,8 +733,59 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         super()._finalize()
         self.optimizer.finalize_optimizer_config()
-        if self.optimizer.use_layer_wise_distributed_optimizer:
-            self.ddp.use_distributed_optimizer = False
+        if self.ddp.use_torch_fsdp2:
+            if is_te_min_version("2.0.0"):
+                self.ddp.fp8_param_gather = False
+            if not is_te_min_version("2.7.0.dev0"):
+                self.ddp.fp4_param_gather = False
+        self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
+        self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+        )
+        if self.ddp.grad_reduce_in_fp32:
+            self.ddp.reduce_scatter_with_fp32_accumulation = False
+            self.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation = False
+        if self.ddp.use_megatron_fsdp:
+            self.ddp.use_custom_fsdp = True
+            self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+            if self.ddp.megatron_fsdp_version == 1:
+                self.optimizer.use_distributed_optimizer = True
+                self.ddp.megatron_fsdp_use_decoupled_grad = (
+                    self.optimizer.use_precision_aware_optimizer
+                )
+                if not self.ddp.disable_symmetric_registration:
+                    self.ddp.average_in_collective = False
+                if self.ddp.nccl_ub:
+                    self.ddp.fsdp_manual_registration = True
+            else:
+                # V2 owns sharded storage and communication, not DDP's optimizer/overlap path.
+                self.optimizer.use_distributed_optimizer = False
+                self.optimizer.overlap_param_gather = False
+                self.optimizer.overlap_param_gather_with_optimizer_step = False
+                self.ddp.overlap_param_gather = False
+                self.ddp.overlap_grad_reduce = False
+                self.ddp.fsdp_all_gather_in_start_param_sync = False
+        # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
+        self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
+            not self.ddp.use_torch_fsdp2
+            and not self.ddp.use_megatron_fsdp
+            and self.optimizer.use_layer_wise_distributed_optimizer
+            and self.optimizer.use_layer_wise_param_layout
+        )
+        if transformer is not None:
+            transformer.fp8_param = self.ddp.fp8_param_gather
+            transformer.fp4_param = self.ddp.fp4_param_gather
+            if transformer.virtual_pipeline_model_parallel_size is None:
+                self.ddp.align_param_gather = False
+            if self.ddp.use_megatron_fsdp:
+                if self.ddp.megatron_fsdp_version == 2:
+                    transformer.gradient_accumulation_fusion = False
+                    transformer.deallocate_pipeline_outputs = False
+                if transformer.cuda_graph_impl != "none":
+                    self.ddp.megatron_fsdp_cuda_graph_mode = True
+                    if transformer.cuda_graph_impl == "full_iteration":
+                        self.ddp.fsdp_all_gather_in_start_param_sync = False
         # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
         # perform numerical validation. Loss and gradient checks otherwise remain independent.
         fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
@@ -689,6 +821,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+        self.ddp.finalize()
 
 
 def update_train_iters(train: TrainingConfig) -> None:
@@ -748,20 +881,6 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
-
-    def validate(self) -> None:
-        """Validate each section, then the checkpoint format against the sections inference owns."""
-        super().validate()
-        self._validate_checkpoint()
-
-    def _validate_checkpoint(self) -> None:
-        """The torch_dcp / FSDP2 pairing, the one cross-section checkpoint rule inference can
-        express: it has no ddp or optimizer section (the CLI checks those from the arguments)."""
-        if self.dist.use_torch_fsdp2:
-            assert self.checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
-                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
-        if self.checkpoint.ckpt_format == "torch_dcp":
-            assert self.dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
 
     def _finalize(self) -> None:
         super()._finalize()

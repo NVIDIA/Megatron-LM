@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -30,6 +31,12 @@ class DistributedDataParallelConfig:
     PP stage will independently launch as needed.
     """
 
+    create_all_gather_group: bool = False
+    """Create separate data-parallel process groups for parameter all-gathers."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
+
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
@@ -58,6 +65,11 @@ class DistributedDataParallelConfig:
     """Number of buckets for data-parallel communication. Should only specify one of
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
        will be determined at runtime."""
+
+    _bucket_size_resolved: bool = field(default=False, repr=False)
+    """Whether bucket_size has been resolved from the model and process-group size.
+    Saved with the config so a resolved num_buckets/bucket_size pair can be restored.
+    """
 
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
@@ -91,6 +103,9 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
+    use_torch_fsdp2: bool = False
+    """Use Torch FSDP2 with TorchFullyShardedDataParallelConfig, instead of Megatron DDP/FSDP."""
+
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
@@ -120,7 +135,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      None is replaced with `data_parallel_sharding_strategy` during initialization."""
+      None is replaced with `data_parallel_sharding_strategy` during finalization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -198,7 +213,7 @@ class DistributedDataParallelConfig:
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
     Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
     ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during initialization.
+    ``outer_dp_sharding_strategy`` during finalization.
     """
 
     disable_symmetric_registration: bool = False
@@ -325,15 +340,30 @@ class DistributedDataParallelConfig:
         # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
-    def __post_init__(self):
-        import os
+    def finalize(self) -> None:
+        """Resolve local defaults after recipe edits and before wrapper construction.
 
-        """Check the validity of the config."""
+        Training containers first derive optimizer-owned fields. Standalone MCore
+        wrappers also call this method; repeated calls preserve resolved settings.
+        """
+        self._canonicalize()
+        self.validate()
+
+    def _canonicalize(self) -> None:
+        """Resolve local defaults and aliases after recipe edits."""
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+        if self.megatron_fsdp_max_pool_double_buffer:
+            self.fsdp_double_buffer = True
 
+    def validate(self) -> None:
+        """Check user settings without mutation, including edits after construction.
+
+        Optimizer-owned buffer policy may still be stale here. Its resolved layout
+        is checked by the training container and at DDP wrapper construction.
+        """
         for name in (
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
@@ -341,6 +371,10 @@ class DistributedDataParallelConfig:
             "expert_outer_dp_sharding_strategy",
         ):
             value = getattr(self, name)
+            if value is None and name == "expert_data_parallel_sharding_strategy":
+                value = self.data_parallel_sharding_strategy
+            if value is None and name == "expert_outer_dp_sharding_strategy":
+                value = self.outer_dp_sharding_strategy
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
@@ -352,15 +386,6 @@ class DistributedDataParallelConfig:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
             if self.megatron_fsdp_version != 2:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
-
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
-
-        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
-            )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
@@ -376,9 +401,36 @@ class DistributedDataParallelConfig:
             )
 
         if self.num_buckets is not None:
-            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
 
-        if self.megatron_fsdp_max_pool_double_buffer:
-            # MaxPoolAllocator is a type of double-buffer allocator.
-            self.fsdp_double_buffer = True
+    def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
+        """Resolve buckets in place after model construction and process-group setup.
+
+        Repeated calls with the same inputs preserve the resolved value. num_buckets,
+        when provided, remains authoritative. An explicit or previously resolved
+        bucket_size is otherwise retained. Per-chunk bucketing overrides stay local
+        to the wrappers and must not overwrite this run-wide setting.
+        """
+        if self.num_buckets is not None:
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            bucket_size = num_parameters // self.num_buckets
+        elif self.bucket_size is None:
+            bucket_size = max(40000000, 1000000 * data_parallel_size)
+        else:
+            bucket_size = self.bucket_size
+        self.bucket_size = bucket_size if self.overlap_grad_reduce else None
+        self._bucket_size_resolved = True
+
+    def to_cfg_dict(self) -> dict:
+        """Include the resolution marker when saving the otherwise public config."""
+        return {
+            "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
+            **{
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in asdict(self).items()
+            },
+        }

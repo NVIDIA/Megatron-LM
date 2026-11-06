@@ -52,6 +52,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import (
+    get_model_config,
     get_pg_rank,
     get_pg_size,
     grant_shape_mismatch_for_gtp_padding,
@@ -2227,7 +2228,7 @@ def _load_global_dist_base_checkpoint(
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
-def _get_checkpoint_format(checkpoint_name, args):
+def _get_checkpoint_format(checkpoint_name, *, use_megatron_fsdp=False):
     """Get the format of an existing checkpoint."""
     checkpoint_dir = maybe_msc.Path(checkpoint_name)
     is_torch_ckpt = any([f.name.startswith('mp_rank_0') for f in checkpoint_dir.iterdir()])
@@ -2240,7 +2241,7 @@ def _get_checkpoint_format(checkpoint_name, args):
         ckpt_format = 'torch'
     elif is_torch_dcp:
         ckpt_format = 'torch_dcp'
-        if getattr(args, 'use_megatron_fsdp', False):
+        if use_megatron_fsdp:
             ckpt_format = 'fsdp_dtensor'
     else:
         raise NotImplementedError(f'unknown checkpoint format in {checkpoint_name}')
@@ -2259,6 +2260,7 @@ def _load_base_checkpoint(
     checkpoint_group=None,
     gpt_compat_layer_maps=None,
     gtp_pad_for_alignment=None,
+    use_megatron_fsdp=False,
     *,
     checkpoint: Optional[CheckpointConfig] = None,
     finetune: Optional[bool] = None,
@@ -2336,7 +2338,9 @@ def _load_base_checkpoint(
 
     # Determine the type of the checkpoint on disk.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    ckpt_format = _get_checkpoint_format(checkpoint_name, args)
+    ckpt_format = _get_checkpoint_format(
+        checkpoint_name, use_megatron_fsdp=use_megatron_fsdp
+    )
 
     if not rank0:
         dist_infix = 'distributed ' if ckpt_format == 'torch_dist' else ''
@@ -2489,7 +2493,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     # Parse time: no run config is registered yet, the load policy comes from the arguments.
     checkpoint = checkpoint_config_from_args(args)
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=True, checkpointing_context=checkpointing_context, checkpoint=checkpoint
+        load_dir, args, rank0=True, checkpointing_context=checkpointing_context,
+        checkpoint=checkpoint,
+        use_megatron_fsdp=getattr(args, "use_megatron_fsdp", False),
     )
 
     # Args.
@@ -2866,6 +2872,20 @@ def load_checkpoint(
             train_state.effective_finetune = finetune
 
     model = unwrap_model(ddp_model)
+    # Inference has no training wrapper, but can still load an MFSDP checkpoint.
+    use_megatron_fsdp = (
+        cfg.ddp.use_megatron_fsdp
+        if hasattr(cfg, "ddp")
+        else load_format == "fsdp_dtensor"
+    )
+    quantized_params = (
+        cfg.ddp.fp8_param_gather or cfg.ddp.fp4_param_gather
+        if hasattr(cfg, "ddp")
+        else any(
+            get_model_config(chunk).fp8_param or get_model_config(chunk).fp4_param
+            for chunk in model
+        )
+    )
 
     ckpt_format = load_format
     state_dict = None
@@ -2878,6 +2898,7 @@ def load_checkpoint(
                 rank0=True,
                 checkpointing_context=checkpointing_context,
                 finetune=finetune,
+                use_megatron_fsdp=use_megatron_fsdp,
             )
 
         ckpt_format = None
@@ -3297,6 +3318,7 @@ def load_checkpoint(
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
         finetune=finetune,
+        use_megatron_fsdp=use_megatron_fsdp,
         **load_kwargs,
     )
 
@@ -3587,14 +3609,11 @@ def load_checkpoint(
             not skip_load_to_model_and_opt
             and optimizer is not None
             and not getattr(optimizer, 'is_stub_optimizer', False)
-            and (
-                getattr(args, 'fp8_param_gather', False)
-                or getattr(args, 'fp4_param_gather', False)
-            )
+            and quantized_params
         ):
             optimizer.quantize_and_sync_model_params_from_main_params()
     else:
-        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+        if quantized_params:
             print_rank_0(
                 'WARNING: quantized params were loaded without the optimizer main params, so '
                 'they were re-quantized from the dequantized values in the checkpoint rather '

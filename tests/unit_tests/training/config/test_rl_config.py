@@ -337,7 +337,7 @@ def test_validate_run_at_every_call_site():
     offload_container.validate()
     assert not offload_container.ddp.grad_buffer_offload
     offload_container.rl.rl_offload_optimizer_during_inference = True
-    offload_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    offload_container.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         offload_container.validate()
 
@@ -353,7 +353,7 @@ def test_validate_run_at_every_call_site():
     explicit_layout_container.validate()
     assert explicit_layout_container.ddp.grad_buffer_offload
     explicit_layout_container.ddp.fp8_param_gather = True
-    explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    explicit_layout_container.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         explicit_layout_container.validate()
     container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
