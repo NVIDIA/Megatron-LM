@@ -22,10 +22,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
+    _resolve_dynamic_cp_group_for_batch,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
+from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
@@ -67,8 +71,6 @@ def initialize_test_environment(
     args.create_attention_mask_in_dataloader = create_attention_mask
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
-    args.vocab_size = 1024
-    args.tokenizer_type = "NullTokenizer"
     args.num_layers = 4
     args.hidden_size = 512
     args.num_attention_heads = 8
@@ -78,7 +80,9 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.tokenizer = TokenizerConfig(vocab_size=1024, tokenizer_type="NullTokenizer")
+    set_global_variables(args, cfg, build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -1127,6 +1131,44 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert batch["padding_mask"] is padding_mask
 
 
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
+    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
+    configs = [
+        SimpleNamespace(
+            virtual_pipeline_model_parallel_size=None,
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+        )
+        for _ in range(2)
+    ]
+    build_config = MagicMock(side_effect=configs)
+    result = object()
+    fetch_batch = MagicMock(return_value=result)
+    monkeypatch.setattr(script, "_transformer_config_cache", None)
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "core_transformer_config_from_args", build_config)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
+    monkeypatch.setattr(script, "get_batch_on_this_rank_for_sequence_packing", fetch_batch)
+    pg_collection = ProcessGroupCollection(pp=object())
+
+    # Repeated microbatches with the same args object reuse one config.
+    for _ in range(2):
+        assert script.get_batch(None, pg_collection=pg_collection) is result
+        assert fetch_batch.call_args.kwargs["config"] is configs[0]
+    build_config.assert_called_once_with(args)
+
+    # Replacing args with an equal but distinct object rebuilds the config.
+    previous_args = args
+    args = SimpleNamespace(**vars(previous_args))
+    assert args == previous_args and args is not previous_args
+    for _ in range(2):
+        assert script.get_batch(None, pg_collection=pg_collection) is result
+        assert fetch_batch.call_args.kwargs["config"] is configs[1]
+    assert build_config.call_count == 2
+    assert build_config.call_args.args[0] is args
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -1608,14 +1650,19 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize(
+    "sequence_packing_scheduler,is_packed_sequence",
+    [(None, True), ("dp_balanced", True), ("dp_balanced", False)],
+)
 @pytest.mark.parametrize("vp_size", [None, 2])
-def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_scheduler, vp_size):
-    """Check which ranks build a packed-sequence dataset.
+def test_packed_sequence_dataset_built_on_rank(
+    script, sequence_packing_scheduler, is_packed_sequence, vp_size
+):
+    """Check that TP rank 0 of every PP stage builds the dataset for packed sequences.
 
     Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
-    own data iterator. The scheduler sends that metadata to them instead and rejects a data
-    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    own data iterator. The scheduler runs on every PP stage and reads its input there, also when
+    the dataset itself is not a packed-sequence dataset.
     """
     tp_size, pp_size = 2, 4
     if tp_size * pp_size > torch.cuda.device_count():
@@ -1634,19 +1681,16 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
     args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
     config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
     vp_stages = [None] if vp_size is None else range(vp_size)
+    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
+    # the arguments and the transformer config at call time from these two modules.
     with (
-        patch.object(script, "get_args", return_value=args),
-        patch.object(script, "core_transformer_config_from_args", return_value=config),
+        patch.object(global_vars, "get_args", return_value=args),
+        patch.object(arguments, "core_transformer_config_from_args", return_value=config),
     ):
         for vp_stage in vp_stages:
-            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
-
-            if sequence_packing_scheduler is None:
-                expected = tp_rank == 0
-            else:
-                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
-                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
-                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
-            assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
+            built = script.is_dataset_built_on_rank(
+                vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+            )
+            assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()

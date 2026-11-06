@@ -22,6 +22,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -143,6 +144,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp4_param": False,
     "fp4_quantizer_factory": None,
     "fp4_recipe": "nvfp4",
+    "fp4_recipe_attrs": None,
     "fp8": None,
     "fp8_amax_compute_algo": "most_recent",
     "fp8_amax_history_len": 1,
@@ -154,6 +156,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
+    "fp8_recipe_attrs": None,
     "fp8_wgrad": True,
     "freeze_base_model_for_mtp": False,
     "fused_residual_rmsnorm": False,
@@ -196,6 +199,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_num_value_heads": 32,
     "gdn_pre_gated_delta_rule_fusion": False,
     "gdn_gated_output_norm_fusion": False,
+    "gdn_conv_pad_alignment": None,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
@@ -207,6 +211,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
+    "mhc_keep_mappings_in_fp32": False,
+    "mhc_learned_output_contract": True,
+    "mhc_norm_eps_inside_sqrt": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
@@ -235,6 +242,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_num_hash_layers": 0,
     "moe_ncclep_zero_copy": False,
     "moe_pad_expert_input_to_capacity": False,
@@ -267,6 +276,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shortcut_connection": False,
+    "moe_shortcut_disable_mtp": False,
     "moe_shortcut_parallel": False,
     "moe_shortcut_post_norm": False,
     "moe_shared_expert_gate": False,
@@ -277,6 +287,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
     "moe_token_dropping": False,
+    "moe_training_matches_inference": False,
     "moe_virtual_expert_load_balance": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
@@ -314,6 +325,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
     "overlap_p2p_comm_warmup_flush": False,
+    "pad_packed_seq_alignment": None,
     "param_sync_func": None,
     "params_dtype": "torch.bfloat16",
     "perform_initialization": True,
@@ -342,6 +354,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tensor_parallel_num_weight_shards": 2,
     "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
+    "cuda_graph_thd_max_packed_sequences": None,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -384,10 +397,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "fine_grained_offloading_buffer_size_gib": 0.0,
     "hybrid_context_parallel": False,
     "dynamic_context_parallel": False,
     "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
+    "max_seq_length_per_sample": 1024,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
@@ -400,6 +415,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_flashinfer_mxfp8_token_capacity": None,
     "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
+    "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
@@ -608,6 +624,7 @@ class TestHybridMoEModel:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         destroy_moe_metrics_tracker()
         args = self.create_test_args()
+        cfg = get_run_config()
         set_args(args)
 
         Utils.initialize_model_parallel(
@@ -623,7 +640,7 @@ class TestHybridMoEModel:
         self.model = HybridModel(
             config=model_config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg.tokenizer.vocab_size,
             max_sequence_length=args.seq_length,
             hybrid_layer_pattern=args.hybrid_layer_pattern,
             position_embedding_type=args.position_embedding_type,
