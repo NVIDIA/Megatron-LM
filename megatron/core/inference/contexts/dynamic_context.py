@@ -2253,6 +2253,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     ) -> Tuple[Tensor, Tensor]:
         """
         Apply rotary embedding to query and key tensors using flashinfer's fused rope.
+
         Args:
             query (Tensor): Query tensor.
             key (Tensor): Key tensor.
@@ -5670,7 +5671,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         unsqueezed to [sum(seq_img_i), 1, hidden]. The downstream consumer
         does ``permute(1, 0, 2).reshape(-1, hidden)`` to yield the flat
         [total_image_tokens, hidden] array indexed by
-        :meth:`current_image_token_mask`.
+        {meth}`current_image_token_mask`.
 
         Returns tensor of shape [total_image_tokens, 1, hidden] or None.
         """

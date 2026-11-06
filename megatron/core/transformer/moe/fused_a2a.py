@@ -859,7 +859,7 @@ if HAVE_HYBRIDEP:
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
 
-        args:
+        Args:
             x (torch.Tensor):
                 Input hidden states to combine
             handle (EventHandle):

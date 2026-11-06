@@ -138,12 +138,12 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     Two mutually exclusive input shapes are accepted, and every sample in
     ``batch`` must use the same one:
 
-      * **Pre-packed** (e.g. :class:`SFTDataset`): each sample carries a
+      * **Pre-packed** (e.g. {class}`SFTDataset`): each sample carries a
         ``cu_seqlens`` tensor and the tokens of multiple sub-samples
         concatenated together. We slice them apart and synthesize
         ``original_seq_len`` / ``padded_seq_len`` from the cu_seqlens deltas.
 
-      * **Already unpacked** (e.g. :class:`VarlenDataset`): each sample is a
+      * **Already unpacked** (e.g. {class}`VarlenDataset`): each sample is a
         single sub-sample that already carries ``padded_seq_len`` (and
         usually ``original_seq_len``). We just normalize the leading batch
         dimension introduced by the default collate_fn and return as-is.
@@ -590,6 +590,7 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     Get the batch and global sequence lengths.
     Each DP rank loads the same number of sequences, so we need to gather the sequence
     lengths from all ranks then we can schedule the sequences into groups.
+
     Args:
         data_iterator: The data iterator.
         num_microbatches: The number of microbatches.
@@ -598,7 +599,7 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     Returns:
         batch (List[Dict[str, torch.Tensor]]): The sub-samples pulled from this rank's
             ``data_iterator`` over ``num_microbatches`` steps, flattened and unpacked
-            (see :func:`_unpack_batch`). Every dict carries ``tokens`` / ``labels`` /
+            (see {func}`_unpack_batch`). Every dict carries ``tokens`` / ``labels`` /
             ``loss_mask`` / ``position_ids`` plus the ``original_seq_len`` and
             ``padded_seq_len`` scalars used for scheduling.
         global_id_seqlens (List[Tuple[int, int]]): ``(global_id, padded_seq_len)`` for
@@ -610,12 +611,12 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
         offsets (torch.Tensor): int32 CPU tensor of shape ``[dp_size + 1]`` with the
             exclusive prefix sum of the per-rank sub-sample counts, so DP rank ``r`` owns
             global IDs ``offsets[r]:offsets[r + 1]``. Used by
-            :func:`reroute_samples_to_dcp_ranks` to map a global ID back to its source
+            {func}`reroute_samples_to_dcp_ranks` to map a global ID back to its source
             rank.
         seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
             DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
             ``global_id_seqlens[gid][1]``). These lengths size the schedule; FLOPs
-            accounting counts real tokens with :func:`get_global_real_seqlen_stats`.
+            accounting counts real tokens with {func}`get_global_real_seqlen_stats`.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]
@@ -651,7 +652,7 @@ def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
     """Sum the real (unpadded) sub-sample lengths of the global batch and their squares.
 
     Args:
-        batch: This DP rank's sub-samples as returned by :func:`get_batch_and_global_seqlens`.
+        batch: This DP rank's sub-samples as returned by {func}`get_batch_and_global_seqlens`.
         dp_group: The DP group whose padded lengths were gathered for scheduling.
         dev: Device for the reduction.
 

@@ -410,6 +410,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         rank (int): Rank for logging.
         schedule (str): Schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
             Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+
             Examples:
                 "0:768 250B:1536 500B:3072 750B:6144" (thresholds in tokens)
                 "0:768 61035156250:1536" (thresholds in samples)

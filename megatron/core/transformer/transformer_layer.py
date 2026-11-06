@@ -1409,6 +1409,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 Required by hash-routed MoE layers.
             residual_stream_recompute_context: Call-local ordered replay state for the
                 configured MLP residual connection.
+
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -1481,7 +1482,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         Picks between the recompute (te_checkpoint / tensor_parallel.checkpoint),
         chunked-prefill, and direct-call paths. Shared by both
-        :class:`TransformerLayer` and :class:`HyperConnectionTransformerLayer` so
+        {class}`TransformerLayer` and {class}`HyperConnectionTransformerLayer` so
         the MLP-call branching stays in one place.
 
         Returns:
@@ -2390,6 +2391,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
+
         Returns:
             List[Tensor]: A list of layernorm weight tensors.
         """

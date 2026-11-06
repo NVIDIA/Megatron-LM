@@ -237,6 +237,7 @@ def update_pg_timeout(
 ):
     """Update the timeout for all process groups or a specific process group.
        Synchronize the process groups before updating the timeout.
+
     Args:
         timeout(datetime.timedelta): The timeout to set for the process group(s)
         pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
@@ -2137,7 +2138,7 @@ def get_dynamic_data_context_parallel_groups(
 def get_hybrid_data_context_parallel_groups(
     check_initialized: bool = True, group_size: Optional[int] = None
 ) -> torch.distributed.ProcessGroup:
-    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
+    """Deprecated alias for {func}`get_dynamic_data_context_parallel_groups`."""
     warnings.warn(
         "get_hybrid_data_context_parallel_groups is deprecated; use "
         "get_dynamic_data_context_parallel_groups instead.",

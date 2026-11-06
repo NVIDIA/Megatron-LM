@@ -655,7 +655,7 @@ class DistributedDataParallel(_BaseDataParallel):
         """Dispatch one bucket group's param all-gather + run the FP8 / MXFP8 / FP4
         post-all-gather work the synchronous path needs.
 
-        Factored out of :meth:`start_param_sync` so callers that own a subset
+        Factored out of {meth}`start_param_sync` so callers that own a subset
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.

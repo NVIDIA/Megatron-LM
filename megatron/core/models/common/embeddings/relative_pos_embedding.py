@@ -19,11 +19,7 @@ __all__ = ['RelativePositionEmbedding']
 
 
 class RelativePositionEmbedding(nn.Module):
-    """Relative Position Embedding for language model.
-
-    Args:
-
-    """
+    """Relative Position Embedding for language models."""
 
     def __init__(
         self,
@@ -173,8 +169,5 @@ class RelativePositionEmbedding(nn.Module):
 
     @nvtx_decorator()
     def forward(self, query_seq_length, key_seq_length):
-        """
-        Args:
-        Returns:
-        """
+        """Return the attention bias for the given query and key sequence lengths."""
         return self._compute_bias(query_seq_length, key_seq_length)

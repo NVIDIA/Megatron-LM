@@ -372,7 +372,7 @@ class MegatronOptimizer(ABC):
 
         Does not zero any shared buffer and does not all-gather; both are the caller's
         responsibility so that optimizers sharing a DDP model chunk can be staged together.
-        See :meth:`quantize_and_sync_model_params_from_main_params`.
+        See {meth}`quantize_and_sync_model_params_from_main_params`.
         """
         return
 
@@ -386,7 +386,7 @@ class MegatronOptimizer(ABC):
 
         Not for use inside the training loop: the all-gather is forced synchronous and would
         defeat the overlapped param gather. The training loop reaches the same copy through
-        :meth:`step_with_ready_grads`.
+        {meth}`step_with_ready_grads`.
 
         Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
         scales, so loading them re-quantizes a value that has already been through one

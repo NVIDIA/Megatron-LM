@@ -61,8 +61,8 @@ def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
         stack_spec: A Mamba/hybrid stack spec to derive from. Not modified.
 
     Returns:
-        A spec whose ``attention_layer`` builds :class:`DSGroupedSelfAttention`
-        over a :class:`DSGQACoreAttention`. Unchanged layers and builders are shared.
+        A spec whose ``attention_layer`` builds {class}`DSGroupedSelfAttention`
+        over a {class}`DSGQACoreAttention`. Unchanged layers and builders are shared.
     """
     # Copy only the dataclasses on the modified path. Optional-dependency builders
     # can be mocks containing closure cells, which cannot be deep-copied.

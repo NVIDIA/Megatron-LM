@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Parser and typed representation (:class:`InferenceShardSpec`) for the
+"""Parser and typed representation ({class}`InferenceShardSpec`) for the
 ``--inference-shards`` shard-layout string."""
 
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ class InferenceShardSpec:
     Frozen and self-validating: ``expt_tp`` defaults to ``tp`` (resolved at
     construction), the expert decomposition is checked to tile within the shard,
     and ``role`` (``"prefill"`` / ``"decode"`` for disaggregation, else ``None``)
-    is validated. A list of these, produced by :func:`normalize_shard_specs`, is
+    is validated. A list of these, produced by {func}`normalize_shard_specs`, is
     what every inference-shard consumer (the PG builder, the disaggregation
     setup) operates on.
     """
@@ -87,8 +87,8 @@ def normalize_shard_specs(
     shards: Union[str, Sequence["InferenceShardSpec"], Sequence[dict]], world_size: int
 ) -> List["InferenceShardSpec"]:
     """Coerce the public shard-spec input (a spec string, a list of
-    :class:`InferenceShardSpec`, or a list of raw dicts) into the validated
-    list of :class:`InferenceShardSpec` the shard builders consume."""
+    {class}`InferenceShardSpec`, or a list of raw dicts) into the validated
+    list of {class}`InferenceShardSpec` the shard builders consume."""
     if isinstance(shards, str):
         return parse_inference_shards_spec(shards, world_size)
     out: List[InferenceShardSpec] = [
@@ -103,7 +103,7 @@ def resolve_inference_shard(
     """Resolve a global rank to its shard in a validated layout.
 
     Args:
-        shards: Any shard layout accepted by :func:`normalize_shard_specs`.
+        shards: Any shard layout accepted by {func}`normalize_shard_specs`.
         world_size: Total number of ranks partitioned by the layout.
         rank: Global rank to resolve.
 
@@ -136,7 +136,7 @@ def spec_declares_disaggregation(spec_str: str | None) -> bool:
     A role tag is what marks the layout as a prefill->decode handoff rather
     than plain multi-shard / data-parallel inference. Cheap and world_size-
     free, so it can be checked at arg-validation time; full parsing +
-    validation is :func:`parse_inference_shards_spec`.
+    validation is {func}`parse_inference_shards_spec`.
     """
     if not spec_str:
         return False
@@ -157,7 +157,7 @@ def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[Inferenc
             exactly (no idle ranks; see note below).
 
     Returns:
-        List of :class:`InferenceShardSpec`, one per shard. Order matches the
+        List of {class}`InferenceShardSpec`, one per shard. Order matches the
         input (left-to-right corresponds to ascending ``rank_offset``).
 
     Raises:
@@ -166,7 +166,7 @@ def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[Inferenc
             partition explicit — any world-collective consumer must be able to
             enumerate every rank's shard membership from the parsed list alone.
         ValueError: on an expert-grid mismatch within a shard (raised by
-            :class:`InferenceShardSpec`).
+            {class}`InferenceShardSpec`).
     """
     parsed: List[InferenceShardSpec] = []
     # ``+`` is convenient from shell recipes where ``;`` would otherwise
@@ -212,9 +212,9 @@ def _finalize_and_validate(
 ) -> List["InferenceShardSpec"]:
     """Assert the shards partition the world exactly.
 
-    Shared by the string parser and the object path (:func:`normalize_shard_specs`).
+    Shared by the string parser and the object path ({func}`normalize_shard_specs`).
     Per-shard defaults and expert-grid validation live in
-    :class:`InferenceShardSpec`; this only enforces the cross-shard total. Idle
+    {class}`InferenceShardSpec`; this only enforces the cross-shard total. Idle
     ranks are rejected so any world-collective consumer can enumerate every
     rank's shard membership from the list alone.
     """

@@ -1004,7 +1004,7 @@ def a2a_cp_to_hp(
 
     Returns:
         The hidden-parallel tensor and the sequence-dim inverse permutation to hand to
-        :func:`a2a_hp_to_cp` (``None`` outside the ``thd`` + CP>1 case).
+        {func}`a2a_hp_to_cp` (``None`` outside the ``thd`` + CP>1 case).
     """
     if cp_size > 1:
         # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
@@ -1046,7 +1046,7 @@ def a2a_hp_to_cp(
         packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
             ``qkv_format`` is ``'thd'``.
         thd_cp_a2a_inv: sequence-dim inverse permutation returned by
-            :func:`a2a_cp_to_hp`, required on the ``thd`` path when ``cp_size > 1``.
+            {func}`a2a_cp_to_hp`, required on the ``thd`` path when ``cp_size > 1``.
 
     Returns:
         The context-parallel tensor, matching the layout of the GDN module input.

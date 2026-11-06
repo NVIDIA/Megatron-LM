@@ -404,7 +404,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     independently TP-sharded — otherwise loading a checkpoint written at TP=M
     into TP=N would slice across logical component boundaries.
 
-    This is analogous to :func:`handle_swiglu_in_state_dict` which splits
+    This is analogous to {func}`handle_swiglu_in_state_dict` which splits
     ``linear_fc1`` into ``weight_w`` / ``weight_v``.
 
     Sub-key naming follows ``GatedDeltaNet.sharded_state_dict()``::
@@ -565,7 +565,7 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     The returned DTensors alias the fused parameter's storage, so a save reads the fused
     values and an in-place load writes back into the fused parameter.
 
-    Same flat-slice arithmetic as :func:`handle_swiglu_in_state_dict`, generalized from an
+    Same flat-slice arithmetic as {func}`handle_swiglu_in_state_dict`, generalized from an
     even two-way split to arbitrary section sizes.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
@@ -915,7 +915,7 @@ _MODEL_SECTION_PATTERN = re.compile(r'^model\d*\.')
 def get_unexpected_model_keys(state_dict_metadata, load_state_dict):
     """Model weights this rank requests that the checkpoint does not contain.
 
-    "Unexpected" follows :class:`~megatron.core.dist_checkpointing.validation.StrictHandling`:
+    "Unexpected" follows {class}`~megatron.core.dist_checkpointing.validation.StrictHandling`:
     keys accessed locally but absent from the checkpoint. The opposite direction (keys the
     checkpoint holds that this rank does not request) is *not* reported, because that is
     normal under pipeline, tensor and expert parallelism where every rank loads a subset of
@@ -948,7 +948,7 @@ def validate_fsdp_dtensor_model_load(
     parameters at their initialized values. That does not crash; it surfaces much later as
     a convergence regression, so by default fail here instead.
 
-    Only "unexpected" keys are determined (see :func:`get_unexpected_model_keys`), so the
+    Only "unexpected" keys are determined (see {func}`get_unexpected_model_keys`), so the
     ``*_ALL`` variants of ``strict`` behave like their ``*_UNEXPECTED`` counterparts;
     identifying genuinely "missing" keys would require exchanging key sets across ranks.
 

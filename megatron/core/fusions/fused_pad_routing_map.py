@@ -73,6 +73,7 @@ def _pad_routing_map_kernel(
 @jit_fuser
 def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
     """Fused version of pad_routing_map.
+
     Args:
         routing_map (torch.Tensor): A boolean or integer tensor of shape [num_tokens,
             num_experts] indicating which tokens are routed to which experts.

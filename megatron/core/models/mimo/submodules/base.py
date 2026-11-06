@@ -22,9 +22,10 @@ class ModalitySubmodules(ABC, nn.Module):
     in a multi-modal model architecture. Subclasses must implement methods for
     encoding, decoding, combining embeddings, and projecting embeddings.
 
-    .. warning::
-        **EXPERIMENTAL**: This class is experimental, still under active development,
-        and the API is subject to change without notice. Use at your own risk.
+    ```{warning}
+    **EXPERIMENTAL**: This class is experimental, still under active development,
+    and the API is subject to change without notice. Use at your own risk.
+    ```
 
     Args:
         encoders (Dict[str, nn.Module]):

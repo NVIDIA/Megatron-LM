@@ -1258,6 +1258,7 @@ class LLaVAModel(MegatronModule):
                 subsample length information. 2) If using SP/CP with padding mask type,
                 must contain padded token information.
             has_pad_img: Whether the final dynamic-resolution image is synthetic FP8 padding.
+
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
                 otherwise logits of shape [b, s, vocab_size].
@@ -2101,7 +2102,7 @@ def pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, versio
     """Pixel shuffle for dynamic resolution (variable tile sizes).
 
     Splits the packed sequence by per-tile lengths, applies pixel shuffle to each tile,
-    then re-concatenates using :func:`pixel_shuffle`'s canonical spatial-neighborhood
+    then re-concatenates using {func}`pixel_shuffle`'s canonical spatial-neighborhood
     ordering.
 
     Args:

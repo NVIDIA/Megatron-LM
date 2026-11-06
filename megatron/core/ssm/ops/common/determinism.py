@@ -10,7 +10,7 @@
 Kernel-config selection used to live here, but it is not specific to SSM: the
 same wall-clock autotuning affects Transformer Engine's MoE permutation kernels,
 and a model without Mamba needs it just as much. It moved to
-:mod:`megatron.core.tuning`, which is also where the policy is installed from.
+{mod}`megatron.core.tuning`, which is also where the policy is installed from.
 
 What remains here is the tile workspaces that let the SSD kernels accumulate in
 a fixed order, plus re-exports of the names this module defined before the move

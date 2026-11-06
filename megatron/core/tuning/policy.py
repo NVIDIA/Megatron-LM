@@ -12,7 +12,7 @@ of them is about determinism:
   workload disagree with each other, so measurements are noisy.
 
 Pinning the choice to a pure function of the candidate list fixes both. This
-module holds the intent; :mod:`megatron.core.tuning.interception` carries it out.
+module holds the intent; {mod}`megatron.core.tuning.interception` carries it out.
 """
 
 import os
@@ -50,7 +50,7 @@ def use_deterministic_mode() -> bool:
 
 
 def set_deterministic_mode(value):
-    """Override :func:`use_deterministic_mode` for the current process."""
+    """Override {func}`use_deterministic_mode` for the current process."""
     global _deterministic_override
     _deterministic_override = value
 
@@ -71,7 +71,7 @@ class AutotunePolicy:
 
     This object contains settings only. Installation resolves defaults into a
     separate policy value; loaded tables, selected configs, and recorded winners
-    belong to the runtime adapter in :mod:`megatron.core.tuning.interception`.
+    belong to the runtime adapter in {mod}`megatron.core.tuning.interception`.
     See ``megatron/core/tuning/README.md`` for modes, scope, tables and
     configuration.
     """
@@ -223,7 +223,7 @@ class AutotunePolicy:
 
 
 def coerce_policy(value) -> AutotunePolicy | None:
-    """Return ``value`` as an :class:`AutotunePolicy`, converting a mapping.
+    """Return ``value`` as an {class}`AutotunePolicy`, converting a mapping.
 
     ``None`` stays ``None``. Anything else is rejected before it can reach the
     process-wide adapter.

@@ -3782,6 +3782,7 @@ class ParamAndGradBuffer:
 
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3813,6 +3814,7 @@ class ParamAndGradBuffer:
 
     def reduce_scatter_gradients(self, async_op: bool = True):
         """Reduce scatter the gradients.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3854,6 +3856,7 @@ class ParamAndGradBuffer:
 
     def all_reduce_gradients(self, async_op: bool = False):
         """All reduce the gradients.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3928,8 +3931,7 @@ def _create_hfsdp_helper_buffer(
     global bucket, while still sharing the same logical bucket indexing
     (`bucket_index`) with the fully DP buffer.
 
-    Parameters
-    ==========
+    Args:
     dp_buffer : DataParallelBuffer
         The existing fully data-parallel buffer whose configuration
         and bucket layout should be mirrored.
@@ -3940,8 +3942,7 @@ def _create_hfsdp_helper_buffer(
         Whether the underlying data in this helper buffer is sharded
         across ranks in `inner_dp_group`.
 
-    Returns
-    =======
+    Returns:
     DataParallelBuffer
         A new DataParallelBuffer configured as the HFSDP helper buffer
         for the given `inner_dp_group`, sharing the same bucket index
@@ -3995,8 +3996,7 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     through `dp_buffer`, so the fully-DP buffer becomes a view into the helper
     buffer rather than owning separate storage.
 
-    Parameters
-    ==========
+    Args:
     hfsdp_helper_buffer : DataParallelBuffer
         The HFSDP helper buffer that owns the full inner-/outer-DP bucket
         storage.
@@ -4119,6 +4119,7 @@ class GradReducePipeline:
         outer_fsdp_group_grad_reduce: bool = False,
     ):
         """Reduce the gradients for the given parameters.
+
         Args:
             params (List[torch.Tensor]): The parameters.
             suggested_queue_capacity (int, optional): The suggested queue capacity.
@@ -4161,6 +4162,7 @@ class GradReducePipeline:
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
+
         Args:
             suggested_queue_size (int, optional): The recommended queue size in
                 buckets. Defaults to 1.
@@ -4255,11 +4257,13 @@ class GradReducePipeline:
     ) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
+
         Args:
             bucket_id (int): The bucket to be marked.
             bucket_group (List[int]): The bucket group to be reduced.
             async_op (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
+
         Returns:
             bool: True if the bucket is go for reduce-scatter/all-reduce.
         """
@@ -5232,9 +5236,11 @@ def _check_nan_in_grad(grad: torch.Tensor):
 def check_gpu_memory(threshold=0.9):
     """
     Check if the GPU memory is over the threshold.
+
     Args:
         threshold (float, optional): The threshold to check if the GPU memory is over.
             Defaults to 0.9.
+
     Returns:
         bool: True if the GPU memory is over the threshold.
     """
@@ -5309,6 +5315,7 @@ class ResetParametersContext:
 def override_sharded_param_methods_with_safety_checks(params, all_gather_pipeline):
     """
     Override the methods of the parameters to prevent undefined behavior.
+
     Args:
         params (List[torch.Tensor]): The parameters to add hint on shard to functions.
         all_gather_pipeline (AllGatherPipeline): The all-gather pipeline.
@@ -5354,6 +5361,7 @@ def _dtype_size(dtype: torch.dtype) -> int:
 
     Args:
         dtype (torch.dtype): The dtype to get the size of.
+
     Returns:
         int: The size of the dtype.
     """
@@ -5380,8 +5388,10 @@ def _dtype_size(dtype: torch.dtype) -> int:
 def to_local_if_dtensor(tensor):
     """
     Convert a DTensor to a local tensor.
+
     Args:
         tensor (torch.Tensor): The tensor to convert.
+
     Returns:
         torch.Tensor: The local tensor.
     """

@@ -519,6 +519,7 @@ class RerunStateMachine:
                 reproducibility of results. Default is no tolerance (deterministic calculations).
             fatal: whether to abort the job when fault attribution is complete
                 (transient/permanent/not HW)
+
         Returns:
             None
 
@@ -770,6 +771,7 @@ class RerunStateMachine:
             num_samples: the sample size used to estimate the max value.
                 Default is 100 value samples.
             reset: whether to resample the max value. Default is False.
+
         Returns:
             A boolean telling whether the current loss deviates from the previous
             loss by a factor greater than the threshold
@@ -827,6 +829,7 @@ class RerunStateMachine:
             force: if True, emit the full state dict even when the machine is
                 disabled or no rerun is pending (used on the load path to
                 build a matching template).
+
         Returns:
             A state dict representing the rerun state machine, or None if
             rerun checkpointing is not applicable (mode is DISABLED, or the
@@ -927,6 +930,7 @@ class RerunStateMachine:
         Args:
             state_dict: the state dict saved in the checkpoint and originally
                 obtained from state_dict().
+
         Returns:
             bool
         """
@@ -943,6 +947,7 @@ class RerunStateMachine:
         Args:
             state_dict: the state dict saved in the checkpoint and originally
                 obtained from state_dict().
+
         Returns:
             None
 

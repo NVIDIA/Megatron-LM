@@ -647,7 +647,6 @@ def linear_with_frozen_weight(
     weight gradient allreduce.
 
     Args:
-
     input (torch.Tensor required): input like torch.nn.functional.linear
 
     weight (torch.Tensor required): weight like torch.nn.functional.linear

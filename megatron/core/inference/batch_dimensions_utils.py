@@ -795,6 +795,7 @@ class CUDAGraphBatchDimensionBuilder:
                 all-reduce-max so all ranks select the same CUDA graph. Set to False when the
                 dispatcher handles per-rank token variation internally (e.g. AGV/RSV in the NVLS
                 path) and external EP sync is not needed.
+
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """

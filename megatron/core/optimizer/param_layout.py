@@ -55,9 +55,9 @@ class BufferKey:
         is_expert_parallel: Whether the buffer holds expert-parallel parameters,
             which use a separate data-parallel group.
         is_managed_by_layer_wise_optimizer: Whether parameters in this buffer are
-            managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
+            managed by {class}`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
-            :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+            {class}`DistributedOptimizer`'s byte-level layout in a separate buffer.
     """
 
     param_dtype: torch.dtype

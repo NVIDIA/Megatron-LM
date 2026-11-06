@@ -270,7 +270,7 @@ class _VirtualExpertFC2WgradStore:
 
     @staticmethod
     def delay_wgrad_compute() -> bool:
-        """TE routes the wgrad GEMM through :meth:`put` when this is true."""
+        """TE routes the wgrad GEMM through {meth}`put` when this is true."""
         return True
 
     def put(self, tensors, wgrad_gemm) -> None:

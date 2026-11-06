@@ -679,7 +679,7 @@ def async_gather_from_sequence_parallel_region(
 
     The caller must wait before the gathered tensor's first use. The returned
     tensor retains the same autograd contract as
-    :func:`gather_from_sequence_parallel_region`: its backward either
+    {func}`gather_from_sequence_parallel_region`: its backward either
     reduce-scatters or splits along the first dimension.
     """
     if group is None:

@@ -603,6 +603,7 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
+
         Returns:
             Tensor: the output tensor.
         """

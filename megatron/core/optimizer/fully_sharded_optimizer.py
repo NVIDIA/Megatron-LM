@@ -48,7 +48,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     """MCore optimizer wrapper for MFSDP-owned sharded parameters and gradients.
 
     MFSDP v2 owns the optimizer-facing parameter and gradient shards directly.
-    Unlike :class:`DistributedOptimizer`, this wrapper does not build DDP
+    Unlike {class}`DistributedOptimizer`, this wrapper does not build DDP
     param-and-grad-buffer range maps or allocate separate main-parameter shards.
     It preserves MCore's mixed-precision optimizer step contract while making
     MFSDP-specific storage operations explicit.
@@ -133,7 +133,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def state_dict(self):
         """Return optimizer state.
 
-        Deliberately unsupported: MFSDP v2 checkpoints through :meth:`sharded_state_dict`,
+        Deliberately unsupported: MFSDP v2 checkpoints through {meth}`sharded_state_dict`,
         and Megatron-FSDP always runs with ``--ckpt-format fsdp_dtensor`` (see
         ``validate_args``), so nothing reaches this accessor. Forwarding the wrapped
         optimizer's state here would only produce a checkpoint that silently drops the
@@ -207,7 +207,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Rebuild FQN-keyed torch param groups matching this rank's current optimizer.
 
         Iterating ``self.optimizer.param_groups`` preserves the current parameter order
-        within each group, which is what :meth:`torch.optim.Optimizer.load_state_dict` uses
+        within each group, which is what {meth}`torch.optim.Optimizer.load_state_dict` uses
         to map the checkpoint's FQN-keyed state onto parameter tensors.
         """
         param_groups = []
@@ -240,14 +240,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     @override
     def load_state_dict(self, state_dict: ShardedStateDict) -> None:
-        """Load optimizer state produced by :meth:`sharded_state_dict`.
+        """Load optimizer state produced by {meth}`sharded_state_dict`.
 
         By the time this runs DCP has already written the checkpoint's tensors into the
         resting optimizer-state DTensors in place, since ``sharded_state_dict(is_loading=True)``
         exposed them as the load destinations. What is left is to restore the param-group
         hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
         to the current parameters, mirroring the Megatron-FSDP branch of
-        :meth:`DistributedOptimizer.load_state_dict`.
+        {meth}`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
         state = state_dict["state"]
@@ -266,14 +266,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     ) -> ShardedStateDict:
         """Build the ``fsdp_dtensor`` sharded optimizer state dict.
 
-        The layout mirrors :meth:`DistributedOptimizer.sharded_param_state_fsdp_dtensor`, so
+        The layout mirrors {meth}`DistributedOptimizer.sharded_param_state_fsdp_dtensor`, so
         v1 and v2 write the same on-disk format::
 
             {"state": {fqn: {"exp_avg": DTensor, "exp_avg_sq": DTensor}},
              "param_to_group_meta": {fqn: {...group hyperparameters...}}}
 
         That is also why the FQNs come from ``get_global_unique_param_name`` instead of
-        torch's :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`,
+        torch's {func}`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`,
         whose names are the plain ``named_parameters`` ones rather than MCore's PP/EP-unique
         checkpoint names.
 

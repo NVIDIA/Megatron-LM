@@ -783,6 +783,7 @@ class MoELayer(BaseMoELayer):
                 tokens, ``[seq_length * bsz, topk]``, replayed in place of the micro-batch's
                 (see ``ChunkedRouterReplay``). Being an argument, they are also what a
                 recompute of this call replays.
+
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """

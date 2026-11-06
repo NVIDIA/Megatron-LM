@@ -151,7 +151,7 @@ class MoEMetricsTracker:
         """Sync metrics across ranks, aggregate, log, and clear.
 
         This is the main entry point called once per training step.  It pairs
-        with :meth:`record`: you *record* individual data points during forward,
+        with {meth}`record`: you *record* individual data points during forward,
         then *report* the summary at step end.
 
         Args:

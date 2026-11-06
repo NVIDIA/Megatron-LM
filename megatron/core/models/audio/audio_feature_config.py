@@ -129,7 +129,7 @@ class NemoTransformerAudioTokenEstimator:
     def estimate_from_num_frames(
         self, num_frames: int, padded_num_frames: int | None = None
     ) -> int:
-        """Alias for :meth:`estimate` taking a frame count."""
+        """Alias for {meth}`estimate` taking a frame count."""
         return self.estimate(num_frames, padded_num_frames)
 
     def __call__(self, num_frames: int, padded_num_frames: int | None = None) -> int:

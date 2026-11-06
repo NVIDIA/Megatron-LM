@@ -79,6 +79,7 @@ def get_num_layers_to_build(
 ) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
+
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.

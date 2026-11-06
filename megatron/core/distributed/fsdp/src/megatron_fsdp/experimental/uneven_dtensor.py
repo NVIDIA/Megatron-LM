@@ -14,17 +14,17 @@
 
 """Distributed-checkpoint chunk metadata for Megatron-FSDP's packed parameter buffers.
 
-An :class:`~.parameter_group.FsdpParameterGroup` packs several parameters into one flat
-:class:`~.dbuffer.DBuffer` with least-common-multiple row padding, so a parameter's per-rank shard
+An {class}`~.parameter_group.FsdpParameterGroup` packs several parameters into one flat
+{class}`~.dbuffer.DBuffer` with least-common-multiple row padding, so a parameter's per-rank shard
 does not tile the way torch's canonical ``Shard(0)`` does: a rank may own several rows of one
-parameter and none of the next. :meth:`~.dbuffer.DBuffer.get_dtensor` presents each parameter as a
+parameter and none of the next. {meth}`~.dbuffer.DBuffer.get_dtensor` presents each parameter as a
 plain ``Shard(0)`` DTensor, which cannot express those offsets, so DCP's default planner would
 mis-place every packed shard and silently corrupt the checkpoint.
 
 DCP lets a local tensor override that placement through the ``__create_chunk_list__`` and
-``__create_write_items__`` hooks, which :class:`~torch.distributed.tensor.DTensor` forwards to its
+``__create_write_items__`` hooks, which {class}`~torch.distributed.tensor.DTensor` forwards to its
 local tensor. This module derives each shard's true position from the
-:class:`~.layout.GlobalLayout` that already backs the buffer -- it records every logical tensor's
+{class}`~.layout.GlobalLayout` that already backs the buffer -- it records every logical tensor's
 global element offset, and the buffer records this rank's owned element range -- and attaches those
 hooks. The derivation is pure rank-local arithmetic, so it needs no collective.
 """
@@ -91,7 +91,7 @@ def chunk_metadata_by_fqn(model: nn.Module) -> dict[str, ChunkStorageMetadata]:
     state dict and the per-parameter entries of the optimizer state dict.
 
     Args:
-        model: A module tree that has been sharded with :func:`~.fully_shard.fully_shard`.
+        model: A module tree that has been sharded with {func}`~.fully_shard.fully_shard`.
 
     Returns:
         Chunk metadata for each sharded parameter, and nothing for parameters FSDP does not own.
@@ -128,9 +128,9 @@ def attach_uneven_dtensor_metadata(
     Args:
         model: The sharded module tree the state dicts were taken from.
         model_state_dict: Model state dict from
-            :func:`~torch.distributed.checkpoint.state_dict.get_model_state_dict`.
+            {func}`~torch.distributed.checkpoint.state_dict.get_model_state_dict`.
         optimizer_state_dict: Optimizer state dict from
-            :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`.
+            {func}`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`.
     """
     metadata_by_fqn = chunk_metadata_by_fqn(model)
     _attach_by_fqn(model_state_dict, metadata_by_fqn)

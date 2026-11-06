@@ -615,7 +615,7 @@ class Compressor(MegatronModule):
     ) -> torch.Tensor:
         """Batched overlapping window transform for THD packed layout.
 
-        Like :meth:`_overlap_transform` but operates on the flat
+        Like {meth}`_overlap_transform` but operates on the flat
         ``(total_comp, ratio, b, coff * head_dim)`` tensor from all segments
         at once. ``is_first_in_seg`` is a ``(total_comp,)`` bool mask that
         is ``True`` for each compressed entry that starts a new segment

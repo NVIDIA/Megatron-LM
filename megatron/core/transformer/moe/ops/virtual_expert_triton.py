@@ -455,7 +455,7 @@ class VirtualExpertPlannerWorkspace:
     ``gathered_counts`` is this rank's ``[ep_size, num_experts]`` NCCL symmetric-memory window:
     the kernel publishes the local histogram into every peer's window and reads the peers' rows
     from its own, so planning needs no collective. ``scratch`` is the int32 field arena of
-    :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
+    {func}`_scratch_layout`; {meth}`field` views one field for inspection."""
 
     def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
         _check_triton_version()

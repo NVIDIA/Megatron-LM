@@ -261,7 +261,7 @@ def split_multimodal_data(
     raw image or video bytes, or serialized preprocessed tensors.
 
     Args:
-        serialized: The output of :func:`serialize_multimodal_data`, or None.
+        serialized: The output of {func}`serialize_multimodal_data`, or None.
 
     Returns:
         ``(media_meta, payload)``, both None for a text-only request.
@@ -281,8 +281,8 @@ def merge_multimodal_data(
 ) -> Optional[Dict[str, Any]]:
     """Rebuild serialized media from its descriptor and payload frames.
 
-    Inverse of :func:`split_multimodal_data`, returning the shape
-    :func:`resolve_multimodal_data_for_engine` consumes.
+    Inverse of {func}`split_multimodal_data`, returning the shape
+    {func}`resolve_multimodal_data_for_engine` consumes.
 
     Args:
         media_meta: The bounded descriptor from the metadata frame, or None.

@@ -8,8 +8,9 @@ from typing import Any
 def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """Backward compatible muon optimizer getter.
 
-    .. deprecated::
-        Use :func:`megatron.core.optimizer.get_megatron_optimizer` instead.
+    ```{deprecated}
+    Use {func}`megatron.core.optimizer.get_megatron_optimizer` instead.
+    ```
     """
     from . import get_megatron_optimizer
 

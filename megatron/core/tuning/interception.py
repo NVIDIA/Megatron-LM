@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Carrying out an :class:`AutotunePolicy` against Triton's autotuner.
+"""Carrying out an {class}`AutotunePolicy` against Triton's autotuner.
 
 This is the only module that touches Triton internals. Everything else works
 against the policy and the table, so replacing this file is all that is needed
@@ -194,7 +194,7 @@ def verify_choices(group=None) -> bool:
 
 
 def maybe_verify_choices(iteration: int, group=None) -> bool | None:
-    """Run :func:`verify_choices` if the policy asks for a check at ``iteration``.
+    """Run {func}`verify_choices` if the policy asks for a check at ``iteration``.
 
     This is the cadence behind ``AutotunePolicy.verify_every``; the training loop calls
     it once per step and the policy decides whether anything happens. Returns

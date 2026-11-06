@@ -138,6 +138,7 @@ def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_t
     """
     Generate a mapping of sharded state dictionary keys.
     Mapping in case of not using Transformer Engine with regular attention and mlp.
+
     Args:
         block_config (TransformerBlockConfig): The configuration of the transformer block.
         use_te (bool): Flag indicating whether to use Transformer Engine.

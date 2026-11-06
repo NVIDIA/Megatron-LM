@@ -3579,10 +3579,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Walks each model chunk's DDP bucket groups and skips those tagged
         ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
-        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
+        {class}`LayerWiseDistributedOptimizer` does not double-sync the same
         buckets). When no LayerWise tagging is present every bucket group is
         included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        behaviour. Uses {meth}`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
         # Deferred import: layer_wise_optimizer's compute_full_param_layout

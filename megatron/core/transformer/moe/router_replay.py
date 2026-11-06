@@ -45,10 +45,13 @@ class RouterReplay:
     @staticmethod
     def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
         """
-        Distributes the topk indices for all layers to their respective RouterReplay instances.
-        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
-                                        topk indices for a specific layer. The order
-                                        must match the instantiation order of the routers.
+        Distributes the topk indices for all layers to their respective
+        RouterReplay instances.
+
+        Args:
+            all_layers_topk_indices: A list of tensors, where each tensor contains
+                the topk indices for a specific layer. The order must match the
+                instantiation order of the routers.
         """
         if len(all_layers_topk_indices) != len(RouterReplay.global_router_replay_instances):
             raise ValueError(

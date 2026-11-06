@@ -261,6 +261,7 @@ class StaticInferenceEngine(AbstractEngine):
         """The megatron core inference backend generate function
 
         This backend returns the output generations as a list.
+
         Args:
             prompts (List[str]): All the prompts as a list of strings
             add_BOS (bool): Whether to add BOS token to beginning of prompts

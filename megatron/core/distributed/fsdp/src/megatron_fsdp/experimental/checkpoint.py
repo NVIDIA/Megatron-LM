@@ -14,14 +14,14 @@
 
 """PyTorch Distributed Checkpoint (DCP) save/load for the experimental Megatron-FSDP path.
 
-After :func:`fully_shard`, a module's parameters rest as ``DTensor`` views over the optimizer
+After {func}`fully_shard`, a module's parameters rest as ``DTensor`` views over the optimizer
 (``main_weight``) buffers, and the optimizer's ``exp_avg``/``exp_avg_sq`` states are ``DTensor`` s
 on the same device mesh. The standard DCP state-dict helpers
-(:func:`torch.distributed.checkpoint.state_dict.get_model_state_dict` /
-:func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
+({func}`torch.distributed.checkpoint.state_dict.get_model_state_dict` /
+{func}`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
 DTensors and initialize the (empty) optimizer state on load, so we do not reimplement that here.
 
-The one Megatron-FSDP-specific step is :func:`attach_uneven_dtensor_metadata`, which describes each
+The one Megatron-FSDP-specific step is {func}`attach_uneven_dtensor_metadata`, which describes each
 parameter's true position inside its packed parameter-group buffer. Without it the default planner
 assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
@@ -50,7 +50,7 @@ def save_checkpoint(
     """Save a ``fully_shard``-wrapped model and its optimizer as a DCP checkpoint.
 
     Args:
-        model: A module tree that has been sharded with :func:`fully_shard`.
+        model: A module tree that has been sharded with {func}`fully_shard`.
         optimizer: Optimizer stepping the sharded parameters.
         checkpoint_dir: Destination directory for the DCP checkpoint.
     """
@@ -69,12 +69,12 @@ def load_checkpoint(
 
     The model and optimizer must already be sharded with the same layout used at save time (the same
     module structure and mesh); DCP reshards the on-disk data to this rank's shards.
-    :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
+    {func}`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
     (empty) optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers
     reinstall the loaded state. Compute weights are then refreshed from the loaded main weights.
 
     Args:
-        model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
+        model: A module tree sharded with {func}`fully_shard`, whose weights receive the load.
         optimizer: Optimizer whose state receives the load.
         checkpoint_dir: Source directory of the DCP checkpoint.
     """

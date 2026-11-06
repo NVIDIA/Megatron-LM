@@ -176,6 +176,7 @@ def _bmm_chunk_fwd(
         target_rows: optional (nchunks,) int32. Decode mode: compute only the
             M-block containing target_rows[c] (and N-blocks up to it); other
             output entries are left uninitialized.
+
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """

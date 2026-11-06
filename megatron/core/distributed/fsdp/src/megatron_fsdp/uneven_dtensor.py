@@ -375,6 +375,7 @@ def redistribute_uneven_dtensor_to_replicated(dtensor: DTensor) -> DTensor:
 
     Args:
         dtensor (DTensor): The unevenly sharded DTensor to redistribute.
+
     Returns:
         DTensor: A replicated DTensor with the same data as the input DTensor.
     """

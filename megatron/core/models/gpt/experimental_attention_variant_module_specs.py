@@ -376,7 +376,7 @@ def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) ->
     """Check if the experimental attention variant is served by a gated delta net layer.
 
     Accepts the deprecated ``gated_delta_net`` spelling without warning; use
-    :func:`normalize_experimental_attention_variant` to emit the deprecation notice.
+    {func}`normalize_experimental_attention_variant` to emit the deprecation notice.
     """
     canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
         experimental_attention_variant, experimental_attention_variant

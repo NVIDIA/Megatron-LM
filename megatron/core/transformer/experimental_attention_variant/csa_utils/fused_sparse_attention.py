@@ -5,10 +5,10 @@
 Mirrors the three integration paths of the old standalone ``dsa_kernels``
 package, but built on top of
 
-* :mod:`cudnn.deepseek_sparse_attention` (a.k.a. ``DSA``) — CuTe-DSL backward
+* {mod}`cudnn.deepseek_sparse_attention` (a.k.a. ``DSA``) — CuTe-DSL backward
   + indexer score kernels + TRT-LLM radix top-K, shipped as part of
   cuDNN Frontend.
-* :mod:`flash_mla` — production sparse-attention forward kernel, expected to
+* {mod}`flash_mla` — production sparse-attention forward kernel, expected to
   be available as a separate PyPI package.
 
 Public API:
@@ -51,7 +51,7 @@ def _ensure_flash_mla():
     """Lazily import the FlashMLA sparse-forward kernel.
 
     FlashMLA ships ``flash_mla_sparse_fwd`` with a multi-head-KV signature;
-    :func:`_csa_fwd_flash_mla` below is a thin adapter that unbatches the
+    {func}`_csa_fwd_flash_mla` below is a thin adapter that unbatches the
     DSA-shape inputs and pads ``TopK`` and local query heads to the
     alignments expected by FlashMLA's SM90 / SM100 kernels.
     """
@@ -95,7 +95,7 @@ def _csa_fwd_flash_mla(
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
-    """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
+    """DSA-shaped adapter around {func}`flash_mla.flash_mla_sparse_fwd`.
 
     Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
     the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
@@ -487,8 +487,8 @@ def build_flat_topk_idxs(
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
-    Forward uses :mod:`flash_mla`; backward uses cuDNN Frontend's
-    :attr:`cudnn.DSA.sparse_attention_backward_wrapper`.
+    Forward uses {mod}`flash_mla`; backward uses cuDNN Frontend's
+    {attr}`cudnn.DSA.sparse_attention_backward_wrapper`.
     """
 
     @staticmethod
@@ -551,7 +551,7 @@ def csa_sparse_attn(
         kv:    ``(skv, b, d)`` bf16 SBD (K=V).
         attn_sink: ``(np,)`` f32.
         topk_idxs: ``(sq*b, topk)`` int32 — **flat global** indices produced
-            by :func:`build_flat_topk_idxs`.
+            by {func}`build_flat_topk_idxs`.
         softmax_scale: scalar float.
         topk_length: ``(sq*b,)`` int32 — optional compact fast-path. Must be
             ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
@@ -583,7 +583,7 @@ def csa_sparse_attn(
 def _indexer_topk_bshd(
     q_bshd: Tensor, k_bsd: Tensor, w_bsh: Tensor, topk: int, ratio: int = 4
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """BSHD-layout core for :func:`indexer_topk`.
+    """BSHD-layout core for {func}`indexer_topk`.
 
     Internal entry point used by both the public SBHD wrapper and Path B's
     ``FusedCSAIndexerSparseAttnFunc.forward`` so the SBHD→BSHD permute can be
@@ -604,7 +604,7 @@ def _indexer_topk_bshd(
         * ``topk_indices``: ``(b, sq, topk)`` int32, invalid slots ``-1``.
         * ``topk_length``:  ``(b, sq)`` int32, per-row valid count.
         * ``scores``: ``(b, sq, sk)`` fp32, raw scores from
-          :attr:`cudnn.DSA.indexer_forward_wrapper` with ``-inf`` on
+          {attr}`cudnn.DSA.indexer_forward_wrapper` with ``-inf`` on
           causally-masked positions.
     """
     _ensure_dsa_namespace()
@@ -726,7 +726,7 @@ def _compute_indexer_predict(
 ) -> Tensor:
     """Compute ``predict`` distribution (softmax over top-K of indexer scores).
 
-    Wraps :attr:`cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
+    Wraps {attr}`cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
 
     Args:
         q_indexer_bshd: ``(B, S_q, H_q, D)`` bf16.
@@ -759,9 +759,9 @@ def _compute_attn_target(
 ) -> Tensor:
     """Compute ``target`` distribution (L1-normalised head-sum softmax).
 
-    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`.
+    Wraps {attr}`cudnn.DSA.sparse_attn_score_recompute_wrapper`.
 
-    Shapes match :func:`_compute_indexer_predict`; ``lse`` is
+    Shapes match {func}`_compute_indexer_predict`; ``lse`` is
     ``(B, S_q, H_q)`` FP32 (comes from the attention forward pass).
     """
     q_attn_bshd, lse, qhead_per_kv_head = _pad_attn_target_heads(q_attn_bshd, lse)
@@ -819,7 +819,7 @@ def _compute_dense_indexer_score(
 ) -> Tuple[Tensor, Tensor]:
     """Dense indexer score forward over the full ``S_k`` axis.
 
-    Wraps :attr:`cudnn.DSA.dense_indexer_score_recompute_wrapper`. Returns
+    Wraps {attr}`cudnn.DSA.dense_indexer_score_recompute_wrapper`. Returns
     ``(out, denom)`` where
 
     * ``out``    : ``(B, S_q, S_k)`` fp32, the raw head-reduced score
@@ -829,7 +829,7 @@ def _compute_dense_indexer_score(
       ``S_k`` — i.e. ``predict = exp(out - denom[..., None])`` is the
       indexer softmax distribution over the full KV.
 
-    Both outputs are forwarded into :func:`_kl_loss_from_dense_scores`
+    Both outputs are forwarded into {func}`_kl_loss_from_dense_scores`
     *and* saved for the dense-path backward, where the dense indexer-grad
     kernel consumes them directly.
     """
@@ -855,7 +855,7 @@ def _compute_dense_attn_score(
 ) -> Tuple[Tensor, Tensor]:
     """Dense attention score forward over the full ``S_k`` axis.
 
-    Wraps :attr:`cudnn.DSA.dense_attn_score_recompute_wrapper`. Returns
+    Wraps {attr}`cudnn.DSA.dense_attn_score_recompute_wrapper`. Returns
     ``(out, denom)`` where
 
     * ``out``   : ``(B, S_q, S_k)`` fp32, the head-summed unnormalized
@@ -1246,7 +1246,7 @@ def fused_csa_indexer_sparse_attn(
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
-    See :class:`FusedCSAIndexerSparseAttnFunc` for the detailed data flow.
+    See {class}`FusedCSAIndexerSparseAttnFunc` for the detailed data flow.
 
     Args:
         query:        ``(sq, b, np, d)`` bf16 SBHD — attention query.
@@ -1270,7 +1270,7 @@ def fused_csa_indexer_sparse_attn(
             KL is computed over the full causally-valid KV (more
             informative, matches the DeepSeek-V3.2 paper, larger
             intermediate-tensor footprint). See
-            :class:`FusedCSAIndexerSparseAttnFunc` for the full data flow
+            {class}`FusedCSAIndexerSparseAttnFunc` for the full data flow
             of each variant.
         kv_offset:    start of compressed region within ``kv_full``.
         calculate_per_token_loss: if True, report raw local KL sum and

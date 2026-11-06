@@ -207,6 +207,7 @@ class PipelineParallelLayerLayout:
 
     def pretty_repr(self):
         """Pretty representation of the custom layout, showing the layers held by each stage.
+
         Example:
                             VPP rank 0                 VPP rank 1
         PP rank 0           embedding,decoder*2        decoder*2

@@ -3348,7 +3348,7 @@ def ensure_params_ready(params: Iterable[Any]) -> None:
     A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
     asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
     consumer reading it earlier -- ahead of that module, or from another stream -- calls this
-    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    first. Backends mark their params with {data}`PARAM_READY_CALLBACK_ATTR`; unmarked params
     no-op, so neither side needs to know about the other.
 
     Callbacks are shared per communication bucket, so each fires once, not once per parameter.

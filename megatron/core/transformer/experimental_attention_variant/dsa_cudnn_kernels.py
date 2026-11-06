@@ -308,7 +308,7 @@ def _ensure_flash_mla() -> None:
     """Lazily import the FlashMLA sparse-forward kernel.
 
     FlashMLA ships ``flash_mla_sparse_fwd`` with a multi-head-KV signature;
-    :func:`_dsa_fwd_flash_mla` below adapts the DSA-shape inputs and pads
+    {func}`_dsa_fwd_flash_mla` below adapts the DSA-shape inputs and pads
     ``topk`` to the alignment expected by the active FlashMLA sparse-prefill kernel.
     """
     global _flash_mla_sparse_fwd
@@ -418,8 +418,8 @@ def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
 def _topk_tie_break_bias(positions: Tensor, key_count: int, dtype: torch.dtype) -> Tensor:
     """Per-position tie-break bias; lower key indices get a larger bias.
 
-    Shared by :func:`_add_indexer_topk_tie_break` and
-    :func:`_remove_indexer_topk_tie_break` so the add and remove sides stay exact inverses.
+    Shared by {func}`_add_indexer_topk_tie_break` and
+    {func}`_remove_indexer_topk_tie_break` so the add and remove sides stay exact inverses.
     """
     step = _TOPK_TIE_BREAK_EPS / float(key_count - 1)
     return ((key_count - 1 - positions) * step).to(dtype=dtype)
@@ -877,7 +877,7 @@ def _dsa_fwd_flash_mla(
     attn_sink: Tensor,
     topk_length: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
+    """DSA-shaped adapter around {func}`flash_mla.flash_mla_sparse_fwd`.
 
     Accepts flat tensors with global indices; pads ``topk`` to
     the GPU-specific alignment; returns ``(out, lse)``.
@@ -1688,7 +1688,7 @@ def _compute_dense_attn_score(
 ) -> Tuple[Tensor, Tensor]:
     """Dense attention score forward over the full ``S_k`` axis.
 
-    Wraps :attr:`cudnn.DSA.dense_attn_score_recompute_wrapper`. Returns
+    Wraps {attr}`cudnn.DSA.dense_attn_score_recompute_wrapper`. Returns
     ``(out, denom)`` where
 
     * ``out``   : ``(B, S_q, S_k)`` fp32, the head-summed unnormalized
@@ -1885,7 +1885,7 @@ def _compute_dense_indexer_loss_and_grads(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Dense (full-KV) indexer KL loss and precomputed indexer gradients.
 
-    Sibling of :func:`_compute_sparse_indexer_loss_and_grads` for the non-sparse-loss path.
+    Sibling of {func}`_compute_sparse_indexer_loss_and_grads` for the non-sparse-loss path.
     """
     sq, b, num_heads, _d = query.shape
     # Attention-path tensors are detached; the KL loss trains only the indexer.

@@ -1304,6 +1304,7 @@ def save_to_aux_losses_tracker(
     reduce_group_has_dp: bool = False,
 ) -> None:
     """Save the auxiliary loss for logging.
+
     Args:
         name (str): The name of the loss.
         loss (torch.Tensor): The loss tensor.
@@ -1503,6 +1504,7 @@ def maybe_move_tensor_to_cpu(
     tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
 ) -> torch.Tensor:
     """Move a tensor to CPU if it is on GPU.
+
     Args:
         tensor (torch.Tensor): The tensor to move to CPU.
         as_numpy (bool, optional): Whether to convert the tensor to a numpy array.

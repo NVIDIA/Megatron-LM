@@ -194,6 +194,7 @@ def padded_swiglu(
         zero_padding: write zeros to alignment-padding rows instead of leaving them
             undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
             ``permutation_map``. Rows beyond n_used remain undefined.
+
     Returns:
         [output_size, ffn_hidden] BF16.
     """
@@ -255,6 +256,7 @@ def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
         x: [M, 2 * ffn_hidden] BF16 FC1 output (gate = first half, up = second half).
         n_rows: scalar int32/int64 CUDA tensor with the number of live rows
             (e.g. valid_tokens * topk). Rows >= n_rows are skipped, not zeroed.
+
     Returns:
         [M, ffn_hidden] BF16 (rows >= n_rows undefined).
     """

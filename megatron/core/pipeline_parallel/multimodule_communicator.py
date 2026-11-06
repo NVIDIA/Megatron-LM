@@ -126,6 +126,7 @@ class MultiModulePipelineCommunicator:
 
         Args:
             module_to_grid_map (dict): A dictionary mapping module names to HyperCommGrids.
+
                 Example:
                     module_to_grid_map = {
                         'image_encoder': image_encoder_grid,
@@ -134,6 +135,7 @@ class MultiModulePipelineCommunicator:
                         'generator': generator_grid
                     }
             topology (dict): A dictionary mapping module names to lists of outgoing modules.
+
                 Example:
                     topology = {
                         'image_encoder': ['llm'],
@@ -143,6 +145,7 @@ class MultiModulePipelineCommunicator:
                     }
             config (ModelParallelConfig): A ModelParallelConfig object.
             dim_mapping (Dict[str, List[int]]): Dimension mapping for sequence, batch, hidden.
+
                 Example:
                     dim_mapping = {'s': 0, 'h': 2, 'b': 1}
                 Default: None
@@ -150,6 +153,7 @@ class MultiModulePipelineCommunicator:
                 output tensor. Used by bridge communicators for cross-module fan-in/fan-out.
                 Modules producing 2D tensors [B*S, H] (e.g. vision encoders) should be 2.
                 Modules not listed default to 3.
+
                 Example:
                     module_output_ndim = {'image_encoder': 2, 'llm': 3}
                 Default: None (all modules assumed 3D)

@@ -298,6 +298,7 @@ def roll_tensor(
                               shifts=-1; "zigzag" retains the legacy rolling paths.
         fill_value: Value used outside the same real document in the contiguous path.
                     Other layouts require the default zero fill.
+
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """

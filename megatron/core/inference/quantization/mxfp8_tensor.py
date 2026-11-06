@@ -210,7 +210,7 @@ class MXFP8Tensor:
         return self
 
     def copy_(self, value: torch.Tensor) -> "MXFP8Tensor":
-        """Tensor-compatible alias for :meth:`quantize_` used by generic writeback.
+        """Tensor-compatible alias for {meth}`quantize_` used by generic writeback.
 
         Unlike ``torch.Tensor.copy_``, this method requires an exact shape and
         does not accept ``non_blocking``; quantization and storage updates are

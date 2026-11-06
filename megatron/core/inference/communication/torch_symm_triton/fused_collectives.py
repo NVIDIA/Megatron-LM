@@ -29,6 +29,7 @@ def unpack_bf16x2(x, mask):
     Args:
         x: tl.uint32 tensor containing packed bf16x2 values.
         mask: boolean mask tensor, 1 denotes that x is valid.
+
     Returns:
         x_hi: float32 tensor containing the high bf16 values.
         x_lo: float32 tensor containing the low bf16 values.
@@ -45,9 +46,11 @@ def sum_sq(x, y, z, w, mask):
     First computes the squared sum of 8 bf16 values
     packed in x, y, z, w. Then does an SM-wide
     reduction to get the total sqaured sum.
+
     Args:
         x, y, z, w: tl.uint32 tensors containing packed bf16x2 values.
         mask: boolean mask tensor, 1 denotes that x,y,z,w are valid.
+
     Returns:
         sq_sum: float32 scalar, the total squared sum.
     """
@@ -224,6 +227,7 @@ def fused_multimem_rs_add_norm_ag(
     triton kernel. Writes out the output of the residual add to residual_output_tensor.
     The output of the full kernel is written in-place to the symmetric memory buffer.
     input_tensor must be a symmetric memory buffer.
+
     Args:
         residual_output_tensor: torch.Tensor to write the output of the residual add.
         input_tensor: torch.Tensor, symmetric memory buffer to read the input from.
@@ -231,6 +235,7 @@ def fused_multimem_rs_add_norm_ag(
         residual_input_tensor: torch.Tensor, the residual input to be added.
         rms_norm_weights: torch.Tensor, the weights for rms norm.
         eps: float, epsilon value for rms norm.
+
     Returns:
         residual_output_tensor: torch.Tensor, the output of the full fused operation.
     """

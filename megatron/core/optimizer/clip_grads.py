@@ -202,7 +202,7 @@ def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
     Padding rows are permanent zeros (never written by the wgrad GEMM), not real zero
     gradients, so counting them would inflate GTP's num_zeros relative to non-GTP runs.
 
-    - :class:`~megatron.core.optimizer.distrib_optimizer.DistributedOptimizer`, when it
+    - {class}`~megatron.core.optimizer.distrib_optimizer.DistributedOptimizer`, when it
       byte-slices a GTP shard into DP-optimizer-state fragments, stamps the correction
       explicitly as ``.gtp_pad_zeros``: a fragment alone can't tell whether it overlaps the
       padding tail without the slice offset, which only that optimizer has.

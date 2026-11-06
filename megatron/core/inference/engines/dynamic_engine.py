@@ -5217,7 +5217,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _unpack_tp_broadcast(frames: List[bytes]) -> List[List[bytes]]:
         """Rebuild per-message frame lists from a TP broadcast.
 
-        Inverse of :meth:`_pack_tp_broadcast`.
+        Inverse of {meth}`_pack_tp_broadcast`.
 
         Args:
             frames: The received multipart message, header frame first.
@@ -5709,6 +5709,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             local_work: Pending request count for this rank.
             signal_consensus: True if this rank is ready to pause.
+
         Returns:
             (global_work, all_pausing): max work across EP, and whether
             all peers signaled consensus.

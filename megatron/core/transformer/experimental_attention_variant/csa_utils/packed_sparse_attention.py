@@ -115,8 +115,8 @@ def _validate_kv_reconstruction_parts(
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
-    Forward uses :mod:`flash_mla`; backward uses cuDNN Frontend's
-    :attr:`cudnn.DSA.sparse_attention_backward_wrapper`.
+    Forward uses {mod}`flash_mla`; backward uses cuDNN Frontend's
+    {attr}`cudnn.DSA.sparse_attention_backward_wrapper`.
     """
 
     @staticmethod

@@ -63,6 +63,7 @@ def get_gpt_layer_with_inference_submodules(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
+
     Args:
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
