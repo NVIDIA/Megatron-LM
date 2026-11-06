@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,9 @@ from megatron.core.transformer.residual_recompute import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
+
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallel
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -290,6 +293,42 @@ class HyperConnectionModule(MegatronModule):
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
+        self._mapping_cuda_graph = None
+
+    def enable_mapping_cuda_graphs(
+        self,
+        sample: Tensor,
+        warmup_steps: int = 3,
+        *,
+        ddp_model: Optional["DistributedDataParallel"] = None,
+    ) -> None:
+        """Prepare optional CUDA graphs for native-shape mapping computation.
+
+        Call after moving the module to its final device and dtype, outside any
+        enclosing CUDA graph capture, using a representative contiguous input.
+        Training supports one outstanding graph context; additional outstanding
+        forwards use the native path. Changed shapes or parameter layouts require
+        disabling or preparing the graphs again.
+        Only first-order gradients are supported by the graph autograd boundary.
+
+        Args:
+            sample: CUDA input with shape ``[sequence, batch, streams * hidden]``.
+            warmup_steps: Number of native warmup calls before graph capture.
+            ddp_model: Owning Megatron DDP wrapper, required when parameters have
+                DDP gradient buffers. Overlapped reductions require a single bucket
+                group so graph/native fallbacks cannot reorder collectives.
+        """
+        from megatron.core.transformer.mhc_mapping_graph import _MHCMappingsGraph
+
+        self.disable_mapping_cuda_graphs()
+        self._mapping_cuda_graph = _MHCMappingsGraph(self, sample, warmup_steps, ddp_model)
+
+    def disable_mapping_cuda_graphs(self) -> None:
+        """Return to native mapping execution after all pending backwards finish."""
+        graph = self._mapping_cuda_graph
+        if graph is not None and graph.owner is not None and graph.owner() is not None:
+            raise RuntimeError("Finish the pending mHC mapping backward before disabling graphs.")
+        self._mapping_cuda_graph = None
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
@@ -381,6 +420,12 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        if self._mapping_cuda_graph is not None and not torch.compiler.is_compiling():
+            return self._mapping_cuda_graph(x)
+        return self._compute_mappings(x)
+
+    def _compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Compute the native mappings used by eager execution and graph capture."""
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:

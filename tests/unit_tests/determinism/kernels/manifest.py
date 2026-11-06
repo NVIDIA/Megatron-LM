@@ -257,9 +257,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(K + "test_fused_triton_kernels.py", K + "test_mhc_mapping_graph.py"),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
+    ),
+    KernelEntry(
+        name="mhc_mapping_cuda_graphs",
+        sources=("megatron/core/transformer/mhc_mapping_graph.py",),
+        tests=(K + "test_mhc_mapping_graph.py",),
+        kind="dispatch",
+        notes="CUDA replay of native mHC mappings; private parameter leaves keep accumulation and "
+        "distributed hooks outside capture. Exact forward/VJP replay includes side-stream contention.",
     ),
     KernelEntry(
         name="streamwise_residual_ops",
