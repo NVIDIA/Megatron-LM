@@ -2,27 +2,20 @@
 
 import pytest
 
-from megatron.core.inference import cpu_affinity as affinity
+from megatron.core.inference.cpu_affinity import _check_threads
 
 
-def test_nvml_uuid_adds_gpu_prefix():
-    # torch reports bare UUIDs; NVML lookups need the "GPU-" prefix.
-    assert affinity._nvml_uuid("109c5465-7b59") == "GPU-109c5465-7b59"
-
-
-def test_find_violations():
-    masks = {1: {2}, 3: {3, 4}}  # tid 2 exited before inspection and is skipped.
+def test_check_threads(caplog):
+    masks = {1: {0}, 3: {0, 5}}  # tid 2 exited after enumeration and is skipped.
 
     def get_affinity(tid):
         if tid not in masks:
             raise ProcessLookupError(tid)
         return masks[tid]
 
-    assert affinity._find_violations([1, 2, 3], 1, {2, 3}, get_affinity) == {3: {3, 4}}
-
-
-def test_caller_violation_raises_while_helper_violation_warns(caplog):
+    _check_threads([1, 2, 3], 1, {0}, get_affinity, warn_for_helper_threads=True)
+    assert "tid=3 allowed=[0,5]" in caplog.text
+    with pytest.raises(RuntimeError, match="tid=3"):
+        _check_threads([1, 2, 3], 1, {0}, get_affinity, warn_for_helper_threads=False)
     with pytest.raises(RuntimeError, match="caller"):
-        affinity._report_violations({1: {0, 5}}, 1, {0}, "ctx", warn_for_helper_threads=True)
-    affinity._report_violations({7: {0, 5}}, 1, {0}, "ctx", warn_for_helper_threads=True)
-    assert "tid=7" in caplog.text
+        _check_threads([3], 3, {0}, get_affinity, warn_for_helper_threads=True)

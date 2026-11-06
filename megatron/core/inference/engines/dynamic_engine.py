@@ -635,8 +635,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.create_cuda_graphs()
 
         if inference_config.require_gpu_local_cpu_affinity:
-            # Warmup may have changed this thread's affinity, so it must still pass. Library
-            # threads (NCCL, ZMQ, CUDA driver) may set their own affinity, so only warn for those.
+            # Library threads may set their own affinity, so only warn for those.
             validate_inference_cpu_affinity(all_threads=True, warn_for_helper_threads=True)
 
     def _initialize_disaggregation_state(self) -> None:

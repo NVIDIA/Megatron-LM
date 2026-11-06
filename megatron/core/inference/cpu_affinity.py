@@ -1,68 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Opt-in CPU placement validation for inference workers."""
+"""Opt-in check that inference threads are bound to GPU-local CPUs."""
 
-import ctypes
 import logging
 import os
 import threading
-from pathlib import Path
 from typing import Callable, Iterable
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-_NVML_UUID_PREFIXES = ("GPU-", "MIG-")
-
-
-def _nvml_uuid(torch_uuid: object) -> str:
-    """Convert a torch device UUID to the prefixed form NVML expects."""
-    uuid = str(torch_uuid)
-    if uuid.startswith(_NVML_UUID_PREFIXES):
-        return uuid
-    return f"GPU-{uuid}"
-
-
-def _possible_cpu_count(possible: str) -> int:
-    """Number of CPU IDs covered by a /sys/devices/system/cpu/possible list, e.g. "0-3,128-131"."""
-    return max(int(part.split("-")[-1]) for part in possible.strip().split(",")) + 1
-
-
-def _mask_to_cpus(words: Iterable[int], word_bits: int) -> set[int]:
-    """Decode an NVML CPU affinity bitmask (array of words) into CPU IDs."""
-    return {
-        word_index * word_bits + bit
-        for word_index, word in enumerate(words)
-        for bit in range(word_bits)
-        if word & (1 << bit)
-    }
-
-
-def _gpu_local_cpus(gpu_uuid: str) -> set[int]:
-    """Query NVML for the CPUs on the NUMA node(s) local to the given GPU."""
-    try:
-        import pynvml
-    except ImportError as exc:
-        raise RuntimeError("CPU affinity validation requires nvidia-ml-py (pynvml).") from exc
-
-    # CPU IDs can be sparse; size the NVML bitmask using the highest possible ID.
-    num_cpus = _possible_cpu_count(Path("/sys/devices/system/cpu/possible").read_text())
-    word_bits = ctypes.sizeof(ctypes.c_ulong) * 8
-    pynvml.nvmlInit()
-    try:
-        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
-        words = pynvml.nvmlDeviceGetCpuAffinity(handle, (num_cpus + word_bits - 1) // word_bits)
-    finally:
-        pynvml.nvmlShutdown()
-    cpus = _mask_to_cpus(words, word_bits)
-    if not cpus:
-        raise RuntimeError(f"NVML returned no GPU-local CPUs for {gpu_uuid}.")
-    return cpus
-
 
 def _format_cpus(cpus: Iterable[int]) -> str:
-    """Format CPU IDs as a compact list of ranges, e.g. "0-69,140"."""
+    """Format CPU IDs as ranges, e.g. "0-69,140"."""
     ranges = []
     for cpu in sorted(cpus):
         if ranges and cpu == ranges[-1][1] + 1:
@@ -72,39 +23,47 @@ def _format_cpus(cpus: Iterable[int]) -> str:
     return ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
-def _find_violations(
-    tids: Iterable[int], caller: int, local_cpus: set[int], get_affinity: Callable[[int], set[int]]
-) -> dict[int, set[int]]:
-    """Map each thread whose allowed CPUs are not all GPU-local to its allowed CPUs."""
+def _gpu_local_cpus() -> set[int]:
+    """Query NVML for the CPUs local to the current CUDA device."""
+    import pynvml
+
+    # torch reports bare UUIDs; NVML expects the "GPU-" prefix.
+    uuid = f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}"
+    pynvml.nvmlInit()
+    try:
+        # 64 words of 64 bits covers CPU IDs up to 4095.
+        words = pynvml.nvmlDeviceGetCpuAffinity(pynvml.nvmlDeviceGetHandleByUUID(uuid), 64)
+    finally:
+        pynvml.nvmlShutdown()
+    mask = sum(word << (64 * i) for i, word in enumerate(words))
+    return {cpu for cpu in range(mask.bit_length()) if mask >> cpu & 1}
+
+
+def _check_threads(
+    tids: Iterable[int],
+    caller: int,
+    local_cpus: set[int],
+    get_affinity: Callable[[int], set[int]],
+    warn_for_helper_threads: bool,
+) -> None:
     violations = {}
     for tid in tids:
         try:
-            allowed = set(get_affinity(tid))
+            allowed = get_affinity(tid)
         except ProcessLookupError:
             if tid == caller:
                 raise
-            continue  # A helper thread may exit between enumeration and inspection.
-        if not allowed or not allowed <= local_cpus:
+            continue  # A helper thread exited after enumeration.
+        if not allowed <= local_cpus:
             violations[tid] = allowed
-    return violations
-
-
-def _report_violations(
-    violations: dict[int, set[int]],
-    caller: int,
-    local_cpus: set[int],
-    context: str,
-    warn_for_helper_threads: bool,
-) -> None:
-    """Raise for violations, or only log them when they are all on helper threads and allowed."""
     if not violations:
         return
     details = "; ".join(
-        f"tid={tid}{' (caller)' if tid == caller else ''} allowed=[{_format_cpus(allowed)}]"
-        for tid, allowed in sorted(violations.items())
+        f"tid={tid}{' (caller)' if tid == caller else ''} allowed=[{_format_cpus(cpus)}]"
+        for tid, cpus in sorted(violations.items())
     )
     message = (
-        f"Inference CPU affinity check failed ({context}): {details}; "
+        f"CPU affinity check failed (rank={os.environ.get('RANK', '?')}): {details}; "
         f"GPU-local CPUs=[{_format_cpus(local_cpus)}]. "
         "Bind this rank to GPU-local CPUs with your launcher before CUDA initialization."
     )
@@ -117,33 +76,10 @@ def _report_violations(
 def validate_inference_cpu_affinity(
     *, all_threads: bool = False, warn_for_helper_threads: bool = False
 ) -> None:
-    """Check that threads may only run on CPUs local to the current CUDA device.
-
-    Checks the calling thread, or every thread in the process when all_threads is set.
-    Never changes affinity. A violation on the calling thread always raises; with
-    warn_for_helper_threads, violations on other threads are logged instead.
-
-    Raises:
-        RuntimeError: Topology is unavailable, the calling thread may run on non-local
-            CPUs, or (unless warn_for_helper_threads) another thread may.
+    """Raise if the calling thread, or any thread with all_threads, may run on CPUs that are
+    not local to the current CUDA device. With warn_for_helper_threads, threads other than
+    the caller only log a warning. Never changes affinity; requires nvidia-ml-py.
     """
-    if not hasattr(os, "sched_getaffinity"):
-        raise RuntimeError("Inference CPU affinity validation requires Linux sched_getaffinity.")
-    identity = f"rank={os.environ.get('RANK', '?')} pid={os.getpid()}"
-    try:
-        gpu_uuid = _nvml_uuid(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
-        local_cpus = _gpu_local_cpus(gpu_uuid)
-    except Exception as exc:
-        raise RuntimeError(f"Cannot determine GPU-local CPU affinity ({identity}): {exc}") from exc
-
     caller = threading.get_native_id()
-    try:
-        tids = {caller}
-        if all_threads:
-            tids.update(int(path.name) for path in Path("/proc/self/task").iterdir())
-        violations = _find_violations(sorted(tids), caller, local_cpus, os.sched_getaffinity)
-    except OSError as exc:
-        raise RuntimeError(f"Cannot inspect thread CPU affinity ({identity}): {exc}") from exc
-    _report_violations(
-        violations, caller, local_cpus, f"{identity}, GPU={gpu_uuid}", warn_for_helper_threads
-    )
+    tids = sorted(int(t) for t in os.listdir("/proc/self/task")) if all_threads else [caller]
+    _check_threads(tids, caller, _gpu_local_cpus(), os.sched_getaffinity, warn_for_helper_threads)
