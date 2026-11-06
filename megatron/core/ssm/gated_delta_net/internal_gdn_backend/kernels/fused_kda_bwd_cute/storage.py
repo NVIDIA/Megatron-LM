@@ -72,6 +72,11 @@ class SharedStorage:
     # (one arrival per consumer warp) barriers per slot.
     ring_full: cute.struct.MemRange[cutlass.Int64, 4]
     ring_empty: cute.struct.MemRange[cutlass.Int64, 4]
+    # Persistent tape schedule: work items handed from the TMA warp to the
+    # three consumer roles through two slots.
+    item_full: cute.struct.MemRange[cutlass.Int64, 2]
+    item_empty: cute.struct.MemRange[cutlass.Int64, 2]
+    items: cute.struct.MemRange[cutlass.Int32, 2]
     # Two-CTA split: the other CTA arrives once dS for this CTA's next chunk is ready.
     ds_ready: cute.struct.MemRange[cutlass.Int64, 1]
     tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]

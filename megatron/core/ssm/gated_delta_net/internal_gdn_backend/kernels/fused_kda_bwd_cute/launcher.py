@@ -52,18 +52,15 @@ def prefer_tape(num_sequences: int, heads: int, device: torch.device) -> bool:
     return num_sequences * heads <= 4 * sms
 
 
-def tape_split(num_sequences: int, heads: int) -> int:
-    """CTAs per (sequence, head) for the tape-fed gradient kernel.
+# Chunks per work item of the persistent tape-fed kernel.
+TAPE_RUN = 4
 
-    The power of two that gives at least 1024 CTAs in total (one resident per
-    SM, so several short waves that even out ragged sequences), at most 32 per
-    pair; a power of two divides the usual chunk counts evenly, and a CTA past
-    its sequence's last chunk exits at once.
-    """
-    ways = 1
-    while ways < 32 and ways * num_sequences * heads < 1024:
-        ways *= 2
-    return ways
+
+def tape_flags(num_chunks: int, heads: int, device: torch.device) -> torch.Tensor:
+    """Zeroed int32 chunk ready flags (``[C * H]``) plus the work counter of the
+    tape-fed gradient kernel, for ``kda_dhu(..., flags=...)`` and
+    ``fused_kda_bwd(..., flags=...)``."""
+    return torch.zeros(num_chunks * heads + 1, dtype=torch.int32, device=device)
 
 
 def _require(name, tensor, dtype, shape, device):
@@ -142,8 +139,8 @@ def fused_kda_bwd(
     final-state gradient ``[S, H, 128, 128]``; ``cu_seqlens`` is int32
     ``[S + 1]``.  ``chunk_offsets`` is the per-sequence chunk prefix of ``cu_seqlens``
     (computed on device when omitted). ``tape`` is ``(dh, dv_new)`` from
-    ``kda_dhu``: the kernel then skips the recurrence and ``split`` (default
-    ``tape_split``) CTAs per (sequence, head) take its chunks in turn; without a
+    ``kda_dhu``: the kernel then skips the recurrence and persistent CTAs take
+    runs of ``split`` (default ``TAPE_RUN``) chunks from a global counter; without a
     tape ``split`` is 1 or 2 (default ``default_split``) and dh0 is computed here.
     ``flags`` are the chunk ready flags ``kda_dhu`` raised for this tape: the
     kernel then launches as its programmatic dependent and starts on the chunks
@@ -171,7 +168,7 @@ def fused_kda_bwd(
         _require("dh", dh_tape, torch.bfloat16, tuple(h.shape), q.device)
         _require("dv_new", dv_new, torch.bfloat16, tuple(v.shape), q.device)
         if split is None:
-            split = tape_split(cu_seqlens.numel() - 1, heads)
+            split = TAPE_RUN
     else:
         dh_tape, dv_new = h, v
         if split is None:
@@ -186,8 +183,18 @@ def fused_kda_bwd(
     signal = flags is not None
     if signal and tape is None:
         raise ValueError("flags need a tape")
-    if not signal:
+    ctas = 0
+    if tape is not None:
+        # Persistent CTAs take runs of ``split`` chunks from a global counter
+        # (the last element of the flags, zeroed with them).
+        items = (cu_seqlens.numel() - 1) * heads * -(-h.shape[1] // split)
+        ctas = max(1, min(torch.cuda.get_device_properties(q.device).multi_processor_count, items))
+    if signal:
+        _require("flags", flags, torch.int32, (h.shape[1] * heads + 1,), q.device)
+        work = flags[-1:]
+    else:
         flags = torch.empty((1,), device=q.device, dtype=torch.int32)
+        work = torch.zeros((1,), device=q.device, dtype=torch.int32)
     # Unused buffers stay uninitialized: with flags, no kernel may run between
     # the recurrence and this launch.
     alloc = torch.zeros if debug else torch.empty
@@ -213,15 +220,16 @@ def fused_kda_bwd(
         _dynamic(dh0, 0),
         _dynamic(xfer, 0),
         _dynamic(flags, 0, align=4),
+        _dynamic(work, 0, align=4),
         from_dlpack(debug_out, assumed_align=16),
         from_dlpack(trace_out, assumed_align=16),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    # With a tape the CTA count per (sequence, head) is a runtime argument.
+    # With a tape the run length and the persistent CTA count are runtime arguments.
     compiled_split = 1 if tape is not None else split
     key = (heads, compiled_split, tape is not None, signal, debug, trace, device_index)
-    runtime = (cutlass.Float32(scale), cutlass.Int32(split), stream)
+    runtime = (cutlass.Float32(scale), cutlass.Int32(split), cutlass.Int32(ctas), stream)
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
@@ -259,6 +267,7 @@ def kda_dhu(
     chunk_offsets=None,
     num_chunks=None,
     flags=None,
+    keepalive=None,
     trace=False,
 ):
     """KDA's backward state recurrence from the forward residuals.
@@ -270,9 +279,11 @@ def kda_dhu(
     chunk-local log2 gate cumsum, ``beta`` FP32 ``[1, T, H]``, ``aqk`` and
     ``akk`` BF16 ``[1, T, H, 64]`` and ``dht`` the FP32 ``[S, H, 128, 128]``
     final-state gradient; ``num_chunks`` (default: an upper bound) sizes the
-    tape like the forward's ``h``.  ``flags`` (zeroed int32 ``[C * H]``) makes
+    tape like the forward's ``h``.  ``flags`` (from ``tape_flags``) makes
     the recurrence raise a ready flag per chunk for ``fused_kda_bwd(...,
-    flags=flags)`` launched right after it.  Returns ``(dh, dh0, dv2)``: the
+    flags=flags)`` launched right after it; that kernel overlaps this one, so
+    the intermediate buffers this one reads are appended to ``keepalive``, which
+    the caller must hold until it has launched ``fused_kda_bwd``.  Returns ``(dh, dh0, dv2)``: the
     BF16 per-chunk dS ``[1, C, H, 128, 128]``, the FP32 initial-state gradient
     and BF16 dv_new.
     """
@@ -301,13 +312,17 @@ def kda_dhu(
     qg, kg, w, aqk_masked = kda_dhu_prep(
         q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks
     )
+    if flags is not None:
+        if keepalive is None:
+            raise ValueError("flags need a keepalive list")
+        keepalive.extend((qg, kg, w, aqk_masked))
     dh = torch.empty((1, num_chunks, heads, _D, _D), device=device, dtype=torch.bfloat16)
     dv2 = torch.empty_like(do)
     dh0 = torch.empty_like(dht)
     trace_out = torch.zeros((8, 16) if trace else (1, 1), device=device, dtype=torch.int64)
     signal = flags is not None
     if signal:
-        _require("flags", flags, torch.int32, (num_chunks * heads,), device)
+        _require("flags", flags, torch.int32, (num_chunks * heads + 1,), device)
     else:
         flags = torch.empty((1,), device=device, dtype=torch.int32)
     args = (

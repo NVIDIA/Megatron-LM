@@ -251,6 +251,7 @@ def _call_fused_kda_bwd(
         fused_kda_bwd,
         kda_dhu,
         prefer_tape,
+        tape_flags,
     )
 
     batch, seq_len, heads, dim = q.shape
@@ -279,10 +280,12 @@ def _call_fused_kda_bwd(
     dht = dht.detach().reshape(num_sequences, heads, dim, dim).to(torch.float32).contiguous()
     chunk_offsets = chunk_offsets_for(cu_seqlens)
     tape = flags = None
+    # Buffers the overlapped recurrence reads; held until the gradient launch.
+    keepalive = []
     if prefer_tape(num_sequences, heads, q.device):
         # The gradient kernel starts on each chunk as soon as the recurrence
         # has written it (chunk ready flags; nothing is enqueued in between).
-        flags = torch.zeros(h.shape[1] * heads, dtype=torch.int32, device=q.device)
+        flags = tape_flags(h.shape[1], heads, q.device)
         dh, _dh0, dv_new = kda_dhu(
             q,
             k,
@@ -297,6 +300,7 @@ def _call_fused_kda_bwd(
             chunk_offsets=chunk_offsets,
             num_chunks=h.shape[1],
             flags=flags,
+            keepalive=keepalive,
         )
         tape = (dh, dv_new)
     dq, dk, dv, dg, db, _ = fused_kda_bwd(
@@ -316,6 +320,7 @@ def _call_fused_kda_bwd(
         tape=tape,
         flags=flags,
     )
+    del keepalive
     _fused_kda_bwd_launches += 1
     shape = (batch, seq_len, heads, dim)
     return (
