@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import get_model_config, log_single_rank
+from megatron.core.utils import get_model_config, is_te_min_version, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -34,6 +34,12 @@ except ImportError:
         from torch.optim import Adam as Adam
 
         HAVE_APEX_OR_TE = False
+
+# Apex FusedAdam and TE FusedAdam before 2.19 skip empty param groups entirely, so their "step"
+# never advances. TE 2.19 and later advance "step" in empty groups like in any other group.
+FUSED_ADAM_SKIPS_EMPTY_GROUPS = USING_APEX_OPTIMIZER or (
+    USING_TE_OPTIMIZER and not is_te_min_version("2.19.0")
+)
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
@@ -1188,8 +1194,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 or USING_APEX_OPTIMIZER
                 or isinstance(self.optimizer, HybridDeviceOptimizer)
             ) and step is not None:
-                # TE FusedAdam will not accumulate step for empty param groups, so we need to
-                # align the step across param groups.
+                # Empty param groups may lack a step (see FUSED_ADAM_SKIPS_EMPTY_GROUPS), and a
+                # group's local ownership can change on resharding, so align the step across
+                # param groups.
                 param_group["step"] = int(step)
 
         # Grad scaler state.
@@ -1273,9 +1280,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
             if saved_param_group is None:
                 raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
-            state_dict_param_groups.append(
-                {**saved_param_group, "params": inner_param_group['params']}
-            )
+            restored_group = {**saved_param_group, "params": inner_param_group['params']}
+            if (
+                FUSED_ADAM_SKIPS_EMPTY_GROUPS
+                and isinstance(self.optimizer, Adam)
+                and not inner_param_group['params']
+            ):
+                # Checkpoints align step across groups for resharding. This FusedAdam does
+                # not advance empty local groups, so retain their live step metadata
+                # instead of introducing the checkpoint's global step on this rank.
+                if "step" in inner_param_group:
+                    restored_group["step"] = inner_param_group["step"]
+                else:
+                    restored_group.pop("step", None)
+            state_dict_param_groups.append(restored_group)
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
