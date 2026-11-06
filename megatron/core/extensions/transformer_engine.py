@@ -2527,6 +2527,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        # TE registers the learnable softmax_offset with one entry per local attention head
+        # (num_attention_heads // tp_size) but sets no TP attributes on it. Mark it as sharded
+        # along dim 0 (as in sharded_state_dict) so the grad-norm and zero-count filters count
+        # every TP rank's shard instead of only TP rank 0's. Skip it if TE already marked it.
+        if self.config.softmax_type == "learnable" and not hasattr(
+            self.softmax_offset, "tensor_model_parallel"
+        ):
+            set_tensor_model_parallel_attributes(
+                self.softmax_offset, is_parallel=True, dim=0, stride=1
+            )
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
