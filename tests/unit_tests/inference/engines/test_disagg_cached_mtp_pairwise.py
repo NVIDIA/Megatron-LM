@@ -9,6 +9,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.disaggregation.mtp_draft_handoff import (
+    MTP_DRAFT_Q_KEY,
+    MTP_VERIFICATION_KEY,
+    decode_mtp_draft_q,
+)
+from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     admit_import,
@@ -74,6 +80,10 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 assert request.generated_tokens == expected[:1]
                 metadata, state = snapshot_source(engine, request)
                 assert len(metadata["kv_meta"]["resume_tokens"]) == depth + 1
+                if depth:
+                    # Greedy requests keep exact-match verification: no draft q is sent.
+                    assert metadata["kv_meta"][MTP_VERIFICATION_KEY] == "rejection"
+                    assert MTP_DRAFT_Q_KEY not in metadata["kv_meta"]
                 if mtp_kv:
                     slot = engine.context.mtp_kv_layer_slot
                     assert metadata["kv_meta"]["num_layers_global"] == slot + 1
@@ -151,3 +161,77 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
         finally:
             for hook in hooks:
                 hook.remove()
+
+
+@torch.inference_mode()
+def test_sampled_mtp_handoff_verifies_first_drafts_with_transferred_q(transport_world):
+    """A sampled import's first decode step verifies the prefill engine's drafts by rejection
+    sampling, using the exact draft distributions q sent with the handoff."""
+    depth = 2
+    config = disagg_config(num_speculative_tokens=depth)
+    tokens = prompt(31)
+    params = SamplingParams(temperature=1.0, top_p=0.9, termination_id=-1, num_tokens_to_generate=7)
+    weights, _ = collocated_reference(config, tokens, params)
+    source = dist.get_rank() % 2 == 0
+    with real_engine(
+        config, role="prefill" if source else "decode", backend="nccl", weights=weights
+    ) as engine:
+        controller = engine.controller
+        assert controller.mtp_draft_q_shape() == (depth, controller.vocab_size)
+        metadata = state = q_ref = None
+        if source:
+            handoff_params = SamplingParams(
+                temperature=1.0,
+                top_p=0.9,
+                termination_id=-1,
+                num_tokens_to_generate=1,
+                do_kv_handoff=True,
+            )
+            request = run_to_completion(engine, engine.add_request(101, tokens, handoff_params))
+            metadata, state = snapshot_source(engine, request)
+            kv_meta = metadata["kv_meta"]
+            assert kv_meta[MTP_VERIFICATION_KEY] == "rejection"
+            drafts = kv_meta["resume_tokens"][1:]
+            row = controller._mtp_draft_row_of_request[101]
+            q_ref = controller._mtp_draft_probs[:, row].cpu()
+            assert drafts == controller._sampled_mtp_tokens_cuda[:depth, row].tolist()
+            decoded = decode_mtp_draft_q(
+                kv_meta[MTP_DRAFT_Q_KEY],
+                num_depths=depth,
+                vocab=controller.vocab_size,
+                drafts=drafts,
+            )
+            assert torch.equal(decoded, q_ref)
+        peer = exchange((metadata, state, q_ref) if source else None, transport_world)
+        if not source:
+            metadata, state, q_ref = peer
+        pending, future = complete_transfer(engine, metadata, tokens, params, transport_world)
+        if not source:
+            assert torch.equal(pending.mtp_draft_q, q_ref)
+            admit_import(engine)
+            assert set(controller._imported_mtp_draft_q) == {101}
+            chain_calls = []
+            real_chain = controller._sampling.chain_speculative_sampling
+
+            def spy(draft_probs, draft_tokens, target_probs):
+                chain_calls.append((draft_probs.clone(), draft_tokens.clone()))
+                return real_chain(draft_probs, draft_tokens, target_probs)
+
+            controller._sampling.chain_speculative_sampling = spy
+            actual = run_to_completion(engine, future)
+            # The first verification used the imported q for the prefill engine's drafts.
+            assert chain_calls, "the imported request's first drafts must use rejection sampling"
+            first_q, first_drafts = chain_calls[0]
+            assert torch.equal(first_q[0].cpu(), q_ref)
+            assert first_drafts[0].tolist() == metadata["kv_meta"]["resume_tokens"][1:]
+            assert not controller._imported_mtp_draft_q
+            assert len(actual.generated_tokens) == 7
+            assert actual.generated_tokens[0] == metadata["kv_meta"]["resume_tokens"][0]
+            steps = actual.acceptance_step_lengths
+            assert steps[0] == 1 and sum(steps) == len(actual.generated_tokens)
+            assert_released(engine)
+        dist.barrier(group=transport_world)
+        if source:
+            engine._poll_pending_kv_pushes()
+            engine.release_handoff_blocks(101)
+            assert_released(engine)

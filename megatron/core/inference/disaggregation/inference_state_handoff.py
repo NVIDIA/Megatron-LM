@@ -26,6 +26,12 @@ from megatron.core.inference.disaggregation.handoff_completion_tracker import (
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     strip_registered_nixl_agent_metadata,
 )
+from megatron.core.inference.disaggregation.mtp_draft_handoff import (
+    MTP_DRAFT_Q_KEY,
+    MTP_VERIFICATION_KEY,
+    decode_mtp_draft_q,
+    encode_mtp_draft_q,
+)
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     HandoffRequestMetadata,
@@ -67,6 +73,7 @@ class _PreparedHandoffMetadata:
     ssm_meta: Any
     resume_tokens: list[int]
     resume_log_probs: list[float]
+    mtp_draft_q: dict | None = None  # Encoded draft distributions for rejection verification.
 
 
 class InferenceStateHandoffMixin:
@@ -694,6 +701,7 @@ class InferenceStateHandoffMixin:
                     ssm_meta=ssm_meta,
                     resume_tokens=resume_tokens,
                     resume_log_probs=resume_log_probs,
+                    mtp_draft_q=self._export_handoff_mtp_draft_q(request, resume_tokens),
                 )
             return prepared
         except Exception:
@@ -704,6 +712,38 @@ class InferenceStateHandoffMixin:
                 self._release_pinned_handoff_blocks(block_ids)
                 self._release_pinned_handoff_ssm_slot(ssm_slot)
             raise
+
+    def _export_handoff_mtp_draft_q(
+        self, request: "DynamicInferenceRequest", resume_tokens: list[int]
+    ) -> dict | None:
+        """Encode the draft distributions q behind a handoff's MTP proposals.
+
+        Under rejection verification the decode engine needs the q each proposal in
+        `resume_tokens[1:]` was sampled from to verify them by chain speculative sampling on the
+        imported request's first decode step. Greedy requests keep exact match and send nothing.
+
+        Side: prefill engine, in the step whose draft loop produced the proposals.
+        """
+        controller = getattr(self, "controller", None)
+        shape_fn = getattr(controller, "mtp_draft_q_shape", None)
+        shape = shape_fn() if shape_fn is not None else None
+        if shape is None or request.sampling_params.top_k == 1:
+            return None
+        exported = controller.export_mtp_draft_q(request.request_id)
+        if exported is None:
+            return None
+        q, drafts = exported
+        num_depths = shape[0]
+        if drafts != resume_tokens[1 : 1 + num_depths]:
+            logging.warning(
+                "Not sending MTP draft q for handoff request %d: stored drafts %s do not match "
+                "its resume proposals %s; decode verifies them by exact match",
+                request.request_id,
+                drafts,
+                resume_tokens[1 : 1 + num_depths],
+            )
+            return None
+        return encode_mtp_draft_q(q, drafts)
 
     @staticmethod
     def _ssm_stage_transfer_meta(static_metas: dict, selected_slot: int) -> dict:
@@ -752,6 +792,12 @@ class InferenceStateHandoffMixin:
             # request-specific SSM metadata out of that shared object.
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
+        if self.context.num_speculative_tokens > 0:
+            kv_meta[MTP_VERIFICATION_KEY] = getattr(
+                self.controller, "mtp_verification", "exact_match"
+            )
+        if prepared.mtp_draft_q is not None:
+            kv_meta[MTP_DRAFT_Q_KEY] = prepared.mtp_draft_q
         if request.block_hash_salt is not None:
             kv_meta["block_hash_salt"] = request.block_hash_salt
         if prepared.resume_log_probs:
@@ -886,6 +932,8 @@ class InferenceStateHandoffMixin:
                 f"expected {expected_log_probs}, got {len(resume_log_probs)}"
             )
 
+        mtp_draft_q = self._import_handoff_mtp_draft_q(request_id, kv_meta, resume_tokens)
+
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
             prompt_tensor, self.context.block_size_tokens, cache_salt=kv_meta.get("block_hash_salt")
@@ -919,6 +967,7 @@ class InferenceStateHandoffMixin:
             request_metadata=(
                 HandoffRequestMetadata(**request_metadata) if request_metadata is not None else None
             ),
+            mtp_draft_q=mtp_draft_q,
         )
         # Preserve receive order under backpressure. This is required by NCCL's
         # two-sided transport and also prevents a stream of small handoffs from
@@ -941,6 +990,51 @@ class InferenceStateHandoffMixin:
                 len(self._deferred_kv_handoffs),
             )
         return future
+
+    def _import_handoff_mtp_draft_q(
+        self, request_id: int, kv_meta: dict, resume_tokens: list[int]
+    ) -> torch.Tensor | None:
+        """Validate and decode the draft distributions sent with a handoff, if usable here.
+
+        Returns None (the imported request's first verification uses exact match) when this
+        engine does not verify by rejection sampling, the request is greedy or the prefill
+        engine verifies by exact match (no q sent). A mismatched verification mode is logged
+        once; a q that does not match the local MTP depth / vocabulary or the handoff's drafts
+        is rejected as an incompatible handoff.
+
+        Side: decode engine.
+        """
+        if self.context.num_speculative_tokens == 0 or not isinstance(kv_meta, dict):
+            return None
+        local_mode = getattr(self.controller, "mtp_verification", "exact_match")
+        source_mode = kv_meta.get(MTP_VERIFICATION_KEY)
+        if source_mode is not None and source_mode != local_mode:
+            if not getattr(self, "_warned_mtp_verification_mismatch", False):
+                logging.warning(
+                    "Disaggregated prefill verifies MTP drafts by %r but this decode engine by "
+                    "%r; imported requests' first drafts use exact-match verification",
+                    source_mode,
+                    local_mode,
+                )
+                self._warned_mtp_verification_mismatch = True
+            return None
+        payload = kv_meta.get(MTP_DRAFT_Q_KEY)
+        shape_fn = getattr(self.controller, "mtp_draft_q_shape", None)
+        shape = shape_fn() if shape_fn is not None else None
+        if payload is None or shape is None:
+            return None
+        num_depths, vocab = shape
+        try:
+            return decode_mtp_draft_q(
+                payload,
+                num_depths=num_depths,
+                vocab=vocab,
+                drafts=resume_tokens[1 : 1 + num_depths],
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid MTP draft distributions in handoff request {request_id}: {error}"
+            ) from error
 
     def _try_start_kv_handoff_import(self, handoff: DeferredKvHandoff) -> bool:
         """Reserve cache state and start one import, or return without mutation.
@@ -1066,6 +1160,7 @@ class InferenceStateHandoffMixin:
             resume_tokens=resume_tokens,
             resume_log_probs=resume_log_probs,
             continuation_blocks=continuation_blocks,
+            mtp_draft_q=handoff.mtp_draft_q,
             local_error=start_error,
             destinations_safe=(
                 start_error is None
@@ -1349,6 +1444,16 @@ class InferenceStateHandoffMixin:
                     pending.resume_tokens,
                     ssm_state_idx=(pending.ssm.live_slot if pending.ssm is not None else None),
                 )
+                if pending.mtp_draft_q is not None:
+                    # Keyed by request id: the rejection planner finds the request's row at
+                    # its first verification, after any reordering or compaction.
+                    num_depths = pending.mtp_draft_q.shape[0]
+                    self.controller.import_mtp_draft_q(
+                        pending.request_id,
+                        pending.mtp_draft_q,
+                        pending.resume_tokens[1 : 1 + num_depths],
+                    )
+                    pending.mtp_draft_q = None
                 pending.ssm = None
                 pending.local_blocks = []
                 pending.continuation_blocks = []

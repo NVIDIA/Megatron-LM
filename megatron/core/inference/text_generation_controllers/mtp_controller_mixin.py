@@ -16,9 +16,9 @@ the model -- including the chunked-prefill boundary carry, which lives on the co
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -77,6 +77,10 @@ class _RejectionPlan:
 
     rows: List[int]
     draft_rows: List[int]
+    # Plan index -> (q [num_mtp_depths, vocab] fp32 GPU, drafts [num_mtp_depths] int64 GPU) for
+    # requests whose drafts were imported from a disaggregated prefill engine; their
+    # `draft_rows` entry is unused.
+    imported: Dict[int, Tuple[Tensor, Tensor]] = field(default_factory=dict)
 
 
 class MTPControllerMixin:
@@ -108,6 +112,9 @@ class MTPControllerMixin:
         self._mtp_resolved_padded_count = None
         self._mtp_draft_probs = None
         self._mtp_draft_row_of_request = None
+        # Request id -> (q, drafts) imported with a disaggregated prefill->decode handoff,
+        # consumed by that request's first rejection-sampling verification.
+        self._imported_mtp_draft_q: Dict[int, Tuple[Tensor, Tensor]] = {}
         if not self.num_speculative_tokens:
             self._sampled_mtp_tokens_cuda = None
             self._accepted_tokens_per_request = None
@@ -251,11 +258,12 @@ class MTPControllerMixin:
         Returns:
             Optional[_RejectionPlan]: The qualifying rows, or None when there are none.
         """
-        row_of_request = getattr(self, "_mtp_draft_row_of_request", None)
+        row_of_request = getattr(self, "_mtp_draft_row_of_request", None) or {}
         self._mtp_draft_row_of_request = None
+        imported = getattr(self, "_imported_mtp_draft_q", None) or {}
         if (
             getattr(self, "_mtp_draft_probs", None) is None
-            or not row_of_request
+            or not (row_of_request or imported)
             or num_decode_requests == 0
             or self.num_mtp_depths == 0
         ):
@@ -266,15 +274,76 @@ class MTPControllerMixin:
         top_k = context.active_request_metadata["top_k"][:num_decode_requests].tolist()
         rows: List[int] = []
         draft_rows: List[int] = []
+        plan_imported: Dict[int, Tuple[Tensor, Tensor]] = {}
         for row, (rid, k) in enumerate(zip(request_ids, top_k)):
-            draft_row = row_of_request.get(rid)
-            if k == 1 or draft_row is None:
+            if k == 1:
                 continue
+            draft_row = row_of_request.get(rid)
+            if draft_row is None:
+                # First verification of a disaggregated import: its drafts came from the
+                # prefill engine's draft loop, and q came with the handoff.
+                entry = imported.pop(rid, None)
+                if entry is None:
+                    continue
+                plan_imported[len(rows)] = entry
+                draft_row = -1
             rows.append(row)
             draft_rows.append(draft_row)
+        if imported:
+            # Drop imports whose request left the context before its first verification.
+            live = set(context.request_ids[: context.total_request_count].tolist())
+            for rid in [rid for rid in imported if rid not in live]:
+                del imported[rid]
         if not rows:
             return None
-        return _RejectionPlan(rows=rows, draft_rows=draft_rows)
+        return _RejectionPlan(rows=rows, draft_rows=draft_rows, imported=plan_imported)
+
+    def mtp_draft_q_shape(self) -> Optional[Tuple[int, int]]:
+        """`(num_mtp_depths, vocab)` of the stored draft distributions, or None when MTP
+        rejection-sampling verification is off."""
+        buf = getattr(self, "_mtp_draft_probs", None)
+        if buf is None or self.num_mtp_depths == 0:
+            return None
+        return self.num_mtp_depths, int(buf.shape[-1])
+
+    def export_mtp_draft_q(self, request_id: int) -> Optional[Tuple[Tensor, List[int]]]:
+        """q and drafts of a request drafted by the last draft loop, for a handoff export.
+
+        Side: disaggregated prefill engine, after the step whose draft loop produced the
+        handoff's `resume_tokens` proposals. Returns None when rejection verification is off or
+        the request was not drafted by the last draft loop. Call only for sampled requests.
+        Copies `[num_mtp_depths, vocab]` fp32 to the host (synchronizes the stream).
+        """
+        if getattr(self, "_mtp_draft_probs", None) is None or self.num_mtp_depths == 0:
+            return None
+        draft_row = (getattr(self, "_mtp_draft_row_of_request", None) or {}).get(request_id)
+        if draft_row is None:
+            return None
+        # The caller skips greedy requests (their rows may hold an unwritten q): the per-row
+        # sampling metadata may already be compacted for the next step here.
+        q = self._mtp_draft_probs[:, draft_row].cpu()
+        drafts = self._sampled_mtp_tokens_cuda[: self.num_mtp_depths, draft_row].tolist()
+        return q, drafts
+
+    def import_mtp_draft_q(self, request_id: int, q: Tensor, drafts: Sequence[int]) -> None:
+        """Register an imported request's draft distributions for its first verification.
+
+        Side: disaggregated decode engine, when the imported request is admitted. Ignored under
+        exact-match verification.
+        """
+        if getattr(self, "_mtp_draft_probs", None) is None:
+            return
+        expected = (self.num_mtp_depths, self._mtp_draft_probs.shape[-1])
+        if tuple(q.shape) != expected or len(drafts) != self.num_mtp_depths:
+            raise ValueError(
+                f"Imported MTP draft q has shape {tuple(q.shape)} / {len(drafts)} drafts; "
+                f"expected {expected} / {self.num_mtp_depths}"
+            )
+        device = self._mtp_draft_probs.device
+        self._imported_mtp_draft_q[int(request_id)] = (
+            q.to(device=device, dtype=torch.float32, non_blocking=True),
+            torch.tensor([int(t) for t in drafts], dtype=torch.int64).to(device, non_blocking=True),
+        )
 
     def _sample_speculative_verify_rows(
         self,
@@ -377,9 +446,10 @@ class MTPControllerMixin:
         stride = self.num_speculative_tokens + 1
         rows_cpu = torch.tensor(plan.rows, dtype=torch.long)
         rows_gpu = rows_cpu.to(device, non_blocking=True)
-        draft_rows_gpu = torch.tensor(plan.draft_rows, dtype=torch.long).to(
-            device, non_blocking=True
-        )
+        # Imported requests (draft row -1) gather a placeholder row, overwritten below.
+        draft_rows_gpu = torch.tensor(
+            [max(row, 0) for row in plan.draft_rows], dtype=torch.long
+        ).to(device, non_blocking=True)
 
         # [num_rows, num_depths + 1] verify rows: target positions of x_1..x_Dm, then the bonus.
         offsets = torch.arange(num_depths + 1, device=device)
@@ -400,6 +470,13 @@ class MTPControllerMixin:
         # Drafts x_1..x_Dm sit on input rows 1..Dm of each request.
         draft_tokens = input_tokens_required[verify_rows[:, 1:]]
         stored_drafts = self._sampled_mtp_tokens_cuda[:num_depths, draft_rows_gpu].transpose(0, 1)
+        if plan.imported:
+            imported_idx = torch.tensor(list(plan.imported), dtype=torch.long).to(
+                device, non_blocking=True
+            )
+            draft_probs[imported_idx] = torch.stack([q for q, _ in plan.imported.values()])
+            stored_drafts = stored_drafts.clone()
+            stored_drafts[imported_idx] = torch.stack([d for _, d in plan.imported.values()])
         consistent = (stored_drafts == draft_tokens).all(dim=1)
         # Point-mass q for inconsistent requests (in place, no host sync).
         draft_probs.mul_(consistent.view(-1, 1, 1))

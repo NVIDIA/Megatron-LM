@@ -14,6 +14,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference.disaggregation.mtp_draft_handoff import (
+    decode_mtp_draft_q,
+    encode_mtp_draft_q,
+)
 from megatron.core.inference.sampling.speculative import chain_speculative_sampling_torch
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
@@ -245,6 +249,7 @@ class _Controller(MTPControllerMixin):
             else None
         )
         self._mtp_draft_row_of_request = None
+        self._imported_mtp_draft_q = {}
 
 
 def _make_sampling(backend, seed):
@@ -547,3 +552,76 @@ class TestControllerRejectionSampling:
         for i, src in enumerate(perm):
             ref_q = _reference_probs(draft_logits[:, src], 1.0, 0, 0.0)
             torch.testing.assert_close(captured["draft_probs"][i], ref_q, atol=1e-5, rtol=1e-4)
+
+    @pytest.mark.parametrize("backend", BACKENDS)
+    def test_imported_draft_q_matches_collocated_verification(self, backend):
+        """Disaggregated handoff: q exported by the prefill controller, encoded, decoded and
+        imported by the decode controller verifies the first drafts exactly like the
+        collocated path (same plan coverage, emitted distribution and acceptance)."""
+        temperature, top_k, top_p = 1.0, 0, 0.9
+        num_spec, n, rounds = 2, 2048, 6
+        stride = num_spec + 1
+        gen = torch.Generator(device=DEVICE).manual_seed(61)
+        target_row = _logits(num_spec + 1, 2.0, gen)
+        draft_row = _logits(num_spec, 2.0, gen)
+        p = _reference_probs(target_row, temperature, top_k, top_p)
+        q = _reference_probs(draft_row, temperature, top_k, top_p)
+        target_logits = target_row.repeat(n, 1)
+        draft_logits = draft_row.unsqueeze(1).expand(num_spec, n, VOCAB).contiguous()
+        base = torch.zeros(n, 1, dtype=torch.long, device=DEVICE)
+        rows = torch.arange(n, device=DEVICE)
+
+        stats = {}
+        for path in ("collocated", "imported"):
+            prefill_ctx = _Ctx([temperature] * n, [top_k] * n, [top_p] * n)
+            prefill = _Controller(
+                prefill_ctx, _make_sampling(backend, 62), num_spec, VOCAB, "rejection"
+            )
+            decode_ctx = _Ctx([temperature] * n, [top_k] * n, [top_p] * n)
+            decode = _Controller(
+                decode_ctx, _make_sampling(backend, 63), num_spec, VOCAB, "rejection"
+            )
+            first, acc = [], []
+            for _ in range(rounds):
+                for depth in range(num_spec):
+                    prefill._sampled_mtp_tokens_cuda[depth] = prefill._sample_mtp_draft(
+                        depth, draft_logits[depth], n
+                    )
+                prefill._record_mtp_draft_rows(prefill_ctx, n)
+                drafts = prefill._sampled_mtp_tokens_cuda.T.clone()
+                verifier = prefill
+                if path == "imported":
+                    verifier = decode
+                    for rid in prefill_ctx.request_ids.tolist():
+                        exported_q, exported_drafts = prefill.export_mtp_draft_q(rid)
+                        imported_q = decode_mtp_draft_q(
+                            encode_mtp_draft_q(exported_q, exported_drafts),
+                            num_depths=num_spec,
+                            vocab=VOCAB,
+                            drafts=exported_drafts,
+                        )
+                        assert torch.equal(imported_q, exported_q)
+                        decode.import_mtp_draft_q(rid, imported_q, exported_drafts)
+                plan = verifier._mtp_rejection_plan(n)
+                assert plan.rows == list(range(n))
+                assert len(plan.imported) == (n if path == "imported" else 0)
+                output = verifier._sample_speculative_verify_rows(target_logits, None, n, 0, plan)
+                inputs = torch.cat([base, drafts], dim=1).reshape(-1)
+                verifier._apply_mtp_rejection_sampling(output, target_logits, None, inputs, plan)
+                assert not verifier._imported_mtp_draft_q
+                last_one, mask, _ = verify_speculative_tokens(inputs, output, n, 0, num_spec)
+                a = mask.view(n, stride).sum(1) - 1
+                assert torch.equal(last_one, rows * stride + a)
+                first.append(torch.where(a >= 1, drafts[:, 0], output[last_one]))
+                acc.append(a)
+            stats[path] = (torch.cat(first), torch.cat(acc))
+
+        alpha = torch.minimum(p[0], q[0]).sum().item()
+        for path, (first, acc) in stats.items():
+            assert _tv(_hist(first, VOCAB), p[0]) < _tv_tol(VOCAB, first.numel()), path
+            rate = (acc >= 1).double().mean().item()
+            sigma = math.sqrt(alpha * (1 - alpha) / acc.numel())
+            assert abs(rate - alpha) < 5 * sigma + 1e-3, (path, rate, alpha)
+        rates = {path: (acc >= 1).double().mean().item() for path, (_, acc) in stats.items()}
+        sigma = math.sqrt(2 * alpha * (1 - alpha) / (n * rounds))
+        assert abs(rates["imported"] - rates["collocated"]) < 5 * sigma + 1e-3, rates
