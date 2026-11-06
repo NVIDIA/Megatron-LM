@@ -352,7 +352,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     compute_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
-    inference_context = object()
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=False)
+    )
     observed = {}
 
     def compute_forward(hidden_states, **kwargs):
