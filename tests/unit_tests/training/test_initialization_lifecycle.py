@@ -139,6 +139,15 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     initialize_ub.assert_called_once_with(**expected)
 
 
+@pytest.mark.parametrize("flags, expected", [([], True), (["--no-share-process-groups"], False)])
+def test_process_group_sharing_cli_reaches_distributed_config(flags, expected):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args(flags)
+    config = _default_config_from_args(DistributedInitConfig, args)
+    assert config.share_process_groups is expected
+
+
 def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -158,6 +167,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         use_sharp=True,
         sharp_enabled_group="dp_replica",
         use_gloo_process_groups=False,
+        share_process_groups=False,
         high_priority_stream_groups=["tp"],
         use_tp_pp_dp_mapping=True,
         nccl_communicator_config_path="owned.yaml",
@@ -198,6 +208,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     assert kwargs["gtp_remat_num_sequence_shards"] == 1
     assert kwargs["sharp_enabled_group"] == "dp_replica"
     assert kwargs["create_gloo_process_groups"] is False
+    assert kwargs["share_process_groups"] is False
     assert vars(args) == original_args
 
 

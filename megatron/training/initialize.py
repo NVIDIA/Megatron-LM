@@ -476,6 +476,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=cfg.dist.use_gloo_process_groups,
+                share_process_groups=cfg.dist.share_process_groups,
                 high_priority_stream_groups=cfg.dist.high_priority_stream_groups,
                 sharp_enabled_group=cfg.dist.sharp_enabled_group,
             )

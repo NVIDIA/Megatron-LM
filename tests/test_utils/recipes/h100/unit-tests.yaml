@@ -96,6 +96,14 @@ spec:
     fi
 
 products:
+  # Own a device-bound WORLD for the eager communicator-split path. The catch-all excludes it.
+  - test_case: [tests/unit_tests/test_process_group_sharing_gpu.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   # Runtime topology regressions run separately from the broad SSM/transformer buckets.
   - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
     products:

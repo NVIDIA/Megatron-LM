@@ -2171,6 +2171,10 @@ class ParamAndGradBuffer:
                 # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
+            # Dense and expert roles may share a communicator. Register each object once,
+            # preserving the order of distinct groups (including independent AG groups).
+            self.ubr_groups = list({id(group): group for group in self.ubr_groups}.values())
+
             log_single_rank(
                 logger,
                 logging.INFO,
