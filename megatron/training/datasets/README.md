@@ -2,6 +2,9 @@
 
 ## FIM dataset
 
+The FIM dataset lives in Megatron Core, `megatron/core/datasets/gpt_fim_dataset.py`
+(`megatron.training.datasets.fim_dataset` re-exports it).
+
 `GPTFIMDataset` extends Megatron-Core’s `GPTDataset` to support **Fill-in-the-Middle (FIM)** data augmentation.
 It probabilistically converts samples into FIM format using configurable rates, with support for both PSM and SPM patterns, fragment-level splitting, and length-preserving output.
 

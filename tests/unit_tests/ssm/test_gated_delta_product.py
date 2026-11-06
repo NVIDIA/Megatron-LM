@@ -16,19 +16,20 @@ bitwise bar as everything else.
 import pytest
 import torch
 
-from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP,
-    HAVE_EINOPS,
-    HAVE_FLA,
-    HAVE_MAMBA_SSM,
-    GatedDeltaProductMixer,
-    causal_conv1d_fn,
-)
+from megatron.core.ssm.gated_delta_product import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import Float16Module
+from tests.unit_tests.ssm.gdp_test_utils import (
+    HAVE_GDP_DEPS,
+    HIDDEN_SIZE,
+    MAMBA_NUM_HEADS,
+    _assert_replay_matches,
+    _build_mixer,
+    _make_config,
+    _run,
+    assert_in_proj_recompute_preserves_norm_gate_view,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -37,67 +38,6 @@ try:
     fp8_available, reason_for_no_fp8 = check_fp8_support()
 except ImportError:
     fp8_available, reason_for_no_fp8 = False, "transformer-engine is not installed"
-
-HAVE_GDP_DEPS = (
-    HAVE_MAMBA_SSM
-    and HAVE_EINOPS
-    and (HAVE_FLA or HAVE_CUTEDSL_GDP)
-    and causal_conv1d_fn is not None
-)
-
-# The mixer places several divisibility constraints on these: d_inner = num_heads *
-# head_dim must divide evenly by the group count, and the in_proj output width
-# (d_inner * 4 + num_groups * state_dim * 4 + num_heads * 4 = 2064) must stay a
-# multiple of 16 so the FP8 GEMM is legal.
-HIDDEN_SIZE = 256
-MAMBA_NUM_HEADS = 4
-MAMBA_HEAD_DIM = 64
-MAMBA_NUM_GROUPS = 2
-MAMBA_STATE_DIM = 128
-
-
-def _make_config(recompute_modules, fp8_recipe=None):
-    """Build a GDP config; an empty recompute_modules disables selective recompute."""
-    return TransformerConfig(
-        num_layers=1,
-        hidden_size=HIDDEN_SIZE,
-        num_attention_heads=MAMBA_NUM_HEADS,
-        mamba_num_heads=MAMBA_NUM_HEADS,
-        mamba_head_dim=MAMBA_HEAD_DIM,
-        mamba_num_groups=MAMBA_NUM_GROUPS,
-        mamba_state_dim=MAMBA_STATE_DIM,
-        params_dtype=torch.bfloat16,
-        bf16=True,
-        recompute_granularity="selective" if recompute_modules else None,
-        recompute_modules=list(recompute_modules),
-        fp8="hybrid" if fp8_recipe else None,
-        fp8_recipe=fp8_recipe if fp8_recipe else "delayed",
-    )
-
-
-def _build_mixer(config, state_dict=None):
-    """Build a GatedDeltaProductMixer, optionally loading a shared state dict."""
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-    mixer = GatedDeltaProductMixer(
-        config,
-        gdp_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
-        config.hidden_size,
-        layer_number=1,
-        pg_collection=pg_collection,
-    ).cuda()
-    if state_dict is not None:
-        mixer.load_state_dict(state_dict)
-    return mixer
-
-
-def _run(mixer, hidden_states, grads):
-    """Run one forward/backward and collect the output and every gradient."""
-    x = hidden_states.clone().requires_grad_(True)
-    with get_fp8_context(mixer.config):
-        out, _ = mixer(x)
-    out.backward(grads)
-    param_grads = {name: param.grad.clone() for name, param in mixer.named_parameters()}
-    return out.detach().clone(), x.grad.clone(), param_grads
 
 
 @pytest.fixture(autouse=True)
@@ -112,20 +52,28 @@ def deterministic_conv1d(monkeypatch):
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
 
 
-def _assert_replay_matches(baseline, recomputed):
-    """Compare a (output, input grad, param grads) triple; every tensor bitwise."""
-    base_out, base_input_grad, base_param_grads = baseline
-    recomp_out, recomp_input_grad, recomp_param_grads = recomputed
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires GDP dependencies")
+@pytest.mark.parametrize("parameter_name", ["A_log", "dt_bias"])
+def test_decay_parameters_stay_fp32_in_float16_module(parameter_name):
+    """Preserve the initialized decay values when wrapping GDP for BF16 training."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = _make_config([])
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        mixer = _build_mixer(config)
+        parameter = getattr(mixer, parameter_name)
+        assert parameter.dtype == torch.float32
+        expected = parameter.detach().clone()
 
-    torch.testing.assert_close(recomp_out, base_out, rtol=0, atol=0, msg="output drifted")
-    torch.testing.assert_close(
-        recomp_input_grad, base_input_grad, rtol=0, atol=0, msg="input gradient drifted"
-    )
-    assert set(recomp_param_grads) == set(base_param_grads)
-    for name, base_grad in base_param_grads.items():
-        torch.testing.assert_close(
-            recomp_param_grads[name], base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
-        )
+        wrapped = Float16Module(config=config, module=mixer).module
+
+        parameter = getattr(wrapped, parameter_name)
+        assert parameter.dtype == torch.float32
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+        assert wrapped.in_proj.weight.dtype == torch.bfloat16
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
@@ -192,6 +140,19 @@ def test_fp8_in_proj_recompute_parity(fp8_recipe):
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
+@pytest.mark.parametrize("recompute_qkv", [False, True])
+@pytest.mark.parametrize("fp8_recipe", [None, "mxfp8"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_in_proj_recompute_preserves_norm_gate_view(
+    monkeypatch, recompute_qkv, fp8_recipe, cp_size
+):
+    """At MB=1, CP1 and chunkwise CP must discard and restore the norm's saved gate."""
+    assert_in_proj_recompute_preserves_norm_gate_view(
+        monkeypatch, recompute_qkv, fp8_recipe, cp_size
+    )
 
 
 def test_in_proj_recompute_rejects_qkv_offload():

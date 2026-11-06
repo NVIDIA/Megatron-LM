@@ -129,12 +129,12 @@ def initialize_megatron(
         initialize_rerun_state_machine(
             state_save_func=state_save_func,
             state_restore_func=state_restore_func,
-            mode=RerunMode(args.rerun_mode),
+            mode=RerunMode(cfg.rerun_state_machine.rerun_mode),
             error_injector=RerunErrorInjector(
-                error_injection_rate=args.error_injection_rate,
-                error_injection_type=RerunDiagnostic(args.error_injection_type),
+                error_injection_rate=cfg.rerun_state_machine.error_injection_rate,
+                error_injection_type=RerunDiagnostic(cfg.rerun_state_machine.error_injection_type),
             ),
-            result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+            result_rejected_tracker_filename=cfg.rerun_state_machine.result_rejected_tracker_filename,
         )
 
     if args.batch_invariant_mode:
@@ -465,7 +465,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
+                dynamic_context_parallel=args.dynamic_context_parallel,
+                min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,

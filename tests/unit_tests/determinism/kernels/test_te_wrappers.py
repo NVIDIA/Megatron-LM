@@ -8,7 +8,9 @@ and backward (cross-row dgamma reduction), grouped GEMMs over uneven expert load
 attention with GQA (dK/dV accumulate across query groups), fused RoPE, and the DSA indexer's
 BF16-input/FP32-output projection. Each wrapper is replayed standalone under side-stream
 contention; the bare TE modules are what the model-level suite composes, so a regression here
-localises to one kernel family.
+localises to one kernel family. Runtime CP head-geometry and MLA projection/RoPE
+replays live in ``context_parallel/runtime/test_te_replay.py`` and
+``context_parallel/runtime/test_mla_replay.py`` so their distributed cases have a dedicated CI bucket.
 """
 
 import inspect
@@ -18,9 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
+from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -229,6 +232,21 @@ class TestTEWrappers:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_mark_grouped_tensor_is_numerically_transparent(self):
+        """The paged-stash marker must not change activation values or gradients."""
+        if te_ext._te_mark_grouped_tensor is None:
+            pytest.skip("Transformer Engine does not provide mark_grouped_tensor")
+
+        seeded()
+        x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(x):
+            mark_grouped_tensor(x)
+            assert x.grouped_tensor_scale_inv is False
+            return x.square()
+
+        assert_replays_bit_exact(fn, (x,), replays=3, what="mark_grouped_tensor")
 
     def test_te_column_parallel_linear_replays(self):
         seeded()
@@ -530,6 +548,11 @@ class TestTEWrappers:
             skip_bias_add=False,
             is_expert=False,
         ).cuda()
+        assert getattr(module.layer_norm_weight, "is_rmsnorm_weight", False) == (
+            normalization == "RMSNorm"
+        )
+        assert not getattr(module.weight, "is_rmsnorm_weight", False)
+        assert not getattr(module.bias, "is_rmsnorm_weight", False)
         # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
@@ -544,6 +567,7 @@ class TestTEWrappers:
     def test_te_norm_replays(self, normalization):
         seeded()
         module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
+        assert getattr(module.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
