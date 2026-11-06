@@ -9,6 +9,7 @@ order. Shared inputs, runners and the FP64 reference live in
 
 import itertools
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +21,11 @@ from megatron.core.fusions.wide_residual_shortcut import (
     forward_kernel,
     kernel_utils,
 )
-from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import Reader, eligible, reader_for
+from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import (
+    check_call,
+    linear_eligible,
+    reader_for,
+)
 from megatron.core.fusions.wide_residual_shortcut.replay_kernel import replay_interval
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
@@ -53,7 +58,6 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401
     mx_inputs,
     mxfp8_test,
     offset_view,
-    ordered_reductions,
     poison,
     poison_bytes,
     reader_work,
@@ -281,7 +285,9 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
                 from transformer_engine.common.recipe import MXFP8BlockScaling
 
                 stack.enter_context(te.fp8_autocast(fp8_recipe=MXFP8BlockScaling()))
-                assert eligible(layer, raw[1][0], 3)
+                mxfp8_layer = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", hidden_size=hidden)
+                assert linear_eligible(layer, mxfp8_layer)
+                check_call(raw[1][0])
             actual = invoke(raw, quantized, layer)
             assert all(not t.requires_grad and t.grad_fn is None for t in actual)
             assert all(reader_for(t) is None for t in actual)
@@ -544,15 +550,16 @@ def test_interval_replay_matches_emulated_writes(value, depth, retain, readers, 
             carry = actual[0]
 
 
-# ---------------------------------------------------------------- deferred MXFP8 weight gradient
+# ---------------------------------------------------------------- MXFP8 weight gradient
 
 
 @mxfp8_test
 @pytest.mark.parametrize("readers", [1, 2])
 @pytest.mark.parametrize("other_stream", [False, True])
-def test_deferred_wgrad_order_and_replay(monkeypatch, readers, other_stream):
-    """dW is submitted before parameter reductions but publishes weight readiness only after
-    it completed; moving it ahead preserves every gradient bit across replays."""
+def test_unpacked_columns_weight_gradient_is_deterministic(readers, other_stream):
+    """The consumer's backward unpacks the replayed columns once and publishes its weight
+    gradient once; every gradient bit repeats across runs, with the consumer on the same or
+    another stream."""
     expected = None
     for _ in range(3):
         raw = mx_inputs(2048, 2048, readers)
@@ -564,32 +571,15 @@ def test_deferred_wgrad_order_and_replay(monkeypatch, readers, other_stream):
         with torch.cuda.stream(consumer):
             y = consume(layer, out[1])
         torch.cuda.current_stream().wait_stream(consumer)
-        order, observed = [], []
-        compute_wgrad = Reader.compute_wgrad
-
-        def submit(self, current, column):
-            assert self is provider and column is not None
-            assert self.fused_calls == 1 and not order
-            compute_wgrad(self, current, column)
-            order.append("wgrad")
-
-        def ready(weight):
-            assert order == ["wgrad", "controller_chunks", "parameters"]
-            order.append("ready")
-            observed.append(weight.main_grad.clone())
-
+        observed = []
+        layer.weight.register_post_accumulate_grad_hook(
+            lambda weight: observed.append(weight.main_grad.clone())
+        )
         outputs = (y, out[0], *out[2:])
-        with monkeypatch.context() as patcher:
-            if readers == 2:
-                layer.weight.register_post_accumulate_grad_hook(ready)
-                patcher.setattr(Reader, "compute_wgrad", submit)
-                ordered_reductions(patcher, order, "wgrad")
-            torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
-        if readers == 2:
-            assert order == ["wgrad", "controller_chunks", "parameters", "ready"]
-            assert torch.equal(observed[0], layer.weight.main_grad)
-            assert torch.count_nonzero(observed[0]) > 0
-        assert provider.reconstructions == 1 and not provider.pending
+        torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
+        assert provider.reconstructions == 1
+        assert len(observed) == 1 and torch.equal(observed[0], layer.weight.main_grad)
+        assert torch.count_nonzero(observed[0]) > 0
         actual = leaf_grads(raw, layer.weight.main_grad)
         if expected is None:
             expected = [t.clone() for t in actual]

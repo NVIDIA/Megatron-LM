@@ -33,8 +33,8 @@ Modules:
 - `residual_replay.py`, `replay_kernel.py`: with `--residual-stream-recompute-num-layers N`
   the residuals between checkpoints are freed in forward and rebuilt bit-exactly by replay
   (which also produces reader zero's MXFP8 columns for the weight gradient).
-- `mxfp8_handoff.py`: the TELinear handoff that defers the consumer's weight gradient until the
-  seam backward provides its columnwise operand.
+- `mxfp8_handoff.py`: the TELinear handoff: the consumer's backward unpacks reader zero's
+  columnwise operand, replayed from the seam (TE runs its GEMMs unchanged).
 
 Residual writes are bit-identical across schedules and to replay; reader outputs differ by at
 most one BF16 ulp between schedules. Tests: `tests/unit_tests/fusions/test_wide_residual_shortcut.py`

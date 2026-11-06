@@ -71,15 +71,22 @@ def _seam_connections(layer):
     )
 
 
+def _mxfp8_consumer(linear, config):
+    """``linear`` if it takes its read directly as MXFP8 (decided once, at construction)."""
+    from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import linear_eligible
+
+    return linear if linear is not None and linear_eligible(linear, config) else None
+
+
 def _shared_expert_input(moe_layer):
-    """The shared expert's ``(module, linear_fc1)`` if fc1 alone consumes the MoE layer's read."""
+    """The shared expert's ``linear_fc1`` if it alone consumes the MoE layer's read."""
     from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
     shared = getattr(moe_layer.mlp, "shared_experts", None)
     # A custom forward or the shared-expert gate would also use the read.
     if shared is None or type(shared).forward is not SharedExpertMLP.forward:
         return None
-    return None if shared.use_shared_expert_gate else (shared, shared.linear_fc1)
+    return None if shared.use_shared_expert_gate else shared.linear_fc1
 
 
 def group_layers_into_shortcut_blocks(
@@ -185,13 +192,14 @@ def _link_residual_seams(layers, grouped_layers) -> None:
             continue
         # The shared expert's first Linear may take the MoE read as MXFP8, and the compute
         # layer's input projection the compute read (applied by the block's two-reader seam).
-        block.moe_layer.residual_read_mlp.consumer = _shared_expert_input(block.moe_layer)
+        moe = block.moe_layer
+        moe.residual_read_mlp.consumer = _mxfp8_consumer(_shared_expert_input(moe), moe.config)
         if block.fused_shortcut_read:
             compute = block.compute_layer
             branch = compute.mixer if isinstance(compute, MambaLayer) else compute.self_attention
             projection = getattr(branch, "in_proj", getattr(branch, "linear_qkv", None))
             compute_read = _seam_connections(compute)[0]
-            compute_read.consumer = (branch, projection)
+            compute_read.consumer = _mxfp8_consumer(projection, compute.config)
             block.shortcut_residual_read.link(compute_read)
 
 

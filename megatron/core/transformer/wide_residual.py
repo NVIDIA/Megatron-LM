@@ -493,7 +493,7 @@ class WriteReadNorm(nn.Module):
         self.num_streams = config.wide_residual.num_streams
         self.residual_stream_hidden_size = self.num_streams * config.hidden_size
         self.branch_hidden_size = config.hidden_size
-        # (branch, input projection) that may consume reader zero as MXFP8; set by the layer.
+        # The Linear that consumes reader zero as MXFP8, if any (set when the stack is wired).
         self.consumer = None
         # The write handed here by the previous layer's DeferredWrite, until this read takes it.
         self.pending = None
@@ -524,8 +524,8 @@ class WriteReadNorm(nn.Module):
         by the previous seam."""
         if self.replay_every is None or not (self.training and torch.is_grad_enabled()):
             return None
-        if self.starts_replay:
-            return ReplayInterval()
+        if self.starts_replay:  # linked to the interval whose last write this seam applies
+            return ReplayInterval(getattr(pending.residual, "_replay_interval", None))
         interval = getattr(pending.residual, "_replay_interval", None)
         if interval is None:
             raise RuntimeError("a replayed seam's input residual carries no replay interval")
@@ -627,7 +627,7 @@ def tag_replay(residual: Tensor, replay) -> Tensor:
 
 def apply_pending_write(pending, reads, gammas, epsilon, consumer=None, replay=None):
     """Write ``pending`` and return ``(residual, *rmsnorm(read(residual)))`` from one fused kernel;
-    reader zero goes as MXFP8 to the ``(branch, input projection)`` ``consumer`` if eligible, and
+    reader zero goes as MXFP8 to the ``consumer`` Linear (chosen at construction) if given, and
     the write is recorded into the ``replay`` interval if given."""
     # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
     # gradients enabled.
@@ -639,34 +639,14 @@ def _apply_pending_write(pending, reads, gammas, epsilon, consumer, replay):
     from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
     streams = reads[0].num_streams
-    linear = None
-    if consumer is not None:
-        branch, linear = consumer
-        # A checkpointed input projection (GDP's recompute_in_proj) keeps its weight hooks in an
-        # inner autograd graph the deferred weight gradient cannot order: with fine-grained
-        # offloading it stays BF16, and training needs GTP's explicit weight finalization.
-        recompute = getattr(branch, "recompute_in_proj", False)
-        if (
-            linear is None
-            or (recompute and branch.config.fine_grained_activation_offloading)
-            or not mxfp8_handoff.eligible(linear, pending.routed, streams)
-        ):
-            linear = None
-        elif (
-            recompute
-            and torch.is_grad_enabled()
-            and not getattr(linear.weight, "is_gtp_weight_remat", False)
-        ):
-            raise ValueError(
-                "direct shortcut MXFP8 with GDP input-projection recompute requires GTP weight "
-                "finalization; disable gdp_in_proj recompute or use a BF16 handoff"
-            )
+    if consumer is not None:  # chosen at construction (mxfp8_handoff.linear_eligible)
+        mxfp8_handoff.check_call(pending.routed)  # never falls back to BF16
     logits = tuple(read.read_map(return_logits=True) for read in reads)
     return _apply_boundary(
         pending,
         logits,
         gammas,
-        mxfp8_consumer=linear,
+        mxfp8_consumer=consumer,
         num_streams=streams,
         epsilon=epsilon,
         replay=replay,

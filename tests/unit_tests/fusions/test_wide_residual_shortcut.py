@@ -11,7 +11,6 @@ import gc
 import itertools
 import weakref
 from contextlib import ExitStack
-from contextvars import ContextVar
 from dataclasses import fields, is_dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,7 +23,6 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from megatron.core.fusions.wide_residual_shortcut import (
     PendingWideResidualWrites,
-    api,
     backward_kernel,
     forward_kernel,
     kernel_utils,
@@ -816,7 +814,7 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
         handles = [ReplayHandle(i, k) for i in intervals for k in range(len(i.tapes))]
         # Each seam's input residual comes back bit for bit (handed out once; the backward
         # below replays again).
-        taken = [handle.take()[0] for handle in reversed(handles)]
+        taken = [handle.previous() for handle in reversed(handles)]
         all_bytes_equal(taken, [x.view_as(t) for x, t in zip(reversed(inputs), taken)])
         intervals = [weakref.ref(i) for i in intervals]
         del handles, options  # the test holds no interval past forward
@@ -859,38 +857,18 @@ def test_replay_interval_records_one_connected_chain():
 
 @pytest.fixture
 def reader_work(monkeypatch):
-    """Count column reconstructions at the actual entry points without production counters."""
-    active = ContextVar("reader_under_test", default=None)
-    initialize, backward = Reader.__init__, api._Boundary.backward
-    native_launch = backward_kernel.backward
+    """Count each reader's columnwise-operand reconstructions without production counters."""
+    initialize = Reader.__init__
 
-    def initialize_reader(self, *args, **kwargs):
-        initialize(self, *args, **kwargs)
-        self.reconstructions = self.fused_calls = 0
+    def initialize_reader(self, tensor, columns, consumer):
+        def counted():
+            self.reconstructions += 1
+            return columns()
 
-    def boundary_backward(ctx, *args, **kwargs):
-        token = active.set(ctx.mxfp8_reader)
-        try:
-            return backward(ctx, *args, **kwargs)
-        finally:
-            active.reset(token)
-
-    def observe_native(*args, **kwargs):
-        reader, callback = active.get(), kwargs.get("on_columns_ready")
-        if reader is not None and callback is not None:
-
-            def ready(columns):
-                if columns[0] is not None:
-                    reader.reconstructions += 1
-                    reader.fused_calls += 1
-                callback(columns)
-
-            kwargs["on_columns_ready"] = ready
-        return native_launch(*args, **kwargs)
+        initialize(self, tensor, counted, consumer)
+        self.reconstructions = 0
 
     monkeypatch.setattr(Reader, "__init__", initialize_reader)
-    monkeypatch.setattr(api._Boundary, "backward", staticmethod(boundary_backward))
-    monkeypatch.setattr(backward_kernel, "backward", observe_native)
 
 
 def mxfp8_test(function):
@@ -981,23 +959,12 @@ class _ReferenceQuantization(torch.autograd.Function):
 def reference_operand(operand, raw):
     """Recreate both orientations independently; production emits only columns in backward."""
     r, us, _, gs = raw
-    # The boundary saves (residual, update, coefficients, *gammas, *rstd).
-    _, _, coefficients, *norms = operand.grad_fn.saved_tensors
+    # The boundary saves (update, coefficients, *gammas, *rstd); its interval keeps the residual.
+    _, coefficients, *norms = operand.grad_fn.saved_tensors
     update = us[0] if len(us) == 1 else (us[0].float() + us[1].float()).bfloat16()
     normalized = oracle_normalized(r, update, coefficients, norms[len(gs)], gs[0])
-    return _ReferenceQuantization.apply(operand, normalized)
-
-
-def ordered_reductions(patcher, order, first):
-    """Record controller-chunk, then parameter reductions, both after ``first``."""
-    reduce = backward_kernel.reduce_jobs
-
-    def recorded(*args, **kwargs):
-        assert order == ([first] if len(order) == 1 else [first, "controller_chunks"])
-        order.append("controller_chunks" if len(order) == 1 else "parameters")
-        return reduce(*args, **kwargs)
-
-    patcher.setattr(backward_kernel, "reduce_jobs", recorded)
+    # TE caches requires_grad at quantization, before autograd attaches this function.
+    return _ReferenceQuantization.apply(operand, normalized).requires_grad_(True)
 
 
 @mxfp8_test
@@ -1017,14 +984,15 @@ def test_fp32_bytes_and_te_weight_gradient(monkeypatch, m, h, readers):
     assert q._columnwise_data is None
     assert torch.equal(q._rowwise_data, qref._rowwise_data)
     assert torch.equal(q._rowwise_scale_inv, qref._rowwise_scale_inv)
-    compute_wgrad = Reader.compute_wgrad
+    columns = provider.columns
 
-    def check_columns(self, current, column):
+    def check_columns():
+        column = columns()
         assert torch.equal(column._columnwise_data, qref._columnwise_data)
         assert torch.equal(column._columnwise_scale_inv, qref._columnwise_scale_inv)
-        return compute_wgrad(self, current, column)
+        return column
 
-    monkeypatch.setattr(Reader, "compute_wgrad", check_columns)
+    provider.columns = check_columns
     if readers == 2:
         assert torch.equal(out[2], operands[1])
     dy = torch.randn(m, 128, device="cuda", dtype=BF16)
@@ -1069,8 +1037,7 @@ def test_mcore_fused_backward_matches_independent_columns(m, h, readers):
         assert torch.equal(observed_wgrad[0], layer.weight.main_grad)
         grads = leaf_grads(raw, layer.weight.main_grad, layer.bias.grad)
         records.append((y.detach().cpu(), [g.cpu() for g in grads]))
-        assert provider.fused_calls == int(exclusive)
-        assert not provider.pending
+        assert provider.reconstructions == int(exclusive)
         # Keeping outputs/grad_fn alive must not keep the row allocation alive.
         storage = StorageWeakRef(q._rowwise_data.untyped_storage())
         del q, out, y, outputs, raw, layer, grads
@@ -1095,28 +1062,18 @@ def test_multiple_live_calls_and_replay(replay):
     providers = [reader_for(first[1]), reader_for(second[1])]
     outputs = (y0, y1, second[0])
     torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
-    assert all(p.reconstructions == 1 and p.fused_calls == 1 for p in providers)
+    assert all(p.reconstructions == 1 for p in providers)
     assert torch.isfinite(raw[0].grad).all()
 
 
 @mxfp8_test
 def test_handoff_rejects_invalid_consumers():
-    """Training needs an exclusive consumer with deferred wgrad and fused columns."""
+    """Training needs a declared consumer, and only that Linear may consume the operand."""
     with pytest.raises(ValueError, match="consumer"):
         boundary(mx_inputs(1024, 4096, 1))
-    raw = mx_inputs(2048, 2048, 1)
-    layer = linear(2048, mcore=True)
-    layer.fuse_wgrad_accumulation = False
-    out = boundary(raw, layer)
-    with pytest.raises(RuntimeError, match="requires deferred weight gradients"):
-        consume(layer, out[1])
-    out = boundary(raw, linear(2048, mcore=True))
-    provider = reader_for(out[1])
-    # A pending TE GEMM must never silently launch a standalone regeneration.
-    provider.pending.append(None)
-    with pytest.raises(RuntimeError, match="require fused MXFP8 columns"):
-        provider.compute_wgrad(out[0], None)
-    provider.pending.clear()
+    out = boundary(mx_inputs(2048, 2048, 1), linear(2048, mcore=True))
+    with pytest.raises(RuntimeError, match="declared Linear"):
+        consume(linear(2048, mcore=True), out[1])
 
 
 @mxfp8_test
@@ -1162,7 +1119,7 @@ def test_other_stream_matches_ordinary_backward(side):
                 y = consume(layer, operand)
             torch.cuda.current_stream().wait_stream(other)
             torch.autograd.backward((y, out[0]), (torch.ones_like(y), torch.ones_like(out[0])))
-            # A deferred GEMM on the boundary stream must not read TE buffers after reuse.
+            # TE's weight-gradient GEMM must not read the columns after their reuse.
             with torch.cuda.stream(other):
                 scratch = [
                     torch.empty(8192, 128, device="cuda").fill_(float("nan")) for _ in range(8)
@@ -1170,7 +1127,7 @@ def test_other_stream_matches_ordinary_backward(side):
         torch.cuda.synchronize()
         results.append([g.clone() for g in leaf_grads(raw, layer.weight.main_grad)])
         provider = reader_for(out[1])
-        assert provider.reconstructions == provider.fused_calls == int(exclusive)
+        assert provider.reconstructions == int(exclusive)
     all_bytes_equal(*results)
 
 
@@ -1209,8 +1166,10 @@ def test_native_update_rebinding_and_captured_descriptors(m, h):
 
 @mxfp8_test
 @pytest.mark.parametrize("native_fp8_weight", [False, True])
-def test_checkpointed_bf16_handoff_preserves_weight_readiness(native_fp8_weight):
-    """A reentrant non-GTP GDP checkpoint must publish one fully computed weight gradient."""
+def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
+    """A consumer under a reentrant (GDP-style) checkpoint recomputes on the seam's MXFP8
+    operand in its inner graph and publishes one weight gradient, equal to the uncheckpointed
+    one: the handoff never touches the GEMMs or their gradient readiness."""
     from megatron.core.tensor_parallel.random import (
         CheckpointWithoutOutput,
         model_parallel_cuda_manual_seed,
@@ -1219,27 +1178,35 @@ def test_checkpointed_bf16_handoff_preserves_weight_readiness(native_fp8_weight)
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
     try:
-        raw = mx_inputs(8192, 4096, 2)
         with te.fp8_model_init(enabled=native_fp8_weight, recipe=MXFP8BlockScaling()):
             layer = linear(4096, mcore=True)
         observed = []
         # Use the same AccumulateGrad-node hook that Megatron DDP registers.
-        accumulator = layer.weight.expand_as(layer.weight).grad_fn.next_functions[0][0]
+        accumulator = torch.autograd.graph.get_gradient_edge(layer.weight).node
         accumulator.register_hook(lambda *unused: observed.append(layer.weight.main_grad.clone()))
-        # A checkpointed non-GTP projection cannot defer its weight gradient.
-        current, q, router = boundary(raw, None, mxfp8_handoff=False)
-        assert reader_for(q) is None and q.dtype == BF16
-        checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
-        with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
-            output = checkpoint.checkpoint(lambda value: consume(layer, value), q)
-        loss = output.square().sum()
-        checkpoint.discard_output_and_register_recompute(loss)
-        torch.autograd.backward(
-            (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
-        )
-        assert len(observed) == 1
-        assert torch.equal(observed[0], layer.weight.main_grad)
-        assert torch.count_nonzero(observed[0]) > 0
+        weight_grads = []
+        for checkpointed in (False, True):
+            observed.clear()
+            layer.weight.main_grad.zero_()
+            current, q, router = boundary(mx_inputs(8192, 4096, 2), layer)
+            provider = reader_for(q)
+            if checkpointed:
+                checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
+                with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+                    output = checkpoint.checkpoint(lambda value: consume(layer, value), q)
+                loss = output.square().sum()
+                checkpoint.discard_output_and_register_recompute(loss)
+            else:
+                loss = consume(layer, q).square().sum()
+            torch.autograd.backward(
+                (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
+            )
+            assert provider.reconstructions == 1
+            assert len(observed) == 1
+            assert torch.equal(observed[0], layer.weight.main_grad)
+            assert torch.count_nonzero(observed[0]) > 0
+            weight_grads.append(observed[0])
+        assert torch.equal(*weight_grads)
     finally:
         Utils.destroy_model_parallel()
 
@@ -1247,15 +1214,12 @@ def test_checkpointed_bf16_handoff_preserves_weight_readiness(native_fp8_weight)
 @QUALIFIED
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("other_stream", [False, True])
-def test_deferred_gtp_weight_gradient_matches_independent_columns(
-    monkeypatch, checkpointed, other_stream
-):
-    """GTP completion can precede controller reduction, including checkpoint replay.
+def test_gtp_weight_gradient_matches_independent_columns(checkpointed, other_stream):
+    """A GTP consumer finalizes its own weight gradient from the replayed columns, also under
+    a checkpoint, exactly as from independently encoded ones.
 
     Needs ``torchrun --nproc-per-node 2`` (real GTP sharding); skips with one rank.
     """
-    from transformer_engine.pytorch import distributed_weight
-
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         _GTP_PARAMS,
         reset_gtp_state,
@@ -1275,7 +1239,7 @@ def test_deferred_gtp_weight_gradient_matches_independent_columns(
         group = torch.distributed.new_group(list(range(world_size)))
         model_parallel_cuda_manual_seed(123)
         records = []
-        for deferred in (False, True):
+        for handoff in (False, True):
             reset_gtp_state()
             raw = mx_inputs(2048, 2048, 2)
             layer = _make_gtp_linear(2048, 128, group, fuse_wgrad_accumulation=True)
@@ -1285,8 +1249,7 @@ def test_deferred_gtp_weight_gradient_matches_independent_columns(
             weight.grad_added_to_main_grad = False
             weight.zero_out_wgrad = True
             current, q, router = boundary(raw, layer)
-            reader = reader_for(q)
-            if not deferred:
+            if not handoff:
                 q = reference_operand(q, raw)
             stream = torch.cuda.Stream() if other_stream else torch.cuda.current_stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -1302,30 +1265,12 @@ def test_deferred_gtp_weight_gradient_matches_independent_columns(
                     loss = output.square().sum()
             torch.cuda.current_stream().wait_stream(stream)
 
-            order = []
-            finalize = distributed_weight.finalize_weight_grads
-
-            def finish_weight(saved_weight, grads):
-                assert saved_weight.is_gtp_weight_remat
-                assert not order
-                result = finalize(saved_weight, grads)
-                order.append("weight")
-                return result
-
-            with monkeypatch.context() as patcher:
-                if deferred:
-                    patcher.setattr(distributed_weight, "finalize_weight_grads", finish_weight)
-                    ordered_reductions(patcher, order, "weight")
-                torch.autograd.backward(
-                    (loss, current, router),
-                    (None, torch.ones_like(current), torch.ones_like(router)),
-                )
+            torch.autograd.backward(
+                (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
+            )
             torch.cuda.synchronize()
             assert layer.weight is weight
-            assert not reader.pending
             assert torch.count_nonzero(weight.main_grad) > 0
-            if deferred:
-                assert order == ["weight", "controller_chunks", "parameters"]
             grads = [g.cpu() for g in leaf_grads(raw)]
             records.append((output.detach().cpu(), weight.main_grad.cpu(), grads))
 

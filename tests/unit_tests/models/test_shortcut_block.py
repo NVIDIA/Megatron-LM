@@ -19,6 +19,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid import hybrid_layer_specs as specs
+from megatron.core.models.hybrid import shortcut_block
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
@@ -1037,7 +1038,9 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
     )
     replays, replay = [], replay_kernel.replay_interval
     monkeypatch.setattr(
-        replay_kernel, "replay_interval", lambda *a, **k: replays.append(1) or replay(*a, **k)
+        replay_kernel,
+        "replay_interval",
+        lambda *a, **k: replays.append(len(a[1])) or replay(*a, **k),
     )
     norms = {
         n: m
@@ -1061,13 +1064,15 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
         return logits.detach(), grads
 
     fused = step(model)
-    assert epsilons == {1e-6} and hooked == set(norms) and not replays
+    # Without checkpoint replay every seam is a one-write interval: nothing is rebuilt.
+    assert epsilons == {1e-6} and hooked == set(norms) and set(replays) == {1}
+    replays.clear()
     replay_model = _hybrid_model(
         pattern, mixer, residual_stream_recompute_num_layers=interval, **options
     ).train()
     replay_model.load_state_dict(model.state_dict())
     replayed = step(replay_model)
-    assert replays and torch.equal(replayed[0], fused[0])
+    assert max(replays) > 1 and torch.equal(replayed[0], fused[0])
     assert replayed[1].keys() == fused[1].keys()
     assert all(bytes_equal(g, fused[1][n]) for n, g in replayed[1].items())
     unfused = step(twin)
@@ -1167,38 +1172,45 @@ def test_fusion_spec_links_every_seam(monkeypatch):
         _hybrid_model("M", hidden=256)
 
 
-@pytest.mark.parametrize(
-    "recompute,offload,gtp,eligible,expected",
-    [
-        (False, False, False, True, "linear"),
-        (False, False, False, False, None),
-        (True, True, False, True, None),
-        (True, False, True, True, "linear"),
-        (True, False, False, True, "GTP weight finalization"),
-    ],
-)
-def test_direct_mxfp8_consumer_selection(monkeypatch, recompute, offload, gtp, eligible, expected):
-    """Reader zero goes to its projection as MXFP8 only when eligible; a checkpointed (GDP)
-    input projection stays BF16 under fine-grained offloading and needs GTP finalization."""
+@pytest.mark.parametrize("eligible", [True, False])
+def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
+    """The consumer Linear is chosen once at construction; a seam with one always hands it reader
+    zero as MXFP8 (also a checkpointed GDP projection or a GTP Linear: TE's backward is
+    untouched)."""
+    monkeypatch.setattr(mxfp8_handoff, "linear_eligible", lambda *args: eligible)
+    projection, config = object(), SimpleNamespace()
+    assert shortcut_block._mxfp8_consumer(None, config) is None
+    assert shortcut_block._mxfp8_consumer(projection, config) is (projection if eligible else None)
+
     seen = []
-    monkeypatch.setattr(mxfp8_handoff, "eligible", lambda *args: eligible)
+    monkeypatch.setattr(mxfp8_handoff, "check_call", lambda tensor: None)
     monkeypatch.setattr(
         wide_residual, "_apply_boundary", lambda *a, **k: seen.append(k["mxfp8_consumer"])
     )
-    linear = SimpleNamespace(weight=SimpleNamespace(is_gtp_weight_remat=gtp))
-    branch = SimpleNamespace(
-        recompute_in_proj=recompute,
-        config=SimpleNamespace(fine_grained_activation_offloading=offload),
-    )
     read = SimpleNamespace(num_streams=3, read_map=lambda return_logits: None)
     pending = PendingWideResidualWrites(None, None, None, None, None)
-    call = lambda: apply_pending_write(pending, (read,), (None,), 1e-5, (branch, linear))
-    if expected not in ("linear", None):
-        with pytest.raises(ValueError, match=expected):
-            call()
-    else:
-        call()
-        assert seen == [linear if expected else None]
+    apply_pending_write(pending, (read,), (None,), 1e-5, projection)
+    assert seen == [projection]
+
+
+def test_mxfp8_handoff_never_falls_back(monkeypatch):
+    """An MXFP8 seam never changes precision per call: an unsupported token count or a missing
+    FP8 context raises."""
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    rows = lambda m, h=3072: torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: True)
+    with torch.enable_grad():
+        mxfp8_handoff.check_call(rows(2048))
+        with pytest.raises(ValueError, match="1024 tokens .* in training"):
+            mxfp8_handoff.check_call(rows(1024))
+    with torch.no_grad():
+        mxfp8_handoff.check_call(rows(64))
+        with pytest.raises(ValueError, match="33 tokens .* in inference"):
+            mxfp8_handoff.check_call(rows(33))
+    monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: False)
+    with pytest.raises(RuntimeError, match="outside its FP8 context"):
+        mxfp8_handoff.check_call(rows(64))
 
 
 @pytest.mark.usefixtures("model_parallel")
