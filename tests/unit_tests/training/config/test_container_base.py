@@ -482,12 +482,12 @@ class TestConfigContainer_ToYaml:
 
         # Verify that the file is created in the temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
-            config.to_yaml(f"msc://default{temp_dir}/test_output.yaml")
+            # MSC 1.x uses __filesystem__ for local paths; default requires configuration.
+            msc_path = f"msc://__filesystem__{temp_dir}/test_output.yaml"
+            config.to_yaml(msc_path)
             assert os.path.exists(f"{temp_dir}/test_output.yaml")
 
-            loaded_config = TestConfigContainer.from_yaml(
-                f"msc://default{temp_dir}/test_output.yaml"
-            )
+            loaded_config = TestConfigContainer.from_yaml(msc_path)
             assert config.to_dict() == loaded_config.to_dict()
 
 
