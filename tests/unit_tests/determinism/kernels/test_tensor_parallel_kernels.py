@@ -22,13 +22,13 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
-from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_embedding_wgrad import accumulate_embedding_wgrad
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
-from megatron.core.tensor_parallel.cross_entropy import (
+from megatron.core.ops.loss.cross_entropy import (
     VocabParallelCrossEntropy,
     vocab_parallel_cross_entropy,
 )
+from megatron.core.ops.norm import fused_layer_norm
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
