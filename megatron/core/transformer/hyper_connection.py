@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Optional, Tuple
@@ -10,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.component_nvtx import component
+from megatron.core.env_flags import FALSE_VALUES, TRUE_VALUES
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute_plan import (
@@ -194,6 +198,75 @@ class BroadcastTensorFused(torch.autograd.Function):
         if len(grads) == 2:
             return grads[0] + grads[1], None
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
+
+
+def _parse_single_pass_fused_grad_add(value: Optional[str]) -> Optional[str]:
+    """Return the MCORE_MHC_SP_FUSED_GRAD_ADD mode: None (off), "exact" or "fp32".
+
+    Unset selects "exact". ``0``, ``false``, ``no`` and ``off`` turn the fused sum off;
+    ``1``, ``true``, ``yes``, ``on`` and ``exact`` select the bit-exact sum, and ``fp32`` the
+    FP32 one (the on and off spellings are those of ``env_flag``). Matching ignores case and
+    surrounding whitespace; any other value raises.
+    """
+    if value is None:
+        return "exact"
+    mode = value.strip().lower()
+    if mode in FALSE_VALUES:
+        return None
+    if mode in TRUE_VALUES or mode == "exact":
+        return "exact"
+    if mode == "fp32":
+        return "fp32"
+    raise ValueError(
+        f"Environment variable MCORE_MHC_SP_FUSED_GRAD_ADD={value!r} is not a mode; use exact "
+        "(or 1/true/yes/on), fp32 or 0/false/no/off, or unset it for exact."
+    )
+
+
+# MCORE_MHC_SP_FUSED_GRAD_ADD (read once at import). The single-pass forward reads each
+# sublayer's residual input in three places: the mappings, the aggregate and the
+# residual-mixing BDA, so autograd sums three full-size gradients with two sequential adds.
+# Unless it is off, BroadcastTensorFused splits the input of callers that take the residual
+# alias (return_residual=True), and one kernel sums the three gradients:
+#   exact (default): (residual + aggregate) + mappings, rounded after each add exactly as
+#                    autograd accumulates them in that arrival order (bit-identical gradients);
+#   fp32:            native_fused_add_3 (torch.compile), rounding the FP32 sum once (opt-in,
+#                    not bit-identical).
+_SINGLE_PASS_FUSED_GRAD_ADD = _parse_single_pass_fused_grad_add(
+    os.environ.get("MCORE_MHC_SP_FUSED_GRAD_ADD")
+)
+_SINGLE_PASS_FUSED_GRAD_ADD_LOGGED: set[str] = set()
+
+
+def _ordered_single_pass_grad_add_3(
+    add_3_sequential: Callable[[Tensor, Tensor, Tensor], Tensor],
+    grad_mappings: Tensor,
+    grad_aggregate: Tensor,
+    grad_residual: Tensor,
+) -> Tensor:
+    """Sum in the order autograd accumulates the unsplit single-pass residual's gradients.
+
+    The engine runs ready nodes latest-created first. The BDA ends the sublayer, so its residual
+    gradient arrives first; the aggregate's arrives after the branch backward; the mapping nodes
+    were created before the aggregate's checkpoint node, so their gradient arrives last.
+    """
+    return add_3_sequential(grad_residual, grad_aggregate, grad_mappings)
+
+
+def _single_pass_grad_add_3_op(mode: str) -> Callable[[Tensor, Tensor, Tensor], Tensor]:
+    """Return BroadcastTensorFused's combiner of (mappings, aggregate, residual) gradients."""
+    if mode not in _SINGLE_PASS_FUSED_GRAD_ADD_LOGGED:
+        _SINGLE_PASS_FUSED_GRAD_ADD_LOGGED.add(mode)
+        log_single_rank(
+            logging.getLogger(__name__),
+            logging.INFO,
+            f"[mHC] MCORE_MHC_SP_FUSED_GRAD_ADD={mode}: one fused sum per single-pass residual",
+        )
+    if mode == "fp32":
+        return native_fused_add_3
+    from megatron.core.fusions.fused_mhc_kernels import fused_add_3_sequential
+
+    return partial(_ordered_single_pass_grad_add_3, fused_add_3_sequential)
 
 
 @torch.compile
@@ -406,6 +479,13 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_op = native_h_aggregate
             self._h_post_bda_op = native_h_post_bda
             self._proj_rms_compute_h_op = None
+
+        # MCORE_MHC_SP_FUSED_GRAD_ADD: one fused sum of the single-pass residual's gradients.
+        self._single_pass_grad_add_3_op = (
+            _single_pass_grad_add_3_op(_SINGLE_PASS_FUSED_GRAD_ADD)
+            if self.single_pass and _SINGLE_PASS_FUSED_GRAD_ADD is not None
+            else None
+        )
 
         self._init_weights()
 
@@ -695,6 +775,9 @@ class HyperConnectionModule(MegatronModule):
         children so that gradient accumulation from the 3 consumers
         (compute_mappings, aggregate, fused_h_res_h_post_bda) is handled by a
         single fused add instead of PyTorch's default sequential accumulation.
+        The single-pass branch splits only with MCORE_MHC_SP_FUSED_GRAD_ADD on and
+        ``return_residual=True``; 3-tuple callers feed their own unsplit residual to the
+        BDA and keep autograd's accumulation.
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
@@ -714,18 +797,37 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+            hs_for_mappings = hs_for_aggregate = hs_for_residual = hidden_states
+            if (
+                self._single_pass_grad_add_3_op is not None
+                and return_residual
+                and torch.is_grad_enabled()
+                and hidden_states.requires_grad
+            ):
+                # One fused sum replaces autograd's two sequential full-size gradient adds. Only
+                # callers that take the residual alias split: a 3-tuple caller passes its own
+                # unsplit residual to the BDA, so the unused alias would get a zero-filled
+                # gradient and the BDA gradient an extra add (neither exact nor faster).
+                # Exact mode matches autograd only while these three are the input's only
+                # consumers, each alias feeds a single node, and the gradients arrive as BDA,
+                # aggregate, mappings (see _ordered_single_pass_grad_add_3). Another consumer
+                # or a reordering changes bits silently; MCORE_MHC_SP_FUSED_GRAD_ADD=0 restores
+                # autograd's own sum and is the first switch to flip when bisecting a mismatch.
+                hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
+                    hidden_states, self._single_pass_grad_add_3_op
+                )
+            h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
             if mhc_recompute_manager is None:
-                aggregated = self._single_pass_aggregate(hidden_states, mhc_state.pre_mix)
+                aggregated = self._single_pass_aggregate(hs_for_aggregate, mhc_state.pre_mix)
             else:
                 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
                 # Replay receives the incoming mix explicitly, never the mutable state.
                 aggregated = CheckpointWithoutOutput(ckpt_manager=mhc_recompute_manager).checkpoint(
-                    self._single_pass_aggregate, hidden_states, mhc_state.pre_mix
+                    self._single_pass_aggregate, hs_for_aggregate, mhc_state.pre_mix
                 )
             mhc_state.pre_mix = h_pre
-            result = aggregated, h_res, h_post, hidden_states
+            result = aggregated, h_res, h_post, hs_for_residual
         elif mhc_recompute_manager is not None:
             result = self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
         else:

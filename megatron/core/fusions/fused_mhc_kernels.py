@@ -791,6 +791,26 @@ if _TRITON_AVAILABLE:
             g_bias,
         )
 
+    # ============================================================================
+    # Ordered three-way add (MCORE_MHC_SP_FUSED_GRAD_ADD)
+    # ============================================================================
+
+    @triton.jit
+    def _triton_add_3_sequential_kernel(
+        first_ptr, second_ptr, last_ptr, out_ptr, BLOCK: tl.constexpr
+    ):
+        """out = (first + second) + last over BLOCK elements, rounding after each add.
+
+        Eager PyTorch adds in FP32 and stores the operand dtype, so rounding the partial sum
+        reproduces two sequential adds bit for bit. Callers launch whole blocks only.
+        """
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        first = tl.load(first_ptr + offsets).to(tl.float32)
+        second = tl.load(second_ptr + offsets).to(tl.float32)
+        pair_sum = (first + second).to(out_ptr.dtype.element_ty).to(tl.float32)
+        last = tl.load(last_ptr + offsets).to(tl.float32)
+        tl.store(out_ptr + offsets, (pair_sum + last).to(out_ptr.dtype.element_ty))
+
 
 _TRITON_IMPLS = (
     {
@@ -2666,6 +2686,93 @@ def log_fused_mhc_backend_once(backend: MHCBackend = "auto") -> None:
 def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     """Add three tensors using the native torch.compile-backed implementation."""
     return native_fused_add_3(a, b, c)
+
+
+_ADD_3_SEQUENTIAL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+#: (elements per program, warps per program) of the ordered three-way add kernel.
+ADD_3_SEQUENTIAL_LAUNCH_CONFIG = (4096, 8)
+# Specializations launched outside CUDA-graph capture, and those that failed to compile or launch.
+_ADD_3_SEQUENTIAL_WARM_KEYS: set = set()
+_ADD_3_SEQUENTIAL_FAILED_KEYS: set = set()
+
+
+def _eager_add_3_sequential(first: Tensor, second: Tensor, last: Tensor) -> Tensor:
+    return torch.add(first, second).add_(last)
+
+
+def fused_add_3_sequential_with_config(
+    first: Tensor, second: Tensor, last: Tensor, block: int, num_warps: int
+) -> Tensor:
+    """``fused_add_3_sequential`` with an explicit kernel launch shape (for tests and tuning)."""
+    operands = (first, second, last)
+    eligible = (
+        _TRITON_AVAILABLE
+        and 256 <= block <= 65536
+        and block & (block - 1) == 0
+        and num_warps in (1, 2, 4, 8, 16, 32)
+        and first.dtype in _ADD_3_SEQUENTIAL_DTYPES
+        and first.is_cuda
+        and first.device.index == torch.cuda.current_device()
+        and first.numel() >= block
+        and all(
+            type(t) is Tensor
+            and t.dtype == first.dtype
+            and t.shape == first.shape
+            and t.device == first.device
+            and t.is_contiguous()
+            and t.data_ptr() % 16 == 0
+            for t in operands
+        )
+        and not (torch.is_grad_enabled() and any(t.requires_grad for t in operands))
+        and not torch.compiler.is_compiling()
+    )
+    if not eligible:
+        return _eager_add_3_sequential(first, second, last)
+    key = (first.device.index, first.dtype, block, num_warps)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if key in _ADD_3_SEQUENTIAL_FAILED_KEYS or (
+        capturing and key not in _ADD_3_SEQUENTIAL_WARM_KEYS
+    ):
+        # Never compile or load a Triton module inside CUDA-graph capture.
+        return _eager_add_3_sequential(first, second, last)
+    out = torch.empty_like(first, memory_format=torch.contiguous_format)
+    if out.data_ptr() % 16:
+        return _eager_add_3_sequential(first, second, last)
+    num_blocks = first.numel() // block
+    try:
+        _triton_add_3_sequential_kernel[(num_blocks,)](
+            first, second, last, out, BLOCK=block, num_warps=num_warps
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        if capturing:
+            raise
+        _ADD_3_SEQUENTIAL_FAILED_KEYS.add(key)
+        logger.warning(
+            "[mHC] ordered add-3 kernel %s unavailable (%r); using eager adds", key, error
+        )
+        return _eager_add_3_sequential(first, second, last)
+    if not capturing:
+        _ADD_3_SEQUENTIAL_WARM_KEYS.add(key)
+    done = num_blocks * block
+    if done < first.numel():
+        tail = out.view(-1)[done:]
+        torch.add(first.view(-1)[done:], second.view(-1)[done:], out=tail)
+        tail.add_(last.view(-1)[done:])
+    return out
+
+
+def fused_add_3_sequential(first: Tensor, second: Tensor, last: Tensor) -> Tensor:
+    """Return ``torch.add(first, second).add_(last)`` bit for bit, reading each operand once.
+
+    Eager adds compute in FP32 and round to the operand dtype after each add, which is also how
+    autograd accumulates gradients arriving as ``first``, ``second`` and then ``last``. The Triton
+    kernel keeps both roundings in one pass (one kernel instead of two). Contiguous, 16-byte
+    aligned CUDA BF16/FP16/FP32 tensors of one shape use the kernel; anything else, a
+    specialization first seen inside CUDA-graph capture, or one that failed to compile runs the
+    eager adds, which give the same bits.
+    """
+    block, num_warps = ADD_3_SEQUENTIAL_LAUNCH_CONFIG
+    return fused_add_3_sequential_with_config(first, second, last, block, num_warps)
 
 
 def _get_triton_sinkhorn(backend: MHCBackend = "auto"):

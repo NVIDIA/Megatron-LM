@@ -480,3 +480,104 @@ def test_single_pass_mhc_replays_bit_exact(fused):
         replays=3,
         what="single-pass mHC",
     )
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_residual_grad_add_matches_autograd_accumulation(
+    monkeypatch, dtype, fused, recompute
+):
+    """MCORE_MHC_SP_FUSED_GRAD_ADD=exact (the default) sums each single-pass residual input's
+    three gradients in the order autograd accumulates them: a chain of sublayers gets bit-
+    identical outputs and gradients with the switch off and on. 3-tuple callers never split."""
+    from megatron.core.fusions import fused_mhc_kernels
+    from tests.unit_tests.determinism.kernels.harness import bytes_equal
+
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=64,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=fused,
+    )
+    n = config.mhc_num_residual_streams
+    calls = []
+    add_3 = fused_mhc_kernels.fused_add_3_sequential
+
+    def counting_add_3(*args):
+        calls.append(args[0].shape)
+        return add_3(*args)
+
+    monkeypatch.setattr(fused_mhc_kernels, "fused_add_3_sequential", counting_add_3)
+    torch.manual_seed(1203)
+    hidden = torch.randn(256, 2, n * 64, device="cuda", dtype=dtype)
+    previous = torch.randn(256, 2, n, device="cuda")
+    probe = torch.randn(256, 2, 64, device="cuda", dtype=dtype)
+
+    def run(mode, return_residual):
+        monkeypatch.setattr(hyper_connection, "_SINGLE_PASS_FUSED_GRAD_ADD", mode)
+        torch.manual_seed(7)
+        mhcs = [HyperConnectionModule(config, i + 1).cuda() for i in range(3)]
+        branches = [torch.nn.Linear(64, 64).cuda().to(dtype) for _ in range(3)]
+        x = hidden.clone().requires_grad_()
+        mix = previous.clone().requires_grad_()
+        state = SinglePassMHCState(mix)
+        output = x
+        for mhc, branch in zip(mhcs, branches):
+            manager = tensor_parallel_random.CheckpointWithoutOutputManager() if recompute else None
+            result = mhc(
+                output,
+                mhc_recompute_manager=manager,
+                mhc_state=state,
+                return_residual=return_residual,
+            )
+            aggregated, residual_mix, post = result[:3]
+            residual = result[3] if return_residual else output
+            branch_output = torch.tanh(branch(aggregated))
+            output = mhc.fused_h_res_h_post_bda(
+                residual_mix, residual, post, (branch_output, None), 0.0, True, False
+            )
+            if manager is not None:
+                manager.discard_all_outputs_and_register_unified_recompute(output)
+        final = state.contract(output, n, aggregate=get_mhc_aggregate(config))
+        leaves = [x, mix] + [p for module in (*mhcs, *branches) for p in module.parameters()]
+        # backward(), not autograd.grad(): the unified recompute hook rejects .grad(). Every run
+        # builds fresh leaves, so their .grad holds this run's gradients only.
+        final.backward(probe)
+        return final.detach(), [leaf.grad for leaf in leaves]
+
+    for return_residual in (True, False):
+        calls.clear()
+        expected_output, expected_grads = run(None, return_residual)
+        assert not calls
+        output, grads = run("exact", return_residual)
+        assert len(calls) == (3 if return_residual else 0)
+        assert bytes_equal(output, expected_output)
+        assert len(grads) == len(expected_grads)
+        for index, (actual, expected) in enumerate(zip(grads, expected_grads)):
+            assert bytes_equal(actual, expected), index
+
+
+@pytest.mark.parametrize(
+    "value,mode",
+    [
+        (None, "exact"),
+        ("1", "exact"),
+        (" Exact ", "exact"),
+        ("on", "exact"),
+        ("fp32", "fp32"),
+        ("0", None),
+        ("off", None),
+        ("", ValueError),
+        ("2", ValueError),
+    ],
+)
+def test_fused_grad_add_mode_parsing(value, mode):
+    """MCORE_MHC_SP_FUSED_GRAD_ADD: unset is exact; other values must name a mode."""
+    if mode is ValueError:
+        with pytest.raises(ValueError, match="MCORE_MHC_SP_FUSED_GRAD_ADD"):
+            hyper_connection._parse_single_pass_fused_grad_add(value)
+    else:
+        assert hyper_connection._parse_single_pass_fused_grad_add(value) == mode
