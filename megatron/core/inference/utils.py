@@ -245,9 +245,9 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
     For no-drop decode, use ``capacity_factor = num_moe_experts / moe_router_topk``.
 
     Args:
-    - model: Module containing MoE layers.
-    - set_to: Enable (True) or disable (False) padding.
-    - capacity_factor: Capacity scaling shared by router and dispatchers.
+        model: Module containing MoE layers.
+        set_to (bool): Enable (True) or disable (False) padding.
+        capacity_factor (int | None): Capacity scaling shared by router and dispatchers.
     """
     global moe_layer_cache
     if moe_layer_cache is None:

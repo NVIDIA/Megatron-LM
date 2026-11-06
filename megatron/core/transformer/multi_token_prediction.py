@@ -168,7 +168,8 @@ def tie_word_embeddings_state_dict(
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
-    Returns: None, acts in-place
+    Returns:
+        None: acts in-place
     """
     mtp_word_emb_replica_id = (
         1,  # copy of embedding in pre processing stage
@@ -203,7 +204,8 @@ def tie_output_layer_state_dict(
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
-    Returns: None, acts in-place
+    Returns:
+        None: acts in-place
     """
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage

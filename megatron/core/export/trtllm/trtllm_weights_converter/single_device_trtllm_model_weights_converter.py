@@ -425,7 +425,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         Given the trtllm mapping information (tp, pp rank etc) we split the model weights in a list, with each element of the list corresponding to the weights of each gpu rank
 
         Args:
-            mapping : The trtllm mapping information
+            mapping: The trtllm mapping information.
             trtllm_model_config (dict): The trtllm model config
         """
 

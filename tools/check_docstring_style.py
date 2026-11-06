@@ -19,8 +19,12 @@ unconverted and render as garbled text in the generated API docs. Ruff's pydocst
       ```{note}
       Something noteworthy.
       ```
+- Google sections whose content is not indented under the section header, or whose entries use
+  NumPy-style `name : type` fields instead of `name (type): description`. `sphinx.ext.napoleon`
+  only recognizes section content that is indented below the header, so flush-left entries render
+  as plain prose.
 
-This script flags both. Run it as part of `tools/autoformat.sh` or standalone:
+This script flags these. Run it as part of `tools/autoformat.sh` or standalone:
 
     python3 tools/check_docstring_style.py megatron/core
 """
@@ -61,6 +65,72 @@ NUMPY_SECTION_NAMES = {
 # recognize Google section names and miss these).
 NUMPY_SECTION_RE = re.compile(r"^\s{0,8}(\w[\w ]*?)\s*$")
 SECTION_UNDERLINE_RE = re.compile(r"^\s*[-=~=+]{3,}\s*$")
+# Google-style section header alone on its line (e.g., "Args:").
+GOOGLE_SECTION_NAMES = {
+    "Args",
+    "Arguments",
+    "Attention",
+    "Attributes",
+    "Caution",
+    "Danger",
+    "Error",
+    "Example",
+    "Examples",
+    "Hint",
+    "Important",
+    "Keyword Args",
+    "Keyword Arguments",
+    "Methods",
+    "Note",
+    "Notes",
+    "Other Parameters",
+    "Parameters",
+    "Return",
+    "Returns",
+    "Raises",
+    "References",
+    "See Also",
+    "Tip",
+    "Todo",
+    "Warning",
+    "Warnings",
+    "Warns",
+    "Yield",
+    "Yields",
+}
+GOOGLE_SECTION_RE = re.compile(r"^(\s*)([\w][\w ]*?):\s*$")
+# Field-list sections written with inline content (e.g., "Returns: None"). `sphinx.ext.napoleon`
+# only converts sections whose header is alone on its line; inline content passes through
+# unconverted and renders as plain prose instead of a structured field. Admonition-style names
+# ("Note:", "Warning:", ...) are exempt: they commonly appear as intentional prose.
+GOOGLE_FIELD_SECTION_NAMES = {
+    "Args",
+    "Arguments",
+    "Keyword Args",
+    "Keyword Arguments",
+    "Other Parameters",
+    "Parameters",
+    "Return",
+    "Returns",
+    "Raises",
+    "Yields",
+    "Attributes",
+    "Methods",
+}
+INLINE_FIELD_SECTION_RE = re.compile(r"^\s*([\w][\w ]*?\s*\([^)]*\)|[\w][\w ]*?)\s*:\s+\S")
+# NumPy-style field entry inside a Google Args-like section: "name : type" with spaces around the
+# colon. Google requires "name (type): description". Only Args-like sections are checked: Returns
+# and similar sections hold free-form descriptions where aligned "name : value" prose renders fine.
+NUMPY_FIELD_SECTIONS = {
+    "Args",
+    "Arguments",
+    "Keyword Args",
+    "Keyword Arguments",
+    "Other Parameters",
+    "Parameters",
+    "Attributes",
+}
+NUMPY_FIELD_RE = re.compile(r"^\s*[\w*]+(?:\[[^\]]*\])?\s+:\s")
 # reST/Sphinx-style field lists.
 REST_FIELD_RE = re.compile(
     r"^\s*:(param|parameter|arg|argument|key|keyword|type|returns?|rtype|"
@@ -86,9 +156,28 @@ def check_docstring(filename: Path, name: str, lineno: int, docstring: str) -> l
     lines = docstring.splitlines()
     in_code_fence = False
     pending_directive_close = False
+    section = None  # (name, header indent)
+    section_has_content = False
+
+    def end_section() -> None:
+        nonlocal section, section_has_content
+        if section is not None and not section_has_content:
+            issues.append(
+                f"{filename}:{lineno}: empty section '{section[0]}' "
+                f"(docstring '{name}'); document it or remove the header"
+            )
+        section = None
+        section_has_content = False
+
     for i, line in enumerate(lines):
         stripped = line.lstrip()
         if stripped.startswith(("```", "~~~")):
+            if section is not None and len(line) - len(line.lstrip()) > section[1]:
+                # An indented fence is the content of the open section (e.g., an "Example:" section
+                # holding a code block).
+                section_has_content = True
+            else:
+                end_section()
             if pending_directive_close:
                 # Closing fence of a MyST directive fence; its content was checked like normal
                 # docstring text.
@@ -101,6 +190,47 @@ def check_docstring(filename: Path, name: str, lineno: int, docstring: str) -> l
             continue
         if in_code_fence:
             continue
+        if line.strip() == "":
+            continue
+
+        header = GOOGLE_SECTION_RE.match(line)
+        header_name = header.group(2) if header else None
+        if header_name in GOOGLE_SECTION_NAMES:
+            end_section()
+            section = (header_name, len(header.group(1)))
+            continue
+
+        inline_field = INLINE_FIELD_SECTION_RE.match(line)
+        if inline_field:
+            inline_name = re.split(r"\s*\(", inline_field.group(1))[0].strip()
+            if inline_name in GOOGLE_FIELD_SECTION_NAMES:
+                end_section()
+                issues.append(
+                    f"{filename}:{lineno + i}: inline content on section "
+                    f"'{inline_name}' (docstring '{name}'); napoleon only converts "
+                    "sections whose header is alone on its line, use block form"
+                )
+                continue
+
+        if section is not None:
+            indent = len(line) - len(line.lstrip())
+            if indent <= section[1]:
+                if not section_has_content:
+                    issues.append(
+                        f"{filename}:{lineno + i}: content of section '{section[0]}' "
+                        f"(docstring '{name}') must be indented below the header"
+                    )
+                # Dedented prose after proper section content is valid; the section just ends.
+                section = None
+                section_has_content = False
+            else:
+                section_has_content = True
+                if section[0] in NUMPY_FIELD_SECTIONS and NUMPY_FIELD_RE.match(line):
+                    issues.append(
+                        f"{filename}:{lineno + i}: NumPy-style field "
+                        f"(docstring '{name}'); use 'name (type): description'"
+                    )
+
         if RST_DIRECTIVE_RE.match(line):
             issues.append(
                 f"{filename}:{lineno + i}: RST directive (docstring '{name}'); "
@@ -159,6 +289,9 @@ def main() -> int:
         path = Path(raw_path)
         files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
         for py_file in files:
+            # Skip editor lock/backup files (e.g., Emacs `.#foo.py`).
+            if py_file.name.startswith(".#") or py_file.name.endswith("~"):
+                continue
             # Docstring rules are not enforced in tests, consistent with Ruff's per-file-ignores for
             # "tests/**" and "*_test.py".
             parts = py_file.parts

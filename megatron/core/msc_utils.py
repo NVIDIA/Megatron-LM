@@ -65,7 +65,7 @@ class MaybeMultiStorageClient:
 
         Args:
             path: Path to check.
-            strict: If True, use only committed metadata for MSC.
+            strict (bool): If True, use only committed metadata for MSC.
         """
         if MultiStorageClientFeature.is_enabled():
             pkg = MultiStorageClientFeature.import_package()

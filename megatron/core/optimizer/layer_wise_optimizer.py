@@ -114,9 +114,11 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     params (``is_gtp_param``) are offset-sharded and excluded -- each shard already has a
     distinct offset, hence a unique writer.
 
-    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
-    no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
-    collapsed) to match the optimizer-state checkpoint key suffix.
+    Returns:
+        dict[str, tuple[int, int]]: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when
+            GTP_remat is unavailable or no group spans >1 rank. Names are bare (all ``module.``
+            wrappers stripped, layer index collapsed) to match the optimizer-state checkpoint key
+            suffix.
     """
     gtp_fold: Dict[str, Tuple[int, int]] = {}
     try:

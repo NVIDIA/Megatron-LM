@@ -30,9 +30,9 @@ class InferenceBatchDimensions:
     """Batch dimensions for dynamic inference.
 
     Attributes:
-        token_count : number of total input tokens
-        prefill_req_count : number of prefill requests
-        decode_req_count : number of decode requests
+        token_count: Number of total input tokens.
+        prefill_req_count: Number of prefill requests.
+        decode_req_count: Number of decode requests.
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.

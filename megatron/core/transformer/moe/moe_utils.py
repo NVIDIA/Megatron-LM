@@ -111,11 +111,11 @@ def switch_load_balancing_loss_func(
         T is the total number of tokens in the global batch B
 
     Note:
-    To calculate the auxiliary loss at different levels (micro-batch or global batch):
-    - probs: Should always be from the local batch being processed
-    - tokens_per_expert: Should represent token counts at the desired level
-      (either micro-batch or global batch)
-    - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
+        To calculate the auxiliary loss at different levels (micro-batch or global batch):
+        - probs: Should always be from the local batch being processed
+        - tokens_per_expert: Should represent token counts at the desired level
+          (either micro-batch or global batch)
+        - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
 
     Args:
         probs (torch.Tensor): Softmax probabilities output by the router for each token.

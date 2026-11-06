@@ -1441,12 +1441,14 @@ def _require_deepgemm_bf16(op: str) -> None:
 def _offs_to_m_indices(offs: torch.Tensor, m_total: int) -> torch.Tensor:
     """Convert inclusive cumulative per-expert offsets to per-row expert ids.
 
-    offs: int32 [num_experts] inclusive offsets — offs[i] is the (exclusive) end
-          row of expert i in the contiguous M dimension. Equivalently, offs[i] is
-          the start of expert i+1.
-    Returns: int32 [m_total] m_indices[r] = expert id for row r. Rows past offs[-1]
-             (post-padding tail when m_total > offs[-1]) get -1; DeepGEMM skips
-             those rows.
+    Args:
+        offs (torch.Tensor): int32 [num_experts] inclusive offsets — offs[i] is the (exclusive) end
+            row of expert i in the contiguous M dimension. Equivalently, offs[i] is the start of
+            expert i+1.
+
+    Returns:
+        torch.Tensor: int32 [m_total] m_indices[r] = expert id for row r. Rows past offs[-1]
+            (post-padding tail when m_total > offs[-1]) get -1; DeepGEMM skips those rows.
     """
     rows = torch.arange(m_total, device=offs.device, dtype=torch.int32)
     # For row r, expert id = bisect_right(offs, r). torch.searchsorted is deterministic.
@@ -1530,12 +1532,15 @@ def _bf16_grouped_gemm_contiguous(
 ) -> torch.Tensor:
     """bf16 M-grouped GEMM via DeepGEMM. Deterministic / batch-invariant.
 
-    a:         [M_total, K] bf16, contiguous, expert-grouped (rows of expert i
-                                              are contiguous; m_indices is sorted).
-    b:         [E, N, K]    bf16, contiguous (per-expert weights, NT layout —
-                                              DeepGEMM transposes B internally).
-    m_indices: [M_total]    int32, expert id per row (-1 to skip).
-    Returns:   [M_total, N] bf16 with rows in the same order as `a`.
+    Args:
+        a (torch.Tensor): [M_total, K] bf16, contiguous, expert-grouped (rows of expert i are
+            contiguous; m_indices is sorted).
+        b (torch.Tensor): [E, N, K] bf16, contiguous (per-expert weights, NT layout — DeepGEMM
+            transposes B internally).
+        m_indices (torch.Tensor): [M_total] int32, expert id per row (-1 to skip).
+
+    Returns:
+        torch.Tensor: [M_total, N] bf16 with rows in the same order as `a`.
 
     Handles DeepGEMM's per-expert M alignment requirement by padding/unpadding
     internally; the caller does not need pre-padded inputs.
@@ -1613,9 +1618,12 @@ def _bf16_grouped_gemm_wgrad_contiguous(
 ) -> torch.Tensor:
     """K-grouped TN GEMM producing per-expert weight gradients via DeepGEMM.
 
-    grad_y:    [M_total, N] bf16, contiguous, expert-grouped.
-    x:         [M_total, K] bf16, contiguous, expert-grouped (same row ordering).
-    Returns:   [E, N, K]    bf16 stacked per-expert wgrad.
+    Args:
+        grad_y (torch.Tensor): [M_total, N] bf16, contiguous, expert-grouped.
+        x (torch.Tensor): [M_total, K] bf16, contiguous, expert-grouped (same row ordering).
+
+    Returns:
+        torch.Tensor: [E, N, K] bf16 stacked per-expert wgrad.
 
     DeepGEMM's k_grouped_bf16 kernel computes in fp32 and requires fp32 d/c
     accumulators; we cast the result back to bf16. Per-expert K alignment is

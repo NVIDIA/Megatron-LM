@@ -46,7 +46,8 @@ def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
     Args:
         sharded_tensor (ShardedTensor): sharded tensor representing the data shard
 
-    Returns (tuple): unique id of a data shard
+    Returns:
+        tuple: unique id of a data shard
     """
     f_range = sharded_tensor.flattened_range
     return (
@@ -64,7 +65,8 @@ def _sharded_object_id(sharded_object: ShardedObject) -> _ShardId:
     Args:
         sharded_object (ShardedObject): sharded object representing the data shard
 
-    Returns (tuple): unique id of a data shard
+    Returns:
+        tuple: unique id of a data shard
     """
     return (sharded_object.key, sharded_object.global_offset, sharded_object.global_shape)
 

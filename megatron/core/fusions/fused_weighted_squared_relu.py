@@ -149,7 +149,7 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
         """forward method for `WeightedSquaredReLUFunction`
 
         Args:
-            ctx : context object to store intermediate tensors.
+            ctx: Context object to store intermediate tensors.
             input (torch.Tensor): input tensor.
             weights (Optional[torch.Tensor]): optional per-token weight tensor.
             clamp_scale (Optional[float]): if set, soft-clamp the input with
@@ -176,7 +176,7 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
         """backward method for `WeightedSquaredReLUFunction`
 
         Args:
-            ctx : context object to store intermediate tensors.
+            ctx: Context object to store intermediate tensors.
             grad_output (torch.Tensor): gradient of the output of the forward function.
         """
         if not ctx.has_weights:

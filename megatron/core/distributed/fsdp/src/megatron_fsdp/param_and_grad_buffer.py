@@ -3920,8 +3920,7 @@ def _create_hfsdp_helper_buffer(
     inner_dp_group: torch.distributed.ProcessGroup,
     is_data_distributed: bool,
 ) -> DataParallelBuffer:
-    """
-    Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
+    """Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
 
     This helper buffer mirrors the metadata of the original fully
     `dp_buffer` (bucket config, params, allocator, etc.), but binds it to
@@ -3932,21 +3931,17 @@ def _create_hfsdp_helper_buffer(
     (`bucket_index`) with the fully DP buffer.
 
     Args:
-    dp_buffer : DataParallelBuffer
-        The existing fully data-parallel buffer whose configuration
-        and bucket layout should be mirrored.
-    inner_dp_group : torch.distributed.ProcessGroup
-        The process group representing the inner-DP (HFSDP) data-parallel
-        group for this helper buffer.
-    is_data_distributed : bool
-        Whether the underlying data in this helper buffer is sharded
-        across ranks in `inner_dp_group`.
+        dp_buffer (DataParallelBuffer): The existing fully data-parallel buffer whose configuration
+            and bucket layout should be mirrored.
+        inner_dp_group (torch.distributed.ProcessGroup): The process group representing the inner-DP
+            (HFSDP) data-parallel group for this helper buffer.
+        is_data_distributed (bool): Whether the underlying data in this helper buffer is sharded
+            across ranks in `inner_dp_group`.
 
     Returns:
-    DataParallelBuffer
-        A new DataParallelBuffer configured as the HFSDP helper buffer
-        for the given `inner_dp_group`, sharing the same bucket index
-        as `dp_buffer` but with an inner-DP `shard_bucket_index`.
+        DataParallelBuffer: A new DataParallelBuffer configured as the HFSDP helper buffer for the
+            given `inner_dp_group`, sharing the same bucket index as `dp_buffer` but with an
+            inner-DP `shard_bucket_index`.
     """
     helper_buffer = DataParallelBuffer(
         dp_buffer.ddp_config,
@@ -3986,8 +3981,7 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     mem_alloc: Callable[[torch.dtype, int], torch.Tensor],
     outer_dp_group: torch.distributed.ProcessGroup,
 ) -> None:
-    """
-    Initialize storage for the HFSDP helper buffer and its corresponding
+    """Initialize storage for the HFSDP helper buffer and its corresponding
     fully-DP DataParallelBuffer view.
 
     The helper buffer is allocated as a single contiguous tensor that
@@ -3997,19 +3991,15 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     buffer rather than owning separate storage.
 
     Args:
-    hfsdp_helper_buffer : DataParallelBuffer
-        The HFSDP helper buffer that owns the full inner-/outer-DP bucket
-        storage.
-    dp_buffer : DataParallelBuffer
-        The fully-DP DataParallelBuffer that should view its local shard
-        from `hfsdp_helper_buffer`.
-    mem_alloc : Callable[[torch.dtype, int], torch.Tensor]
-        Allocation function used to create the backing tensor for the
-        helper buffer (dtype, numel).
-    outer_dp_group : torch.distributed.ProcessGroup
-        Process group for the outer data-parallel dimension. Its rank and
-        world size determine which slice of the helper buffer this rank
-        sees through `dp_buffer`.
+        hfsdp_helper_buffer (DataParallelBuffer): The HFSDP helper buffer that owns the full
+            inner-/outer-DP bucket storage.
+        dp_buffer (DataParallelBuffer): The fully-DP DataParallelBuffer that should view its local
+            shard from `hfsdp_helper_buffer`.
+        mem_alloc (Callable[[torch.dtype, int], torch.Tensor]): Allocation function used to create
+            the backing tensor for the helper buffer (dtype, numel).
+        outer_dp_group (torch.distributed.ProcessGroup): Process group for the outer data-parallel
+            dimension. Its rank and world size determine which slice of the helper buffer this rank
+            sees through `dp_buffer`.
     """
     # Allocate contiguous storage for all outer-DP shards in the helper buffer.
     hfsdp_helper_buffer.init_data(

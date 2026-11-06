@@ -755,7 +755,8 @@ class MegatronOptimizer(ABC):
                 used to save or load the optimizer state. Defaults to False.
             metadata (dict, optional): metadata controlling the sharded_state_dict logic.
 
-        Returns: optimizer sharded state dict
+        Returns:
+            ShardedStateDict: optimizer sharded state dict
         """
 
     @staticmethod

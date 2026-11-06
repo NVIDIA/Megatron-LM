@@ -341,7 +341,7 @@ class RotaryEmbedding(nn.Module):
         """Function to get the rotary sequence length.
 
         Args:
-            inference_context : Used during Inference time
+            inference_context: Used during inference time.
             transformer (TransformerBlock): The transformer block (decoder/encoder) used
                 by the model
             transformer_input (Tensor): Input tensor to the transformer

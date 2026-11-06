@@ -141,7 +141,7 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     Validates the chunk metadata of an uneven DTensor to ensure correctness and boundary coverage.
 
     Notes:
-    - `gather_and_compute_chunk_metadata` will ensure that all chunks do not overlap.
+        - `gather_and_compute_chunk_metadata` will ensure that all chunks do not overlap.
 
     This function performs the following checks:
       - All chunk offsets and sizes are within the tensor shape bounds.

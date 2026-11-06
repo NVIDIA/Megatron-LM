@@ -250,11 +250,11 @@ def _coerce_arguments_mapping(arguments):
     """Coerce function.arguments to a mapping for HF/Jinja chat templates.
 
     Examples:
-    - {"x": 1} -> {"x": 1}
-    - '{"x": 1}' -> {"x": 1}
-    - "[1, 2]" -> {}  # JSON parses, but not a mapping
-    - "not-json" -> {}
-    - None -> {}
+        - {"x": 1} -> {"x": 1}
+        - '{"x": 1}' -> {"x": 1}
+        - "[1, 2]" -> {}  # JSON parses, but not a mapping
+        - "not-json" -> {}
+        - None -> {}
     """
     if isinstance(arguments, dict):
         return arguments
