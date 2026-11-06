@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Replay the retained dev CSA metadata/compaction kernels and fused compressor forward.
+"""Replay dev CSA layout kernels, aligned HCA backward, and compressor forward.
 
 The external compressor dAPE backward uses atomics and is not claimed bit-exact;
 the existing strict-determinism dispatch guard is checked explicitly instead.
@@ -77,6 +77,85 @@ def test_dev_flat_sparse_indices_replay():
         contention=True,
         what="dev CSA compact flat indices",
     )
+
+
+@pytest.mark.parametrize("sequence_length,cp_size", [(16384, 4), (32768, 8), (65536, 16)])
+@pytest.mark.parametrize("reconstruct", [False, True])
+def test_dev_aligned_hca_backward_replays(sequence_length, cp_size, reconstruct):
+    """Replay HCA autograd with prepared packing and scheduling contention."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        aligned_hca,
+        fused_sparse_attention,
+        thd_layout_kernels,
+    )
+    from tests.unit_tests.transformer.experimental_attention_variant.test_aligned_hca import (
+        _metadata,
+        _select,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Aligned HCA requires GB300 or Rubin")
+    cudnn = pytest.importorskip("cudnn")
+    api = getattr(cudnn, "AlignedHCABackward", None)
+    tokens, rank = sequence_length // cp_size, cp_size - 1
+    if api is None or not api.supports_configuration(tokens, cp_size, torch.device("cuda")):
+        pytest.skip("Supporting cuDNN Frontend is unavailable")
+    pytest.importorskip("flash_mla")
+    seeded()
+    _, _, params, group = _metadata(rank, sequence_length, cp_size)
+    aligned_hca.prepare_aligned_hca_metadata(params)
+    cu = params.cu_seqlens_q_padded
+    compressed = sequence_length // 128 + cp_size
+    comp = thd_layout_kernels.build_cp_compressor_layout(cu, rank * tokens, tokens, cp_size, 128)
+    indices, lengths, _, _ = thd_layout_kernels.build_attention_indices(
+        cu,
+        rank * tokens,
+        tokens,
+        128,
+        128,
+        128,
+        sequence_length // 128,
+        cu_seqlens_compressed=comp.cu_seqlens_compressed,
+        seq_to_rank_row=comp.seq_to_rank_row,
+        compressed_rows=compressed,
+        output_alignment=64,
+    )
+    q = torch.randn(tokens, 128, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(
+        tokens + 128 + compressed, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    sink = torch.randn(128, device="cuda", requires_grad=True)
+
+    def run(q, kv, sink):
+        selected = _select(q, kv, params, group)
+        assert selected == rank
+        parts = (
+            tuple(part.detach() for part in kv.split((128, tokens, compressed)))
+            if reconstruct
+            else None
+        )
+        output = fused_sparse_attention.csa_sparse_attn(
+            q,
+            kv,
+            sink,
+            indices,
+            512**-0.5,
+            topk_length=lengths,
+            is_thd=True,
+            kv_reconstruction_parts=parts,
+            deterministic=True,
+            hca_cp_rank=selected,
+            hca_cp_size=cp_size,
+        )
+        context = output.grad_fn.next_functions[0][0]
+        assert context.saved_tensors[-3] is None
+        assert context.topk_length is None
+        return output
+
+    _, grads = assert_replays_bit_exact(
+        run, (q, kv, sink), contention=True, what="aligned HCA backward"
+    )
+    assert len(grads) == 3
 
 
 def test_dev_fused_compressor_forward_and_determinism_guard():

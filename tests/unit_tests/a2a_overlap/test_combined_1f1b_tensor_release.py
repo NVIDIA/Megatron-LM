@@ -398,6 +398,8 @@ def test_external_consumed_grad_records_stream_in_schedule_node(monkeypatch):
     )
     node.inputs = [node_input]
     node.output = node_output
+    # ScheduleNode.forward records gradient edges as the backward roots.
+    node._output_edges = (torch.autograd.graph.get_gradient_edge(node_output),)
     _publish(tensor_release, node_output, consumer, "forward")
     _publish(tensor_release, output_grad, consumer, "upstream backward")
 
@@ -437,6 +439,8 @@ def test_no_external_consumed_grad_skips_record_stream(monkeypatch):
     node.inputs = [node_input]
     node.inputs[0].grad = input_grad
     node.output = node_output
+    # ScheduleNode.forward records gradient edges as the backward roots.
+    node._output_edges = (torch.autograd.graph.get_gradient_edge(node_output),)
     _publish(tensor_release, node_output, stream, "forward")
     _publish(tensor_release, output_grad, stream, "upstream backward")
 

@@ -17,7 +17,8 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
-from megatron.training.training import get_model
+from megatron.training.global_vars import get_run_config, is_run_config_initialized
+from megatron.training.training import get_megatron_ddp_config, get_model
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -247,6 +248,19 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
         raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
 
+def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise, grad_collective):
+    """Make the run config describe the optimizer the test is about to build.
+
+    Checkpoint saving derives the optimizer sharding metadata from the run config, not from args,
+    and get_model() wraps DDP for the run config's grad collective.
+    """
+    if is_run_config_initialized():
+        optimizer_cfg = get_run_config().optimizer
+        optimizer_cfg.use_distributed_optimizer = use_distributed_optimizer
+        optimizer_cfg.use_layer_wise_distributed_optimizer = use_layer_wise
+        optimizer_cfg.emerging_optimizer_grad_collective = grad_collective
+
+
 def setup_model_and_optimizer(
     seed,
     tp,
@@ -315,9 +329,11 @@ def setup_model_and_optimizer(
         mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
-        mock_args.emerging_optimizer_grad_collective = grad_collective
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise, grad_collective)
         model = get_model(
             partial(
                 initialize_fn,
@@ -329,7 +345,10 @@ def setup_model_and_optimizer(
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     optimizer_config_kwargs = optimizer_config_kwargs or {}
@@ -353,6 +372,7 @@ def setup_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -453,9 +473,11 @@ def setup_moe_model_and_optimizer(
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
-        mock_args.emerging_optimizer_grad_collective = grad_collective
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise, grad_collective)
         model = get_model(
             partial(
                 initialize_fn,
@@ -469,7 +491,10 @@ def setup_moe_model_and_optimizer(
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     config = OptimizerConfig(
@@ -483,6 +508,7 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)

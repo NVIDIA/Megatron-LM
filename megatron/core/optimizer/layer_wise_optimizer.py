@@ -1583,16 +1583,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Adjust dict rank 0 output correct global metadata into common_dict
         for sd in wrapped_sharded_state_dict.values():
             # wrap empty containers into LocalNonpersistentObject so it won't be saved/loaded
-            # params is already wrapped, we only need to handle fp32_from_fp16_params and state
-            # more details in load_state_dict comment
-            if 'fp32_from_fp16_params' in sd:
-                sd['fp32_from_fp16_params'][:] = [
-                    group if group else LocalNonpersistentObject(group)
-                    for group in sd['fp32_from_fp16_params']
-                ]
-                sd['fp32_from_fp16_params'] = {
-                    i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
-                }
+            # params and fp32_from_fp16_params are already handled by the wrapped optimizers,
+            # we only need to handle state
             # state is a single dict and will be empty if optimizer is fully empty
             if not sd['optimizer']['state']:
                 sd['optimizer']['state'] = LocalNonpersistentObject(sd['optimizer']['state'])

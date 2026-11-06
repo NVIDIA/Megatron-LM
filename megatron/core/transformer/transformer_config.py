@@ -592,6 +592,11 @@ class TransformerConfig(ModelParallelConfig):
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
+    hca_aligned_backward: bool = False
+    """Enable cuDNN aligned HCA backward for GB300/Rubin, CP4/8/16 and 8K-128K tokens.
+    Requires one padded sequence and a supporting cuDNN Frontend; other layouts use stock.
+    Captured replay must preserve boundaries; warm backward eagerly before capture."""
+
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
     sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
@@ -1077,9 +1082,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
-    """Backend options for moe_megakernel_backend.
+    """MCore-managed common options and backend-specific options for moe_megakernel_backend.
 
-    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    MCore consumes ``shared_expert_mode``: ``auto`` (default) fuses compatible shared
+    MLPs, ``fused`` requires compatibility, and ``native`` runs shared experts in
+    MCore. Activation selection is independent. Native shared experts retain the
+    model's precision policy; MOK-fused shared experts use BF16.
+    Remaining options, such as MOK's ``fwd_num_comm_sms``, are passed to the backend.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -1537,6 +1546,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_thd_max_packed_sequences: Optional[int] = None
+    """THD metadata capacity, including the dummy padding document.
+
+    Bounds real-document packing and fixes all four cumulative-offset tensor
+    shapes in eager and TE graph execution. Padding reserves one document slot.
+    Setting this capacity also applies during eager execution; it does not enable CUDA graphs.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1821,6 +1838,16 @@ class TransformerConfig(ModelParallelConfig):
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
     fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
     True to disable fusion and use separate kernel launches (useful for debugging)."""
+
+    inference_moe_router_backend: Literal['torch', 'triton'] = 'triton'
+    """Backend for InferenceTopKRouter top-k routing in inference mode.
+    - 'torch': torch.compile'd PyTorch routing.
+    - 'triton': A fused Triton sigmoid top-k kernel for sigmoid scores with an expert
+      bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
+      outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
+      below eight and to within the last fp32 bit otherwise. Other score functions,
+      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
+      use the 'torch' path. Default."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
@@ -3020,6 +3047,11 @@ class TransformerConfig(ModelParallelConfig):
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
                 self.inference_grouped_gemm_backend
             )
+            if self.inference_moe_router_backend not in ('torch', 'triton'):
+                raise ValueError(
+                    "inference_moe_router_backend must be 'torch' or 'triton', "
+                    f"got {self.inference_moe_router_backend!r}"
+                )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if (
@@ -3513,8 +3545,10 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-
         if self.moe_megakernel_backend == "mok":
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
+            fuse_shared = megakernel_fuses_shared_expert(self)
             if self.moe_router_dtype == "fp64":
                 raise ValueError("MOK does not support moe_router_dtype='fp64'; use 'fp32' instead")
             if self.use_transformer_engine_op_fuser:
@@ -3564,24 +3598,26 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
             if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
                 raise ValueError(
                     "MOK does not support GTP weight rematerialization; the megakernel "
                     "bypasses native expert weight-gather hooks"
                 )
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires expert TP=1")
+            # ETP=1 routed weights are unsharded; MOK consumes each rank's SP tokens.
+            # TP-sharded shared experts and duplicated latent projections stay native.
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                raise ValueError("MOK with TP>1 requires sequence_parallel=True")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("MOK requires a shared expert")
             if self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support MCore shared-expert overlap")
-            if self.moe_latent_size is not None:
-                # Native latent MoE projects only the routed branch; its shared expert
-                # stays in the original hidden space. MOK currently fuses both branches.
-                raise ValueError("MOK does not support latent MoE")
-            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+            if (
+                fuse_shared
+                and self.recompute_modules
+                and "shared_experts" in self.recompute_modules
+            ):
                 raise ValueError(
                     "MOK does not support recompute_modules=['shared_experts']; shared-expert "
                     "computation is fused into the megakernel. Use whole-MoE recompute "
@@ -3592,8 +3628,8 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support log_moe_overload_factor because it bypasses the "
                     "native token-dispatcher accounting path"
                 )
-            if not self.gated_linear_unit or self.activation_func != F.silu:
-                raise ValueError("MOK currently requires SwiGLU")
+            if not self.gated_linear_unit or self.activation_func not in (F.silu, situlu):
+                raise ValueError("MOK requires SwiGLU or SiTU-GLU")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
@@ -4933,6 +4969,39 @@ class TransformerConfig(ModelParallelConfig):
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
+        if self.cuda_graph_thd_max_packed_sequences is not None:
+            # Dev's --thd-max-packed-sequences already provides a static THD capacity with its own
+            # padding and graph path, so the two capacity settings must not be combined.
+            assert self.thd_max_packed_sequences is None, (
+                "cuda_graph_thd_max_packed_sequences and thd_max_packed_sequences both set the "
+                "static THD capacity; set only one of them."
+            )
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.dynamic_context_parallel
+            pad_enabled = self.pad_packed_seq_alignment is not None or (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
+            )
+            assert self.cuda_graph_thd_max_packed_sequences >= (
+                2 if pad_enabled else 1
+            ), "THD metadata capacity must leave room for the dummy padding document."
+        # These constraints belong to the cuda_graph_thd_max_packed_sequences path. THD CUDA
+        # graphs configured with thd_max_packed_sequences keep the checks below.
+        scheduler_te_graphs = (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+            and self.cuda_graph_thd_max_packed_sequences is not None
+        )
+        if scheduler_te_graphs and self.pipeline_model_parallel_size > 1:
+            assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
+            assert not self.moe_paged_stash
+        if scheduler_te_graphs:
+            assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+            assert self.cuda_graph_thd_max_packed_sequences is not None
+            assert self.cuda_graph_modules == [
+                CudaGraphModule.attn
+            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
+
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
         )
@@ -6146,7 +6215,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
-            if self.thd_max_packed_sequences is None:
+            if (
+                self.thd_max_packed_sequences is None
+                and self.cuda_graph_thd_max_packed_sequences is None
+            ):
                 raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
                 self.pad_packed_seq_alignment is not None

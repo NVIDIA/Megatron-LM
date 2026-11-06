@@ -122,8 +122,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="triton",
         notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
-        "routing metadata replay. External sparse-attention backward is not certified here; "
+        "routing metadata replay. Stock sparse-attention backward is not certified here; "
         "numerical CP/indexer parity remains in the dev CSA tests.",
+    ),
+    KernelEntry(
+        name="aligned_hca_backward",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/aligned_hca.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="dispatch",
+        notes="FlashMLA forward plus cudnn.aligned_hca_backward_wrapper "
+        "(NVIDIA/cudnn-frontend#1198), with prepared packing and side-stream contention. "
+        "Bypasses stock deterministic backward selection; uses grouped GEMMs and fixed-order "
+        "FP32 partial reductions without atomic accumulation. Requires GB300/Rubin and the "
+        "frontend API; skips on H100 CI.",
     ),
     KernelEntry(
         name="dev_csa_fused_compressor_dispatch",
@@ -506,10 +519,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/megakernel/mok/runtime.py",
             "megatron/core/transformer/moe/megakernel/mok/weights.py",
         ),
+        tests=(K + "test_moe_kernels.py",),
         kind="dispatch",
-        exempt_reason="MOK forward/backward, schedule, and weight-descriptor kernels require "
-        "Blackwell GPUs and the optional qizhang/mcore-integration MOK build, which are not "
-        "available in the H100 determinism bucket. Routing conversion is replayed separately.",
+        notes="Real BF16/MXFP8 routed-only SiTU with dP/main-grad replay, native shared/latent "
+        "TP/SP, and legacy BF16 fused shared with output gate off/on; requires supported MOK/TE "
+        "on SM100/SM103 with EP4.",
     ),
     KernelEntry(
         name="moe_router",
@@ -811,6 +825,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
+            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",

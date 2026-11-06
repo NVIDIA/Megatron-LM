@@ -75,6 +75,11 @@ uses these stages for training. Selective `gdn_norm_out` recomputation keeps
 its existing checkpoint lifecycle. KDA keeps its atomic `forward`; the post-GDR
 fusion applies inside its gated output norm on the same CP/TP layout.
 
+Pre-GDR Q/K parity tests use `atol=1e-3` and `rtol=8e-3` to allow adjacent
+BF16 values from different fused and unfused L2 reduction orders. The relative
+tolerance covers one BF16 ULP for normal values (`2**-7` near a power of two);
+the other pre-GDR outputs retain their existing per-output tolerances.
+
 The post-GDR kernels preserve the activation-dtype RMSNorm materialization boundary
 before the FP32 gating multiply, and round the gradient entering RMSNorm to the
 activation dtype. They support first-order autograd only.

@@ -771,6 +771,28 @@ class ModelParallelConfig:
                     f"{self.pad_packed_seq_alignment}."
                 )
 
+        # Applies to every packed 'max' padding config, not only pipeline_p2p_fixed_shape. It
+        # runs after the pipeline_p2p_fixed_shape checks so their ValueErrors take precedence.
+        if self.pad_packed_seq_alignment == "max":
+            if self.sequence_parallel:
+                assert (
+                    self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size == 0
+                ), "Packed padding must preserve sequence-parallel TP divisibility."
+            # Zigzag CP splits each padded sequence into 2 * context_parallel_size chunks.
+            # Without CP, or with TransformerConfig's contiguous CP layout, there is no zigzag
+            # split; TransformerConfig's layout-specific checks and the batch-time
+            # get_packed_sequence_alignment check validate the padding target instead.
+            if (
+                self.context_parallel_size > 1
+                and getattr(self, "cp_partition_mode", "zigzag") != "contiguous"
+            ):
+                assert (
+                    self.max_seqlen_per_dp_cp_rank % 2 == 0
+                ), "Packed padding must preserve zigzag CP alignment."
+        # Integer alignment is combined with TP/CP/MXFP8 requirements by
+        # get_packed_sequence_alignment, so the requested multiple need not
+        # itself be divisible by TP.
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")
