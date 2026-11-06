@@ -180,6 +180,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return context
         return ResidualStreamRecomputeContext(context.manager, is_block_end=False)
 
+    def supports_two_stage_attention(self) -> bool:
+        """mHC layers run only through ``__call__``, where their replay state enters.
+
+        The split two-stage entry points bypass it, so attention-only mHC layers must not
+        advertise them (for example, to Shortcut MoE grouping).
+        """
+        return False
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
 
