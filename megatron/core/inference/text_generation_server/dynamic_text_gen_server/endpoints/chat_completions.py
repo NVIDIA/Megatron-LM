@@ -50,6 +50,7 @@ from .common import (
     run_inference,
     sampling_params_for_choice,
     submit_requests,
+    submit_streaming_requests,
     unwrap_batch,
     validate_offload_params,
 )
@@ -1300,7 +1301,8 @@ try:
         multi_modal_data,
         offload_params,
     ):
-        """SSE response streaming `n` choices of one prompt; 400 when cannot stream."""
+        """SSE response streaming `n` choices of one prompt; 400 when cannot stream, 500 when a
+        submission fails."""
         # Streaming currently supports only Hugging Face fast tokenizers.
         try:
             incremental_detokenizers = [
@@ -1308,15 +1310,19 @@ try:
             ]
         except ValueError as error:
             return Response(str(error), status=400)
-        streams = [
-            client.add_request_streaming(
-                prompt_tokens,
-                sampling_params_for_choice(sampling_params, index),
+        try:
+            streams = submit_streaming_requests(
+                client,
+                (
+                    (prompt_tokens, sampling_params_for_choice(sampling_params, index))
+                    for index in range(n)
+                ),
                 multi_modal_data=multi_modal_data,
                 offload_params=offload_params,
             )
-            for index in range(n)
-        ]
+        except Exception as error:
+            logger.error(f"Error submitting request: {error}")
+            return Response(f"Error submitting request: {error}", status=500)
         response = Response(
             openai_stream(
                 streams,

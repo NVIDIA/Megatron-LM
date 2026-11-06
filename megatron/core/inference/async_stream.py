@@ -31,6 +31,7 @@ class AsyncStream(Generic[T]):
         self._cancel = cancel
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
+        self._cancelled = False
         self._loop = get_asyncio_loop(loop)
 
     @property
@@ -61,7 +62,14 @@ class AsyncStream(Generic[T]):
         return self
 
     async def __anext__(self) -> T:
-        result = await self._queue.get()
+        try:
+            result = await self._queue.get()
+        except asyncio.CancelledError:
+            # ``InferenceClient.add_request_streaming`` returns this object
+            # directly, so cancellation is not guaranteed to pass through
+            # ``generator()``. Abort the remote request from either API.
+            await self.aclose()
+            raise
         if self._is_raisable(result):
             if result == STOP_ITERATION:
                 raise StopAsyncIteration
@@ -70,7 +78,8 @@ class AsyncStream(Generic[T]):
 
     async def aclose(self) -> None:
         """Cancel the request if the stream is still active."""
-        if not self._finished:
+        if not self._finished and not self._cancelled:
+            self._cancelled = True
             self._cancel()
 
     async def generator(self) -> AsyncGenerator[T, None]:
@@ -78,6 +87,9 @@ class AsyncStream(Generic[T]):
         try:
             async for result in self:
                 yield result
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
         except GeneratorExit:
             await self.aclose()
             raise asyncio.CancelledError from None

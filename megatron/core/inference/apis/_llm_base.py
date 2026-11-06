@@ -522,13 +522,26 @@ class _MegatronLLMBase:
             # coroutine runs on that same loop, so ``asyncio.gather`` over the
             # returned futures is safe.
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
-            futures = [
-                self._coord_runtime.client.add_request(
-                    p, sp, multi_modal_data=sample_multi_modal_data
-                )
-                for p, sample_multi_modal_data in zip(prompts, multi_modal_data_list, strict=True)
-            ]
-            return list(await asyncio.gather(*futures))
+            request_ids = []
+            futures = []
+            try:
+                for p, sample_multi_modal_data in zip(prompts, multi_modal_data_list, strict=True):
+                    request_id, future = self._coord_runtime.client.add_request_with_id(
+                        p, sp, multi_modal_data=sample_multi_modal_data
+                    )
+                    request_ids.append(request_id)
+                    futures.append(future)
+                return list(await asyncio.gather(*futures))
+            except BaseException:
+                # Cancellation and one failed batch member must not strand any
+                # sibling in the remote scheduler. Preserve the original error
+                # if an already-unwinding abort send also fails.
+                for request_id in request_ids:
+                    try:
+                        self._coord_runtime.client.abort_request(request_id)
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                raise
         if any(multi_modal_data_list):
             raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # TODO: replace with an upstream ``engine.async_generate`` so direct-mode

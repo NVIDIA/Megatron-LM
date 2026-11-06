@@ -276,6 +276,29 @@ def submit_requests(client, submissions, *, multi_modal_data=None, offload_param
     return request_ids, tasks
 
 
+def submit_streaming_requests(client, submissions, *, multi_modal_data=None, offload_params=None):
+    """Submit each `(prompt_tokens, sampling_params)` pair as a stream; return the streams.
+
+    If a submission fails, the streams admitted before it are aborted before the error propagates;
+    otherwise they would generate unread, because their generator is never started.
+    """
+    streams = []
+    try:
+        for prompt_tokens, sampling_params in submissions:
+            streams.append(
+                client.add_request_streaming(
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    offload_params=offload_params,
+                )
+            )
+    except Exception as e:
+        abort_requests(client, [s.request_id for s in streams], f"submission failed: {e}")
+        raise
+    return streams
+
+
 async def run_inference(client, request_ids, tasks, verbose, log_label=""):
     """Await inference tasks with optional timing. Re-raises exceptions."""
     start_time = time.perf_counter()
@@ -283,6 +306,12 @@ async def run_inference(client, request_ids, tasks, verbose, log_label=""):
         batch_results = await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         abort_requests(client, request_ids, "client disconnected")
+        raise
+    except Exception as e:
+        # gather returns as soon as one request raises, but does not cancel the remaining engine
+        # work. Abort every admitted request: completed IDs are harmless no-ops at the client,
+        # while pending siblings would otherwise keep generating after this HTTP response ends.
+        abort_requests(client, request_ids, f"inference failed: {e}")
         raise
     if verbose:
         label = f" {log_label}" if log_label else ""
