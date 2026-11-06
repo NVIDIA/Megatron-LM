@@ -206,6 +206,9 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
         is_last: Whether this scope contains the last accumulation microbatch.
     """
     context.ensure_finalized()
+    # Join the reduction stream to any active CUDA-graph capture before gradient reduction.
+    # Needed by schedules that bypass FsdpModule.pre_backward, such as combined 1F1B.
+    context.inner_reduction_stream.wait_stream(context.current_stream())
     previous_state = context.is_last_microbatch
     context.is_last_microbatch = is_last
 
