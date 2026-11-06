@@ -704,11 +704,8 @@ def test_transformer_layer_weights_released_before_final_callback(process_group_
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2, data_parallel_sharding_strategy="optim_grads_params"
         ),
         module=block,
         pg_collection=process_group_collection,

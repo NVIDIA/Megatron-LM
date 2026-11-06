@@ -7,6 +7,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
@@ -165,6 +168,7 @@ def test_resiliency_validation_observes_recipe_edits(run_config, section, field,
     assert run_config.to_dict() == before
 
 
+@pytest.mark.parametrize("use_fsdp", [False, True])
 @pytest.mark.parametrize("native_model", [False, True])
 @pytest.mark.parametrize(
     "fp16,loss_scale,fake",
@@ -172,9 +176,11 @@ def test_resiliency_validation_observes_recipe_edits(run_config, section, field,
 )
 @pytest.mark.parametrize("loss_check,grad_check", [(True, False), (False, True), (True, True)])
 def test_rerun_nan_normalization_is_central(
-    monkeypatch, run_config, native_model, fp16, loss_scale, fake, loss_check, grad_check
+    monkeypatch, run_config, native_model, fp16, loss_scale, fake, loss_check, grad_check, use_fsdp
 ):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    if use_fsdp:
+        run_config.data_parallel = FullyShardedDataParallelConfig()
     run_config.train.micro_batch_size = 1
     run_config.optimizer.fp16 = fp16
     run_config.optimizer.loss_scale = loss_scale
@@ -184,14 +190,14 @@ def test_rerun_nan_normalization_is_central(
         transformer.fp16 = fp16
         run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.rerun_state_machine.check_for_nan_in_loss = loss_check
-    run_config.ddp.check_for_nan_in_grad = grad_check
+    run_config.data_parallel.check_for_nan_in_grad = grad_check
     before = copy.deepcopy(run_config.to_dict())
     run_config.validate()
     assert run_config.to_dict() == before
     run_config.finalize()
     disabled = fake or (fp16 and loss_scale is None)
     assert run_config.rerun_state_machine.check_for_nan_in_loss == (loss_check and not disabled)
-    assert run_config.ddp.check_for_nan_in_grad == (grad_check and not disabled)
+    assert run_config.data_parallel.check_for_nan_in_grad == (grad_check and not disabled)
 
 
 def test_tracker_iterations_are_merged_once_without_mutating_cli(monkeypatch, run_config, tmp_path):

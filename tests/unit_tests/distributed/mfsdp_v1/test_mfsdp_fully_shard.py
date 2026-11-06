@@ -110,7 +110,7 @@ def _recompute_prefetch_pipeline(extended_buckets, double_buffer=False):
             )
             for bucket_id, param in enumerate(params)
         ],
-        ddp_config=SimpleNamespace(fsdp_double_buffer=double_buffer),
+        fsdp_config=SimpleNamespace(double_buffer=double_buffer),
     )
     pipeline.recompute_buckets = set()
     pipeline.bucket_status = {

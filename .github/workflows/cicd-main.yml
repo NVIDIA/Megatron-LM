@@ -826,7 +826,9 @@ jobs:
         env:
           BOT_ID: ${{ vars.COMMUNITY_BOT_ID }}
           BOT_KEY: ${{ secrets.COMMUNITY_BOT_KEY }}
-          MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
+          # MBridge validates the approved mirror head. A synthetic PR merge
+          # SHA can disappear while the run waits in the CI queue.
+          MBRIDGE_MCORE_REF: ${{ github.sha }}
           MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
           MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
         run: python3 -u .github/scripts/trigger_workflow_and_wait.py
@@ -912,7 +914,7 @@ jobs:
           client_payload: |
             {
               "test_to_run": "L1",
-              "test_script_pattern": "L1_Functional_Tests_Megatron_4",
+              "test_script_pattern": "L1_Functional_Tests_Megatron_",
               "test_platform": "h100",
               "megatron_lm_commit": "${{ github.sha }}"
             }
