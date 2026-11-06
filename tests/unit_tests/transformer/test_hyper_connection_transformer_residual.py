@@ -203,7 +203,12 @@ def test_dedicated_context_is_live_only_during_the_call():
 
     _call_with_base(layer, record, "input", residual_stream_recompute_context=next_context)
     assert seen.pop() == ({}, next_context, next_context)
-    for omitted in ({}, {"residual_stream_recompute_context": None}):
+    # An explicit None for either keyword is stripped like an omitted keyword.
+    for omitted in (
+        {},
+        {"residual_stream_recompute_context": None},
+        {"mhc_recompute_manager": None},
+    ):
         _call_with_base(layer, record, "input", **omitted)
         assert seen.pop() == ({}, None, None)
 
@@ -410,6 +415,8 @@ def test_shared_layout_validation_preserves_wr_replay(stages, gpu_model_parallel
 
 
 def _finalize_with_storage_checks(context, boundary):
+    # Pytest must not repr tensor arguments whose storage may have been released.
+    __tracebackhide__ = True
     # These fixtures produce fresh checkpoint outputs with no retained-input exemptions.
     # Detached aliases observe the original storage; clones only record expected values.
     managed = [
@@ -427,7 +434,9 @@ def _finalize_with_storage_checks(context, boundary):
     assert all(
         output.untyped_storage().nbytes() == 0 for output in managed
     ), "Finalize must release every registered output"
-    assert boundary.untyped_storage().nbytes() > 0, "Replay must keep the boundary live"
+    # Compare an int: pytest's assertion rewriting would repr a released boundary tensor.
+    boundary_storage_bytes = boundary.untyped_storage().nbytes()
+    assert boundary_storage_bytes > 0, "Replay must keep the terminal boundary storage live"
     checked = []
 
     def check_restored(gradient):
@@ -444,6 +453,8 @@ def _finalize_with_storage_checks(context, boundary):
 
 
 def _run_layers(layers, value, contexts):
+    # The boundary can alias this frame's value after a failed storage check.
+    __tracebackhide__ = True
     block_outputs = []
     restoration_checks = []
     for layer, context in zip(layers, contexts, strict=True):
@@ -466,6 +477,8 @@ def _run_layers(layers, value, contexts):
 
 
 def _forward_backward(layers, initial, contexts):
+    # Caller locals can retain released tensors too; preserve the raw traceback only.
+    __tracebackhide__ = True
     torch.manual_seed(812)
     value = initial.detach().clone().requires_grad_()
     output, restoration_checks = _run_layers(layers, value, contexts)
