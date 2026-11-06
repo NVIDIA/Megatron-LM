@@ -18,6 +18,7 @@ Tests cover:
   1. Per-TransformerLayer gated_linear_unit check in handle_swiglu_in_state_dict
   2. GDN fused projection splitting in handle_gdn_in_state_dict
   3. Helper functions: get_expert_index_from_key, flatten_state_dict, etc.
+  4. Global pipeline-parallel layer indices in model and optimizer checkpoint keys
 
 Note: handle_swiglu_in_state_dict and handle_gdn_in_state_dict require
 HAVE_MEGATRON_FSDP=True and a real distributed environment with DTensors.
@@ -41,6 +42,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
 )
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel.layers import (
     copy_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
@@ -54,13 +56,18 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     absorbed_input_layernorm_key,
     flatten_state_dict,
     get_expert_index_from_key,
+    get_global_unique_param_name,
     get_mla_fused_down_proj_splits,
     get_mtp_inner_layer_paths,
+    get_pp_global_layer_prefixes,
     get_unexpected_model_keys,
     handle_mla_down_proj_in_state_dict,
     handle_mtp_in_state_dict,
+    handle_pp_layers_in_state_dict,
+    localize_pp_layers_in_optimizer_state_dict,
     match_mla_fused_down_proj_key,
     rename_mtp_inner_layer_keys,
+    rename_pp_layer_keys,
     validate_fsdp_dtensor_model_load,
 )
 
@@ -1170,6 +1177,237 @@ class TestHandleMTPInStateDict:
     def test_empty_optimizer_state_tolerated(self):
         _, opt_sd = handle_mtp_in_state_dict(_Model(mtp_layers=[_MTPLayer()]), {}, {"state": {}})
         assert opt_sd["state"] == {}
+
+
+# ============================================================================
+# Test pipeline-parallel layer key renaming
+# ============================================================================
+class _NumberedLayer(torch.nn.Module):
+    """Stands in for a TransformerLayer/MambaLayer: one weight and its global layer_number."""
+
+    def __init__(self, layer_number, inner_layer_numbers=()):
+        super().__init__()
+        self.layer_number = layer_number
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        if inner_layer_numbers:
+            # Like an MTP layer's inner HybridStack.
+            self.mtp_model_layer = _Decoder([_NumberedLayer(n) for n in inner_layer_numbers])
+
+
+def _pp_stage(layer_numbers, mtp_layer_numbers=()):
+    """One pipeline stage of a model: only that stage's layers, indexed from 0."""
+    model = _Model(
+        decoder_layers=[_NumberedLayer(n) for n in layer_numbers],
+        mtp_layers=[_NumberedLayer(n) for n in mtp_layer_numbers],
+    )
+    model.config = SimpleNamespace(num_moe_experts=None)
+    return model
+
+
+@pytest.fixture
+def no_expert_parallel(monkeypatch):
+    """The expert key handlers read the EP rank from parallel_state, which is not set up."""
+    monkeypatch.setattr(fsdp_dtensor_checkpoint, "get_ep_layer_offset", lambda num_experts: 0)
+
+
+class TestGetPPGlobalLayerPrefixes:
+    """The mapping must match TransformerBlock/HybridStack/MTP ``sharded_state_dict``."""
+
+    def test_first_stage_is_identity(self):
+        assert get_pp_global_layer_prefixes(_pp_stage([1, 2])) == {}
+
+    def test_later_stage_gets_global_indices(self):
+        assert get_pp_global_layer_prefixes(_pp_stage([3, 4])) == {
+            "decoder.layers.0.": "decoder.layers.2.",
+            "decoder.layers.1.": "decoder.layers.3.",
+        }
+
+    def test_uneven_stage(self):
+        """Pipeline layouts give stages different layer counts."""
+        assert get_pp_global_layer_prefixes(_pp_stage([2, 3, 4])) == {
+            "decoder.layers.0.": "decoder.layers.1.",
+            "decoder.layers.1.": "decoder.layers.2.",
+            "decoder.layers.2.": "decoder.layers.3.",
+        }
+
+    def test_mtp_block_included(self):
+        """MultiTokenPredictionBlock.sharded_state_dict applies the same layer offset."""
+        prefixes = get_pp_global_layer_prefixes(_pp_stage([1], mtp_layer_numbers=[2]))
+        assert prefixes == {"mtp.layers.0.": "mtp.layers.1."}
+
+    def test_nested_layers_renamed_under_renamed_parent(self):
+        model = _Model(mtp_layers=[_NumberedLayer(2, inner_layer_numbers=[1])])
+        assert get_pp_global_layer_prefixes(model) == {
+            "mtp.layers.0.": "mtp.layers.1.",
+            "mtp.layers.0.mtp_model_layer.layers.0.": "mtp.layers.1.mtp_model_layer.layers.0.",
+        }
+
+    def test_entries_without_layer_number_skipped(self):
+        model = _Model(decoder_layers=[_Layer(_UnfusedMLAAttention())])
+        assert get_pp_global_layer_prefixes(model) == {}
+
+
+class TestHandlePPLayersInStateDict:
+
+    def test_model_keys_renamed_keeping_wrapper(self):
+        state_dict = {
+            "module.decoder.layers.0.mlp.linear_fc1.weight": 0,
+            "module.decoder.layers.1.self_attention.linear_qkv.weight": 1,
+            "module.decoder.final_layernorm.weight": 2,
+            "module.output_layer.weight": 3,
+        }
+        model_sd, _ = handle_pp_layers_in_state_dict(_pp_stage([3, 4]), state_dict, None)
+        assert model_sd == {
+            "module.decoder.layers.2.mlp.linear_fc1.weight": 0,
+            "module.decoder.layers.3.self_attention.linear_qkv.weight": 1,
+            "module.decoder.final_layernorm.weight": 2,
+            "module.output_layer.weight": 3,
+        }
+
+    def test_layer_index_is_not_matched_by_prefix(self):
+        """``layers.1`` must not match ``layers.10``."""
+        model = _pp_stage(list(range(3, 15)))
+        model_sd, _ = handle_pp_layers_in_state_dict(
+            model, {"decoder.layers.10.weight": 10, "decoder.layers.1.weight": 1}, None
+        )
+        assert model_sd == {"decoder.layers.12.weight": 10, "decoder.layers.3.weight": 1}
+
+    def test_optimizer_state_renamed_and_group_meta_untouched(self):
+        """``param_to_group_meta`` is keyed by the optimizer's (global) names already."""
+        optimizer_sd = {
+            "state": {"module.module.decoder.layers.0.weight": {"exp_avg": 0}},
+            "param_to_group_meta": {"module.module.decoder.layers.2.weight": {"lr": 1.0}},
+        }
+        _, opt_sd = handle_pp_layers_in_state_dict(_pp_stage([3, 4]), {}, optimizer_sd)
+        assert list(opt_sd["state"]) == ["module.module.decoder.layers.2.weight"]
+        assert opt_sd["param_to_group_meta"] is optimizer_sd["param_to_group_meta"]
+
+    def test_noop_without_pipeline_parallelism(self):
+        state_dict = {"decoder.layers.0.weight": 0}
+        optimizer_sd = {"state": {"module.decoder.layers.0.weight": {}}}
+        model_sd, opt_sd = handle_pp_layers_in_state_dict(
+            _pp_stage([1, 2]), state_dict, optimizer_sd
+        )
+        assert model_sd is state_dict
+        assert opt_sd is optimizer_sd
+
+    def test_inputs_not_mutated(self):
+        state_dict = {"decoder.layers.0.weight": 0}
+        optimizer_sd = {"state": {"module.decoder.layers.0.weight": {}}}
+        handle_pp_layers_in_state_dict(_pp_stage([3]), state_dict, optimizer_sd)
+        assert list(state_dict) == ["decoder.layers.0.weight"]
+        assert list(optimizer_sd["state"]) == ["module.decoder.layers.0.weight"]
+
+    def test_empty_optimizer_state_tolerated(self):
+        _, opt_sd = handle_pp_layers_in_state_dict(_pp_stage([3]), {}, {"state": {}})
+        assert opt_sd["state"] == {}
+
+    def test_colliding_layer_numbers_raise(self):
+        with pytest.raises(CheckpointingException, match="decoder.layers.2.weight"):
+            rename_pp_layer_keys(
+                {"decoder.layers.0.weight": 0, "decoder.layers.1.weight": 1},
+                get_pp_global_layer_prefixes(_pp_stage([3, 3])),
+            )
+
+    def test_localize_inverts_global_optimizer_keys(self):
+        model = _pp_stage([3, 4], mtp_layer_numbers=[2])
+        global_state = {
+            "module.module.decoder.layers.2.weight": "a",
+            "module.module.decoder.layers.3.weight": "b",
+            "module.module.mtp.layers.1.weight": "c",
+            "module.module.output_layer.weight": "d",
+        }
+        _, local = localize_pp_layers_in_optimizer_state_dict(model, {}, {"state": global_state})
+        assert local["state"] == {
+            "module.module.decoder.layers.0.weight": "a",
+            "module.module.decoder.layers.1.weight": "b",
+            "module.module.mtp.layers.0.weight": "c",
+            "module.module.output_layer.weight": "d",
+        }
+        _, round_trip = handle_pp_layers_in_state_dict(model, {}, local)
+        assert round_trip["state"] == global_state
+
+
+class TestPipelineStagesShareOneCheckpointLayout:
+    """Every pipeline stage must save its layers under the names a PP=1 run uses.
+
+    Before the fix each stage saved ``layers.0``, ``layers.1``, ...: Torch DCP kept one
+    stage's copy of each colliding key, and loading at another PP size restored the wrong
+    layers without any error.
+    """
+
+    PP1_LAYERS = [1, 2, 3, 4]
+    PP2_STAGES = [[1, 2], [3, 4]]
+
+    @staticmethod
+    def _saved_state(model):
+        """Model and Megatron-FSDP v1 optimizer state as preprocess_fsdp_dtensor_state_dict
+        writes it, each value tagged with the layer_number it came from."""
+        from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
+
+        layer_of = {
+            id(p): layer.layer_number
+            for layer in model.modules()
+            if isinstance(layer, _NumberedLayer)
+            for p in layer.parameters(recurse=False)
+        }
+        optimizer = SimpleNamespace(model_chunks=[model])
+        state_dict = {
+            "model": {name: layer_of[id(p)] for name, p in model.named_parameters()},
+            "optimizer": {
+                "state": {
+                    DistributedOptimizer._param_name(optimizer, p): {"exp_avg": layer_of[id(p)]}
+                    for p in model.parameters()
+                }
+            },
+        }
+        args = SimpleNamespace(swiglu=False, num_experts=None)
+        return preprocess_fsdp_dtensor_state_dict(args, state_dict, model)
+
+    @pytest.mark.parametrize("section", ["model", "optimizer"])
+    def test_stages_write_the_pp1_layout(self, no_expert_parallel, section):
+        def entries(state):
+            return state["model"] if section == "model" else state["optimizer"]["state"]
+
+        expected = entries(self._saved_state(_pp_stage(self.PP1_LAYERS)))
+        stages = [entries(self._saved_state(_pp_stage(s))) for s in self.PP2_STAGES]
+
+        assert not set(stages[0]) & set(stages[1]), "Pipeline stages must not share keys"
+        assert {**stages[0], **stages[1]} == expected
+
+    def test_mtp_layers_split_across_stages(self, no_expert_parallel):
+        expected = self._saved_state(_pp_stage([1, 2], mtp_layer_numbers=[1, 2]))["model"]
+        first = self._saved_state(_pp_stage([1], mtp_layer_numbers=[1]))["model"]
+        second = self._saved_state(_pp_stage([2], mtp_layer_numbers=[2]))["model"]
+        assert {**first, **second} == expected
+
+
+class TestGlobalUniqueParamName:
+    """Optimizer FQNs must use the same global layer names as the model state."""
+
+    def test_any_layer_type_gets_its_global_index(self, no_expert_parallel):
+        """Not only TransformerLayers: e.g. Mamba layers in a HybridStack."""
+        model = _pp_stage([3, 4])
+        param = model.module.decoder.layers[1].weight
+        assert get_global_unique_param_name([model], param) == "module.decoder.layers.3.weight"
+
+    def test_virtual_pipeline_chunks_use_their_own_offsets(self, no_expert_parallel):
+        chunks = [_pp_stage([3, 4]), _pp_stage([7, 8])]
+        names = [
+            get_global_unique_param_name(chunks, layer.weight)
+            for chunk in chunks
+            for layer in chunk.module.decoder.layers
+        ]
+        assert names == [f"module.decoder.layers.{i}.weight" for i in (2, 3, 6, 7)]
+
+    def test_distributed_optimizer_names_match(self, no_expert_parallel):
+        """Megatron-FSDP v1 and v2 optimizers must write the same FQNs."""
+        chunks = [_pp_stage([3, 4], mtp_layer_numbers=[2])]
+        optimizer = SimpleNamespace(model_chunks=chunks)
+        for param in chunks[0].parameters():
+            assert DistributedOptimizer._param_name(
+                optimizer, param
+            ) == get_global_unique_param_name(chunks, param)
 
 
 # ============================================================================
