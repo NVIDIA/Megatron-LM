@@ -2,7 +2,7 @@
 
 
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from typing import NoReturn, Optional, Protocol, Union
 
 import torch
 
@@ -52,6 +52,23 @@ def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
 
+class _GroupedOutputProjectionContext(Protocol):
+    """State supplied by autograd and saved by the grouped projection."""
+
+    groups: int
+    x_shape: torch.Size
+    needs_input_grad: tuple[bool, ...]
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return tensors stored by ``save_for_backward``."""
+        ...
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None:
+        """Save tensors for the backward pass."""
+        ...
+
+
 class _GroupedOutputProjection(torch.autograd.Function):
     """Per-group projection ``y[..., g, :] = x[..., g, :] @ w[g].T`` without layout copies.
 
@@ -61,7 +78,9 @@ class _GroupedOutputProjection(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, groups: int) -> torch.Tensor:
+    def forward(
+        ctx: _GroupedOutputProjectionContext, x: torch.Tensor, weight: torch.Tensor, groups: int
+    ) -> torch.Tensor:
         """x: [s, b, groups * d]; weight: [groups * r, d]. Returns [s, b, groups * r]."""
         x3 = x.reshape(-1, groups, x.size(-1) // groups)
         w3 = weight.view(groups, -1, x3.size(-1))
@@ -73,7 +92,9 @@ class _GroupedOutputProjection(torch.autograd.Function):
         return y.view(*x.shape[:-1], -1)
 
     @staticmethod
-    def backward(ctx, grad_y: torch.Tensor):
+    def backward(
+        ctx: _GroupedOutputProjectionContext, grad_y: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
         """Writes both gradients straight into contiguous buffers."""
         x3, weight = ctx.saved_tensors
         groups = ctx.groups
