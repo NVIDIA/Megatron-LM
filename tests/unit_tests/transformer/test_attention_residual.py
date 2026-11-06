@@ -795,12 +795,15 @@ class TestAttnResInitEquivalence:
             hidden_dropout=0.0,
             attention_dropout=0.0,
             add_bias_linear=False,
-            # LayerNorm (not RMSNorm): apex's FusedLayerNorm — selected by the
-            # local spec when apex is present — rejects RMSNorm, and LayerNorm
-            # is equally scale-invariant so the equivalence oracle is unchanged.
-            normalization="LayerNorm",
+            # The oracle compares norm(h / n) with norm(h). That is exact only up to the
+            # norm kernel's rounding (rsqrt of a scaled variance is not bit-equivariant), so
+            # keep the network from amplifying ULP-level seeds: a small init (the 0.2 of an
+            # earlier version turned a 1-ulp apex FusedLayerNorm difference into 2e-3 on the
+            # logits after four layers on H100) and the local RMSNorm, whose plain-PyTorch
+            # math stays within 1e-6 of scale-equivariant for these depths.
+            normalization="RMSNorm",
             layernorm_epsilon=1e-12,
-            init_method_std=0.2,
+            init_method_std=0.02,
             pipeline_dtype=torch.float32,
         )
         if enable_attn_res:
@@ -822,9 +825,30 @@ class TestAttnResInitEquivalence:
         )
         return model.cuda().eval()
 
+    @staticmethod
+    def _capture_norm_inputs(model):
+        """Record the input of every standalone norm of ``model`` in forward order."""
+        captured, handles = [], []
+        for name, module in model.named_modules():
+            if name.endswith(("input_layernorm", "pre_mlp_layernorm", "final_layernorm")):
+                handles.append(
+                    module.register_forward_hook(
+                        lambda mod, inp, out, name=name: captured.append(
+                            (name, inp[0].detach().float())
+                        )
+                    )
+                )
+        return captured, handles
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     @pytest.mark.parametrize("block_layers", [1, 2])
     def test_first_forward_matches_baseline(self, block_layers):
+        from megatron.core.transformer.attention_residual import (
+            attn_res_final_num_sources,
+            attn_res_num_sources,
+            is_attn_res_block_start,
+        )
+
         baseline = self._make_model(False)
         attnres = self._make_model(True, block_layers=block_layers)
 
@@ -836,9 +860,40 @@ class TestAttnResInitEquivalence:
         input_ids = torch.randint(0, 97, (2, 16), device='cuda')
         position_ids = torch.arange(16, device='cuda').unsqueeze(0).expand(2, -1)
 
-        with torch.no_grad():
-            out_base = baseline(input_ids, position_ids, None)
-            out_attn = attnres(input_ids, position_ids, None)
+        base_inputs, base_handles = self._capture_norm_inputs(baseline)
+        attn_inputs, attn_handles = self._capture_norm_inputs(attnres)
+        try:
+            with torch.no_grad():
+                out_base = baseline(input_ids, position_ids, None)
+                out_attn = attnres(input_ids, position_ids, None)
+        finally:
+            for handle in base_handles + attn_handles:
+                handle.remove()
+
+        # Block bookkeeping oracle: with zero pseudo-queries every sublayer (and the output
+        # head) sees the MEAN of its depth sources, i.e. the baseline residual sum divided
+        # by the number of values that layer aggregates (its sources plus, except for the
+        # attention sublayer of a block-start layer, the running partial sum).
+        num_layers = baseline.config.num_layers
+        assert [name for name, _ in base_inputs] == [name for name, _ in attn_inputs]
+        assert len(base_inputs) == 2 * num_layers + 1, [name for name, _ in base_inputs]
+        for (name, base_in), (_, attn_in) in zip(base_inputs, attn_inputs):
+            if name.endswith("final_layernorm"):
+                num_values = attn_res_final_num_sources(num_layers, block_layers)
+            else:
+                layer_number = int(name.split("layers.")[1].split(".")[0]) + 1
+                num_values = attn_res_num_sources(layer_number, block_layers)
+                if name.endswith("pre_mlp_layernorm") or not is_attn_res_block_start(
+                    layer_number, block_layers
+                ):
+                    num_values += 1
+            torch.testing.assert_close(
+                attn_in * num_values,
+                base_in,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=lambda m, name=name, n=num_values: f"{name} (x{n}): {m}",
+            )
 
         torch.testing.assert_close(out_attn, out_base, rtol=1e-4, atol=1e-4)
 
