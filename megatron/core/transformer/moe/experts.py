@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -1939,10 +1940,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _warn_sequential_mlp_deprecated() -> None:
+    """Emit the migration warning once, even when a model has many MoE layers."""
+    warn_single_rank(
+        "SequentialMLP is deprecated as of Megatron Core 0.21 and will be removed no earlier "
+        "than 0.23. Use TEGroupedMLP with transformer_impl='transformer_engine' and "
+        "moe_grouped_gemm=True (the default). The local backend still uses SequentialMLP; "
+        "switch to the Transformer Engine backend to migrate.",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
     This class executes each expert sequentially.
+
+    Deprecated in Megatron Core 0.21; removal will be no earlier than 0.23.
+    Use TEGroupedMLP on the Transformer Engine backend instead. This implementation
+    remains available during the migration period for local and per-expert workflows.
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
@@ -1954,6 +1972,8 @@ class SequentialMLP(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
     ):
+
+        _warn_sequential_mlp_deprecated()
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
             super().__init__(config=config)
