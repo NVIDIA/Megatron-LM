@@ -3729,7 +3729,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         role: te.pytorch.QuantizerRole,
                     ) -> te.pytorch.NVFP4Quantizer:
                         """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
-                        scale for activations."""
+                        scale for activations.
+                        """
                         tensor_type = role.tensor_type if role is not None else None
                         if not tensor_type:
                             tensor_type = "input"

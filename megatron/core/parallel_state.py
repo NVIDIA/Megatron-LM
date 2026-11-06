@@ -2,15 +2,16 @@
 
 """Model and data parallel groups.
 
-.. warning::
-    **This module is being deprecated.** It holds the process groups for a single, global
-    parallel grid. Megatron-Core is migrating to explicit process-group passing via
-    :class:`~megatron.core.process_groups_config.ProcessGroupCollection`.
+```{warning}
+**This module is being deprecated.** It holds the process groups for a single, global
+parallel grid. Megatron-Core is migrating to explicit process-group passing via
+{class}`~megatron.core.process_groups_config.ProcessGroupCollection`.
 
-    The group / rank / world-size accessors here read that global grid. A model using an
-    independent grid, such as an encoder with different parallelism from its language model,
-    can receive a group or rank from the wrong grid, or fail if the globals are uninitialized.
-    Passing the owning model's groups explicitly avoids that dependency.
+The group / rank / world-size accessors here read that global grid. A model using an
+independent grid, such as an encoder with different parallelism from its language model,
+can receive a group or rank from the wrong grid, or fail if the globals are uninitialized.
+Passing the owning model's groups explicitly avoids that dependency.
+```
 
     What this means for a change you are writing:
 
