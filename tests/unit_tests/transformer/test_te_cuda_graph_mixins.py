@@ -2,7 +2,11 @@
 
 """The shared mixin interface; layer behavior is covered by existing TE graph tests."""
 
+import pickle
+import subprocess
+import sys
 from functools import partial
+from textwrap import dedent
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,9 +16,16 @@ import torch
 import megatron.core.transformer.cuda_graphs as cuda_graphs
 from megatron.core.extensions.te_cuda_graphs import (
     TECudaGraphMixin,
+    get_te_cuda_graph_module_class,
     set_te_cuda_graph_current_microbatch,
 )
+from megatron.core.pipeline_parallel import combined_1f1b, schedules
+from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 
 
 def _config(backend="transformer_engine"):
@@ -39,7 +50,8 @@ class _Module(TECudaGraphMixin, MegatronModule):
 
 
 @pytest.mark.parametrize("backend", ["none", "local", "transformer_engine"])
-def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
+@pytest.mark.parametrize("combined", [False, True])
+def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend, combined):
     """A plain MegatronModule opts in only for TE, then dispatches by capture/training state."""
     module = _Module(_config(backend))
     # The outer model can use eager/local execution while its vision encoder uses TE.
@@ -50,6 +62,8 @@ def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
         decoder=SimpleNamespace(layers=[module]),
         mtp=SimpleNamespace(layers=[SimpleNamespace(mtp_model_layer=mtp_layer)]),
         vision_model=SimpleNamespace(decoder=SimpleNamespace(layers=[vision_layer])),
+        set_input_tensor=Mock(),
+        build_schedule_plan=Mock(),
     )
     vision_layer.te_cuda_graphs = [
         lambda hidden_states, is_first_microbatch: hidden_states,
@@ -57,10 +71,66 @@ def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
     ]
     monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", False)
     x = torch.tensor(3.0)
-    for microbatch in (0, 1):
-        set_te_cuda_graph_current_microbatch(model, microbatch)
-        assert mtp_layer.te_cuda_graph_current_microbatch == microbatch
-        torch.testing.assert_close(vision_layer(x), x + microbatch)
+    model.config.timers = None
+    model.config.enable_autocast = False
+    model.config.fp8 = None
+    if combined:
+        # Exercise the actual combined schedule, substituting only model computation.
+        class Plan(AbstractSchedulePlan):
+            """Run the vision layer in place of a full model chunk."""
+
+            event = None
+
+            @staticmethod
+            def run(
+                f_schedule_plan,
+                b_schedule_plan,
+                b_grad,
+                pre_forward,
+                pre_backward,
+                post_forward,
+                post_backward,
+            ):
+                """Replay the graph selected by the schedule's microbatch update."""
+                return vision_layer(x)
+
+        monkeypatch.setattr(
+            schedules.parallel_state, "get_context_parallel_world_size", Mock(return_value=1)
+        )
+        monkeypatch.setattr(
+            schedules.parallel_state, "is_pipeline_last_stage", Mock(return_value=False)
+        )
+        step = partial(
+            combined_1f1b.combined_forward_backward_step,
+            forward_step_func=lambda iterator, model, return_schedule_plan: (Plan(), None),
+            f_model=model,
+            b_model=None,
+            b_input_tensor=None,
+            b_output_tensor=None,
+            b_output_tensor_grad=None,
+        )
+    else:
+        step = partial(
+            schedules.forward_step,
+            forward_step_func=lambda iterator, model: (vision_layer(x), None),
+            model=model,
+            cp_group_size=1,
+            is_last_stage=False,
+        )
+    for microbatch, expected_slot in ((0, 0), (1, 1), (None, 1)):
+        output, *_ = step(
+            data_iterator=None,
+            num_microbatches=2,
+            input_tensor=None,
+            forward_data_store=[],
+            config=model.config,
+            current_microbatch=microbatch,
+        )
+        assert mtp_layer.te_cuda_graph_current_microbatch == expected_slot
+        assert vision_layer.te_cuda_graph_current_microbatch == expected_slot
+        if backend == "transformer_engine":
+            assert module.te_cuda_graph_current_microbatch == expected_slot
+        torch.testing.assert_close(output, x + expected_slot)
     events = []
     module.register_forward_pre_hook(lambda *_: events.append("eager"))
     if backend != "transformer_engine":
@@ -117,6 +187,47 @@ def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
     module.eval()
     torch.testing.assert_close(module(x), x * 2)
     assert events == ["eager"]
+
+
+def test_te_cuda_graph_class_serialization():
+    """Generated classes retain overrides and reconstruct canonically in a fresh process."""
+    original = HyperConnectionTransformerLayer
+    original_bases = original.__bases__
+    spec = ModuleSpec(module=original)
+    adapted = get_te_cuda_graph_module_class(spec.module)
+    assert get_te_cuda_graph_module_class(original) is adapted
+    assert get_te_cuda_graph_module_class(adapted) is adapted
+    assert get_te_cuda_graph_module_class(_Module) is _Module
+    assert get_te_cuda_graph_module_class(MegatronModule) is MegatronModule
+    assert adapted.__call__ is original.__call__
+    assert adapted.get_layer_static_inputs is original.get_layer_static_inputs
+    assert original.__bases__ == original_bases and spec.module is original
+    payload = pickle.dumps(adapted)
+    assert pickle.loads(payload) is adapted
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            dedent("""
+                import pickle
+                import sys
+
+                # Unpickle before explicitly importing or calling the class factory.
+                restored = pickle.loads(sys.stdin.buffer.read())
+                from megatron.core.extensions.te_cuda_graphs import get_te_cuda_graph_module_class
+                from megatron.core.transformer.hyper_connection_transformer_layer import (
+                    HyperConnectionTransformerLayer,
+                )
+                assert restored is get_te_cuda_graph_module_class(HyperConnectionTransformerLayer)
+                """),
+        ],
+        input=payload,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode()
 
 
 @pytest.mark.parametrize("failure", [None, "graph", "flush", "after"])
