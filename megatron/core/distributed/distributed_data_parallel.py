@@ -161,6 +161,7 @@ class DistributedDataParallel(_BaseDataParallel):
         dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
+            ddp_config._bucket_size_resolved = True
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
