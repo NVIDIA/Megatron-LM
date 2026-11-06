@@ -220,6 +220,20 @@ def test_restore_reuses_previous_packed_layouts(setup):
                 assert value == reference, (name, item.name)
 
 
+def test_prepare_forward_keeps_the_model_restored_state(setup):
+    """The stack restores its start boundary only when the model wrapper has not."""
+    cfg, spec, groups = setup
+    adapter = _stack(cfg, spec, groups).forward_adapter
+    codec = V41StateCodec(cfg, BatchShape(8, 2), groups.cp)
+    csa, mhc, _ = codec.restore({}, adapter.start)
+    context = V41ForwardContext(cross_layer_state=csa, mhc_state=mhc, codec=codec, values={})
+    assert adapter.prepare_forward(None, None, None, context) is context
+    assert context.cross_layer_state is csa and context.mhc_state is mhc
+    fresh = V41ForwardContext(codec=codec, values={})
+    assert adapter.prepare_forward(None, None, None, fresh) is fresh
+    assert fresh.cross_layer_state is not None and fresh.cross_layer_state is not csa
+
+
 class RoutedDense(nn.Module):
     """Small differentiable MoE substitute for CPU orchestration checks."""
 

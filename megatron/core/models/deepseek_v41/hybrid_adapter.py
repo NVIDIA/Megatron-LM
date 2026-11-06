@@ -206,9 +206,12 @@ class DeepSeekV41Adapter:
             raise NotImplementedError('V4.1 draft supports training/full-sequence evaluation')
         if not isinstance(context, V41ForwardContext) or context.codec is None:
             raise ValueError('V4.1 requires a model-owned tensor-state forward context')
-        context.cross_layer_state, context.mhc_state, _ = context.codec.restore(
-            context.values, self.start
-        )
+        # The model wrapper already restored this boundary from the same values; a second
+        # restore would rebuild identical layouts for every chunk and microbatch.
+        if context.cross_layer_state is None:
+            context.cross_layer_state, context.mhc_state, _ = context.codec.restore(
+                context.values, self.start
+            )
         return context
 
     def _prepare_region(self, layer, hidden, context, kwargs, loss):
