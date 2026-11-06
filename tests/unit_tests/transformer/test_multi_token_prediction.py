@@ -4611,6 +4611,7 @@ class TestMultiTokenPredictionHybrid:
             assert kwargs["loss_mask"] is loss_mask
             assert kwargs["mtp_input_mask"] is mtp_input_mask
             assert kwargs["metric_avg_group"] is metric_avg_group
+            assert kwargs["loss_normalization_group"] is metric_avg_group
             assert kwargs["main_hidden_states"] is hidden_states
             return kwargs["main_hidden_states"]
 

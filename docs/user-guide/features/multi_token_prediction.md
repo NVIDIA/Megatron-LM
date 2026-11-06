@@ -53,6 +53,28 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 - For models with MTP layers, the final LayerNorm sits in the stage that contains the last decoder layer, not in the post-process stage. That can change gradient norm reduction slightly in deterministic mode when LayerNorm would otherwise live in another stage. For bitwise alignment, disable gradient norm clipping.
 - MTP loss is computed in the post-processing stage.
 
+### Per-Token Loss Normalization
+
+With `calculate_per_token_loss=True`, `finalize_model_grads` divides the
+accumulated gradients by the main-loss valid-token count summed over the DP×CP
+group (including GTP-remat peers when active). Rolling and masking leave fewer
+valid MTP targets than main-loss tokens, so each MTP depth scales its summed
+loss by a main-token/MTP-token ratio. Both counts are summed over that same
+DP×CP group before taking the ratio, so the result does not depend on how a
+microbatch's tokens are split across DP and CP ranks. Each prediction depth adds
+a two-element all-reduce per microbatch.
+
+For gradient-accumulation microbatch `b`, let `N_b` be the main-token count,
+`M_b` the MTP-token count, and `S_b` the summed MTP loss, all over DP×CP. Each
+depth contributes `alpha * sum_b(N_b * S_b / max(M_b, 1)) / sum_b(N_b)`, where
+`alpha = mtp_loss_scaling_factor / mtp_num_layers`. This is the global per-MTP-token
+mean `alpha * sum_b(S_b) / sum_b(M_b)` when a step has one microbatch; with more
+microbatches, each keeps its own ratio.
+
+`GPTModel` and `HybridModel` pass this group to `process_mtp_loss` as
+`loss_normalization_group`. Direct callers that omit it get the previous
+behavior: the counts are summed over the CP group only.
+
 ## Unsupported Combinations
 
 Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported

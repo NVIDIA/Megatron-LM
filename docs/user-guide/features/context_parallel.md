@@ -70,8 +70,9 @@ The following constraints apply:
 - Inference uses CP1. These runtime training groups do not enable CP inference.
 
 MTP with `--calculate-per-token-loss` sums the main and MTP valid-token counts
-over the effective CP group before scaling gradients. This also corrects static
-CP>1 runs whose ranks have different valid-token counts; it adds a two-element
-all-reduce per MTP depth per microbatch. Logged `mtp_N loss` is a global
+over the DP×CP group that normalizes gradients (a superset of the effective CP
+group) before scaling gradients. This also corrects static CP>1 and DP>1 runs
+whose ranks have different valid-token counts; it adds a two-element all-reduce
+per MTP depth per microbatch. Logged `mtp_N loss` is a global
 token-weighted mean, including under static CP, so packed or masked runs may log
 different values from older mean-of-microbatch-means metrics.

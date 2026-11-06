@@ -801,6 +801,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 else:
                     inference_context.mtp_decoder_hidden_states = hidden_states
             elif not in_inference_mode:
+                # The group finalize_model_grads uses for the per-token loss denominator.
+                loss_normalization_group = (
+                    getattr(self.pg_collection, 'dp_cp_gtp_remat', None) or self.pg_collection.dp_cp
+                )
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -817,10 +821,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                     mtp_input_mask=mtp_input_mask,
-                    metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
-                    ),
+                    metric_avg_group=loss_normalization_group,
+                    loss_normalization_group=loss_normalization_group,
                 )
         sequence_parallel_override = False
 

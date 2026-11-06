@@ -974,6 +974,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     inference_context.mtp_decoder_hidden_states = hidden_states
             elif mtp_forward_ran:
                 assert mtp_inputs is not None
+                # The group finalize_model_grads uses for the per-token loss denominator.
+                loss_normalization_group = (
+                    getattr(self.pg_collection, 'dp_cp_gtp_remat', None) or self.pg_collection.dp_cp
+                )
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
@@ -991,11 +995,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=mtp_inputs.input_ids,
                     mtp_input_mask=mtp_inputs.mtp_input_mask,
-                    metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
-                    ),
+                    metric_avg_group=loss_normalization_group,
                     main_hidden_states=hidden_states,
+                    loss_normalization_group=loss_normalization_group,
                 )
         # Give callers a post-decoder hook before the default output projection and loss path.
         if output_processor is not None:

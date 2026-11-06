@@ -581,6 +581,7 @@ class TestHybridModel:
         assert self.model.mtp.mtp_input_mask is mtp_input_mask
         assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
         assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
+        assert captured_loss_args["loss_normalization_group"] is self.model.pg_collection.dp_cp
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config

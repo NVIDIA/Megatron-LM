@@ -1111,6 +1111,7 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    loss_normalization_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1141,6 +1142,12 @@ def process_mtp_loss(
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
         main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
             Defaults to the first chunk of ``hidden_states``.
+        loss_normalization_group (Optional[ProcessGroup]): Group over which
+            ``finalize_model_grads`` sums the per-token loss denominator: DP x CP, plus the
+            GTP-remat peers when active. With ``calculate_per_token_loss``, the main and MTP
+            valid-token counts are summed over this group before their ratio scales the MTP
+            loss. It must contain the static or runtime CP group. Defaults to the CP group,
+            which keeps the ratio local to each data-parallel replica.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
@@ -1341,20 +1348,25 @@ def process_mtp_loss(
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            # finalize_model_grads divides by the global main-loss token count.
-            # Use one main/MTP token ratio for this logical microbatch, independent
-            # of its CP partition. Rolling and masking can leave different ratios
-            # (or no valid tokens) on individual ranks. Keep the local counts above
-            # unchanged for logging, which reduces them separately over DP+CP.
+            # finalize_model_grads sums the main-loss token count over its DP x CP
+            # group and divides every gradient by it. Sum both counts over that same
+            # group so each microbatch slot gets one main/MTP token ratio, independent
+            # of how its tokens are split across DP and CP ranks. Rolling and masking
+            # can leave different ratios (or no valid tokens) on individual ranks.
+            # Keep the local counts above unchanged for logging, which reduces them
+            # separately over DP+CP.
             normalization_tokens = torch.stack((original_num_tokens, num_tokens))
-            if cp_group is not None and cp_group.size() > 1:
+            count_group = (
+                loss_normalization_group if loss_normalization_group is not None else cp_group
+            )
+            if count_group is not None and count_group.size() > 1:
                 torch.distributed.all_reduce(
-                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
+                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=count_group
                 )
             main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
             # Clamp only after the collective; empty ranks must participate too.
-            # This preserves CP partition invariance, not a global MTP-token mean
-            # across different DP microbatches with different main/MTP ratios.
+            # Each gradient-accumulation microbatch keeps its own ratio, so this is
+            # the global MTP-token mean only when a step has one microbatch.
             mtp_loss_normalized = (
                 mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
             )
