@@ -690,7 +690,7 @@ class KdaDhuKernel:
         zero8 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
         for e in cutlass.range_constexpr(8):
             zero8[e] = cutlass.BFloat16(0.0)
-        row_offset = ((sequence * heads + head) * _DK + tidx) * _DV * 4
+        row_offset = cutlass.Int64((sequence * heads + head) * _DK + tidx) * (_DV * 4)
         dht_row = cutlass.Int64(dht.iterator.toint()) + cutlass.Int64(row_offset)
         for c in cutlass.range_constexpr(_DV):
             ds[c] = _ldg_f32(dht_row + c * 4)

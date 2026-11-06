@@ -42,21 +42,21 @@ def _force_path(monkeypatch, path):
     monkeypatch.setattr(launcher, "prefer_tape", lambda *args: path == "tape")
 
 
-def _inputs(batch, seq_len, gate_range, seed=0):
+def _inputs(batch, seq_len, gate_range, seed=0, heads=_HEADS):
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
     def randn(*shape):
         return torch.randn(*shape, generator=generator, device="cuda")
 
-    shape = (batch, seq_len, _HEADS, _DIM)
+    shape = (batch, seq_len, heads, _DIM)
     q = torch.nn.functional.normalize(randn(*shape), dim=-1).bfloat16()
     k = torch.nn.functional.normalize(randn(*shape), dim=-1).bfloat16()
     v = randn(*shape).bfloat16()
     raw_g = randn(*shape).bfloat16()
-    beta = torch.rand(batch, seq_len, _HEADS, generator=generator, device="cuda")
+    beta = torch.rand(batch, seq_len, heads, generator=generator, device="cuda")
     low, high = gate_range
-    A_log = (low + (high - low) * torch.rand(_HEADS, generator=generator, device="cuda")).float()
-    dt_bias = 0.1 * randn(_HEADS * _DIM)
+    A_log = (low + (high - low) * torch.rand(heads, generator=generator, device="cuda")).float()
+    dt_bias = 0.1 * randn(heads * _DIM)
     do = randn(*shape).bfloat16()
     return (q, k, v, raw_g, beta, A_log, dt_bias), do
 
@@ -118,6 +118,31 @@ def test_fused_bwd_matches_fla(monkeypatch, path, lengths, safe_gate, lower_boun
 
     names = ("out", "dq", "dk", "dv", "draw_g", "dbeta", "dA_log", "ddt_bias")
     for name, got, want in zip(names, candidate, reference):
+        assert torch.isfinite(got).all(), name
+        relative_l2 = ((got.float() - want.float()).norm() / want.float().norm()).item()
+        assert relative_l2 < 1e-2, f"{name}: relative L2 {relative_l2:.3e}"
+
+
+@pytest.mark.parametrize("path", ["tape", "fused"])
+def test_fused_bwd_byte_offsets_past_2gib(monkeypatch, path):
+    """Rows of the FP32 gate cumsum past token 65536 at 64 heads lie more than
+    2 GiB into the tensor, so their byte offsets need 64 bits."""
+    from fla.ops.kda import chunk_kda as fla_chunk_kda
+
+    adapter = _adapter()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
+    _force_path(monkeypatch, path)
+    seq_len = 66000
+    leaves, do = _inputs(1, seq_len, (-1.0, 1.0), heads=64)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    reference = _grads(fla_chunk_kda, leaves, do, cu_seqlens, False, None)
+    candidate = _grads(adapter.chunk_kda, leaves, do, cu_seqlens, False, None)
+    names = ("out", "dq", "dk", "dv", "draw_g", "dbeta", "dA_log", "ddt_bias")
+    for name, got, want in zip(names, candidate, reference):
+        # The last chunks hold the rows past the 2 GiB boundary.
+        if got.dim() == 4:
+            got, want = got[:, 65536:], want[:, 65536:]
         assert torch.isfinite(got).all(), name
         relative_l2 = ((got.float() - want.float()).norm() / want.float().norm()).item()
         assert relative_l2 < 1e-2, f"{name}: relative L2 {relative_l2:.3e}"

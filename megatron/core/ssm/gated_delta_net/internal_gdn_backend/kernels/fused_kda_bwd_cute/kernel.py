@@ -2089,7 +2089,8 @@ class FusedKdaBwdKernel:
             row = u // 16 + 8 * i
             if row < valid:
                 _copy_bf16x8_s2g(
-                    _swz_token(base, row, c0), g_base + (tok0 + row) * row_stride + c0 * 2
+                    _swz_token(base, row, c0),
+                    g_base + cutlass.Int64(tok0 + row) * row_stride + c0 * 2,
                 )
 
     @cute.jit
@@ -2200,13 +2201,16 @@ class FusedKdaBwdKernel:
     def _row_gates(self, kind: cutlass.Constexpr, row, g_row, row_stride, tok0, valid, g8, a8, b8):
         """Issue the gate loads of one ``_row_tiles`` row: its own gate row and the
         anchors the kind needs (rows clamped to the chunk tail)."""
-        _ldg_f32x8(g_row + (tok0 + cutlass.min(row, valid - 1)) * row_stride, g8)
+        _ldg_f32x8(g_row + cutlass.Int64(tok0 + cutlass.min(row, valid - 1)) * row_stride, g8)
         if cutlass.const_expr(kind == 0 and not self.tape):
-            _ldg_f32x8(g_row + (tok0 + valid - 1) * row_stride, a8)
+            _ldg_f32x8(g_row + cutlass.Int64(tok0 + valid - 1) * row_stride, a8)
         if cutlass.const_expr(kind == 2):
             first = (row // _BC) * _BC
-            _ldg_f32x8(g_row + (tok0 + cutlass.min(first + _BC - 1, valid - 1)) * row_stride, a8)
-            _ldg_f32x8(g_row + (tok0 + cutlass.min(first, valid - 1)) * row_stride, b8)
+            _ldg_f32x8(
+                g_row + cutlass.Int64(tok0 + cutlass.min(first + _BC - 1, valid - 1)) * row_stride,
+                a8,
+            )
+            _ldg_f32x8(g_row + cutlass.Int64(tok0 + cutlass.min(first, valid - 1)) * row_stride, b8)
 
     @cute.jit
     def _cm_phase_a(
