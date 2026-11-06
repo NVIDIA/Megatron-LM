@@ -1015,6 +1015,13 @@ def pretrain_cfg_container_from_args(
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+    # Preserve the legacy CLI spelling; native configs use Core's canonical mode.
+    if rerunsm_kwargs.get("rerun_mode") == "report_stats":
+        warn_rank_0(
+            "Prefer --rerun-mode report_determinism_stats over --rerun-mode report_stats "
+            "for consistency with the naming in cfg.rerun_state_machine."
+        )
+        rerunsm_kwargs["rerun_mode"] = "report_determinism_stats"
 
     optim_cfg = _default_config_from_args(OptimizerConfig, args)
     if model_cfg is None:
