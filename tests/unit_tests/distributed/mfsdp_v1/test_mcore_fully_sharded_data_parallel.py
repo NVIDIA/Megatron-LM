@@ -1721,3 +1721,181 @@ class TestMegatronFsdpSynchronousGradReduce:
         wrong width here rescales every gradient in the run.
         """
         self._reduce_once(sharding_strategy)
+
+
+class TestMegatronFsdpSharedEmbeddingOverlapSchedule:
+    """DP-Outer reduction of a word embedding shared with a multi-token prediction (MTP) layer.
+
+    With the embedding in its own bucket, the 1F1B overlap schedule runs the model and the MTP
+    layer in separate backward passes, so it reduces that bucket twice in the last microbatch.
+    The in-place DP-Outer reduction must still run only once per optimization step.
+    """
+
+    EXPERT_MODEL_PARALLEL_SIZE = 2
+    NUM_OPTIMIZER_INSTANCES = 2
+    NUM_MICROBATCHES = 2
+    NUM_STEPS = 2
+    SEQ_LEN = 32
+    VOCAB_SIZE = 128
+
+    @classmethod
+    def _config(cls, overlap_moe_expert_parallel_comm):
+        return TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_dtype="fp32",
+            expert_model_parallel_size=cls.EXPERT_MODEL_PARALLEL_SIZE,
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.1,
+            overlap_moe_expert_parallel_comm=overlap_moe_expert_parallel_comm,
+            attention_backend="unfused",
+            deterministic_mode=True,
+        )
+
+    @classmethod
+    def _gpt_model(cls, config):
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_decoder_block_spec,
+            get_gpt_mtp_block_spec,
+        )
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec.layer_specs[-1], True),
+            vocab_size=cls.VOCAB_SIZE,
+            pre_process=True,
+            post_process=True,
+            max_sequence_length=cls.SEQ_LEN,
+        ).cuda()
+
+    @staticmethod
+    def _forward_step(data_iterator, model, return_schedule_plan=False):
+        def loss_func(output_tensor):
+            loss = output_tensor.float().mean()
+            return loss, {"lm loss": loss}
+
+        data = next(data_iterator)
+        if return_schedule_plan:
+            return model.build_schedule_plan(**data), loss_func
+        return model(**data), loss_func
+
+    def _train_step(self, fsdp_model, optimizer, data):
+        """Run one step through the no-pipelining schedule, as the training loop does.
+
+        The schedule runs the 1F1B overlap schedule when overlap_moe_expert_parallel_comm is
+        set, and runs every microbatch but the last under no_sync(), so the last one reduces
+        over DP-Outer.
+        """
+        from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
+
+        optimizer.zero_grad()
+        fsdp_model.config.no_sync_func = fsdp_model.no_sync
+        forward_data_store = forward_backward_no_pipelining(
+            forward_step_func=self._forward_step,
+            data_iterator=iter([data] * self.NUM_MICROBATCHES),
+            model=fsdp_model,
+            num_microbatches=self.NUM_MICROBATCHES,
+            seq_length=self.SEQ_LEN,
+            micro_batch_size=1,
+        )
+        optimizer.step()
+        return torch.stack([output["lm loss"] for output in forward_data_store])
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_overlap_schedule_matches_standard_schedule(self, outer_dp_sharding_strategy):
+        """
+        HSDP training with the 1F1B overlap schedule must match the standard schedule.
+
+        DP-Shard uses optim_grads. Under optim_grads_params the 1F1B overlap schedule also
+        diverges from the standard schedule without DP-Outer, which is a separate issue.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_optimizer,
+        )
+        from megatron.core.pipeline_parallel.utils import set_streams
+        from tests.unit_tests.a2a_overlap.utils import deterministic_mode
+
+        group_size = self.EXPERT_MODEL_PARALLEL_SIZE * self.NUM_OPTIMIZER_INSTANCES
+        if Utils.world_size % group_size != 0:
+            pytest.skip(f"Requires a world size divisible by {group_size}.")
+
+        Utils.initialize_model_parallel(
+            expert_model_parallel_size=self.EXPERT_MODEL_PARALLEL_SIZE,
+            num_distributed_optimizer_instances=self.NUM_OPTIMIZER_INSTANCES,
+        )
+        try:
+            with deterministic_mode():
+                # Create the 1F1B communication stream up front, as the a2a_overlap tests do.
+                set_streams()
+                model_parallel_cuda_manual_seed(0)
+                torch.manual_seed(0)
+                ref_model = self._gpt_model(self._config(overlap_moe_expert_parallel_comm=False))
+                test_model = self._gpt_model(self._config(overlap_moe_expert_parallel_comm=True))
+                test_model.load_state_dict(ref_model.state_dict())
+
+                def fully_shard(model):
+                    fsdp_model = FullyShardedDataParallel(
+                        config=model.config,
+                        ddp_config=DistributedDataParallelConfig(
+                            data_parallel_sharding_strategy="optim_grads",
+                            overlap_grad_reduce=True,
+                            overlap_param_gather=True,
+                            use_megatron_fsdp=True,
+                            num_distributed_optimizer_instances=self.NUM_OPTIMIZER_INSTANCES,
+                            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+                            # Give the word embedding a bucket of its own.
+                            bucket_size=model.embedding.word_embeddings.weight.numel(),
+                        ),
+                        module=model,
+                        fsdp_unit_modules=[TransformerLayer],
+                    )
+                    optimizer = fully_shard_optimizer(
+                        optimizer=torch.optim.SGD(fsdp_model.parameters(), lr=1.0)
+                    )
+                    return fsdp_model, optimizer
+
+                ref_fsdp, ref_optimizer = fully_shard(ref_model)
+                test_fsdp, test_optimizer = fully_shard(test_model)
+
+                data = {
+                    "input_ids": torch.randint(0, self.VOCAB_SIZE, (1, self.SEQ_LEN)).cuda(),
+                    "labels": torch.randint(0, self.VOCAB_SIZE, (1, self.SEQ_LEN)).cuda(),
+                    "position_ids": torch.arange(self.SEQ_LEN).unsqueeze(0).cuda(),
+                    "attention_mask": torch.ones(
+                        (1, 1, self.SEQ_LEN, self.SEQ_LEN), dtype=torch.bool
+                    ).cuda(),
+                }
+                for step in range(self.NUM_STEPS):
+                    ref_loss = self._train_step(ref_fsdp, ref_optimizer, data)
+                    test_loss = self._train_step(test_fsdp, test_optimizer, data)
+                    # The two schedules reduce the embedding gradient in a different order.
+                    assert_close(
+                        test_loss,
+                        ref_loss,
+                        rtol=1e-3,
+                        atol=0,
+                        msg=lambda msg: f"Loss mismatch at step {step}: {msg}",
+                    )
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
