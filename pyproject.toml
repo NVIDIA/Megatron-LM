@@ -123,6 +123,7 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    "flashinfer-python>=0.7.2,<0.8.0",
 ]
 
 otel = [
