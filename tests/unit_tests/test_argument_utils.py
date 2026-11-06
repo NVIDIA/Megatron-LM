@@ -83,6 +83,19 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    args = _minimal_training_args(monkeypatch)
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = version
+    args.nccl_ub = True
+    args.ckpt_format = "fsdp_dtensor"
+    args = validate_args(args)
+    assert args.fsdp_manual_registration is (version == 1)
+    assert not args.fsdp_double_buffer
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()

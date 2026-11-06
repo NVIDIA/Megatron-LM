@@ -276,6 +276,66 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     )
 
 
+@pytest.mark.parametrize(
+    "version, disable_symmetric_registration", [(1, False), (1, True), (2, False)]
+)
+def test_megatron_fsdp_finalization(
+    monkeypatch, run_config, version, disable_symmetric_registration
+):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.train.micro_batch_size = 1
+    run_config.checkpoint.ckpt_format = "fsdp_dtensor"
+    ddp = run_config.ddp
+    ddp.use_megatron_fsdp = True
+    ddp.megatron_fsdp_version = version
+    ddp.nccl_ub = True
+    ddp.disable_symmetric_registration = disable_symmetric_registration
+    ddp.average_in_collective = True
+    ddp.overlap_grad_reduce = True
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+
+    for _ in range(2):
+        before = copy.deepcopy(run_config.to_dict())
+        run_config.validate()
+        assert run_config.to_dict() == before
+        run_config.finalize()
+        assert ddp.fsdp_manual_registration is (version == 1)
+        assert not ddp.fsdp_double_buffer
+        assert ddp.average_in_collective is (version != 1 or disable_symmetric_registration)
+        assert ddp.use_distributed_optimizer is (version == 1)
+        assert run_config.optimizer.use_distributed_optimizer is (version == 1)
+        assert ddp.overlap_grad_reduce is (version == 1)
+        assert ddp.overlap_param_gather is (version == 1)
+        assert run_config.optimizer.overlap_param_gather is (version == 1)
+        if version == 2:
+            assert not transformer.gradient_accumulation_fusion
+            assert not transformer.deallocate_pipeline_outputs
+            assert not ddp.fsdp_all_gather_in_start_param_sync
+
+
+@pytest.mark.parametrize("expert_override", [None, "no_shard"])
+def test_ddp_finalization_respects_recipe_edits(run_config, expert_override):
+    ddp = run_config.ddp
+    ddp.expert_data_parallel_sharding_strategy = expert_override
+    ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    ddp.outer_dp_sharding_strategy = "optim"
+    ddp.megatron_fsdp_max_pool_double_buffer = True
+    before = copy.deepcopy(run_config.to_dict())
+    ddp.validate()
+    assert run_config.to_dict() == before
+    ddp.finalize()
+    assert ddp.expert_data_parallel_sharding_strategy == (expert_override or "optim_grads_params")
+    assert ddp.expert_outer_dp_sharding_strategy == "optim"
+    assert ddp.fsdp_double_buffer
+    resolved = copy.deepcopy(run_config.to_dict())
+    ddp.finalize()
+    assert run_config.to_dict() == resolved
+
+
 @pytest.mark.parametrize("storage", ["dict", "yaml"])
 @pytest.mark.parametrize(
     "model_cls",

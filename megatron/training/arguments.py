@@ -3,7 +3,6 @@
 """Megatron arguments."""
 
 import argparse
-import dataclasses
 import json
 import os
 import re
@@ -1046,12 +1045,10 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
-        if args.nccl_ub:
-            # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
+            # V1 supplies manual registration; v2 uses symmetric-memory registration instead.
             args.fsdp_manual_registration = True
-            args.fsdp_double_buffer = True
-            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.
@@ -2910,19 +2907,13 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
-    ArgumentGroupFactory(
-        DistributedDataParallelConfig,
-        exclude=[
-            field.name for field in dataclasses.fields(DistributedDataParallelConfig)
-            if field.name != "use_torch_fsdp2"
-        ],
-    ).build_group(parser, "DDP/FSDP wrapper")
+    group.add_argument('--use-torch-fsdp2', action='store_true', default=False,
+                       help="Use PyTorch FSDP2. Cannot be used together with use_megatron_fsdp.")
 
     group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
                        help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")

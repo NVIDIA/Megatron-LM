@@ -562,8 +562,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         elif isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             raise ValueError("TorchFullyShardedDataParallelConfig requires ddp.use_torch_fsdp2.")
         if self.ddp.use_megatron_fsdp:
-            if self.ddp.megatron_fsdp_version == 2 and self.optimizer.use_distributed_optimizer:
-                raise ValueError("Megatron FSDP v2 cannot use the distributed optimizer.")
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
             if self.checkpoint.ckpt_format != "fsdp_dtensor":
@@ -610,10 +608,12 @@ class PretrainConfigContainer(ConfigContainerBase):
                         "Fully sharded parameters do not support DP weight-hash checks."
                     )
         if self.ddp.fsdp_manual_registration and not (
-            self.ddp.use_megatron_fsdp and self.ddp.nccl_ub
+            self.ddp.use_megatron_fsdp
+            and self.ddp.megatron_fsdp_version == 1
+            and self.ddp.nccl_ub
         ):
             raise ValueError(
-                "Manual FSDP registration requires Megatron FSDP with NCCL user buffers."
+                "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
             )
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
@@ -789,9 +789,18 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.ddp.megatron_fsdp_use_decoupled_grad = (
                     self.optimizer.use_precision_aware_optimizer
                 )
-            if self.ddp.nccl_ub:
-                self.ddp.fsdp_manual_registration = True
-                self.ddp.fsdp_double_buffer = True
+                if not self.ddp.disable_symmetric_registration:
+                    self.ddp.average_in_collective = False
+                if self.ddp.nccl_ub:
+                    self.ddp.fsdp_manual_registration = True
+            else:
+                # V2 owns sharded storage and communication, not DDP's optimizer/overlap path.
+                self.optimizer.use_distributed_optimizer = False
+                self.optimizer.overlap_param_gather = False
+                self.optimizer.overlap_param_gather_with_optimizer_step = False
+                self.ddp.overlap_param_gather = False
+                self.ddp.overlap_grad_reduce = False
+                self.ddp.fsdp_all_gather_in_start_param_sync = False
         # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
         self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
             not self.ddp.use_torch_fsdp2
@@ -806,6 +815,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.ddp.align_param_gather = False
             if self.ddp.use_megatron_fsdp:
                 if self.ddp.megatron_fsdp_version == 2:
+                    transformer.gradient_accumulation_fusion = False
                     transformer.deallocate_pipeline_outputs = False
                 if transformer.cuda_graph_impl != "none":
                     self.ddp.megatron_fsdp_cuda_graph_mode = True
