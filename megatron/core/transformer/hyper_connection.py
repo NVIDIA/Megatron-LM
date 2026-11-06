@@ -18,7 +18,7 @@ from megatron.core.transformer.residual_recompute import (
     finalize_recompute_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -382,6 +382,9 @@ class HyperConnectionModule(MegatronModule):
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
         s, b, _ = x.shape
+        # mapping_proj's forward never runs, since its weight is read directly, so its forward
+        # pre-hook cannot wait for an overlapped parameter gather; wait here instead.
+        ensure_params_ready((self.mapping_proj.weight,))
 
         if self._proj_rms_compute_h_op is not None:
             # Fused path: proj_rms + compute_h in one kernel launch sequence

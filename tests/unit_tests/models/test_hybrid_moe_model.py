@@ -214,6 +214,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mhc_keep_mappings_in_fp32": False,
     "mhc_learned_output_contract": True,
     "mhc_norm_eps_inside_sqrt": False,
+    "mhc_recompute_attn_cuda_graph_split": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
