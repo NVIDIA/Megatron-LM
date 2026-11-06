@@ -196,7 +196,45 @@ def test_module_spec_is_built_from_explicit_backend():
     assert indexer_builder.keywords["submodules"].compressor is compressor_builder
 
 
-def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
+class _ReferenceBatchedLinear(torch.nn.Module):
+    """Exercise the batched-weight contract even with a TE version predating BatchedLinear."""
+
+    def __init__(
+        self,
+        groups,
+        in_features,
+        out_features,
+        *,
+        input_batch_dim,
+        device,
+        dtype,
+        init_method,
+        **kwargs,
+    ):
+        super().__init__()
+        assert input_batch_dim == -2
+        self.groups = groups
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(
+            torch.empty(groups * out_features, in_features, device=device, dtype=dtype)
+        )
+        with torch.no_grad():
+            init_method(self.weight)
+
+    def forward(self, inputs):
+        return torch.einsum(
+            "...gd,grd->...gr", inputs, self.weight.view(self.groups, self.out_features, -1)
+        )
+
+    def get_extra_state(self):
+        return None
+
+    def set_extra_state(self, state):
+        assert state is None
+
+
+@pytest.mark.parametrize('batched_linear', [None, _ReferenceBatchedLinear])
+def test_grouped_output_projection_respects_cpu_initialization(monkeypatch, batched_linear):
     """The custom grouped projection follows the standard CPU/no-init constructor contract."""
     from megatron.core.transformer import identity_op
     from megatron.core.transformer.experimental_attention_variant import (
@@ -230,6 +268,7 @@ def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
         linear_q_up_proj=identity_op.IdentityOp,
         linear_kv_proj=identity_op.IdentityOp,
         core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_o_group_proj=batched_linear,
         linear_proj=identity_op.IdentityOp,
     )
 
@@ -242,7 +281,12 @@ def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
         compress_ratio=0,
     )
 
-    assert attention.linear_o_group_proj.device.type == "cpu"
+    assert attention._linear_o_group_proj_weight.device.type == "cpu"
+    state = attention.state_dict()
+    assert 'linear_o_group_proj' in state
+    assert 'linear_o_group_proj.weight' not in state
+    assert 'linear_o_group_proj._extra_state' not in state
+    attention.load_state_dict(state, strict=True)
 
 
 def test_config_includes_mtp_ratio_and_derives_dimensions():
@@ -347,6 +391,18 @@ def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
     assert "compress_ratio" not in normalized.params
     assert normalized.submodules.q_layernorm is not IdentityOp
     assert normalized.submodules.kv_layernorm is not IdentityOp
+
+    from megatron.core.transformer.experimental_attention_variant.dsv4_batched_linear import (
+        DSv4BatchedLinear,
+    )
+
+    assert attention.submodules.linear_o_group_proj is DSv4BatchedLinear
+    assert normalized.submodules.linear_o_group_proj is DSv4BatchedLinear
+    from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+        csa2_attention_spec,
+    )
+
+    assert csa2_attention_spec.submodules.linear_o_group_proj is DSv4BatchedLinear
 
 
 @pytest.mark.parametrize("variant", [None, "dsa"])
@@ -813,8 +869,223 @@ class TestDSv4HybridGroupedOutput:
 
         expected_out = output_projection_groups * output_projection_lora_rank
         expected_in = (config.v_head_dim * config.num_attention_heads) // output_projection_groups
-        assert attn.linear_o_group_proj.shape == (expected_out, expected_in)
-        assert attn.linear_o_group_proj.requires_grad
+        weight = attn._linear_o_group_proj_weight
+        expected_shape = (expected_out, expected_in)
+        assert weight.shape == expected_shape
+        assert weight.requires_grad
+
+    def test_grouped_projection_checkpoint_compatibility(self):
+        """Native and batched storage share plain and distributed checkpoint keys/layouts."""
+        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
+        from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer
+        from megatron.core.transformer.spec_utils import build_module
+
+        config = _make_config()
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        spec = _make_attention_spec(config)
+        spec.submodules = replace(spec.submodules, linear_o_group_proj=None)
+        native = build_module(spec, config=config, layer_number=1, pg_collection=pg)
+        spec.submodules = replace(spec.submodules, linear_o_group_proj=_ReferenceBatchedLinear)
+        batched = build_module(spec, config=config, layer_number=1, pg_collection=pg)
+        legacy = native.state_dict()
+        batched.load_state_dict(legacy, strict=True)
+        restored = batched.state_dict()
+        assert restored.keys() == legacy.keys()
+        assert restored['linear_o_group_proj'].shape == legacy['linear_o_group_proj'].shape
+        torch.testing.assert_close(restored['linear_o_group_proj'], legacy['linear_o_group_proj'])
+        native.load_state_dict(restored, strict=True)
+        assert (
+            len([n for n, _ in batched.named_parameters() if n.startswith('linear_o_group_proj')])
+            == 1
+        )
+        inputs = torch.randn(
+            3,
+            2,
+            config.output_projection_groups,
+            batched._linear_o_group_proj_weight.size(-1),
+            dtype=config.params_dtype,
+        )
+        torch.testing.assert_close(
+            batched._apply_linear_o_group_proj(inputs), native._apply_linear_o_group_proj(inputs)
+        )
+
+        sharded = batched.sharded_state_dict(
+            'attn.', ((0, 2, 6),), metadata={'dp_cp_group': pg.dp_cp}
+        )
+        shard = sharded['attn.linear_o_group_proj']
+        assert isinstance(shard, ShardedTensor)
+        assert not _is_muon_excluded(batched._linear_o_group_proj_weight)
+        assert is_managed_by_layer_wise_optimizer(batched._linear_o_group_proj_weight)
+        assert shard.local_shape == legacy['linear_o_group_proj'].shape
+        assert shard.global_shape == (6, *legacy['linear_o_group_proj'].shape)
+        assert shard.global_offset == (2, 0, 0)
+        torch.testing.assert_close(shard.data, batched._linear_o_group_proj_weight)
+
+    def test_native_grouped_projection_bmm_matches_einsum(self, monkeypatch):
+        """MCORE_DSV4_GROUP_PROJ_BMM: a built module's native (non-TE) grouped projection runs as
+        strided-batched GEMMs with einsum's output and input/weight gradients, bit for bit."""
+        from megatron.core.transformer.experimental_attention_variant import (
+            deepseek_v4_hybrid_attention as dsv4_attention,
+        )
+        from megatron.core.transformer.spec_utils import build_module
+        from tests.unit_tests.determinism.kernels.harness import bytes_equal
+
+        torch.manual_seed(_SEED)
+        config = _make_config()
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        spec = _make_attention_spec(config)
+        spec.submodules = replace(spec.submodules, linear_o_group_proj=None)
+        native = build_module(spec, config=config, layer_number=1, pg_collection=pg).cuda()
+        weight = native._linear_o_group_proj_weight
+        groups, rank = config.output_projection_groups, config.output_projection_lora_rank
+        inputs = torch.randn(48, 2, groups, weight.size(-1), device='cuda', dtype=torch.bfloat16)
+        upstream = torch.randn(48, 2, groups, rank, device='cuda', dtype=torch.bfloat16)
+        calls = []
+        apply = dsv4_attention._GroupedProjectionBMM.apply
+
+        def counted_apply(*args):
+            calls.append(args[0].shape)
+            return apply(*args)
+
+        monkeypatch.setattr(dsv4_attention._GroupedProjectionBMM, 'apply', counted_apply)
+        results = []
+        for switch in (False, True):
+            monkeypatch.setattr(dsv4_attention, '_GROUP_PROJ_BMM', switch)
+            x = inputs.clone().requires_grad_()
+            weight.grad = None
+            output = native._apply_linear_o_group_proj(x)
+            output.backward(upstream)
+            results.append((output.detach(), x.grad, weight.grad))
+        assert len(calls) == 1
+        einsum, bmm = results
+        for name, got, want in zip(('output', 'input grad', 'weight grad'), bmm, einsum):
+            assert bytes_equal(got, want), name
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize(
+        "mxfp8,quantized_weight,accumulate",
+        [(False, False, False), (False, False, True), (True, False, True), (True, True, True)],
+    )
+    def test_te_batched_projection_forward_backward(
+        self, monkeypatch, mxfp8, quantized_weight, accumulate
+    ):
+        """Check the real TE operation, parameter layout, and repeated main-grad accumulation."""
+        from megatron.core.transformer.experimental_attention_variant.dsv4_batched_linear import (
+            DSv4BatchedLinear,
+        )
+
+        if DSv4BatchedLinear is None:
+            pytest.skip('Installed TE does not provide BatchedLinear')
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+
+        from tests.unit_tests.determinism.kernels.harness import assert_module_replays_bit_exact
+
+        monkeypatch.setenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
+        recipe = (
+            MXFP8BlockScaling(fp8_format=Format.E4M3, backward_override=None) if mxfp8 else None
+        )
+        if mxfp8:
+            available, reason = te.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        groups, width, rank = 8, 128, 64
+        with te.quantized_model_init(
+            enabled=quantized_weight,
+            recipe=recipe,
+            preserve_high_precision_init_val=quantized_weight,
+        ):
+            module = DSv4BatchedLinear(
+                groups,
+                width,
+                rank,
+                device='cuda',
+                dtype=torch.bfloat16,
+                bias=False,
+                accumulate_into_main_grad=accumulate,
+                save_original_input=True,
+            )
+        weight = module.weight
+        assert weight.shape == (groups * rank, width)
+        if quantized_weight:
+            from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+                MXFP8TensorStorage,
+            )
+
+            from megatron.core.transformer.experimental_attention_variant.dsv4_batched_linear import (
+                _GroupedWeightView,
+            )
+
+            # TE's operation fuser invokes op_forward with grad mode disabled.
+            # Its MXFP8 custom view must retain the owner's trainability there.
+            with torch.no_grad():
+                grouped = _GroupedWeightView(module).weight
+                assert grouped.requires_grad == weight.requires_grad
+            assert isinstance(weight, MXFP8TensorStorage)
+            assert weight.get_high_precision_init_val().shape == weight.shape
+            assert isinstance(grouped, MXFP8TensorStorage)
+            assert grouped.shape == (groups, rank, width)
+            for field in (
+                '_rowwise_data',
+                '_columnwise_data',
+                '_rowwise_scale_inv',
+                '_columnwise_scale_inv',
+            ):
+                original, view = getattr(weight, field), getattr(grouped, field)
+                assert (original is None) == (view is None)
+                if original is not None:
+                    assert original.data_ptr() == view.data_ptr()
+        reference_weight = (
+            torch.empty(groups, rank, width, device='cuda', dtype=torch.bfloat16)
+            .uniform_(-0.25, 0.25)
+            .requires_grad_(True)
+        )
+        with torch.no_grad():
+            weight.copy_(reference_weight.reshape_as(weight))
+        if accumulate:
+            weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+            weight.grad_added_to_main_grad = False
+        tolerances = dict(rtol=0.125, atol=0.0675) if mxfp8 else dict(rtol=0.016, atol=1e-5)
+        for _ in range(2):
+            inputs = (
+                torch.empty(4, 8, groups, width, device='cuda', dtype=torch.bfloat16)
+                .uniform_(-0.25, 0.25)
+                .requires_grad_(True)
+            )
+            reference_inputs = inputs.detach().clone().requires_grad_(True)
+            reference = torch.einsum('...gd,grd->...gr', reference_inputs, reference_weight)
+            grad = torch.empty_like(reference).uniform_(-0.25, 0.25)
+            reference.backward(grad)
+            with te.autocast(enabled=mxfp8, recipe=recipe):
+                output = module(inputs)
+            output.backward(grad)
+            assert module.weight is weight
+            weight_grad = weight.main_grad if accumulate else weight.grad
+            for actual, expected in (
+                (output, reference),
+                (inputs.grad, reference_inputs.grad),
+                (weight_grad.view_as(reference_weight), reference_weight.grad),
+            ):
+                torch.testing.assert_close(actual, expected, check_dtype=False, **tolerances)
+
+        class AutocastProjection(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = module
+
+            def forward(self, value):
+                with te.autocast(enabled=mxfp8, recipe=recipe):
+                    return self.projection(value)
+
+        assert_module_replays_bit_exact(
+            AutocastProjection(),
+            (inputs.detach().requires_grad_(True),),
+            replays=3,
+            grad_output=grad,
+            contention=True,
+            what='DSv4 BatchedLinear',
+        )
 
 
 # ===========================================================================
@@ -892,3 +1163,82 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
+    """The fused core owns output rotation; the outer projection must not rotate twice."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as hybrid,
+    )
+
+    batch = 1 if packed else 2
+    hidden = torch.randn(4, batch, 4, requires_grad=True)
+    cu = torch.tensor([0, 1, 4], dtype=torch.int32) if packed else None
+    params = (
+        PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=3, max_seqlen_kv=3
+        )
+        if packed
+        else None
+    )
+    cos, sin = torch.ones(4, 2), torch.zeros(4, 2)
+    cache = Mock(return_value=(cos, sin))
+    observed = []
+
+    def core(query, *_args, out_rope, **_kwargs):
+        observed.append(out_rope)
+        # Sentinel output stands for a core that has already applied inverse RoPE.
+        return query.reshape(4, batch, 4) * 3
+
+    core.use_fused_kernels = True
+    monkeypatch.setattr(hybrid, "apply_module", lambda module: module)
+    outer_rope = Mock(side_effect=AssertionError("output RoPE applied twice"))
+    monkeypatch.setattr(hybrid, "fused_mla_rope_out_of_place", outer_rope)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            apply_rope_fusion=True,
+            v_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            output_projection_lora_rank=4,
+            dsa_kernel_backend="cudnn",
+            deterministic_mode=False,
+            attention_cp_layout="contiguous",
+            dsv4_version="v4",
+        ),
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)),
+        rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
+        get_query_key_value_tensors=lambda *_args, **_kwargs: (hidden, hidden, hidden, None, None),
+        core_attention=core,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        training=True,
+        recompute_up_proj=False,
+        output_projection_local_groups=1,
+        linear_o_group_proj=torch.eye(4),
+        linear_proj=lambda x: (x, None),
+    )
+    model._uses_batched_linear = False
+    model._linear_o_group_proj_weight = model.linear_o_group_proj
+    model._apply_linear_o_group_proj = (
+        hybrid.DSv4HybridAttention._apply_linear_o_group_proj.__get__(model)
+    )
+    model._output_projection = hybrid.DSv4HybridAttention._output_projection.__get__(model)
+    output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
+    torch.testing.assert_close(output, hidden * 3)
+    output.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 3))
+    assert len(observed) == 1
+    rope = observed[0]
+    assert rope.cos is cos and rope.sin is sin
+    assert rope.cu_seqlens_q is cu
+    assert rope.sbhd_batch_size == (None if packed else batch)
+    assert (rope.nope_dim, rope.pos_dim, rope.cp_rank, rope.cp_size) == (2, 2, 0, 1)
+    cache.assert_called_once_with(
+        3 if packed else 4, dtype=hidden.dtype, packed_seq=packed, mscale=1.0
+    )
+    outer_rope.assert_not_called()

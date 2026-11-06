@@ -23,11 +23,13 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe import moe_env_flags
 from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
 from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.router_fast_cast import fast_cast
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -346,7 +348,20 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
                 1.0, device=aux_loss.device
             )
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
-        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        if (
+            moe_env_flags.AUX_LOSS_SCALE_0DIM
+            and aux_loss.dim() == 0
+            and aux_loss_backward_scale.dim() > 0
+            and aux_loss_backward_scale.numel() == 1
+            and aux_loss_backward_scale.dtype == aux_loss.dtype
+            and aux_loss_backward_scale.device == aux_loss.device
+        ):
+            # The schedule sets a [1]-shaped scale, so ones_like(aux_loss) * scale is [1]-shaped
+            # and autograd sums it onto the 0-dim aux_loss: fill, mul and a reduce kernel that
+            # returns 0 + 1 * s. One add of zero to a 0-dim view yields the same s + 0 bits.
+            scaled_aux_loss_grad = aux_loss_backward_scale.reshape(()) + 0.0
+        else:
+            scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod
@@ -1327,7 +1342,12 @@ class RandomSTE(torch.autograd.Function):
             torch.Tensor: The random logits.
         """
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
-            random_logits = logits.clone().normal_()
+            if moe_env_flags.RANDOM_STE_EMPTY_LIKE:
+                # normal_ overwrites every element without reading it; empty_like gives the same
+                # layout as clone(), hence the same RNG draws, without the device copy.
+                random_logits = torch.empty_like(logits).normal_()
+            else:
+                random_logits = logits.clone().normal_()
         return random_logits
 
     @staticmethod
@@ -1406,6 +1426,13 @@ def apply_biased_logits(logits, std, layer_number=None):
     return RandomSTEShared.apply(logits, std, layer_number)
 
 
+def _router_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``tensor.to(dtype)``; widening BF16/FP16 to FP32 uses the exact vectorized kernel."""
+    if moe_env_flags.ROUTER_FAST_CAST:
+        return fast_cast(tensor, dtype)
+    return tensor.to(dtype)
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1431,25 +1458,40 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         Returns:
             torch.Tensor: The output tensor.
         """
-        ctx.save_for_backward(inp, weight, bias)
+        # With MCORE_ROUTER_SAVE_FP32_INPUT, save the input already widened to the FP32
+        # router dtype, so backward needs no cast; the GEMMs see the same values.
+        save_widened_input = (
+            moe_env_flags.ROUTER_SAVE_FP32_INPUT
+            and router_dtype == torch.float32
+            and inp.dtype in (torch.bfloat16, torch.float16)
+        )
+        saved_inp = inp
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
-        inp = inp.view(-1, inp_shape[-1])
+        inp_2d = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
             # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
             # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
             # small bias vector before passing it to TE.
             gemm_bias = bias.to(router_dtype) if bias is not None else None
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
-        elif bias is None:
-            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+            output = te_general_gemm(weight, inp_2d, router_dtype, layout="TN", bias=gemm_bias)[0]
+            if save_widened_input:
+                saved_inp = _router_cast(inp, router_dtype)
         else:
-            output = torch.addmm(
-                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
-            )
+            inp_router_dtype = _router_cast(inp_2d, router_dtype)
+            if bias is None:
+                output = torch.mm(inp_router_dtype, _router_cast(weight, router_dtype).t())
+            else:
+                output = torch.addmm(
+                    bias.to(router_dtype), inp_router_dtype, _router_cast(weight, router_dtype).t()
+                )
+            if save_widened_input:
+                saved_inp = inp_router_dtype.view(inp_shape)
+        # Backward casts inp with _router_cast, which returns an already widened input as is.
+        ctx.save_for_backward(saved_inp, weight, bias)
 
         output = output.view(*inp_shape[:-1], -1)
         return output
@@ -1474,18 +1516,32 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
+        # _router_cast is exact (bit-identical to Tensor.to), so the TF32/FP32 GEMMs below
+        # receive the same operands as with Tensor.to.
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
             grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                _router_cast(weight, ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NN",
+                grad=True,
             )
             grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                _router_cast(inp, ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NT",
+                grad=True,
             )
             grad_input = grad_input[0].to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            grad_input = torch.mm(grad_output, _router_cast(weight, ctx.router_dtype)).to(
+                ctx.input_dtype
+            )
+            grad_weight = torch.mm(grad_output.t(), _router_cast(inp, ctx.router_dtype)).to(
+                ctx.weight_dtype
+            )
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)

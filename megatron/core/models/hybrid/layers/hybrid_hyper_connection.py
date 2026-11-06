@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 from torch import Tensor
 
+from megatron.core.component_nvtx import layer_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -169,6 +170,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+    @layer_scope
     def forward(
         self,
         hidden_states: Tensor,
@@ -225,6 +227,39 @@ class HyperConnectionHybridLayer(MegatronModule):
         else:
             layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
 
+        hidden_states = self.combine_branch(
+            aggregated,
+            layer_output_with_bias,
+            h_res,
+            h_post,
+            residual,
+            dropout_prob=dropout_prob,
+            bias_dropout_fusion=bias_dropout_fusion,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        return hidden_states, context
+
+    def combine_branch(
+        self,
+        aggregated,
+        layer_output_with_bias,
+        h_res,
+        h_post,
+        residual,
+        *,
+        dropout_prob=None,
+        bias_dropout_fusion=None,
+        mhc_recompute_manager=None,
+    ):
+        """Finish a branch after eager execution or an explicit tensor-state graph.
+
+        The caller keeps the invocation's mixing tensors and checkpoint manager
+        outside capture. Both execution paths share the same mHC write boundary.
+        """
+        if dropout_prob is None:
+            dropout_prob = self.inner_layer.hidden_dropout
+        if bias_dropout_fusion is None:
+            bias_dropout_fusion = self.inner_layer.config.bias_dropout_fusion
         layer_output = layer_output_with_bias[0]
         if layer_output.shape != aggregated.shape:
             raise RuntimeError(
@@ -254,4 +289,4 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, context
+        return hidden_states

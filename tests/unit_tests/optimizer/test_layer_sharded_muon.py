@@ -394,12 +394,17 @@ class TestConstructorGuards:
         with pytest.raises(ValueError, match="registry-level selector"):
             LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, tp_mode="layer_sharded")
 
-    def test_split_qkv_is_rejected(self):
-        """split_qkv would only apply on the fallback/degenerate paths, making
-        the update rule depend on whether homes are set — reject at the class."""
+    @pytest.mark.parametrize(
+        "split_kwargs",
+        ({"split_qkv": True}, {"split_qkv_per_head": True}),
+        ids=("projection", "per-head"),
+    )
+    def test_split_qkv_is_rejected(self, split_kwargs):
+        """QKV splitting would only apply on fallback/degenerate paths, making
+        the update rule depend on whether homes are set — reject both flags at the class."""
         p = torch.nn.Parameter(torch.randn(4, 4))
         with pytest.raises(ValueError, match="split-QKV"):
-            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, **split_kwargs)
 
     def test_ns_batch_size_below_one_is_rejected(self):
         """ns_batch_size is validated like the parent's num_ns_steps, not clamped."""
@@ -923,7 +928,8 @@ def test_tp_sharded_without_gtp_marker_is_rejected():
         opt.step()
 
 
-def test_weight_update_hooks_called_on_all_paths():
+@pytest.mark.parametrize("use_hook_object", [False, True])
+def test_weight_update_hooks_called_on_all_paths(use_hook_object):
     """pre/post_weight_update_fn_inplace fire once per updated param on the replicated,
     routed and degenerate paths."""
     _require_multi_rank()
@@ -933,10 +939,31 @@ def test_weight_update_hooks_called_on_all_paths():
     routed = [_gtp_param(torch.randn(4, 8)) for _ in range(2)]
     params = routed + [torch.nn.Parameter(torch.randn(6, 6))]
     opt = _muon(params, nesterov=False, gtp_remat_group=_world())
+    if use_hook_object and not hasattr(opt, "_weight_update_hook"):
+        pytest.skip("This emerging_optimizers release has no hook object")
     opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(routed)})
     calls = {"pre": 0, "post": 0}
-    opt.pre_weight_update_fn_inplace = lambda p, update: calls.__setitem__("pre", calls["pre"] + 1)
-    opt.post_weight_update_fn_inplace = lambda p: calls.__setitem__("post", calls["post"] + 1)
+
+    def install_hooks(optimizer, calls):
+        def pre(p, update):
+            calls["pre"] += 1
+            return p.clone()
+
+        def post(p, state):
+            assert not torch.equal(p, state)
+            calls["post"] += 1
+
+        if use_hook_object:
+            optimizer._weight_update_hook = SimpleNamespace(
+                pre_weight_update_inplace=pre, post_weight_update_inplace=post
+            )
+        else:
+            optimizer.pre_weight_update_fn_inplace = pre
+            optimizer.post_weight_update_fn_inplace = lambda p: calls.__setitem__(
+                "post", calls["post"] + 1
+            )
+
+    install_hooks(opt, calls)
     for p in params:
         p.grad = torch.randn_like(p)
     opt.step()
@@ -951,10 +978,7 @@ def test_weight_update_hooks_called_on_all_paths():
     opt2.set_group_process_groups({0: (_world(), None), 1: (None, None)})
     opt2.set_param_ns_homes({id(anchor): (0, 0)})
     calls2 = {"pre": 0, "post": 0}
-    opt2.pre_weight_update_fn_inplace = lambda p, update: calls2.__setitem__(
-        "pre", calls2["pre"] + 1
-    )
-    opt2.post_weight_update_fn_inplace = lambda p: calls2.__setitem__("post", calls2["post"] + 1)
+    install_hooks(opt2, calls2)
     anchor.grad = torch.randn_like(anchor)
     p2.grad = torch.randn_like(p2)
     opt2.step()

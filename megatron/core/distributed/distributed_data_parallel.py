@@ -1,5 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
 import weakref
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
-from ..process_groups_config import ProcessGroupCollection
+from ..process_groups_config import ProcessGroupCollection, get_parameter_parallel_domain
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
@@ -170,6 +171,22 @@ class DistributedDataParallel(_BaseDataParallel):
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
 
+        extra_replica_groups = getattr(pg_collection, 'parameter_replica_groups', None) or {}
+        if {'dense', 'expert'} & extra_replica_groups.keys():
+            raise ValueError('Additional parameter domains cannot replace dense/expert groups')
+        self.parameter_replica_groups = {
+            'dense': self.dp_cp_group,
+            'expert': self.expt_dp_group,
+            **extra_replica_groups,
+        }
+        if (
+            len(self.parameter_replica_groups) > 2
+            and ddp_config.num_distributed_optimizer_instances != 1
+        ):
+            raise ValueError(
+                'Additional parameter domains require one distributed optimizer instance'
+            )
+
         # GTP weight-shard axes, None when GTP-remat is inactive. The buffers use these to
         # elect one rank per module for layout logging; every peer on these axes holds a
         # replica of the same buffer and would otherwise repeat the whole dump.
@@ -211,8 +228,13 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        # Compact Muon keeps FP8 and high-precision gradient reductions together;
+        # parameter gather chooses separate transport storage for each kind.
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not self.ddp_config.use_layer_wise_param_layout,
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -223,17 +245,25 @@ class DistributedDataParallel(_BaseDataParallel):
                 logging.WARNING,
                 "DistributedDataParallel: full_param_layout not provided with "
                 "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
-                "Callers should pre-compute layouts via "
-                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+                "Callers should pre-compute their optimizer's full parameter layout "
+                "and pass it in.",
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+            if any(key.is_managed_by_layer_wise_optimizer for key in buffer_groups):
+                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            full_param_layout = compute_layout(
                 all_params,
                 self.bucket_size,
                 self.intra_dp_cp_group.size(),
                 self.ddp_config,
                 expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+                parallel_group_sizes={
+                    name: group.size() for name, group in self.parameter_replica_groups.items()
+                },
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
@@ -315,6 +345,8 @@ class DistributedDataParallel(_BaseDataParallel):
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
+        self.buffers_by_domain = {name: [] for name in self.parameter_replica_groups}
+        self.buffers_by_domain.update(dense=self.buffers, expert=self.expert_parallel_buffers)
         pg_collection = ProcessGroupCollection(
             tp=self.tp_group,
             dp_cp=self.dp_cp_group,
@@ -322,7 +354,18 @@ class DistributedDataParallel(_BaseDataParallel):
             expt_gtp_remat=self.expt_gtp_remat_group,
         )
         for buffer_key, (params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                data_parallel_group = self.parameter_replica_groups[buffer_key.domain]
+                scaling_factor = (
+                    1.0
+                    if config.calculate_per_token_loss
+                    else (
+                        data_parallel_group.size() / self.dp_cp_group.size()
+                        if self.ddp_config.average_in_collective
+                        else 1.0 / self.dp_cp_group.size()
+                    )
+                )
+            elif buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
@@ -355,9 +398,19 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            buffer_ddp_config = self.ddp_config
+            if (
+                buffer_key.is_managed_by_layer_wise_optimizer
+                and not self.ddp_config.use_layer_wise_param_layout
+            ):
+                # Compact Muon all-reduces whole gradients; Adam keeps DistOpt sharding.
+                # Bucket sizing is already resolved, so do not revalidate num_buckets.
+                buffer_ddp_config = dataclasses.replace(
+                    self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
@@ -370,10 +423,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 pg_collection,
                 param_layout=param_layout,
             )
-            if buffer_key.is_expert_parallel:
-                self.expert_parallel_buffers.append(buffer)
-            else:
-                self.buffers.append(buffer)
+            self.buffers_by_domain[buffer_key.domain].append(buffer)
 
         # In some scenarios, we want to put buckets from different buffers into a group so that
         # their communication can be aggregated. For example, when there are both fp8 buffers
@@ -384,26 +434,22 @@ class DistributedDataParallel(_BaseDataParallel):
         # kernels.
         # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
         # bucket group.
-        self.bucket_groups = partition_buckets(
-            self.buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
-        self.expert_parallel_bucket_groups = partition_buckets(
-            self.expert_parallel_buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
+        self.bucket_groups_by_domain = {
+            name: partition_buckets(
+                buffers,
+                force_single_bucket_group=disable_bucketing,
+                reduce_scatter_with_fp32_accumulation=self.ddp_config.reduce_scatter_with_fp32_accumulation,
+            )
+            for name, buffers in self.buffers_by_domain.items()
+        }
+        self.bucket_groups = self.bucket_groups_by_domain['dense']
+        self.expert_parallel_bucket_groups = self.bucket_groups_by_domain['expert']
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
@@ -417,7 +463,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
         # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -437,12 +483,12 @@ class DistributedDataParallel(_BaseDataParallel):
             and self.ddp_config.reduce_scatter_with_fp32_accumulation
             and self.ddp_config.num_distributed_optimizer_instances == 1
         ):
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 for i in range(1, len(bucket_groups)):
                     bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
 
         # Create map from param to bucket group, used in pre_hook.
-        for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+        for bucket_groups in self.bucket_groups_by_domain.values():
             for bucket_group in bucket_groups:
                 # One readiness callback per bucket group, stamped on all its params, so a
                 # consumer reading param.data outside the owning module's pre-hook can publish it
@@ -476,12 +522,27 @@ class DistributedDataParallel(_BaseDataParallel):
 
             self.module.apply(unmap_weight_tensor)
 
+        self.deferred_grad_params = [
+            param
+            for param in self.params_with_grad
+            if getattr(param, 'deferred_grad_producer', None) is not None
+        ]
+        self.deferred_grad_producers = tuple(
+            dict.fromkeys(param.deferred_grad_producer for param in self.deferred_grad_params)
+        )
+        self._deferred_grads_finished = False
+        self.deferred_bucket_groups = {
+            self.param_to_bucket_group[param] for param in self.deferred_grad_params
+        }
+
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
         for param in self.module.parameters():
             if param.requires_grad:
+                if getattr(param, 'deferred_grad_producer', None) is not None:
+                    continue
                 # When delay_wgrad_compute is True and the param is marked with
                 # skip_backward_post_hook, register the backward post hook for its module
                 # instead of the param so that the wgrad accumulation and reduce will be performed
@@ -526,6 +587,16 @@ class DistributedDataParallel(_BaseDataParallel):
         if self.use_forward_hook:
             self.enable_forward_pre_hook()
         self.overlap_param_gather_with_optimizer_step = False
+
+    @property
+    def all_buffers(self):
+        """All parameter domains, in deterministic construction order."""
+        return [buffer for buffers in self.buffers_by_domain.values() for buffer in buffers]
+
+    @property
+    def all_bucket_groups(self):
+        """Bucket groups from every parameter replica domain."""
+        return [group for groups in self.bucket_groups_by_domain.values() for group in groups]
 
     def enable_forward_pre_hook(self):
         """
@@ -635,12 +706,12 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         Context manager that turns off gradient synchronization.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.is_last_microbatch = False
         try:
             yield
         finally:
-            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            for bucket_group in self.all_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
     def _start_bucket_group_param_sync(
@@ -680,12 +751,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def reset_param_sync_dispatch_state(self):
         """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
@@ -695,6 +766,12 @@ class DistributedDataParallel(_BaseDataParallel):
                 "parameter all-gather is still in flight."
             )
             bucket_group.param_gather_dispatched = False
+
+    def finish_pending_param_sync(self) -> None:
+        """Publish existing gathers before clearing or restaging gradient storage."""
+        for bucket_group in self.all_bucket_groups:
+            if bucket_group.param_gather_handle is not None:
+                bucket_group.start_param_sync(force_sync=True)
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):
@@ -706,8 +783,20 @@ class DistributedDataParallel(_BaseDataParallel):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.start_grad_sync()
+        for bucket_group in self.all_bucket_groups:
+            if bucket_group not in self.deferred_bucket_groups or self._deferred_grads_finished:
+                bucket_group.start_grad_sync()
+
+    def finish_deferred_gradients(self):
+        """Publish externally produced main_grad values before any replica reduction."""
+        if self._deferred_grads_finished:
+            return
+        for producer in self.deferred_grad_producers:
+            producer.finish_deferred_gradients()
+        self._deferred_grads_finished = True
+        if self.ddp_config.overlap_grad_reduce:
+            for param in self.deferred_grad_params:
+                self.param_to_bucket_group[param].register_grad_ready(param, self.force_all_reduce)
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.finish')
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -719,17 +808,18 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        self.finish_deferred_gradients()
+        for bucket_group in self.all_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.all_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -737,15 +827,18 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
+        for producer in self.deferred_grad_producers:
+            producer.reset()
+        self._deferred_grads_finished = False
         if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.all_buffers:
             buffer.reset()
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.reset()
 
     def broadcast_params(self):
@@ -753,12 +846,9 @@ class DistributedDataParallel(_BaseDataParallel):
         Syncs parameters across all DP ranks.
         """
         for param in self.module.parameters():
-            is_expert_parallel = not getattr(param, 'allreduce', True)
-
-            if is_expert_parallel:
-                data_parallel_group = self.expt_dp_group
-            else:
-                data_parallel_group = self.dp_cp_group
+            data_parallel_group = self.parameter_replica_groups[
+                get_parameter_parallel_domain(param)
+            ]
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
@@ -790,7 +880,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if synchronize:
             torch.cuda.synchronize()
 
-        buffers = self.buffers + self.expert_parallel_buffers
+        buffers = self.all_buffers
         # Only registered buffers own pools that need collective deregistration and release;
         # every buffer still offloads its gradient storage in the full buffers loop below.
         registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
@@ -834,7 +924,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.all_buffers:
             if buffer.nccl_grad_pool_is_separate and buffer.nccl_mem_pool is None:
                 buffer.reload_grad_buffer_into_nccl_pool()
             else:

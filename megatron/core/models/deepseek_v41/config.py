@@ -2,6 +2,7 @@
 
 """Configuration for V4.1 conditional n-gram memory."""
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,43 @@ class EngramConfig:
     compressed_vocab_size: int
     """Exact number of normalized token identities used to derive hash multipliers."""
 
+    embedding_lr_multiplier: float = 5.0
+    """Learning-rate multiplier for the lookup tables, excluding projections and norms."""
+
+    communication_backend: str = "nccl"
+    """Embedding lookup transport, independently of the MoE dispatcher."""
+
+    hybridep_chunk_size: int = 4096
+    """Maximum queries sent per rank per HybridEP dispatch; bounds communication workspace."""
+
+    parallel_size: int | None = None
+    """Row-sharding size within a physical pipeline stage; None preserves the EP topology."""
+
+    prefetch: bool = False
+    """Prefetch table rows before the consuming microbatch enters the model."""
+
+    defer_grad_transfer: bool = False
+    """Buffer row gradients and complete their delivery before replica gradient reduction."""
+
+    buffer_budget_mb: int = 1024
+    """MiB available for prefetched rows and pending row gradients, shared by local tables."""
+
+    def __post_init__(self):
+        if self.parallel_size is not None and (
+            type(self.parallel_size) is not int or self.parallel_size <= 0
+        ):
+            raise ValueError('Engram parallel_size must be a positive integer or None')
+        if type(self.prefetch) is not bool or type(self.defer_grad_transfer) is not bool:
+            raise ValueError('Engram prefetch and defer_grad_transfer must be booleans')
+        if type(self.buffer_budget_mb) is not int or self.buffer_budget_mb <= 0:
+            raise ValueError('Engram buffer_budget_mb must be a positive integer')
+        if not math.isfinite(self.embedding_lr_multiplier) or self.embedding_lr_multiplier <= 0:
+            raise ValueError("Engram embedding_lr_multiplier must be finite and positive")
+        if self.communication_backend not in ("nccl", "hybridep", "symmetric"):
+            raise ValueError("Engram communication_backend must be nccl, hybridep or symmetric")
+        if self.hybridep_chunk_size <= 0 or self.hybridep_chunk_size % 64:
+            raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
+
 
 @dataclass
 class DeepSeekV41Config(MLATransformerConfig):
@@ -62,9 +100,13 @@ class DeepSeekV41Config(MLATransformerConfig):
                 "V4.1 residual storage uses the model dtype; mixing arithmetic is FP32"
             )
         if self.recompute_granularity == 'full' and (
-            self.recompute_method != 'uniform' or self.recompute_num_layers != 1
+            self.recompute_method not in ('uniform', 'block')
+            or type(self.recompute_num_layers) is not int
+            or self.recompute_num_layers <= 0
         ):
-            raise ValueError("V4.1 full recompute currently uses one explicit layer per region")
+            raise ValueError(
+                "V4.1 full recompute requires uniform/block and a positive layer count"
+            )
         if self.context_parallel_size > 1 and self.linear_cp_layout != 'contiguous':
             raise ValueError("V4.1 keeps a contiguous CP layout across attention and MoE layers")
         if self.engram_config is not None:
@@ -72,6 +114,14 @@ class DeepSeekV41Config(MLATransformerConfig):
             if len(ids) != len(set(ids)) or any(i < 0 or i >= self.num_layers // 2 for i in ids):
                 raise ValueError("Engram layers must be distinct zero-based logical blocks")
         super().__post_init__()
+        # After the base class, which migrates the deprecated cuda_graph_modules spelling.
+        if self.engram_config is not None and self.cuda_graph_impl == "full_iteration":
+            raise NotImplementedError(
+                "Engram plans its EP lookup on the host per batch (bincount/.cpu()/HybridEP "
+                "rounds; unique_consecutive in the FP8 backward), so it cannot be captured by "
+                "cuda_graph_impl='full_iteration'; use transformer_engine partial graphs or "
+                "drop --engram-config"
+            )
 
     @classmethod
     def from_hf(cls, hf: dict[str, Any], **overrides) -> "DeepSeekV41Config":

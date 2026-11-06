@@ -58,6 +58,7 @@ def unimodal_build_distributed_models(
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -87,12 +88,15 @@ def unimodal_build_distributed_models(
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
     """
+
     if wrap_with_ddp and not ddp_config:
         raise ValueError("ddp_config is required when wrap_with_ddp is True")
 
@@ -127,6 +131,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings,
     )
 
 
@@ -143,6 +148,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -162,8 +168,10 @@ def prepare_existing_model_chunks_for_distributed_training(
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -214,6 +222,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             pg_collection=pg_collection,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings,
         )
 
     return model_list
@@ -278,6 +287,7 @@ def _ddp_wrap(
     pg_collection: ProcessGroupCollection,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -291,9 +301,10 @@ def _ddp_wrap(
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
-            ``False`` keeps LayerWise on its legacy ``allgather_params`` sync path.
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -308,6 +319,15 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
+    if DP is not DistributedDataParallel and (
+        pg_collection.parameter_replica_groups
+        or any(
+            getattr(param, 'deferred_grad_producer', None) is not None
+            for chunk in model
+            for param in chunk.parameters()
+        )
+    ):
+        raise ValueError('Additional parameter domains and deferred gradients require standard DDP')
 
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
@@ -327,24 +347,17 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # Argument validation converts --use-distributed-optimizer into
-    # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
-    # the layerwise optimizer needs the reduce-scatter and the shard-aligned param layout
-    # that the distributed-optimizer path provides. Mirrors wrap_model_chunks_with_ddp() in
-    # megatron/training/training.py, which handles the non-ModelBuilder path.
+    # Argument validation clears use_distributed_optimizer for LayerWise. Re-enable
+    # it for Adam sharding in both layouts, as in wrap_model_chunks_with_ddp().
     compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
-    if (
-        DP is DistributedDataParallel
-        and use_layer_wise_distributed_optimizer
-        and use_layer_wise_param_layout
-    ):
+    if DP is DistributedDataParallel and use_layer_wise_distributed_optimizer:
         ddp_config.use_distributed_optimizer = True
+        ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
         compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-        # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-        # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-        # everything else (embeddings, biases, layernorm) to a separate
-        # DistOpt-style buffer.
-        tag_params_for_buffer_routing(model)
+        # Matrix optimizers need whole parameters; scalar fallbacks can use byte shards.
+        tag_params_for_buffer_routing(
+            model, use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings
+        )
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
     current_stream = torch.cuda.current_stream()
@@ -429,6 +442,12 @@ def _ddp_wrap(
                             if intra_expt_dp_group is not None
                             else pg_collection.expt_dp
                         ).size(),
+                        parallel_group_sizes={
+                            name: group.size()
+                            for name, group in (
+                                pg_collection.parameter_replica_groups or {}
+                            ).items()
+                        },
                     )
 
                 wrapped_chunk = DP(

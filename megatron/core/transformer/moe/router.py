@@ -16,6 +16,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe import moe_env_flags
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -43,6 +44,46 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
+
+
+def _uses_static_token_split(
+    config: TransformerConfig, packed_seq_params: Optional[PackedSeqParams]
+) -> bool:
+    """Whether the aux-loss reduce groups are the static TP/CP groups (Dynamic CP is off).
+
+    Every rank of a static TP/CP group holds the same number of local tokens, so a Python-int
+    local count reduces to ``count * group size``. Dynamic CP (``local_cp_size``, as used by
+    ``_get_aux_loss_groups``; hybrid CP sets it) uses runtime groups whose ranks may differ.
+    """
+    if getattr(config, "hybrid_context_parallel", False):
+        return False
+    return packed_seq_params is None or packed_seq_params.local_cp_size is None
+
+
+def _static_reduced_token_count(
+    num_local_tokens: int,
+    reduce_groups: Sequence[torch.distributed.ProcessGroup],
+    device: torch.device,
+) -> int:
+    """All-reduce-free sum of ``num_local_tokens`` over ``reduce_groups``.
+
+    Only valid when every rank of every group holds ``num_local_tokens``. With
+    MCORE_ROUTER_CHECK_STATIC_TOKENS=1 the count is still all-reduced and compared, outside
+    CUDA-graph capture only (the comparison needs a host sync).
+    """
+    total = int(num_local_tokens)
+    for group in reduce_groups:
+        total *= torch.distributed.get_world_size(group=group)
+    if moe_env_flags.ROUTER_CHECK_STATIC_TOKENS and not torch.cuda.is_current_stream_capturing():
+        reduced = torch.full((), num_local_tokens, dtype=torch.int64, device=device)
+        for group in reduce_groups:
+            torch.distributed.all_reduce(reduced, group=group)
+        reduced = int(reduced.item())
+        assert reduced == total, (
+            f"MCORE_ROUTER_CHECK_STATIC_TOKENS: all-reduced aux-loss token count {reduced} != "
+            f"static count {total} (local {num_local_tokens}); set MCORE_ROUTER_STATIC_TOKENS=0"
+        )
+    return total
 
 
 @dataclass(frozen=True)
@@ -503,6 +544,9 @@ class TopKRouter(Router):
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
         config = self.config
+        # Megakernels adapt the boolean routing map independently of native dispatchers.
+        if config.moe_megakernel_backend is not None:
+            return None
         fused_dense_routing = (
             config.moe_token_dispatcher_type == "flex"
             and config.moe_expert_capacity_factor is None
@@ -638,6 +682,9 @@ class TopKRouter(Router):
             valid_token_count=num_valid_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+            aux_loss_scale_static_token_split=_uses_static_token_split(
+                self.config, packed_seq_params
+            ),
         )
         return probs
 
@@ -647,6 +694,7 @@ class TopKRouter(Router):
         scores_for_aux_loss: torch.Tensor,
         routing_map: torch.Tensor,
         with_padding_mask: bool = False,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Apply the global auxiliary loss for the given scores and routing map."""
         global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
@@ -685,6 +733,9 @@ class TopKRouter(Router):
             needs_dp_avg=False,
             valid_token_count=local_num_tokens,
             aux_loss_scale_reduce_groups=(self.tp_cp_group,),
+            aux_loss_scale_static_token_split=_uses_static_token_split(
+                self.config, packed_seq_params
+            ),
         )
         return probs
 
@@ -727,6 +778,7 @@ class TopKRouter(Router):
         aux_loss_logging_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_num_tokens: Optional[Union[int, torch.Tensor]] = None,
+        aux_loss_scale_static_token_split: bool = False,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -750,6 +802,11 @@ class TopKRouter(Router):
             aux_loss_scale_num_tokens (int or torch.Tensor, optional): Already-reduced token
                 count used directly as the per-token-loss scale, skipping the reduction above.
                 Only used when calculate_per_token_loss is set. Defaults to None.
+            aux_loss_scale_static_token_split (bool): The caller guarantees that every rank of
+                aux_loss_scale_reduce_groups holds the same local token count whenever that
+                count is a Python int (static TP/CP groups, Dynamic CP off). For an FP32/FP64
+                aux_loss the reduced count is then computed on the host instead of all-reduced
+                (MCORE_ROUTER_STATIC_TOKENS). Defaults to False.
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
@@ -794,21 +851,37 @@ class TopKRouter(Router):
                 num_local_tokens = (
                     valid_token_count if valid_token_count is not None else activation.shape[0]
                 )
-                if torch.is_tensor(num_local_tokens):
-                    aux_loss_scale_num_tokens = num_local_tokens.clone().to(
-                        device=activation.device
-                    )
-                else:
-                    # torch.full is a device-side fill; torch.tensor(int, device=cuda) does a
-                    # pageable H2D copy that fails inside the moe_router CUDA graph capture.
-                    aux_loss_scale_num_tokens = torch.full(
-                        (), num_local_tokens, dtype=torch.int64, device=activation.device
-                    )
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
                     aux_loss_scale_reduce_groups = (reduce_group,)
-                for group in aux_loss_scale_reduce_groups:
-                    torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
+                if (
+                    moe_env_flags.ROUTER_STATIC_TOKENS
+                    and aux_loss_scale_static_token_split
+                    and not torch.is_tensor(num_local_tokens)
+                    and aux_loss.dtype in (torch.float32, torch.float64)
+                ):
+                    # With static groups and no padding mask every rank holds the same
+                    # Python-int count, so the reduced count is a host constant equal to the
+                    # all-reduce. aux_loss * int converts the int to FP32/FP64 exactly as the
+                    # int64-tensor product did, in forward and in MulBackward. A BF16/FP16
+                    # aux_loss would not match (the tensor is rounded to 16 bits first, the int
+                    # is not), so it keeps the all-reduce.
+                    aux_loss_scale_num_tokens = _static_reduced_token_count(
+                        num_local_tokens, aux_loss_scale_reduce_groups, activation.device
+                    )
+                else:
+                    if torch.is_tensor(num_local_tokens):
+                        aux_loss_scale_num_tokens = num_local_tokens.clone().to(
+                            device=activation.device
+                        )
+                    else:
+                        # torch.full is a device-side fill; torch.tensor(int, device=cuda) does
+                        # a pageable H2D copy that fails inside the moe_router CUDA graph capture.
+                        aux_loss_scale_num_tokens = torch.full(
+                            (), num_local_tokens, dtype=torch.int64, device=activation.device
+                        )
+                    for group in aux_loss_scale_reduce_groups:
+                        torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
             activation = MoEAuxLossAutoScaler.apply(
                 activation, aux_loss * aux_loss_scale_num_tokens
             )
@@ -1207,6 +1280,7 @@ class TopKRouter(Router):
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
                     with_padding_mask=padding_mask is not None,
+                    packed_seq_params=packed_seq_params,
                 )
 
         # Optionally apply expert bias

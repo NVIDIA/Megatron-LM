@@ -74,7 +74,8 @@ def test_train_step_defaults_to_none():
 
 def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
     class _DistributedOptimizer:
-        def __init__(self, overlap_param_gather):
+        def __init__(self, overlap_param_gather, reuse=True):
+            self.reuse_grad_buffer_for_param_ag = reuse
             self.ddp_config = SimpleNamespace(
                 reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=overlap_param_gather
             )
@@ -82,8 +83,9 @@ def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
 
     overlapped = _DistributedOptimizer(overlap_param_gather=True)
     nonoverlapped = _DistributedOptimizer(overlap_param_gather=False)
+    native = _DistributedOptimizer(overlap_param_gather=True, reuse=False)
     optimizer = SimpleNamespace(
-        zero_grad=lambda: None, chained_optimizers=[overlapped, nonoverlapped]
+        zero_grad=lambda: None, chained_optimizers=[overlapped, nonoverlapped, native]
     )
     model = [
         SimpleNamespace(
@@ -106,11 +108,13 @@ def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
 
     overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
     nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
+    native._copy_main_params_to_param_buffer.assert_not_called()
 
 
 def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
     class _DistributedOptimizer:
         def __init__(self):
+            self.reuse_grad_buffer_for_param_ag = True
             self.ddp_config = SimpleNamespace(
                 reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
             )

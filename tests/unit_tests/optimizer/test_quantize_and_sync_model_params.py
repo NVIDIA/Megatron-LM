@@ -14,10 +14,15 @@ buckets for that reason. None of this needs a GPU to pin.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
+
+pytestmark = pytest.mark.launch_on_gb200
 
 
 class _FakeModelChunk:
@@ -26,6 +31,10 @@ class _FakeModelChunk:
     def __init__(self, log, name):
         self._log = log
         self._name = name
+        self.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+
+    def finish_pending_param_sync(self):
+        self._log.append(('finish', self._name))
 
     def zero_grad_buffer(self):
         self._log.append(('zero', self._name))
@@ -85,6 +94,8 @@ def test_every_optimizer_stages_before_the_gather():
     optimizer.quantize_and_sync_model_params_from_main_params()
 
     order = [entry[0] for entry in log]
+    assert order.index('finish') < order.index('stage'), log
+    assert log.count(('finish', 'chunk_a')) == 1, log
     assert max(i for i, k in enumerate(order) if k == 'stage') < order.index('sync'), log
 
 
@@ -231,3 +242,31 @@ def test_base_optimizer_refresh_is_a_no_op():
         def sharded_state_dict(self, model_sharded_state_dict, is_loading=False, metadata=None): ...
 
     _Bare().quantize_and_sync_model_params_from_main_params()
+
+
+@pytest.mark.parametrize("chain_depth", [0, 1, 2])
+def test_mfsdp_refresh_uses_its_own_sync_contract(chain_depth):
+    """FSDP resume stages and gathers without requiring a DDP-only drain method."""
+    log = []
+    chunk = Mock(spec=FullyShardedDataParallelV1)
+    assert not hasattr(chunk, 'finish_pending_param_sync')
+    chunk.ddp_config = SimpleNamespace(use_megatron_fsdp=True, fp8_param_gather=True)
+    chunk.param_and_grad_buffer = SimpleNamespace(
+        copy_main_weights_to_model_weights=lambda: log.append('stage')
+    )
+    # V1 binds this method from its wrapped FSDP instance during initialization.
+    chunk.start_param_sync = Mock(
+        side_effect=lambda *, force_sync: log.append(('sync', force_sync))
+    )
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.is_stub_optimizer = False
+    optimizer.config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False)
+    optimizer.ddp_config = chunk.ddp_config
+    optimizer.model_chunks = [chunk]
+    optimizer.reuse_grad_buffer_for_param_ag = False
+    for _ in range(chain_depth):
+        optimizer = ChainedOptimizer([optimizer])
+
+    optimizer.quantize_and_sync_model_params_from_main_params()
+
+    assert log == ['stage', ('sync', True)]

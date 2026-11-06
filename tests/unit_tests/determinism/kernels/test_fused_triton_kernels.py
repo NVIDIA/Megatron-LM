@@ -16,7 +16,9 @@
   first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
-  and, when available, cuTile backends.
+  and, when available, cuTile backends. The ordered three-way add of the single-pass residual
+  gradients (``fused_add_3_sequential``) is elementwise with unique stores -- it replays and
+  agrees bit for bit with the two eager adds it replaces.
 """
 
 import contextlib
@@ -37,6 +39,7 @@ from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
+    deterministic_algorithms,
     seeded,
 )
 
@@ -497,18 +500,44 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
-def test_mhc_h_aggregate_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("mix_dtype", [torch.bfloat16, torch.float32])
+def test_mhc_h_aggregate_replays_fwd_bwd(backend, mix_dtype):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
         pytest.skip("Triton mHC backend unavailable")
     seeded()
     x = _mhc_rand(S, B, N, C)
-    h_pre = _mhc_rand(S, B, N)
+    h_pre = _mhc_rand(S, B, N, dtype=mix_dtype)
     assert_replays_bit_exact(
         lambda x, h: fused_mhc_kernels.fused_h_aggregate(x, h, backend=backend),
         (x, h_pre),
         replays=3,
         what=f"mhc h_aggregate[{backend}]",
     )
+
+
+@pytest.mark.launch_on_gb200
+def test_csa2_cudnn_r2_pool_replays_fwd_bwd():
+    """Unused atomic dAPE must not affect pooled values or projection gradients."""
+    from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("cuDNN compressor requires SM100 or newer")
+    pytest.importorskip("cudnn.csa.compressor")
+    pool = get_cudnn_r2_pool()
+    assert pool is not None
+    seeded()
+    kv = torch.randn(1026, 1, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    gate = torch.randn_like(kv, requires_grad=True)
+    with deterministic_algorithms(False):
+        assert_replays_bit_exact(
+            lambda kv, gate: pool(kv, gate, kv.dtype),
+            (kv, gate),
+            replays=3,
+            contention=True,
+            what="CSA2 cuDNN ratio-2 pooling",
+        )
+    with deterministic_algorithms(True):
+        assert pool(kv, gate, kv.dtype) is None
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
@@ -554,6 +583,96 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
     )
+
+
+@pytest.mark.skipif(not fused_mhc_kernels.is_cutile_available(), reason="cuTile unavailable")
+def test_mhc_single_pass_cutile_proj_rms_replays_fwd_bwd():
+    """The opt-in single-pass cuTile projection + RMS (MCORE_MHC_SP_CUTILE_PROJ_RMS,
+    ``eps_inside_sqrt=True``): fixed split-K and tile orders, at M 4096 and K 16384 (split-K
+    backward, and the M >= 2048 launch shapes), replay bit-exactly."""
+    seeded()
+    n = N
+    x = _mhc_rand(S * B, n * C)
+    weight = _mhc_rand(n * n + 2 * n, n * C, dtype=torch.float32)
+    alpha_pre = _mhc_rand(1, dtype=torch.float32)
+    alpha_post = _mhc_rand(1, dtype=torch.float32)
+    alpha_res = _mhc_rand(1, dtype=torch.float32)
+    bias = _mhc_rand(n * n + 2 * n, dtype=torch.float32)
+
+    def run(x, weight, alpha_pre, alpha_post, alpha_res, bias):
+        return fused_mhc_kernels.fused_proj_rms_compute_h(
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            backend="cutile",
+            eps_inside_sqrt=True,
+        )
+
+    assert_replays_bit_exact(
+        run,
+        (x, weight, alpha_pre, alpha_post, alpha_res, bias),
+        replays=3,
+        contention=True,
+        what="mhc single-pass proj_rms_compute_h[cutile]",
+    )
+
+
+@pytest.mark.skipif(not HAVE_TRITON, reason="requires Triton")
+@pytest.mark.parametrize("numel", [1 << 22, (1 << 22) + 777], ids=["whole_blocks", "ragged_tail"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_mhc_ordered_add_3_replays_and_matches_two_adds(dtype, numel):
+    """The ordered three-way add behind MCORE_MHC_SP_FUSED_GRAD_ADD=exact (the default).
+
+    One kernel rounds after each add, so it returns torch.add(first, second).add_(last) bit
+    for bit -- the sum autograd accumulates from gradients arriving in that order -- for every
+    launch shape, the eager fallbacks and a CUDA graph, and replays under contention.
+    """
+    seeded()
+    # Mixed magnitudes, so rounding the partial sum matters in 16-bit types.
+    first, second, last = (
+        (
+            torch.randn(numel, device="cuda")
+            * torch.exp2(torch.randint(-8, 9, (numel,), device="cuda").float())
+        ).to(dtype)
+        for _ in range(3)
+    )
+    expected = torch.add(first, second).add_(last)
+    if dtype != torch.float32:
+        # A single rounding of the FP32 sum differs, so the comparison sees the add order.
+        single = (first.float() + second.float() + last.float()).to(dtype)
+        assert not bytes_equal(single, expected)
+    outputs, _ = assert_replays_bit_exact(
+        fused_mhc_kernels.fused_add_3_sequential,
+        (first, second, last),
+        backward=False,
+        contention=True,
+        what=f"mhc ordered add-3[{dtype}]",
+    )
+    assert bytes_equal(outputs["out"], expected)
+    key = (torch.cuda.current_device(), dtype, *fused_mhc_kernels.ADD_3_SEQUENTIAL_LAUNCH_CONFIG)
+    assert key in fused_mhc_kernels._ADD_3_SEQUENTIAL_WARM_KEYS, "the Triton kernel did not run"
+    for block, num_warps in ((256, 1), (1024, 4), (65536, 32)):
+        actual = fused_mhc_kernels.fused_add_3_sequential_with_config(
+            first, second, last, block, num_warps
+        )
+        assert bytes_equal(actual, expected), (block, num_warps)
+    # Ineligible operands (here a strided view) take the eager adds, with the same bits.
+    strided = torch.stack((first, first), dim=1)[:, 0]
+    assert not strided.is_contiguous()
+    assert bytes_equal(fused_mhc_kernels.fused_add_3_sequential(strided, second, last), expected)
+    # A specialization first seen during capture never compiles there: it runs the eager adds.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused_mhc_kernels.fused_add_3_sequential_with_config(
+            first, second, last, 2048, 2
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bytes_equal(captured, expected)
 
 
 def test_contiguous_thd_rope_and_teacher_replay():

@@ -95,12 +95,29 @@ BATCH_KEYS = [
     "tokens",
 ]
 
+# The (args, transformer config) pair last built by _cached_transformer_config.
+_TRANSFORMER_CONFIG_CACHE: Optional[Tuple[Any, Any]] = None
+
+
+def _cached_transformer_config(args):
+    """Build the transformer config once per args namespace instead of once per microbatch.
+
+    Each build validates the whole config and, for V4.1, re-reads ``--engram-config``. The
+    callers read only fields that are fixed once the arguments are validated, so the config is
+    cached by the identity of ``args`` and a different namespace rebuilds it. ``lru_cache``
+    cannot key on an unhashable Namespace, and holding ``args`` keeps its id from being reused.
+    """
+    global _TRANSFORMER_CONFIG_CACHE
+    if _TRANSFORMER_CONFIG_CACHE is None or _TRANSFORMER_CONFIG_CACHE[0] is not args:
+        _TRANSFORMER_CONFIG_CACHE = (args, core_transformer_config_from_args(args))
+    return _TRANSFORMER_CONFIG_CACHE[1]
+
 
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = _cached_transformer_config(args)
 
     if args.sequence_packing_scheduler is not None:
         v41 = getattr(args, 'dsv4_version', 'v4') == 'v4.1'
@@ -333,8 +350,10 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = (next(data_iterator) if isinstance(data_iterator, PipelineDataIterator)
-                    else get_batch(data_iterator, vp_stage))
+        if isinstance(data_iterator, PipelineDataIterator):
+            cp_batch, model_kwargs = data_iterator.next_with_model_kwargs()
+        else:
+            cp_batch, model_kwargs = get_batch(data_iterator, vp_stage), {}
         if getattr(get_args(), 'dsv4_version', 'v4') == 'v4.1':
             from megatron.training.datasets.v41_pipeline import normalize_v41_batch
 
@@ -364,6 +383,7 @@ def forward_step(data_iterator, model: HybridModel):
             loss_mask=loss_mask,
             padding_mask=padding_mask,
             cp_batch=cp_batch,
+            **model_kwargs,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -389,7 +409,7 @@ forward_step.prepare_pipeline_inputs = _prepare_pipeline_inputs
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = _cached_transformer_config(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:

@@ -5,7 +5,7 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, Optional, Protocol, Self, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -133,6 +133,58 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+@dataclass(frozen=True)
+class QKVLayout:
+    """Logical row layout for a packed attention projection weight.
+
+    Both split-shape tuples describe boundaries within one logical group. Standard fused QKV
+    uses one group per query group; MLA up-projections use one group per attention head.
+
+    Projection-level Muon combines the same entry of ``projection_split_shapes`` across all
+    groups into one Newton-Schulz matrix. Per-head Muon instead repeats
+    ``per_head_split_shapes`` for every group and processes every resulting slice independently.
+    For example, two MLA heads with content/positional widths ``(2, 2)`` produce two 4-row
+    projection-level matrices, but four independent 2-row per-head matrices.
+    """
+
+    num_groups: int
+    projection_split_shapes: tuple[int, ...]
+    per_head_split_shapes: tuple[int, ...]
+
+    @classmethod
+    def from_transformer_config(cls, config: TransformerConfig) -> Self:
+        """Build the fused QKV row layout described by a transformer config."""
+        assert config.num_query_groups is not None
+        assert config.kv_channels is not None
+        num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
+        projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
+        per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
+        if getattr(config, "attention_output_gate", False):
+            projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
+            per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
+        projection_split_shapes += [config.kv_channels, config.kv_channels]
+        per_head_split_shapes += [config.kv_channels, config.kv_channels]
+        return cls(
+            num_groups=config.num_query_groups,
+            projection_split_shapes=tuple(projection_split_shapes),
+            per_head_split_shapes=tuple(per_head_split_shapes),
+        )
+
+    @classmethod
+    def from_mla_head_components(cls, num_heads: int, component_widths: tuple[int, ...]) -> Self:
+        """Build an MLA up-projection layout from one head's component widths.
+
+        Each group is one attention head. Projection-level Muon aggregates each component
+        across all heads, whereas per-head Muon processes each component of each head
+        independently.
+        """
+        return cls(
+            num_groups=num_heads,
+            projection_split_shapes=component_widths,
+            per_head_split_shapes=component_widths,
+        )
 
 
 class LinearQkvInterface(Protocol):
@@ -1782,6 +1834,7 @@ class SelfAttention(Attention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
+        self.linear_qkv.weight.qkv_layout = QKVLayout.from_transformer_config(self.config)
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.

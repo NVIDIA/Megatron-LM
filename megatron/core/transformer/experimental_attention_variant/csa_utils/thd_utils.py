@@ -8,11 +8,13 @@ padded cumulative lengths describe physical addresses. As in DSv4, a dummy
 sequence registered in both sets of prefixes is processed as an ordinary sequence.
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
+from megatron.core.env_flags import env_flag
 from megatron.core.packed_seq_params import PackedSeqParams
 
 
@@ -104,8 +106,142 @@ def get_thd_compressed_group_indices(
     return gather_idx, local_pos, batch_ids, valid_comp
 
 
-def _check_values(condition: torch.Tensor, message: str) -> None:
-    """Validate device metadata without transferring CUDA scalars to the host."""
+# THD padding rows must reach the attention kernels and the following projection as zeros.
+# With MCORE_CSA2_SPARSE_PAD_ZERO on (the default), CSA2 writes zeros into only those rows,
+# in place, instead of building a masked copy of each whole tensor; =0 restores masked_fill.
+# Both write the same +0 values, so results are bit-identical.
+SPARSE_PAD_ZERO = env_flag("MCORE_CSA2_SPARSE_PAD_ZERO", True)
+
+
+def _pad_row_capacity() -> int:
+    """Parse MCORE_CSA2_PAD_ROW_CAPACITY, a positive integer (default 512)."""
+    value = os.environ.get("MCORE_CSA2_PAD_ROW_CAPACITY")
+    if value is None:
+        return 512
+    try:
+        capacity = int(value)
+    except ValueError:
+        capacity = 0
+    if capacity < 1:
+        raise ValueError(
+            f"Environment variable MCORE_CSA2_PAD_ROW_CAPACITY={value!r} is not a positive integer"
+        )
+    return capacity
+
+
+# Static number of padding rows one zeroing call handles (the row list has a fixed shape, so
+# it can be captured in CUDA graphs). More padding rows in one call trip a device assert.
+PAD_ROW_CAPACITY = _pad_row_capacity()
+
+
+def padding_rows(invalid: Tensor) -> tuple[Tensor, Tensor]:
+    """List the rows flagged in ``invalid`` (one flag per row) for :func:`zero_rows_`.
+
+    The list has a static shape and is built without host syncs, so it can run inside CUDA
+    graphs. Returns ``rows`` of length ``PAD_ROW_CAPACITY`` and a per-entry ``keep`` flag.
+    Unused entries name the first valid row with ``keep`` set, so writing that row back
+    leaves it unchanged; when every row is padding, they name row 0 with ``keep`` unset.
+    """
+    invalid = invalid.reshape(-1)
+    count = invalid.numel()
+    capacity = PAD_ROW_CAPACITY
+    position = invalid.cumsum(0) - 1
+    if count:
+        torch._assert_async(
+            position[-1] < capacity,
+            "CSA2 THD padding rows exceed MCORE_CSA2_PAD_ROW_CAPACITY; raise it or set "
+            "MCORE_CSA2_SPARSE_PAD_ZERO=0",
+        )
+    slot = torch.where(invalid & (position < capacity), position, capacity)
+    rows = torch.full((capacity + 1,), -1, dtype=torch.long, device=invalid.device)
+    rows = rows.scatter(0, slot, torch.arange(count, device=invalid.device))[:capacity]
+    used = rows >= 0
+    if count:
+        # index_select, not invalid[anchor]: indexing with a 0-dim tensor syncs with the host.
+        anchor = (~invalid).int().argmax().view(1)
+        anchor_valid = ~invalid.index_select(0, anchor)
+    else:
+        anchor = torch.zeros(1, dtype=torch.long, device=invalid.device)
+        anchor_valid = torch.zeros(1, dtype=torch.bool, device=invalid.device)
+    keep = ~used & anchor_valid
+    return torch.where(used, rows, anchor), keep
+
+
+def zero_rows_(tensor: Tensor, rows: Tensor, keep: Tensor) -> Tensor:
+    """Zero ``tensor[rows]`` where ``keep`` is unset, in place along dim 0, outside autograd.
+
+    Writes go through ``.data``, so tensors that other autograd nodes saved stay usable;
+    callers keep the gradients of padding rows at zero themselves (see
+    :func:`zero_padding_rows_`). Returns ``tensor``.
+    """
+    if tensor.numel() == 0:
+        # Empty THD batches: view(0, -1) is ambiguous, and padding_rows names row 0.
+        return tensor
+    flat = tensor.data.view(tensor.shape[0], -1)
+    # where, not a 0/1 product: padding rows may hold NaN or inf, and NaN * 0 is NaN.
+    flat.index_copy_(0, rows, torch.where(keep[:, None], flat.index_select(0, rows), 0))
+    return tensor
+
+
+def save_rows(tensor: Tensor, rows: Tensor) -> Tensor | None:
+    """Copy ``tensor[rows]`` along dim 0, outside autograd, for :func:`restore_rows_`."""
+    if tensor.numel() == 0:
+        return None
+    return tensor.data.view(tensor.shape[0], -1).index_select(0, rows)
+
+
+def restore_rows_(tensor: Tensor, rows: Tensor, saved: Tensor | None) -> Tensor:
+    """Write rows copied by :func:`save_rows` back in place, undoing a :func:`zero_rows_`.
+
+    Duplicate row entries carry identical values, so their write order does not matter.
+    """
+    if saved is not None:
+        tensor.data.view(tensor.shape[0], -1).index_copy_(0, rows, saved)
+    return tensor
+
+
+def zero_padding_rows_(invalid: Tensor, *tensors: Tensor) -> tuple[Tensor, ...]:
+    """In-place counterpart of ``masked_fill(invalid, 0)`` over dim 0 for contiguous tensors.
+
+    Zeroes the padding rows of each tensor and, through a gradient hook, the same rows of
+    each tensor's gradient, as masked_fill's backward does.
+    """
+    rows, keep = padding_rows(invalid)
+
+    def zero_grad_rows(grad):
+        """Zero the padding rows of an incoming gradient."""
+        return zero_rows_(grad.contiguous(), rows, keep)
+
+    for tensor in tensors:
+        zero_rows_(tensor, rows, keep)
+        if tensor.requires_grad:
+            tensor.register_hook(zero_grad_rows)
+    return tensors
+
+
+# Device-side validation of packed THD metadata: every check is a compare/reduce plus a
+# torch._assert_async launch, about 17 per layout build, captured CUDA graphs included. The
+# checks never change a tensor, and a failing one aborts the CUDA context without a Python
+# stack, so they are a debugging aid and off by default; MCORE_CSA2_DEVICE_CHECKS=1 turns
+# them on (recommended for new data pipelines). Metadata held on the CPU is always validated.
+DEVICE_CHECKS = env_flag("MCORE_CSA2_DEVICE_CHECKS", False)
+
+
+def metadata_checks_enabled(device: torch.device) -> bool:
+    """Whether THD metadata on ``device`` is validated: always on the host, on CUDA only
+    with ``MCORE_CSA2_DEVICE_CHECKS=1``."""
+    return DEVICE_CHECKS or device.type != "cuda"
+
+
+def _check_values(condition_fn, message: str, device: torch.device) -> None:
+    """Validate metadata on ``device`` without transferring CUDA scalars to the host.
+
+    ``condition_fn`` builds the condition tensor. It is not called when the check is
+    disabled, so a disabled device check launches no kernel.
+    """
+    if not metadata_checks_enabled(device):
+        return
+    condition = condition_fn()
     if condition.is_cuda:
         torch._assert_async(condition, message)
     elif not bool(condition):
@@ -262,8 +398,9 @@ class CSA2THDLayout:
             raise ValueError("CSA2 state cannot be reused with a different THD layout")
         for name in ("cu_seqlens", "cu_seqlens_padded", "valid_tokens"):
             _check_values(
-                (getattr(self, name) == getattr(other, name)).all(),
+                lambda: (getattr(self, name) == getattr(other, name)).all(),
                 "CSA2 state cannot be reused with a different THD layout",
+                self.cu_seqlens.device,
             )
 
 
@@ -317,19 +454,34 @@ def build_csa2_thd_layout(
             raise ValueError(
                 "CSA2 THD query/KV metadata must have matching shape, dtype and device"
             )
-        _check_values(prefix[0] == 0, "CSA2 THD cumulative lengths must start at zero")
-        _check_values((prefix.diff() >= 0).all(), "CSA2 THD cumulative lengths must be monotonic")
         _check_values(
-            prefix[-1] <= global_total, "CSA2 THD metadata exceeds physical token capacity"
+            lambda: prefix[0] == 0, "CSA2 THD cumulative lengths must start at zero", prefix.device
         )
-    _check_values((cu_q == cu_kv).all(), "CSA2 THD self-attention requires equal query/KV lengths")
+        _check_values(
+            lambda: (prefix.diff() >= 0).all(),
+            "CSA2 THD cumulative lengths must be monotonic",
+            prefix.device,
+        )
+        _check_values(
+            lambda: prefix[-1] <= global_total,
+            "CSA2 THD metadata exceeds physical token capacity",
+            prefix.device,
+        )
+    device = cu_q.device
     _check_values(
-        (physical_q == physical_kv).all(),
-        "CSA2 THD self-attention requires equal query/KV physical lengths",
+        lambda: (cu_q == cu_kv).all(),
+        "CSA2 THD self-attention requires equal query/KV lengths",
+        device,
     )
     _check_values(
-        (cu_q.diff() <= physical_q.diff()).all(),
+        lambda: (physical_q == physical_kv).all(),
+        "CSA2 THD self-attention requires equal query/KV physical lengths",
+        device,
+    )
+    _check_values(
+        lambda: (cu_q.diff() <= physical_q.diff()).all(),
         "CSA2 THD valid sequence length exceeds its physical segment",
+        device,
     )
     max_seqlen = packed_seq_params.max_seqlen_q
     max_seqlen_kv = packed_seq_params.max_seqlen_kv
@@ -337,8 +489,9 @@ def build_csa2_thd_layout(
         if type(limit) is not int or limit < 0:
             raise ValueError("CSA2 THD max_seqlen_q/kv must be non-negative host integers")
         _check_values(
-            (physical_q.diff() <= limit).all(),
+            lambda: (physical_q.diff() <= limit).all(),
             "CSA2 THD physical sequence length exceeds max_seqlen_q/kv",
+            device,
         )
     if max_seqlen != max_seqlen_kv:
         raise ValueError("CSA2 THD self-attention requires equal max_seqlen_q/kv")

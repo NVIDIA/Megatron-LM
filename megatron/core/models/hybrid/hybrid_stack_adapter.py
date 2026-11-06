@@ -42,6 +42,38 @@ class HybridStackForwardAdapter(Protocol):
         """Execute a layer with explicit state, including an optional replay boundary."""
         ...
 
+    def checkpointed_forward(self, layers, hidden_states, context, **kwargs) -> Tensor:
+        """Checkpoint local layer groups using the owning model's state contract."""
+        ...
+
+    def record_cuda_graphs(self) -> None:
+        """Optional hook: collect detached tensor samples during eager warmup."""
+        ...
+
+    def prepare_cuda_graphs(self, *, slots: int, backend: str):
+        """Optional hook: publish warmed tensor-state profiles at the CLI boundary.
+
+        Return ``(key, (region, hidden, state, pre_hook_factory))`` pairs to capture
+        together, or None for an adapter that manages independent graph slots.
+        """
+        ...
+
+    def install_cuda_graphs(self, captures, *, slots: int) -> None:
+        """Optional hook: install completed captures and release warmup samples."""
+        ...
+
+    def setup_cuda_graph_hooks(self, make_hook_func) -> None:
+        """Optional hook: forward the host's parameter-gather hook factory."""
+        ...
+
+    def has_cuda_graphs(self) -> bool:
+        """Report whether model-owned captures are ready for replay."""
+        ...
+
+    def reset_cuda_graphs(self) -> None:
+        """Close model-owned profiles after all their backwards have completed."""
+        ...
+
     def finalize_forward(
         self, output: Tensor | tuple[Tensor, Tensor], context: HybridStackForwardContext
     ) -> Any:

@@ -27,7 +27,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe import moe_env_flags, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -47,10 +47,13 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     count_differing_replays,
     deterministic_algorithms,
+    run_once,
     seeded,
 )
+from tests.unit_tests.determinism.utils import capture_rng_state, restore_rng_state
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -725,6 +728,84 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
     )
 
 
+# --- bit-identical overhead trims (moe_env_flags) ----------------------------------------------
+
+
+def _assert_bit_identical(expected, actual, what):
+    """Assert two ``(outputs, gradients)`` results are byte-for-byte identical."""
+    for kind, want, got in zip(("output", "gradient"), expected, actual):
+        assert want.keys() == got.keys(), f"{what}: {kind} names differ"
+        for name in want:
+            assert bytes_equal(got[name], want[name]), f"{what}: {kind} {name} differs"
+
+
+@pytest.mark.parametrize("te_gemm", [True, False], ids=["te_gemm", "torch_mm"])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("save_fp32_input", [False, True])
+def test_router_gating_linear_fast_cast_is_bit_exact(
+    monkeypatch, te_gemm, with_bias, save_fp32_input
+):
+    """The vectorized operand cast, and saving the widened input for backward, give outputs and
+    gradients bit-identical to Tensor.to on both GEMM paths."""
+    if te_gemm and moe_utils.te_general_gemm is None:
+        pytest.skip("TE general_gemm is not available")
+    if not te_gemm:
+        monkeypatch.setattr(moe_utils, "te_general_gemm", None)
+    seeded()
+    inp = torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16) * 0.02
+    weight.requires_grad_(True)
+    bias = (
+        torch.randn(256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if with_bias
+        else None
+    )
+    upstream = {"out": torch.randn(8192, 256, device="cuda")}
+
+    def gating(i, w, b):
+        return moe_utils.router_gating_linear(i, w, b, torch.float32)
+
+    monkeypatch.setattr(moe_env_flags, "ROUTER_FAST_CAST", False)
+    monkeypatch.setattr(moe_env_flags, "ROUTER_SAVE_FP32_INPUT", False)
+    reference = run_once(gating, (inp, weight, bias), upstream)
+    monkeypatch.setattr(moe_env_flags, "ROUTER_FAST_CAST", True)
+    monkeypatch.setattr(moe_env_flags, "ROUTER_SAVE_FP32_INPUT", save_fp32_input)
+    what = f"router_gating_linear[te_gemm={te_gemm}, bias={with_bias}, save={save_fp32_input}]"
+    actual = assert_replays_bit_exact(
+        gating, (inp, weight, bias), grad_outputs=upstream, replays=3, contention=True, what=what
+    )
+    _assert_bit_identical(reference, actual, what)
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [1.0, 0.125, -0.0, 1e-40, float("inf"), float("nan")],
+    ids=["one", "eighth", "negative_zero", "subnormal", "inf", "nan"],
+)
+def test_aux_loss_scaler_0dim_gradient_is_bit_exact(monkeypatch, scale):
+    """Forming the 0-dim aux-loss gradient directly gives the bits autograd produces when it
+    reduces the [1]-shaped gradient onto the 0-dim aux loss, for every kind of loss scale."""
+    seeded()
+    output = torch.randn(256, 64, device="cuda", requires_grad=True)
+    aux_loss = torch.rand((), device="cuda", requires_grad=True)
+    monkeypatch.setattr(
+        moe_utils.MoEAuxLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.tensor([scale], device="cuda"),
+    )
+    monkeypatch.setattr(moe_env_flags, "AUX_LOSS_SCALE_0DIM", False)
+    reference = run_once(moe_utils.MoEAuxLossAutoScaler.apply, (output, aux_loss))
+    monkeypatch.setattr(moe_env_flags, "AUX_LOSS_SCALE_0DIM", True)
+    actual = assert_replays_bit_exact(
+        moe_utils.MoEAuxLossAutoScaler.apply,
+        (output, aux_loss),
+        replays=2,
+        what=f"MoEAuxLossAutoScaler[scale={scale}]",
+    )
+    assert actual[1]["in[1]"].shape == ()
+    _assert_bit_identical(reference, actual, f"MoEAuxLossAutoScaler[scale={scale}]")
+
+
 # --- modules --------------------------------------------------------------------------------
 
 
@@ -901,6 +982,65 @@ class TestMoEModules:
             contention=hash_routing,
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
+
+    @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
+    def test_random_ste_empty_like_draws_match_clone(self, monkeypatch, layout):
+        """Drawing the random logits into empty_like(logits) consumes the expert-parallel RNG
+        exactly like drawing into logits.clone(), for dense and transposed logits."""
+        self._init()
+        seeded()
+        logits = torch.randn(4096, 256, device="cuda")
+        if layout == "transposed":
+            logits = torch.randn(256, 4096, device="cuda").t()
+        logits.requires_grad_(True)
+        upstream = {"out": torch.randn(4096, 256, device="cuda")}
+        rng = capture_rng_state()
+        monkeypatch.setattr(moe_env_flags, "RANDOM_STE_EMPTY_LIKE", False)
+        reference = run_once(moe_utils.apply_random_logits, (logits,), upstream)
+        restore_rng_state(rng)
+        monkeypatch.setattr(moe_env_flags, "RANDOM_STE_EMPTY_LIKE", True)
+        actual = run_once(moe_utils.apply_random_logits, (logits,), upstream)
+        assert actual[0]["out"].stride() == reference[0]["out"].stride()
+        _assert_bit_identical(reference, actual, f"RandomSTE[{layout}]")
+
+    def test_topk_router_static_token_count_is_bit_exact(self, monkeypatch):
+        """With static TP/CP groups the per-token aux-loss scale uses the host token product;
+        it equals the all-reduced count (checked on the device here) and router outputs and
+        gradients are bit-identical to the all-reduce path."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.01,
+            calculate_per_token_loss=True,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        monkeypatch.setattr(
+            moe_utils.MoEAuxLossAutoScaler,
+            "main_loss_backward_scale",
+            torch.tensor([0.75], device="cuda"),
+        )
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn(8192, config.num_moe_experts, device="cuda")
+        results = {}
+        for static in (False, True):
+            monkeypatch.setattr(moe_env_flags, "ROUTER_STATIC_TOKENS", static)
+            monkeypatch.setattr(moe_env_flags, "ROUTER_CHECK_STATIC_TOKENS", static)
+            results[static] = assert_module_replays_bit_exact(
+                router,
+                (hidden,),
+                replays=2,
+                grad_output=grad_output,
+                what=f"TopKRouter[seq_aux_loss, per-token, static={static}]",
+            )
+        _assert_bit_identical(results[False], results[True], "TopKRouter static token count")
+        moe_utils.get_moe_metrics_tracker().clear()
 
     def test_topk_router_per_token_loss_replays_and_captures(self):
         """seq_aux_loss with per-token-loss scaling replays bit-exactly and its scale tensor can
@@ -1113,6 +1253,12 @@ class TestMoEModules:
         [
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
+            pytest.param(
+                "alltoall",
+                1,
+                {"moe_shared_expert_intermediate_size": 2048},
+                id="alltoall-native-shared-expert",
+            ),
             pytest.param(
                 "alltoall",
                 1,
