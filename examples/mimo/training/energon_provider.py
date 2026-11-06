@@ -73,6 +73,13 @@ def add_energon_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         "when omitted, Energon uses one logical partition per physical worker.",
     )
     group.add_argument(
+        "--energon-dp-resume",
+        action="store_true",
+        help="Enable explicit fixed-total-worker language-DP checkpoint redistribution. "
+        "Requires positive workers, micro-batch size 1, global batch size divisible by "
+        "the total workers, and one logical partition per worker.",
+    )
+    group.add_argument(
         "--dataloader-save",
         metavar="ROOT",
         help="Dataloader checkpoint output root; defaults to --save. "
@@ -102,6 +109,8 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
     _validate_logical_workers(
         getattr(args, "energon_logical_workers", None), args.mimo_llm_dp, args.num_workers
     )
+    if getattr(args, "energon_dp_resume", False):
+        _validate_dp_resume_args(args, args.mimo_llm_dp)
     if args.eval_iters != 0:
         raise ValueError("initial Energon MIMO support is train-only; use --eval-iters 0")
     if args.mimo_encoder_prefetch or args.mimo_encoder_ddp_overlap:
@@ -142,6 +151,24 @@ def _validate_logical_workers(
         )
 
 
+def _validate_dp_resume_args(args: argparse.Namespace, language_lanes: int) -> None:
+    """Validate the deliberately bounded fixed-P migration mode."""
+    workers = args.num_workers
+    if type(workers) is not int or workers <= 0:
+        raise ValueError("--energon-dp-resume requires positive --num-workers")
+    if type(args.micro_batch_size) is not int or args.micro_batch_size != 1:
+        raise ValueError("--energon-dp-resume requires --micro-batch-size 1")
+    total_workers = language_lanes * workers
+    logical_workers = getattr(args, "energon_logical_workers", None)
+    if logical_workers is not None and logical_workers != total_workers:
+        raise ValueError("--energon-dp-resume requires logical workers L=P")
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if type(global_batch_size) is not int or global_batch_size <= 0:
+        raise ValueError("--energon-dp-resume requires a positive --global-batch-size")
+    if global_batch_size % total_workers:
+        raise ValueError("global batch size must be divisible by total physical workers")
+
+
 def _close_loader(loader: SavableDataLoader) -> None:
     close = getattr(loader, "close", None)
     if close is not None:
@@ -165,6 +192,8 @@ class EnergonMimoIterator:
         lane_ids: Sequence[int],
         module_name: str | None,
         merge_encoder_batches: Callable[..., dict[str, Any]] | None,
+        dp_resume: bool = False,
+        rescale_profiles: list[Any] | None = None,
     ) -> None:
         self._loaders = loaders
         self._contracts = contracts
@@ -172,6 +201,8 @@ class EnergonMimoIterator:
         self.lane_ids = tuple(lane_ids)
         self.module_name = module_name
         self._merge_encoder_batches = merge_encoder_batches
+        self._dp_resume = dp_resume
+        self._rescale_profiles = rescale_profiles
         self._closed = False
 
     def __iter__(self) -> EnergonMimoIterator:
@@ -224,7 +255,12 @@ class EnergonMimoIterator:
             raise RuntimeError("cannot checkpoint a closed Energon iterator")
         if self.module_name is not None:
             return None
-        return {"contract": self._contracts[0], "energon": self._loaders[0].save_state_rank()}
+        state = {"contract": self._contracts[0], "energon": self._loaders[0].save_state_rank()}
+        if self._dp_resume:
+            from dataclasses import asdict
+
+            state = {"format": 2, **state, "rescale": asdict(self._rescale_profiles[0])}
+        return state
 
     def close(self) -> None:
         """Close every generator and loader, including partially constructed iterations."""
@@ -257,6 +293,10 @@ def build_energon_iterator(
     """
     logical_workers = getattr(args, "energon_logical_workers", None)
     _validate_logical_workers(logical_workers, language_lanes, args.num_workers)
+    dp_resume = getattr(args, "energon_dp_resume", False)
+    if dp_resume:
+        _validate_dp_resume_args(args, language_lanes)
+        logical_workers = language_lanes * args.num_workers
     from megatron.energon import WorkerConfig, __version__, get_savable_loader, get_train_dataset
     from megatron.energon.errors import reraise_exception
 
@@ -264,8 +304,9 @@ def build_energon_iterator(
         logical_workers is not None
         and "logical_workers" not in inspect.signature(WorkerConfig).parameters
     ):
+        option = "--energon-dp-resume" if dp_resume else "--energon-logical-workers"
         raise RuntimeError(
-            "--energon-logical-workers requires an Energon WorkerConfig that supports "
+            f"{option} requires an Energon WorkerConfig that supports "
             "the logical_workers constructor parameter"
         )
 
@@ -297,7 +338,7 @@ def build_energon_iterator(
     if {"dataset", "worker_config"} & loader_kwargs.keys():
         raise ValueError("loader_kwargs cannot override bridge-owned dataset or worker config")
     options = {"shuffle_buffer_size": None, "max_samples_per_sequence": None, **dataset_kwargs}
-    loaders, contracts = [], []
+    loaders, contracts, profiles = [], [], []
     with ExitStack() as cleanup:
         for lane in lane_ids:
             worker_options = dict(
@@ -337,13 +378,36 @@ def build_energon_iterator(
             if logical_workers is not None:
                 contract["logical_workers"] = logical_workers
             contracts.append(contract)
+            if dp_resume:
+                from examples.mimo.training.energon_checkpoint import build_rescale_profile
+
+                profiles.append(
+                    build_rescale_profile(contract, loader.config(), args.global_batch_size)
+                )
             if checkpoint_paths is not None:
                 path = checkpoint_paths[lane]
                 if path.is_file():
                     state = torch.load(path, map_location="cpu", weights_only=False)[
                         "dataloader_state_dict"
                     ]
-                    if not isinstance(state, dict) or state.get("contract") != contract:
+                    if dp_resume:
+                        from examples.mimo.training.energon_checkpoint import (
+                            validate_rescale_restore,
+                        )
+
+                        try:
+                            validate_rescale_restore(state, contract, profiles[-1])
+                        except (TypeError, ValueError) as error:
+                            raise ValueError(
+                                f"incompatible Energon dataloader state: {path}"
+                            ) from error
+                    elif (
+                        not isinstance(state, dict)
+                        or "migration" in state
+                        or "format" in state
+                        or "rescale" in state
+                        or state.get("contract") != contract
+                    ):
                         raise ValueError(f"incompatible Energon dataloader state: {path}")
                     loader.restore_state_rank(state["energon"])
                 elif not allow_missing_checkpoint:
@@ -354,6 +418,8 @@ def build_energon_iterator(
             lane_ids=lane_ids,
             module_name=module_name,
             merge_encoder_batches=config.merge_encoder_batches,
+            dp_resume=dp_resume,
+            rescale_profiles=profiles,
         )
         cleanup.pop_all()
     return iterator
