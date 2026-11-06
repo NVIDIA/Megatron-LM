@@ -464,6 +464,15 @@ class TransformerConfig(ModelParallelConfig):
     ``dsa_indexer_kpool > 1``.
     """
 
+    dsa_indexer_kpool_shard_queries_across_tp: bool = False
+    """Split KPool indexer scoring across the tensor-parallel group by query rows.
+    Every TP rank otherwise scores the full gathered sequence against every pool with the
+    same replicated indexer weights. When enabled, each rank selects pools for a contiguous
+    1/TP slice of the queries and the int32 selections are all-gathered, so the selected
+    indices are unchanged. Only applies when ``dsa_indexer_kpool > 1`` and the tensor-parallel
+    size is greater than one.
+    """
+
     ####################
     # Compressed sparse attention
     ####################
