@@ -64,6 +64,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.mla_latent_cp import MLAWithLatentCP
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -376,6 +377,31 @@ hybrid_stack_spec = ModuleSpec(
                     "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
                     "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
                 },
+            ),
+        ),
+        # Experimental latent-KV context parallelism (config.mla_latent_cp): the mla_layer
+        # projections with MLAWithLatentCP's own ring in place of the TE attention wrapper.
+        mla_latent_cp_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=MLAWithLatentCP,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_down_proj=TELinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=IdentityOp,
+                        linear_gate=TEColumnParallelLinear,
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py
@@ -692,6 +718,9 @@ def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             mla_layer=layer_spec(WideResidualTransformerLayer, submodules.mla_layer),
             mla_fused_down_proj_layer=layer_spec(
                 WideResidualTransformerLayer, submodules.mla_fused_down_proj_layer
+            ),
+            mla_latent_cp_layer=layer_spec(
+                WideResidualTransformerLayer, submodules.mla_latent_cp_layer
             ),
             mlp_layer=layer_spec(WideResidualTransformerLayer, submodules.mlp_layer),
             moe_layer=layer_spec(WideResidualTransformerLayer, submodules.moe_layer),
