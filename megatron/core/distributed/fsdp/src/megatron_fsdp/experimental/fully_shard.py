@@ -210,6 +210,9 @@ def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[N
         enabled: Whether backward should finalize gradients. Defaults to True.
     """
     context.ensure_finalized()
+    # Join the reduction stream to any active CUDA-graph capture before gradient reduction.
+    # Needed by schedules that bypass FsdpModule.pre_backward, such as combined 1F1B.
+    context.inner_reduction_stream.wait_stream(context.current_stream())
     previous_state = context.finalize_gradients
     context.finalize_gradients = enabled
 
