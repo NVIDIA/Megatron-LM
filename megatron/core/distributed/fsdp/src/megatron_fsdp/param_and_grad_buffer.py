@@ -3449,6 +3449,10 @@ class ParamAndGradBuffer:
                             # main gradient norm.
                             "allreduce",
                             "grad_norm_group",
+                            # finalize_model_grads reads this tag from these parameters, which
+                            # replace the module's own ones, to sum the TP-partial gradients of
+                            # TP-replicated parameters such as GatedDeltaNet's out_norm.
+                            "sum_gradients_across_tp_domain",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
