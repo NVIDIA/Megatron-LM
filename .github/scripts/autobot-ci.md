@@ -31,10 +31,13 @@ gh workflow run cicd-main.yml --repo NVIDIA/Megatron-LM \
   --ref "pull-request/<PR-number>" -f autobot_hello=true
 ```
 
-This invokes the normal CI workflow as well as the hello jobs. For repeated
-mirror-push tests, set `AUTOBOT_CI_HELLO=true`; omit/unset that variable afterward
-to return to opt-in manual runs. These jobs are not added to the existing final
-CI gate and do not alter its dependencies or test matrices.
+This draft runs only the request and waiter jobs. The real CI jobs, including
+Docker builds, linting, downstream/GPU tests, coverage and the final test gate,
+are temporarily commented out in `cicd-main.yml`. Restore them before using this
+workflow for production CI.
+
+For repeated mirror-push tests, set `AUTOBOT_CI_HELLO=true`; omit/unset that
+variable afterward to return to opt-in manual runs.
 
 ## Request and result identity
 
@@ -67,7 +70,7 @@ check conclusion, supported schema/kind and matching payload. It paginates with
 `filter=all` so an older or concurrent same-SHA attempt cannot replace the result.
 The wait has a ten-minute deadline inside a twelve-minute CPU job. Missing,
 ambiguous, malformed or failed results fail this smoke-test job; they never
-silently count as a response. The normal CI selection remains independent.
+silently count as a response. This draft does not run the real CI test suite.
 
 The result is also available as `needs.wait-for-autobot.outputs.result`, but no
 existing job consumes it. A future test-recommendation implementation can keep
