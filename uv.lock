@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -2750,7 +2750,7 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
+    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/Megatron-Energon.git?rev=3f2d246b347f4bedd504cd89e716c9dc789bca8d" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
@@ -2842,8 +2842,8 @@ testmon = [{ name = "pytest-testmon", specifier = "==2.2.0" }]
 
 [[package]]
 name = "megatron-energon"
-version = "7.4.1"
-source = { registry = "https://pypi.org/simple" }
+version = "7.4.2.dev135+g3f2d246b3"
+source = { git = "https://github.com/NVIDIA/Megatron-Energon.git?rev=3f2d246b347f4bedd504cd89e716c9dc789bca8d#3f2d246b347f4bedd504cd89e716c9dc789bca8d" }
 dependencies = [
     { name = "braceexpand" },
     { name = "click" },
@@ -2858,10 +2858,6 @@ dependencies = [
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
     { name = "webdataset" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/81/15/1aa34071dbb64c30f56c68b78989e2a3f11ce72583466b98b37a04206ad4/megatron_energon-7.4.1.tar.gz", hash = "sha256:31e5511bf894e235dff35dacbe130fb1283010a132b612c07e3fa841cc37d82c", size = 211270, upload-time = "2026-08-03T12:11:07.224Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/21/fcfffd2dbc8523412ac623da5e24096a252ff6342f97e1bddf3cce99e36e/megatron_energon-7.4.1-py3-none-any.whl", hash = "sha256:b2d96756f2825750bf51a2b2c16bd1ddfed8f50414b72bb9da174dd8ddafb7d8", size = 286847, upload-time = "2026-08-03T12:11:05.704Z" },
 ]
 
 [package.optional-dependencies]

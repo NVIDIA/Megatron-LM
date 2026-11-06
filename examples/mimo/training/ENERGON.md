@@ -4,8 +4,12 @@
 
 `examples/mimo/pretrain_mimo.py` defaults to mock data. Select
 `--dataset-provider energon` to use native Energon datasets and task encoders
-with the heterogeneous MIMO training loop. This bridge uses the repository's
-existing Energon dependency; no dependency or source patch is required.
+with the heterogeneous MIMO training loop.
+
+Use the repository's uv development environment for prepared BinIdx recipes and
+streaming checkpoints. `pyproject.toml` and `uv.lock` pin the required native
+interfaces and checkpoint fixes at an exact source revision. Other installation
+methods must provide a compatible Energon version with those interfaces.
 
 ## Application configuration
 
