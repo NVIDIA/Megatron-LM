@@ -454,6 +454,9 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
                             f"graph {num_tokens=} {topk=} {alignment=} {skew=} {replay=} {label}",
                             errors,
                         )
+                    # Finish inspecting every symmetric-memory window before a peer
+                    # publishes the next replay's histogram into it.
+                    dist.barrier(group=group, device_ids=[device.index])
         _report(errors, dist.group.WORLD)
     finally:
         workspace.destroy()
