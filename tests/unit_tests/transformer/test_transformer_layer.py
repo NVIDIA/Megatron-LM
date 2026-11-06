@@ -1508,7 +1508,10 @@ class TestMHCWithCudaGraph:
         )
 
         assert output.shape == (seq_len, batch_size, n_channels)
-        # The local recording pass runs inside the call, so replay work reaches the manager.
+        # The call took the local recording path, which runs the layer inside the call, so
+        # replay work reaches the manager.
+        runners = layer.cudagraph_manager.cudagraph_runners
+        assert len(runners) == 1 and runners[0].fwd_graph_recorded, "Expected a local graph record"
         assert mgr.checkpoints, "mHC replay must stay active on the local CUDA-graph path"
         assert layer._mhc_recompute_context is None
 
