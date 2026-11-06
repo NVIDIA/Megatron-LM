@@ -67,6 +67,7 @@ models/index
 
 user-guide/deterministic-training
 user-guide/features/moe
+user-guide/features/mimo-dcp
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
 user-guide/features/checkpoint-merge

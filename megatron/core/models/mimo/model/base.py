@@ -62,8 +62,13 @@ class MimoModel(MegatronModule):
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        external_feature_transport: bool = False,
     ) -> None:
         """Initialize the multimodal model.
+
+        Set ``external_feature_transport`` when the caller routes independently encoded
+        features. This skips static bridge communication, including the pipeline input
+        boundary on disjoint ranks. Features must already be projected to language width.
 
         Example:
             ```python
@@ -71,6 +76,7 @@ class MimoModel(MegatronModule):
             model = MimoModel(mimo_config)
             ```
         """
+
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
 
@@ -83,7 +89,14 @@ class MimoModel(MegatronModule):
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
         self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
-        if self.role.mode is ModuleLayout.COLOCATED and mimo_config.module_to_grid_map:
+        self.external_feature_transport = external_feature_transport
+        if external_feature_transport and mimo_config.language_model_input_projections_spec:
+            raise ValueError("External feature transport requires projections on encoder ranks")
+        if (
+            not external_feature_transport
+            and self.role.mode is ModuleLayout.COLOCATED
+            and mimo_config.module_to_grid_map
+        ):
             # Per-encoder bridge needed iff modules share ranks but may differ
             # in TP/DP within those ranks.
             self._build_colocated_communicators()
@@ -638,6 +651,10 @@ class MimoModel(MegatronModule):
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+        modality_embeddings: Optional[Dict[str, torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -665,6 +682,14 @@ class MimoModel(MegatronModule):
                 ``[B, S]`` input grid. Encoder-only ranks ignore this argument. Pass ``None`` to
                 derive every position from ``input_ids``. See
                 ``align_embeddings_by_token_positions`` for the trusted-producer contract.
+            modality_embeddings: Already projected and routed features for this complete pack.
+                Bypasses encoder execution and static bridge communication. Disjoint language
+                ranks require ``external_feature_transport=True``. Mutually exclusive with
+                ``modality_inputs``. The caller owns feature backward.
+            padding_mask: Boolean ``[B, S]`` mask, True at physical padding positions.
+            cp_group: Optional runtime CP group for a packed forward. CP1 requires
+                an explicit singleton group; None retains the configured static CP group.
+            tp_cp_group: TP x runtime CP group, required with runtime CP and sequence parallelism.
 
         Returns:
             tuple: (output, loss_mask) where output semantics depend on role:
@@ -674,8 +699,29 @@ class MimoModel(MegatronModule):
         """
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
+        if modality_embeddings is not None and modality_inputs is not None:
+            raise ValueError("Pass either modality_inputs or modality_embeddings, not both")
+        external_language = self.external_feature_transport and self.role.has_language_module
+        if self.external_feature_transport and self.role.mode is ModuleLayout.NON_COLOCATED:
+            if input_tensors is not None:
+                raise ValueError("External feature transport cannot also consume pipeline inputs")
+            if external_language and modality_embeddings is None:
+                raise ValueError(
+                    "External language ranks require modality_embeddings; use {} for text"
+                )
+        if (
+            self.role.mode is not ModuleLayout.COLOCATED
+            and not external_language
+            and any(
+                value is not None
+                for value in (modality_embeddings, padding_mask, cp_group, tp_cp_group)
+            )
+        ):
+            raise ValueError(
+                "External features and runtime CP require a language transport endpoint"
+            )
 
-        if self.role.mode == ModuleLayout.COLOCATED:
+        if self.role.mode == ModuleLayout.COLOCATED or external_language:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -687,10 +733,16 @@ class MimoModel(MegatronModule):
                 cu_seqlens_padded=cu_seqlens_padded,
                 max_seqlen=max_seqlen,
                 modality_token_indices=modality_token_indices,
+                modality_embeddings=modality_embeddings,
+                padding_mask=padding_mask,
+                cp_group=cp_group,
+                tp_cp_group=tp_cp_group,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
+                if self.external_feature_transport:
+                    return self.encode_modalities(modality_inputs), loss_mask
                 # Token indices are consumed only when language embeddings are assembled.
                 return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
@@ -855,6 +907,9 @@ class MimoModel(MegatronModule):
         max_seqlen: Optional[torch.Tensor],
         owns_mtp: bool,
         text_token_indices: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ContextParallelBatch:
         """Prepare CP-local position IDs and optional MTP token metadata.
 
@@ -884,6 +939,9 @@ class MimoModel(MegatronModule):
             cu_seqlens=cu_seqlens,
             cu_seqlens_padded=cu_seqlens_padded,
             max_seqlen=max_seqlen,
+            padding_mask=padding_mask,
+            cp_group=cp_group,
+            tp_cp_group=tp_cp_group,
         )
 
     def _forward_prepared_language_inputs(
@@ -901,6 +959,7 @@ class MimoModel(MegatronModule):
             loss_mask=batch["loss_mask"],
             mtp_input_mask=batch["mtp_input_mask"],
             packed_seq_params=cp_batch.get_packed_seq_params(),
+            padding_mask=batch.get("padding_mask"),
             **cp_kwargs,
         )
 
@@ -1083,6 +1142,24 @@ class MimoModel(MegatronModule):
                 )
         return modality_embeddings
 
+    def encode_modalities(
+        self, modality_inputs: Optional[Dict[str, Dict[str, Any]]]
+    ) -> Dict[str, torch.Tensor]:
+        """Encode local inputs without transport or decoder execution, retaining their graph.
+
+        Outputs contain projected feature rows in each modality submodule's input order.
+        Ranks with no local inputs return an empty mapping. A step runtime can retain these
+        tensors until all decoder rounds have returned their feature gradients.
+        """
+        outputs = {}
+        for name, submodule in self.modality_submodules.items():
+            inputs = (modality_inputs or {}).get(name)
+            if inputs is not None:
+                features = submodule.forward(encoder_inputs=inputs)
+                if features is not None:
+                    outputs[name] = features
+        return outputs
+
     def _forward_all_modules(
         self,
         input_ids: torch.Tensor,
@@ -1095,33 +1172,24 @@ class MimoModel(MegatronModule):
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+        modality_embeddings: Optional[Dict[str, torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Forward pass when all modules are on all ranks (no multi-module PP).
+        """Merge local or externally routed features and run the complete language model.
 
-        This is the original behavior, preserved for backward compatibility.
+        External transport also uses this path on disjoint language ranks.
         """
         owns_mtp = self._language_model_owns_mtp()
 
         # 1. Process each modality to get embeddings
-        modality_embeddings = {}
-
-        for modality_name, submodule in self.modality_submodules.items():
-            if (
-                modality_inputs
-                and modality_name in modality_inputs
-                and modality_inputs[modality_name] is not None
-            ):
-                logger.debug(f"Processing {modality_name} modality")
-                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                if embeddings is not None:
-                    modality_embeddings[modality_name] = embeddings
-                    logger.debug(
-                        f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
-                    )
-
-        # Apply colocated communication if configured (no-op when colocated_comms is empty)
-        if self.colocated_comms:
-            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+        if modality_embeddings is None:
+            modality_embeddings = self.encode_modalities(modality_inputs)
+            if self.colocated_comms:
+                modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+        else:
+            modality_embeddings = dict(modality_embeddings)
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(
@@ -1157,6 +1225,9 @@ class MimoModel(MegatronModule):
             max_seqlen=max_seqlen,
             owns_mtp=owns_mtp,
             text_token_indices=(modality_token_indices or {}).get("text"),
+            padding_mask=padding_mask,
+            cp_group=cp_group,
+            tp_cp_group=tp_cp_group,
         )
 
         # 5. Forward pass through language model

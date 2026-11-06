@@ -144,6 +144,8 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     correct_vision_grad = bool(
         getattr(args, "correct_encoder_grad_for_partial_participation", False)
     )
+    if getattr(args, "mimo_packed", False) and correct_vision_grad:
+        raise ValueError("Packed MIMO uses token normalization, not active-encoder averaging")
 
     def finalize_grads_func(_model_list, num_tokens, force_all_reduce=False, **_kwargs):
         # calculate_per_token_loss=True => DDP gradient_scaling_factor 1.0 (pure SUM),

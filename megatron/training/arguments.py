@@ -1276,7 +1276,9 @@ def validate_args(args, defaults={}):
 
     if args.dynamic_context_parallel:
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.dataloader_type in ('single', 'external'), (
+            'Dynamic context parallelism requires a single or externally provided dataloader'
+        )
         if args.sequence_packing_scheduler is None:
             args.sequence_packing_scheduler = 'default_dynamic_cp'
         if args.sequence_packing_scheduler != 'default_dynamic_cp':
@@ -1284,7 +1286,10 @@ def validate_args(args, defaults={}):
                 "Dynamic context parallelism requires "
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
-        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        # DCP schedules all independent sample owners and context partitions.
+        # data_parallel_size excludes GTP weight shards; batch_parallel_size
+        # includes the GTP ranks that own distinct samples.
+        dp_cp_size = args.batch_parallel_size * args.context_parallel_size
         from megatron.core.parallel_state import (
             get_valid_dynamic_context_parallel_group_sizes,
         )
@@ -1584,7 +1589,9 @@ def validate_args(args, defaults={}):
         if args.max_seqlen_per_dp_cp_rank is not None:
             total_cp_ranks = args.context_parallel_size
             if args.sequence_packing_scheduler == 'default_dynamic_cp':
-                total_cp_ranks *= args.data_parallel_size
+                # Runtime CP can span all independent sample owners, including
+                # GTP weight peers, just like the minimum-CP validation above.
+                total_cp_ranks *= args.batch_parallel_size
             assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
                 f'must be >= single sequence max length ({args.seq_length})'
@@ -2269,6 +2276,7 @@ def _add_network_size_args(parser):
         # cannot provide callables over CLI
         "timers",
         "finalize_model_grads_func",
+        "forward_backward_func",
         "grad_scale_func",
         "moe_grad_scale_func",
         "mtp_grad_scale_func",
