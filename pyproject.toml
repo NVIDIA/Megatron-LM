@@ -103,7 +103,7 @@ dev = [
     "multi-storage-client~=0.50",
     "opentelemetry-api>=1.33.1,<2",
     "nemo-lens",
-    "megatron-energon[av_decode]~=7.0",
+    "megatron-energon[av_decode]",
     "av",
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
@@ -256,6 +256,8 @@ version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.uv.sources]
+
+megatron-energon = { git = "https://github.com/NVIDIA/Megatron-Energon.git", rev = "3f2d246b347f4bedd504cd89e716c9dc789bca8d" }
 
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
