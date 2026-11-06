@@ -646,6 +646,89 @@ def test_batch_invariant_mxfp8_permute_replays():
     assert not padding_data.any() and not padding_scales.any()
 
 
+def test_inference_permute_valid_pairs_past_int32_replays():
+    """``valid_tokens * topk`` past int32 (``valid_tokens`` at its int32 maximum): the count
+    kernels, both permute kernels and the vLLM path's scatter form it in int64 and clamp it to
+    the routing-map rows. They replay bit-exactly and give the ``valid_tokens == rows`` result
+    bit for bit."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
+    from megatron.core.inference.moe.permute import (
+        compute_local_tokens_per_expert,
+        permute_and_quantize_mxfp8,
+        permute_tokens,
+    )
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+    seeded()
+    rows, hidden, topk, num_local = 1024, 1024, 8, 32
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, topk, device="cuda")
+    tokens = torch.arange(rows, device="cuda")[:, None]
+    routing_map = (tokens + 3 * torch.arange(topk, device="cuda")[None, :]) % num_local
+    fc1 = torch.randn(num_local, 256, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(num_local, hidden, 256, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    def logical_rows(hidden_states, probs, valid_tokens=2**31 - 1):
+        valid = _dev_scalar(valid_tokens)
+        counts = [
+            compute_local_tokens_per_expert(routing_map, 0, num_local, valid, persistent=p)
+            for p in (False, True)
+        ]
+        perm_h, perm_p, _, offs, inverse_map = permute_tokens(
+            hidden_states,
+            probs,
+            routing_map,
+            0,
+            num_local,
+            valid,
+            alignment=16,
+            return_batch_invariant_inverse_map=True,
+        )
+        live = inverse_map[inverse_map >= 0].long()
+        quantized, q_probs, _, q_offs, q_inverse_map = permute_and_quantize_mxfp8(
+            hidden_states,
+            probs,
+            routing_map,
+            0,
+            num_local,
+            valid,
+            alignment=128,
+            return_batch_invariant_inverse_map=True,
+        )
+        q_live = q_inverse_map[q_inverse_map >= 0].long()
+        moe_out = vllm_fused_moe(
+            hidden_states,
+            probs,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            num_local,
+            0,
+            valid,
+            routing_map,
+        )
+        return (
+            *counts,
+            offs,
+            perm_h[live],
+            perm_p[live],
+            q_offs,
+            quantized.data[q_live].view(torch.uint8),
+            q_probs[q_live],
+            moe_out,
+        )
+
+    reference, _ = assert_replays_bit_exact(
+        logical_rows,
+        (hidden_states, probs),
+        replays=4,
+        backward=False,
+        what="permute with valid_tokens * topk past int32",
+    )
+    for name, out in zip(reference, logical_rows(hidden_states, probs, valid_tokens=rows)):
+        assert torch.equal(reference[name], out), f"{name} differs from valid_tokens == rows"
+
+
 def _unpermute_case():
     from megatron.core.inference.moe import permute
 
@@ -848,6 +931,47 @@ def test_vllm_moe_align_block_size_replays():
         contention=True,
         what="_moe_align_block_size_cuda_graphable",
     )
+
+
+def test_vllm_fused_moe_clamps_valid_tokens_to_rows_replay():
+    """The count, scatter and top-k sum kernels clamp ``valid_tokens`` to the input rows: a larger
+    count replays bit-exactly and gives the ``valid_tokens == rows`` result bit for bit."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+    seeded()
+    rows, hidden, ffn, topk, experts = 1024, 1024, 512, 8, 32
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, topk, device="cuda")
+    # The routing map and the output view the head of larger buffers. The routing tail routes
+    # nowhere, so rows past the inputs could only show up as stores past the output.
+    routing_buffer = torch.full((2 * rows, topk), -1, device="cuda", dtype=torch.int64)
+    routing_buffer[:rows] = torch.randint(0, experts, (rows, topk), device="cuda")
+    routing_map = routing_buffer[:rows]
+    fc1 = torch.randn(experts, ffn, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
+    out_buffer = torch.empty(2 * rows, hidden, device="cuda")
+
+    def fn(h, p, valid_tokens=2 * rows):
+        out_buffer.fill_(-1.0)
+        vllm_fused_moe(
+            h,
+            p,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            experts,
+            0,
+            _dev_scalar(valid_tokens),
+            routing_map,
+            out=out_buffer[:rows],
+        )
+        return out_buffer.clone()
+
+    assert_replays_bit_exact(
+        fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe clamp"
+    )
+    assert torch.equal(fn(hidden_states, probs), fn(hidden_states, probs, valid_tokens=rows))
 
 
 @pytest.mark.parametrize(
