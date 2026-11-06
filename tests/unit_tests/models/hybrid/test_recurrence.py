@@ -94,7 +94,8 @@ def test_invalid_loop_distribution(value):
 
 
 @pytest.mark.parametrize("pattern", [":*-:", ":*:-*-:"])
-def test_cli_policy_reaches_native_builder(monkeypatch, pattern):
+@pytest.mark.parametrize("inference_n_loops", [None, 2])
+def test_cli_policy_reaches_native_builder(monkeypatch, pattern, inference_n_loops):
     from megatron.training.argument_utils import hybrid_config_from_args
     from megatron.training.arguments import parse_args, validate_args
     from megatron.training.models.hybrid import HybridModelBuilder
@@ -118,20 +119,54 @@ def test_cli_policy_reaches_native_builder(monkeypatch, pattern):
             "4",
             "--micro-batch-size",
             "1",
-        ],
+        ]
+        + (
+            ["--inference-n-loops", str(inference_n_loops)] if inference_n_loops is not None else []
+        ),
     )
     args = validate_args(parse_args())
     assert args.num_layers == len(pattern.replace(":", ""))
     model_config = hybrid_config_from_args(args)
     assert model_config.n_loops_distribution == "1:.5,4:.5"
+    assert model_config.inference_n_loops == inference_n_loops
     model_config.vocab_size = 32
     monkeypatch.setattr("megatron.training.models.hybrid.HybridModel", lambda **kwargs: kwargs)
     builder = HybridModelBuilder(model_config)
     kwargs = builder.build_model(SimpleNamespace(), pre_process=True, post_process=True)
     assert kwargs["n_loops_distribution"] == "1:.5,4:.5"
+    assert kwargs["inference_n_loops"] == inference_n_loops
     assert kwargs["hybrid_layer_pattern"] == pattern
     with pytest.raises(ValueError, match="FSDP"):
         builder.build_distributed_models(SimpleNamespace(), use_megatron_fsdp=True)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_cli_rejects_non_positive_inference_loop_counts(monkeypatch, value):
+    from megatron.training.arguments import parse_args, validate_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pretrain_hybrid.py",
+            "--hybrid-layer-pattern",
+            ":*-:",
+            "--inference-n-loops",
+            str(value),
+            "--hidden-size",
+            "128",
+            "--num-attention-heads",
+            "4",
+            "--seq-length",
+            "4",
+            "--max-position-embeddings",
+            "4",
+            "--micro-batch-size",
+            "1",
+        ],
+    )
+    with pytest.raises(ValueError, match="inference_n_loops must be a positive integer"):
+        validate_args(parse_args())
 
 
 def test_recurrence_boundaries_do_not_shift_dsv4_layer_metadata():
@@ -340,6 +375,79 @@ def test_repeated_forward_and_gradients_match_manual_unroll(
         assert name == ref_name
         assert parameter.grad is not None, name
         torch.testing.assert_close(parameter.grad, ref_parameter.grad, msg=name)
+
+
+@pytest.mark.parametrize(
+    "pattern,bodies", [("-:*-:-", ((1, 2),)), ("-:G-:-", ((1, 2),)), ("-:*:-*:-", ((1,), (2, 3)))]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_recurrence_matches_independent_layer_instances(model_factory, pattern, bodies, dtype):
+    """Compare reused modules with fresh, untied modules for every logical execution."""
+    model = model_factory(pattern=pattern, dtype=dtype)
+    flat = pattern.replace(":", "")
+    tokens, positions = _inputs()
+    # Reuse the recurrent model across changing depths and shapes to expose stale state.
+    for n_loops, seq_len in [(3, 4), (1, 3), (2, 2), (3, 4)]:
+        execution_order = [0]
+        for body in bodies:
+            for _ in range(n_loops):
+                execution_order.extend(body)
+        execution_order.append(len(flat) - 1)
+        reference = model_factory(
+            pattern="".join(flat[index] for index in execution_order),
+            distribution=None,
+            dtype=dtype,
+        )
+        reference.embedding.load_state_dict(model.embedding.state_dict())
+        reference.decoder.final_norm.load_state_dict(model.decoder.final_norm.state_dict())
+        reference.output_layer.load_state_dict(model.output_layer.state_dict())
+        for copy, index in zip(reference.decoder.layers, execution_order, strict=True):
+            copy.load_state_dict(model.decoder.layers[index].state_dict())
+        assert len({id(layer) for layer in reference.decoder.layers}) == len(execution_order)
+        copy_parameters = [
+            parameter.data_ptr()
+            for layer in reference.decoder.layers
+            for parameter in layer.parameters()
+        ]
+        assert len(copy_parameters) == len(set(copy_parameters))
+        source_parameters = {parameter.data_ptr() for parameter in model.parameters()}
+        assert source_parameters.isdisjoint(
+            parameter.data_ptr() for parameter in reference.parameters()
+        )
+
+        model.zero_grad(set_to_none=True)
+        decoder_input = torch.randn(
+            seq_len, 1, model.config.hidden_size, device="cuda", dtype=dtype, requires_grad=True
+        )
+        reference_input = decoder_input.detach().clone().requires_grad_()
+        actual = model(tokens, positions, None, decoder_input=decoder_input, n_loops=n_loops)
+        expected = reference(tokens, positions, None, decoder_input=reference_input)
+        torch.testing.assert_close(actual, expected)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        assert decoder_input.grad is not None and reference_input.grad is not None
+        torch.testing.assert_close(decoder_input.grad, reference_input.grad)
+        for module, copy in (
+            (model.decoder.final_norm, reference.decoder.final_norm),
+            (model.output_layer, reference.output_layer),
+        ):
+            for parameter, other in zip(module.parameters(), copy.parameters(), strict=True):
+                assert parameter.grad is not None and other.grad is not None
+                torch.testing.assert_close(parameter.grad, other.grad)
+        copies = [dict(layer.named_parameters()) for layer in reference.decoder.layers]
+        for index, layer in enumerate(model.decoder.layers):
+            occurrences = [i for i, source in enumerate(execution_order) if source == index]
+            for name, parameter in layer.named_parameters():
+                assert parameter.grad is not None, name
+                # Accumulate in backward execution order, in the parameter's gradient dtype.
+                accumulated = torch.zeros_like(parameter.grad)
+                for occurrence in reversed(occurrences):
+                    gradient = copies[occurrence][name].grad
+                    assert gradient is not None, name
+                    accumulated.add_(gradient)
+                torch.testing.assert_close(
+                    parameter.grad, accumulated, msg=f"layer {index}: {name}"
+                )
 
 
 @pytest.mark.parametrize("pattern", ["-:*-:-", "-:*:-*:-"])
@@ -570,8 +678,49 @@ def test_later_recompute_setting_cannot_bypass_recurrence(model_factory):
         model(tokens, positions, None)
 
 
+@pytest.mark.parametrize("inference_n_loops", [0, -1, True, 1.5])
+def test_invalid_inference_loop_counts(model_factory, inference_n_loops):
+    with pytest.raises(ValueError, match="inference_n_loops must be a positive integer"):
+        model_factory(inference_n_loops=inference_n_loops)
+
+
+@pytest.mark.parametrize("pattern", ["-:*-:-", "-:*:-*:-"])
+@pytest.mark.parametrize(
+    "inference_n_loops,override,expected",
+    [(None, None, 3), (2, None, 2), (5, None, 5), (2, 1, 1), (None, 2, 2)],
+)
+def test_inference_loop_count_precedence(
+    model_factory, pattern, inference_n_loops, override, expected
+):
+    model = model_factory(
+        pattern=pattern, distribution="1:.5,3:.5", inference_n_loops=inference_n_loops
+    )
+    calls = []
+    handle = model.decoder.layers[1].register_forward_hook(lambda *args: calls.append(1))
+    tokens, positions = _inputs()
+    try:
+        with torch.no_grad():
+            model.eval()
+            model(tokens, positions, None, n_loops=override)
+            assert len(calls) == expected
+            calls.clear()
+            model.train()
+            model(tokens, positions, None, recurrence_step=0)
+            assert len(calls) == 3  # The inference setting must not change training sampling.
+            calls.clear()
+            model.eval()
+            model(tokens, positions, None)
+            assert len(calls) == (3 if inference_n_loops is None else inference_n_loops)
+            with pytest.raises(ValueError, match="cached inference"):
+                model(tokens, positions, None, inference_context=SimpleNamespace())
+    finally:
+        handle.remove()
+
+
 def test_distribution_requires_boundaries(model_factory):
     with pytest.raises(ValueError, match="requires ':' boundaries"):
         model_factory(pattern="-*--")
+    with pytest.raises(ValueError, match="requires ':' boundaries"):
+        model_factory(pattern="-*--", distribution=None, inference_n_loops=2)
     with pytest.raises(ValueError, match="complete non-pipelined"):
         model_factory(pre_process=False)

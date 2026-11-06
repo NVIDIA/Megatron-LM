@@ -816,20 +816,27 @@ def validate_args(args, defaults={}):
     ):
         args.multi_latent_attention = True
 
-    n_loops_distribution = getattr(args, 'n_loops_distribution', None)
+    n_loops_distribution = getattr(args, "n_loops_distribution", None)
     if n_loops_distribution is not None:
         from megatron.core.models.hybrid.recurrence import LoopDistribution
 
         LoopDistribution.from_string(n_loops_distribution)
         if not parse_hybrid_pattern(args.hybrid_layer_pattern).recurrent_layer_ranges:
-            raise ValueError('--n-loops-distribution requires : boundaries in --hybrid-layer-pattern')
-    if args.hybrid_layer_pattern and ':' in args.hybrid_layer_pattern:
+            raise ValueError("--n-loops-distribution requires ':' boundaries in --hybrid-layer-pattern")
+    inference_n_loops = getattr(args, "inference_n_loops", None)
+    if inference_n_loops is not None:
+        from megatron.core.models.hybrid.recurrence import validate_loop_count
+
+        validate_loop_count(inference_n_loops, "inference_n_loops")
+        if not parse_hybrid_pattern(args.hybrid_layer_pattern).recurrent_layer_ranges:
+            raise ValueError("--inference-n-loops requires ':' boundaries in --hybrid-layer-pattern")
+    if args.hybrid_layer_pattern and ":" in args.hybrid_layer_pattern:
         # Parse even without MTP or a loop policy so malformed boundaries fail during validation.
         parse_hybrid_pattern(args.hybrid_layer_pattern)
         if args.pipeline_model_parallel_size != 1:
-            raise ValueError('Hybrid recurrence does not yet support pipeline parallelism')
+            raise ValueError("Hybrid recurrence does not yet support pipeline parallelism")
         if args.use_torch_fsdp2 or args.use_megatron_fsdp:
-            raise ValueError('Hybrid recurrence does not yet support FSDP; use Megatron DDP')
+            raise ValueError("Hybrid recurrence does not yet support FSDP; use Megatron DDP")
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
@@ -3598,10 +3605,15 @@ def _add_experimental_args(parser):
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
-    group.add_argument('--n-loops-distribution', type=str, default=None,
-                       help='Shared loop-count probabilities for all ":"-delimited hybrid '
-                       'regions, e.g., "1:0.25,2:0.25,4:0.25,8:0.25". Defaults to one loop. '
-                       'Evaluation uses the largest count. Independent of checkpoint weights.')
+    group.add_argument("--n-loops-distribution", type=str, default=None,
+                       help="Shared loop-count probabilities for all ':'-delimited hybrid "
+                       "regions, e.g., '1:0.25,2:0.25,4:0.25,8:0.25'. Defaults to one loop. "
+                       "Evaluation defaults to the largest count; --inference-n-loops "
+                       "can override it. Independent of checkpoint weights.")
+    group.add_argument("--inference-n-loops", type=int, default=None,
+                       help="Loop count for whenever the model is in eval mode (e.g., inference "
+                       "and evaluation). Defaults to the largest training-distribution count from "
+                       "`--n-loops-distribution` when omitted.")
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')

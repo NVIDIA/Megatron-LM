@@ -69,9 +69,21 @@ Use the same step and distribution on all participating ranks. Supplying an expl
 step rather than deriving it from forward-call order also permits future pipeline
 stages to reproduce the same count without communicating the sampled value.
 
-Evaluation (`model.eval()`) uses the largest count in the distribution without
-sampling. For full-sequence evaluation at a particular depth, use the forward
-argument `n_loops`, e.g.:
+`--inference-n-loops` sets a fixed positive loop count for both inference and
+evaluation (`model.eval()`). It does not affect training sampling. Its default is
+`None` (omit the flag), which uses the largest count in the shared training
+distribution without sampling. The same count applies to every recurrent region.
+For example, `--inference-n-loops 2` evaluates at two loops even when the training
+distribution includes larger counts.
+
+The precedence for evaluation and inference is:
+
+1. Explicit forward argument `n_loops`.
+2. Configured `inference_n_loops`, if not `None`.
+3. Largest training-distribution count.
+
+Direct Core callers can set `HybridModel(..., inference_n_loops=2)` or use a
+per-forward override, e.g.:
 
 ```python
 model.eval()
@@ -81,7 +93,8 @@ with torch.no_grad():
 
 The override applies to every region for this forward only and does not modify
 the training policy. Use the same override on every participating rank and throughout
-a training minibatch's accumulation microbatches.
+a training minibatch's accumulation microbatches. Selecting an inference loop count
+does not enable cached decoding; inference contexts remain unsupported.
 
 ## State and gradients
 
@@ -122,6 +135,10 @@ when continuing training rather than using a weights-only finetune. Restoring th
 training step is sufficient to reproduce loop sampling; normal RNG restoration
 remains necessary for dropout and other stochastic model operations.
 
+`--inference-n-loops` is also a runtime override, not an architectural change. The
+legacy checkpoint-argument loader does not restore it. Supply the desired setting
+for each run, or omit it to use the largest training loop count.
+
 ## Initial scope
 
 The implementation supports multiple recurrent regions of different lengths with
@@ -156,10 +173,18 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node 1 -m pytest
 ```
 
 Tests cover parsing, distribution validation, stateless step replay without changing
-global RNG state or using collectives, and CLI-to-builder and training-step propagation. They verify ordinary
-and distributed checkpoints saved without recurrence boundaries load into models
+global RNG state or using collectives, CLI-to-builder and training-step propagation,
+and inference/evaluation loop-count precedence. They verify ordinary and distributed
+checkpoints saved without recurrence boundaries load into models
 with boundaries. The ordinary checkpoint test also restores AdamW optimizer state,
 the LR scheduler, and training progress, reproduces a one-loop optimizer update, and
-then trains at greater depth. Single-/multi-region tests compare forward results and
-gradients with explicit unrolling and verify one shared count across accumulation
+then trains at greater depth. Both unroll comparisons are retained: one explicitly
+calls shared layer instances, while the other builds a separate layer instance for
+every logical execution. The independent-instance reference compares outputs and
+input gradients, and sums the copies' parameter gradients to compare with the
+recurrent model's shared gradients. It reuses the recurrent model across changing
+loop counts and sequence lengths to expose stale state. These checks cover FP32
+and BF16, attention/MLP and GDN/MLP bodies, and multiple recurrent regions.
+
+Other single-/multi-region tests verify one shared count across accumulation
 microbatches and regions, with each body finishing its loops before the next starts.

@@ -61,6 +61,8 @@ class HybridModelConfig(ModelConfig):
     hybrid_layer_pattern: str | None = None
     n_loops_distribution: str | None = None
     """Shared loop-count policy for all colon-delimited recurrent decoder regions."""
+    inference_n_loops: int | None = None
+    """Loop count for inference and evaluation. None uses the largest training loop count."""
     seq_length: int = 8192
     """Position-embedding capacity, passed to the model as max_sequence_length; the launcher
     fills it from --max-position-embeddings. The training sequence length that core modules
@@ -210,6 +212,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             n_loops_distribution=self._model_config.n_loops_distribution,
+            inference_n_loops=self._model_config.inference_n_loops,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
             logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,

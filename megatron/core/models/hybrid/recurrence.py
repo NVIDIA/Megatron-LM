@@ -96,12 +96,17 @@ class LoopDistribution:
         return random.Random(step).choices(self.counts, weights=self.probabilities, k=1)[0]
 
 
+def validate_loop_count(n_loops: int, name: str = "n_loops") -> None:
+    """Require a positive loop count, excluding Python's boolean integer subtype."""
+    if isinstance(n_loops, bool) or not isinstance(n_loops, int) or n_loops < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
 def recurrent_layer_indices(
     num_layers: int, ranges: tuple[tuple[int, int], ...], n_loops: int
 ) -> Iterator[int]:
     """Repeat each region in order with one shared count and no duplicated modules."""
-    if isinstance(n_loops, bool) or not isinstance(n_loops, int) or n_loops < 1:
-        raise ValueError("n_loops must be a positive integer")
+    validate_loop_count(n_loops)
     previous_end = 0
     for start, end in ranges:
         if not previous_end <= start < end <= num_layers:
