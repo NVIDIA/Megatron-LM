@@ -671,11 +671,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",

@@ -192,8 +192,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-batch_invariant = ["deep_gemm"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
 managed = true
@@ -206,7 +205,6 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
-    "deep_gemm",
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
@@ -258,7 +256,6 @@ requires-dist = ["torch", "packaging", "ninja"]
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
-deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "ea2b7805b97956268bed1adf94591f428ded6cc1" }
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "44f31bbeaf99bd30a67b928000d4b980026debd2" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }

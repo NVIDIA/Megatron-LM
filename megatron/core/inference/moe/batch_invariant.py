@@ -15,8 +15,6 @@ from megatron.core.inference.communication.torch_symm_triton.utils import (
     sync_threads,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    grouped_gemm_batch_invariant,
-    grouped_gemm_batch_invariant_alignment,
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.utils import null_decorator
@@ -44,18 +42,6 @@ except ImportError:
 def enabled() -> bool:
     """Return whether global batch-invariant mode is active."""
     return is_batch_invariant_mode_enabled()
-
-
-def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """Batch-invariant BF16 grouped GEMM used by inference fused MoE."""
-    return grouped_gemm_batch_invariant(
-        x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
-    )
-
-
-def grouped_mm_alignment() -> int:
-    """Per-expert row alignment required by the batch-invariant grouped GEMM."""
-    return grouped_gemm_batch_invariant_alignment()
 
 
 @triton.jit

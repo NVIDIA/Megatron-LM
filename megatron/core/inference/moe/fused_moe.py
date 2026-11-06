@@ -201,10 +201,9 @@ def mcore_fused_moe(
         # scaled_grouped_mm needs each expert's token count aligned to 32; the
         # swizzled MXFP8 scale layout needs 128, which satisfies both constraints.
         expert_alignment = MXFP8_SCALE_ROW_BLOCK
-    elif batch_invariant_mode:
-        mm_fn = batch_invariant.grouped_mm
-        expert_alignment = batch_invariant.grouped_mm_alignment()
     else:
+        # grouped_mm is batch-invariant as well: a row's output does not depend on the
+        # other rows of any group (tested in test_moe_batch_invariant.py).
         assert (
             HAVE_GROUPED_MM
         ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."

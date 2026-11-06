@@ -152,10 +152,11 @@ workload rather than generalizing from any single comparison.
 > `nvls` token dispatcher when `EP > 1`). FlashInfer supports MXFP8 non-gated
 > squared-ReLU experts, including selective BF16 layers, but its batch invariance
 > does not imply bitwise parity with TE training. Use Torch/vLLM for exact
-> training-policy comparisons. The `triton` backend's MoE experts and the `torch`
-> inference backend's BF16 experts additionally need DeepGEMM bf16 grouped-GEMM
-> bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case. MXFP8 training uses
+> training-policy comparisons. Batch invariance needs no extra dependency: training
+> experts use TE's native grouped GEMM under the starved cuBLASLt workspace with
+> either backend, and the `torch` inference backend's BF16 experts use
+> `torch._grouped_mm`. Context parallelism and attention dropout are not supported
+> in either case. MXFP8 training uses
 > `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
 > default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
 > TE device-metadata grouped GEMM and its required 256-row expert padding.
