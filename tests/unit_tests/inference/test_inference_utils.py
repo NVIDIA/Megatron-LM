@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import Counter, detokenize_tokens, get_language_model
 
 
@@ -62,3 +63,14 @@ class TestInferenceUtils:
     def test_detokenize_without_generation_config_strips_only_eod(self):
         tokenizer = _tokenizer()
         assert detokenize_tokens(tokenizer, [5, 11, 2]) == "5 11"
+
+    def test_metadata_sync_goes_to_the_first_layer_with_an_inference_dispatcher(self, monkeypatch):
+        """A MoE layer without an inference dispatcher does not use up its forward's refresh."""
+        dispatcher = SimpleNamespace(_runs_metadata_sync=False)
+        moe_layers = [SimpleNamespace(), SimpleNamespace(_inference_token_dispatcher=dispatcher)]
+        monkeypatch.setattr(inference_utils, "moe_layer_cache", moe_layers)
+        monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+
+        inference_utils.set_moe_metadata_sync(torch.nn.Module())
+
+        assert dispatcher._runs_metadata_sync is True
