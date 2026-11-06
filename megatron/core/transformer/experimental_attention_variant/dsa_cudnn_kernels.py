@@ -61,6 +61,7 @@ class CudnnDsaInterface(Protocol):
         weights: Tensor,
         ratio: int,
         sm_scale: float,
+        out: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[Tensor] = None,
         cu_seqlens_k: Optional[Tensor] = None,
         max_seqlen_q: Optional[int] = None,
@@ -698,6 +699,17 @@ def _indexer_topk_from_score_chunks(
                 "with explicit score sequence lengths."
             )
     chunk_rows = _indexer_score_chunk_rows(b, sq, sk)
+    reusable_out_buffer = torch.empty(
+        (b, chunk_rows, sk), 
+        dtype=torch.float32, 
+        device=q_bshd.device,
+    )
+    reusable_out_buffer_sub = torch.empty(
+        (b, chunk_rows//2, sk), 
+            dtype=torch.float32, 
+            device=q_bshd.device,
+    )
+
     seq_lens_b = seq_lens.view(b, sq)
     indices_chunks = []
     values_chunks = [] if return_topk_scores else None
@@ -719,6 +731,8 @@ def _indexer_topk_from_score_chunks(
         score_chunk_seq_lens = (
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
+        use_cudnn_dsa = False
+
         if bottom_right_key_start is not None:
             scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
@@ -727,6 +741,57 @@ def _indexer_topk_from_score_chunks(
             scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
+        elif (
+             score_chunk_seq_lens is not None
+            and score_chunk_seq_lens.ndim == 1
+            and score_chunk_seq_lens.numel() > 1
+        ):
+            use_cudnn_dsa = True
+            num_elements = score_chunk_seq_lens.shape[0]
+            is_contiguous_len = (score_chunk_seq_lens[-1] - score_chunk_seq_lens[0]) == (
+                num_elements - 1
+            )
+            if is_contiguous_len:
+                # These one-dimensional bounds are shared across the batch, but
+                # cuDNN requires one contiguous offset per batch element.
+                current_offsets = (
+                    (score_chunk_seq_lens[0:1] - 1).to(torch.int32).expand(b).contiguous()
+                )
+                scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+                    q_chunk,
+                    k_bshd,
+                    w_chunk,
+                    ratio=indexer_ratio,
+                    sm_scale=_INDEXER_SOFTMAX_SCALE,
+                    q_causal_offsets=current_offsets,
+                    out=reusable_out_buffer,
+                )["scores"]
+            else:
+                sub_scores_list = []
+                chunk_mid = q_chunk.size(1) // 2
+                for sub_start, sub_end in ((0, chunk_mid), (chunk_mid, q_chunk.size(1))):
+                    if sub_start == sub_end:
+                        continue
+                    q_sub_chunk = q_chunk[:, sub_start:sub_end].contiguous()
+                    w_sub_chunk = w_chunk[:, sub_start:sub_end].contiguous()
+                    sub_seq_lens = score_chunk_seq_lens[sub_start:sub_end]
+                    current_offsets = (
+                        (sub_seq_lens[0:1] - 1).to(torch.int32).expand(b).contiguous()
+                    )
+                    # Keep each result alive until concatenation; sharing an out
+                    # buffer would overwrite the preceding segment's scores.
+                    
+                    sub_scores = _cudnn_dsa.indexer_forward_wrapper(
+                        q_sub_chunk,
+                        k_bshd,
+                        w_sub_chunk,
+                        ratio=indexer_ratio,
+                        sm_scale=_INDEXER_SOFTMAX_SCALE,
+                        q_causal_offsets=current_offsets,
+                        out=reusable_out_buffer_sub,
+                    )["scores"]
+                    sub_scores_list.append(sub_scores)
+                scores_chunk = torch.cat(sub_scores_list, dim=1)
         else:
             if global_rows_k_bdk is None:
                 global_rows_k_bdk = (
@@ -744,7 +809,7 @@ def _indexer_topk_from_score_chunks(
                 k_bdk=global_rows_k_bdk,
                 key_positions=global_rows_key_positions,
             )
-        if starts is not None:
+        if starts is not None and not use_cudnn_dsa:
             scores_chunk = dsa_masking.apply_starts_ends_mask_to_scores(
                 scores_chunk, starts[row_start:row_end], ends[row_start:row_end], key_positions_i64
             )
@@ -1506,6 +1571,17 @@ def _indexer_topk_bshd(
         scoring_plan = IndexerScoringDecision(
             IndexerScoringPlan.UNFUSED_BOUNDS,
             "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for CP>1 packed THD",
+        )
+    # Classify the existing chunk executor without changing its scorer selection.
+    if (
+        scoring_plan.plan is IndexerScoringPlan.UNFUSED_BOUNDS
+        and not return_scores
+        and starts is not None
+        and ends is not None
+    ):
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.BOUNDS_CHUNKED,
+            f"explicit row bounds are passed to the chunk executor ({scoring_plan.reason})",
         )
     plan = scoring_plan.plan
     report_unfused_scoring_once(scoring_plan, "indexer scoring")

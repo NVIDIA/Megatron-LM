@@ -39,6 +39,12 @@ class IndexerScoringPlan(Enum):
     PACKED_THD_GENERAL = "packed_thd_general"
     """General packed THD scoring driven by query/key cu_seqlens metadata."""
 
+    BOUNDS_CHUNKED = "bounds_chunked"
+    """Bounds-driven chunks select cuDNN or per-head scoring independently.
+
+    This plan does not guarantee that every chunk uses a fused scorer.
+    """
+
     UNFUSED_BOUNDS = "unfused_bounds"
     """Valid row bounds exist, but no fused executor currently claims the layout.
 
@@ -182,7 +188,7 @@ _REPORTED_UNFUSED: set = set()
 
 
 def report_unfused_scoring_once(decision: IndexerScoringDecision, context: str) -> Optional[str]:
-    """Log an unfused scoring plan the first time each distinct reason appears.
+    """Log a fallback or chunk-selected scoring plan once per distinct reason.
 
     A configuration that misses every fused kernel is a throughput cliff with no other
     symptom, so it should say so once rather than never. Returns the emitted message, or
@@ -195,10 +201,17 @@ def report_unfused_scoring_once(decision: IndexerScoringDecision, context: str) 
         return None
     _REPORTED_UNFUSED.add(key)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    message = (
-        f"DSA indexer scoring falls back to the unfused per-head loop ({context}, "
-        f"rank {rank}): {decision.reason}."
-    )
+    if decision.plan is IndexerScoringPlan.BOUNDS_CHUNKED:
+        message = (
+            f"DSA indexer scoring uses bounds-driven chunks ({context}, "
+            f"rank {rank}); each chunk selects cuDNN or the per-head loop: "
+            f"{decision.reason}."
+        )
+    else:
+        message = (
+            f"DSA indexer scoring falls back to the unfused per-head loop ({context}, "
+            f"rank {rank}): {decision.reason}."
+        )
     # Deliberately not rank-0-only: with heterogeneous packs a non-zero rank can sit
     # on the unfused cliff while rank 0 stays fused, which is exactly the silent case
     # this exists to surface. The once-per-reason set bounds the volume per process.
