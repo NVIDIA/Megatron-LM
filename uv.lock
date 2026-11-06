@@ -37,6 +37,11 @@ name = "flash-mla"
 version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = ["flashinfer-jit-cache-sm80==0.7.2.post1", "flashinfer-jit-cache-sm89==0.7.2.post1", "flashinfer-jit-cache-sm90a==0.7.2.post1", "flashinfer-jit-cache-sm100a==0.7.2.post1", "flashinfer-jit-cache-sm103a==0.7.2.post1", "flashinfer-jit-cache-sm110a==0.7.2.post1 ; platform_machine == 'aarch64'", "flashinfer-jit-cache-sm120f==0.7.2.post1", "flashinfer-jit-cache-sm121a==0.7.2.post1 ; platform_machine == 'aarch64'"]
+
+[[manifest.dependency-metadata]]
 name = "transformer-engine"
 version = "2.20.2+44f31bbe"
 requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.29.0"]
@@ -1528,9 +1533,9 @@ source = { registry = "https://flashinfer.ai/whl/cu130" }
 dependencies = [
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "flashinfer-jit-cache-sm110a", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "flashinfer-jit-cache-sm121a", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-jit-cache-sm80", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-jit-cache-sm89", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -2730,9 +2735,9 @@ inference = [
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux'" },
-    { name = "flashinfer-jit-cache-sm110a", marker = "sys_platform == 'linux'" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'linux'" },
-    { name = "flashinfer-jit-cache-sm121a", marker = "sys_platform == 'linux'" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform == 'linux'" },
@@ -2852,9 +2857,9 @@ requires-dist = [
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm110a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm121a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },

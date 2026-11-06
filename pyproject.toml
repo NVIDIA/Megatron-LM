@@ -145,9 +145,9 @@ inference = [
     "flashinfer-jit-cache-sm90a==0.7.2.post1; sys_platform == 'linux'",
     "flashinfer-jit-cache-sm100a==0.7.2.post1; sys_platform == 'linux'",
     "flashinfer-jit-cache-sm103a==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 otel = [
@@ -277,6 +277,23 @@ requires-dist = [
 name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
+
+# The aarch64 flashinfer-jit-cache wheel also requires sm110a/sm121a (aarch64-only wheels),
+# but uv locks one wheel's metadata for every platform, which breaks x86_64 installs.
+# Keep this in sync with the flashinfer-jit-cache pin in the inference extra.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = [
+    "flashinfer-jit-cache-sm80==0.7.2.post1",
+    "flashinfer-jit-cache-sm89==0.7.2.post1",
+    "flashinfer-jit-cache-sm90a==0.7.2.post1",
+    "flashinfer-jit-cache-sm100a==0.7.2.post1",
+    "flashinfer-jit-cache-sm103a==0.7.2.post1",
+    "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm120f==0.7.2.post1",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+]
 
 [tool.uv.sources]
 
