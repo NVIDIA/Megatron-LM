@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
     HYBRIDEP_TOKEN_ALIGNMENT,
@@ -26,6 +28,7 @@ from megatron.core.transformer.moe.fused_a2a import (
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
 from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
     _DeepepManager,
@@ -347,6 +350,7 @@ class MoEModelTestContainer:
             fp8=kwargs.get("fp8", None),
             fp8_recipe=kwargs.get("fp8_recipe", "delayed"),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
+            max_seq_length_per_sample=kwargs.get("max_seq_length_per_sample", None),
         )
 
         # init moe layer
@@ -417,6 +421,112 @@ class MoEModelTestContainer:
         torch.testing.assert_close(
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
+
+    @pytest.mark.internal
+    def dispatcher_thd_uneven_tokens_test(self, seq_length):
+        """Packed (THD) input: per-rank token counts differ and change between dispatches. The
+        dispatcher sizes its buffers once from seq_length and must round-trip every count under
+        it, and reject a count above it."""
+        moe_layer = self.moe_layer
+        dispatcher = moe_layer.token_dispatcher
+        rank = torch.distributed.get_rank()
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
+
+        def round_trip(num_tokens):
+            hidden_states = torch.randn(
+                (num_tokens, 1, moe_layer.config.hidden_size), dtype=self.test_dtype, device="cuda"
+            )
+            hidden_states.requires_grad = True
+            probs, indices = apply_module(moe_layer.router)(hidden_states)
+            probs = torch.ones_like(probs) / moe_layer.router.topk
+            permuted, permuted_probs = dispatcher.dispatch_preprocess(
+                hidden_states, indices, probs, packed_seq_params=packed_seq_params
+            )
+            permuted, permuted_probs = dispatcher.token_dispatch(permuted, permuted_probs)
+            permuted, _, permuted_probs = dispatcher.dispatch_postprocess(permuted, permuted_probs)
+            permuted = (permuted * permuted_probs.unsqueeze(-1)).to(dtype=self.test_dtype)
+            restored, _ = token_unpermutation(dispatcher, permuted)
+            torch.testing.assert_close(restored, hidden_states)
+            torch.autograd.backward(restored, hidden_states)
+            torch.testing.assert_close(hidden_states.grad, hidden_states)
+
+        round_trip(64 + 16 * rank)
+        round_trip(seq_length - 8 * rank)
+        bound = dispatcher._comm_manager._max_tokens_per_rank
+        assert bound == seq_length, f"bound {bound} should come from seq_length {seq_length}"
+        with pytest.raises(RuntimeError, match="sized for"):
+            round_trip(bound + 64)
+
+    @pytest.mark.internal
+    def dispatcher_thd_parity_vs_alltoall_test(self, rtol, atol):
+        """Full MoE-layer fwd+bwd on packed (THD) input with a padding mask and a different token
+        count per rank: ncclep against the alltoall dispatcher with identical weights. ncclep
+        routes the padded rows to -1 and never ships them, so the reference is alltoall run on
+        the valid rows alone (the alltoall dispatcher has no padding handling of its own). The
+        valid rows' outputs and input grads and every parameter grad must agree within
+        tolerance; ncclep's padded rows must come out exactly zero."""
+        rank = torch.distributed.get_rank()
+        torch.manual_seed(1000 + rank)
+        num_tokens = 64 + 16 * rank
+        hidden_size = self.config.hidden_size
+        x = torch.randn((num_tokens, 1, hidden_size), dtype=self.test_dtype, device="cuda")
+        padding_mask = torch.zeros((1, num_tokens), dtype=torch.bool, device="cuda")
+        padding_mask[0, num_tokens - 4 - rank :] = True
+        padding_rows = padding_mask[0]
+        valid_rows = ~padding_rows
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
+
+        def run(layer, inputs, **forward_kwargs):
+            inp = inputs.clone().detach().requires_grad_(True)
+            out, _ = layer(inp, **forward_kwargs)
+            out.sum().backward()
+            param_grads = {
+                name: p.grad.detach().clone()
+                for name, p in layer.named_parameters()
+                if p.grad is not None
+            }
+            return out.detach(), inp.grad.detach(), param_grads
+
+        ref_layer = self.new_moe_layer(
+            moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None
+        )
+        out_ref, grad_ref, param_grads_ref = run(ref_layer, x[valid_rows])
+        ncclep_layer = self.moe_layer
+        ncclep_layer.load_state_dict(ref_layer.state_dict())
+        # NCCL EP reads NCCL_EP_HT_EM_PULL_PUSH when its process-wide group is created, and
+        # earlier tests may already have created it: rebuild under this test's environment,
+        # and again afterwards so later tests do not inherit the mode.
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        nccl_ep_release_context()
+        try:
+            out, grad, param_grads = run(
+                ncclep_layer, x, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+            )
+        finally:
+            nccl_ep_release_context()
+
+        assert ncclep_layer.token_dispatcher._comm_manager._is_thd
+        assert not torch.isnan(out).any() and not torch.isnan(grad).any()
+        assert torch.equal(out[padding_rows], torch.zeros_like(out[padding_rows]))
+        assert torch.equal(grad[padding_rows], torch.zeros_like(grad[padding_rows]))
+        out, grad = out[valid_rows], grad[valid_rows]
+
+        def report(name, actual, expected):
+            diff = (actual.float() - expected.float()).abs()
+            rel = diff / expected.float().abs().clamp_min(1e-6)
+            if rank == 0:
+                print(
+                    f"[thd parity {self.test_dtype}] {name}: max_abs={diff.max().item():.3e} "
+                    f"max_rel={rel.max().item():.3e} ref_absmax={expected.abs().max().item():.3e}"
+                )
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, msg=name)
+
+        report("output", out, out_ref)
+        report("input_grad", grad, grad_ref)
+        assert param_grads.keys() == param_grads_ref.keys()
+        for name in sorted(param_grads):
+            report(f"grad[{name}]", param_grads[name], param_grads_ref[name])
 
     @pytest.mark.internal
     def moe_layer_variant_parity_test(self, variant="zero_copy"):
@@ -812,6 +922,183 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     assert not manager.token_probs[local_num_tokens:].any()
 
 
+def _ncclep_manager_stub(**config_overrides):
+    """An _NCCLEPManager with the state setup_metadata and _ensure_bootstrap read, no NCCL EP."""
+    manager = _NCCLEPManager.__new__(_NCCLEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.hidden_dim = 16
+    manager.alignment = 0
+    manager.moe_expert_rank_capacity_factor = None
+    manager._recv_capacity_override = None
+    manager._bootstrapped = False
+    manager._is_thd = False
+    cfg = dict(
+        moe_ncclep_zero_copy=False,
+        fp8=None,
+        fp4=None,
+        moe_flex_dispatcher_num_sms=None,
+        overlap_moe_expert_parallel_comm=False,
+        tensor_model_parallel_size=1,
+        context_parallel_size=1,
+        sequence_parallel=False,
+        max_seqlen_per_dp_cp_rank=None,
+        max_seq_length_per_sample=None,
+    )
+    cfg.update(config_overrides)
+    manager.config = SimpleNamespace(**cfg)
+    return manager
+
+
+@pytest.mark.parametrize("routing_mode", ["bool", "indices"])
+def test_ncclep_padding_mask_marks_routes_invalid(routing_mode):
+    manager = _ncclep_manager_stub()
+    seq_len, batch = 3, 2  # tokens flattened from sequence-first [s, b]
+    num_tokens = seq_len * batch
+    # Experts 0 and 1 are the top-2 of every row, in that order (topk sorts by probability).
+    probs = torch.tensor([[0.6, 0.3, 0.07, 0.03]] * num_tokens)
+    if routing_mode == "bool":
+        routing_map = torch.zeros(num_tokens, manager.num_experts, dtype=torch.bool)
+        routing_map[:, :2] = True
+    else:
+        routing_map = torch.tensor([[0, 1]] * num_tokens, dtype=torch.int32)
+    padding_mask = torch.zeros(batch, seq_len, dtype=torch.bool)  # batch-first [b, s]
+    padding_mask[1, 2] = True  # (s=2, b=1) -> flattened row 2 * batch + 1
+    padded_row = 2 * batch + 1
+
+    manager.setup_metadata(
+        routing_map, probs, padding_mask=padding_mask, packed_seq_params=PackedSeqParams("thd")
+    )
+
+    assert manager.num_local_tokens == num_tokens
+    assert manager._is_thd
+    assert manager.token_indices.shape == (num_tokens, manager.router_topk)
+    assert (manager.token_indices[padded_row] == -1).all()
+    assert (manager.token_probs[padded_row] == 0).all()
+    valid = torch.arange(num_tokens) != padded_row
+    torch.testing.assert_close(
+        manager.token_indices[valid], torch.tensor([[0, 1]] * (num_tokens - 1))
+    )
+    torch.testing.assert_close(manager.token_probs[valid], probs[valid][:, :2])
+
+
+@pytest.mark.parametrize(
+    "is_thd,num_local_tokens,config_overrides,expected",
+    [
+        # BSHD: the first dispatch's count, rounded up to the HT chunk.
+        (False, 100, dict(max_seq_length_per_sample=4096), 128),
+        # THD: max_seqlen_per_dp_cp_rank wins over max_seq_length_per_sample; SP slice.
+        (
+            True,
+            100,
+            dict(
+                max_seqlen_per_dp_cp_rank=1000,
+                max_seq_length_per_sample=4096,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            ),
+            512,
+        ),
+        # THD: max_seq_length_per_sample split over CP and the sequence-parallel TP slice.
+        (
+            True,
+            100,
+            dict(
+                max_seq_length_per_sample=4096,
+                context_parallel_size=2,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            ),
+            1024,
+        ),
+        # THD: no sequence parallel, TP does not shrink the per-rank count.
+        (
+            True,
+            100,
+            dict(
+                max_seq_length_per_sample=4096,
+                context_parallel_size=2,
+                tensor_model_parallel_size=2,
+            ),
+            2048,
+        ),
+    ],
+)
+def test_ncclep_bootstrap_token_bound(
+    monkeypatch, is_thd, num_local_tokens, config_overrides, expected
+):
+    bootstrap_kwargs = {}
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: False)
+    monkeypatch.setattr(
+        token_dispatcher,
+        "ensure_nccl_ep_bootstrapped",
+        lambda *args, **kwargs: bootstrap_kwargs.update(kwargs),
+    )
+    manager = _ncclep_manager_stub(**config_overrides)
+    manager.num_local_tokens = num_local_tokens
+    manager._is_thd = is_thd
+
+    manager._ensure_bootstrap()
+
+    assert manager._max_tokens_per_rank == expected
+    assert bootstrap_kwargs["max_tokens_per_rank"] == expected
+
+
+def test_ncclep_thd_requires_a_sequence_length_bound(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: False)
+    manager = _ncclep_manager_stub()
+    manager.num_local_tokens = 100
+    manager._is_thd = True
+    with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
+        manager._ensure_bootstrap()
+
+
+def test_ncclep_thd_rejects_first_microbatch_above_the_bound(monkeypatch):
+    """The bound must be identical on every rank for the NCCL EP bootstrap, so a rank above it
+    fails before the collective instead of silently enlarging its own buffers."""
+    bootstrap_calls = []
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: False)
+    monkeypatch.setattr(
+        token_dispatcher, "ensure_nccl_ep_bootstrapped", lambda *a, **kw: bootstrap_calls.append(kw)
+    )
+    manager = _ncclep_manager_stub(max_seq_length_per_sample=2048)
+    manager.num_local_tokens = 3000
+    manager._is_thd = True
+    with pytest.raises(RuntimeError, match="per-rank bound from max_seq_length_per_sample"):
+        manager._ensure_bootstrap()
+    assert not bootstrap_calls
+
+
+def test_ncclep_fixed_length_packed_input_uses_the_measured_bound():
+    """tokens_per_sample marks fixed-length samples (inter-document masking, any micro batch
+    size): their per-rank count is fixed like BSHD, so the config bound is not required."""
+    manager = _ncclep_manager_stub()
+    routing_map = torch.tensor([[0, 1]] * 4, dtype=torch.int32)
+    probs = torch.full((4, manager.num_experts), 0.25)
+    manager.setup_metadata(
+        routing_map, probs, packed_seq_params=PackedSeqParams(qkv_format="thd", tokens_per_sample=2)
+    )
+    assert not manager._is_thd
+    manager.setup_metadata(routing_map, probs, packed_seq_params=PackedSeqParams(qkv_format="thd"))
+    assert manager._is_thd
+
+
+@pytest.mark.parametrize("is_thd", [False, True])
+def test_ncclep_dispatch_guard_names_the_right_remedy(monkeypatch, is_thd):
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: True)
+    manager = _ncclep_manager_stub()
+    manager._bootstrapped = True
+    manager._max_tokens_per_rank = 128
+    manager._is_thd = is_thd
+    with pytest.raises(RuntimeError, match="sized for") as excinfo:
+        manager.dispatch(torch.zeros(192, manager.hidden_dim))
+    message = str(excinfo.value)
+    assert ("max_seq_length_per_sample" in message) is is_thd
+    assert ("first microbatch" in message) is not is_thd
+
+
 def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     manager = object.__new__(_HybridEPManager)
@@ -876,16 +1163,19 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
 
 @pytest.mark.parametrize("flex", [False, True])
 def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex):
-    """MoELayer.preprocess hands the batch-first mask to the flex dispatcher (whose backend
-    decides whether padded rows are excluded); the other dispatchers keep their 3-arg call."""
+    """MoELayer.preprocess hands the batch-first mask and the packed-sequence metadata to the
+    flex dispatcher (whose backend decides what to do with them); the other dispatchers keep
+    their 3-arg call."""
     calls = []
 
     class _FlexSpy(MoEFlexTokenDispatcher):
         def __init__(self):
             pass
 
-        def dispatch_preprocess(self, hidden_states, routing_map, probs, padding_mask=None):
-            calls.append(padding_mask)
+        def dispatch_preprocess(
+            self, hidden_states, routing_map, probs, padding_mask=None, packed_seq_params=None
+        ):
+            calls.append((padding_mask, packed_seq_params))
             return hidden_states, probs
 
     class _OtherSpy:
@@ -904,13 +1194,49 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
     probs = torch.zeros(4, 2)
     routing_map = torch.zeros(4, 2, dtype=torch.bool)
     padding_mask = torch.tensor([[False, True], [False, False]])
+    packed_seq_params = PackedSeqParams(qkv_format="thd")
 
-    layer.preprocess(hidden_states, probs, routing_map, padding_mask)
+    layer.preprocess(
+        hidden_states, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+    )
 
     if flex:
-        assert len(calls) == 1 and calls[0] is padding_mask
+        assert len(calls) == 1
+        assert calls[0][0] is padding_mask and calls[0][1] is packed_seq_params
     else:
         assert calls == ["no-mask"]
+
+
+def test_alltoall_combine_postprocess_releases_router_probs():
+    """combine_postprocess drops the dispatcher's reference to the router probs, so their
+    autograd graph is not kept alive until the next forward (under full recompute, through
+    the rest of backward). The combined output is unchanged.
+    """
+    dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
+    dispatcher.config = SimpleNamespace(moe_permute_fusion=False)
+    dispatcher.drop_and_pad = False
+    dispatcher.batch_invariant_inverse_permutation_mapping = None
+    dispatcher.shared_experts = None
+    num_tokens, hidden, topk, num_experts = 3, 4, 2, 2
+    dispatcher.hidden_shape = torch.Size([num_tokens, 1, hidden])
+    dispatcher.hidden_shape_before_permute = torch.Size([num_tokens, hidden])
+    dispatcher.routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool)
+    # Permuted rows are grouped by expert: expert 0 gets tokens [0, 1, 2], then expert 1.
+    dispatcher.reversed_local_input_permutation_mapping = torch.tensor([0, 1, 2, 0, 1, 2])
+
+    logits = torch.randn(num_tokens, num_experts, requires_grad=True)
+    probs = torch.softmax(logits, dim=-1)  # non-leaf, carries the router's grad_fn
+    probs_ref = weakref.ref(probs)
+    dispatcher.probs = probs
+    del probs
+
+    permuted = torch.arange(num_tokens * topk * hidden, dtype=torch.float32).view(-1, hidden)
+    output = dispatcher.combine_postprocess(permuted)
+
+    expected = (permuted[:num_tokens] + permuted[num_tokens:]).view(num_tokens, 1, hidden)
+    torch.testing.assert_close(output, expected)
+    assert dispatcher.probs is None
+    assert probs_ref() is None, "the router probs (and their graph) are still referenced"
 
 
 def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
@@ -1249,3 +1575,60 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.moe_layer_variant_parity_test(variant)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    def test_ncclep_thd_uneven_tokens(self, tp_size, ep_size):
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+        seq_length = 256
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+            max_seq_length_per_sample=seq_length,
+        )
+        container.dispatcher_thd_uneven_tokens_test(seq_length)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    def test_ncclep_thd_parity_vs_alltoall(self, monkeypatch, tp_size, ep_size):
+        # NCCL EP carries bf16 (or MXFP8) payloads only, so the comparison runs in bf16. In
+        # eager mode the pull-push EM mode builds its expert-major slot map with the
+        # order-preserving routing-map scan, so every received row has a fixed slot and the
+        # comparison is bit-exact. The default local-permute mode builds the map in-kernel
+        # with atomic per-expert cursors, so the row order inside an expert zone depends on
+        # scheduling and the token-reduced weight grads can drift by one bf16 ulp.
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+        monkeypatch.setenv("NCCL_EP_HT_EM_PULL_PUSH", "1")
+        rtol = atol = 0.0
+        test_dtype = torch.bfloat16
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            # The reference sees only the valid rows; an aux loss would make the router grads
+            # depend on the token count rather than on the dispatcher.
+            moe_aux_loss_coeff=0.0,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            hidden_size=1024,
+            test_dtype=test_dtype,
+            max_seq_length_per_sample=256,
+        )
+        container.dispatcher_thd_parity_vs_alltoall_test(rtol=rtol, atol=atol)

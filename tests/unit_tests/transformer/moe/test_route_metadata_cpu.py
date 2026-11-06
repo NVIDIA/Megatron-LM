@@ -59,7 +59,9 @@ def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
         def __init__(self):
             pass
 
-        def dispatch_preprocess(self, hidden, routing, probs, padding_mask=None):
+        def dispatch_preprocess(
+            self, hidden, routing, probs, padding_mask=None, packed_seq_params=None
+        ):
             received.append(padding_mask)
             assert padding_mask.shape == (hidden.shape[1], hidden.shape[0])
             return hidden, probs

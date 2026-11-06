@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
 from argparse import ArgumentParser
@@ -565,8 +565,251 @@ def test_constructor_requires_explicit_process_groups():
         DSv4HybridSelfAttention(config=None, submodules=None, layer_number=1)
 
 
-def _build_attention(config, layer_number, pg_collection, **kwargs):
-    """Instantiate DSv4 attention through HybridModel's static spec."""
+class _CpuLinearStub(torch.nn.Module):
+    """Bias-free CPU linear that returns ``(output, None)`` like Megatron's linear layers."""
+
+    def __init__(self, input_size, output_size, **kwargs):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(output_size, input_size, dtype=torch.bfloat16) * input_size**-0.5
+        )
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight), None
+
+
+class _CpuDoublingNormStub(IdentityOp):
+    """Norm stub whose output differs from its input, so tests can tell the two apart."""
+
+    def forward(self, x):
+        return x * 2
+
+
+class _CpuRotaryEmbeddingStub(IdentityOp):
+    """RoPE stub with placeholder frequencies; the CPU forward tests patch out their use."""
+
+    def get_rotary_seq_len(
+        self, inference_context, transformer, transformer_input, *args, **kwargs
+    ):
+        return transformer_input.size(0)
+
+    def forward(self, max_seq_len, packed_seq=False):
+        return torch.zeros(max_seq_len, 1, 1, 1)
+
+
+class _CpuCoreAttentionStub(IdentityOp):
+    """Core-attention stub that flattens the query heads into the output channels."""
+
+    def forward(self, query, key, value, attention_mask, **kwargs):
+        return query.flatten(-2)
+
+
+def _build_cpu_post_o_group_proj_attention(monkeypatch, attention_cls=None):
+    """Build DSv4 attention on CPU with its real QKV dataflow and grouped output projection,
+    and stubs for the linears, norms, RoPE, and core attention."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", _CpuRotaryEmbeddingStub)
+    monkeypatch.setattr(dsv4_attention, "TELinear", _CpuLinearStub)
+    # The RoPE values do not matter here, and the eager query norm avoids compiling on CPU.
+    monkeypatch.setattr(dsv4_attention, "apply_rotary_pos_emb", lambda t, *args, **kwargs: t)
+    monkeypatch.setattr(dsv4_attention, "_q_rms_norm", lambda q, eps: q)
+
+    config = _make_config(csa_compress_ratios=[0, 0, 0, 0])
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=_CpuDoublingNormStub,
+        kv_layernorm=IdentityOp,
+        linear_q_down_proj=_CpuLinearStub,
+        linear_q_up_proj=_CpuLinearStub,
+        linear_kv_proj=_CpuLinearStub,
+        core_attention=ModuleSpec(module=_CpuCoreAttentionStub),
+        linear_proj=_CpuLinearStub,
+    )
+    attention_cls = attention_cls or dsv4_attention.DSv4HybridSelfAttention
+    return attention_cls(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        compress_ratio=0,
+    )
+
+
+def _run_cpu_post_o_group_proj_forward(monkeypatch, attention, qkv_format):
+    """Run a CPU forward in SBHD or THD layout and capture the tensors around the hook.
+
+    Returns the output, the leading dims of the attention output, and a dict with the
+    ``q_layernorm`` input and output, the input of each fine-grained offload group, the
+    ``linear_proj`` input, and a reference grouped output projection (wo_a) of the core
+    attention output.
+    """
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface,
+    )
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    config = attention.config
+    # THD packs the tokens into one dim, so the attention output is [t, 1, channels].
+    if qkv_format == "thd":
+        # Packed input needs int32 cumulative lengths and host-known maximum lengths.
+        cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+        out_dims = (6, 1)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+        )
+    else:
+        out_dims, packed_seq_params = (3, 2), None
+    captured = {"offload_inputs": {}}
+    attention.q_layernorm.register_forward_hook(
+        lambda module, args, output: captured.update(q_norm_input=args[0], q_norm_output=output)
+    )
+    attention.core_attention.register_forward_hook(
+        lambda module, args, output: captured.update(core_out=output)
+    )
+    attention.linear_proj.register_forward_pre_hook(
+        lambda module, args: captured.update(proj_input=args[0])
+    )
+
+    def recording_off_interface(offload, tensor, name):
+        captured["offload_inputs"][name] = tensor
+        return FineGrainedActivationOffloadingInterface(offload, tensor, name)
+
+    monkeypatch.setattr(dsv4_attention, "off_interface", recording_off_interface)
+
+    hidden_states = torch.randn(*out_dims, config.hidden_size, dtype=torch.bfloat16)
+    output, bias = attention(
+        hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+    )
+    assert bias is None
+
+    groups = config.output_projection_groups
+    core_out = captured["core_out"].reshape(*out_dims, groups, -1)
+    wo_a = attention.linear_o_group_proj.detach().view(
+        groups, config.output_projection_lora_rank, -1
+    )
+    captured["wo_a_out"] = torch.einsum("...gd,grd->...gr", core_out, wo_a).reshape(*out_dims, -1)
+    return output, out_dims, captured
+
+
+def test_post_o_group_proj_defaults_to_identity(monkeypatch):
+    """Without an override, the hook returns the grouped projection result itself."""
+    attention = _build_cpu_post_o_group_proj_attention(monkeypatch)
+    attn_out = torch.randn(3, 2, 8)
+    q_compressed = torch.randn(3, 2, 4)
+
+    assert attention._post_o_group_proj(attn_out, q_compressed) is attn_out
+
+
+@pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
+def test_post_o_group_proj_runs_between_grouped_projection_and_linear_proj(monkeypatch, qkv_format):
+    """An override gets the grouped (wo_a) projection result and the q latent with matching
+    leading dims, and ``linear_proj`` gets the override's result."""
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+
+    class ZeroingAttention(DSv4HybridSelfAttention):
+        """Records the hook inputs and replaces the grouped projection result with zeros."""
+
+        def _post_o_group_proj(self, attn_out, q_compressed):
+            self.hook_inputs = (attn_out, q_compressed)
+            self.hook_result = torch.zeros_like(attn_out)
+            return self.hook_result
+
+    torch.manual_seed(_SEED)
+    default = _build_cpu_post_o_group_proj_attention(monkeypatch)
+    _, _, default_captured = _run_cpu_post_o_group_proj_forward(monkeypatch, default, qkv_format)
+    override = _build_cpu_post_o_group_proj_attention(monkeypatch, attention_cls=ZeroingAttention)
+    output, out_dims, captured = _run_cpu_post_o_group_proj_forward(
+        monkeypatch, override, qkv_format
+    )
+    config = override.config
+
+    # Without an override, linear_proj gets the grouped projection result.
+    assert default_captured["wo_a_out"].abs().sum() > 0
+    assert torch.equal(default_captured["proj_input"], default_captured["wo_a_out"])
+
+    attn_out, q_compressed = override.hook_inputs
+    attn_out_size = config.output_projection_groups * config.output_projection_lora_rank
+    assert attn_out.shape == (*out_dims, attn_out_size)
+    assert torch.equal(attn_out, captured["wo_a_out"])
+    # The q latent is the q_layernorm output, not its input (the q down-projection output),
+    # and it is still part of the autograd graph.
+    q_latent_shape = (*out_dims, config.q_lora_rank)
+    assert q_compressed.shape == q_latent_shape
+    assert torch.equal(q_compressed, captured["q_norm_output"].reshape(q_latent_shape))
+    assert not torch.equal(q_compressed, captured["q_norm_input"].reshape(q_latent_shape))
+    assert q_compressed.requires_grad
+    # The override's result is the input of the attn_proj offload group and of linear_proj.
+    assert captured["offload_inputs"]["attn_proj"] is override.hook_result
+    assert captured["proj_input"] is override.hook_result
+    assert torch.count_nonzero(output) == 0
+
+
+def test_post_o_group_proj_gate_gradient_reaches_q_down_proj(monkeypatch):
+    """A gate on the q latent passed to the hook backpropagates into the q down-projection:
+    gating with a detached copy of the q latent changes that projection's weight gradient."""
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+
+    class SigmoidGatedAttention(DSv4HybridSelfAttention):
+        """Multiplies the grouped projection result by sigmoid(gate_proj(q latent))."""
+
+        detach_q_latent = False
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.gate_proj = torch.nn.Linear(
+                self.config.q_lora_rank,
+                self.config.output_projection_groups * self.config.output_projection_lora_rank,
+                bias=False,
+                dtype=self.config.params_dtype,
+            )
+
+        def _post_o_group_proj(self, attn_out, q_compressed):
+            if self.detach_q_latent:
+                q_compressed = q_compressed.detach()
+            return attn_out * torch.sigmoid(self.gate_proj(q_compressed))
+
+    q_down_proj_grads = []
+    for detach_q_latent in (False, True):
+        torch.manual_seed(_SEED)
+        attention = _build_cpu_post_o_group_proj_attention(
+            monkeypatch, attention_cls=SigmoidGatedAttention
+        )
+        attention.detach_q_latent = detach_q_latent
+        hidden_states = torch.randn(3, 2, attention.config.hidden_size, dtype=torch.bfloat16)
+        output, _ = attention(hidden_states=hidden_states, attention_mask=None)
+        output.float().sum().backward()
+        q_down_proj_grads.append(attention.linear_q_down_proj.weight.grad)
+
+    gated_grad, detached_grad = q_down_proj_grads
+    assert gated_grad is not None and detached_grad is not None
+    assert not torch.equal(gated_grad, detached_grad)
+
+
+def _build_attention(config, layer_number, pg_collection, *, attention_cls=None, **kwargs):
+    """Instantiate DSv4 attention through HybridModel's static spec, optionally as
+    ``attention_cls`` (a subclass of the spec's attention module)."""
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
@@ -576,6 +819,8 @@ def _build_attention(config, layer_number, pg_collection, **kwargs):
         else hybrid_stack_spec.submodules.csa_layer
     )
     spec = layer_spec.submodules.self_attention
+    if attention_cls is not None:
+        spec = replace(spec, module=attention_cls)
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )
@@ -845,6 +1090,109 @@ class TestDSv4HybridAttentionForwardBackward:
             output, bias = attn(hidden_states=hidden, attention_mask=None)
             assert output.shape == (seq_len, batch_size, self.config.hidden_size)
 
+    def test_post_o_group_proj_default_matches_baseline_bitwise(self):
+        """Without an override, linear_proj gets the grouped projection result unchanged, so
+        the output equals linear_proj applied to that result, bitwise."""
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridSelfAttention,
+        )
+
+        seq_len = 256
+        batch_size = 2
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        attn = _build_attention(self.config, layer_number=2, pg_collection=self.pg).cuda()
+        hook_calls = []
+
+        def observe_default_hook(attn_out, q_compressed):
+            result = DSv4HybridSelfAttention._post_o_group_proj(attn, attn_out, q_compressed)
+            hook_calls.append((attn_out, result))
+            return result
+
+        # Observe the default implementation without changing what it returns.
+        attn._post_o_group_proj = observe_default_hook
+
+        hidden = torch.randn(
+            seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
+        ).cuda()
+        output, _ = attn(hidden_states=hidden, attention_mask=None)
+
+        ((attn_out, result),) = hook_calls
+        assert result is attn_out
+        baseline, _ = attn.linear_proj(attn_out)
+        assert torch.equal(output, baseline)
+
+    def test_post_o_group_proj_override_gates_grouped_output(self):
+        """A subclass can gate the grouped projection result with the q latent; the gate gets
+        the q_layernorm output, and backward reaches the gate, the grouped projection, the q
+        down-projection, and linear_proj."""
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridSelfAttention,
+        )
+
+        class SigmoidGatedAttention(DSv4HybridSelfAttention):
+            """Multiplies the grouped projection result by sigmoid(gate_proj(q latent))."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.gate_proj = torch.nn.Linear(
+                    self.config.q_lora_rank,
+                    self.config.output_projection_groups * self.config.output_projection_lora_rank,
+                    bias=False,
+                    dtype=self.config.params_dtype,
+                )
+                self.gate_inputs = []
+
+            def _post_o_group_proj(self, attn_out, q_compressed):
+                self.gate_inputs.append(q_compressed.detach().clone())
+                return attn_out * torch.sigmoid(self.gate_proj(q_compressed))
+
+        seq_len = 256
+        batch_size = 2
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        # qk_layernorm=True builds a real q_layernorm, so its output differs from its input.
+        config = _make_config(dsa_indexer_loss_coeff=1.0, qk_layernorm=True)
+        attn = _build_attention(
+            config, layer_number=2, pg_collection=self.pg, attention_cls=SigmoidGatedAttention
+        ).cuda()
+        attn.train()
+        q_norm_calls = []
+        attn.q_layernorm.register_forward_hook(
+            lambda module, args, output: q_norm_calls.append(
+                (args[0].detach().clone(), output.detach().clone())
+            )
+        )
+
+        hidden = (
+            torch.randn(seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16)
+            .cuda()
+            .requires_grad_(True)
+        )
+        output, _ = attn(hidden_states=hidden, attention_mask=None)
+        output.sum().backward()
+
+        (gate_input,) = attn.gate_inputs
+        ((q_norm_input, q_norm_output),) = q_norm_calls
+        assert gate_input.shape == (seq_len, batch_size, config.q_lora_rank)
+        assert torch.equal(gate_input, q_norm_output)
+        assert not torch.equal(gate_input, q_norm_input)
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        for name in (
+            "gate_proj.weight",
+            "linear_o_group_proj",
+            "linear_q_down_proj.weight",
+            "linear_proj.weight",
+        ):
+            grad = attn.get_parameter(name).grad
+            assert grad is not None, f"No gradient for parameter {name}"
+            assert torch.isfinite(grad).all(), f"Non-finite gradient for parameter {name}"
+            assert grad.abs().sum() > 0, f"Zero gradient for parameter {name}"
+
 
 # ===========================================================================
 # get_query_key_value_tensors tests
@@ -1024,3 +1372,81 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
+    """The core owns output rotation; the outer projection must not rotate twice.
+
+    The core attention builds and applies the output inverse RoPE itself, so
+    the hybrid wrapper must call it exactly once, must not hand it a second
+    rotation, and must not rotate or rebuild RoPE tables after it returns.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as hybrid,
+    )
+
+    batch = 1 if packed else 2
+    hidden = torch.randn(4, batch, 4, requires_grad=True)
+    cu = torch.tensor([0, 1, 4], dtype=torch.int32) if packed else None
+    params = (
+        PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=3, max_seqlen_kv=3
+        )
+        if packed
+        else None
+    )
+    cache = Mock(side_effect=AssertionError("output RoPE tables built outside the core"))
+    observed = []
+
+    def core(query, *_args, **kwargs):
+        observed.append(kwargs)
+        # Sentinel output stands for a core that has already applied inverse RoPE.
+        return query.reshape(4, batch, 4) * 3
+
+    core.use_fused_kernels = True
+    outer_rope = Mock(side_effect=AssertionError("output RoPE applied twice"))
+    for name in ("fused_mla_rope_out_of_place", "fused_mla_rope_inplace"):
+        monkeypatch.setattr(hybrid, name, outer_rope, raising=False)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            apply_rope_fusion=True,
+            v_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            o_lora_rank=4,
+            dsa_kernel_backend="cudnn",
+            deterministic_mode=False,
+            attention_cp_layout="contiguous",
+        ),
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)),
+        rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
+        get_query_key_value_tensors=lambda *_args, **_kwargs: (
+            hidden,
+            hidden,
+            hidden,
+            torch.zeros(4, batch, 2),
+            None,
+        ),
+        core_attention=core,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        training=True,
+        recompute_up_proj=False,
+        o_local_groups=1,
+        linear_o_group_proj=torch.eye(4),
+        _post_o_group_proj=lambda attn_out, _q_compressed: attn_out,
+        linear_proj=lambda x: (x, None),
+    )
+    output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
+    torch.testing.assert_close(output, hidden * 3)
+    output.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 3))
+    assert len(observed) == 1
+    assert "out_rope" not in observed[0]
+    assert observed[0]["packed_seq_params"] is params
+    cache.assert_not_called()
+    outer_rope.assert_not_called()

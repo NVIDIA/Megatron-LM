@@ -38,20 +38,22 @@ def _make_args(**overrides):
     )
     for name, value in overrides.items():
         setattr(args, name, value)
-    return args
+    cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=args.padded_vocab_size))
+
+    return cfg, args
 
 
 def test_situ_glu_counts_the_same_ffn_parameters_as_swiglu():
-    swiglu_args = _make_args(swiglu=True)
-    situ_glu_args = _make_args(situ_glu=True)
+    swiglu_cfg, swiglu_args = _make_args(swiglu=True)
+    situ_glu_cfg, situ_glu_args = _make_args(situ_glu=True)
 
     assert compute_weight_and_optimizer_memory(
-        situ_glu_args
-    ) == compute_weight_and_optimizer_memory(swiglu_args)
+        situ_glu_cfg, situ_glu_args
+    ) == compute_weight_and_optimizer_memory(swiglu_cfg, swiglu_args)
 
 
 def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
-    args = _make_args(pipeline_model_parallel_size=2, world_size=64)
+    cfg, args = _make_args(pipeline_model_parallel_size=2, world_size=64)
 
     # Most-loaded stage has 1 / PP of the transformer block plus the embedding table.
     # Regular TP-sharded params: (dense attention/MLP + MoE attention/shared-expert) / PP
@@ -68,40 +70,38 @@ def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
         6 + 12 / 16
     ) + expert_sharded_params_on_rank * (6 + 12 / 4)
 
-    assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)
+    assert math.isclose(compute_weight_and_optimizer_memory(cfg, args), expected_memory)
 
 
 def test_weight_and_optimizer_memory_decreases_with_tensor_parallelism():
-    memories = [
-        compute_weight_and_optimizer_memory(
-            _make_args(
-                data_parallel_size=16,
-                expert_model_parallel_size=1,
-                expert_tensor_parallel_size=1,
-                tensor_model_parallel_size=tp_size,
-                use_distributed_optimizer=False,
-                world_size=16 * tp_size,
-            )
+    memories = []
+    for tp_size in (1, 2, 4):
+        cfg, args = _make_args(
+            data_parallel_size=16,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            tensor_model_parallel_size=tp_size,
+            use_distributed_optimizer=False,
+            world_size=16 * tp_size,
         )
-        for tp_size in (1, 2, 4)
-    ]
+        memories.append(compute_weight_and_optimizer_memory(cfg, args))
 
     assert memories[0] > memories[1] > memories[2]
 
 
 def test_weight_and_optimizer_memory_decreases_with_expert_parallelism():
-    memories = [
-        compute_weight_and_optimizer_memory(
-            _make_args(expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size)
+    memories = []
+    for ep_size, etp_size in ((1, 1), (2, 1), (2, 2), (4, 2)):
+        cfg, args = _make_args(
+            expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
         )
-        for ep_size, etp_size in ((1, 1), (2, 1), (2, 2), (4, 2))
-    ]
+        memories.append(compute_weight_and_optimizer_memory(cfg, args))
 
     assert memories[0] > memories[1] > memories[2] > memories[3]
 
 
 def test_weight_and_optimizer_memory_accounts_for_latent_moe_experts():
-    args = _make_args(moe_latent_size=4)
+    cfg, args = _make_args(moe_latent_size=4)
 
     # Latent MoE routes experts through moe_latent_size instead of hidden_size.
     # The hidden<->latent projections are duplicated non-expert params.
@@ -115,4 +115,4 @@ def test_weight_and_optimizer_memory_accounts_for_latent_moe_experts():
         6 + 12 / 16
     ) + expert_sharded_params_on_rank * (6 + 12 / 4)
 
-    assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)
+    assert math.isclose(compute_weight_and_optimizer_memory(cfg, args), expected_memory)
