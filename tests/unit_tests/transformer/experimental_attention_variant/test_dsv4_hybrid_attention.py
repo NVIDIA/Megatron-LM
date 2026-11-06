@@ -18,6 +18,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -1451,8 +1452,10 @@ class TestDSv4HybridGroupedOutput:
         # use_cpu_initialization leaves BF16 weights on CPU; training moves them to the GPU
         # before forward, and BatchedLinear requires input and weight on the same device.
         attn = attn.cuda()
+        convert_module_to_dtype_except_fp32_marked(attn, torch.bfloat16)
         module = attn.linear_o_group_proj
         weight = module.weight
+        assert weight.muon_matrix_shape == attn._linear_o_group_proj_checkpoint_shape
         assert isinstance(module, te_batched_linear)
         assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
         group_proj_param_names = [

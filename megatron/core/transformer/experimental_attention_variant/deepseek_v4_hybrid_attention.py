@@ -266,8 +266,7 @@ class DSv4HybridAttention(Attention):
             # TE owns a [groups, rank, input] parameter, but Muon must still
             # orthogonalize the same complete matrix as the legacy einsum path.
             self.linear_o_group_proj.weight.muon_matrix_shape = (
-                self.o_local_groups * self.config.o_lora_rank,
-                group_proj_in_size,
+                self._linear_o_group_proj_checkpoint_shape
             )
             self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
@@ -305,6 +304,15 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _apply(self, fn, recurse=True):
+        """Restore matrix metadata that TE quantized tensor conversions can drop."""
+        result = super()._apply(fn, recurse=recurse)
+        if self._uses_te_batched_linear:
+            self.linear_o_group_proj.weight.muon_matrix_shape = (
+                self._linear_o_group_proj_checkpoint_shape
+            )
+        return result
 
     @property
     def _linear_o_group_proj_weight(self) -> torch.nn.Parameter:
