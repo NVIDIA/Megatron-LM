@@ -1187,6 +1187,7 @@ def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
     model._apply_linear_o_group_proj = (
         hybrid.DSv4HybridAttention._apply_linear_o_group_proj.__get__(model)
     )
+    model._output_projection = hybrid.DSv4HybridAttention._output_projection.__get__(model)
     output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
     torch.testing.assert_close(output, hidden * 3)
     output.sum().backward()

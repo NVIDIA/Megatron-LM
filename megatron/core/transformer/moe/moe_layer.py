@@ -9,6 +9,7 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import utils
+from megatron.core.component_nvtx import component
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
@@ -736,6 +737,7 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    @component("moe")
     def forward(
         self,
         hidden_states: torch.Tensor,

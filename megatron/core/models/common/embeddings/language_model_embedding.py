@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.component_nvtx import component
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -100,6 +101,7 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.shared = True
 
     @nvtx_decorator()
+    @component("embedding")
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
         """Forward pass of the embedding module.
 

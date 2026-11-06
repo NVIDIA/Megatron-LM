@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.component_nvtx import component
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute_plan import (
@@ -34,6 +35,7 @@ class SinglePassMHCState:
 
     pre_mix: Tensor | None = None
 
+    @component("mhc")
     def contract(
         self,
         hidden_states: Tensor,
@@ -678,6 +680,7 @@ class HyperConnectionModule(MegatronModule):
 
         return mixed.view(s, b, n * C)
 
+    @component("mhc")
     def forward(
         self,
         hidden_states: Tensor,
@@ -803,6 +806,7 @@ class HyperConnectionModule(MegatronModule):
     # ==================== Block-level utilities ====================
 
     @staticmethod
+    @component("mhc")
     def input_expand(x: Tensor, n: int) -> Tensor:
         """
         Expand 1-stream to n-stream at TransformerBlock entry.
@@ -822,6 +826,7 @@ class HyperConnectionModule(MegatronModule):
         return expanded.view(s, b, n * C)
 
     @staticmethod
+    @component("mhc")
     def output_contract(x: Tensor, n: int) -> Tensor:
         """
         Contract n-stream to 1-stream at TransformerBlock exit.
@@ -845,6 +850,7 @@ class HyperConnectionModule(MegatronModule):
     # ==================== Fused kernel placeholder ====================
 
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda")
+    @component("mhc")
     def fused_h_res_h_post_bda(
         self,
         h_res: Tensor,

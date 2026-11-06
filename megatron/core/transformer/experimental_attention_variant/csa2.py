@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.core.component_nvtx import component
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.ops._backends import require
@@ -384,6 +385,7 @@ class CSA2Compressor(MegatronModule):
             eps=config.attention_latent_norm_epsilon,
         )
 
+    @component("compressor")
     def forward(
         self,
         x: torch.Tensor,
@@ -699,6 +701,7 @@ class CSA2Indexer(MegatronModule):
                 eps=config.attention_latent_norm_epsilon,
             )
 
+    @component("indexer")
     def project_keys(
         self,
         latent: torch.Tensor,
@@ -960,6 +963,7 @@ class CSA2Indexer(MegatronModule):
             self.config.csa2_candidate_block_size,
         )
 
+    @component("indexer")
     def forward_with_scores(
         self,
         x: torch.Tensor,
@@ -1552,10 +1556,12 @@ class CompressedSparseAttention2(MegatronModule):
             output = out_rope.apply(flat).view_as(output)
         return output, loss
 
+    @component("swa")
     def _forward_fused_no_indexer(self, query, local, window, state, out_rope=None):
         """Window-only layer: one sparse-attention forward/backward."""
         return self._fused_attention(query, local, window, state=state, out_rope=out_rope), None
 
+    @component("csa")
     def _forward_fused_indexer_training(
         self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
     ):
@@ -1598,6 +1604,7 @@ class CompressedSparseAttention2(MegatronModule):
         )
         return output, loss
 
+    @component("csa")
     def _forward_fused_indexer_no_loss(
         self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
     ):
@@ -1605,6 +1612,7 @@ class CompressedSparseAttention2(MegatronModule):
         global_kv, topk, _ = self._shared_global_attention(x, qr, state, **shared_kwargs)
         return self._fused_attention(query, local, window, global_kv, topk, state, out_rope), None
 
+    @component("csa")
     def _forward_fused_reuse(
         self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
     ):

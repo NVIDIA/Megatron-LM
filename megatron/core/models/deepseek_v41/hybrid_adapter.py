@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import nn
 
+from megatron.core.component_nvtx import layer_scope
 from megatron.core.extensions.transformer_engine import te_checkpoint
 from megatron.core.fp8_utils import get_fp8_context, get_fp8_recipe, is_first_last_bf16_layer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -464,6 +465,7 @@ class DeepSeekV41Adapter:
             self._retire_state(context)
         return hidden_states
 
+    @layer_scope(layer_arg=True)
     def run_layer(self, layer, hidden_states, context, *, recompute=None, **kwargs):
         """Run eagerly, with explicit checkpointing, or in a prepared graph slot."""
         c, codec, csa = self.config, context.codec, context.cross_layer_state

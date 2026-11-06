@@ -9,6 +9,7 @@ from typing import Callable, NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.component_nvtx import component, layer_scope
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
@@ -367,6 +368,8 @@ class DSv4HybridAttention(Attention):
         )
         return torch.einsum("...gd,grd->...gr", input_, weight)
 
+    @component("attention")
+    @layer_scope
     def forward(
         self,
         hidden_states,
@@ -633,7 +636,11 @@ class DSv4HybridAttention(Attention):
                     rot_part = rot_part_out
                 core_attn_out = torch.cat([content_part, rot_part], dim=-1)
             core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+        return self._output_projection(core_attn_out)
 
+    @component("out_proj")
+    def _output_projection(self, core_attn_out):
+        """Grouped low-rank output projection followed by linear_proj."""
         # Grouped output
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
@@ -764,6 +771,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             eps=self.config.attention_latent_norm_epsilon,
         )
 
+    @component("qkv_proj")
     def get_query_key_value_tensors(
         self,
         hidden_states,

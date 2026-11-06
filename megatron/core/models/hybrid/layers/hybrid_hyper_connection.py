@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 from torch import Tensor
 
+from megatron.core.component_nvtx import layer_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -169,6 +170,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+    @layer_scope
     def forward(
         self,
         hidden_states: Tensor,

@@ -210,11 +210,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+            K + "test_component_nvtx.py",
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
         "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
-        "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
+        "construction and optional latent norms around the registered TE / RoPE / CSA kernels. "
+        "test_component_nvtx checks that the opt-in component NVTX ranges leave the module code "
+        "untouched when off and its numerics bit-identical when on.",
     ),
     KernelEntry(
         name="dsv4_batched_output_projection",
@@ -281,9 +284,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_fused_triton_kernels.py",
             "tests/unit_tests/transformer/test_single_pass_mhc.py",
             "tests/unit_tests/models/test_v41_state_integration.py",
+            K + "test_component_nvtx.py",
         ),
         kind="triton",
-        notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
+        notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends."
+        " test_component_nvtx covers the opt-in component NVTX ranges on the mHC entry points.",
     ),
     KernelEntry(
         name="streamwise_residual_ops",
@@ -427,10 +432,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(K + "test_moe_kernels.py", K + "test_component_nvtx.py"),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention.",
+        "virtual-expert routing metadata and probability gradients replay under stream contention. "
+        "test_component_nvtx covers the opt-in component NVTX range on MoELayer.forward.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -973,11 +979,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
         ),
-        tests=("tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+            K + "test_component_nvtx.py",
+        ),
         kind="triton",
         notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
         "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "
-        "unqualified for deterministic mode; this draft rejects that mode.",
+        "unqualified for deterministic mode; this draft rejects that mode. test_component_nvtx "
+        "covers the opt-in component NVTX ranges on the compressor, indexer and attention paths.",
     ),
     KernelEntry(
         name="csa_teacher_lse",

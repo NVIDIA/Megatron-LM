@@ -15,6 +15,7 @@ from functools import cached_property
 import torch
 from torch import Tensor
 
+from megatron.core.component_nvtx import forward_range
 from megatron.core.ops.attention.csa.indexer_quantization import (
     indexer_mxfp8_thd_scale_capacity,
     indexer_mxfp8_thd_scale_shape,
@@ -952,44 +953,45 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             q, kv, indices, scale, attn_sink=sink, topk_length=topk_length
         )
         del kv
-        # Sparse supervision has exactly the main attention's support. FlashMLA
-        # returns natural-log LSE excluding sink, matching V4's Path B contract.
-        sparse = mode == 2
-        teacher_q, teacher_lse = q, lse
-        if query_shape is not None:
-            seq_len, batch = query_shape
-            teacher_q = (
-                q.reshape(seq_len, batch, q.shape[1], q.shape[2])
-                .transpose(0, 1)
-                .reshape(-1, q.shape[1], q.shape[2])
-                .contiguous()
-            )
+        with forward_range("indexer_loss"):
+            # Sparse supervision has exactly the main attention's support. FlashMLA
+            # returns natural-log LSE excluding sink, matching V4's Path B contract.
+            sparse = mode == 2
+            teacher_q, teacher_lse = q, lse
+            if query_shape is not None:
+                seq_len, batch = query_shape
+                teacher_q = (
+                    q.reshape(seq_len, batch, q.shape[1], q.shape[2])
+                    .transpose(0, 1)
+                    .reshape(-1, q.shape[1], q.shape[2])
+                    .contiguous()
+                )
+                teacher_lse = (
+                    lse.reshape(seq_len, batch, -1)
+                    .transpose(0, 1)
+                    .reshape(-1, lse.shape[-1])
+                    .contiguous()
+                )
             teacher_lse = (
-                lse.reshape(seq_len, batch, -1)
-                .transpose(0, 1)
-                .reshape(-1, lse.shape[-1])
-                .contiguous()
+                torch.logaddexp(teacher_lse, sink.unsqueeze(0))
+                if sparse
+                else fused_csa_window_lse(teacher_q, local, sink, window, scale)
             )
-        teacher_lse = (
-            torch.logaddexp(teacher_lse, sink.unsqueeze(0))
-            if sparse
-            else fused_csa_window_lse(teacher_q, local, sink, window, scale)
-        )
-        loss, gradients = _precompute_indexer_loss(
-            iq,
-            ik,
-            weights,
-            teacher_q,
-            global_kv,
-            teacher_lse,
-            ids,
-            counts,
-            starts,
-            visible,
-            divisor,
-            options,
-            full_lse=sparse,
-        )
+            loss, gradients = _precompute_indexer_loss(
+                iq,
+                ik,
+                weights,
+                teacher_q,
+                global_kv,
+                teacher_lse,
+                ids,
+                counts,
+                starts,
+                visible,
+                divisor,
+                options,
+                full_lse=sparse,
+            )
         if topk_length is not None:
             indices = indices.clamp_min(0)
             topk_length = topk_length.clone()
