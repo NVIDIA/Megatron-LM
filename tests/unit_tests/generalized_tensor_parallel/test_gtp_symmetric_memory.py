@@ -1050,3 +1050,122 @@ class TestAgAllocRouting:
     def test_slice_storage_and_cache_routing(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_ag_alloc_routing, 4)
+
+
+# ---------------------------------------------------------------------------
+# AG-input placement lifecycle: CPU init and frozen weights under real DDP (world 4)
+# ---------------------------------------------------------------------------
+
+
+def _gtp_remat_world(modes):
+    """Re-init model parallel with GTP_remat=2 and fake ``modes`` registration on its group."""
+    from megatron.core import parallel_state as ps
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    group = ps.get_gtp_weight_remat_group()
+    pred = lambda g, mode=None: g is group and (mode is None or mode in modes)
+    saved = (gtp_module.is_gtp_symm_pool_registered, gtp_symm.is_gtp_symm_pool_registered)
+    gtp_module.is_gtp_symm_pool_registered = pred
+    gtp_symm.is_gtp_symm_pool_registered = pred
+    gtp_module.reset_gtp_state()
+    GTP_CONFIG.pad_for_alignment = 0
+    return group, saved
+
+
+def _restore_world(saved):
+    from megatron.core import parallel_state as ps
+
+    gtp_module.is_gtp_symm_pool_registered, gtp_symm.is_gtp_symm_pool_registered = saved
+    torch.cuda.synchronize()
+    deregister_and_clear_gtp_symm_pools()
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+
+def _worker_cpu_init_placement(rank, world_size, port, modes):
+    import transformer_engine.pytorch as te
+
+    group, saved = _gtp_remat_world(modes)
+    try:
+        model = torch.nn.Module()
+        # CPU-initialized slice-path and pre-sharded BF16 weights, built with the modes set.
+        model.sliced = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cpu")
+        gtp_module.wrap_module_params_gtp(model.sliced, ["weight"], group)
+        model.presharded = te.Linear(16, 16, bias=False, params_dtype=torch.bfloat16, device="cpu")
+        gtp_module.attach_gtp_to_presharded_module(model.presharded, group, 0)
+        weights = (model.sliced.weight, model.presharded.weight)
+        values = [w.detach().clone() for w in weights]
+        assert not any(getattr(w, "is_in_symm_pool", False) for w in weights)
+
+        model.cuda()
+        pointers = [w.data_ptr() for w in weights]
+        gtp_module.classify_gtp_remat_chains(model)
+        for w, value, ptr in zip(weights, values, pointers):
+            assert torch.equal(w.detach().cpu(), value)
+            if "ag" in modes:
+                assert w.is_in_symm_pool and _in_pool(w, group)
+            else:
+                # RS-only control: the all-gather input is never moved.
+                assert w.data_ptr() == ptr and not getattr(w, "is_in_symm_pool", False)
+        del model, weights
+    finally:
+        _restore_world(saved)
+
+
+def _worker_frozen_placement_under_ddp(rank, world_size, port):
+    import transformer_engine.pytorch as te
+
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    group, saved = _gtp_remat_world(("ag",))
+    saved_register = gtp_module.register_external_pool
+    hooks = []
+    gtp_module.register_external_pool = lambda pool, g: hooks.append((pool, g))
+    try:
+        model = torch.nn.Module()
+        model.trainable = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        model.frozen = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        for layer in (model.trainable, model.frozen):
+            gtp_module.wrap_module_params_gtp(layer, ["weight"], group)
+        trainable, frozen = model.trainable.weight, model.frozen.weight
+        frozen.requires_grad_(False)
+        frozen_value = frozen.detach().clone()
+
+        ddp = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1, hidden_size=4),
+            DistributedDataParallelConfig(use_distributed_optimizer=True, bucket_size=None),
+            model,
+        )
+        buffers = ddp.buffers + ddp.expert_parallel_buffers
+        (buffer,) = [b for b in buffers if any(p is trainable for p in b.params)]
+        assert not any(p is frozen for b in buffers for p in b.params)
+        # DDP re-homed the trainable weight into param_data and handed it the pool.
+        start = buffer.param_data.data_ptr()
+        end = start + buffer.param_data.numel() * buffer.param_data.element_size()
+        assert start <= trainable.data_ptr() < end
+        assert hooks == [(buffer.param_nccl_mem_pool, group)] and trainable.is_in_symm_pool
+
+        ptr = trainable.data_ptr()
+        gtp_module.classify_gtp_remat_chains(ddp)
+        assert trainable.data_ptr() == ptr
+        assert frozen.is_in_symm_pool and _in_pool(frozen, group)
+        assert torch.equal(frozen.detach(), frozen_value)
+        del ddp, model, trainable, frozen, buffers, buffer
+    finally:
+        gtp_module.register_external_pool = saved_register
+        _restore_world(saved)
+
+
+class TestAgInputPlacementLifecycle:
+    @pytest.mark.parametrize("modes", [("ag",), ("rs",)])
+    def test_cpu_initialized_weights_pooled_after_cuda(self, modes):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_cpu_init_placement, 4, modes)
+
+    def test_frozen_weight_pooled_trainable_left_in_ddp(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_frozen_placement_under_ddp, 4)
