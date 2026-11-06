@@ -326,7 +326,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context.increment_sequence_len_offset(seq_len)
 
-        return output_tensor if is_pipeline_last_stage(self.pp_group) else None
+        logits = None
+        if is_pipeline_last_stage(self.pp_group):
+            logits = output_tensor
+
+            # Explicitly cast logits to expected dtype
+            logits = logits.to(self.config.params_dtype)
+
+        return logits
 
     @torch.inference_mode()
     def run_one_forward_step(
