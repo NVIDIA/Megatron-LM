@@ -321,6 +321,10 @@ class MegatronOptimizer(ABC):
         init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
+    # Orthogonalizing (Muon-family) optimizers are exempt from magnitude-based grad-norm
+    # clipping and the grad-norm skip threshold; their updates are scale-invariant (#5394).
+    skip_grad_norm_clip: bool = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -2176,47 +2180,74 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_grad_norm()
-        if self.grads_states_parallel_group_is_shared():
-            grads_for_norm = []
-            for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_grads_for_grad_norm()
-            grad_norm = get_grad_norm_fp32(
-                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        return self._get_grad_norm_over(self.chained_optimizers)
+
+    @torch.no_grad()
+    def _get_grad_norm_over(self, optimizers: List[MegatronOptimizer]):
+        """Combined grad norm over ``optimizers`` (a subset of ``chained_optimizers``).
+
+        One code path serves :meth:`get_grad_norm` (all subs) and the clip / skip-threshold
+        norm (non-exempt subs only, see #5394), mirroring the shared / non-shared
+        grad-stats-group handling for any subset.
+        """
+        if not optimizers:
+            return 0.0
+        if len(optimizers) == 1:
+            return optimizers[0].get_grad_norm()
+        try:
+            reference_group = optimizers[0].get_grad_stats_parallel_group()
+            shared = all(
+                optimizer.get_grad_stats_parallel_group() == reference_group
+                for optimizer in optimizers
             )
-        else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
-        return grad_norm
+        except AssertionError:
+            # A nested ChainedOptimizer member cannot report a single group.
+            shared = False
+        if shared:
+            grads_for_norm = []
+            for optimizer in optimizers:
+                grads_for_norm += optimizer.get_grads_for_grad_norm()
+            return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=reference_group)
+        grad_norms = [optimizer.get_grad_norm() or 0.0 for optimizer in optimizers]
+        return math.sqrt(sum(x**2 for x in grad_norms))
+
+    @property
+    def skip_grad_norm_clip(self) -> bool:
+        """A chained container is exempt from clipping only if every sub-optimizer is."""
+        return bool(self.chained_optimizers) and all(
+            optimizer.skip_grad_norm_clip for optimizer in self.chained_optimizers
+        )
 
     @override
     @torch.no_grad()
-    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
-        if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_dsa_split_grad_norms()
-        if self.grads_states_parallel_group_is_shared():
+    def get_dsa_split_grad_norms(self, optimizers=None) -> Tuple[float, float]:
+        optimizers = self.chained_optimizers if optimizers is None else optimizers
+        if not optimizers:
+            return 0.0, 0.0
+        if len(optimizers) == 1:
+            return optimizers[0].get_dsa_split_grad_norms()
+        reference_group = optimizers[0].get_grad_stats_parallel_group()
+        if all(
+            optimizer.get_grad_stats_parallel_group() == reference_group for optimizer in optimizers
+        ):
             indexer_grads = []
             non_indexer_grads = []
-            for optimizer in self.chained_optimizers:
+            for optimizer in optimizers:
                 child_indexer_params, child_non_indexer_params = (
                     optimizer.get_dsa_split_parameters()
                 )
                 indexer_grads += optimizer._filter_grads_for_norm(child_indexer_params)
                 non_indexer_grads += optimizer._filter_grads_for_norm(child_non_indexer_params)
             indexer_grad_norm = get_grad_norm_fp32(
-                indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                indexer_grads, grad_stats_parallel_group=reference_group
             )
             non_indexer_grad_norm = get_grad_norm_fp32(
-                non_indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                non_indexer_grads, grad_stats_parallel_group=reference_group
             )
         else:
             indexer_norm_sq = 0.0
             non_indexer_norm_sq = 0.0
-            for optimizer in self.chained_optimizers:
+            for optimizer in optimizers:
                 child_indexer_norm, child_non_indexer_norm = optimizer.get_dsa_split_grad_norms()
                 indexer_norm_sq += child_indexer_norm**2
                 non_indexer_norm_sq += child_non_indexer_norm**2
@@ -2264,26 +2295,34 @@ class ChainedOptimizer(MegatronOptimizer):
             self._has_grad_norm_group_cache = {}
         cache = self._has_grad_norm_group_cache
         if grad_norm_group not in cache:
-            cache[grad_norm_group] = any(
+            has_group = [
                 optimizer.has_grad_norm_group(grad_norm_group)
                 for optimizer in self.chained_optimizers
-            )
+            ]
+            cache[grad_norm_group] = any(has_group)
         return cache[grad_norm_group]
 
     @torch.no_grad()
-    def _get_grad_norm_for_group(self, grad_norm_group: str):
-        """Compute gradient norm for a named parameter group."""
+    def _get_grad_norm_for_group(
+        self, grad_norm_group: str, optimizers: Optional[List[MegatronOptimizer]] = None
+    ):
+        """Compute a named parameter group's norm over a sub-optimizer subset."""
         _validate_grad_norm_group(grad_norm_group)
-        if self.grads_states_parallel_group_is_shared():
+        optimizers = self.chained_optimizers if optimizers is None else optimizers
+        if not optimizers:
+            return 0.0
+        reference_group = optimizers[0].get_grad_stats_parallel_group()
+        shared = all(
+            optimizer.get_grad_stats_parallel_group() == reference_group for optimizer in optimizers
+        )
+        if shared:
             grouped_grads = []
-            for optimizer in self.chained_optimizers:
+            for optimizer in optimizers:
                 grouped_grads += optimizer.get_grads_for_grad_norm(grad_norm_group)
-            return get_grad_norm_fp32(
-                grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-            )
+            return get_grad_norm_fp32(grouped_grads, grad_stats_parallel_group=reference_group)
         else:
             group_norms = []
-            for optimizer in self.chained_optimizers:
+            for optimizer in optimizers:
                 grouped_grads = optimizer.get_grads_for_grad_norm(grad_norm_group)
                 norm = get_grad_norm_fp32(
                     grouped_grads,
@@ -2293,12 +2332,19 @@ class ChainedOptimizer(MegatronOptimizer):
             return math.sqrt(sum([x**2 for x in group_norms]))
 
     @torch.no_grad()
-    def _compute_grad_norms_by_group(self) -> Dict[str, float]:
-        """Compute gradient norms for registered separate grad-norm groups."""
+    def _compute_grad_norms_by_group(
+        self, optimizers: Optional[List[MegatronOptimizer]] = None
+    ) -> Dict[str, float]:
+        """Compute separate-group norms over a sub-optimizer subset."""
+        optimizers = self.chained_optimizers if optimizers is None else optimizers
         self.grad_norms_by_group = {}
         for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
-            if self.has_grad_norm_group(grad_norm_group):
-                group_grad_norm = self._get_grad_norm_for_group(grad_norm_group)
+            # Evaluate every member before aggregating. has_grad_norm_group() may perform
+            # a collective on the member's grad-stats group, so short-circuiting here can
+            # make different ranks issue a different collective sequence.
+            has_group = [optimizer.has_grad_norm_group(grad_norm_group) for optimizer in optimizers]
+            if any(has_group):
+                group_grad_norm = self._get_grad_norm_for_group(grad_norm_group, optimizers)
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
 
@@ -2323,15 +2369,31 @@ class ChainedOptimizer(MegatronOptimizer):
             if any(param_group.get('is_dsa_indexer', False) for param_group in self.param_groups):
                 self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
             grad_norm = self.get_grad_norm()
+        # Norm over the subs that participate in magnitude clipping / the skip-threshold
+        # check. Orthogonalizing (Muon) subs are excluded: their grad magnitude is
+        # discarded by Newton-Schulz, so it must distort neither decision (#5394).
+        clippable_optimizers = [
+            optimizer for optimizer in self.chained_optimizers if not optimizer.skip_grad_norm_clip
+        ]
+        if len(clippable_optimizers) == len(self.chained_optimizers):
+            clippable_grad_norm = grad_norm
+        else:
+            clippable_grad_norm = self._get_grad_norm_over(clippable_optimizers)
+        if self.config.dsa_indexer_clip_grad is not None and len(clippable_optimizers) != len(
+            self.chained_optimizers
+        ):
+            indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms(
+                clippable_optimizers
+            )
         should_skip_update = False
 
         should_clip = any(
             not (hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer)
             and optimizer.config.clip_grad > 0.0
-            for optimizer in self.chained_optimizers
+            for optimizer in clippable_optimizers
         )
         if should_clip:
-            self._compute_grad_norms_by_group()
+            self._compute_grad_norms_by_group(clippable_optimizers)
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
@@ -2350,6 +2412,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 or use_fsdp_decoupled_grad
             )
+            if optimizer.skip_grad_norm_clip:
+                continue
             if optimizer.config.dsa_indexer_clip_grad is not None:
                 indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
                 indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
@@ -2377,12 +2441,13 @@ class ChainedOptimizer(MegatronOptimizer):
                 else:
                     main_params.append(p)
 
-            if optimizer.config.clip_grad > 0.0:
+            skip_grad_norm_clip = optimizer.skip_grad_norm_clip
+            if optimizer.config.clip_grad > 0.0 and not skip_grad_norm_clip:
                 if main_params:
                     clip_grad_by_total_norm_fp32(
                         main_params,
                         max_norm=optimizer.config.clip_grad,
-                        total_norm=grad_norm,
+                        total_norm=clippable_grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
                     )
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
@@ -2398,12 +2463,16 @@ class ChainedOptimizer(MegatronOptimizer):
 
             grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
             if (
-                main_params
+                not skip_grad_norm_clip
+                and main_params
                 and math.isfinite(grad_norm_skip_threshold)
-                and grad_norm > grad_norm_skip_threshold
+                and clippable_grad_norm > grad_norm_skip_threshold
             ):
                 log_single_rank(
-                    logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+                    logger,
+                    logging.INFO,
+                    "skipping grad norm because it's too large %s",
+                    clippable_grad_norm,
                 )
                 should_skip_update = True
 

@@ -293,6 +293,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_tensor_parallel_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/optimizer/test_muon_dsa_clipping.py",
         ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
@@ -605,11 +606,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/optimizer/test_muon_dsa_clipping.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "CPU Muon/DSA clipping controls cover optimizer dispatch and denominators, not GPU kernel replay.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
