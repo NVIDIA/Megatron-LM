@@ -45,11 +45,13 @@ def prefer_tape(num_sequences: int, heads: int, device: torch.device) -> bool:
     The fused kernel walks each (sequence, head) with one or two CTAs, so its
     parallelism is the pair count; the tape path spreads every chunk over the
     device and overlaps the recurrence with the gradients, at the cost of the
-    extra prep and recurrence passes.  On GB200 the tape path is as fast or
-    faster up to about four pairs per SM, and the fused kernel wins beyond.
+    extra prep and recurrence passes and of a transient tape as large as the
+    forward's ``h``.  On GB200 the tape path is about 3% faster at eight pairs
+    per SM and within 1% of the fused kernel beyond, so it is used up to
+    eight pairs per SM.
     """
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return num_sequences * heads <= 4 * sms
+    return num_sequences * heads <= 8 * sms
 
 
 # Chunks per work item of the persistent tape-fed kernel.
