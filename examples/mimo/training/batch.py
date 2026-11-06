@@ -57,5 +57,8 @@ def move_batch_to_cuda(value):
     # Pixels and packed-attention cu_seqlens belong on CUDA. Preserve that
     # wrong-device error rather than silently repairing input with .cpu().
     return map_batch_tensors(
-        value, lambda tensor: tensor.cuda(non_blocking=True), preserve_keys={"imgs_sizes"}
+        value,
+        lambda tensor: tensor.cuda(non_blocking=True),
+        # Keep this exclusion: CUDA imgs_sizes crashes native dynamic ViT.
+        preserve_keys={"imgs_sizes"},
     )

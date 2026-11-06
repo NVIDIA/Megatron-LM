@@ -2,6 +2,7 @@
 
 """MIMO batch placement follows vision host-metadata contracts."""
 
+import pytest
 import torch
 
 from examples.mimo.training.batch import map_batch_tensors, move_batch_to_cuda
@@ -52,3 +53,13 @@ def test_generic_mapper_keeps_its_default_transform_all_behavior():
     result = map_batch_tensors({"imgs_sizes": sizes}, lambda tensor: tensor + 1)
     assert torch.equal(result["imgs_sizes"], sizes + 1)
     assert torch.equal(sizes, torch.tensor([[32, 48]]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_batch_mover_preserves_native_vit_size_contract():
+    sizes = torch.tensor([[32, 48]], dtype=torch.int32)
+    with pytest.raises(ValueError, match="imgs_sizes must remain on CPU"):
+        _dynamic_patch_grid_lists(sizes.cuda(), 16)
+    moved = move_batch_to_cuda({"imgs_sizes": sizes, "x": torch.zeros(1)})
+    assert moved["x"].is_cuda
+    assert _dynamic_patch_grid_lists(moved["imgs_sizes"], 16) == ([(2, 3)], [6])
