@@ -49,9 +49,9 @@ class PackedSeqParams:
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
         if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
-            total_tokens_tensor = torch.tensor(
-                [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-            )
+            # new_full, not torch.tensor: a fill kernel instead of a pageable host-to-device
+            # copy, which also keeps this safe inside CUDA-graph capture.
+            total_tokens_tensor = cu_seqlens.new_full((1,), self.total_tokens)
             # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]

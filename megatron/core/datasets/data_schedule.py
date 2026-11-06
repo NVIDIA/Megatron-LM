@@ -32,14 +32,18 @@ except ImportError:
 
 
 def _build_thd_padding_mask(
-    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor, total_tokens: Optional[int] = None
 ) -> torch.Tensor:
-    """Build a 1D THD padding mask from scheduler sequence metadata."""
+    """Build a 1D THD padding mask from scheduler sequence metadata.
+
+    total_tokens (cu_seqlens_padded[-1]) can be passed from a tensor shape to avoid a host sync.
+    """
     assert cu_seqlens.dim() == 1
     assert cu_seqlens_padded.dim() == 1
     assert cu_seqlens.numel() == cu_seqlens_padded.numel()
 
-    total_tokens = int(cu_seqlens_padded[-1].item())
+    if total_tokens is None:
+        total_tokens = int(cu_seqlens_padded[-1].item())
     if total_tokens == 0:
         return torch.empty((0,), dtype=torch.bool, device=cu_seqlens.device)
 
@@ -806,8 +810,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
     if is_tp_rank_0:
+        # Stages that own tokens size the mask from its shape (no host sync); metadata-only
+        # batches (middle PP stages, non-owning VPP chunks) read cu_seqlens_padded[-1] instead.
+        tokens = batch.get('tokens')
         batch['padding_mask'] = _build_thd_padding_mask(
-            batch['cu_seqlens'], batch['cu_seqlens_padded']
+            batch['cu_seqlens'],
+            batch['cu_seqlens_padded'],
+            total_tokens=None if tokens is None else tokens.numel(),
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
@@ -822,7 +831,8 @@ def get_batch_on_this_rank_for_sequence_packing(
             # cu_seqlens to get the correct result.
             # TODO: Revert this workaround once TE fixes the issue.
             cu_seqlens = batch["cu_seqlens_padded"]
-            total_tokens = int(cu_seqlens[-1].item())
+            # Equals cu_seqlens_padded[-1]; the mask is not CP-sliced yet. No host sync.
+            total_tokens = batch['padding_mask'].numel()
             if cp_layout == "contiguous":
                 if total_tokens % cp_size:
                     raise ValueError("Packed token capacity must be divisible by CP size")
