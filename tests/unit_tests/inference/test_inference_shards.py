@@ -123,7 +123,11 @@ def test_disagg_rl_rejects_ignored_overrides(field):
 @pytest.mark.parametrize("mismatch", [None, "groups", "model"])
 def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     from megatron.core.inference.disaggregation import coordinator_setup as setup
+    from megatron.core.inference.disaggregation.transfer_backends import nccl as nccl_backend
 
+    setup_peer_groups = Mock()
+    monkeypatch.setattr(nccl_backend, "setup_peer_groups", setup_peer_groups)
+    monkeypatch.setattr(setup.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(setup.dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(setup.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(setup, "get_pg_size", lambda group: group)
@@ -138,7 +142,10 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     engine = SimpleNamespace(
         context=SimpleNamespace(
             enable_prefix_caching=True,
-            config=SimpleNamespace(disaggregation_shards="tp=1,role=prefill+tp=1,role=decode"),
+            config=SimpleNamespace(
+                disaggregation_shards="tp=1,role=prefill+tp=1,role=decode",
+                kv_transport_backend="nccl",
+            ),
         ),
         pg_collection=SimpleNamespace(
             tp=2 if mismatch == "groups" else 1, pp=1, dp=1, ep=1, cp=1, expt_tp=1
@@ -157,6 +164,8 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     else:
         setup.configure_prebuilt_disagg_engine(engine)
         engine.set_disaggregation_config.assert_called_once()
+        # NCCL transfers get one group per prefill/decode rank pair.
+        assert setup_peer_groups.call_args.args[0] == [(0, 1)]
 
 
 def test_shard_builder_keeps_replica_process_group(monkeypatch):
