@@ -8,7 +8,9 @@ and backward (cross-row dgamma reduction), grouped GEMMs over uneven expert load
 attention with GQA (dK/dV accumulate across query groups), fused RoPE, and the DSA indexer's
 BF16-input/FP32-output projection. Each wrapper is replayed standalone under side-stream
 contention; the bare TE modules are what the model-level suite composes, so a regression here
-localises to one kernel family.
+localises to one kernel family. Runtime CP head-geometry and MLA projection/RoPE
+replays live in ``context_parallel/runtime/test_te_replay.py`` and
+``context_parallel/runtime/test_mla_replay.py`` so their distributed cases have a dedicated CI bucket.
 """
 
 import inspect
@@ -546,6 +548,11 @@ class TestTEWrappers:
             skip_bias_add=False,
             is_expert=False,
         ).cuda()
+        assert getattr(module.layer_norm_weight, "is_rmsnorm_weight", False) == (
+            normalization == "RMSNorm"
+        )
+        assert not getattr(module.weight, "is_rmsnorm_weight", False)
+        assert not getattr(module.bias, "is_rmsnorm_weight", False)
         # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
@@ -560,6 +567,7 @@ class TestTEWrappers:
     def test_te_norm_replays(self, normalization):
         seeded()
         module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
+        assert getattr(module.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
@@ -605,6 +613,51 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
         )
+
+    @pytest.mark.launch_on_gb200
+    def test_te_grouped_linear_bf16_override_replays_under_mxfp8(self):
+        """The per-module autocast override also preserves deterministic gradients."""
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.extensions.transformer_engine import (
+            TEQuantizationParams,
+            TEQuantizationRecipe,
+        )
+
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+        seeded()
+        config = _config(fp8="e4m3", fp8_recipe=Fp8Recipe.mxfp8)
+        module = TEGroupedLinear(
+            4,
+            256,
+            512,
+            parallel_mode=None,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+        ).cuda()
+        module.te_quant_params = TEQuantizationParams(
+            training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+        )
+        splits = [256, 768, 0, 3072]
+        hidden = torch.randn(
+            sum(splits), 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with get_fp8_context(config):
+            assert FP8GlobalStateManager.is_fp8_enabled()
+            assert_module_replays_bit_exact(
+                module,
+                (hidden, splits),
+                replays=3,
+                contention=True,
+                what="TEGroupedLinear[BF16 override under MXFP8]",
+            )
+            assert FP8GlobalStateManager.is_fp8_enabled()
+        assert not module.fp8
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200

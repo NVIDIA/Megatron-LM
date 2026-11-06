@@ -10,6 +10,8 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -27,11 +29,13 @@ from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.transformer.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -120,8 +124,20 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     "name,activation",
     [("swiglu", weighted_bias_swiglu_impl), ("quick_geglu", weighted_bias_quick_geglu_impl)],
 )
-def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation):
-    """Marker propagation through activation views must preserve bit-exact numerics."""
+@pytest.mark.parametrize(
+    "bf16_override",
+    [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)],
+    ids=["bf16", "bf16_override_under_mxfp8"],
+)
+def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation, bf16_override):
+    """Marked activations retain bit-exact outputs and gradients under BF16 overrides."""
+    if bf16_override:
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        available, reason = te_ext.FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+
     seeded()
     x = _act((TOKENS, 2 * FFN))
     weights = _weights(TOKENS)
@@ -130,7 +146,32 @@ def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activati
         te_ext.mark_grouped_tensor(x)
         return activation(x, None, weights)
 
-    assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+    reference = assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+    if not bf16_override:
+        return
+
+    qparams = te_ext.TEQuantizationParams(
+        training_recipe=te_ext.TEQuantizationRecipe(), evaluation_recipe=None
+    )
+    initial_fp8_enabled = te_ext.FP8GlobalStateManager.is_fp8_enabled()
+
+    def with_bf16_override(x, weights):
+        with te_ext.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+            with te_ext._get_fp8_autocast_for_quant_params(qparams, training=True):
+                assert not te_ext.FP8GlobalStateManager.is_fp8_enabled()
+                output = fn(x, weights)
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+        assert te_ext.FP8GlobalStateManager.is_fp8_enabled() == initial_fp8_enabled
+        return output
+
+    overridden = assert_replays_bit_exact(
+        with_bf16_override, (x, weights), replays=3, what=f"marked_{name}[BF16 override]"
+    )
+    for actual, expected in zip(overridden, reference):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            assert bytes_equal(actual[key], expected[key]), f"BF16 override changed {name}: {key}"
 
 
 @pytest.mark.parametrize("weighted", [False, True])
@@ -201,6 +242,25 @@ def test_l2norm_replays_bit_exactly():
     norm = L2Norm(hidden_size=128).cuda()
     x = _act((4096, 2, 32, 128))
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
+
+
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
+    seeded()
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_zero_centered_gamma=False,
+        persist_layer_norm=False,
+        sequence_parallel=False,
+        memory_efficient_layer_norm=False,
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=2048).cuda().to(dtype=DTYPE)
+    assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
+    x = _act((4096, 2, 2048))
+    assert_module_replays_bit_exact(
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
+    )
 
 
 # --- bias + dropout + residual --------------------------------------------------------------

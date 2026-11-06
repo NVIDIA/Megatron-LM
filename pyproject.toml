@@ -123,6 +123,7 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    "flashinfer-python>=0.7.2,<0.8.0",
 ]
 
 otel = [
@@ -199,7 +200,7 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 managed = true
 default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
-constraint-dependencies = ["quack-kernels>=0.6.5"]
+constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",
@@ -219,6 +220,7 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "filelock>=4.2.1",  # CVE-2026-112940; multi-storage-client 0.51 caps filelock below 4
     "tilelang==0.1.12",
     "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
