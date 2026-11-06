@@ -1173,12 +1173,13 @@ class TestRegisterUbPoolHook:
 
     def test_symmetric_pool_without_nccl_ub(self):
         buffer, params = self._make_buffer()
-        assert buffer.nccl_mem_pool is not None
-        self._assert_hook_calls(params, buffer.nccl_mem_pool)
+        # The pool backs param_data only, so no gradient pool is registered for offload.
+        assert buffer.param_nccl_mem_pool is not None and buffer.nccl_mem_pool is None
+        self._assert_hook_calls(params, buffer.param_nccl_mem_pool)
 
     def test_no_hook_without_distributed_optimizer(self):
         buffer, params = self._make_buffer(use_distributed_optimizer=False)
-        assert buffer.nccl_mem_pool is None
+        assert buffer.nccl_mem_pool is None and buffer.param_nccl_mem_pool is None
         for param in params:
             param.register_ub_pool.assert_not_called()
 
@@ -1195,18 +1196,28 @@ class TestRegisterUbPoolHook:
         # With grad-buffer reuse, DDP does not remap quantized params, so it has no pool to hand.
         buffer, params = self._make_buffer(reuse_grad_buf=True, quantized=(0,))
         params[0].register_ub_pool.assert_not_called()
-        params[1].register_ub_pool.assert_called_once_with(buffer.nccl_mem_pool)
+        params[1].register_ub_pool.assert_called_once_with(buffer.param_nccl_mem_pool)
 
 
-def test_ub_pool_hook_reaches_dense_and_expert_buffers():
-    """Each buffer, dense and expert, hands its own pool to its stamped params; a frozen
-    param, which DDP leaves out, gets none."""
+def _in_pool(tensor, pool):
+    return any(
+        seg["address"] <= tensor.data_ptr() < seg["address"] + seg["total_size"]
+        for seg in pool.snapshot()
+    )
+
+
+@pytest.mark.parametrize("grad_buffer_offload", [False, True])
+def test_ub_pool_hook_reaches_dense_and_expert_buffers(grad_buffer_offload):
+    """Each buffer, dense and expert, backs only its param_data with its own pool and hands it
+    to its stamped params; a frozen param, which DDP leaves out, gets none. Grads stay outside
+    the pool, so gradient offload works without --use-nccl-ub."""
     Utils.initialize_model_parallel()
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True,
         overlap_grad_reduce=True,
         bucket_size=None,
         average_in_collective=False,
+        grad_buffer_offload=grad_buffer_offload,
     )
     model = TestModelWithExperts(
         input_dim=16, output_dim=16, num_dense_layers=2, num_expert_layers=2, bias=True
@@ -1237,11 +1248,22 @@ def test_ub_pool_hook_reaches_dense_and_expert_buffers():
 
     (dense_buffer,) = ddp_model.buffers
     (expert_buffer,) = ddp_model.expert_parallel_buffers
-    assert dense_buffer.nccl_mem_pool is not expert_buffer.nccl_mem_pool
+    assert dense_buffer.param_nccl_mem_pool is not expert_buffer.param_nccl_mem_pool
+    for buffer in (dense_buffer, expert_buffer):
+        assert buffer.nccl_mem_pool is None
+        assert _in_pool(buffer.param_data, buffer.param_nccl_mem_pool)
+        assert not _in_pool(buffer.grad_data, buffer.param_nccl_mem_pool)
     frozen.register_ub_pool.assert_not_called()
     for layer in model.dense_layers[1:]:
-        layer.weight.register_ub_pool.assert_called_once_with(dense_buffer.nccl_mem_pool)
+        layer.weight.register_ub_pool.assert_called_once_with(dense_buffer.param_nccl_mem_pool)
     for layer in model.expert_layers:
-        layer.weight.register_ub_pool.assert_called_once_with(expert_buffer.nccl_mem_pool)
+        layer.weight.register_ub_pool.assert_called_once_with(expert_buffer.param_nccl_mem_pool)
+
+    if grad_buffer_offload:
+        ddp_model.offload_grad_buffers()
+        assert dense_buffer.grad_data.untyped_storage().size() == 0
+        ddp_model.restore_grad_buffers()
+        assert dense_buffer.grad_data.untyped_storage().size() > 0
+        assert _in_pool(dense_buffer.param_data, dense_buffer.param_nccl_mem_pool)
 
     Utils.destroy_model_parallel()
