@@ -1530,13 +1530,12 @@ class TransformerConfig(ModelParallelConfig):
     """ Random seed to use for sampling during inference. """
 
     inference_fa4_min_num_splits: int = 8
-    """Floor on FlashAttention-4's split-KV count in dynamic-inference attention (decode-only and
-    mixed steps). FA4's own heuristic splits only to fill idle SMs: at large decode batch it picks
-    1 split, so each request's KV is walked by one CTA and the kernel waits for the longest request.
-    The floor bounds that request's work by its length / floor, at a small cost when lengths are
-    even (8 measured within ~4 us per layer of FA4's choice; 32+ is slower). At small batch FA4's
-    larger split count is kept. 0 = use FA4's heuristic unchanged. Ignored in batch-invariant mode,
-    which forces 1 split."""
+    """Floor on FlashAttention-4's split-KV count in the mixed (prefill + decode) steps of dynamic
+    inference. Those steps use FA4's standard kernel, whose heuristic splits only to fill idle SMs:
+    at large batch it picks 1 split, so each request's KV is walked by one CTA and the step waits
+    for its longest decode. A floor such as 8 bounds that by the length / 8. Decode-only steps are
+    left to FA4 (>= 4.0.0b25), whose SwapAB decode kernel picks split counts per request. 0 = FA4's
+    heuristic for mixed steps too. Ignored in batch-invariant mode, which forces 1 split."""
 
     symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
     """What type of symmetric all reduce to use. The default is None

@@ -86,8 +86,9 @@ if not HAVE_FA3:
 # The FA4 version is tracked by the `flash-attn-4` distribution metadata,
 # not `flash_attn.__version__` (which reports the 2.x version) or
 # `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
-# `is_fa_min_version` here.
-_MIN_FA4_VERSION = "4.0.0b20"
+# `is_fa_min_version` here. 4.0.0b25 is the first with the SM100 SwapAB decode kernel, which splits
+# each decode request's KV by its own length (per-request split counts); decode relies on it below.
+_MIN_FA4_VERSION = "4.0.0b25"
 flash_attn4_varlen_func = None
 try:
     from importlib.metadata import PackageNotFoundError
@@ -118,7 +119,7 @@ def fa4_num_splits(
     tile_m: int = 128,
     tile_n: int = 128,
 ) -> int:
-    """Split-KV count for FA4 inference attention: max(FA4's heuristic, min_splits).
+    """Split-KV count for FA4 mixed (prefill + decode) attention: max(FA4's heuristic, min_splits).
 
     Returns 0 (FA4 decides) when min_splits is 0. Otherwise mirrors the heuristic in
     flash_attn.cute.interface for 128 x 128 tiles with GQA packed into the M tile,
@@ -1352,18 +1353,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=(
-                            1
-                            if self.batch_invariant_mode
-                            else fa4_num_splits(
-                                num_requests,
-                                q_varlen.shape[-2],
-                                k.shape[-2],
-                                tokens_per_request,
-                                max_seqlen_k,
-                                self.config.inference_fa4_min_num_splits,
-                            )
-                        ),
+                        # FA4 decides: its SwapAB decode kernel picks per-request split counts.
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                         return_lse=need_lse,
                         **softcap_kwargs,
                     )
