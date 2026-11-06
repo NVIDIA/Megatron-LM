@@ -430,7 +430,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         def _absorbs(numel: int) -> bool:
             """True if ``numel`` fits in the least-loaded shard without growing
             the bucket's padded size (``dp_size * padded_shard_size``), i.e.,
-            it fills existing shard padding instead of adding a new row."""
+            it fills existing shard padding instead of adding a new row.
+            """
             target = pad_to_divisor(max(shard_loads), shard_divisor)
             return pad_param_start(min(shard_loads)) + numel <= target
 
@@ -829,7 +830,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:
         """The GTP layer records the group it sharded a weight over on the param
         (``p.group``); the gtp_remat axis picked for the domain must have the same ranks,
-        or the stage-1 exchange would concatenate shards from the wrong ranks."""
+        or the stage-1 exchange would concatenate shards from the wrong ranks.
+        """
         expected = None
         for p, spec in zip(params, specs):
             recorded = getattr(p, 'group', None)

@@ -615,7 +615,8 @@ class RankGenerator(object):
 
 def default_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the word embeddings live.
-    For most models, these are the first and last pipeline stages."""
+    For most models, these are the first and last pipeline stages.
+    """
     if len(pp_ranks) == 1:
         return [pp_ranks[0]]
     else:
@@ -624,7 +625,8 @@ def default_embedding_ranks(pp_ranks):
 
 def default_position_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the position embeddings live.
-    For most models, this is only the first pipeline stage."""
+    For most models, this is only the first pipeline stage.
+    """
     return [pp_ranks[0]]
 
 
@@ -3024,7 +3026,8 @@ def destroy_global_memory_buffer():
 
 def get_all_ranks():
     """Get caller's rank in tensor-model-parallel, data-parallel, context-parallel,
-    pipeline-model-parallel and expert-model-parallel groups."""
+    pipeline-model-parallel and expert-model-parallel groups.
+    """
     ranks = [
         get_tensor_model_parallel_rank(),
         get_gtp_weight_remat_rank(),

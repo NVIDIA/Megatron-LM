@@ -269,7 +269,8 @@ def _coerce_arguments_mapping(arguments):
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject HTTP redirects so a 3xx to a private address can't bypass the
-    pre-fetch allowlist check."""
+    pre-fetch allowlist check.
+    """
 
     def http_error_301(self, req, fp, code, msg, headers):
         """Turn a 3xx redirect into an HTTPError so the fetch fails closed."""
@@ -581,7 +582,8 @@ def _replace_prefix_tokens(
     current_turn_token_ids,
 ):
     """Replace the token ids that are associated with the previous turn with the actual tokens
-    from the previous generation (rather than the ones from the chat template application)."""
+    from the previous generation (rather than the ones from the chat template application).
+    """
 
     if not previous_turn_token_ids:
         return current_turn_token_ids
@@ -604,7 +606,8 @@ def _replace_prefix_tokens(
 def _has_previous_turn_tokens(last_assistant_message):
     """True when the last assistant message carries the token ids of a previous
     Megatron-Inference response, so the endpoint can replace the prefix with the exact prior turn here.
-    Dataset-provided conversation history won't have these fields."""
+    Dataset-provided conversation history won't have these fields.
+    """
     if last_assistant_message is None:
         return False
     prompt_token_ids = last_assistant_message.get("prompt_token_ids")
@@ -627,7 +630,8 @@ def _last_assistant_message(template_messages):
 
 def _replace_prefix_tokens_metadata(eos_token_ids, template_prefix_token_ids, offload_params):
     """Ship the rendered prior-turn tokens so the engine's RequestPromptPreparer can replace the
-    prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``)."""
+    prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``).
+    """
     return {
         **offload_params,
         PREFIX_TEMPLATE_TOKEN_IDS_FIELD: list(template_prefix_token_ids),

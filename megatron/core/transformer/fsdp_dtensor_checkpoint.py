@@ -441,7 +441,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     def _match_gdn_key(key):
         """Return (split_sizes, sub_names, split_dim) if *key* is a GDN fused
-        parameter that needs splitting, else ``None``."""
+        parameter that needs splitting, else ``None``.
+        """
         norm = _strip_wrapper_prefixes(key)
         for gdn_path, info in _gdn_info.items():
             if not norm.startswith(gdn_path + '.'):

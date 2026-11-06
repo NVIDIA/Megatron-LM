@@ -2,7 +2,8 @@
 
 """Framework-agnostic primitives for heterogeneous inference sharding: build a
 ``ProcessGroupCollection`` per shard, each over a contiguous rank window at its
-own parallelism."""
+own parallelism.
+"""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union

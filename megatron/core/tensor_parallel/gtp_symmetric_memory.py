@@ -54,7 +54,8 @@ _registered: typing.Dict[str, typing.Any] = {}
 def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     """Return the per-group symmetric MemPool, creating it once. Pools come from the
     VMM allocator, falling back to ``ncclMemAlloc`` (same pool API) if its extension
-    cannot build."""
+    cannot build.
+    """
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
@@ -112,13 +113,15 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
 
 def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     """Context manager: allocations inside it come from ``group``'s pool. Collective-free
-    (capture-safe); register the pool first or allocations are not window-registered."""
+    (capture-safe); register the pool first or allocations are not window-registered.
+    """
     return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
 def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
     """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
-    ``None`` and single-rank groups, which are never registered."""
+    ``None`` and single-rank groups, which are never registered.
+    """
     return group is not None and group.size() > 1 and group.group_name in _registered
 
 
@@ -264,7 +267,8 @@ symmetric_wgrad_pool = RegisteredLIFOPool()
 def deregister_and_clear_gtp_symm_pools() -> None:
     """Tear down what this module owns: deregister the pools' windows, then drop the
     recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
-    are not freed here. Call on all ranks before teardown; no-op if never registered."""
+    are not freed here. Call on all ranks before teardown; no-op if never registered.
+    """
     # Wait for all GPU work to finish first: a kernel or collective still reading
     # pool memory would fault once the windows go away.
     if torch.cuda.is_available() and torch.cuda.is_initialized():

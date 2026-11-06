@@ -553,7 +553,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     If last stage, output_tensor_grad is None, otherwise gradient of loss
     with respect to stage's output tensor.
 
-    Returns gradient of loss with respect to input tensor (None if first stage)."""
+    Returns gradient of loss with respect to input tensor (None if first stage).
+    """
 
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
@@ -1029,7 +1030,8 @@ def forward_backward_pipelining_with_interleaving(
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
 
-    Returns dictionary with losses if the last stage, empty dict otherwise."""
+    Returns dictionary with losses if the last stage, empty dict otherwise.
+    """
 
     # Convention used in this function:
     # num_microbatches for number of microbatches per pipeline stage;
@@ -1249,7 +1251,8 @@ def forward_backward_pipelining_with_interleaving(
 
     def num_released_microbatches(virtual_microbatch_id, model_chunk_id):
         """Helper method to count number of released (i.e. popped from input_tensors)
-        microbatches for a model chunk."""
+        microbatches for a model chunk.
+        """
         if forward_only:  # Micro-batch is released after forward prop.
             return model_chunk_id_table[:virtual_microbatch_id].count(model_chunk_id)
         else:  # Micro-batch is released after backward prop.
@@ -2185,7 +2188,8 @@ def forward_backward_pipelining_without_interleaving(
     force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+    stages. Returns dictionary with losses if the last stage, empty dict otherwise.
+    """
 
     if isinstance(model, list):
         assert (

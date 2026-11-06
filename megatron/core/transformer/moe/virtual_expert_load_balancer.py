@@ -74,7 +74,8 @@ class VirtualExpertPlan:
 
     ``virtual_experts`` holds int16 [tokens, topk] runtime ids; ``experts_to_copy`` holds
     int32 [EP, local_experts] semantic ids (-1 for unused slots). Repeated MTP forwards
-    retain separate plans through their layer-output hooks. ``ready`` joins the planner stream."""
+    retain separate plans through their layer-output hooks. ``ready`` joins the planner stream.
+    """
 
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
@@ -196,7 +197,8 @@ class _VirtualExpertStorage:
     @staticmethod
     def _wrap_mxfp8(template, shape, views, device) -> tuple[torch.Tensor, ...]:
         """Wrap ``(rowwise, rowwise_scale, columnwise, columnwise_scale)`` views as MXFP8 tensors
-        with ``template``'s quantization metadata."""
+        with ``template``'s quantization metadata.
+        """
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
         return tuple(
@@ -305,7 +307,8 @@ class _GTPTEWeightBridge:
     """TE DistributedWeight protocol bound to BF16/MXFP8 runtime parameters.
 
     TE materializes weights and acquires wgrad buffers. The layer-input hook finalizes
-    GTP only after remote virtual-expert gradients arrive."""
+    GTP only after remote virtual-expert gradients arrive.
+    """
 
     def _gtp_runtime_shells(self, fc_layer: int):
         """Create native weight shells and empty gradients until GTP supplies their buffers."""
@@ -548,7 +551,8 @@ class _VirtualExperts(_GTPTEWeightBridge):
     def hand_off_wgrads(self, fc_layer: int) -> tuple[torch.Tensor, ...]:
         """Finish GTP reduction or return dummy grads to trigger DDP's grad-ready hooks.
 
-        Non-GTP weights already accumulated into main_grad; do not add their gradients again."""
+        Non-GTP weights already accumulated into main_grad; do not add their gradients again.
+        """
         from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
         if self.gtp_leaders[fc_layer] is not None:
@@ -575,7 +579,8 @@ class _VirtualExpertHook(torch.autograd.Function):
     """Call a method during backward, preserving the tensor gradient.
 
     Its return values are gradients for ``inputs``. Hold the method weakly: the manager
-    retains forward tensors, so a strong reference would keep the autograd graph alive."""
+    retains forward tensors, so a strong reference would keep the autograd graph alive.
+    """
 
     @staticmethod
     def forward(ctx, tensor, method, args, *inputs):
@@ -598,7 +603,8 @@ class VirtualExpertLoadBalancer:
 
     Every rank receives tokens * topk routes. Each rank copies experts from one owner into
     num_local_experts slots and reduces their gradients back during backward. HybridEP owns
-    token transport; this mixin schedules planning, weight movement, and gradient reduction."""
+    token transport; this mixin schedules planning, weight movement, and gradient reduction.
+    """
 
     # Shared by every layer of the process, allocated by the first layer to bind. Two candidate
     # weight streams: a CUDA-graph capture stream comes from the same pool and may alias one.
@@ -825,7 +831,8 @@ class VirtualExpertLoadBalancer:
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Initialize the runtime and finalize gradients at the layer input's backward.
 
-        This follows router/dispatch backward and both FC reductions."""
+        This follows router/dispatch backward and both FC reductions.
+        """
         self._runtime_init(hidden_states)
         return _VirtualExpertHook.apply(
             hidden_states, self._finish_grad_reduce, (), *self.source_parameters
@@ -849,7 +856,8 @@ class VirtualExpertLoadBalancer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attach dispatch-backward work and return what the transport dispatches: the hidden
         states and the int16 ``[num_tokens, topk]`` runtime expert ids (the router's
-        probabilities are unchanged by the remap)."""
+        probabilities are unchanged by the remap).
+        """
         hidden_states = _VirtualExpertHook.apply(
             hidden_states, self._start_pending_grad_reduces, ()
         )
@@ -866,7 +874,8 @@ class VirtualExpertLoadBalancer:
 
     def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
         """Close the forward; the layer output's backward hook hands the plan back for its
-        backward and starts the backward weight push."""
+        backward and starts the backward weight push.
+        """
         plan, self._plan = self._plan, None
         return _VirtualExpertHook.apply(output, self._start_backward, (plan,))
 
@@ -923,7 +932,8 @@ class VirtualExpertLoadBalancer:
     @nvtx_decorator(message="virtual_expert_grad_reduce_start")
     def _start_grad_reduce(self, fc_layer: int) -> None:
         """Enqueue the virtual-expert-gradient reduction of one FC layer (0 = FC1, 1 = FC2)
-        on the reduction stream, behind everything the compute stream has issued."""
+        on the reduction stream, behind everything the compute stream has issued.
+        """
         plan = self._plan
         if plan is None or plan.push_in_flight:
             raise RuntimeError("Virtual-expert gradient reduction needs the prepared backward.")
@@ -950,7 +960,8 @@ class VirtualExpertLoadBalancer:
 
     def _start_pending_grad_reduces(self) -> None:
         """Start pending reductions FC2 first. TE normally starts FC2 at its wgrad GEMM;
-        FC1 starts here after dispatch, overlapping latent/shared-expert/router backward."""
+        FC1 starts here after dispatch, overlapping latent/shared-expert/router backward.
+        """
         for fc_layer in (1, 0):
             if fc_layer not in self._plan.started:
                 self._start_grad_reduce(fc_layer)
@@ -962,7 +973,8 @@ class VirtualExpertLoadBalancer:
 
         Finalize GTP FC2 first on the compute stream, returning gradients FC1 first.
         GTP adds shard gradients to main_grad and fires DDP hooks, which may scale/copy
-        buckets shared with compute-stream parameters."""
+        buckets shared with compute-stream parameters.
+        """
         plan, self._plan = self._plan, None
         if plan is None or plan.started != {0, 1}:
             raise RuntimeError(

@@ -133,7 +133,8 @@ class BlendedMegatronDatasetConfig:
     @property
     def mock(self) -> bool:
         """Whether to bypass real data loading and validation in favor of mock data generation:
-        True when neither ``blend`` nor ``blend_per_split`` provides a data source."""
+        True when neither ``blend`` nor ``blend_per_split`` provides a data source.
+        """
         return self.blend is None and not (
             self.blend_per_split is not None and any(self.blend_per_split)
         )
@@ -144,7 +145,8 @@ class BlendedMegatronDatasetConfig:
         ``split``. Mock data always uses an arbitrarily even split, whatever ``split`` says, as it
         always has; ``split`` itself is left as given. For more information, refer to
         'convert_split_vector_to_split_matrix'. None with ``blend_per_split``, which carries one
-        blend per split."""
+        blend per split.
+        """
         if self.blend_per_split is not None and any(self.blend_per_split):
             return None
         if self.mock:

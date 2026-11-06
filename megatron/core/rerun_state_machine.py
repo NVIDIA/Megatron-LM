@@ -1372,7 +1372,8 @@ class RerunErrorInjector:
 
         When no error is injected, this method defers to the user-provided comparison function.
         When an error is injected, it returns matching or mismatching results depending on the type
-        of error being injected and on the re-run state."""
+        of error being injected and on the re-run state.
+        """
 
         if self.injected_error_type is None:
             return comparison_func(initial_result, result)

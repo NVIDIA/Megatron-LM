@@ -366,7 +366,8 @@ def _replace_state_dict_keys_with_sharded_keys(
     sharded_state_dict: ShardedStateDict, keep_only_main_replica: bool = False
 ) -> Tuple[Dict[str, List[ShardedBase]], FLATTEN_MAPPING, Dict[str, List[str]]]:
     """Group ShardedBase objects by keys and
-    return mappings required for recreating the original dict."""
+    return mappings required for recreating the original dict.
+    """
     flat_sd, flat_mapping = flatten_state_dict(sharded_state_dict)
     rename_mapping = defaultdict(list)
     new_flat_sd = defaultdict(list)

@@ -70,7 +70,8 @@ class ParamWithNamePredicate:
 @dataclass(frozen=True, slots=True)
 class ParamKey:
     """Key to group parameters by. All such grouped parameters can share an
-    optimizer config specification."""
+    optimizer config specification.
+    """
 
     # TODO: Can add layer_id here later.
 

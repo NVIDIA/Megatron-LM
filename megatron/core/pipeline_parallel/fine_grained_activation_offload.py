@@ -1405,7 +1405,8 @@ class ChunkOffloadHandler:
     def _drain_offload_pending(self, group_name: str) -> None:
         """For ``group_name``, have the main stream wait on older D2H events
         when that name's pending count exceeds ``_max_inflight_offloads``
-        (same cap for every name; 0 = wait on each commit for that name)."""
+        (same cap for every name; 0 = wait on each commit for that name).
+        """
         if self._max_inflight_offloads is None:
             return
         cur = torch.cuda.current_stream()

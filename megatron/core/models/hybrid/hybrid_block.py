@@ -513,7 +513,8 @@ class HybridStack(MegatronModule):
         stage comes from communication, not from the input, so the
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
-        forward_step_func"""
+        forward_step_func
+        """
         self.input_tensor = input_tensor
 
     def physical_layers(self) -> tuple[nn.Module, ...]:

@@ -188,7 +188,8 @@ _AUTO_TP_MODES = ("duplicated", "distributed")
 @dataclass(frozen=True)
 class HardwareProfile:
     """HW spec for different GPU. Use for cost model when selecting TP mode.
-    Bandwidths are UNIDIRECTIONAL."""
+    Bandwidths are UNIDIRECTIONAL.
+    """
 
     bf16_peak_tflops: float  # dense, fp32_matmul_prec = "medium" for now
     bw_intra_gbps: float  # collectives staying inside one NVLink domain

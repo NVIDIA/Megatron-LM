@@ -1213,7 +1213,8 @@ class DynamicInferenceEngine(AbstractEngine):
         cache: bool = True,
     ) -> None:
         """Check the embedding count against the mask, then store the embeddings on the
-        request, in the vision cache and on the context (shared by the post-admission paths)."""
+        request, in the vision cache and on the context (shared by the post-admission paths).
+        """
         actual_count = embeddings.numel() // embeddings.shape[-1] if embeddings.ndim > 0 else 0
         if actual_count != expected_count:
             raise ValueError(
@@ -2350,7 +2351,8 @@ class DynamicInferenceEngine(AbstractEngine):
     async def snapshot_live_requests(self) -> List[LiveRequestSnapshot]:
         """Snapshot every non-failed request for later resumption; must run on the
         engine loop whenever that loop is running (any loop may run it while the
-        engine loop is stopped, as between a suspend and a resume)."""
+        engine loop is stopped, as between a suspend and a resume).
+        """
         if self._loop.is_running() and asyncio.get_running_loop() is not self._loop:
             raise RuntimeError(
                 "snapshot_live_requests must run on the engine loop while it is running"

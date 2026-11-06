@@ -5,7 +5,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 
 def _make_unshard_forward_hook(owner: FsdpModule):
     """Create a forward pre-hook that unshards the owning FSDP module before the submodule
-    forward."""
+    forward.
+    """
 
     def hook(submodule, _args, _kwargs):
         if owner.is_root():
@@ -18,7 +19,8 @@ def _make_unshard_forward_hook(owner: FsdpModule):
 
 def _make_unshard_backward_hook(owner: FsdpModule):
     """Create a backward pre-hook that unshards the owning FSDP module before the submodule
-    backward."""
+    backward.
+    """
 
     def hook(submodule, _grad_output):
         owner.unshard()

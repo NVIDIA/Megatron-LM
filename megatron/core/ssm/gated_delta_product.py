@@ -857,7 +857,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         The CuTeDSL kernel uses a flattened token axis described by ``cu_seqlens`` and
         applies the query/key L2 norm itself. Its output is restored to ``(b, l, h, p)``
         here. The FLA kernel uses the batched layout and receives query/key tensors already
-        normalized by ``_prepare_qkv``. Unpacked FLA leaves ``cu_seqlens`` unset."""
+        normalized by ``_prepare_qkv``. Unpacked FLA leaves ``cu_seqlens`` unset.
+        """
         if runtime_cp.chunkwise:
             assert self.chunkwise_cp_backend is not None
             core_attn_out = gdp_chunkwise_context_parallel(
@@ -1150,7 +1151,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
     def _postprocess(self, core_attn_out, z, packed_seq_params=None, *, runtime_cp: _GDPRuntimeCP):
         """Switch back to (l, b, d) layout, scatter across CP ranks, and apply the
-        gated output norm."""
+        gated output norm.
+        """
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         if not runtime_cp.chunkwise:
             assert runtime_cp.helper is not None
@@ -1252,7 +1254,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
         Every op here is CUDA-graph safe: no host synchronization, no
         data-dependent shapes, and the state caches are addressed by device-side
-        indices rather than gathered and scattered."""
+        indices rather than gathered and scattered.
+        """
         assert (intermediate_conv_state is None) == (intermediate_ssm_state is None), (
             "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
             "a rollback needs both halves of the recurrent state"
@@ -1354,7 +1357,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         which take precomputed chunk descriptors and per-token conv metadata and
         so need neither a host synchronization nor a data-dependent shape.
         Padding requests are zero-length sequences with a `-1` state slot; they
-        produce zero output and touch no state."""
+        produce zero output and touch no state.
+        """
         assert self.cp is not None, "Headwise geometry is required for GDP inference"
         metadata = context.mamba_metadata
         cu_seqlens = metadata.cu_seqlens

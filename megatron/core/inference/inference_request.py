@@ -1277,7 +1277,8 @@ class DynamicInferenceRequestRecord:
 
     def checkpoint(self) -> None:
         """Maintain reference to previous request, and then append a new request
-        that concatenates the previous prompt and generations."""
+        that concatenates the previous prompt and generations.
+        """
 
         old_request = self[-1]
 
@@ -1596,7 +1597,8 @@ class LiveRequestSnapshot:
     """Snapshot of a live request, allowing for its later resumption.
 
     A snapshot carries no media; resuming a multimodal request requires resubmitting the
-    same media so the expanded prompt the boundaries were counted on is reproduced."""
+    same media so the expanded prompt the boundaries were counted on is reproduced.
+    """
 
     uid: str
     request_id: int

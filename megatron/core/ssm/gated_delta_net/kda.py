@@ -260,7 +260,8 @@ class KimiDeltaAttention(_GDNBase):
 
         vLLM rollout keeps every KDA projection in BF16 (the checkpoint stores them
         BF16 with no FP8 scales), so the actor must match to keep actor<->rollout
-        pearson sharp under FP8 hybrid training."""
+        pearson sharp under FP8 hybrid training.
+        """
         if self.config.kda_disable_fp8:
             with get_fp8_disabled_context(self.config):
                 return proj(x)

@@ -163,5 +163,6 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
     def load_state_dict(self, state_dict, strict=True):
         """
         No-op because tensors are already loaded in-place by
-        `_load_base_checkpoint` with FSDP2."""
+        `_load_base_checkpoint` with FSDP2.
+        """
         pass

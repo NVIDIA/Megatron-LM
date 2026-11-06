@@ -1942,7 +1942,8 @@ class SelfAttention(Attention):
 
         (TODO) In the future, more tensors should be checked across the training run and
         checked every X iterations. This is left for future work. Equality of tensors is probably
-        not required; transmitting hashes is sufficient."""
+        not required; transmitting hashes is sufficient.
+        """
 
         if not self.config.qk_layernorm:
             return

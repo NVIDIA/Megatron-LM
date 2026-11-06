@@ -4704,7 +4704,8 @@ class AllGatherPipeline:
         """Extend a bucket list using the communication-size heuristic. Buckets that need
         neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
         stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
-        group added may exceed it."""
+        group added may exceed it.
+        """
         parameter_groups = self.buffer.parameter_groups
         allgathered_bucket_ids = set(bucket_ids)
 
@@ -4862,7 +4863,8 @@ class AllGatherPipeline:
     def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
         """Record the buckets whose row-wise weights a recomputed forward re-gathered.
         Buckets without a transpose buffer use the same weights in forward and backward.
-        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units.
+        """
         if self.buffer.ddp_config.fsdp_double_buffer:
             return
         parameter_groups = self.buffer.parameter_groups
@@ -4874,7 +4876,8 @@ class AllGatherPipeline:
 
     def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
         """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
-        not already gathered, so that their recomputed forward does not wait on them."""
+        not already gathered, so that their recomputed forward does not wait on them.
+        """
         pending = [
             bucket_id
             for bucket_id in bucket_ids
@@ -4903,7 +4906,8 @@ class AllGatherPipeline:
     ) -> List[int]:
         """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
         them, as described in `all_gather_params`. Return all of these bucket IDs, including
-        those that were already gathered."""
+        those that were already gathered.
+        """
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups

@@ -209,7 +209,8 @@ class RotaryEmbedding(nn.Module):
 
     def get_freqs_non_repeated(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Generates matrix of frequencies based on positions in the sequence,
-        used to create positional encodings"""
+        used to create positional encodings
+        """
         seq = (
             torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
             + offset
@@ -224,7 +225,8 @@ class RotaryEmbedding(nn.Module):
 
     def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
         """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
-        sequence length"""
+        sequence length
+        """
         if self.inv_freq.device.type == 'cpu':
             # Match get_emb(): CPU initialization defers this persistent tensor's
             # device transfer until its first inference forward.

@@ -20,7 +20,8 @@ def run_mcore_engine(
     random_seed=-1,
 ):
     """Server-compatible version of the MCore Engine, used in
-    tools/run_text_generation_server.py."""
+    tools/run_text_generation_server.py.
+    """
 
     values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs, random_seed]
     values_float_tensor = broadcast_float_list(len(values), float_list=values, data_parallel=False)

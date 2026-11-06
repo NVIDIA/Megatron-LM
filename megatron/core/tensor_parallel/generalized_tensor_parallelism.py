@@ -332,7 +332,8 @@ _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     """Padded send buffer from the registered recycling pool, pad tail zeroed (the RS
-    sends the whole buffer, and a recycled buffer may hold stale rows)."""
+    sends the whole buffer, and a recycled buffer may hold stale rows).
+    """
     buf = symmetric_wgrad_pool.alloc(weight._unsharded_shape_padded, dtype, device, weight.group)
     if weight.pad_length:
         buf[weight._unsharded_shape[0] :].zero_()
@@ -402,7 +403,8 @@ def _close_wgrad_accumulation_windows() -> None:
 
 def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
     """Return a pool-owned buffer for reuse (no-op for untagged buffers; see
-    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight."""
+    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight.
+    """
     if not getattr(buf, "_from_gtp_wgrad_pool", False):
         return
     buf._gtp_wgrad_reuse_event = ready_event
@@ -1978,7 +1980,8 @@ class GTPShardedParam(torch.nn.Parameter):
         RS send buffer (dtype permitting): direct writes keep the RS send out of the
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
-        _prepare_wgrad_reduce_scatter_inputs."""
+        _prepare_wgrad_reduce_scatter_inputs.
+        """
         return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
@@ -2231,7 +2234,8 @@ class GTPShardedParam(torch.nn.Parameter):
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
         """Reduce-scatter one or more wgrads → (outputs, handle, release_bufs). Single
         tensor: plain RS; multiple: coalesced RS. ``release_bufs`` are the send buffers
-        to free once the collective has been waited on."""
+        to free once the collective has been waited on.
+        """
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
@@ -2914,7 +2918,8 @@ def grouped_gather_along_first_dim(
     output_tensors: list = None,
 ):
     """All-gather multiple weights in one coalesced op; handles NVFP4 post-processing for both
-    sync and async paths."""
+    sync and async paths.
+    """
     # Determine device from first weight.
     inp = weights[0]
     if isinstance(inp, NVFP4TensorStorage):

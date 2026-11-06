@@ -253,7 +253,8 @@ class OptimizerParamScheduler:
         """Weight decay incr functions
 
         Args:
-            param_group (dict): parameter group from the optimizer."""
+            param_group (dict): parameter group from the optimizer.
+        """
 
         if param_group is not None:
             start_wd = param_group.get('start_wd', self.start_wd)

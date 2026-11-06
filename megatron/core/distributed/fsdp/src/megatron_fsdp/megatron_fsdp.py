@@ -68,7 +68,8 @@ except ImportError:
 
 class TrainingState(Enum):
     """States of a FSDP parameter group, which are coupled with
-    the sharding activity of parameters and gradients during training."""
+    the sharding activity of parameters and gradients during training.
+    """
 
     # From pre-forward before post-forward, where parameters should be unsharded
     FORWARD = auto()

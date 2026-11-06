@@ -577,7 +577,8 @@ class LLaVAModel(MegatronModule):
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
-        necessary for `finalize_model_grads._allreduce_word_embedding_grads`."""
+        necessary for `finalize_model_grads._allreduce_word_embedding_grads`.
+        """
         if self.add_decoder:
             return self.language_model.shared_embedding_or_output_weight()
         return None

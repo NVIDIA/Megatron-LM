@@ -43,7 +43,8 @@ def _reduce(input_, group):
 
 def _split_along_last_dim(input_, group):
     """Split the tensor along its last dimension and keep the
-    corresponding slice."""
+    corresponding slice.
+    """
     assert group is not None, "group should not be None"
 
     world_size = group.size()
@@ -63,7 +64,8 @@ def _split_along_last_dim(input_, group):
 
 def _split_along_first_dim(input_, group):
     """Split the tensor along its first dimension and keep the
-    corresponding slice."""
+    corresponding slice.
+    """
     assert group is not None, "group should not be None"
 
     world_size = group.size()

@@ -247,7 +247,8 @@ class ParamShardSpec:
     @property
     def ns_cost(self) -> int:
         """Newton-Schulz cost estimate on ``full_shape``, ~ max(M, N) * min(M, N)^2, the
-        weight NS-home balancing uses; non-2-D shapes count their elements."""
+        weight NS-home balancing uses; non-2-D shapes count their elements.
+        """
         if len(self.full_shape) != 2:
             return math.prod(self.full_shape)
         m, n = self.full_shape
@@ -539,7 +540,8 @@ class LayerShardedMuon(TensorParallelMuon):
     ) -> Iterator[tuple[int, torch.Tensor]]:
         """{meth}`_run_ns` one chunk at a time: yields ``(k, ns)`` as each chunk finishes,
         so a caller that consumes each result right away holds one chunk, not all.
-        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts."""
+        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts.
+        """
         by_shape: dict = {}
         for k, full in full_by_k.items():
             by_shape.setdefault(tuple(full.shape), []).append(k)
@@ -610,7 +612,8 @@ class LayerShardedMuon(TensorParallelMuon):
     def step(self, closure: Any = None) -> None:
         """Run one optimizer step: momentum update, shard exchange to the NS homes,
         full-matrix Newton-Schulz there, reverse exchange, weight update (see the
-        class docstring for the per-stage breakdown)."""
+        class docstring for the per-stage breakdown).
+        """
         if closure is not None:
             raise ValueError("closure is not supported")
 
@@ -757,7 +760,8 @@ class LayerShardedMuon(TensorParallelMuon):
 
             def ns_input(p):
                 """NS input of ``p``. With nesterov=False it aliases the momentum buffer
-                (``.float()`` is a no-op on fp32); everything below treats it as read-only."""
+                (``.float()`` is a no-op on fp32); everything below treats it as read-only.
+                """
                 buf = self.state[p]["momentum_buffer"]
                 return (p.grad.lerp(buf, beta) if self.nesterov else buf).float()
 

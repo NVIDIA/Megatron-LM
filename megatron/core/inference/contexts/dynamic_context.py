@@ -176,7 +176,8 @@ class BlockOverflowError(ContextOverflowError):
 
 class ActiveRequestCountOverflowError(ContextOverflowError):
     '''Used when `initialize_attention_state()` is called with
-    `num_warmup_requests > max_requests.'''
+    `num_warmup_requests > max_requests.
+    '''
 
     def __init__(self, max_request_count, active_request_count):
         assert active_request_count > max_request_count
@@ -189,7 +190,8 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
 
 class TensorStateDeallocatedError(ContextOverflowError):
     """Context's tensor state is currently deallocated, such as when the engine
-    has been suspended."""
+    has been suspended.
+    """
 
     pass
 

@@ -8,7 +8,8 @@ import torch
 
 class _ReduceScatterWithFP32AccumulationWorkHandle:
     """Work handle to return to user when using reduce_scatter_with_fp32_accumulation with
-    async_op=True."""
+    async_op=True.
+    """
 
     def __init__(
         self,

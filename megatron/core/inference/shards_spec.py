@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Parser and typed representation ({class}`InferenceShardSpec`) for the
-``--inference-shards`` shard-layout string."""
+``--inference-shards`` shard-layout string.
+"""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union
@@ -88,7 +89,8 @@ def normalize_shard_specs(
 ) -> List["InferenceShardSpec"]:
     """Coerce the public shard-spec input (a spec string, a list of
     {class}`InferenceShardSpec`, or a list of raw dicts) into the validated
-    list of {class}`InferenceShardSpec` the shard builders consume."""
+    list of {class}`InferenceShardSpec` the shard builders consume.
+    """
     if isinstance(shards, str):
         return parse_inference_shards_spec(shards, world_size)
     out: List[InferenceShardSpec] = [

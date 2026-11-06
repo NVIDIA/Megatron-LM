@@ -115,7 +115,8 @@ def copy_gtp_attributes(destination, source):
     """Copy GTP metadata onto a param view/copy (e.g. an optimizer's master or shard param):
     dedup tags for ``param_is_not_gtp_duplicate``, the checkpoint replica group, and
     ``pad_length``/``group`` for ``gtp_local_pad_zero_count``. The latter two must both be
-    present or padding exclusion silently returns 0."""
+    present or padding exclusion silently returns 0.
+    """
     for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length", "group"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
@@ -267,7 +268,8 @@ def _initialize_affine_weight_cpu(
 
     Build the master weight on all processes and scatter
     the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
-    rank's GTP rows as well, so the initialization matches a run with GTP off."""
+    rank's GTP rows as well, so the initialization matches a run with GTP off.
+    """
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -553,7 +555,8 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     Conceptually this op is the same as torch.nn.functional.linear with
     weight.requires_grad==False, but in experiments they are not identical
-    mathematically."""
+    mathematically.
+    """
 
     @staticmethod
     @custom_fwd

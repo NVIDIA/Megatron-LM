@@ -284,7 +284,8 @@ class PipelineParallelLayerLayout:
     def parse_str_to_list(layout_str: str):
         """Parse a layout string to a list of lists.
         Example: "Ettt|(tt|)*29,m|L" will be parsed to
-        [["E","t","t","t"]]+[["t","t"]]*29+[["m"],["L"]]"""
+        [["E","t","t","t"]]+[["t","t"]]*29+[["m"],["L"]]
+        """
 
         layout_str = layout_str.replace(",", "")  # remove purely cosmetic commas
 

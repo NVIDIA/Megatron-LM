@@ -56,7 +56,8 @@ except ImportError:
 
     def deregister_and_clear_gtp_symm_pools() -> None:
         """No-op stub: shutdown calls this unconditionally, and without the GTP
-        surface no pool can have been registered."""
+        surface no pool can have been registered.
+        """
 
 
 __all__ = [

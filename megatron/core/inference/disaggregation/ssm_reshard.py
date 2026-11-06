@@ -45,7 +45,8 @@ class SSMStateDims:
 class SSMShardLayout:
     """One rank's SSM-state ownership: which global layers and TP rank,
     plus the model's structural dims. Per-rank local sizes follow by dividing
-    by tp_size."""
+    by tp_size.
+    """
 
     global_rank: int
     tp_size: int
@@ -93,7 +94,8 @@ class SSMShardLayout:
 
     def shard_key(self) -> Tuple[int, int]:
         """The SSM shard this rank holds: (tp_rank, layer_start). Ranks
-        sharing a key hold identical state (e.g. EP/DP replicas)."""
+        sharing a key hold identical state (e.g. EP/DP replicas).
+        """
         return (self.tp_rank, self.layer_start)
 
     def layer_range(self) -> Tuple[int, int]:

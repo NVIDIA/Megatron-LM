@@ -427,7 +427,8 @@ def _plan_virtual_expert_routes_kernel(
 
 def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
     """Fields of the planner's int32 scratch arena as ``name -> (offset, shape)`` plus its total
-    size; mirrors the field offsets in ``_plan_virtual_expert_routes_kernel``."""
+    size; mirrors the field offsets in ``_plan_virtual_expert_routes_kernel``.
+    """
     block_ep = 1 << (ep_size - 1).bit_length()
     # Each flag word gets its own 128-byte line (the kernel's _FLAG_STRIDE).
     fields = (
@@ -455,7 +456,8 @@ class VirtualExpertPlannerWorkspace:
     ``gathered_counts`` is this rank's ``[ep_size, num_experts]`` NCCL symmetric-memory window:
     the kernel publishes the local histogram into every peer's window and reads the peers' rows
     from its own, so planning needs no collective. ``scratch`` is the int32 field arena of
-    {func}`_scratch_layout`; {meth}`field` views one field for inspection."""
+    {func}`_scratch_layout`; {meth}`field` views one field for inspection.
+    """
 
     def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
         _check_triton_version()
@@ -582,7 +584,8 @@ def _handshake(
 def _rendezvous(signal_bases, rank, peers, valid, dummy, LABEL: tl.constexpr):
     """Raise this rank's word in every peer's pad, then consume the word each peer raised in
     ours: a self-resetting release/acquire handshake over one int32 word per ordered rank pair.
-    ``peers`` holds the peer ranks, ``valid`` the live lanes."""
+    ``peers`` holds the peer ranks, ``valid`` the live lanes.
+    """
     # A release covers only the stores its thread has observed; the block barrier lets one
     # thread's release cover every warp's preceding stores.
     tl.debug_barrier()
@@ -931,7 +934,8 @@ def _barrier_scratch(device_index: int) -> torch.Tensor:
 def _source_scratch(device_index: int, entries: int) -> torch.Tensor:
     """The table the reduction compacts each expert's sources into; one per device and
     shape so its address is stable under CUDA-graph capture. Launches sharing this storage
-    must be serialized, as the bridge does on its shared gradient stream."""
+    must be serialized, as the bridge does on its shared gradient stream.
+    """
     return torch.empty(entries, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 

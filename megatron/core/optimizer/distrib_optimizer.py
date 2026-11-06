@@ -1118,7 +1118,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @property
     def optimizer_state_keys(self):
         """Return the optimizer's tensor state keys, e.g., ('exp_avg', 'exp_avg_sq') for Adam
-        or ('exp_avg',) for Lion."""
+        or ('exp_avg',) for Lion.
+        """
         _OPTIMIZER_STATE_KEYS = {"lion": ("exp_avg",)}
         optimizer_name = self.config.optimizer
         # When Muon is the top-level optimizer, the DistributedOptimizer wrapping
@@ -2490,7 +2491,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
         '''Reshard buckets (where each bucket is a tensor) to new target
-        numels, where the total numel remains the same.'''
+        numels, where the total numel remains the same.
+        '''
 
         old_total = sum([t.numel() for t in old_tensors])
         new_total = sum(new_numels)

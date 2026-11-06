@@ -225,7 +225,8 @@ class FullyParallelLoadStrategyWrapper:
         `TorchDistLoadShardedStrategy`), so that `serialization.load` keeps the quantized
         destinations in the state dict. Only the `broadcast` exchange supports it: it replicates
         the raw quantized storage of the loading rank into the receivers' destinations (see
-        `exchange_loaded_tensors_broadcast_quantized`)."""
+        `exchange_loaded_tensors_broadcast_quantized`).
+        """
         return getattr(self.base_strategy, "stream_ckpt_dequant", False)
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)

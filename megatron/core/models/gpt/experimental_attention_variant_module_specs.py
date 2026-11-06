@@ -431,7 +431,8 @@ def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
     """Parse config.moe_layer_freq to get per-layer MoE pattern (1=MoE, 0=dense).
 
     - int N: one MoE layer every N layers (e.g., N=2 -> [1,0,1,0,...])
-    - list: use directly as the pattern."""
+    - list: use directly as the pattern.
+    """
 
     if isinstance(config.moe_layer_freq, int):
         # [1,0,0,...,0,1,0,0,...,0,...]
@@ -456,7 +457,8 @@ def get_linear_attention_pattern(config: TransformerConfig) -> List[int]:
     """Parse config.linear_attention_freq to get per-layer attention pattern (1=LA, 0=SDPA).
 
     - int N: one SDPA layer every N layers (e.g., N=4 -> [1,1,1,0,1,1,1,0,...])
-    - list: use directly as the pattern."""
+    - list: use directly as the pattern.
+    """
 
     if isinstance(config.linear_attention_freq, int):
         linear_attention_pattern = [
@@ -511,7 +513,8 @@ def _get_self_attention_module_spec(
     """Get non-experimental self-attention module spec.
     For hybrid models that mix experimental and non-experimental attention architectures.
 
-    Warning: This function may be deprecated in the future."""
+    Warning: This function may be deprecated in the future.
+    """
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
