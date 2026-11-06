@@ -740,6 +740,7 @@ class MegatronFSDP(torch.nn.Module):
 
             # Reset the grad accumulate flag.
             param.grad_added_to_main_grad = False
+            param._fsdp_wgrad_written = False
 
         self._params_require_handle_grad = set()
 
@@ -1032,6 +1033,7 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad |= set(param_group.params)
                 for param in param_group.params:
                     param.grad_added_to_main_grad = False
+                    param._fsdp_wgrad_written = False
             # Queue the root post-backward hook to reduce leftover gradients after
             # the backward pass.
             if skip_backward_hook:
@@ -1555,6 +1557,7 @@ class MegatronFSDP(torch.nn.Module):
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
+                param._fsdp_wgrad_written = False
         self.param_and_grad_buffer.zero_grad()
 
     def install_optimized_model_weights(self):

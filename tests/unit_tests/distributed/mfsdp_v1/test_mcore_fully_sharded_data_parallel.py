@@ -1721,3 +1721,91 @@ class TestMegatronFsdpSynchronousGradReduce:
         wrong width here rescales every gradient in the run.
         """
         self._reduce_once(sharding_strategy)
+
+
+class TestMegatronFsdpGradAccumFusionReusedWeight:
+    """A weight used twice per backward (output layer + MTP head) under gradient-accumulation
+    fusion must get the sum of both wgrads, as it does without fusion."""
+
+    HIDDEN, OUT, SEQ = 256, 512, 64
+
+    def _sharded_grads(self, gaf, sharding_strategy, microbatches):
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+
+        hidden, out = self.HIDDEN, self.OUT
+
+        class ReusedHead(torch.nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.pre = torch.nn.Linear(hidden, hidden, bias=False)
+                self.head = ColumnParallelLinear(
+                    hidden,
+                    out,
+                    config=config,
+                    init_method=torch.nn.init.normal_,
+                    bias=False,
+                    gather_output=False,
+                )
+
+            def forward(self, x):
+                h = self.pre(x)
+                a, _ = self.head(h)
+                b, _ = self.head(torch.tanh(h) * 3.0)
+                return a.float().pow(2).sum() + 0.5 * b.float().sum()
+
+        torch.manual_seed(0)
+        model_parallel_cuda_manual_seed(0)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=gaf,
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy=sharding_strategy,
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                use_megatron_fsdp=True,
+                grad_reduce_in_fp32=True,
+            ),
+            module=ReusedHead(config).cuda().to(torch.bfloat16),
+            fsdp_unit_modules=[ColumnParallelLinear, torch.nn.Linear],
+        )
+        fsdp_model.zero_grad_buffer()
+        gen = torch.Generator(device="cuda").manual_seed(1 + torch.distributed.get_rank())
+        for mb in range(microbatches):
+            fsdp_model.is_last_microbatch = mb == microbatches - 1
+            x = torch.randn(self.SEQ, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
+            fsdp_model(x).backward()
+        fsdp_model.finish_grad_sync()
+        pgb = fsdp_model.param_and_grad_buffer
+        pgb.update_main_grads()
+        grads = {
+            name: pgb.dist_main_grad[name]._local_tensor.detach().float().clone()
+            for name, _ in pgb.optimizer_named_parameters
+        }
+        fsdp_model.stop_communication()
+        return grads
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(not HAVE_TE, reason="FSDP gradient-accumulation fusion uses TE's GEMM")
+    @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
+    @pytest.mark.parametrize("microbatches", [1, 2])
+    def test_reused_weight_wgrads_accumulate(self, sharding_strategy, microbatches):
+        Utils.initialize_model_parallel()
+        try:
+            ref = self._sharded_grads(False, sharding_strategy, microbatches)
+            got = self._sharded_grads(True, sharding_strategy, microbatches)
+            assert ref.keys() == got.keys()
+            for name in ref:
+                assert_close(got[name], ref[name], rtol=0, atol=0, msg=f"wgrad mismatch: {name}")
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
