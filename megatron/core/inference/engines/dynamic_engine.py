@@ -17,6 +17,7 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Set, Tuple, TypedDict, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -47,16 +48,19 @@ from megatron.core.inference.inference_request import (
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    RESUMED_GENERATION_FIELD,
     DynamicInferenceEvent,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    LiveRequestSnapshot,
     OffloadedRequestPayload,
     RequestPayloadStager,
     RequestPayloadStageResult,
     RequestPromptPreparer,
+    ResumedGeneration,
     Status,
     compute_media_cache_key,
     merge_multimodal_data,
@@ -90,7 +94,8 @@ from megatron.core.utils import (
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 
 # Engine-owned control field written into ``offload_params`` on MP rank 0 when the
-# RequestPromptPreparer fails, and read back by ``_apply_prompt_preparation_error``
+# RequestPromptPreparer fails, or by ``_admit_request`` for a resumed generation it
+# cannot honour, and read back by ``_add_request`` which fails the request
 # on every rank. The HTTP endpoints reject client-supplied ``offload_params`` keys
 # that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
 # this namespace cannot be forged from a request body.
@@ -2069,23 +2074,42 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
-    @staticmethod
+    def _finalize_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
+        """Record the end of a request whose status is terminal and merge its record."""
+        request = request_entry.record[-1]
+        if request.status == Status.COMPLETED:
+            request.add_event_finish()
+            self.finished_request_count += 1
+        else:
+            assert (
+                request.status == Status.FAILED
+            ), f"Request {request.request_id} ended in non-terminal status {request.status}."
+            request.add_event_fail()
+        return request_entry.record.merge()
+
     def _complete_request(
-        request_entry: RequestEntry, finished_request: Optional[DynamicInferenceRequest] = None
+        self,
+        request_entry: RequestEntry,
+        finished_request: Optional[DynamicInferenceRequest] = None,
+        *,
+        reply_now: bool = False,
     ) -> DynamicInferenceRequest:
-        """Resolve a request future, merging its record unless already finalized.
+        """Resolve a request future, finalizing its record unless already finalized.
 
         Args:
             request_entry: Engine-owned record and completion future.
-            finished_request: Result assembled before context cleanup, when available.
-
-        Returns:
-            The completed request exposed through the future.
+            finished_request: Result finalized before context cleanup, when available.
+            reply_now: Send the result to the coordinator now. Used for a request that ends outside
+                a step: one that failed before it ran a step, a resumed generation that arrived
+                finished, or a KV import already satisfied by its transferred token.
         """
         assert not request_entry.future.done(), "Request future was already resolved."
         if finished_request is None:
-            finished_request = request_entry.record.merge()
+            finished_request = self._finalize_request(request_entry)
         request_entry.future.set_result(finished_request)
+        self.context.remove_vlm_request_data(finished_request.request_id)
+        if reply_now and self.use_coordinator and self.is_mp_coordinator:
+            self._send_requests_to_coordinator([finished_request])
         return finished_request
 
     def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
@@ -2266,16 +2290,8 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         request.status = Status.FAILED
-        request.add_event_fail()
         self.failed_request_ids.append(request_id)
-        # Media registered by _build_vlm_request is never consumed for a request
-        # that fails before admission, so drop it here (a no-op for text-only).
-        self.context.remove_vlm_request_data(request_id)
-        finished_request = self._complete_request(request_entry)
-
-        # Send the reply immediately, because it may never get a chance to be sent again.
-        if self.use_coordinator and self.is_mp_coordinator:
-            self._send_requests_to_coordinator([finished_request])
+        self._complete_request(request_entry, reply_now=True)
 
     def _fail_submission(
         self, request_id: int, sampling_params: Optional[SamplingParams], exc: BaseException
@@ -2331,6 +2347,48 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_requests.append(failed_entry.future.result())
         return failed_requests
 
+    async def snapshot_live_requests(self) -> List[LiveRequestSnapshot]:
+        """Snapshot every non-failed request for later resumption; must run on the
+        engine loop whenever that loop is running (any loop may run it while the
+        engine loop is stopped, as between a suspend and a resume)."""
+        if self._loop.is_running() and asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError(
+                "snapshot_live_requests must run on the engine loop while it is running"
+            )
+        # A stop the engine has detected but has yet to complete sits on the record
+        # as its finish reason, so the record alone says whether a request ended.
+        snapshots = []
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if request.status == Status.FAILED:
+                continue
+            snapshots.append(
+                LiveRequestSnapshot.from_record(
+                    entry.record,
+                    # The blocks hold the routing of every token that ran forward; a request
+                    # still in prefill has none that is complete.
+                    routing_indices=(
+                        self._routing_from_blocks(request) if request.generated_tokens else None
+                    ),
+                )
+            )
+        return snapshots
+
+    def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
+        """A resident request's expert routing, read from its blocks as its completion reads it."""
+        routing_replay = self.context.kv_block_allocator.routing_replay
+        if not routing_replay.has_data():  # routing replay off: nothing was recorded
+            return None
+        if not hasattr(self.context, "request_ids"):
+            return None
+        index = self.context.get_index_of_request(request.request_id)
+        if index < 0:
+            return None
+        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
+        return routing_replay.reconstruct_routing_from_blocks(
+            self.context.get_committed_kv_block_ids(index), total_tokens - 1
+        )
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -2360,22 +2418,59 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > self.controller.num_mtp_depths:
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
 
+    def _resolve_generation_budget(self, request: DynamicInferenceRequest) -> bool:
+        """Resolve and clamp the generation budget; False when the request overflows the engine."""
+        params = request.sampling_params
+        remaining = self.context.max_sequence_length - len(request.prompt_tokens)
+        if params.num_tokens_total is not None:
+            params.num_tokens_to_generate = params.num_tokens_total - len(request.prompt_tokens)
+            params.num_tokens_total = None
+        elif params.num_tokens_to_generate is None:
+            params.num_tokens_to_generate = remaining
+        if params.num_tokens_to_generate < 0 or remaining < 0:
+            return False
+        if params.num_tokens_to_generate > remaining:
+            # Clamp instead of rejecting, for compatibility with other frameworks.
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request.request_id} requested "
+                    f"num_tokens_to_generate={params.num_tokens_to_generate} which exceeds the "
+                    f"maximum sequence length of the engine. Clamping num_tokens_to_generate to "
+                    f"{remaining}."
+                )
+            params.num_tokens_to_generate = remaining
+        return True
+
     def _add_request(
-        self, request: DynamicInferenceRequest, *, is_resume: bool = False
+        self,
+        request: DynamicInferenceRequest,
+        *,
+        is_resume: bool = False,
+        record: Optional[DynamicInferenceRequestRecord] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
         Args:
             request (DynamicInferenceRequest): Request to add.
-            is_resume (bool): Whether an existing record is being explicitly
-                re-admitted after suspend/resume.
+            is_resume (bool): Whether the newest segment of a record is being re-admitted,
+                as after suspend/resume, rather than a new record opened.
+            record (Optional[DynamicInferenceRequestRecord]): With `is_resume`, the record of
+                a generation resumed from another engine.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
         """
 
+        assert record is None or is_resume, "A record is registered only on resume."
         request_id = request.request_id
         if is_resume:
+            if record is not None:
+                assert (
+                    request_id not in self.requests
+                ), f"Request ID {request_id} is already active."
+                self.requests[request_id] = RequestEntry(
+                    record=record, future=self._loop.create_future()
+                )
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
         elif request_id in self.requests:
@@ -2426,15 +2521,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 "or skip_prompt_log_probs to True in SamplingParams."
             )
 
-        if request.sampling_params.num_tokens_total is not None:
-            request.sampling_params.num_tokens_to_generate = (
-                request.sampling_params.num_tokens_total - len(request.prompt_tokens)
-            )
-            request.sampling_params.num_tokens_total = None
-        if request.sampling_params.num_tokens_to_generate is None:
-            request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
-                request.prompt_tokens
-            )
+        error = (
+            request.offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+            if isinstance(request.offload_params, dict)
+            else None
+        )
+        if error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(PromptPreparationError(request_id, error))
+        if not self._resolve_generation_budget(request):
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
         if request.sampling_params.termination_id is None:
             try:
                 eod = self.controller.tokenizer.eod
@@ -2446,22 +2543,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 eod = -1
             request.sampling_params.termination_id = eod
-
-        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
-        # This is included for compatibility with other frameworks.
-        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
-        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
-            request.status = Status.FAILED
-            request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
-        elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
-            requested_tokens = request.sampling_params.num_tokens_to_generate
-            request.sampling_params.num_tokens_to_generate = remaining_tokens
-            if self.rank == 0:
-                warnings.warn(
-                    f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
-                    f"which exceeds the maximum sequence length of the engine. "
-                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
-                )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
@@ -2632,14 +2713,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             finally:
                 nvtx_range_pop(nvtx_range)
-            self._apply_prompt_preparation_error(request, offload_params)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
-            # _add_request now rejects the request (oversized prompt, cache
+            # admission now rejects the request (oversized prompt, cache
             # exhaustion, ...), those tensors would linger in the context
             # dicts and leak GPU memory. Clean them up on failure.
             try:
-                return self._add_request(request)
+                return self._admit_request(request)
             except Exception:
                 self.context.remove_vlm_request_data(request_id)
                 raise
@@ -2660,22 +2740,42 @@ class DynamicInferenceEngine(AbstractEngine):
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
-            self._apply_prompt_preparation_error(request, offload_params)
+        return self._admit_request(request)
 
-        return self._add_request(request)
+    def _admit_request(
+        self, request: DynamicInferenceRequest
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Admit a built request, resuming the generation its preparer handed back, if any."""
+        params = request.offload_params if isinstance(request.offload_params, dict) else {}
+        wire = params.pop(RESUMED_GENERATION_FIELD, None)
+        # New request path.
+        if wire is None or _PROMPT_PREPARATION_ERROR_FIELD in params:
+            return self._add_request(request)
 
-    def _apply_prompt_preparation_error(self, request, offload_params) -> None:
-        """Fail a request whose prompt preparer reported an error on MP rank zero."""
-        error = (
-            offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
-            if isinstance(offload_params, dict)
-            else None
-        )
-        if error is not None:
-            request.status = Status.FAILED
-            request.add_event_error_nontransient(
-                PromptPreparationError(request.request_id, str(error))
+        # Resumed request path.
+        try:
+            resumed = ResumedGeneration.from_wire(wire)
+            record = (
+                DynamicInferenceRequestRecord.from_resumed_generation(
+                    request, resumed, generation_epoch=self._generation_epoch
+                )
+                if resumed.token_ids or resumed.finish_reason is not None
+                else None  # nothing generated yet
             )
+        except ValueError as invalid:
+            # Refused the way rank zero refuses a prompt: _add_request fails the request.
+            params[_PROMPT_PREPARATION_ERROR_FIELD] = str(invalid)
+            return self._add_request(request)
+        if record is None:  # admitted fresh, under the banked budget
+            request.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
+            request.sampling_params.num_tokens_total = None
+            return self._add_request(request)
+
+        if resumed.finish_reason is not None:  # ended on its first engine: nothing to schedule
+            entry = RequestEntry(record=record, future=self._loop.create_future())
+            self._complete_request(entry, reply_now=True)
+            return entry.future
+        return self._add_request(record[-1], is_resume=True, record=record)
 
     def _build_vlm_request(
         self,
@@ -3202,8 +3302,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+                block_ref_counts = block_allocator.pc_state.block_ref_counts
+                blocks_hashed_active = int((block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -3442,16 +3543,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                        routing_replay = self.context.kv_block_allocator.routing_replay
+                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    request.add_event_finish()
                     # Keep handoff blocks only when the request needs them.
                     handoff_blocks = handoff_blocks_by_request.get(request_id, [])
                     if request.sampling_params.do_kv_handoff:
@@ -3590,7 +3689,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
-                finished = finished_entry.record.merge()
+                finished = self._finalize_request(finished_entry)
                 if request_id in tpot_updates:
                     start, count = tpot_updates[request_id]
                     tpot_updates[request_id] = (
@@ -3676,7 +3775,6 @@ class DynamicInferenceEngine(AbstractEngine):
             Active request IDs and completed requests.
         """
         finished_ids = finished_request_ids.tolist()
-        self.finished_request_count += len(finished_ids)
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
@@ -3743,10 +3841,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
-
-        # Finished VLM data is no longer needed after the request has been flattened.
-        for request in finished_requests:
-            self.context.remove_vlm_request_data(request.request_id)
 
         return active_request_ids, finished_requests
 
@@ -4138,6 +4232,25 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._cg_admission_check(req, candidate)
         return self._matches_cg_admission(candidate)
 
+    def _chunked_prefill_token_budget(self) -> int:
+        """Return how many more prompt tokens this step can admit.
+
+        The step capacity is `context.max_tokens`. Batch-invariant hybrid models also
+        bound the prefill tokens alone by `context.max_prefill_tokens`, which leaves
+        the rest of the capacity to this step's decode tokens.
+        """
+        context = self.context
+        token_budget = context.max_tokens - context.active_token_count
+        if context.max_prefill_tokens < context.max_tokens:
+            assert context.batch_invariant_mode, (
+                "max_prefill_tokens below max_tokens is set only for batch-invariant hybrid "
+                "chunked prefill"
+            )
+            decode_token_count = context.num_decode_requests * (context.num_speculative_tokens + 1)
+            prefill_token_count = context.active_token_count - decode_token_count
+            token_budget = min(token_budget, context.max_prefill_tokens - prefill_token_count)
+        return token_budget
+
     def _can_schedule_chunked_prefill(self, req) -> bool:
         """Return whether the queue-head request can admit at least one prompt token.
 
@@ -4151,7 +4264,7 @@ class DynamicInferenceEngine(AbstractEngine):
             req, prefill_chunk_length=1
         )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
-        token_capacity_available = self.context.active_token_count < self.context.max_tokens
+        token_capacity_available = self._chunked_prefill_token_budget() > 0
         return (
             (is_continuing_chunk or request_can_be_added)
             and kv_cache_available
@@ -4209,7 +4322,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -4404,7 +4517,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self._can_schedule_chunked_prefill(req):
                 # How many tokens we can admit this step.
-                token_budget = self.context.max_tokens - self.context.active_token_count
+                token_budget = self._chunked_prefill_token_budget()
 
                 # Prefix-cache skip: on a request's first chunk, the tokens covered
                 # by a cached prefix are reused rather than recomputed, so they do
@@ -4493,7 +4606,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
 
                 if prefill_chunk_length >= remaining_len:
@@ -4739,7 +4852,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
@@ -4974,7 +5086,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # where Mamba state is still cached).
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
-                    len(kv_alloc.kv_hash_to_block_id),
+                    len(self.context.prefix_cache_registry.kv_hash_to_block_id),
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
@@ -5676,10 +5788,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
-                        global_work_from_last_consensus == 0
+                        self.tp_ep_world_size == 1
+                        or global_work_from_last_consensus == 0
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
+                        # 0. there are no EP peers -> consensus is local and free. A cached value
+                        #    goes stale once local work drains and would trigger a dummy forward
+                        #    with no collective to join. Such a dummy forward would also need a
+                        #    request-owned recurrent-state slot (the dedicated dummy slot is only
+                        #    reserved for EP > 1), which pending handoffs may all be holding.
                         # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus

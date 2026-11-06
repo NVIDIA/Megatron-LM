@@ -545,6 +545,14 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
 
     legacy_args = deepcopy(args)
     legacy_tokenizer = build_tokenizer(legacy_args)
+    # Reproduce the legacy tokenizer-first padding update on args.
+    if legacy_args.pad_vocab_size and legacy_args.padded_vocab_size is None:
+        legacy_args.padded_vocab_size = calculate_padded_vocab_size(
+            legacy_tokenizer.vocab_size,
+            legacy_args.make_vocab_size_divisible_by,
+            legacy_args.tensor_model_parallel_size,
+            logging_enabled=False,
+        )
     legacy_model = adapter(legacy_args, config=deepcopy(transformer))
 
     model = adapter(args, config=deepcopy(transformer), vocab_size_from_tokenizer=True)
@@ -552,9 +560,8 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     global_vars.set_args(args)
     global_vars._build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)
-    if not (pad_vocab and checkpoint_vocab is None):
-        assert model.as_dict() == legacy_model.as_dict()
-        assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
+    assert model.as_dict() == legacy_model.as_dict()
+    assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
     assert global_vars.get_tokenizer().vocab_size == legacy_tokenizer.vocab_size
 
 
@@ -670,7 +677,6 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     assert model.vocab_size == expected
     cfg = SimpleNamespace(model=model, tokenizer=_default_config_from_args(TokenizerConfig, args))
     global_vars.set_args(args)
-    # breakpoint()
     global_vars._build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)
 
@@ -747,6 +753,18 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         else inference_cfg_container_from_args(args, build_model_config=False)
     )
     cfg.model = model
+    if training:
+        # Native recipe edits must win over stale or absent legacy CLI settings.
+        cfg.rerun_state_machine.rerun_mode = "report_determinism_stats"
+        cfg.rerun_state_machine.error_injection_rate = 17
+        cfg.rerun_state_machine.error_injection_type = "correct_result"
+        for name in (
+            "rerun_mode",
+            "error_injection_rate",
+            "error_injection_type",
+            "result_rejected_tracker_filename",
+        ):
+            delattr(args, name)
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
     events = []
@@ -769,6 +787,12 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
 
     monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
     expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}
+    expected_tokenizer_vocab = {
+        "tokenizer": 256,
+        "checkpoint": 512,
+        "explicit": 256,
+        "custom": None,
+    }
 
     def writer(received_args):
         assert received_args is args
@@ -778,14 +802,7 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
             assert cfg.validation.eval_micro_batch_size == 2
         if model is not None:
             assert model.vocab_size == expected_vocab[vocabulary]
-        expected_padded_vs = args.padded_vocab_size or calculate_padded_vocab_size(
-            args.vocab_size,
-            args.make_vocab_size_divisible_by,
-            args.tensor_model_parallel_size,
-            logging_enabled=False,
-        )
-        expected_padded_vs = None if vocabulary == "custom" else expected_padded_vs
-        assert cfg.tokenizer.padded_vocab_size == expected_padded_vs
+        assert cfg.tokenizer.padded_vocab_size == expected_tokenizer_vocab[vocabulary]
         events.append("writer")
 
     monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)
@@ -793,7 +810,8 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     training_services = Mock(side_effect=lambda args: events.append("training"))
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
-    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", Mock())
+    initialize_rerun = Mock()
+    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", initialize_rerun)
     monkeypatch.setattr(initialize.tuning, "install", Mock())
 
     initialize.initialize_megatron(
@@ -810,6 +828,13 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         + (["training"] if training else [])
     )
     assert training_services.call_count == int(training)
+    assert initialize_rerun.call_count == int(training)
+    if training:
+        settings = initialize_rerun.call_args.kwargs
+        assert settings["mode"].value == "report_determinism_stats"
+        assert settings["error_injector"].error_injection_rate == 17
+        assert settings["error_injector"].error_injection_type.value == "correct_result"
+        assert settings["result_rejected_tracker_filename"] is None
     assert (global_vars._GLOBAL_TOKENIZER is None) == (vocabulary == "custom")
 
 
@@ -832,17 +857,31 @@ def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_glob
     services.assert_not_called()
 
 
-def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
+@pytest.mark.parametrize("rollout_only", [False, True])
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
+    monkeypatch, isolated_globals, run_config, rollout_only
+):
     import megatron.training as training_package
+    from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
+    from megatron.rl.training_setup import RLSetupCallback
     from megatron.training import argument_utils, utils
 
-    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
+    args = Namespace(
+        reset_attention_mask=False,
+        batch_invariant_mode=False,
+        perform_rl_step=True,
+        no_load_optim=False,
+    )
     model = Mock()
     # The real RL callback derives its rollout interval from these batch values.
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
+    # The entrypoint branches on the container; the namespace carries the matching attrs
+    # anyway so the test stays green under a raw-args read as well.
+    cfg.rl.perform_rl_step = True
+    cfg.rl.rl_rollout_only = rollout_only
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
@@ -853,13 +892,24 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
     monkeypatch.setattr(training_package, "pretrain", pretrain)
+    # The entrypoint's finally owns the shutdown; the real one would os._exit the test process.
+    shutdown = Mock()
+    monkeypatch.setattr(rl_utils, "rl_inference_interface_shutdown", shutdown)
 
     runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
 
     pretrain.assert_called_once()
     assert pretrain.call_args.args[0] is cfg
-    callbacks = pretrain.call_args.kwargs["callbacks"]
-    assert [type(callback) for callback in callbacks] == [RLLoggingCallback, RLCheckpointCallback]
+    assert pretrain.call_args.args[1] is None  # RL builds no datasets
+    kwargs = pretrain.call_args.kwargs
+    assert [type(callback) for callback in kwargs["callbacks"]] == [
+        RLSetupCallback,
+        RLLoggingCallback,
+        RLCheckpointCallback,
+    ]
+    assert kwargs["run_train_loop_without_updates"] is rollout_only
+    assert kwargs["suppress_microbatch_rampup_handling"] is False
+    assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()
