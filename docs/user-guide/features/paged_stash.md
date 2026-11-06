@@ -71,6 +71,28 @@ The stash copy/pop kernels are memory-bound; with 1024/2048, wide activations (t
 elements per token) do not saturate DRAM bandwidth. For example, on VR200 with DeepSeek-V3
 (hidden size 7168), using 4096/8192 makes the stash kernels ~2.3x faster.
 
+```bash
+# Copy whole pages in contiguous chunks instead of row by row (bit-identical results)
+--moe-paged-stash-page-copy
+# Store BF16 activations as MXFP8 in the stash (lossy, halves their stash memory)
+--moe-paged-stash-mxfp8-activations
+```
+
+`--moe-paged-stash-page-copy` switches the copy/pop kernels to page-contiguous kernels: a page
+holds consecutive rows in both the activation and the stash buffer, so each program copies a
+contiguous chunk of a page (16 KiB) instead of one row per inner-loop iteration. Narrow
+activations such as columnwise scales and router probabilities no longer pay a page lookup and a
+mostly masked vector load per row. The stash contents and reloaded activations are bit-identical
+to the row kernels.
+
+`--moe-paged-stash-mxfp8-activations` stores every BF16 activation with a power-of-two row size
+as MXFP8 rows (`hidden` E4M3 bytes followed by `hidden / 32` E8M0 scales) and decodes it to BF16
+on reload. Each 32-element block uses the power-of-two scale `2^ceil(log2(amax / 448))`, so no
+finite value saturates, and values round to nearest even. With FP8 or FP4 expert GEMMs the
+largest BF16 stashed activation is the SwiGLU input (the FC1 output); MXFP8 halves its stash
+footprint and copy traffic at the cost of FP8 rounding (about 2.7% relative error) in the
+activation-function backward.
+
 ## What `moe_expert_rank_capacity_factor` and `moe_paged_stash_buffer_size_factor_cuda` mean
 
 Both are **multipliers on buffer size relative to the perfectly balanced case**—the space you would need if routed tokens were evenly distributed across expert ranks. A larger factor adds headroom for real-world **skew**.
