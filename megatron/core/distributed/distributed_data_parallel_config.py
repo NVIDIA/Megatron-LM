@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Optional, Tuple
 
@@ -345,16 +346,11 @@ class DistributedDataParallelConfig:
         Training containers first derive optimizer-owned fields. Standalone MCore
         wrappers also call this method; repeated calls preserve resolved settings.
         """
+        self._canonicalize()
         self.validate()
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
-            )
-
+    def _canonicalize(self) -> None:
+        """Resolve local defaults and aliases after recipe edits."""
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
@@ -366,10 +362,8 @@ class DistributedDataParallelConfig:
         """Check user settings without mutation, including edits after construction.
 
         Optimizer-owned buffer policy may still be stale here. Its resolved layout
-        is checked by finalize before wrapper setup.
+        is checked by the training container and at DDP wrapper construction.
         """
-        import os
-
         for name in (
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
