@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import activations, parallel_state
+from megatron.core.fusions import fused_swiglu_triton
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
     bias_dropout_add_fused_train,
@@ -43,6 +44,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 TOKENS = CONTENTION_TOKENS
 FFN = 8192
+# MoE expert width: short rows take the multi-row Triton SwiGLU kernels.
+FFN_SHORT = 768
 DTYPE = torch.bfloat16
 
 
@@ -81,6 +84,19 @@ GATED_CASES = {
         ),
         (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
     ),
+    "swiglu_no_bias_short_rows": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN_SHORT)), None)),
+    "clamped_swiglu_short_rows": lambda: (
+        lambda x: bias_swiglu_impl(x, None, clamp_value=7.0),
+        (_act((TOKENS, 2 * FFN_SHORT)),),
+    ),
+    "weighted_swiglu_short_rows": lambda: (
+        weighted_bias_swiglu_impl,
+        (_act((TOKENS, 2 * FFN_SHORT)), None, _weights(TOKENS)),
+    ),
+    "weighted_clamped_swiglu_short_rows": lambda: (
+        lambda x, b, w: weighted_bias_swiglu_impl(x, b, w, clamp_value=7.0),
+        (_act((TOKENS, 2 * FFN_SHORT)), None, _weights(TOKENS)),
+    ),
     "bias_geglu": lambda: (bias_geglu_impl, (_act((TOKENS, 2 * FFN)), _act((2 * FFN,)))),
     "geglu_no_bias": lambda: (bias_geglu_impl, (_act((TOKENS, 2 * FFN)), None)),
     "weighted_quick_geglu": lambda: (
@@ -113,6 +129,19 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.parametrize(
+    "n_cols,multi_row",
+    [(FFN_SHORT, True), (fused_swiglu_triton.MR_DISPATCH_MAX_COLS, True), (FFN, False)],
+)
+def test_triton_swiglu_dispatch_by_row_length(n_cols, multi_row):
+    """The SwiGLU cases above cover both Triton kernel layouts; short rows use the multi-row ones."""
+    fwd, bwd = fused_swiglu_triton._kernels(n_cols)
+    if multi_row:
+        assert (fwd, bwd) == (fused_swiglu_triton.swiglu_fwd_mr, fused_swiglu_triton.swiglu_bwd_mr)
+    else:
+        assert (fwd, bwd) == (fused_swiglu_triton.swiglu_fwd, fused_swiglu_triton.swiglu_bwd)
 
 
 @pytest.mark.skipif(

@@ -5,7 +5,13 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.fusions import fused_bias_swiglu
+from megatron.core.fusions.fused_bias_swiglu import (
+    SwiGLUFunction,
+    WeightedSwiGLUFunction,
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -249,3 +255,110 @@ def test_bias_swiglu_impl_clamp_none_matches_unclamped(input_dtype, with_bias):
             bias_explicit.grad.flatten().float().unsqueeze(0),
         ).item()
         assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
+
+
+# The bias-free plain, clamped and weighted paths run the Triton kernels in fused_swiglu_triton.
+# They must match the torch.compile functions they replace: within one bf16 ULP for activations
+# and input grads (the kernels round once, Inductor may fuse differently), and to FP32 reduction
+# order for the weighted d_w.
+_TRITON_TOLS = {
+    torch.bfloat16: dict(rtol=2.0**-7, atol=1.0e-5),
+    torch.float32: dict(rtol=1.0e-5, atol=1.0e-6),
+}
+_TRITON_REQUIRED = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fused_bias_swiglu.HAVE_TRITON), reason="needs CUDA + Triton"
+)
+
+
+def _clamp_inputs(tokens, ffn, dtype, clamp_value):
+    x = torch.randn(tokens, 2 * ffn, dtype=dtype, device="cuda") * 5.0
+    if clamp_value is not None:
+        # Exact boundary values exercise the clamp's gradient rule at +/-clamp_value.
+        x[:, :4] = clamp_value
+        x[:, ffn : ffn + 4] = -clamp_value
+    return x
+
+
+@_TRITON_REQUIRED
+@pytest.mark.parametrize("ffn", [96, 768, 2048], ids=("tiny", "multi_row", "one_row"))
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("clamp_value", [None, 7.0], ids=("unclamped", "clamped"))
+def test_triton_swiglu_matches_compiled(ffn, input_dtype, clamp_value):
+    tols = _TRITON_TOLS[input_dtype]
+    x = _clamp_inputs(67, ffn, input_dtype, clamp_value).requires_grad_(True)
+    grad = torch.randn(67, ffn, dtype=input_dtype, device="cuda")
+
+    y_ref = SwiGLUFunction.apply(x, False, False, clamp_value, None, None)
+    (dx_ref,) = torch.autograd.grad(y_ref, x, grad)
+    y = bias_swiglu_impl(x, None, clamp_value=clamp_value)
+    (dx,) = torch.autograd.grad(y, x, grad)
+
+    assert y.dtype == y_ref.dtype and dx.dtype == dx_ref.dtype
+    torch.testing.assert_close(y, y_ref, **tols)
+    torch.testing.assert_close(dx, dx_ref, **tols)
+
+
+@_TRITON_REQUIRED
+@pytest.mark.parametrize("ffn", [96, 768, 2048], ids=("tiny", "multi_row", "one_row"))
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("clamp_value", [None, 7.0], ids=("unclamped", "clamped"))
+def test_triton_weighted_swiglu_matches_compiled(ffn, input_dtype, clamp_value):
+    tols = _TRITON_TOLS[input_dtype]
+    x = _clamp_inputs(67, ffn, input_dtype, clamp_value).requires_grad_(True)
+    weights = torch.rand(67, 1, dtype=torch.float32, device="cuda", requires_grad=True)
+    grad = torch.randn(67, ffn, dtype=input_dtype, device="cuda")
+
+    y_ref = WeightedSwiGLUFunction.apply(x, weights, False, clamp_value, None, None)
+    dx_ref, dw_ref = torch.autograd.grad(y_ref, (x, weights), grad)
+    y = weighted_bias_swiglu_impl(x, None, weights, clamp_value=clamp_value)
+    dx, dw = torch.autograd.grad(y, (x, weights), grad)
+
+    assert y.dtype == y_ref.dtype and dx.dtype == dx_ref.dtype and dw.dtype == dw_ref.dtype
+    torch.testing.assert_close(y, y_ref, **tols)
+    torch.testing.assert_close(dx, dx_ref, **tols)
+    torch.testing.assert_close(dw, dw_ref, rtol=1.0e-4, atol=1.0e-4)
+
+
+@_TRITON_REQUIRED
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 9),
+    reason="FP8 loads need sm89+",
+)
+@pytest.mark.parametrize("weighted", [False, True], ids=("plain", "weighted"))
+def test_triton_swiglu_fp8_input_store_matches_compiled(weighted):
+    x = torch.randn(67, 2 * 768, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weights = torch.rand(67, 1, dtype=torch.float32, device="cuda", requires_grad=True)
+    grad = torch.randn(67, 768, dtype=torch.bfloat16, device="cuda")
+    if weighted:
+        y_ref = WeightedSwiGLUFunction.apply(x, weights, True, None, None, None)
+        y = weighted_bias_swiglu_impl(x, None, weights, fp8_input_store=True)
+        inputs = (x, weights)
+    else:
+        y_ref = SwiGLUFunction.apply(x, True, False, None, None, None)
+        y = bias_swiglu_impl(x, None, fp8_input_store=True)
+        inputs = (x,)
+    grads_ref = torch.autograd.grad(y_ref, inputs, grad)
+    grads = torch.autograd.grad(y, inputs, grad)
+
+    torch.testing.assert_close(y, y_ref, **_TRITON_TOLS[torch.bfloat16])
+    torch.testing.assert_close(grads[0], grads_ref[0], **_TRITON_TOLS[torch.bfloat16])
+    if weighted:
+        torch.testing.assert_close(grads[1], grads_ref[1], rtol=1.0e-4, atol=1.0e-4)
+
+
+@_TRITON_REQUIRED
+def test_triton_swiglu_3d_input_keeps_shape():
+    x = torch.randn(5, 7, 2 * 768, dtype=torch.bfloat16, device="cuda")
+    weights = torch.rand(35, 1, dtype=torch.float32, device="cuda")
+    assert bias_swiglu_impl(x, None).shape == (5, 7, 768)
+    assert weighted_bias_swiglu_impl(x, None, weights).shape == (5, 7, 768)
+
+
+def test_triton_swiglu_routing():
+    x = torch.empty(4, 8, device="cuda" if torch.cuda.is_available() else "cpu")
+    expected = fused_bias_swiglu.HAVE_TRITON and x.is_cuda
+    assert fused_bias_swiglu._use_triton_swiglu(x, None, None) == expected
+    # SiTU-GLU and CPU tensors stay on the torch.compile path.
+    assert not fused_bias_swiglu._use_triton_swiglu(x, 2.0, None)
+    assert not fused_bias_swiglu._use_triton_swiglu(x, 2.0, 3.0)
+    assert not fused_bias_swiglu._use_triton_swiglu(torch.empty(4, 8), None, None)
