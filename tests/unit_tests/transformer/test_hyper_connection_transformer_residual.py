@@ -21,6 +21,7 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
     HyperConnectionTransformerLayer,
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
+from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
@@ -309,6 +310,17 @@ def test_optional_stages_construct_and_run_the_inherited_forward(stages):
 def test_optional_stages_reject_inconsistent_specs(stages, overrides, message):
     with pytest.raises(ValueError, match=message):
         _make_layer(stages, **overrides)
+
+
+class _TwoStageBranch(_Branch, TwoStageAttentionLayer):
+    """A branch that advertises two-stage attention, as a plain SelfAttention does."""
+
+
+def test_attention_only_layers_do_not_advertise_two_stage_attention():
+    # The split entry points would bypass __call__, where mHC replay state enters.
+    layer = _make_layer("attention", self_attention=_TwoStageBranch)
+    assert TransformerLayer.supports_two_stage_attention(layer)
+    assert not layer.supports_two_stage_attention()
 
 
 @pytest.mark.parametrize(
