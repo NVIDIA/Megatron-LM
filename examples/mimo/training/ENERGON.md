@@ -45,6 +45,16 @@ path, task encoder, worker config and batch size to maintain lane alignment.
 `shuffle_buffer_size` and `max_samples_per_sequence` default to None when omitted;
 the bridge does not choose a packing strategy. `--num-workers` is native workers
 per sample-lane loader; an encoder rank owns multiple such loaders when DP differs.
+`--energon-logical-workers` optionally sets the global number of logical dataset
+partitions across language sample lanes. The physical worker count is
+`language_lanes * max(--num-workers, 1)`; the explicit logical count must be
+positive, no larger than that count, and divide it evenly. For example, with four
+language lanes and two physical workers per lane, `--energon-logical-workers 2`
+keeps eight worker processes while assigning the dataset to two logical streams.
+If omitted, the option is not passed to Energon and its native one logical
+partition per physical worker behavior remains in effect. Encoder replicas
+receive the same global logical count as language lanes; replica count does not
+multiply it.
 
 Normal pretrain tokenizer initialization is used. Applications may use the
 existing tokenizer choices; prepared token IDs can use `NullTokenizer` with
@@ -110,6 +120,15 @@ dependency version and application identity. Change `checkpoint_identity` when
 application semantics hidden in callbacks change, and keep dataset artifacts
 immutable. Cross-version, edited-recipe and changed-DP migrations are separate
 capabilities; no consumed-samples fast-forward is substituted for saved state.
+When `--energon-logical-workers` is explicitly selected, its value is also part
+of the checkpoint contract, so changing it rejects strict restore. The default
+omitted setting retains the existing contract shape. Constructor support is
+checked only when the option is selected; dependencies without native
+`WorkerConfig.logical_workers` support continue to serve default mode.
+Exact replay with physical fan-out also requires native stride checkpoints to
+preserve their pending discarded outputs. Constructor support alone does not
+qualify that behavior; use a compatible checkpoint-safe dependency before
+resuming a fanned-out stream.
 
 The iterator owns all lane loaders and closes them on failure and training exit.
 The existing dependency predates a public loader close API, so cleanup has a

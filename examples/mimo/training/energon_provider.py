@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
@@ -64,6 +65,14 @@ def add_energon_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         "Pass the root, not an iteration directory or a .pt file.",
     )
     group.add_argument(
+        "--energon-logical-workers",
+        type=int,
+        default=None,
+        help="Global number of logical dataset partitions across language sample lanes. "
+        "--num-workers remains the number of physical processes per sample lane; "
+        "when omitted, Energon uses one logical partition per physical worker.",
+    )
+    group.add_argument(
         "--dataloader-save",
         metavar="ROOT",
         help="Dataloader checkpoint output root; defaults to --save. "
@@ -90,6 +99,9 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
         raise ValueError("Energon MIMO GTP rematerialization is not supported yet")
     if args.micro_batch_size < 1 or type(args.num_workers) is not int or args.num_workers < 0:
         raise ValueError("Energon requires positive micro-batch size and nonnegative workers")
+    _validate_logical_workers(
+        getattr(args, "energon_logical_workers", None), args.mimo_llm_dp, args.num_workers
+    )
     if args.eval_iters != 0:
         raise ValueError("initial Energon MIMO support is train-only; use --eval-iters 0")
     if args.mimo_encoder_prefetch or args.mimo_encoder_ddp_overlap:
@@ -103,6 +115,31 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
                 "native zero-worker RNG state is shared across lane replicas"
             )
     args.dataloader_save = args.dataloader_save or args.save
+
+
+def _validate_logical_workers(
+    logical_workers: int | None, language_lanes: int, num_workers: int
+) -> None:
+    """Validate the global partition count against the actual physical sample lanes."""
+    if type(language_lanes) is not int or language_lanes <= 0:
+        raise ValueError("language_lanes must be a positive integer")
+    if type(num_workers) is not int or num_workers < 0:
+        raise ValueError("Energon requires nonnegative physical workers per sample lane")
+    if logical_workers is None:
+        return
+    if type(logical_workers) is not int:
+        raise ValueError("--energon-logical-workers must be a positive integer")
+    physical_workers = language_lanes * max(num_workers, 1)
+    if logical_workers <= 0 or logical_workers > physical_workers:
+        raise ValueError(
+            "--energon-logical-workers must be positive and no greater than the global "
+            f"physical worker count ({physical_workers})"
+        )
+    if physical_workers % logical_workers:
+        raise ValueError(
+            "global physical worker count "
+            f"({physical_workers}) must be divisible by --energon-logical-workers"
+        )
 
 
 def _close_loader(loader: SavableDataLoader) -> None:
@@ -218,8 +255,19 @@ def build_energon_iterator(
     ordered language-lane replicas through the application's encoder merger.
     ``checkpoint_paths`` maps lane IDs to canonical .pt files, not directories.
     """
+    logical_workers = getattr(args, "energon_logical_workers", None)
+    _validate_logical_workers(logical_workers, language_lanes, args.num_workers)
     from megatron.energon import WorkerConfig, __version__, get_savable_loader, get_train_dataset
     from megatron.energon.errors import reraise_exception
+
+    if (
+        logical_workers is not None
+        and "logical_workers" not in inspect.signature(WorkerConfig).parameters
+    ):
+        raise RuntimeError(
+            "--energon-logical-workers requires an Energon WorkerConfig that supports "
+            "the logical_workers constructor parameter"
+        )
 
     if (
         not lane_ids
@@ -252,7 +300,7 @@ def build_energon_iterator(
     loaders, contracts = [], []
     with ExitStack() as cleanup:
         for lane in lane_ids:
-            workers = WorkerConfig(
+            worker_options = dict(
                 rank=lane,
                 world_size=language_lanes,
                 num_workers=args.num_workers,
@@ -261,6 +309,9 @@ def build_energon_iterator(
                 global_error_handler=reraise_exception,
                 restore_error_handler=reraise_exception,
             )
+            if logical_workers is not None:
+                worker_options["logical_workers"] = logical_workers
+            workers = WorkerConfig(**worker_options)
             dataset = get_train_dataset(
                 args.data_path[0],
                 worker_config=workers,
@@ -283,6 +334,8 @@ def build_energon_iterator(
                 "micro_batch_size": args.micro_batch_size,
                 "seed": args.seed,
             }
+            if logical_workers is not None:
+                contract["logical_workers"] = logical_workers
             contracts.append(contract)
             if checkpoint_paths is not None:
                 path = checkpoint_paths[lane]

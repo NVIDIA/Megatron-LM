@@ -3,6 +3,7 @@
 """CPU data-path checks using native Energon, independent of model/GPU initialization."""
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -23,7 +24,7 @@ from examples.mimo.training.energon_provider import (
     build_energon_iterator,
     validate_energon_data_args,
 )
-from megatron.energon import Cooker, DefaultTaskEncoder, basic_sample_keys, stateless
+from megatron.energon import Cooker, DefaultTaskEncoder, WorkerConfig, basic_sample_keys, stateless
 from megatron.energon.flavors import CrudeJsonlDatasetFactory
 
 
@@ -314,10 +315,27 @@ def _resume_in_fresh_process(args, paths, output):
             language.close()
 
 
+@pytest.mark.parametrize(
+    "logical_workers",
+    [
+        None,
+        pytest.param(
+            1,
+            marks=pytest.mark.skipif(
+                "logical_workers" not in inspect.signature(WorkerConfig).parameters,
+                reason="installed Energon lacks native logical-worker support",
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("workers", [1, 2])
-def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers):
+def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers, logical_workers):
     args = _args(
-        _jsonl(tmp_path / "data.jsonl"), "randomized_config", mimo_llm_dp=2, num_workers=workers
+        _jsonl(tmp_path / "data.jsonl"),
+        "randomized_config",
+        mimo_llm_dp=2,
+        num_workers=workers,
+        energon_logical_workers=logical_workers,
     )
     languages = [_build(args, (lane,)) for lane in range(2)]
     encoder = _build(args, (0, 1), "sound_encoder")
@@ -329,7 +347,12 @@ def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers)
                 next(encoder)["input_ids"], torch.cat([b["input_ids"] for b in batches])
             )
         for lane, language in enumerate(languages):
-            torch.save({"dataloader_state_dict": language.save_state()}, paths[lane])
+            state = language.save_state()
+            if logical_workers is None:
+                assert "logical_workers" not in state["contract"]
+            else:
+                assert state["contract"]["logical_workers"] == logical_workers
+            torch.save({"dataloader_state_dict": state}, paths[lane])
         expected = {
             "encoder": [next(encoder) for _ in range(4)],
             "languages": [[next(language) for _ in range(4)] for language in languages],
@@ -338,6 +361,10 @@ def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers)
         encoder.close()
         for language in languages:
             language.close()
+    if logical_workers is not None:
+        changed = argparse.Namespace(**{**vars(args), "energon_logical_workers": 2})
+        with pytest.raises(ValueError, match="incompatible"):
+            _build(changed, checkpoint_paths={0: paths[0]})
     request, output = tmp_path / "request.pt", tmp_path / "continued.pt"
     torch.save((args, paths), request)
     code = (
@@ -559,7 +586,9 @@ def test_native_state_rejects_changed_application_and_seed(tmp_path):
     path = tmp_path / "state.pt"
     try:
         next(iterator)
-        torch.save({"dataloader_state_dict": iterator.save_state()}, path)
+        state = iterator.save_state()
+        assert "logical_workers" not in state["contract"]
+        torch.save({"dataloader_state_dict": state}, path)
     finally:
         iterator.close()
     for changed in (
@@ -599,13 +628,23 @@ def test_empty_modality_batches_keep_all_input_rows(tmp_path):
         encoder.close()
 
 
-def test_merger_failure_closes_all_workers_and_cannot_retry(tmp_path):
+def test_merger_failure_closes_all_workers_and_cannot_retry(tmp_path, monkeypatch):
+    from examples.mimo.training import energon_provider
+
     args = _args(_jsonl(tmp_path / "data.jsonl"), "failing_config", mimo_llm_dp=2)
     encoder = _build(args, (0, 1), "sound_encoder")
-    loaders = list(encoder._loaders)
+    processes = []
+    original_close = energon_provider._close_loader
+
+    def close_and_record(loader):
+        if loader._iterator is not None:
+            processes.extend(loader._iterator._workers)
+        original_close(loader)
+
+    monkeypatch.setattr(energon_provider, "_close_loader", close_and_record)
     with pytest.raises(RuntimeError, match="merger failed"):
         next(encoder)
-    assert all(not worker.is_alive() for loader in loaders for worker in loader._iterator._workers)
+    assert processes and all(not worker.is_alive() for worker in processes)
     with pytest.raises(StopIteration):
         next(encoder)
 
@@ -655,9 +694,138 @@ def test_unsupported_settings_fail_before_workers(override):
         validate_energon_data_args(_args("unused.jsonl", **override))
 
 
+@pytest.mark.parametrize(
+    "workers,lanes,logical,valid",
+    [
+        (1, 3, 1, True),
+        (1, 3, 3, True),
+        (0, 3, 3, True),
+        (2, 3, 2, True),
+        (1, 3, 0, False),
+        (1, 3, -1, False),
+        (1, 3, 4, False),
+        (1, 3, 2, False),
+        (2, 3, 4, False),
+        (1, 3, True, False),
+        (1, 3, 1.5, False),
+    ],
+)
+def test_logical_worker_argument_validation(workers, lanes, logical, valid):
+    args = _args(
+        "unused.jsonl",
+        num_workers=workers,
+        mimo_llm_dp=lanes,
+        mimo_encoder_dp=lanes,
+        energon_logical_workers=logical,
+    )
+    if valid:
+        validate_energon_data_args(args)
+    else:
+        with pytest.raises(ValueError, match="logical-workers"):
+            validate_energon_data_args(args)
+
+
+def test_builder_uses_actual_language_lanes_for_logical_worker_bounds(monkeypatch):
+    from examples.mimo.training import energon_provider
+
+    args = _args("unused.jsonl", mimo_llm_dp=4, num_workers=0, energon_logical_workers=4)
+    with patch.object(
+        energon_provider.importlib,
+        "import_module",
+        side_effect=AssertionError("application factory must not be imported"),
+    ):
+        with pytest.raises(ValueError, match=r"physical worker count \(3\)"):
+            build_energon_iterator(args, lane_ids=(0,), language_lanes=3, module_name=None)
+
+
+@pytest.mark.skipif(
+    "logical_workers" not in inspect.signature(WorkerConfig).parameters,
+    reason="installed Energon lacks native logical-worker support",
+)
+def test_native_logical_workers_preserve_physical_lane_count_and_alignment(tmp_path, monkeypatch):
+    import megatron.energon
+    from megatron.energon import WorkerConfig
+
+    args = _args(
+        _jsonl(tmp_path / "data.jsonl"), mimo_llm_dp=2, num_workers=2, energon_logical_workers=1
+    )
+    original_init = WorkerConfig.__init__
+    configurations = []
+
+    def record_config(self, *, rank, world_size, num_workers, logical_workers=None, **kwargs):
+        configurations.append(
+            {
+                "rank": rank,
+                "world_size": world_size,
+                "num_workers": num_workers,
+                "logical_workers": logical_workers,
+            }
+        )
+        original_init(
+            self,
+            rank=rank,
+            world_size=world_size,
+            num_workers=num_workers,
+            logical_workers=logical_workers,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(megatron.energon.WorkerConfig, "__init__", record_config)
+    languages = [_build(args, (lane,)) for lane in range(2)]
+    encoder = _build(args, (0, 1), "sound_encoder")
+    observed_tokens = set()
+    try:
+        for _ in range(24):
+            batches = [next(language) for language in languages]
+            merged = next(encoder)
+            assert torch.equal(merged["input_ids"], torch.cat([b["input_ids"] for b in batches]))
+            observed_tokens.update(
+                token for batch in batches for token in batch["input_ids"][:, 0].tolist()
+            )
+        assert len(configurations) == 4
+        assert all(config["num_workers"] == 2 for config in configurations)
+        assert all(config["logical_workers"] == 1 for config in configurations)
+        assert [config["rank"] for config in configurations] == [0, 1, 0, 1]
+        assert all(config["world_size"] == 2 for config in configurations)
+        assert all(
+            loader.worker_config.num_workers == 2
+            for iterator in [*languages, encoder]
+            for loader in iterator._loaders
+        )
+        assert observed_tokens == set(range(100, 196))
+    finally:
+        encoder.close()
+        for language in languages:
+            language.close()
+
+
 def test_mock_args_are_untouched_and_help_explains_application_and_roots():
     args = argparse.Namespace(dataset_provider="mock")
     validate_energon_data_args(args)
     assert vars(args) == {"dataset_provider": "mock"}
     help_text = add_energon_data_args(argparse.ArgumentParser()).format_help()
     assert "MODULE:FUNCTION" in help_text and "not an iteration directory" in help_text
+    parser = add_energon_data_args(argparse.ArgumentParser())
+    assert parser.parse_args([]).energon_logical_workers is None
+    assert "Global number of logical dataset partitions" in help_text
+    assert "physical processes per sample lane" in help_text
+
+
+def test_explicit_logical_workers_require_native_constructor_capability(monkeypatch):
+    import megatron.energon
+    from examples.mimo.training import energon_provider
+
+    args = _args("unused.jsonl", mimo_llm_dp=1, energon_logical_workers=1)
+
+    class ReleasedWorkerConfig:
+        def __init__(self, *, rank, world_size, num_workers):
+            pass
+
+    monkeypatch.setattr(megatron.energon, "WorkerConfig", ReleasedWorkerConfig)
+    with patch.object(
+        energon_provider.importlib,
+        "import_module",
+        side_effect=AssertionError("application factory must not be imported"),
+    ):
+        with pytest.raises(RuntimeError, match="logical_workers constructor parameter"):
+            _build(args)
