@@ -55,7 +55,7 @@ def prefer_tape(num_sequences: int, heads: int, device: torch.device) -> bool:
 
 
 # Chunks per work item of the persistent tape-fed kernel.
-TAPE_RUN = 4
+TAPE_RUN = 2
 
 
 def tape_flags(num_chunks: int, heads: int, device: torch.device) -> torch.Tensor:
