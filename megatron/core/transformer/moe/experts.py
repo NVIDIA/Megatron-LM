@@ -1957,8 +1957,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 def _warn_sequential_mlp_deprecated() -> None:
     """Emit the migration warning once, even when a model has many MoE layers."""
     warn_single_rank(
-        "SequentialMLP is deprecated as of Megatron Core 0.21 and will be removed no earlier "
-        "than 0.23. Use TEGroupedMLP with transformer_impl='transformer_engine' and "
+        "SequentialMLP is deprecated. Use TEGroupedMLP with transformer_impl='transformer_engine' and "
         "moe_grouped_gemm=True (the default). The local backend still uses SequentialMLP; "
         "switch to the Transformer Engine backend to migrate.",
         FutureWarning,
@@ -1971,9 +1970,7 @@ class SequentialMLP(MegatronModule):
 
     This class executes each expert sequentially.
 
-    Deprecated in Megatron Core 0.21; removal will be no earlier than 0.23.
-    Use TEGroupedMLP on the Transformer Engine backend instead. This implementation
-    remains available during the migration period for local and per-expert workflows.
+    Deprecated. Use TEGroupedMLP on the Transformer Engine backend instead.
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
