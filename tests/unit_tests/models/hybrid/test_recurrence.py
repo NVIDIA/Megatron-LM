@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import random
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from megatron.core.models.hybrid.recurrence import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -156,40 +158,85 @@ def test_invalid_loop_override(count):
         list(recurrent_layer_indices(2, ((0, 2),), count))
 
 
-def test_sampling_replays_checkpointed_rng_and_eval_does_not_sample():
-    policy = LoopDistribution.from_string("1:0.5,4:0.5")
-    group = Mock()
-    group.size.return_value = 1
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(13)
-        state = torch.get_rng_state()
-        first = [policy.sample(True, torch.device("cpu"), group) for _ in range(32)]
-        torch.set_rng_state(state)
-        assert first == [policy.sample(True, torch.device("cpu"), group) for _ in range(32)]
-        assert set(first) == {1, 4}
-        state = torch.get_rng_state()
-        assert policy.sample(False, torch.device("cpu"), group) == 4
-        assert torch.equal(state, torch.get_rng_state())
-        assert LoopDistribution.from_string("2:1").sample(True, torch.device("cpu"), None) == 2
-        assert torch.equal(state, torch.get_rng_state())
-    with pytest.raises(ValueError, match="tp_dp_cp"):
-        policy.sample(True, torch.device("cpu"), None)
+def test_sampling_is_stateless_and_does_not_communicate(monkeypatch):
+    policy = LoopDistribution.from_string("1:0.5,3:0.5")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Loop sampling must not use global RNG draws, reseeding, or collectives")
+
+    monkeypatch.setattr(torch, "rand", forbidden)
+    monkeypatch.setattr(random, "random", forbidden)
+    monkeypatch.setattr(random, "seed", forbidden)
+    for name in ("broadcast", "all_reduce", "all_gather"):
+        monkeypatch.setattr(torch.distributed, name, forbidden)
+    python_state = random.getstate()
+    try:
+        with torch.random.fork_rng(devices=[]):
+            state = torch.get_rng_state()
+            first = [policy.sample(True, step=step) for step in range(64)]
+            assert torch.equal(state, torch.get_rng_state())
+            assert python_state == random.getstate()
+            # Pin the mapping so future changes cannot silently change restart behavior.
+            assert first[:8] == [3, 1, 3, 1, 1, 3, 3, 1]
+            for rank_seed in (13, 29):
+                torch.manual_seed(rank_seed)
+                random.setstate(random.Random(rank_seed).getstate())
+                rank_python_state = random.getstate()
+                rank_torch_state = torch.get_rng_state()
+                restored_policy = LoopDistribution.from_string("1:0.5,3:0.5")
+                assert first == [restored_policy.sample(True, step=step) for step in range(64)]
+                assert rank_python_state == random.getstate()
+                assert torch.equal(rank_torch_state, torch.get_rng_state())
+            assert policy.sample(False) == 3
+            assert LoopDistribution.from_string("2:1").sample(True) == 2
+    finally:
+        random.setstate(python_state)
 
 
-def test_sampling_uses_explicit_group_and_source(monkeypatch):
-    group = Mock()
-    group.size.return_value = 2
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda pg: "gloo")
-    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda pg, rank: 17)
-    broadcasts = []
+@pytest.mark.parametrize("step", [None, -1, True, 1.5, "1"])
+def test_stochastic_sampling_requires_a_logical_step(step):
+    with pytest.raises(
+        ValueError, match="^Stochastic hybrid recurrence requires a non-negative integer step$"
+    ):
+        LoopDistribution.from_string("1:.5,4:.5").sample(True, step=step)
 
-    def broadcast(tensor, src, group):
-        broadcasts.append((src, group, tensor.device.type))
-        tensor.fill_(4)
 
-    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
-    assert LoopDistribution.from_string("1:.5,4:.5").sample(True, torch.device("cpu"), group) == 4
-    assert broadcasts == [(17, group, "cpu")]
+def test_step_sampling_respects_distribution():
+    policy = LoopDistribution.from_string("1:.25,2:.25,4:.25,8:.25")
+    frequencies = {count: 0 for count in policy.counts}
+    for step in range(4096):
+        frequencies[policy.sample(True, step=step)] += 1
+    for count in policy.counts:
+        assert frequencies[count] / 4096 == pytest.approx(0.25, abs=0.03)
+
+
+@pytest.mark.parametrize("pattern", ["-*--", "-:*-:-", "-:*:-*:-"])
+def test_pretrain_supplies_minibatch_step_to_all_microbatches(monkeypatch, pattern):
+    import pretrain_hybrid
+
+    train_state = TrainState(iteration=11)
+    model = Mock(pg_collection=object(), vp_stage=None)
+    monkeypatch.setattr(
+        pretrain_hybrid, "get_args", lambda: SimpleNamespace(hybrid_layer_pattern=pattern)
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_train_state", lambda: train_state)
+    monkeypatch.setattr(pretrain_hybrid, "get_timers", lambda: Mock())
+    batch = SimpleNamespace(get_batch=lambda: {}, get_packed_seq_params=lambda: None)
+    monkeypatch.setattr(pretrain_hybrid, "get_batch", lambda *args, **kwargs: batch)
+    monkeypatch.setattr(
+        "megatron.training.distillation.logits_saver.get_logits_saver", lambda: None
+    )
+    stimer = MagicMock()
+    stimer.return_value = stimer
+    monkeypatch.setattr(pretrain_hybrid, "stimer", stimer)
+    pretrain_hybrid.forward_step(None, model)
+    pretrain_hybrid.forward_step(None, model)
+    train_state.iteration += 1
+    pretrain_hybrid.forward_step(None, model)
+    if ":" in pattern:
+        assert [call.kwargs["recurrence_step"] for call in model.call_args_list] == [11, 11, 12]
+    else:
+        assert all("recurrence_step" not in call.kwargs for call in model.call_args_list)
 
 
 @pytest.mark.parametrize(
@@ -345,6 +392,84 @@ def test_distributed_checkpoint_policy_restart(model_factory, tmp_path_dist_ckpt
     assert recurrent.decoder.loop_distribution.counts == (2,)
 
 
+@pytest.mark.parametrize("pattern", ["-:*-:-", "-:*:-*:-"])
+def test_non_recurrent_checkpoint_resumes_optimizer_and_loop_training(
+    model_factory, tmp_path, pattern
+):
+    baseline = model_factory(pattern=pattern.replace(":", ""), distribution=None)
+    optimizer = torch.optim.AdamW(baseline.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    train_state = TrainState()
+    tokens, positions = _inputs()
+
+    def update(model, opt, lr_scheduler, **kwargs):
+        opt.zero_grad(set_to_none=True)
+        loss = model(tokens, positions, None, **kwargs).square().mean()
+        loss.backward()
+        assert torch.isfinite(loss)
+        for parameter in model.parameters():
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+        opt.step()
+        lr_scheduler.step()
+
+    update(baseline, optimizer, scheduler)
+    train_state.iteration += 1
+    train_state.consumed_train_samples = 1
+    path = tmp_path / f"non_recurrent_rank_{Utils.rank}.pt"
+    torch.save(
+        {
+            "model": baseline.state_dict(),
+            "hybrid_layer_pattern": baseline.hybrid_layer_pattern,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "train_state": train_state.state_dict(),
+        },
+        path,
+    )
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    assert ":" not in loaded["hybrid_layer_pattern"]
+    recurrent = model_factory(pattern=pattern, distribution="2:.5,4:.5")
+    recurrent.load_state_dict(loaded["model"], strict=True)
+    resumed_optimizer = torch.optim.AdamW(recurrent.parameters(), lr=1e-3)
+    resumed_scheduler = torch.optim.lr_scheduler.StepLR(resumed_optimizer, step_size=1, gamma=0.9)
+    resumed_optimizer.load_state_dict(loaded["optimizer"])
+    resumed_scheduler.load_state_dict(loaded["scheduler"])
+    resumed_state = TrainState()
+    resumed_state.load_state_dict(loaded["train_state"])
+    assert resumed_state.iteration == train_state.iteration
+    assert resumed_state.consumed_train_samples == train_state.consumed_train_samples
+    assert resumed_scheduler.state_dict() == scheduler.state_dict()
+    for parameter, restored in zip(baseline.parameters(), recurrent.parameters(), strict=True):
+        for name, value in optimizer.state[parameter].items():
+            torch.testing.assert_close(value, resumed_optimizer.state[restored][name])
+
+    # One-loop continuation must reproduce both the output and the next optimizer update.
+    with torch.no_grad():
+        torch.testing.assert_close(
+            recurrent(tokens, positions, None, n_loops=1), baseline(tokens, positions, None)
+        )
+    update(baseline, optimizer, scheduler)
+    update(recurrent, resumed_optimizer, resumed_scheduler, n_loops=1)
+    resumed_state.iteration += 1
+    for parameter, restored in zip(baseline.parameters(), recurrent.parameters(), strict=True):
+        torch.testing.assert_close(parameter, restored)
+    assert resumed_scheduler.get_last_lr() == scheduler.get_last_lr()
+
+    # The restored optimizer can then train the same weights at a greater recurrent depth.
+    calls = []
+    handle = recurrent.decoder.layers[1].register_forward_hook(lambda *args: calls.append(1))
+    previous_weight = recurrent.output_layer.weight.detach().clone()
+    try:
+        update(
+            recurrent, resumed_optimizer, resumed_scheduler, recurrence_step=resumed_state.iteration
+        )
+        assert calls == [1, 1, 1, 1]
+        assert not torch.equal(previous_weight, recurrent.output_layer.weight)
+    finally:
+        handle.remove()
+
+
 @pytest.mark.parametrize("grad_fusion", [False, True])
 @pytest.mark.parametrize("pattern", ["-:*-:-", "-:*:-*:-"])
 def test_ddp_accumulates_shared_weight_gradients(model_factory, grad_fusion, pattern):
@@ -412,10 +537,8 @@ def test_override_and_eval_execution_order(model_factory, pattern, execution_ord
     "pattern,execution_order",
     [("-:*-:-", [0, 1, 2, 1, 2, 1, 2, 3]), ("-:*:-*:-", [0, 1, 1, 1, 2, 3, 2, 3, 2, 3, 4])],
 )
-def test_training_resamples_once_per_forward(model_factory, monkeypatch, pattern, execution_order):
+def test_training_keeps_one_count_per_minibatch(model_factory, pattern, execution_order):
     model = model_factory(pattern=pattern, distribution="1:.5,3:.5")
-    draws = iter([torch.tensor(0.1), torch.tensor(0.9)])
-    monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: next(draws))
     calls = []
     handles = [
         layer.register_forward_hook(lambda module, inputs, output, i=i: calls.append(i))
@@ -423,11 +546,17 @@ def test_training_resamples_once_per_forward(model_factory, monkeypatch, pattern
     ]
     tokens, positions = _inputs()
     try:
-        model(tokens, positions, None)
-        assert calls == list(range(len(model.decoder.layers)))
+        # Step 0 uses three loops; step 1 uses one. Returning to step 0 tests retry/replay.
+        for step in (0, 1, 0):
+            for _ in range(3):
+                calls.clear()
+                model(tokens, positions, None, recurrence_step=step)
+                expected = list(range(len(model.decoder.layers))) if step == 1 else execution_order
+                assert calls == expected
         calls.clear()
-        model(tokens, positions, None)
-        assert calls == execution_order
+        with pytest.raises(ValueError, match="non-negative integer step"):
+            model(tokens, positions, None)
+        assert calls == []
     finally:
         for handle in handles:
             handle.remove()

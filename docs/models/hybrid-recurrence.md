@@ -23,7 +23,7 @@ either outer section may be empty. For example, `:*-:` repeats the entire decode
 while `G-:G-:G-*G-:G-` repeats two differently sized regions. Empty interior sections,
 such as `G-:G-::G-`, are invalid.
 
-All regions use the same sampled loop count `k` for a forward pass. They execute
+All regions use the same sampled loop count `k` for a training minibatch. They execute
 in order: `prefix`, `body1` repeated `k` times, `body2` repeated `k` times, then
 `suffix`. This is not a loop over the concatenation of the bodies. Each body has
 its own parameters, shared across that body's iterations, not with other bodies.
@@ -37,15 +37,37 @@ and sum to one (within an absolute tolerance of `1e-6`). A fixed count uses a
 single pair, e.g., `4:1.0`. Omitting the distribution runs one loop. A distribution
 without loop boundaries is an error.
 
-Each training forward samples one count for the whole microbatch and applies it
-to every recurrent region. The count is broadcast across the explicit
-`pg_collection.tp_dp_cp` process group so all tensor, data, and expert parallel
-ranks execute the same depth. Stochastic recurrence
-requires that group to be supplied; the standard model initialization supplies it.
-Fixed counts do not require a sampling group. Sampling uses the ordinary PyTorch
-CPU random-number generator, which Megatron saves with its training RNG state.
-Restoring that state restores the sampling sequence; changing the distribution
-changes how subsequent draws map to counts.
+The loop count is selected with Python's standard-library RNG:
+`random.Random(step).choices(counts, weights=probabilities, k=1)[0]`. Each call
+creates a local RNG seeded with the logical training minibatch step. Every rank,
+every gradient-accumulation microbatch in that step, and every recurrent region
+uses the same count. Sampling performs no communication or device synchronization
+and does not read, advance, or reseed the global Python or PyTorch RNGs. Microbatch
+IDs and local forward counters do not affect sampling.
+
+The step alone determines the draw; no separate seed or persistent sampler state
+is needed. Restarting or retrying a step with the same policy reproduces its count.
+Changing the distribution changes how that step's draw maps to a count.
+
+`pretrain_hybrid.py` supplies the checkpointed `TrainState.iteration` automatically.
+Direct Core callers must pass a non-negative integer `recurrence_step` when training
+with a stochastic distribution, unless they explicitly override `n_loops`. Keep the
+step constant across all microbatches making up one minibatch, and advance it only
+when advancing to the next training step. Fixed distributions and evaluation need
+no step. For example:
+
+```python
+for input_ids, position_ids, attention_mask, labels in minibatch:
+    loss = model(
+        input_ids, position_ids, attention_mask,
+        labels=labels, recurrence_step=step,
+    )
+    loss.mean().backward()
+```
+
+Use the same step and distribution on all participating ranks. Supplying an explicit
+step rather than deriving it from forward-call order also permits future pipeline
+stages to reproduce the same count without communicating the sampled value.
 
 Evaluation (`model.eval()`) uses the largest count in the distribution without
 sampling. For full-sequence evaluation at a particular depth, use the forward
@@ -58,7 +80,8 @@ with torch.no_grad():
 ```
 
 The override applies to every region for this forward only and does not modify
-the training policy. Use the same override on every participating rank.
+the training policy. Use the same override on every participating rank and throughout
+a training minibatch's accumulation microbatches.
 
 ## State and gradients
 
@@ -94,8 +117,10 @@ Specify the desired distribution on **every restart**, including when using
 and is deliberately not restored by the legacy checkpoint-argument loader. For
 example, start with `--n-loops-distribution '1:1.0'`, then resume the same architecture
 with `--n-loops-distribution '1:0.5,4:0.5'`. Without an explicit policy the default
-remains one loop. Retain normal optimizer, scheduler, and RNG loading when continuing
-training rather than using a weights-only finetune.
+remains one loop. Retain normal optimizer, scheduler, training-step, and RNG loading
+when continuing training rather than using a weights-only finetune. Restoring the
+training step is sufficient to reproduce loop sampling; normal RNG restoration
+remains necessary for dropout and other stochastic model operations.
 
 ## Initial scope
 
@@ -130,8 +155,11 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node 1 -m pytest
   tests/unit_tests/ssm/test_hybrid_layer_allocation.py
 ```
 
-Tests cover parsing, distribution validation, RNG replay and synchronization,
-CLI-to-builder propagation, unchanged checkpoint structure, one-loop equivalence,
-and single-/multi-region forward and gradient equivalence to explicit unrolling.
-Multi-region tests also verify that all bodies use the same sampled count and
-that each body completes its loops before the next body starts.
+Tests cover parsing, distribution validation, stateless step replay without changing
+global RNG state or using collectives, and CLI-to-builder and training-step propagation. They verify ordinary
+and distributed checkpoints saved without recurrence boundaries load into models
+with boundaries. The ordinary checkpoint test also restores AdamW optimizer state,
+the LR scheduler, and training progress, reproduces a one-loop optimizer update, and
+then trains at greater depth. Single-/multi-region tests compare forward results and
+gradients with explicit unrolling and verify one shared count across accumulation
+microbatches and regions, with each body finishing its loops before the next starts.
