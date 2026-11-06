@@ -23,6 +23,8 @@ unconverted and render as garbled text in the generated API docs. Ruff's pydocst
   NumPy-style `name : type` fields instead of `name (type): description`. `sphinx.ext.napoleon`
   only recognizes section content that is indented below the header, so flush-left entries render
   as plain prose.
+- More than one trailing empty line before the closing quotes (a single blank line before the
+  closing quotes is the codebase convention and is accepted).
 
 This script flags these. Run it as part of `tools/autoformat.sh` or standalone:
 
@@ -154,6 +156,22 @@ def check_docstring(filename: Path, name: str, lineno: int, docstring: str) -> l
     """Return a list of style violations for one docstring."""
     issues = []
     lines = docstring.splitlines()
+
+    # More than one trailing empty line: a single blank line before the closing quotes is the
+    # prevailing convention in this codebase; multiple blank lines are accidental.
+    trailing_empty = 0
+    for line in reversed(lines):
+        if line.strip() == "":
+            trailing_empty += 1
+        else:
+            break
+    if trailing_empty > 1:
+        issues.append(
+            f"{filename}:{lineno + len(lines) - trailing_empty}: docstring ends with "
+            f"{trailing_empty} empty lines (docstring '{name}'); keep at most one blank line "
+            "before the closing quotes"
+        )
+
     in_code_fence = False
     pending_directive_close = False
     section = None  # (name, header indent)
