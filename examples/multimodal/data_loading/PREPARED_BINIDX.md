@@ -162,3 +162,78 @@ Construction validates the layout and index endpoints with bounded reads.
 Requested index pairs and run rows are checked on access. Expansion validates
 the expected original token count before allocating the boolean list. This is
 not a checksum or an eager scan of every row.
+
+## Encode prepared documents for causal prediction
+
+`PreparedDocumentTaskEncoder` uses the cooker above and produces unbatched
+`EncodedPreparedDocument` samples. It retains source IDs, expands typed images
+into visual positions, and shifts target eligibility once. It does not tokenize,
+append BOS/EOS, truncate, split, pad or pack documents. Existing conversation
+encoders and training defaults are unchanged.
+
+Construct it with an existing image strategy configured for the selected model:
+
+```python
+from examples.multimodal.data_loading.prepared_task_encoder import PreparedDocumentTaskEncoder
+
+encoder = PreparedDocumentTaskEncoder(
+    image_strategy=visual_only_strategy,
+    image_token_id=image_token_id,
+    eos_token_id=eos_token_id,
+    vocab_size=vocab_size,
+    image_token_budget=4096,
+)
+```
+
+The five inputs are explicit: the strategy supplies image geometry, the two IDs
+are distinct vocabulary IDs, `vocab_size` bounds every prepared text ID, and
+`image_token_budget` is a positive **per-image visual-position limit**. The
+strategy's returned count is also checked against this limit. It does not bound
+document length or share a budget among images. The optional `ignore_index`
+defaults to `-100` and must be outside the vocabulary.
+
+Use `encoder` as `task_encoder` in the previous native loader example with
+`batch_size=None` and `packing_buffer_size=None`. Set the worker's
+`global_error_handler` to `megatron.energon.errors.reraise_exception` to surface
+invalid documents immediately. Keep an explicit cache pool. This encoder uses
+`BinIdxTokenMaskDecoder`; register the auxiliary mask protocol above only when
+the recipe selects a mask companion. Text-only recipes work with the same
+encoder, without invoking the image strategy.
+
+The image strategy must count **visual embeddings only**, matching the model's
+patch size and any pooling/pixel shuffle. For example, an existing RADIO strategy
+with 16-pixel patches and 2-by-2 pixel shuffle counts
+`(width // 16) * (height // 16) // 4` on its aligned, resized dimensions. This
+formula is specific to that configuration. Do not reuse a count that also adds
+row separators, image break/end IDs or other serialization overhead. Structural
+IDs already in the prepared text remain ordinary text targets with their source
+eligibility; this encoder never inserts them. The structural `image_token_id`
+itself is reserved for typed images and must not appear in text parts.
+
+The output contains CPU int64 `input_ids` and `labels`, float32 `loss_mask`,
+half-open `image_spans`, and corresponding lazy `image_params`. Source/restore
+identity is preserved. Geometry planning uses metadata; pixels remain unread
+until a consumer materializes a plan. Each span contains exactly the plan's
+visual embedding count.
+
+Target ownership belongs to the **next token**, including at image boundaries:
+
+```text
+input_ids:  [A, IMG, IMG, B, EOS]
+labels:     [-100, -100, B, EOS, -100]
+loss_mask:  [0, 0, 1, 1, 0]
+```
+
+Visual targets are excluded, while the final visual position predicts `B`.
+With a source end marker between the image and `B`, the end-marker position
+predicts `B` instead. Whether the marker itself is supervised follows its source
+flag. An excluded text token stays in context and can still predict the next
+eligible token; targets never jump over excluded positions. The final position
+has no lookahead and is ignored. Missing terminal EOS, malformed IDs/masks/plans,
+over-budget plans and completely targetless documents raise errors.
+
+This is a document-encoding component, not a complete training application.
+Consumers must preserve image spans when splitting sequences, assemble fixed
+batches, materialize image plans and provide the model's positions, attention
+policy and modality metadata. Do not shift these labels again. Distributed MTP,
+image-aware packing and model integration require their own qualification.
