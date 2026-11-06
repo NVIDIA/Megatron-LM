@@ -942,8 +942,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
-        "GEMM path and mxfp8_quantize_only are not replayed.",
+        "softmax_scale MultiLatentAttention hands to its core attention. NoPE layers "
+        "(no_rope_freq) build no rotary embedding and bypass every RoPE kernel; such a layer's "
+        "forward/backward is replayed in test_te_wrappers.py with the RoPE entry points stubbed "
+        "out. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
@@ -1175,6 +1177,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "one key more than once, so the sum order follows kernel scheduling. The accumulation runs "
         "in FP32 regardless of the parameter dtype, which "
         "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
+    ),
+    KernelEntry(
+        name="mla_attention_output_gate_fusion",
+        sources=("megatron/core/fusions/fused_attention_output_gate.py",),
+        tests=(K + "test_attention_output_gate_fusion.py",),
+        kind="triton",
+        notes="Elementwise MLA output gate (core_attn_out * sigmoid(gate.float()) cast to the "
+        "activation dtype before the multiply): the forward and backward Triton kernels are "
+        "replayed bit-exactly for BF16 / FP16 / FP32 under serial and contended streams, and "
+        "compared bitwise with the eager composition; the full eager-parity grid lives in "
+        "tests/unit_tests/fusions/test_fused_attention_output_gate.py.",
     ),
 )
 
