@@ -9,7 +9,6 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from einops import rearrange
@@ -38,6 +37,7 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
 
 
 @dataclass
@@ -45,7 +45,6 @@ class ImageTaskSample(Sample):
     __key__: str
     __restore_key__: Tuple[Union[str, int, tuple], ...]
     __subflavor__: Dict
-    __subflavors__: Dict
     # (c, h, w)
     imgs: List[torch.Tensor]
     num_tiles: List[int]
@@ -67,7 +66,6 @@ class ImageTaskSamplePacked(Sample):
     __key__: str  # Sample name
     __restore_key__: Tuple[Union[str, int, tuple], ...]
     __subflavor__: Dict  # Sample metadata. Deprecated.
-    __subflavors__: Dict  # Sample metadata.
     tokens: torch.Tensor  # Input tokens packed into a single tensor (seq_len,)
     labels: torch.Tensor  # Target tokens packed into a single tensor (seq_len,)
     imgs: List[torch.Tensor]  # Input images
@@ -95,7 +93,6 @@ class ImageTaskBatchPacked(Batch):
     __key__: List[str]  # Sample names
     __restore_key__: Tuple[Union[str, int, tuple], ...]
     __subflavor__: Dict  # Sample metadata. Deprecated.
-    __subflavors__: List[Dict]  # Sample metadatas.
     tokens: torch.Tensor  # Input tokens packed and padded (N, seq_len)
     labels: torch.Tensor  # Target tokens packed and padded (N, seq_len)
     imgs: torch.Tensor  # All image tiles stacked into a single tensor (num_tiles, C, H, W)
@@ -111,6 +108,7 @@ class ImageTaskBatchPacked(Batch):
     vision_max_lengths: List[int]
     vision_cu_lengths: List[List[int]]
     has_pad_img: bool
+
 
 # Based on https://github.com/hiyouga/LLaMA-Factory/blob/641d0dab08d96a93c34657742213d8994d9ed476/src/llamafactory/data/processors/processor_utils.py#L19
 # Copyright (c) 2024 LLaMA-Factory. Apache license 2.0.
@@ -1201,7 +1199,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
     def encode_batch(self, batch: ImageTaskBatchPacked) -> dict:
         raw = dataclasses.asdict(batch)
-        del raw["__subflavors__"]
+        raw.pop("__subflavors__", None)
+        raw.pop("__tags__", None)
         return raw
 
     def select_samples_to_pack(self, samples: List[ImageTaskSample]) -> List[List[ImageTaskSample]]:
