@@ -26,6 +26,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -228,7 +229,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
     # Experts additionally need grad_scale=1 / ep_size; see fully_shard.
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for decoder_layer in model.decoder.layers:
             if isinstance(decoder_layer, MoETransformerLayer):
                 fully_shard(

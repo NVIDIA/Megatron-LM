@@ -115,6 +115,21 @@ def _restore_torch_settings(settings):
     ) = settings["matmul"]
 
 
+def test_restore_torch_settings_with_frozen_backend_flags():
+    original = _snapshot_torch_settings()
+    with torch.backends.__allow_nonbracketed_mutation():
+        try:
+            torch.backends.cudnn.deterministic = not original["cudnn"][0]
+            torch.backends.cudnn.benchmark = not original["cudnn"][1]
+            torch.backends.cudnn.allow_tf32 = not original["cudnn"][2]
+            torch.backends.disable_global_flags()
+            _restore_torch_settings(original)
+            assert _snapshot_torch_settings() == original
+            assert torch.backends.flags_frozen()
+        finally:
+            _restore_torch_settings(original)
+
+
 def snapshot_process_state():
     """Capture process-global settings a test may change; restoring puts back the values."""
     state = {
