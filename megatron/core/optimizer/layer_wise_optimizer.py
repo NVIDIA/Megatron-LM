@@ -438,6 +438,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            # The shard is the fullest bin, so one outsized param forces every shard to
+            # its size however well the rest pack. Log the largest to tell those apart.
+            sizes = sorted((p.data.nelement() for p in chunk_params if p is not None), reverse=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
+                f"real={sum(sizes)}, largest={sizes[:3]}",
+            )
             bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
