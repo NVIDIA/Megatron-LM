@@ -11,7 +11,6 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
-from megatron.core.transformer.hyper_connection import build_mhc_recompute_layer_plan
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
@@ -411,9 +410,8 @@ class TestCheckpointManagerPartialCheckpoint:
 #
 # These tests instantiate a full ``TransformerBlock`` with mHC enabled to
 # exercise:
-#   * shared residual context planning and block-end manager finalization,
-#     including the ``mhc_recompute_layer_num`` boundary case,
-#   * legacy ``build_mhc_recompute_layer_plan`` compatibility for Hybrid callers,
+#   * the replay contexts the real block passes to its real layers, including
+#     the ``mhc_recompute_layer_num`` boundary case,
 #   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
 #     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
 #     stages.
@@ -467,26 +465,35 @@ class TestTransformerBlockMHCRecompute:
         return TransformerBlock(config, spec, pre_process=True, post_process=True).cuda(), config
 
     def _check_recompute_plan(self, block, expected_block_ends):
-        """Build the mHC recompute plan directly and check the boundary list."""
-        block.train()
-        managers, ends = build_mhc_recompute_layer_plan(
-            num_layers=len(block.layers),
-            mhc_recompute_layer_num=block.config.mhc_recompute_layer_num,
-            use_mhc_recompute=True,
+        """Run the real block and check the replay context each real layer receives."""
+        from megatron.core.transformer.hyper_connection_transformer_layer import (
+            HyperConnectionTransformerLayer,
         )
-        assert len(managers) == len(block.layers)
-        assert ends == expected_block_ends, f"got {ends}, expected {expected_block_ends}"
-        # Layers in the same recompute block share a manager; new block → new manager.
-        last_was_end = True
-        last_mgr = None
-        for mgr, end in zip(managers, ends):
-            assert mgr is not None
-            if last_was_end:
-                assert mgr is not last_mgr, "new recompute block should get a new manager"
-            else:
-                assert mgr is last_mgr, "layers within a recompute block share a manager"
-            last_was_end = end
-            last_mgr = mgr
+
+        contexts = []
+        layer_call = HyperConnectionTransformerLayer.__call__
+
+        def record_context(layer, *args, **kwargs):
+            # Pass-through spy: each real layer still runs with the real context.
+            contexts.append(kwargs.get("residual_stream_recompute_context"))
+            return layer_call(layer, *args, **kwargs)
+
+        block.train()
+        seq_len, batch_size = 8, 2
+        hidden_states = torch.randn(
+            seq_len, batch_size, block.config.hidden_size, device="cuda", requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device="cuda")
+        with patch.object(HyperConnectionTransformerLayer, "__call__", record_context):
+            output = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.sum().backward()
+
+        assert [context.is_block_end for context in contexts] == expected_block_ends
+        # Layers in one replay block share a manager; each new block gets a new one.
+        for previous, current in zip(contexts, contexts[1:]):
+            assert (current.manager is previous.manager) == (not previous.is_block_end)
+        assert all(context.manager.checkpoints for context in contexts)
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
 
     def test_recompute_plan_no_layer_num(self):
         """Without ``mhc_recompute_layer_num`` only the final layer ends a recompute block."""
@@ -497,17 +504,6 @@ class TestTransformerBlockMHCRecompute:
         """With ``mhc_recompute_layer_num=2`` every other layer ends a recompute block."""
         block, _ = self._make_mhc_block(num_layers=4, mhc_recompute_layer_num=2)
         self._check_recompute_plan(block, expected_block_ends=[False, True, False, True])
-
-    def test_recompute_plan_disabled(self):
-        """``use_mhc_recompute=False`` returns an all-None / all-False plan."""
-        block, _ = self._make_mhc_block(num_layers=3)
-        managers, ends = build_mhc_recompute_layer_plan(
-            num_layers=len(block.layers),
-            mhc_recompute_layer_num=block.config.mhc_recompute_layer_num,
-            use_mhc_recompute=False,
-        )
-        assert managers == [None, None, None]
-        assert ends == [False, False, False]
 
     def test_recompute_enablement_initialized(self):
         """TransformerBlock records static mHC recompute enablement during initialization."""

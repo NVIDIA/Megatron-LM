@@ -729,6 +729,77 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         for name, parameter in layer.named_parameters():
             torch.testing.assert_close(replay_gradients[name], parameter.grad, rtol=1e-5, atol=1e-6)
 
+    def _real_layer_inputs(self, config, seq_len=8, batch_size=2):
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda').triu(
+            diagonal=1
+        )
+        return hidden_states, attention_mask
+
+    def test_deprecated_manager_keyword_runs_real_replay(self):
+        """The deprecated keyword still drives real mHC replay, with a warning."""
+        layer, config = self._create_layer_with_hyper_connection()
+        layer.train()
+        hidden_states, attention_mask = self._real_layer_inputs(config)
+        manager = CheckpointWithoutOutputManager()
+        manager.is_last_layer_in_recompute_block = True
+
+        with pytest.warns(DeprecationWarning, match="mhc_recompute_manager"):
+            output, _ = layer(
+                hidden_states, attention_mask=attention_mask, mhc_recompute_manager=manager
+            )
+        assert manager.checkpoints, "The deprecated keyword must still register replay work"
+        assert layer._mhc_recompute_context is None
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+        # Nonuniform weights expose changes that a uniform sum of residual streams can hide.
+        weights = torch.linspace(0.25, 1.25, output.numel(), device=output.device).reshape_as(
+            output
+        )
+        (output.square() * weights).sum().backward()
+
+        eager_input = hidden_states.detach().clone().requires_grad_(True)
+        eager_output, _ = layer(eager_input, attention_mask=attention_mask)
+        (eager_output.square() * weights).sum().backward()
+        torch.testing.assert_close(output, eager_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(hidden_states.grad, eager_input.grad, rtol=1e-5, atol=1e-6)
+
+    def test_direct_module_call_after_public_call_sees_no_context(self):
+        """A call that bypasses __call__, as deferred local graph capture does, runs eagerly."""
+        layer, config = self._create_layer_with_hyper_connection()
+        layer.train()
+        hidden_states, attention_mask = self._real_layer_inputs(config)
+        manager = CheckpointWithoutOutputManager()
+        output, _ = layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            residual_stream_recompute_context=ResidualStreamRecomputeContext(
+                manager, is_block_end=True
+            ),
+        )
+        registered = len(manager.checkpoints)
+        assert registered, "The public call must register replay work"
+
+        # _CudaGraphRunner's default func, used by deferred local capture, is this call. It
+        # bypasses the mHC entry point.
+        direct_input = hidden_states.detach().clone().requires_grad_(True)
+        direct_output, _ = super(MegatronModule, layer).__call__(
+            direct_input, attention_mask=attention_mask
+        )
+        assert len(manager.checkpoints) == registered, "Bypassing calls must not replay"
+        torch.testing.assert_close(direct_output, output, rtol=1e-5, atol=1e-6)
+        direct_output.sum().backward()
+        assert direct_input.grad is not None and torch.isfinite(direct_input.grad).all()
+
+    def test_attention_only_layer_does_not_advertise_two_stage_attention(self):
+        """Real attention supports two-stage execution, but the mHC layer must not offer it."""
+        layer, _ = self._create_layer_with_hyper_connection(stages="attention")
+        assert layer.self_attention.supports_two_stage_attention()
+        assert TransformerLayer.supports_two_stage_attention(layer)
+        assert not layer.supports_two_stage_attention()
+
     def test_intermediate_layer_with_recompute(self):
         """
         Test TransformerLayer as an intermediate layer (not last in block).
@@ -1437,6 +1508,9 @@ class TestMHCWithCudaGraph:
         )
 
         assert output.shape == (seq_len, batch_size, n_channels)
+        # The local recording pass runs inside the call, so replay work reaches the manager.
+        assert mgr.checkpoints, "mHC replay must stay active on the local CUDA-graph path"
+        assert layer._mhc_recompute_context is None
 
     def test_mcore_cudagraph_manager_without_residual_stream_recompute_context(self):
         """MCore CudaGraphManager path works without a residual replay context."""
