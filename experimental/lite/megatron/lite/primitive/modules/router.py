@@ -67,10 +67,12 @@ class _RouterGate(nn.Linear):
     def __init__(self, hidden_size: int, num_experts: int):
         super().__init__(hidden_size, num_experts, bias=False)
 
-    def forward(self, x: torch.Tensor, router_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, router_dtype: torch.dtype | None = None, use_te_gemm: bool = True
+    ) -> torch.Tensor:
         if router_dtype is None:
             return super().forward(x)
-        return router_gating_linear(x, self.weight, None, router_dtype)
+        return router_gating_linear(x, self.weight, None, router_dtype, use_te_gemm=use_te_gemm)
 
 
 class TopKRouter(nn.Module):
@@ -194,6 +196,8 @@ class SigmoidTopKRouter(nn.Module):
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
         expert_bias_persistent: bool = False,
+        router_te_gemm: bool = True,
+        gate_weight_fp32: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -216,6 +220,10 @@ class SigmoidTopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.router_te_gemm = router_te_gemm
+        # Keep the gate weight (and so its gradient and optimizer master) in fp32
+        # across model-wide dtype casts, as checkpoints store it.
+        self.gate_weight_fp32 = gate_weight_fp32
         self.router_replay: RouterReplay | None = None
 
         self.gate = _RouterGate(config.hidden_size, config.n_routed_experts)
@@ -230,10 +238,12 @@ class SigmoidTopKRouter(nn.Module):
     def _apply(self, fn):
         super()._apply(fn)
         self.expert_bias.data = self.expert_bias.data.float()
+        if self.gate_weight_fp32:
+            self.gate.weight.data = self.gate.weight.data.float()
         return self
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x, self.router_dtype)
+        logits = self.gate(x, self.router_dtype, self.router_te_gemm)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         routing_kwargs = {}
