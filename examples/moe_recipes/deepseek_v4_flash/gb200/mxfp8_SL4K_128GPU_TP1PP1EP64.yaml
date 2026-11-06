@@ -140,24 +140,19 @@ ARGS:
   no_create_attention_mask_in_dataloader: true
   manual_gc: true
   manual_gc_interval: 10
-  lr: 3.9e-06
-  min_lr: 3.9e-07
-  lr_warmup_init: 3.9e-07
+  lr: 0.00027
+  min_lr: 2.7e-05
+  lr_warmup_init: 2.7e-05
   lr_decay_style: cosine
   weight_decay: 0.1
   clip_grad: 1.0
-  adam_beta1: 0.9
-  adam_beta2: 0.95
   bf16: true
   fp8_recipe: mxfp8
   fp8_format: e4m3
   fp8_param_gather: true
   reuse_grad_buf_for_mxfp8_param_ag: true
-  use_precision_aware_optimizer: true
   main_grads_dtype: fp32
   main_params_dtype: fp32
-  exp_avg_dtype: bf16
-  exp_avg_sq_dtype: bf16
   moe_router_padding_for_quantization: true
   init_method_std: 0.02
   eval_iters: 0
@@ -193,4 +188,8 @@ ARGS:
   num_workers: 0
   num_dataset_builder_threads: 1
   cuda_graph_warmup_steps: 3
-  optimizer: adam
+  optimizer: muon
+  muon_momentum: 0.95
+  muon_coefficient_type: deepseekv4
+  muon_num_ns_steps: 10
+  no_use_layer_wise_param_layout: true

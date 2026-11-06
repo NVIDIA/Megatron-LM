@@ -36,7 +36,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>128</td>
       <td>1/1/64/1/1</td>
       <td>1/2048/4096</td>
-      <td>BSHD; MoK; MXFP8 indexer and batched projection; full CG; Adam</td>
+      <td>BSHD; MoK; MXFP8 indexer and batched projection; full CG; Muon</td>
       <td>Pending refreshed measurement</td>
     </tr>
     <tr>
@@ -197,8 +197,8 @@ The GB200 BSHD 4K and THD 64K recipes use HybridModel and include pinned build
 instructions for TE BatchedLinear, cuDNN Frontend and Mixture-of-Kittens. Run
 from the repository root so the shared-expert precision configuration resolves.
 MoK uses MXFP8 routed experts and BF16 shared experts; it replaces the native
-TE fused-expert/paged-stash path. The 4K recipe retains Adam and full-iteration
-CUDA graphs. The 64K recipe uses compact Muon and an attention-only graph split
+TE fused-expert/paged-stash path. Both recipes use compact Muon. The 4K recipe uses full-iteration
+CUDA graphs; the 64K recipe uses an attention-only graph split
 that leaves mHC aggregation and recompute outside the captured region.
 
 TE's grouped output projection stores a 3D parameter. Its explicit Muon matrix
