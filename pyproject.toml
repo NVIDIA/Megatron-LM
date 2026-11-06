@@ -131,8 +131,8 @@ inference = [
 ]
 
 nvshmem = [
-    "nvshmem4py-cu13; sys_platform == 'linux'",
-    "cupy-cuda13x; sys_platform == 'linux'",
+    "nvshmem4py-cu13>=0.4.1; sys_platform == 'linux'",
+    "cupy-cuda13x>=14.2.0; sys_platform == 'linux'",
 ]
 
 otel = [
