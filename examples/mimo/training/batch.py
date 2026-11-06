@@ -52,6 +52,10 @@ def move_batch_to_cuda(value):
     indices in ``PackedSeqParams`` still move to CUDA with pixels and token IDs.
     Callers must supply ``imgs_sizes`` on CPU.
     """
+    # Native ViT requires CPU imgs_sizes (PR #7363); Python grid reads would
+    # otherwise synchronize CUDA to the host, and the encoder rejects them.
+    # Pixels and packed-attention cu_seqlens belong on CUDA. Preserve that
+    # wrong-device error rather than silently repairing input with .cpu().
     return map_batch_tensors(
         value, lambda tensor: tensor.cuda(non_blocking=True), preserve_keys={"imgs_sizes"}
     )
