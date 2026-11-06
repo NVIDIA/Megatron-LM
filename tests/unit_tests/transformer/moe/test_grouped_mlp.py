@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import warnings
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -205,6 +206,81 @@ def test_paged_stash_keeps_supported_gtp_grouped_tensor(monkeypatch):
 
     assert module._use_grouped_tensor is True
     assert all(linear.use_grouped_tensor is True for linear in grouped_linears)
+
+
+def _mock_cublaslt_grouped_gemm_runtime(monkeypatch, *, capability, cublaslt_version):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformer_engine_torch",
+        SimpleNamespace(get_cublasLt_version=lambda: cublaslt_version),
+    )
+    monkeypatch.delenv("MCORE_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM", raising=False)
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (11, 0)], ids=["sm100", "sm103", "sm110"])
+@pytest.mark.parametrize("cublaslt_version", [130700, 130705, 130800], ids=str)
+def test_buggy_cublaslt_grouped_gemm_is_rejected(monkeypatch, capability, cublaslt_version):
+    _mock_cublaslt_grouped_gemm_runtime(
+        monkeypatch, capability=capability, cublaslt_version=cublaslt_version
+    )
+
+    with pytest.raises(RuntimeError, match="MCORE_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM=1"):
+        experts_module._check_cublaslt_grouped_gemm_version()
+
+
+@pytest.mark.parametrize(
+    "capability,cublaslt_version",
+    [
+        pytest.param((10, 0), 130604, id="sm100-before-bug"),
+        pytest.param((10, 0), 130801, id="sm100-fixed"),
+        pytest.param((10, 0), 130900, id="sm100-newer"),
+        pytest.param((9, 0), 130700, id="sm90-buggy-version"),
+        pytest.param((12, 0), 130700, id="sm120-buggy-version"),
+    ],
+)
+def test_unaffected_cublaslt_grouped_gemm_is_allowed(monkeypatch, capability, cublaslt_version):
+    _mock_cublaslt_grouped_gemm_runtime(
+        monkeypatch, capability=capability, cublaslt_version=cublaslt_version
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        experts_module._check_cublaslt_grouped_gemm_version()
+
+
+def test_buggy_cublaslt_grouped_gemm_escape_hatch_warns(monkeypatch):
+    _mock_cublaslt_grouped_gemm_runtime(monkeypatch, capability=(10, 0), cublaslt_version=130700)
+    monkeypatch.setenv("MCORE_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM", "1")
+
+    with pytest.warns(UserWarning, match=r"cuBLASLt 13\.7\.0 grouped GEMM"):
+        experts_module._check_cublaslt_grouped_gemm_version()
+
+
+def test_grouped_mlp_rejects_buggy_cublaslt_with_grouped_tensor(monkeypatch):
+    _mock_cublaslt_grouped_gemm_runtime(monkeypatch, capability=(10, 0), cublaslt_version=130700)
+
+    with pytest.raises(RuntimeError, match=r"cuBLASLt 13\.7\.0 grouped GEMM"):
+        _construct_grouped_mlp_with_gtp_weights(
+            monkeypatch,
+            moe_paged_stash=False,
+            te_supports_sharded_weights=True,
+            native_fp8_gather=False,
+        )
+
+
+def test_grouped_mlp_split_quantize_fallback_skips_cublaslt_check(monkeypatch):
+    _mock_cublaslt_grouped_gemm_runtime(monkeypatch, capability=(10, 0), cublaslt_version=130700)
+
+    module, _ = _construct_grouped_mlp_with_gtp_weights(
+        monkeypatch,
+        moe_paged_stash=False,
+        te_supports_sharded_weights=False,
+        native_fp8_gather=False,
+    )
+
+    assert module._use_grouped_tensor is False
 
 
 @pytest.mark.parametrize(
