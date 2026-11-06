@@ -92,6 +92,7 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          MAX_PRS_PER_USER_PER_BRANCH = 2
           CICD_WORKFLOW_NAME = "CICD Megatron-LM"
           FUNCTIONAL_TEST_LABEL = "Run functional tests"
           RUN_TESTS_LABEL = "Run tests"
@@ -124,6 +125,18 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
+          MAX_RATE_LIMIT_WAIT = 60
+
+          def get_rate_limit_wait(response):
+              """Return seconds until a GitHub rate limit clears, or None if this is not a rate-limit error."""
+              if response.status_code not in (403, 429):
+                  return None
+              if "Retry-After" in response.headers:
+                  return int(response.headers["Retry-After"])
+              if response.headers.get("X-RateLimit-Remaining") == "0":
+                  return max(int(response.headers.get("X-RateLimit-Reset", 0)) - int(time.time()), 0) + 1
+              return None
+
           def make_request(endpoint, method="GET", data=None, max_retries=5, return_response=False):
               """Make a request to the GitHub API with retry on transient errors."""
               url = f"{API_BASE}/{endpoint}"
@@ -133,10 +146,16 @@ jobs:
                           response = requests.get(url, headers=headers, timeout=30)
                       else:
                           response = requests.post(url, headers=headers, json=data, timeout=30)
-                      if response.status_code == 429:
-                          retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
-                          print(f"Rate limited on {endpoint}, retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})")
-                          time.sleep(retry_after)
+                      wait = get_rate_limit_wait(response)
+                      if wait is None and response.status_code == 429:
+                          wait = 2 ** attempt
+                      if wait is not None:
+                          if wait > MAX_RATE_LIMIT_WAIT:
+                              # The next scheduled run picks up where this one stopped, so don't fail the workflow.
+                              print(f"::warning::GitHub API rate limit hit on {endpoint}; resets in {wait}s, skipping this run")
+                              exit(0)
+                          print(f"Rate limited on {endpoint}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                          time.sleep(wait)
                           continue
                       if response.status_code >= 500:
                           delay = 2 ** attempt
@@ -183,6 +202,8 @@ jobs:
                   role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
               )
 
+          pr_cache = {}
+
           def get_pr_base_branch(workflow_run):
               """
               Return the base branch of the PR associated with a workflow run, or None.
@@ -197,14 +218,24 @@ jobs:
 
               pr_number = int(match.group(1))
 
-              # Fetch PR info from GitHub API
-              pr_info = make_request(f"pulls/{pr_number}")
-              if not pr_info:
-                  print(f"Failed to fetch PR #{pr_number}")
-                  return None, None
+              # Fetch PR info from GitHub API, once per PR
+              pr_info = pr_cache.get(pr_number)
+              if pr_info is None:
+                  pr_info = make_request(f"pulls/{pr_number}")
+                  if not pr_info:
+                      print(f"Failed to fetch PR #{pr_number}")
+                      return None, None
+                  pr_cache[pr_number] = pr_info
 
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
+
+          def get_pr_queue_key(workflow_run):
+              """Identify the PR and its author/base-branch concurrency bucket."""
+              base_branch, pr_info = get_pr_base_branch(workflow_run)
+              if not base_branch or not pr_info or not pr_info.get("user", {}).get("login"):
+                  raise RuntimeError(f"Failed to inspect PR ownership for run {workflow_run['id']}")
+              return (pr_info["user"]["login"].lower(), base_branch), pr_info["number"]
 
           def get_pr_labels(workflow_run):
               """Return the labels for the PR associated with a workflow run."""
@@ -284,6 +315,12 @@ jobs:
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
                                           if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
+          # Count distinct active PRs per author and actual base branch, not matrix bucket.
+          active_prs_by_user_branch = {}
+          for workflow in queued_workflow_runs + in_progress_workflow_runs:
+              user_branch, pr_number = get_pr_queue_key(workflow)
+              active_prs_by_user_branch.setdefault(user_branch, set()).add(pr_number)
+
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
           in_progress_workflows = len(in_progress_workflow_runs)
@@ -343,6 +380,15 @@ jobs:
                   )
                   continue
 
+              user_branch, pr_number = get_pr_queue_key(workflow)
+              active_prs = active_prs_by_user_branch.setdefault(user_branch, set())
+              if pr_number not in active_prs and len(active_prs) >= MAX_PRS_PER_USER_PER_BRANCH:
+                  print(
+                      f"Skipping workflow {workflow_name} with Run Id: {workflow_id}; "
+                      f"{user_branch[0]} already has {len(active_prs)} active PRs targeting {user_branch[1]}"
+                  )
+                  continue
+
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
@@ -362,6 +408,7 @@ jobs:
               result = make_request(deployment_url, method="POST", data=status_data)
 
               if result:
+                  active_prs.add(pr_number)
                   total_workflows += 1
                   if runs_functional_tests:
                       functional_test_workflow_running = True
