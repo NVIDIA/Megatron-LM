@@ -1240,11 +1240,8 @@ class _ParamAndGradBuffer:
         elif self.ddp_config.use_distributed_optimizer and any(
             getattr(p, 'needs_nccl_mem', False) for p in self.params
         ):
-            # Params opted into symmetric-pool backing so the caller can window-register this
-            # buffer on other comm groups; it registers and warms them itself, so this branch
-            # only allocates. Distopt-gated: without it there is no param_data to back.
-            # Always symmetric: --disable-symmetric-registration is rejected in combination
-            # with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub at argument validation.
+            # Params opted into symmetric-pool backing; they register the pool on their own
+            # groups (register_ub_pool below), so this branch only allocates.
             pool = vmm_symm_allocator.create_symm_mem_pool()
             self.nccl_mem_pool = pool
             mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, pool)
@@ -1320,6 +1317,13 @@ class _ParamAndGradBuffer:
                     if self.ddp_config.use_distributed_optimizer:
                         allocate_param_buffer()
                     allocate_grad_buffer()
+
+        # Hand the pool backing param_data to the params that asked for it; they register it.
+        if self.ddp_config.use_distributed_optimizer:
+            param_pool = self.param_nccl_mem_pool or self.nccl_mem_pool
+            for param in self.params:
+                if getattr(param, 'needs_nccl_mem', False):
+                    param.register_ub_pool(param_pool)
 
         self.grad_data_size = 0
         self.param_data_size = 0
@@ -1774,9 +1778,8 @@ class _ParamAndGradBuffer:
     def deregister_nccl_mem_pools(self) -> None:
         """Deregister every live NCCL memory pool owned by this buffer."""
         if not self.nccl_ub:
-            # Only nccl_ub buffers register their pools on the DP group. A pool created for
-            # params opted in via needs_nccl_mem is registered on other groups by its caller,
-            # which also deregisters it.
+            # Only nccl_ub buffers register their pools on the DP group; pools handed to
+            # params via register_ub_pool are deregistered by whoever registered them.
             return
         for pool in self.get_nccl_mem_pools():
             nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)

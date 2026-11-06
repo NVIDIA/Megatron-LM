@@ -2395,17 +2395,10 @@ def pretrain(
     )
 
     if cfg_container.model.transformer.gtp_remat_nccl_ub or cfg_container.model.transformer.gtp_expert_remat_nccl_ub:
-        from megatron.core.tensor_parallel.gtp_api import (
-            deregister_and_clear_gtp_symm_pools,
-            deregister_ddp_buffers_from_gtp_groups,
-        )
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
-        # Deregister the GTP symmetric-memory windows: windows left registered when the
-        # process groups are destroyed make NCCL abort. DDP-buffer windows first, then
-        # the GTP-owned pools.
-        torch.cuda.synchronize()
-        for model_module in model:
-            deregister_ddp_buffers_from_gtp_groups(model_module)
+        # Deregister the GTP symmetric-memory pools: windows left registered when the
+        # process groups are destroyed make NCCL abort.
         deregister_and_clear_gtp_symm_pools()
 
     ft_integration.shutdown()
@@ -3077,13 +3070,6 @@ def setup_model_and_optimizer(
             moe_shared_expert_overlap=cfg.model.transformer.moe_shared_expert_overlap,
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
-
-        # Window-register the DDP param buffers (the all-gather inputs under the distributed
-        # optimizer) on the GTP groups. No-op unless params opted in via needs_nccl_mem.
-        from megatron.core.tensor_parallel.gtp_api import register_ddp_buffers_on_gtp_groups
-
-        for model_chunk in model:
-            register_ddp_buffers_on_gtp_groups(model_chunk)
 
     if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
@@ -5796,17 +5782,10 @@ def train(
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
         if cfg.model.transformer.gtp_remat_nccl_ub or cfg.model.transformer.gtp_expert_remat_nccl_ub:
-            from megatron.core.tensor_parallel.gtp_api import (
-                deregister_and_clear_gtp_symm_pools,
-                deregister_ddp_buffers_from_gtp_groups,
-            )
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
-            # Deregister the GTP symmetric-memory windows: windows left registered when the
-            # process groups are destroyed make NCCL abort. DDP-buffer windows first, then
-            # the GTP-owned pools.
-            torch.cuda.synchronize()
-            for model_module in model:
-                deregister_ddp_buffers_from_gtp_groups(model_module)
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
             deregister_and_clear_gtp_symm_pools()
 
         for model_module in model:
