@@ -13,10 +13,8 @@ description: Describes the Megatron Core API that calculates the learning rate a
 */}
 
 This api is used to calculate the learning rate and weight decay for the optimizer.
-<<<<<<< HEAD:docs/api-guide/internal/optimizer_param_scheduler.mdx
-=======
 
-## Weight decay on RMSNorm gamma
+## Weight Decay on RMSNorm Gamma
 
 By default, the optimizer excludes biases and one-dimensional parameters from weight decay.
 Set `OptimizerConfig.rmsnorm_weight_decay_mult` (or `--rmsnorm-weight-decay-mult`) to
@@ -46,4 +44,3 @@ decay acts on the stored parameter, as with the other optimizer parameters.
 
 Callers supplying custom `config_overrides` should start from
 `get_standard_config_overrides(config)` to include this policy.
->>>>>>> upstream/main:docs/api-guide/internal/optimizer_param_scheduler.md
