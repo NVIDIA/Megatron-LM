@@ -47,8 +47,8 @@ from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLa
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import (
     cat_with_oom_fallback,
+    core_attention_checkpoint,
     is_layer_window_attention,
-    precision_aware_checkpoint,
 )
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
@@ -647,7 +647,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         checkpoint_inputs[5] = attn_mask_type
-        hidden_states = precision_aware_checkpoint(
+        hidden_states = core_attention_checkpoint(
             custom_forward, self.config, self.pg_collection.tp, *checkpoint_inputs
         )
 

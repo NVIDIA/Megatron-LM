@@ -563,6 +563,10 @@ class PipelineOffloadManager:
         # vpp_rank -> group index where the decoder chunk's groups end (the post-process
         # callable's groups follow them in the warm-up template).
         self._block_capture_decoder_end = {}
+        # Set when the block capture is over: the captured graphs own every offload of the
+        # step, and an eager caller that follows a replay (the fixed-length post-process)
+        # must not bind itself to the warm-up handlers.
+        self._block_graphs_captured = False
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -918,8 +922,13 @@ class PipelineOffloadManager:
         self._block_capture_keep_last_group = keep_last_group
 
     def exit_block_capture(self):
-        """Leave the whole-block capture mode (the recorded per-step replay resumes)."""
+        """Leave the whole-block capture mode.
+
+        The captured graphs carry every offload and reload of the step; code that still runs
+        eagerly after a replay (the post-process of fixed-length chunk graphs) gets no handler.
+        """
         self._block_capture = False
+        self._block_graphs_captured = True
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
 
@@ -927,29 +936,18 @@ class PipelineOffloadManager:
         """Open the handler of one capture-time model-chunk forward (see enter_block_capture).
 
         ``continue_current`` is set by the post-process callable (MTP, LM head, loss): it extends
-        the decoder forward of the same slot, so it keeps using the decoder's handler, whose
-        template lists the post-process groups after the decoder's, exactly like the eager
-        forward that recorded it. Transformer Engine warms every callable up several times in a
-        row, so a handler that already served a post-process forward is replaced by a fresh one
-        that resumes at the decoder's last group.
+        the decoder forward of the same slot, so its handler is cloned from the same template
+        and resumes at the decoder's last group, the post-process groups coming after the
+        decoder's exactly like in the eager forward that recorded the template. It is a handler
+        of its own, not the decoder's: Transformer Engine captures the two callables as separate
+        graphs, and a graph may neither prefetch the other graph's groups nor wait on events
+        recorded in the other capture.
         """
         if not self._block_capture or not self.do_offload:
             return
         vpp_rank = 0 if vp_stage is None else vp_stage
         resume_index = 0
         if continue_current:
-            current = self._cur_forward_chunk
-            if (
-                current is not None
-                and current.vpp_rank == vpp_rank
-                and not current._block_capture_postprocess_visited
-            ):
-                current._block_capture_postprocess_visited = True
-                if self._block_capture_keep_last_group:
-                    self._block_capture_keep_last_groups(
-                        current, current._offloaded_group_index, None
-                    )
-                return
             resume_index = self._block_capture_decoder_end.get(vpp_rank)
             assert resume_index is not None, (
                 "The post-process callable was captured before a decoder chunk of virtual "
@@ -977,7 +975,6 @@ class PipelineOffloadManager:
             clone.total_tensor_count = group.total_tensor_count
             handler.offload_groups.append(clone)
         handler._offloaded_group_index = resume_index
-        handler._block_capture_postprocess_visited = continue_current
         if self._block_capture_keep_last_group:
             self._block_capture_keep_last_groups(
                 handler,
@@ -1023,6 +1020,11 @@ class PipelineOffloadManager:
         if self._block_capture:
             # One handler per capture-time model-chunk forward (begin_block_capture_chunk).
             return self._cur_forward_chunk
+        if self._block_graphs_captured:
+            # Eager post-process after a chunk graph replay: its groups stay on the GPU, as
+            # eager keeps the schedule's last groups resident; binding them to the warm-up
+            # handlers would offload them without a prefetch (and mismatch the chunks under VPP).
+            return None
         while not self._is_warmup and (
             self._cur_forward_chunk is None or self._cur_forward_chunk.finish_all_groups(name)
         ):
@@ -1214,7 +1216,6 @@ class ChunkOffloadHandler:
         # and whether a post-process forward already continued this handler.
         self._block_capture_host_buffers = []
         self._block_capture_consumed = set()
-        self._block_capture_postprocess_visited = False
         # (group, forced-release tensors) whose GPU blocks wait for their D2H copies to be
         # joined by the main stream before they are released (in-graph recycling).
         self._block_capture_pending_release = []

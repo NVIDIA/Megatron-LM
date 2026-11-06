@@ -2401,6 +2401,18 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.position_embedding_type in ("yarn", "mrope")
+            and not args.multi_latent_attention
+        ):
+            # The chunk capture's sample inputs carry a rotary table only for 'rope'; the
+            # block capture itself raises later, this fails before the model is built.
+            raise ValueError(
+                f"--cuda-graph-impl chunk_wise does not support --position-embedding-type "
+                f"{args.position_embedding_type}: the captured block would replay attention "
+                "without RoPE. Use rope or disable chunk-wise CUDA graphs."
+            )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'

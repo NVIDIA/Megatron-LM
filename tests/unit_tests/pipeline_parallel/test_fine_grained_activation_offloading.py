@@ -2221,10 +2221,12 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
     Warm-up records two virtual pipeline stages (two ``mlp`` groups on stage 0; two ``mlp``
     groups and a ``post`` group on stage 1). In block-capture mode every capture-time decoder
     forward gets a fresh handler cloned from its stage's warm-up template (same names and
-    policy flags, never the pooled host buffers), the post-process callable continues that
-    handler once, a repeated post-process call (Transformer Engine warms every callable up
-    several times) resumes a fresh handler at the decoder's last group, reloads stay inside the
-    handler, and the gradients equal the offload-free reference.
+    policy flags, never the pooled host buffers); every post-process call (Transformer Engine
+    warms every callable up several times) gets a handler of its own that resumes at the
+    decoder's last group, so neither callable's graph prefetches or waits on the other's
+    groups; reloads stay inside each handler, and the gradients equal the offload-free
+    reference. Once the capture is over, an eager caller (the post-process of fixed-length chunk
+    graphs) gets no handler and runs offload-free.
     """
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         PipelineOffloadManager,
@@ -2247,12 +2249,18 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
     def decoder(x):
         return group(group(x, "mlp", weights[0]), "mlp", weights[1])
 
+    def post_process(x):
+        # Two groups of one name: the warm-up policy keeps only the last one resident, so the
+        # post-process handler has a group of its own to offload and reload.
+        return group(group(x, "post", weights[2]), "post", weights[2])
+
     def reference(x, with_post):
         x = x.detach().clone().requires_grad_()
         w = [weight.detach() for weight in weights]
         y = torch.nn.functional.gelu(torch.nn.functional.linear(x, w[0]))
         y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[1]))
         if with_post:
+            y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[2]))
             y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[2]))
         y.sum().backward()
         return x.grad
@@ -2276,7 +2284,7 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
             )
             out = decoder(inputs[vp_stage])
             if vp_stage == 1:
-                out = group(out, "post", weights[2])
+                out = post_process(out)
             outputs.append(out)
         for out in reversed(outputs):
             out.sum().backward()
@@ -2284,7 +2292,7 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         assert not manager._is_warmup
         templates = list(manager._cached_chunks_forward)
         template = next(chunk for chunk in templates if chunk.vpp_rank == 1)
-        assert [g._name for g in template.offload_groups] == ["mlp", "mlp", "post"]
+        assert [g._name for g in template.offload_groups] == ["mlp", "mlp", "post", "post"]
 
         off_interface.enter_block_capture(keep_last_group=True)
         # Capture-time decoder forward of stage 1: a fresh handler cloned from the template.
@@ -2292,11 +2300,11 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         handler = manager.cur_forward_chunk()
         assert handler not in templates and handler.vpp_rank == 1
         assert manager.pop_forward_chunk("mlp") is handler
-        assert [g._name for g in handler.offload_groups] == ["mlp", "mlp", "post"]
+        assert [g._name for g in handler.offload_groups] == ["mlp", "mlp", "post", "post"]
         # Warm-up policy flags, minus the last group of every name (keep_last_group=True: kept
         # resident so that no backward graph starts with a synchronous reload).
         expected_flags = [g.offload for g in template.offload_groups]
-        for last in (1, 2):
+        for last in (1, 3):
             expected_flags[last] = False
         assert [g.offload for g in handler.offload_groups] == expected_flags
         assert not any(g.use_cpu_pool for g in handler.offload_groups)
@@ -2308,31 +2316,65 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         assert offloaded, "the warm-up policy should offload at least one group"
         assert len(handler._block_capture_host_buffers) > 0
 
-        # The post-process callable continues the decoder's handler once ...
+        # Every post-process call gets a handler of its own that resumes at the decoder's end:
+        # the two callables are separate graphs, and one graph may neither prefetch the other
+        # graph's groups nor wait on events recorded in the other capture.
         off_interface.begin_block_capture_chunk(1, continue_current=True)
-        assert manager.cur_forward_chunk() is handler
-        out = group(hidden, "post", weights[2])
-        # ... and a repeated post-process call resumes a fresh handler at the decoder's end.
+        post = manager.cur_forward_chunk()
+        assert post is not handler and post.vpp_rank == 1
+        assert post._offloaded_group_index == 2
+        assert [g._name for g in post.offload_groups] == ["mlp", "mlp", "post", "post"]
+        out = post_process(hidden)
+        off_interface.end_block_capture_chunk(record_decoder_end=False)
+        # The first post-process group was offloaded by the post-process handler itself ...
+        assert post.offload_groups[2].offload and not post.offload_groups[3].offload
+        assert post._offloaded_group_index == 4
+        assert len(post._block_capture_host_buffers) > 0
+        # ... and the decoder's groups still belong to the decoder's handler alone.
+        decoder_reloads = list(handler._groups_to_reload)
+        assert decoder_reloads
         off_interface.begin_block_capture_chunk(1, continue_current=True)
         fresh = manager.cur_forward_chunk()
-        assert fresh is not handler and fresh.vpp_rank == 1
+        assert fresh is not handler and fresh is not post and fresh.vpp_rank == 1
         assert fresh._offloaded_group_index == 2
         hidden_again = hidden.detach().clone().requires_grad_()
-        out_again = group(hidden_again, "post", weights[2])
+        out_again = post_process(hidden_again)
+        off_interface.end_block_capture_chunk(record_decoder_end=False)
 
-        out.sum().backward()
-        out_again.sum().backward()
-        assert not handler._groups_to_reload and not handler._reloading_group
+        # The post-process backward (up to the decoder's output) reloads only its own group:
+        # the decoder's pending reloads are untouched until the decoder's backward runs.
+        (grad_hidden_again,) = torch.autograd.grad(out_again.sum(), hidden_again)
         assert not fresh._groups_to_reload and not fresh._reloading_group
+        assert list(handler._groups_to_reload) == decoder_reloads
+        out.sum().backward()
+        for chunk_handler in (handler, post, fresh):
+            assert not chunk_handler._groups_to_reload and not chunk_handler._reloading_group
         torch.cuda.synchronize()
         assert torch.equal(x.grad, reference(x, with_post=True))
         ref_hidden = hidden.detach().clone().requires_grad_()
-        torch.nn.functional.gelu(
+        ref_out = torch.nn.functional.gelu(
             torch.nn.functional.linear(ref_hidden, weights[2].detach())
+        )
+        torch.nn.functional.gelu(
+            torch.nn.functional.linear(ref_out, weights[2].detach())
         ).sum().backward()
-        assert torch.equal(hidden_again.grad, ref_hidden.grad)
+        assert torch.equal(grad_hidden_again, ref_hidden.grad)
         off_interface.exit_block_capture()
         assert manager.cur_forward_chunk() is None
+        # After the capture the replayed graphs own every offload; an eager caller (the
+        # post-process of fixed-length chunk graphs runs after the decoder replay) gets no
+        # handler, so its groups stay on the GPU and its backward reloads nothing.
+        off_interface.reset()
+        assert manager.pop_forward_chunk("post") is None
+        eager_in = torch.randn(8, 64, device=device, requires_grad=True)
+        eager_out = group(eager_in, "post", weights[2])
+        assert manager.cur_forward_chunk() is None
+        eager_out.sum().backward()
+        ref_in = eager_in.detach().clone().requires_grad_()
+        torch.nn.functional.gelu(
+            torch.nn.functional.linear(ref_in, weights[2].detach())
+        ).sum().backward()
+        assert torch.equal(eager_in.grad, ref_in.grad)
     finally:
         off_interface.reset_instance()
         Utils.destroy_model_parallel()

@@ -1764,6 +1764,65 @@ class TestChunkGraphRegression:
             Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_hybrid_mtp_stack_is_not_a_chunk_callable():
+    """Only the decoder stack of a hybrid model is a chunk CUDA graph callable. The MTP stack
+    (``HybridStack(..., is_mtp_layer=True)``) runs inside the post-process callable's capture
+    and must not re-enter the chunk-capture adapter there (it would open a second offload
+    handler and bump the paged-stash microbatch counter as if it were a new decoder chunk)."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.transformer import cuda_graphs
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=4,
+            ffn_hidden_size=128,
+            is_hybrid_model=True,
+            mtp_num_layers=1,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            cuda_graph_impl="chunk_wise",
+            cuda_graph_modules=[],
+            cuda_graph_dynamic_microbatches=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=4,
+        )
+        model_parallel_cuda_manual_seed(42)
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=64,
+            hybrid_layer_pattern="*-/*-",
+            position_embedding_type="rope",
+        )
+        model.train()
+        mtp_stack = model.mtp.layers[0].mtp_model_layer
+        assert isinstance(mtp_stack, HybridStack) and mtp_stack.is_mtp_layer
+        assert model.decoder.is_cuda_graph_chunk_callable is True
+        assert mtp_stack.is_cuda_graph_chunk_callable is False
+        cuda_graphs._set_capture_start()
+        try:
+            assert model.decoder._should_call_te_cudagraph()
+            assert not mtp_stack._should_call_te_cudagraph()
+        finally:
+            cuda_graphs._set_capture_end()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestStaticInputs:
 
     def setup_method(self):

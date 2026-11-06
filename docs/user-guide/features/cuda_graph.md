@@ -164,27 +164,35 @@ step graph is captured into that same pool.
 ```
 
 Requirements: `--cuda-graph-modules` must be empty; MoE layers need static token shapes (drop-padding
-MoE, the HybridEP flex dispatcher with `--moe-expert-rank-capacity-factor`, or a MoE megakernel
-backend); `--overlap-moe-expert-parallel-comm` and `--delay-wgrad-compute` are not supported.
+MoE, the HybridEP flex dispatcher with `--moe-expert-rank-capacity-factor`, or a BF16 MoE megakernel
+backend; MoK's MXFP8 mode refreshes its expert scales on the host between microbatches and is
+rejected); `--overlap-moe-expert-parallel-comm` and `--delay-wgrad-compute` are not supported.
+FP4 is not supported yet (the block-wide capture autocast would also quantize
+`--first-last-layers-bf16` layers). Only `--position-embedding-type rope` (or MLA's own rotary
+handling) can be captured: `yarn` and `mrope` are rejected, since the replayed attention would
+run without a rotary table.
 GDN / KDA layers are rejected together with packed sequences: the FLA kernels derive their chunk
 indices on the host from the `cu_seqlens` values and cache them per tensor, so a captured block
 graph would replay the pack layout of the capture sample; fixed-length (non-packed) chunk graphs
 with those layers are fine. A graph replay runs under the block-wide FP8 autocast the eager block
 forward opens (the replay does not run the forward), so delayed scaling keeps reducing its amax
 and updating its scales, and the FP8 weight cache keeps following `is_first_microbatch`.
-`--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are captured into each
+`--fine-grained-activation-offloading` runs in a whole-block capture mode (not together with full activation recompute,
+whose captured recompute would re-run the offload hooks inside the backward graph; and `attn_norm` cannot be offloaded on
+layers without hyper connections, because its commit frees the block's static input): the D2H/H2D copies are captured into each
 slot's graphs with static pinned host buffers and no cross-slot prefetch, so any number of live slots can replay. Because a
 slot's graphs are self-contained, the copies that eager overlaps with the *next* microbatch (the last groups' D2H at the end
 of a forward, the first group's reload at the start of a backward) cannot be hidden the same way, so the copies cost more
 step time than in eager. `--fine-grained-offloading-graph-keep-last-group` keeps the last group of every offload module
 resident per slot to avoid the synchronous reload at the price of part of the memory saving (DSv4 proxy, five offload
 modules, chunk graphs without offload as the reference: 2.35 s/step and -5.3 GB without the flag, 1.55 s/step and -1.7 GB
-with it).
+with it). Without packed sequences the post-process (MTP, LM head, loss) runs eagerly after the decoder replay and keeps
+its activations on the GPU: the captured graphs own every offload of the step.
 `--dsa-cp-balance-indexer` works in its graph-dynamic mode: the per-pack route pair becomes two
 static inputs of the block graph (refreshed per replay like `cu_seqlens`). `--moe-paged-stash`
 works in a runtime-keyed mode: each MoE layer stashes its own activations after its forward and
 reloads them right before its own backward (no cross-layer prefetch; GPU pages only by default),
-so the captured graphs do not depend on the recorded pipeline order; it needs TE >= 2.19 and
+at any pipeline size, so the captured graphs do not depend on the recorded pipeline order; it needs TE >= 2.19 and
 `--cuda-graph-warmup-steps >= 2`. Full recompute inside the captured block requires
 `hidden_dropout=0`, `attention_dropout=0` and no router input jitter: the recompute runs inside the
 backward graph, where the RNG state cannot be rewound. `--moe-router-force-load-balancing` is not

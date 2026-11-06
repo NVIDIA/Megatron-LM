@@ -28,6 +28,7 @@ from megatron.core.transformer.moe.paged_stash import (
     PagedTensor,
     _stash_buffer_dtype,
     check_paged_stash_overflow,
+    configure_runtime_schedule,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
     paged_stash_te_graph_capture,
@@ -169,6 +170,28 @@ def test_te_graph_capture_reallocates_buffers_released_by_warmup_fallback(monkey
     assert manager.overflow.item() == 0
     assert manager.host_spill.item() == 0
     manager.finish_te_graph_capture(runtime_state)
+
+
+@pytest.mark.parametrize("pipeline_model_parallel_size", [1, 2])
+def test_runtime_schedule_stashes_at_every_pipeline_size(pipeline_model_parallel_size):
+    """Chunk-wise graphs key the stash by the live (vp, layer, microbatch) coordinates: every
+    captured MoE layer stashes its own activations and reloads them before its own backward,
+    at PP=1 as on the last pipeline stage. Without stashing the page buffers would be allocated
+    for nothing."""
+    manager = SimpleNamespace()
+    config = SimpleNamespace(
+        cuda_graph_impl="chunk_wise",
+        moe_paged_stash=True,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+    )
+    configure_runtime_schedule(manager, True, config)
+    assert manager.runtime_schedule and manager.runtime_schedule_stash_activations
+    configure_runtime_schedule(manager, False, config)
+    assert not manager.runtime_schedule and not manager.runtime_schedule_stash_activations
+    configure_runtime_schedule(
+        manager, True, SimpleNamespace(cuda_graph_impl="transformer_engine", moe_paged_stash=True)
+    )
+    assert not manager.runtime_schedule and not manager.runtime_schedule_stash_activations
 
 
 def test_paged_stash_schedule_supports_distinct_vp_layer_templates():

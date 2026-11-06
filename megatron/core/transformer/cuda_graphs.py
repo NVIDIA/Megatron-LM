@@ -3008,13 +3008,27 @@ class TECudaGraphHelper:
                 # unsupported contracts is actually captured.
                 uses_mla = self.config.multi_latent_attention
                 if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
-                    # Config types select the layer implementation; copied flags may differ.
-                    config_type = type(layer.config)
-                    if config_type is AttentionLayerConfig:
-                        uses_mla = False
-                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
-                        uses_mla = True
-                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
+                    if is_chunk_callable or is_postprocess_callable:
+                        # A block callable carries the model's root config; the runtime hands
+                        # the decoder / MTP a RoPE table iff its own section is not MLA
+                        # (HybridModel.forward: decoder_rotary_pos_emb, _postprocess_after_decoder).
+                        uses_mla = (
+                            transformer_module._decoder_uses_mla
+                            if is_chunk_callable
+                            else transformer_module._mtp_uses_mla
+                        )
+                    else:
+                        # Config types select the layer implementation; copied flags may differ.
+                        config_type = type(layer.config)
+                        if config_type is AttentionLayerConfig:
+                            uses_mla = False
+                        elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                            uses_mla = True
+                if (
+                    transformer_module.position_embedding_type == 'rope'
+                    and not uses_mla
+                    and getattr(transformer_module, 'rotary_pos_emb', None) is not None
+                ):
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
@@ -3068,16 +3082,13 @@ class TECudaGraphHelper:
                     )
                 )
 
-            if (
-                contains_self_attn
-                and not self.config.multi_latent_attention
-                and not (is_chunk_callable or is_postprocess_callable)
-            ):
+            if contains_self_attn and not self.config.multi_latent_attention:
                 position_embedding_type = getattr(
                     chunk_of_the_layer, 'position_embedding_type', None
                 )
                 is_thd = 'cu_seqlens_q' in static_inputs
                 context_parallel_size = self.config.context_parallel_size
+                is_block_callable = is_chunk_callable or is_postprocess_callable
                 unsupported_reasons = []
                 if position_embedding_type == 'yarn':
                     unsupported_reasons.append(
@@ -3087,10 +3098,26 @@ class TECudaGraphHelper:
                     unsupported_reasons.append(
                         'mRoPE rotary embeddings are not represented in the capture sample inputs'
                     )
-                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
+                if (
+                    position_embedding_type == 'rope'
+                    and is_thd
+                    and context_parallel_size > 1
+                    and not is_block_callable
+                ):
+                    # Chunk callables capture the full packed RoPE table (get_rotary_pos_emb).
                     unsupported_reasons.append(
                         'THD with context parallelism captures a CP-sliced RoPE table, while '
                         'runtime packed sequences use the full table'
+                    )
+                if is_block_callable and unsupported_reasons:
+                    # A chunk graph is the whole training forward: replaying it without the
+                    # rotary table would silently train without RoPE. Refuse instead of warning.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not capture "
+                        f"position_embedding_type={position_embedding_type!r} rotary embeddings "
+                        f"({'; '.join(unsupported_reasons)}): the replayed attention would run "
+                        "without RoPE. Use position_embedding_type='rope' or disable chunk-wise "
+                        "CUDA graphs."
                     )
 
                 warning_key = (position_embedding_type, is_thd, context_parallel_size)

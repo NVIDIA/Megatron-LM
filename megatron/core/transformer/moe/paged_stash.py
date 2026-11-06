@@ -404,8 +404,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             if stash_manager.runtime_schedule:
                 # Runtime-keyed mode (chunk CUDA graphs): every layer stashes its own
                 # activations and reloads them right before its own backward, so the captured
-                # graphs do not depend on the recorded pipeline order. With PP=1 a microbatch's
-                # backward follows its forward directly and nothing is stashed.
+                # graphs do not depend on the recorded pipeline order, at any pipeline size.
                 if stash_manager.runtime_schedule_stash_activations:
                     ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
                 else:
@@ -1271,9 +1270,10 @@ def configure_runtime_schedule(stash_manager, enabled, config):
         and getattr(config, 'moe_paged_stash', False)
     )
     stash_manager.runtime_schedule = runtime_schedule
-    stash_manager.runtime_schedule_stash_activations = bool(
-        runtime_schedule and getattr(config, 'pipeline_model_parallel_size', 1) > 1
-    )
+    # Every captured layer stashes its own activations and reloads them before its own
+    # backward, at any pipeline size: the keys are the live (vp, layer, microbatch)
+    # coordinates, so PP=1 and the last pipeline stage take the same path.
+    stash_manager.runtime_schedule_stash_activations = runtime_schedule
 
 
 def paged_stash_prepare_for_cuda_graph_capture(config):

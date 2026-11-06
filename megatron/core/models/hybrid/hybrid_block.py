@@ -182,6 +182,9 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # Only the decoder stack is a chunk CUDA graph callable. An MTP stack runs inside the
+        # post-process callable's capture and must not re-enter the chunk-capture adapter.
+        self.is_cuda_graph_chunk_callable = not is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
         uses_stack_cp_layout = getattr(self.config, "_linear_cp_layout_explicit", True)
         # MTP consumes the decoder readout and shifted-token embedding at hidden_size.

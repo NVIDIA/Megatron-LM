@@ -4971,6 +4971,15 @@ class TransformerConfig(ModelParallelConfig):
         is_te_chunk_graph = self.cuda_graph_impl == "chunk_wise"
 
         if self.moe_megakernel_backend == "mok":
+            if self.cuda_graph_impl == "chunk_wise" and self.fp8 is not None:
+                # MoK's MXFP8 mode keeps swizzled E8M0 scale copies that are refreshed on the
+                # host-side is_first_microbatch flag; a replayed block never runs that refresh,
+                # so the scales would go stale after every parameter update.
+                raise ValueError(
+                    "MOK with MXFP8 (fp8_param) does not support cuda_graph_impl='chunk_wise': "
+                    "the expert scale refresh runs on the host between microbatches and is not "
+                    "part of the captured block. Use BF16 MOK or cuda_graph_impl='full_iteration'."
+                )
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
                 # Per-layer replay needs per-microbatch ownership or recomputation
@@ -4992,7 +5001,8 @@ class TransformerConfig(ModelParallelConfig):
                         "moe/moe_router/moe_preprocess"
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration", "chunk_wise"):
-                # Whole-iteration and whole-block captures record the megakernel inside the graph.
+                # Whole-iteration and whole-block captures record the megakernel inside the
+                # graph (BF16 only for whole-block captures, see above).
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
         if (
             self.fine_grained_activation_offloading
@@ -5340,6 +5350,29 @@ class TransformerConfig(ModelParallelConfig):
                         "mhc_recompute_attn_cuda_graph_split is a per-layer capture option and "
                         "does not apply to cuda_graph_impl='chunk_wise'."
                     )
+                if self.fp4:
+                    # The whole block is captured under one quantization autocast; the FP4
+                    # branches of the layer contexts do not opt first_last_layers_bf16 layers out
+                    # of it the way get_layer_fp8_context does for FP8.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support FP4 (fp4_format) yet: the "
+                        "block-wide NVFP4 capture autocast would also quantize "
+                        "first_last_layers_bf16 layers. Use cuda_graph_impl='transformer_engine' "
+                        "or disable FP4."
+                    )
+                if (
+                    self.fine_grained_activation_offloading
+                    and "attn_norm" in (self.offload_modules or [])
+                    and not self.enable_hyper_connections
+                ):
+                    # The attn_norm commit frees the layer input; in the block's first layer
+                    # that input is the captured graph's static hidden_states buffer.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' cannot offload 'attn_norm' on layers "
+                        "without hyper connections: the attn_norm commit frees the layer input, "
+                        "which for the block's first layer is the static graph input. Drop "
+                        "'attn_norm' from offload_modules."
+                    )
                 if (
                     self.sequence_packing_scheduler is not None
                     and not self.cuda_graph_dynamic_microbatches
@@ -5376,6 +5409,13 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_impl='chunk_wise' with full activation recompute requires "
                         "hidden_dropout=0, attention_dropout=0 and no moe_input_jitter_eps: a "
                         "captured recompute cannot reproduce those random draws."
+                    )
+                if self.recompute_granularity == "full" and self.fine_grained_activation_offloading:
+                    # The captured recompute re-runs the offload hooks inside the backward graph.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support full activation recompute "
+                        "together with fine_grained_activation_offloading: the recompute captured "
+                        "into the backward graph would re-run the offload hooks there."
                     )
                 if self.recompute_granularity == "full" and self.moe_router_force_load_balancing:
                     warnings.warn(

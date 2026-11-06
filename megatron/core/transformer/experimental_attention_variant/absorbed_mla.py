@@ -45,7 +45,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import core_attention_checkpoint
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
@@ -958,7 +958,7 @@ class AbsorbedMLASelfAttention(Attention):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = precision_aware_checkpoint(
+        hidden_states = core_attention_checkpoint(
             custom_forward,
             self.config,
             self.pg_collection.tp,

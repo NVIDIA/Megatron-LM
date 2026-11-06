@@ -117,6 +117,16 @@ def test_native_single_grouped_weights_do_not_require_op_fuser():
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
+        (
+            {
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": True,
+                "cuda_graph_impl": "chunk_wise",
+                "cuda_graph_modules": [],
+            },
+            "MXFP8 .* does not support cuda_graph_impl='chunk_wise'",
+        ),
         ({"moe_shortcut_connection": True}, "does not support moe_shortcut_connection"),
         ({"add_bias_linear": True}, "add_bias_linear"),
         ({"moe_apply_probs_on_input": True}, "moe_apply_probs_on_input"),

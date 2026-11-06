@@ -294,10 +294,11 @@ class ChunkCudaGraphBlockMixin:
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            # One offload handler per capture-time model-chunk forward; the post-process block
-            # continues the decoder's handler, like eager MTP. backward_record/forward_record are
-            # dev's per-callable capture boundary: the backward graph's tail joins the H2D stream
-            # and the forward graph's tail joins the D2H stream.
+            # One offload handler per capture-time callable forward; the post-process block's
+            # handler resumes where the decoder's groups end, like eager MTP, but is its own
+            # (the two callables are separate graphs). backward_record/forward_record are dev's
+            # per-callable capture boundary: the backward graph's tail joins the H2D stream and
+            # the forward graph's tail joins the D2H stream.
             is_postprocess = getattr(self, 'is_cuda_graph_postprocess_callable', False)
             off_interface.begin_block_capture_chunk(
                 getattr(self, 'vp_stage', None), continue_current=is_postprocess

@@ -606,3 +606,57 @@ def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(
 
     assert output == 6
     assert calls == [(False, (3,))]
+
+
+class TestCoreAttentionCheckpointPolicy:
+    """Selective core-attention recompute keeps Megatron's checkpoint outside chunk-wise graphs."""
+
+    @staticmethod
+    def _config(**overrides):
+        values = dict(fp8=None, fp4=None, cuda_graph_impl="none")
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @pytest.mark.parametrize(
+        "config_overrides, expects_te",
+        [
+            (dict(), False),
+            (dict(fp8="e4m3"), False),
+            (dict(fp4="e2m1"), False),
+            (dict(fp8="e4m3", cuda_graph_impl="transformer_engine"), False),
+            (dict(fp8="e4m3", cuda_graph_impl="local"), False),
+            (dict(cuda_graph_impl="chunk_wise"), True),
+            (dict(fp8="e4m3", cuda_graph_impl="chunk_wise"), True),
+        ],
+    )
+    def test_core_attention_checkpoint_dispatch(self, monkeypatch, config_overrides, expects_te):
+        """FP8/FP4 alone must not route the core attention through TE's checkpoint: Megatron's
+        checkpoint re-enters the quantization autocast, skips graph warm-up / capture and rewinds
+        graph-safe RNG states; only a chunk-wise capture needs the recompute inside the graph."""
+        import megatron.core.extensions.transformer_engine as te_ext
+
+        calls = []
+        monkeypatch.setattr(
+            transformer_utils.tensor_parallel,
+            "checkpoint",
+            lambda function, distribute, *args: calls.append(("mcore", distribute, args))
+            or function(*args),
+        )
+        monkeypatch.setattr(
+            te_ext,
+            "te_checkpoint",
+            lambda function, distribute, get_rng_tracker, tp_group, *args: calls.append(
+                ("te", distribute, args)
+            )
+            or function(*args),
+        )
+        config = self._config(**config_overrides)
+        assert transformer_utils.use_te_checkpoint_for_core_attention(config) is expects_te
+        out = transformer_utils.core_attention_checkpoint(
+            lambda a, b: a + b, config, None, torch.ones(2), torch.ones(2)
+        )
+        assert torch.equal(out, torch.full((2,), 2.0))
+        assert len(calls) == 1
+        backend, distribute, args = calls[0]
+        assert backend == ("te" if expects_te else "mcore")
+        assert distribute is False and len(args) == 2

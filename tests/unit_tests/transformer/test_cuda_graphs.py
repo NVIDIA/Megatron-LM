@@ -780,6 +780,19 @@ class TestCudaGraphConfigAndArguments:
                 inference_cuda_graph_scope='layer',
             )
 
+    def test_chunk_wise_cli_rejects_yarn_rotary(self, monkeypatch):
+        """The chunk capture carries a rotary table only for 'rope': yarn / mRoPE would replay
+        attention without RoPE, so the CLI fails before the model is built."""
+        with pytest.raises(ValueError, match="does not support --position-embedding-type yarn"):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                ['--cuda-graph-impl', 'chunk_wise', '--position-embedding-type', 'yarn'],
+            )
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'chunk_wise', '--position-embedding-type', 'rope']
+        )
+        assert args.cuda_graph_impl == 'chunk_wise'
+
     def test_enable_cuda_graph_flag_migrates_to_local_impl(self, monkeypatch):
         args, _, print_messages = _validated_cuda_graph_cli_args(
             monkeypatch, ['--enable-cuda-graph']
@@ -1987,6 +2000,35 @@ class TestHybridTECudaGraphDiscovery:
                 assert 'affecting GPTModel.' in records[0][1]
                 assert 'GPTModel and HybridModel' not in records[0][1]
 
+    @pytest.mark.parametrize("position_embedding_type", ["yarn", "mrope"])
+    def test_chunk_callable_rejects_unsupported_rotary_contract(
+        self, monkeypatch, position_embedding_type
+    ):
+        """A chunk callable captured without a rotary table would replay attention without
+        RoPE for the whole training forward, so the sample builder refuses yarn / mRoPE instead
+        of logging the per-layer warning."""
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            'log_on_each_pipeline_stage',
+            lambda **kwargs: records.append((kwargs['level'], kwargs['msg'])),
+        )
+        helper, _rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='transformer',
+            position_embedding_type=position_embedding_type,
+            cuda_graph_modules=[],
+        )
+        # Make the callable the chunk decoder itself (a whole-block callable).
+        chunk = helper.chunks_with_decoder[0]
+        decoder = helper.flattened_callables[0]
+        decoder.layers = [decoder]
+        chunk.decoder = decoder
+
+        with pytest.raises(ValueError, match="cuda_graph_impl='chunk_wise' does not capture"):
+            helper._get_sample_arguments([1, -1])
+        assert records == []
+
     def test_rotary_sample_contract_warning_is_deduplicated_for_yarn_thd_cp2(self, monkeypatch):
         records = []
         monkeypatch.setattr(
@@ -2802,6 +2844,31 @@ class TestChunkWiseCudaGraphs:
                     'attention_dropout': 0.0,
                 },
                 "hidden_dropout=0",
+            ),
+            # The block-wide capture autocast would quantize first_last_layers_bf16 layers.
+            ({'cuda_graph_modules': [], 'fp4': 'e2m1'}, "does not support FP4"),
+            # The attn_norm commit frees the layer input: the block's static graph input.
+            (
+                {
+                    'cuda_graph_modules': [],
+                    'fine_grained_activation_offloading': True,
+                    'offload_modules': ['attn_norm'],
+                },
+                "cannot offload 'attn_norm'",
+            ),
+            # A captured recompute would re-run the offload hooks inside the backward graph.
+            (
+                {
+                    'cuda_graph_modules': [],
+                    'recompute_granularity': 'full',
+                    'recompute_method': 'uniform',
+                    'recompute_num_layers': 1,
+                    'hidden_dropout': 0.0,
+                    'attention_dropout': 0.0,
+                    'fine_grained_activation_offloading': True,
+                    'offload_modules': ['core_attn'],
+                },
+                "together with fine_grained_activation_offloading",
             ),
         ],
     )
