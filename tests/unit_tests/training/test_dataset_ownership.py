@@ -170,6 +170,7 @@ def warnings_log(monkeypatch):
 
 def _layout(**overrides):
     layout = dict(
+        fp16=False,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
