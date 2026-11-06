@@ -982,12 +982,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_component_nvtx.py",
+            K + "test_csa_packed_kernels.py",
         ),
         kind="triton",
         notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
         "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "
         "unqualified for deterministic mode; this draft rejects that mode. test_component_nvtx "
-        "covers the opt-in component NVTX ranges on the compressor, indexer and attention paths.",
+        "covers the opt-in component NVTX ranges on the compressor, indexer and attention paths; "
+        "test_csa_packed_kernels checks that THD layouts are bit-identical with the opt-in device "
+        "metadata checks on and off.",
     ),
     KernelEntry(
         name="csa_teacher_lse",
@@ -1014,7 +1017,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
-        "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+        "numerical CP parity is covered by test_dsv4_packed_cp.py. The opt-in device metadata "
+        "checks (MCORE_CSA2_DEVICE_CHECKS) only validate; parity is in test_csa_packed_kernels.",
     ),
     KernelEntry(
         name="v41_engram_embedding",

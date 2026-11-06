@@ -333,7 +333,8 @@ class DeepSeekV41Adapter:
                 field.key: values[field.key] for field in codec.schema(key[0] + 1, loss=loss).fields
             }
             # The region passes packed prefixes through unchanged, so their eager layouts still
-            # hold; rebuilding them would add ~100 launches and 17 device asserts per replay.
+            # hold; rebuilding them would launch dozens of small kernels per replay (plus 17
+            # device asserts with MCORE_CSA2_DEVICE_CHECKS=1).
             csa, mhc, _ = codec.restore(values, key[0] + 1, previous=context.cross_layer_state)
             context.cross_layer_state, context.mhc_state = csa, mhc
             objective = values.pop('indexer_loss', None)

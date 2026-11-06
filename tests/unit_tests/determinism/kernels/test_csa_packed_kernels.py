@@ -1,15 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Replay the packed layout, indexer metadata and CP collective operations."""
 
+import dataclasses
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     csa_indexer_loss_kernels,
     packed_layout,
+    thd_utils,
 )
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_replays_bit_exact,
+    bytes_equal,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -42,6 +51,80 @@ def test_cp_compressor_layout_replays():
         )
 
     assert_replays_bit_exact(indices, (layout[-2], layout[-1]), backward=False, contention=True)
+
+
+class _SingleRankGroup:
+    def size(self):
+        return 1
+
+    def rank(self):
+        return 0
+
+
+@pytest.mark.parametrize("device_checks", [False, True], ids=["checks_off", "checks_on"])
+def test_thd_metadata_device_checks_only_validate(monkeypatch, device_checks):
+    """MCORE_CSA2_DEVICE_CHECKS only adds device asserts: the layouts are bit-identical with
+    the checks on or off, off launches no check, and CPU metadata is validated either way."""
+    seeded()
+    cu = torch.tensor([0, 37, 37, 215, 300], device="cuda", dtype=torch.int32)
+    padded = torch.tensor([0, 40, 40, 256, 512], device="cuda", dtype=torch.int32)
+    config = SimpleNamespace(dsa_kernel_backend="cudnn", deterministic_mode=False)
+
+    def packed():
+        # Separate Q and KV tensors, so aliasing does not skip the Q/KV equality checks.
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu.clone(),
+            cu_seqlens_kv=cu.clone(),
+            cu_seqlens_q_padded=padded.clone(),
+            cu_seqlens_kv_padded=padded.clone(),
+            max_seqlen_q=256,
+            max_seqlen_kv=256,
+        )
+
+    def build():
+        layout = thd_utils.build_csa2_thd_layout(packed(), 512)
+        layout.validate_compatible(packed(), 512)
+        cp_utils.validate_packed_inputs(packed(), config, _SingleRankGroup())
+        return layout, layout.for_compression(2)
+
+    monkeypatch.setattr(thd_utils, "DEVICE_CHECKS", True)
+    reference = build()
+    torch.cuda.synchronize()
+
+    launched = []
+    assert_async = torch._assert_async
+
+    def counting_assert_async(*args, **kwargs):
+        launched.append(args)
+        return assert_async(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "_assert_async", counting_assert_async)
+    monkeypatch.setattr(thd_utils, "DEVICE_CHECKS", device_checks)
+    actual = build()
+    torch.cuda.synchronize()
+
+    assert bool(launched) == device_checks
+    for expected, value in zip(reference, actual):
+        for field in dataclasses.fields(expected):
+            got, want = getattr(value, field.name), getattr(expected, field.name)
+            if isinstance(want, torch.Tensor):
+                assert bytes_equal(got, want), field.name
+            else:
+                assert got == want, field.name
+
+    bad = torch.tensor([1, 37, 37, 215, 300], dtype=torch.int32)
+    with pytest.raises(ValueError, match="must start at zero"):
+        thd_utils.build_csa2_thd_layout(
+            PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=bad,
+                cu_seqlens_kv=bad.clone(),
+                max_seqlen_q=256,
+                max_seqlen_kv=256,
+            ),
+            512,
+        )
 
 
 def test_packed_indexer_metadata_and_loss_replay():

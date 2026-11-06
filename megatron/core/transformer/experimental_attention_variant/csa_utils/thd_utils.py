@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from megatron.core.env_flags import env_flag
 from megatron.core.packed_seq_params import PackedSeqParams
 
 
@@ -104,8 +105,29 @@ def get_thd_compressed_group_indices(
     return gather_idx, local_pos, batch_ids, valid_comp
 
 
-def _check_values(condition: torch.Tensor, message: str) -> None:
-    """Validate device metadata without transferring CUDA scalars to the host."""
+# Device-side validation of packed THD metadata: every check is a compare/reduce plus a
+# torch._assert_async launch, about 17 per layout build, captured CUDA graphs included. The
+# checks never change a tensor, and a failing one aborts the CUDA context without a Python
+# stack, so they are a debugging aid and off by default; MCORE_CSA2_DEVICE_CHECKS=1 turns
+# them on (recommended for new data pipelines). Metadata held on the CPU is always validated.
+DEVICE_CHECKS = env_flag("MCORE_CSA2_DEVICE_CHECKS", False)
+
+
+def metadata_checks_enabled(device: torch.device) -> bool:
+    """Whether THD metadata on ``device`` is validated: always on the host, on CUDA only
+    with ``MCORE_CSA2_DEVICE_CHECKS=1``."""
+    return DEVICE_CHECKS or device.type != "cuda"
+
+
+def _check_values(condition_fn, message: str, device: torch.device) -> None:
+    """Validate metadata on ``device`` without transferring CUDA scalars to the host.
+
+    ``condition_fn`` builds the condition tensor. It is not called when the check is
+    disabled, so a disabled device check launches no kernel.
+    """
+    if not metadata_checks_enabled(device):
+        return
+    condition = condition_fn()
     if condition.is_cuda:
         torch._assert_async(condition, message)
     elif not bool(condition):
@@ -262,8 +284,9 @@ class CSA2THDLayout:
             raise ValueError("CSA2 state cannot be reused with a different THD layout")
         for name in ("cu_seqlens", "cu_seqlens_padded", "valid_tokens"):
             _check_values(
-                (getattr(self, name) == getattr(other, name)).all(),
+                lambda: (getattr(self, name) == getattr(other, name)).all(),
                 "CSA2 state cannot be reused with a different THD layout",
+                self.cu_seqlens.device,
             )
 
 
@@ -317,19 +340,34 @@ def build_csa2_thd_layout(
             raise ValueError(
                 "CSA2 THD query/KV metadata must have matching shape, dtype and device"
             )
-        _check_values(prefix[0] == 0, "CSA2 THD cumulative lengths must start at zero")
-        _check_values((prefix.diff() >= 0).all(), "CSA2 THD cumulative lengths must be monotonic")
         _check_values(
-            prefix[-1] <= global_total, "CSA2 THD metadata exceeds physical token capacity"
+            lambda: prefix[0] == 0, "CSA2 THD cumulative lengths must start at zero", prefix.device
         )
-    _check_values((cu_q == cu_kv).all(), "CSA2 THD self-attention requires equal query/KV lengths")
+        _check_values(
+            lambda: (prefix.diff() >= 0).all(),
+            "CSA2 THD cumulative lengths must be monotonic",
+            prefix.device,
+        )
+        _check_values(
+            lambda: prefix[-1] <= global_total,
+            "CSA2 THD metadata exceeds physical token capacity",
+            prefix.device,
+        )
+    device = cu_q.device
     _check_values(
-        (physical_q == physical_kv).all(),
-        "CSA2 THD self-attention requires equal query/KV physical lengths",
+        lambda: (cu_q == cu_kv).all(),
+        "CSA2 THD self-attention requires equal query/KV lengths",
+        device,
     )
     _check_values(
-        (cu_q.diff() <= physical_q.diff()).all(),
+        lambda: (physical_q == physical_kv).all(),
+        "CSA2 THD self-attention requires equal query/KV physical lengths",
+        device,
+    )
+    _check_values(
+        lambda: (cu_q.diff() <= physical_q.diff()).all(),
         "CSA2 THD valid sequence length exceeds its physical segment",
+        device,
     )
     max_seqlen = packed_seq_params.max_seqlen_q
     max_seqlen_kv = packed_seq_params.max_seqlen_kv
@@ -337,8 +375,9 @@ def build_csa2_thd_layout(
         if type(limit) is not int or limit < 0:
             raise ValueError("CSA2 THD max_seqlen_q/kv must be non-negative host integers")
         _check_values(
-            (physical_q.diff() <= limit).all(),
+            lambda: (physical_q.diff() <= limit).all(),
             "CSA2 THD physical sequence length exceeds max_seqlen_q/kv",
+            device,
         )
     if max_seqlen != max_seqlen_kv:
         raise ValueError("CSA2 THD self-attention requires equal max_seqlen_q/kv")
