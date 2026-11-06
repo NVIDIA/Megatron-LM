@@ -900,6 +900,7 @@ class TestTEWrappers:
 
 
 # 8 query heads: 8 K/V groups are split across CP2 and CP4; 1 and 2 groups are gathered.
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("cp_size,num_query_groups", [(2, 8), (4, 8), (2, 1), (4, 2)])
 @pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
 def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
