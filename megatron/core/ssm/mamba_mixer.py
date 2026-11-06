@@ -520,8 +520,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """
         # Copies per token, forward + backward. Sequence-first: the in_proj output and its grad,
         # and the SSM output (the kernel reads its strided grad in place): 2 * in_proj + d_inner.
-        # Batch-first: the input, the output and the out_proj grad, plus the input grad when its
-        # producer makes it contiguous (a separate norm, the wide-residual read): <= 4 * d_model
+        # Batch-first: the input, the output and the out_proj grad, plus the input grad, which its
+        # producer either copies (a separate norm, the wide-residual read) or adds into the
+        # residual grad with a strided, non-vectorized add that costs about as much: ~4 * d_model
         # with TE linears. MCore-local linears copy each strided grad twice, on both sides.
         in_proj_width = (
             2 * self.d_inner_local_tp
