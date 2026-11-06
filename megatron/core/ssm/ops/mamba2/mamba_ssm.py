@@ -147,7 +147,8 @@ def _selective_scan_update_kernel(
     # 1. State Mapping (handles dynamic batching slot allocation)
     if HAS_STATE_BATCH_INDICES:
         state_batch_indices_ptr += pid_b
-        state_batch_idx = tl.load(state_batch_indices_ptr)
+        # int64: slot * stride_state_batch can exceed 2^31 elements on large state pools.
+        state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         # Skip padding tokens (e.g. from graph capture or inactive slots)
         if state_batch_idx < 0:
             for s in range(seq_len):
@@ -158,9 +159,9 @@ def _selective_scan_update_kernel(
         if HAS_INT_STATE:
             int_state_ptr += state_batch_idx * stride_int_batch + pid_h * stride_int_head
     else:
-        state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
+        state_ptr += pid_b.to(tl.int64) * stride_state_batch + pid_h * stride_state_head
         if HAS_INT_STATE:
-            int_state_ptr += pid_b * stride_int_batch + pid_h * stride_int_head
+            int_state_ptr += pid_b.to(tl.int64) * stride_int_batch + pid_h * stride_int_head
 
     # Base Pointers for Sequence iteration
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head

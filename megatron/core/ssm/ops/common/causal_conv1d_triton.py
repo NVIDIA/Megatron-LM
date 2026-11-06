@@ -66,10 +66,11 @@ def causal_conv1d_update_kernel(
     mask = channel_offsets < dim
 
     # State batch coordinate mapping
+    # int64: slot * conv_state_b_stride can exceed 2^31 elements on large state pools.
     if HAS_STATE_INDICES:
-        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id)
+        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id).to(tl.int64)
     else:
-        state_batch_coord = batch_id
+        state_batch_coord = batch_id.to(tl.int64)
 
     # Base Pointers
     conv_state_ptrs = (
