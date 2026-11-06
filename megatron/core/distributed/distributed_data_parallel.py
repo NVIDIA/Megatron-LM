@@ -111,7 +111,17 @@ class DistributedDataParallel(_BaseDataParallel):
     def _validate_config(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
-        """Validate model settings that depend on the data-parallel configuration."""
+        """Validate resolved buffer policy and model settings before wrapper setup."""
+        if ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            assert (
+                ddp_config.fp8_param_gather
+            ), "Reuse grad buffer only when keeping params in MXFP8."
+            if ddp_config.grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                )
+
         if config.moe_virtual_expert_load_balance and config.fp8:
             if not ddp_config.fp8_param_gather:
                 raise ValueError(

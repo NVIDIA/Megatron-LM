@@ -37,14 +37,15 @@ def test_invalid_buffer_reuse_is_rejected_before_ddp_setup(fp8_param_gather):
     error = ValueError if fp8_param_gather else AssertionError
     match = "Gradient-buffer offload" if fp8_param_gather else "Reuse grad buffer"
     ddp_config = DistributedDataParallelConfig(**kwargs)
+    ddp_config.finalize()
+    model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
     with pytest.raises(error, match=match):
-        ddp_config.finalize()
+        DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
 
     # Standalone callers can also edit the config after construction.
     ddp_config = DistributedDataParallelConfig()
     for name, value in kwargs.items():
         setattr(ddp_config, name, value)
-    model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
     with pytest.raises(error, match=match):
         DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
 
