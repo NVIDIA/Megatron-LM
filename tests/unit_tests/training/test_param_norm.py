@@ -472,7 +472,9 @@ def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
 
 
 @pytest.mark.parametrize("expert_parallel_size", (1, 2))
-def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expert_parallel_size):
+def test_layer_wise_param_norm_counts_owners_before_param_sync(
+    monkeypatch, run_config, expert_parallel_size
+):
     """Norms use updated owner weights while non-owner model copies remain stale."""
     from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
     from megatron.core.process_groups_config import ProcessGroupCollection
@@ -480,9 +482,7 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expe
     if Utils.world_size < 4 or Utils.world_size % 2 != 0:
         pytest.skip("test requires an even world size of at least four")
 
-    monkeypatch.setattr(
-        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=True)
-    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False))
     try:
         Utils.initialize_model_parallel(expert_model_parallel_size=expert_parallel_size)
         model = _build_tiny_moe_gpt(
@@ -491,6 +491,7 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expe
             expert_tensor_parallel_size=1,
             bf16=True,
         ).bfloat16()
+        run_config.model = GPTModelConfig(transformer=model.config, vocab_size=16)
         _fill_parameters_with_ones(model)
         expected_numel = sum(
             p.numel() * (1 if getattr(p, "allreduce", True) else expert_parallel_size)
