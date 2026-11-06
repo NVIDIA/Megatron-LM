@@ -496,6 +496,16 @@ class InferenceConfig:
     NOTE: Must remain mutually exclusive with the `TransformerConfig`.
     """
 
+    require_gpu_local_cpu_affinity: bool = False
+    """Validate CPU placement during dynamic inference engine initialization.
+
+    Checks the calling thread before graph warmup and all existing threads afterward.
+    Raises on non-local allowed CPUs or unavailable topology; never changes affinity.
+    Requires Linux and nvidia-ml-py. This is a deployment policy, not a performance
+    guarantee. Bind workers before initialization; later thread creation or affinity
+    changes require explicit revalidation. Does not affect training.
+    """
+
     # =================================
     # KV cache and Mamba states config
     # =================================
