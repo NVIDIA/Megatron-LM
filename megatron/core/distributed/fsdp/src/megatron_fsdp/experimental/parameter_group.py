@@ -201,7 +201,7 @@ class FsdpParameterGroup:
         # Building Parameter views requires live storage. Release temporary gather
         # storage afterward; replicated weights keep their persistent buffer.
         self.release_unsharded_storage()
-        self._switch_to_sharded_parameters()
+        self.bind_sharded_parameters()
 
     @staticmethod
     def _collect_parameter_metadata(
@@ -439,12 +439,13 @@ class FsdpParameterGroup:
             module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
-    def _switch_to_sharded_parameters(self) -> None:
+    def bind_sharded_parameters(self) -> None:
+        """Install sharded parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
-    def _switch_to_unsharded_parameters(self) -> None:
-        """Expose each FsdpParameter's unsharded Parameter on its owning module."""
+    def bind_unsharded_parameters(self) -> None:
+        """Install full parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
@@ -504,7 +505,7 @@ class FsdpParameterGroup:
         self._install_unsharded_parameters(
             rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
         )
-        self._switch_to_unsharded_parameters()
+        self.bind_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
         for ready_phase in ready_phases:
             self._unshard_events[ready_phase] = event
@@ -573,10 +574,6 @@ class FsdpParameterGroup:
                     rowwise=rowwise,
                     columnwise=columnwise,
                 )
-
-    def reshard_parameters(self) -> None:
-        """Install sharded DTensor parameters on the owning modules."""
-        self._switch_to_sharded_parameters()
 
     def release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
         """Release gathered weights, or only their MXFP8 rowwise planes.
