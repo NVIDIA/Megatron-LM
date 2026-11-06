@@ -103,6 +103,13 @@ class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 
 
+def _experimental_reached_eol(introduced_with_version: str, max_lifetime_minor: int) -> bool:
+    """Return True if an experimental API has outlived its allowed lifetime."""
+    introduced = PkgVersion(introduced_with_version)
+    current = PkgVersion(mcore_version)
+    return (introduced.major, introduced.minor + max_lifetime_minor) < (current.major, current.minor)
+
+
 def experimental_fn(introduced_with_version: str):
     """A decorator that marks a function as experimental.
     Experimental functions may change quickly and do not guarantee backwards
@@ -140,10 +147,7 @@ def experimental_fn(introduced_with_version: str):
             raise ImportError(
                 "packaging is not installed. Please install it with `pip install packaging`."
             )
-        if (
-            PkgVersion(introduced_with_version).minor + max_lifetime
-            < PkgVersion(mcore_version).minor
-        ):
+        if _experimental_reached_eol(introduced_with_version, max_lifetime):
             log_single_rank(
                 logger,
                 logging.WARNING,
@@ -207,10 +211,7 @@ def experimental_cls(introduced_with_version: str):
                 "packaging is not installed. Please install it with `pip install packaging`."
             )
 
-        if (
-            PkgVersion(introduced_with_version).minor + max_lifetime
-            < PkgVersion(mcore_version).minor
-        ):
+        if _experimental_reached_eol(introduced_with_version, max_lifetime):
             log_single_rank(
                 logger,
                 logging.WARNING,
