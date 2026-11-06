@@ -49,6 +49,8 @@ DEPENDENCIES:
 ENTRY:
   script: pretrain_hybrid.py
 ENV_VARS:
+  # cuTile uses SQLite; keep its compilation cache off shared home/NFS mounts.
+  CUDA_TILE_CACHE_DIR: /tmp/cutile-python
   TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True

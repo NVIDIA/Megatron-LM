@@ -214,3 +214,7 @@ Periodic Python garbage collection is disabled during this bounded benchmark;
 startup collection remains enabled.
 Historical throughput values belong to the previous recipe revisions and are
 not measurements of the refreshed configuration.
+
+The cuTile compilation cache is placed in node-local `/tmp` to avoid SQLite
+locking across ranks on a shared home directory. If the launcher overrides
+`CUDA_TILE_CACHE_DIR`, keep it on a node-local filesystem.
