@@ -237,3 +237,87 @@ Consumers must preserve image spans when splitting sequences, assemble fixed
 batches, materialize image plans and provide the model's positions, attention
 policy and modality metadata. Do not shift these labels again. Distributed MTP,
 image-aware packing and model integration require their own qualification.
+
+## Stream image-safe fixed-length sequences
+
+`PreparedStreamingTaskEncoder` extends the prepared-document encoder with
+pull-based sequence splitting and packing. It reuses the already shifted IDs,
+labels, loss mask and lazy image plans. It does not tokenize, expand images a
+second time, shift labels again, or read pixels while selecting packs.
+
+```python
+from examples.multimodal.data_loading.prepared_streaming import (
+    PreparedStreamingTaskEncoder,
+)
+
+encoder = PreparedStreamingTaskEncoder(
+    image_strategy=visual_only_strategy,
+    image_token_id=image_token_id,
+    eos_token_id=eos_token_id,
+    vocab_size=vocab_size,
+    image_token_budget=4096,
+    sequence_length=8192,
+    pad_token_id=pad_token_id,
+)
+from megatron.energon import WorkerConfig
+from megatron.energon.errors import reraise_exception
+
+worker_config = WorkerConfig(
+    rank=0, world_size=1, num_workers=0,
+    global_error_handler=reraise_exception,
+    restore_error_handler=reraise_exception,
+)
+dataset = get_train_dataset(
+    "recipe.yaml",
+    worker_config=worker_config,
+    task_encoder=encoder,
+    batch_size=None,
+    packing_buffer_size="stream",
+    shuffle_buffer_size=None,
+    max_samples_per_sequence=None,
+)
+loader = get_loader(dataset, cache_pool=NoCachePool())
+```
+
+The sequence length is a positive built-in integer. The padding ID must be in
+the vocabulary and differ from the structural image sentinel; it may equal EOS
+when that is the model's padding policy. IDs, labels, masks and image plans stay
+on CPU. Native streaming packing owns partial-sample buffering, restore keys and
+checkpoint advancement.
+
+The selector pulls only until a sequence is full, an image boundary blocks the
+next window, or the source ends. Windows use half-open positions in the
+expanded document. Cuts at an image start or end are valid; a cut inside the
+visual span is rejected. If the next image does not fit the remaining positions,
+the current sequence is padded and the complete image suffix is carried into
+the next sequence. An image whose visual span exceeds `sequence_length` raises
+an error; it is never resized, truncated or dropped by the packer. An exact
+image-end cut retains the previous visual input's already-shifted label for the
+following text token, even when that text appears in the next sequence.
+
+Each completed output is a `PackedPreparedDocument`. Its `valid_length` excludes
+padding, `fragment_offsets` mark each fragment's packed boundaries, and
+`fragments` record `(source_key, source_start, source_stop)` windows in original
+expanded positions. Image spans are rebased into the packed sequence, and the
+same lazy image-plan objects remain attached. Source metadata is retained across
+all fragments. Packing groups are isolated per loaded source so one packed
+sequence does not combine records from different recipe sources.
+
+Labels and masks are concatenated exactly as prepared; the packer does not make
+targets across document boundaries. IDs pad with `pad_token_id`, labels with
+`ignore_index`, and masks with zero. A completed pack with no eligible targets
+raises `ValueError`. This can occur when a fully masked document fragment fills
+a sequence by itself, even if a later fragment of that source document has
+eligible targets. An ordinary unmasked document can also leave an EOS-only final
+suffix: five positions split at length four leave a final EOS position with no
+lookahead. If this suffix is the last source input, its targetless pack is rejected.
+Use the fail-fast error handler shown above so errors cannot become skipped packs.
+A pack combining that fragment with any eligible fragment is
+valid. This explicit limitation prevents silently discarding input; the encoder
+does not implement an allow-fully-masked policy.
+
+Set `packing_buffer_size="stream"` to use this task encoder. `batch_size=None`
+keeps outputs as individual fixed-length samples; model-specific batching,
+attention/position policy, modality materialization and MIMO role wiring remain
+consumer responsibilities. The unbatched `PreparedDocumentTaskEncoder` path
+with packing disabled remains available unchanged.
