@@ -4,6 +4,7 @@
 
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import ClassVar
 
 import torch
@@ -16,6 +17,17 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 from megatron.core.process_groups_config import create_row_parallel_groups
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
+
+
+@lru_cache(maxsize=None)
+def _load_engram_config(path):
+    """Parse an Engram JSON file once per path and share the frozen result.
+
+    The startup config builds fill this cache, so the FLOPs estimate that runs every iteration
+    never opens the file during training. A failed open or parse is not cached.
+    """
+    with open(path, encoding='utf-8') as source:
+        return EngramConfig(**json.load(source))
 
 
 def configure_v41_args(args, kwargs):
@@ -42,8 +54,7 @@ def configure_v41_args(args, kwargs):
         raise ValueError('V4.1 uses its explicit static model spec; omit --spec')
     kwargs['experimental_attention_variant'] = 'dsv4_hybrid'
     if args.engram_config is not None:
-        with open(args.engram_config, encoding='utf-8') as source:
-            kwargs['engram_config'] = EngramConfig(**json.load(source))
+        kwargs['engram_config'] = _load_engram_config(args.engram_config)
         if args.engram_token_map is None:
             raise ValueError('--engram-config requires --engram-token-map')
 
@@ -225,8 +236,7 @@ def estimate_v41_training_flops(args, total_tokens, squared_lengths):
     # The args namespace keeps a path; the embedded transformer carries the dataclass.
     options = args.engram_config
     if isinstance(options, str):
-        with open(options, encoding='utf-8') as source:
-            options = EngramConfig(**json.load(source))
+        options = _load_engram_config(options)
     if options is not None:
         width = (options.max_ngram_size - 1) * options.n_heads * options.head_dim
         forward += len(options.layer_ids) * 2 * t * width * (n + 1) * h
