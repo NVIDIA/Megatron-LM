@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import fields
 
 import torch
@@ -12,16 +12,31 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 
 
-def map_batch_tensors(value, transform: Callable[[torch.Tensor], torch.Tensor]):
-    """Apply a transform to tensor leaves, including PackedSeqParams fields."""
+def map_batch_tensors(
+    value, transform: Callable[[torch.Tensor], torch.Tensor], *, preserve_keys: Collection[str] = ()
+):
+    """Transform tensor leaves, excluding subtrees under named dictionary keys.
+
+    ``PackedSeqParams`` tensor fields are included. The default transforms every
+    tensor; callers may preserve host metadata such as per-image sizes.
+    """
     if isinstance(value, torch.Tensor):
         return transform(value)
     if isinstance(value, dict):
-        return {key: map_batch_tensors(item, transform) for key, item in value.items()}
+        return {
+            key: (
+                item
+                if key in preserve_keys
+                else map_batch_tensors(item, transform, preserve_keys=preserve_keys)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [map_batch_tensors(item, transform) for item in value]
+        return [map_batch_tensors(item, transform, preserve_keys=preserve_keys) for item in value]
     if isinstance(value, tuple):
-        return tuple(map_batch_tensors(item, transform) for item in value)
+        return tuple(
+            map_batch_tensors(item, transform, preserve_keys=preserve_keys) for item in value
+        )
     if isinstance(value, PackedSeqParams):
         for field in fields(value):
             item = getattr(value, field.name)
@@ -31,5 +46,19 @@ def map_batch_tensors(value, transform: Callable[[torch.Tensor], torch.Tensor]):
 
 
 def move_batch_to_cuda(value):
-    """Move tensor leaves, including PackedSeqParams tensor fields, to CUDA."""
-    return map_batch_tensors(value, lambda tensor: tensor.cuda(non_blocking=True))
+    """Move model tensors to CUDA, retaining ``imgs_sizes`` host metadata.
+
+    Dynamic vision encoders read the CPU per-image sizes in Python. Attention
+    indices in ``PackedSeqParams`` still move to CUDA with pixels and token IDs.
+    Callers must supply ``imgs_sizes`` on CPU.
+    """
+    # Native ViT requires CPU imgs_sizes (PR #7363); Python grid reads would
+    # otherwise synchronize CUDA to the host, and the encoder rejects them.
+    # Pixels and packed-attention cu_seqlens belong on CUDA. Preserve that
+    # wrong-device error rather than silently repairing input with .cpu().
+    return map_batch_tensors(
+        value,
+        lambda tensor: tensor.cuda(non_blocking=True),
+        # Keep this exclusion: CUDA imgs_sizes crashes native dynamic ViT.
+        preserve_keys={"imgs_sizes"},
+    )
