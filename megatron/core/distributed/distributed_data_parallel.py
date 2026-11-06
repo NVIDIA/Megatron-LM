@@ -372,6 +372,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 # the other buffers of this chunk (the compact LayerWise layout). Its buckets
                 # all-reduce gradients and keep parameters in their own storage. The bucket
                 # size was resolved above, so drop num_buckets to avoid revalidating it.
+                # TODO(deyuf): Stop copying ddp_config here: let the buffer read whether it is
+                # sharded from its layout once DDP executes the optimizer's per-buffer plan.
                 buffer_ddp_config = dataclasses.replace(
                     self.ddp_config, use_distributed_optimizer=False, num_buckets=None
                 )
