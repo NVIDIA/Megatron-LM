@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd, _apply_boundary
+from megatron.core.fusions.wide_residual_shortcut.api import (
+    PendingWideResidualWrites,
+    _apply_boundary,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
@@ -443,8 +446,24 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
     )
 
 
-# Fused residual seams: a layer with ``defers_residual_write`` returns its write as a
-# PendingShortcutAdd, which the next layer applies with its own read and RMSNorm in one kernel.
+# Fused residual seams: a layer's last write is a DeferredWrite linked to the next layer's
+# WriteReadNorm. The DeferredWrite hands its write to that (empty) read instead of applying it, and
+# the read takes it and applies it with its read and RMSNorm in one kernel.
+
+
+def put_pending_write(read: nn.Module, item) -> None:
+    """Hand ``item`` (PendingWideResidualWrites or SeamInput) to the empty ``read``."""
+    if read.pending is not None:
+        raise RuntimeError("a deferred residual write for this read was not applied")
+    read.pending = item
+
+
+def take_pending_write(read: nn.Module):
+    """Take the write handed to ``read``, leaving it empty."""
+    item, read.pending = read.pending, None
+    if item is None:
+        raise RuntimeError("no deferred residual write was handed to this fused read")
+    return item
 
 
 @dataclass(frozen=True)
@@ -455,59 +474,128 @@ class SeamInput:
     branch_input: Tensor
 
 
-def is_fusable_rmsnorm(norm: nn.Module) -> bool:
-    """Whether ``norm`` is a standalone, bias-free, ordinary RMSNorm the seam kernels can apply."""
-    import transformer_engine.pytorch as te
+class WriteReadNorm(nn.Module):
+    """Applies the previous layer's pending residual write, then this layer's read and RMSNorm, in
+    one fused kernel; owns the read logits and the norm weight.
 
-    return (
-        isinstance(norm, (nn.RMSNorm, te.RMSNorm))
-        and getattr(norm, "eps", None) is not None
-        and getattr(norm, "bias", None) is None
-        and not getattr(norm, "zero_centered_gamma", False)
-    )
+    A fused layer spec selects this as the layer's read connection (with an identity input norm);
+    its predecessor's DeferredWrite always hands its write here, and the tensor this read is called
+    with is only that write's unwritten input residual. Reader zero is MXFP8 for an eligible
+    consumer, otherwise BF16. A SeamInput (a fused shortcut block's two-reader kernel already
+    applied the write) passes through. Returns ``(branch_input, (residual,))`` like a
+    residual-connection read.
+    """
+
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        del layer_number, branch_name
+        super().__init__()
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+        device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
+        self.weight = nn.Parameter(
+            torch.ones(config.hidden_size, dtype=config.params_dtype, device=device)
+        )
+        setattr(self.weight, "sequence_parallel", config.sequence_parallel)
+        self.eps = config.layernorm_epsilon
+        self.num_streams = config.wide_residual.num_streams
+        self.residual_stream_hidden_size = self.num_streams * config.hidden_size
+        self.branch_hidden_size = config.hidden_size
+        # (branch, input projection) that may consume reader zero as MXFP8; set by the layer.
+        self.consumer = None
+        # The write handed here by the previous layer's DeferredWrite, until this read takes it.
+        self.pending = None
+
+    def forward(self, hidden_states, *, fp32_residual_connection=False, branch_input_dtype=None):
+        """Apply the write handed to this read with this read and norm."""
+        # The kernel keeps the residual's dtype; ``hidden_states`` is the unwritten input residual.
+        del hidden_states, fp32_residual_connection, branch_input_dtype
+        item = take_pending_write(self)
+        if isinstance(item, SeamInput):
+            return item.branch_input, (item.residual,)
+        residual, branch_input = apply_pending_write(
+            item, (self,), (self.weight,), self.eps, self.consumer
+        )
+        return branch_input, (residual,)
+
+    def apply_with(self, read, norm) -> tuple[Tensor, Tensor]:
+        """Run a fused shortcut block's two-reader seam: apply the write handed to this read with
+        this read/norm and the block's shortcut ``read``/``norm`` in one kernel.
+
+        This read's own call then returns its normalized input. Returns ``(residual,
+        shortcut_input)``.
+        """
+        pending = take_pending_write(self)
+        gammas = (hooked_weight(self), hooked_weight(norm))  # neither module is called
+        residual, branch_input, shortcut_input = apply_pending_write(
+            pending, (self, read), gammas, self.eps, self.consumer
+        )
+        put_pending_write(self, SeamInput(residual, branch_input))
+        return residual, shortcut_input
+
+    @staticmethod
+    def residual_stream(state) -> Tensor:
+        """The carried residual stream of a read's state."""
+        return state[0]
 
 
-def fuses_lone_seams(layer: nn.Module, norm: nn.Module) -> bool:
-    """Whether neighbouring seam kernels may apply a lone layer's input read and residual write."""
-    return (
-        layer.config.moe_shortcut_wide_residual_norm_fusion
-        and is_fusable_rmsnorm(norm)
-        # A CUDA-graph runner cannot pass a PendingShortcutAdd, so graphed layers keep their seams.
-        and getattr(layer, "cudagraph_manager", None) is None
-        and layer.config.cuda_graph_impl != "transformer_engine"
-    )
+class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
+    """A residual write that its linked WriteReadNorm (the next layer's read) applies in its fused
+    kernel. Returns the unwritten input residual; only that read may consume it.
+
+    A fused layer spec selects this as every write but the stack's last; the stack links each one
+    to its successor's read (``link``).
+    """
+
+    target: nn.Module | None = None
+
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        super().__init__(config, layer_number, branch_name, operation="write")
+
+    def link(self, target: nn.Module) -> None:
+        """Hand this write to ``target``, the next layer's read (a reference, not a submodule)."""
+        object.__setattr__(self, "target", target)
+
+    def forward(  # pylint: disable=arguments-differ
+        self, branch_output, *, state, dropout_probability, training, shared=None
+    ):
+        """Hand this write (plus an optional shared-expert update: a shortcut add) to the target
+        read; return the unwritten residual."""
+        del dropout_probability, training  # fusion requires hidden_dropout == 0
+        put_pending_write(self.target, defer_write(state[0], branch_output, self, shared))
+        return state[0]
 
 
 def defer_write(residual: Tensor, branch_output, write, shared: Tensor | None = None):
-    """A branch's residual write as a PendingShortcutAdd, plus an optional shared-expert update."""
+    """A branch's residual write as PendingWideResidualWrites (plus an optional shared update)."""
     update, bias = branch_output
     if bias is not None:
         raise ValueError("fused residual seams require a bias-free branch projection")
     retain = None if write.retention is None else write.retention(return_logits=True)
-    return PendingShortcutAdd(residual, update, shared, write.write_map(return_logits=True), retain)
+    return PendingWideResidualWrites(
+        residual, update, shared, write.write_map(return_logits=True), retain
+    )
 
 
-def _fused_norm_weight(norm: nn.Module) -> Tensor:
-    """``norm.weight`` after the forward pre-hooks calling ``norm`` would run (DDP's overlapped
-    parameter all-gather waits for the weight in such a hook)."""
-    for hook_id, hook in tuple(norm._forward_pre_hooks.items()):
-        if hook_id in norm._forward_pre_hooks_with_kwargs:
-            hook(norm, (), {})
+def hooked_weight(module: nn.Module) -> Tensor:
+    """``module.weight`` after the forward pre-hooks calling ``module`` would run (DDP's overlapped
+    parameter all-gather waits for the weight there), for norms a kernel applies uncalled."""
+    for hook_id, hook in tuple(module._forward_pre_hooks.items()):
+        if hook_id in module._forward_pre_hooks_with_kwargs:
+            hook(module, (), {})
         else:
-            hook(norm, ())
-    return norm.weight
+            hook(module, ())
+    return module.weight
 
 
-def apply_pending_write(pending, reads, norms, consumer=None):
-    """Write ``pending`` and return ``(residual, *norm(read(residual)))`` from one fused kernel;
+def apply_pending_write(pending, reads, gammas, epsilon, consumer=None):
+    """Write ``pending`` and return ``(residual, *rmsnorm(read(residual)))`` from one fused kernel;
     reader zero goes as MXFP8 to the ``(branch, input projection)`` ``consumer`` if eligible."""
     # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
     # gradients enabled.
     with torch.no_grad() if InferenceMode.is_active() else nullcontext():
-        return _apply_pending_write(pending, reads, norms, consumer)
+        return _apply_pending_write(pending, reads, gammas, epsilon, consumer)
 
 
-def _apply_pending_write(pending, reads, norms, consumer):
+def _apply_pending_write(pending, reads, gammas, epsilon, consumer):
     from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
     streams = reads[0].num_streams
@@ -534,7 +622,6 @@ def _apply_pending_write(pending, reads, norms, consumer):
                 "finalization; disable gdp_in_proj recompute or use a BF16 handoff"
             )
     logits = tuple(read.read_map(return_logits=True) for read in reads)
-    gammas = tuple(_fused_norm_weight(norm) for norm in norms)
     return _apply_boundary(
-        pending, logits, gammas, mxfp8_consumer=linear, num_streams=streams, epsilon=norms[0].eps
+        pending, logits, gammas, mxfp8_consumer=linear, num_streams=streams, epsilon=epsilon
     )

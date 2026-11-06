@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 import transformer_engine as te
 
 from megatron.core.fusions.wide_residual_shortcut import (
-    PendingShortcutAdd,
+    PendingWideResidualWrites,
     forward_kernel,
     kernel_utils,
     mxfp8_handoff,
@@ -22,6 +23,8 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
+    _first_read,
+    _last_write,
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -31,9 +34,12 @@ from megatron.core.transformer.residual_recompute import build_residual_stream_r
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import (
+    DeferredWrite,
     StreamwiseSigmoidWideResidualConnection,
+    WriteReadNorm,
     apply_pending_write,
-    is_fusable_rmsnorm,
+    put_pending_write,
+    take_pending_write,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
@@ -857,13 +863,29 @@ def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, **overri
     return model.cuda()
 
 
-def _unfuse(model):
-    """Run every seam unfused (ordinary reads, norms and writes) with the same weights."""
-    for module in model.modules():
-        if hasattr(module, "defers_residual_write"):
-            module.defers_residual_write = False
-        if isinstance(module, ShortcutMoEBlock):
-            module.fuses_residual_seams = False
+def _unfused_names(model):
+    """Map the fused model's parameter names to the unfused model's, through the fusion specs'
+    sharded checkpoint key maps (the moved norm weights keep their unfused checkpoint keys)."""
+    renames = {}
+    for prefix, module in model.named_modules():
+        keys_map = getattr(
+            getattr(module, "submodules_config", None), "sharded_state_dict_keys_map", {}
+        )
+        renames.update({f"{prefix}.{src}": f"{prefix}.{dst}" for src, dst in keys_map.items()})
+    return {name: renames.get(name, name) for name in model.state_dict()}
+
+
+def _unfused_twin(model, pattern, mixer="mamba", hidden=3072, optimized=False, **overrides):
+    """The same model built without fusion, holding the fused model's weights."""
+    twin = _hybrid_model(
+        pattern, mixer, hidden, optimized, moe_shortcut_wide_residual_norm_fusion=False, **overrides
+    )
+    state = {
+        twin_name: model.state_dict()[name] for name, twin_name in _unfused_names(model).items()
+    }
+    missing, unexpected = twin.load_state_dict(state, strict=False)
+    assert not unexpected and all(name.endswith("_extra_state") for name in missing), missing
+    return twin.train(model.training)
 
 
 def _static_prefill_decode(model):
@@ -943,8 +965,8 @@ INFERENCE_CASES = [
     ("MMEME", "mamba", [1, 1, 2, 1]),
     ("M-MMEMEM-M-", "mamba", [1, 1, 1, 1, 2, 1, 2, 1, 1, 1]),
     ("M-MEMMEM-M-", "mamba", [1, 1, 1, 2, 1, 1, 2, 1, 1, 1]),
-    # A lone attention layer keeps its seams: M -> * and * -> [ME] stay unfused.
-    ("M*MEME", "mamba", [1, 2, 1]),
+    # A lone attention layer chains too: M -> * and * -> [ME] fuse.
+    ("M*MEME", "mamba", [1, 1, 1, 2, 1]),
     # An attention compute layer inside a block; the lone Mamba write enters its two-reader seam.
     ("M*EME", "mamba", [1, 1, 2, 1]),
 ]
@@ -957,7 +979,8 @@ INFERENCE_CASES = [
     + [("MEME", "mamba", [1, 2, 1], False, False, 256, True)]
     + [("M-MMEMEM-M-", "mamba", INFERENCE_CASES[4][2], False, False, 3072, False)]
     + [
-        (p + "*", mixer, [1, 2, 1], True, optimized, 3072, True)
+        # The last block's shortcut add fuses into the lone attention layer's read.
+        (p + "*", mixer, [1, 2, 1, 2], True, optimized, 3072, True)
         for p, mixer in (("MEME", "mamba"), ("MEME", "gdp"), ("GEGE", "gdn"))
         for optimized in (False, True)
     ],
@@ -970,6 +993,9 @@ def test_fused_seams_inference_matches_unfused(
     model = _hybrid_model(
         pattern, mixer, hidden, optimized, fp32_residual_connection=fp32_residual
     ).eval()
+    twin = _unfused_twin(
+        model, pattern, mixer, hidden, optimized, fp32_residual_connection=fp32_residual
+    )
     execute = _dynamic_prefill_decode if dynamic else _static_prefill_decode
     launch, calls = forward_kernel.forward, []  # each fused launch's update count
     monkeypatch.setattr(
@@ -981,9 +1007,8 @@ def test_fused_seams_inference_matches_unfused(
         torch.manual_seed(1)
         fused = execute(model)
         assert calls == launches * 4
-        _unfuse(model)
         torch.manual_seed(1)
-        unfused = execute(model)
+        unfused = execute(twin)
     assert len(calls) == len(launches) * 4  # the unfused model launches no fused kernel
     for a, b in zip(fused, unfused, strict=True):
         # The fused reader norms the unrounded FP32 mix; the unfused read rounds to BF16 first.
@@ -997,7 +1022,7 @@ def test_fused_seams_inference_matches_unfused(
         ("M-MMEMEM-M-", "mamba", True, 2),
         ("M-MEMMEM-M-", "mamba", False, 4),
         ("MEME", "gdp", True, 2),
-        ("GE*E", "gdn", True, 3),
+        ("*GE-*E", "gdn", True, 3),
     ],
 )
 @REQUIRES_FUSED_BACKWARD
@@ -1006,9 +1031,9 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
     parameter gradients within BF16 noise. The kernels apply each norm's epsilon and run its
     forward pre-hooks (DDP's overlapped parameter all-gather waits there), and checkpoint replay
     every ``interval`` layers reproduces outputs and gradients bit for bit."""
-    model = _hybrid_model(
-        pattern, mixer, fp32_residual_connection=fp32_residual, layernorm_epsilon=1e-6
-    ).train()
+    options = dict(fp32_residual_connection=fp32_residual, layernorm_epsilon=1e-6)
+    model = _hybrid_model(pattern, mixer, **options).train()
+    twin = _unfused_twin(model, pattern, mixer, **options)
     launch, epsilons = forward_kernel.forward, set()
     monkeypatch.setattr(
         forward_kernel, "forward", lambda *a, **k: epsilons.add(k["epsilon"]) or launch(*a, **k)
@@ -1017,31 +1042,37 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
     monkeypatch.setattr(
         replay_kernel, "replay_interval", lambda *a, **k: replays.append(1) or replay(*a, **k)
     )
-    norms = {n: m for n, m in model.decoder.named_modules() if is_fusable_rmsnorm(m)}
+    norms = {
+        n: m
+        for n, m in model.decoder.named_modules()
+        if isinstance(m, (te.pytorch.RMSNorm, WriteReadNorm))
+    }
     hooked = set()
     for name, norm in norms.items():
         norm.register_forward_pre_hook(lambda m, args, name=name: hooked.add(name))
     ids = torch.randint(0, 128, (1, 1024), device="cuda")
     positions = torch.arange(1024, device="cuda")[None]
 
-    def step(replay_interval=None):
+    def step(model, replay_interval=None):
         model.config.residual_stream_recompute_num_layers = replay_interval
         model.zero_grad(set_to_none=True)
         logits = model(ids, positions, None)
         logits.float().square().mean().backward()
-        grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        names = _unfused_names(model)  # compare gradients under the unfused names
+        grads = {
+            names[n]: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+        }
         return logits.detach(), grads
 
-    fused = step()
+    fused = step(model)
     assert epsilons == {1e-6} and hooked == set(norms) and not replays
-    replayed = step(interval)
+    replayed = step(model, interval)
     assert replays and torch.equal(replayed[0], fused[0])
     assert replayed[1].keys() == fused[1].keys()
     assert all(bytes_equal(g, fused[1][n]) for n, g in replayed[1].items())
-    _unfuse(model)
-    unfused = step()
-    hook = model.embedding.register_forward_hook(lambda module, args, out: out * (1 + 2**-7))
-    perturbed = step()
+    unfused = step(twin)
+    hook = twin.embedding.register_forward_hook(lambda module, args, out: out * (1 + 2**-7))
+    perturbed = step(twin)
     hook.remove()
 
     def deviation(run):
@@ -1077,6 +1108,14 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
         ({"add_bias_linear": True}, "add_bias_linear"),
         ({"wide_residual": WideResidualConfig(num_streams=7)}, "num_streams"),
         ({"residual_stream_recompute_num_layers": 2, "cuda_graph_impl": "local"}, "CUDA graphs"),
+        (
+            {
+                "cuda_graph_impl": "local",
+                "inference_cuda_graph_scope": "block",
+                "cuda_graph_modules": ["mamba"],
+            },
+            "per-layer CUDA graphs",
+        ),
     ],
 )
 def test_fusion_rejects_unsupported_config(overrides, message):
@@ -1100,6 +1139,33 @@ def test_fusion_spec_keeps_sharded_checkpoint_keys():
     fused = specs.shortcut_fusion_stack_spec(specs.wide_residual_hybrid_stack_spec)
     assert fused is specs.wide_residual_shortcut_fusion_stack_spec
     assert specs.shortcut_fusion_stack_spec(fused) is fused  # fusion and custom specs unchanged
+
+
+@pytest.mark.usefixtures("model_parallel")
+def test_fusion_spec_links_every_seam(monkeypatch):
+    """Every write but the last defers to the next layer's fused read and every read but the first
+    is fused; a stack with an unfused layer (e.g. MLA, DSA or CSA) or only one layer is rejected."""
+    model = _hybrid_model("M-*EME-", hidden=256)
+    layers = []
+    for layer in model.decoder.layers:
+        is_block = isinstance(layer, ShortcutMoEBlock)
+        layers += [layer.compute_layer, layer.moe_layer] if is_block else [layer]
+    reads = [_first_read(layer) for layer in layers]
+    writes = [_last_write(layer) for layer in layers]
+    assert not isinstance(reads[0], WriteReadNorm)
+    assert all(isinstance(read, WriteReadNorm) for read in reads[1:])
+    assert all(write.target is read for write, read in zip(writes, reads[1:]))
+    assert type(writes[-1]) is StreamwiseSigmoidWideResidualConnection
+
+    fused = specs.wide_residual_shortcut_fusion_stack_spec
+    stock_mamba = specs.wide_residual_hybrid_stack_spec.submodules.mamba_layer
+    unfused_mamba = replace(fused, submodules=replace(fused.submodules, mamba_layer=stock_mamba))
+    monkeypatch.setattr(specs, "shortcut_fusion_stack_spec", lambda spec: unfused_mamba)
+    with pytest.raises(ValueError, match="fused type"):
+        _hybrid_model("-M-", hidden=256)
+    monkeypatch.setattr(specs, "shortcut_fusion_stack_spec", lambda spec: fused)
+    with pytest.raises(ValueError, match="at least two layers"):
+        _hybrid_model("M", hidden=256)
 
 
 @pytest.mark.parametrize(
@@ -1126,11 +1192,38 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, recompute, offload, gtp, e
         config=SimpleNamespace(fine_grained_activation_offloading=offload),
     )
     read = SimpleNamespace(num_streams=3, read_map=lambda return_logits: None)
-    pending = PendingShortcutAdd(None, None, None, None, None)
-    call = lambda: apply_pending_write(pending, (read,), (torch.nn.RMSNorm(8),), (branch, linear))
+    pending = PendingWideResidualWrites(None, None, None, None, None)
+    call = lambda: apply_pending_write(pending, (read,), (None,), 1e-5, (branch, linear))
     if expected not in ("linear", None):
         with pytest.raises(ValueError, match=expected):
             call()
     else:
         call()
         assert seen == [linear if expected else None]
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("training", [False, True])
+def test_deferred_writes_are_consumed_within_one_forward(training):
+    """A deferred write goes only to an empty read and is taken exactly once; a forward leaves
+    every fused read empty (no residual or branch tensors held across forwards)."""
+    read = SimpleNamespace(pending=None)
+    put_pending_write(read, "write")
+    with pytest.raises(RuntimeError, match="not applied"):
+        put_pending_write(read, "again")
+    assert take_pending_write(read) == "write" and read.pending is None
+    with pytest.raises(RuntimeError, match="no deferred residual write"):
+        take_pending_write(read)
+
+    model = _hybrid_model("M-*E-ME", hidden=256).train(training)
+    tokens = 1024 if training else 64  # training seams need a multiple of 1024 tokens
+    ids = torch.randint(0, 128, (1, tokens), device="cuda")
+    positions = torch.arange(tokens, device="cuda")
+    reads = [m for m in model.modules() if isinstance(m, WriteReadNorm)]
+    assert reads
+    for _ in range(2):
+        with torch.set_grad_enabled(training):
+            out = model(ids, positions[None], None)
+        assert all(r.pending is None for r in reads)
+    if training:
+        out.float().sum().backward()

@@ -177,7 +177,7 @@ def _apply_boundary(
 
 
 @dataclass(frozen=True)
-class PendingShortcutAdd:
+class PendingWideResidualWrites:
     """A branch output not yet written to the wide residual.
 
     The next seam kernel writes it together with that layer's read/RMSNorm(s). A MoE output is

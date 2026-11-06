@@ -75,6 +75,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
 )
+from megatron.core.transformer.wide_residual import DeferredWrite, WriteReadNorm
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 
 # This should be private and should not be used outside of this file.
@@ -688,80 +689,107 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 )
 
 
-def _split_input_norms(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Split the input norms the fused seam kernels apply out of their projections; sharded
-    checkpoints keep the fused-projection keys."""
-    unfused = {
-        TELayerNormColumnParallelLinear: TEColumnParallelLinear,
-        InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
-    }
-    layers = {}
-    for name, branch_name, norm_name, projection_name in (
-        ("mamba_layer", "mixer", "norm", "in_proj"),
-        ("gdn_layer", "self_attention", "input_layernorm", "in_proj"),
-        ("gdn2_layer", "self_attention", "input_layernorm", "in_proj"),
-        ("attention_layer", "self_attention", "input_layernorm", "linear_qkv"),
-        ("mlp_layer", "mlp", "pre_mlp_layernorm", "linear_fc1"),
-    ):
-        spec = getattr(stack_spec.submodules, name)
-        branch = getattr(getattr(spec, "submodules", None), branch_name, None)
+# --moe-shortcut-wide-residual-norm-fusion: each layer's residual write is deferred to the next
+# layer's read, which applies it with its read and input RMSNorm in one kernel (the read owns the
+# norm weight, under the norm's original checkpoint key). Per fused layer: the norm slot, its
+# branch and the input projection the norm was fused into (None: a standalone MoE pre-MLP norm).
+_FUSED_SEAM_LAYERS = {
+    "mamba_layer": ("norm", "mixer", "in_proj"),
+    "gdn_layer": ("input_layernorm", "self_attention", "in_proj"),
+    "gdn2_layer": ("input_layernorm", "self_attention", "in_proj"),
+    "attention_layer": ("input_layernorm", "self_attention", "linear_qkv"),
+    "mlp_layer": ("pre_mlp_layernorm", "mlp", "linear_fc1"),
+    "moe_layer": ("pre_mlp_layernorm", "mlp", None),
+}
+# The connections reading and writing for each norm slot's branch.
+_SEAM_CONNECTIONS = {
+    "norm": ("residual_read", "residual_write"),
+    "input_layernorm": ("residual_read_self_attn", "residual_write_self_attn"),
+    "pre_mlp_layernorm": ("residual_read_mlp", "residual_write_mlp"),
+}
+_UNFUSED_PROJECTIONS = {
+    TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+    InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+}
+
+
+def _fused_read_layer(spec: ModuleSpec, norm_name: str, branch_name: str, projection_name):
+    """``spec`` with its input norm moved into a WriteReadNorm read."""
+    submodules = spec.submodules
+    read = _SEAM_CONNECTIONS[norm_name][0]
+    changes = {norm_name: IdentityOp}
+    if projection_name is None:
+        norm_key = f"{norm_name}.weight"
+    else:
+        branch = getattr(submodules, branch_name)
         # The MLP branch is a partial(MLP.as_mlp_submodule, submodules=...).
-        branch_submodules = (
-            branch.keywords.get("submodules")
-            if isinstance(branch, partial)
-            else getattr(branch, "submodules", None)
-        )
-        projection = unfused.get(getattr(branch_submodules, projection_name, None))
-        if projection is None:
-            continue
+        is_partial = isinstance(branch, partial)
+        branch_submodules = branch.keywords["submodules"] if is_partial else branch.submodules
+        projection = _UNFUSED_PROJECTIONS[getattr(branch_submodules, projection_name)]
         branch_submodules = replace(branch_submodules, **{projection_name: projection})
-        if isinstance(branch, partial):
+        if is_partial:
             branch = partial(branch.func, *branch.args, **branch.keywords)
             branch.keywords["submodules"] = branch_submodules
         else:
             branch = replace(branch, submodules=branch_submodules)
-        keys = dict(spec.submodules.sharded_state_dict_keys_map)
-        keys[f"{norm_name}."] = f"{branch_name}.{projection_name}.layer_norm_"
-        layers[name] = replace(
-            spec,
-            submodules=replace(
-                spec.submodules,
-                **{branch_name: branch, norm_name: TENorm},
-                sharded_state_dict_keys_map=keys,
-            ),
-        )
-    return replace(stack_spec, submodules=replace(stack_spec.submodules, **layers))
+        changes[branch_name] = branch
+        norm_key = f"{branch_name}.{projection_name}.layer_norm_weight"
+    keys = {**submodules.sharded_state_dict_keys_map, f"{read}.weight": norm_key}
+    return replace(
+        spec,
+        submodules=replace(submodules, **changes, sharded_state_dict_keys_map=keys),
+        params={**spec.params, read: WriteReadNorm},
+    )
 
 
-# Stacks for --moe-shortcut-wide-residual-norm-fusion (select with shortcut_fusion_stack_spec).
-wide_residual_shortcut_fusion_stack_spec = _split_input_norms(wide_residual_hybrid_stack_spec)
-wide_residual_shortcut_fusion_gdp_stack_spec = _split_input_norms(
+def _fuse_residual_seams(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Every read fused but the first layer's, every write deferred but the last layer's (other
+    layer types stay unfused and are rejected when the stack is built)."""
+    submodules = stack_spec.submodules
+    middle, first, last = {}, {}, {}
+    for name, (norm_name, branch_name, projection_name) in _FUSED_SEAM_LAYERS.items():
+        spec = getattr(submodules, name)
+        deferred_write = {_SEAM_CONNECTIONS[norm_name][1]: DeferredWrite}
+        last[name] = _fused_read_layer(spec, norm_name, branch_name, projection_name)
+        middle[name] = replace(last[name], params={**last[name].params, **deferred_write})
+        first[name] = replace(spec, params={**spec.params, **deferred_write})
+    return replace(
+        stack_spec,
+        submodules=replace(
+            submodules,
+            **middle,
+            first_layer_submodules=replace(submodules, **first),
+            last_layer_submodules=replace(submodules, **last),
+        ),
+    )
+
+
+wide_residual_shortcut_fusion_stack_spec = _fuse_residual_seams(wide_residual_hybrid_stack_spec)
+wide_residual_shortcut_fusion_gdp_stack_spec = _fuse_residual_seams(
     wide_residual_gated_delta_product_stack_spec
 )
-wide_residual_shortcut_fusion_inference_stack_spec = _split_input_norms(
+wide_residual_shortcut_fusion_inference_stack_spec = _fuse_residual_seams(
     wide_residual_hybrid_inference_stack_spec
 )
-wide_residual_shortcut_fusion_gdp_inference_stack_spec = _split_input_norms(
+wide_residual_shortcut_fusion_gdp_inference_stack_spec = _fuse_residual_seams(
     wide_residual_gated_delta_product_inference_stack_spec
 )
-_SHORTCUT_FUSION_STACK_SPECS = (
-    (wide_residual_hybrid_stack_spec, wide_residual_shortcut_fusion_stack_spec),
-    (wide_residual_gated_delta_product_stack_spec, wide_residual_shortcut_fusion_gdp_stack_spec),
-    (wide_residual_hybrid_inference_stack_spec, wide_residual_shortcut_fusion_inference_stack_spec),
-    (
-        wide_residual_gated_delta_product_inference_stack_spec,
-        wide_residual_shortcut_fusion_gdp_inference_stack_spec,
+_SHORTCUT_FUSION_STACK_SPECS = {
+    id(wide_residual_hybrid_stack_spec): wide_residual_shortcut_fusion_stack_spec,
+    id(wide_residual_gated_delta_product_stack_spec): wide_residual_shortcut_fusion_gdp_stack_spec,
+    id(wide_residual_hybrid_inference_stack_spec): (
+        wide_residual_shortcut_fusion_inference_stack_spec
     ),
-)
+    id(wide_residual_gated_delta_product_inference_stack_spec): (
+        wide_residual_shortcut_fusion_gdp_inference_stack_spec
+    ),
+}
 
 
 def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
     """The shortcut-fusion counterpart of a built-in wide-residual stack spec, else ``stack_spec``
-    (custom specs must split the fused input norms themselves)."""
-    for wide, fused in _SHORTCUT_FUSION_STACK_SPECS:
-        if stack_spec is wide:
-            return fused
-    return stack_spec
+    (custom specs must fuse their residual seams themselves)."""
+    return _SHORTCUT_FUSION_STACK_SPECS.get(id(stack_spec), stack_spec)
 
 
 # Backward-compatible aliases

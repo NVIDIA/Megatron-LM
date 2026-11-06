@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
+from functools import partial
+
 from torch import Tensor
 
-from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
@@ -18,11 +19,7 @@ from megatron.core.transformer.residual_recompute import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
-    SeamInput,
     StreamwiseSigmoidWideResidualConnection,
-    apply_pending_write,
-    defer_write,
-    fuses_lone_seams,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -32,8 +29,6 @@ class WideResidualMambaLayer(MambaLayer):
     """Mamba layer carrying a wide stream around its ordinary-width mixer."""
 
     supports_wide_residual_connections: bool = True
-    # Fused residual seams (see wide_residual.py): set when the next layer applies this write.
-    defers_residual_write: bool = False
 
     def __init__(
         self,
@@ -44,7 +39,11 @@ class WideResidualMambaLayer(MambaLayer):
         pp_layer_offset: int = 0,
         name: str | None = None,
         is_mtp_layer: bool = False,
+        residual_read=partial(StreamwiseSigmoidWideResidualConnection, operation="read"),
+        residual_write=partial(StreamwiseSigmoidWideResidualConnection, operation="write"),
     ) -> None:
+        """``residual_read``/``residual_write`` build the connections; a fused spec selects
+        WriteReadNorm/DeferredWrite."""
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width MambaLayer, not "
@@ -68,12 +67,8 @@ class WideResidualMambaLayer(MambaLayer):
                 "returns its own residual."
             )
 
-        self.residual_read = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", operation="read"
-        )
-        self.residual_write = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", operation="write"
-        )
+        self.residual_read = residual_read(config, self.layer_number, "mamba")
+        self.residual_write = residual_write(config, self.layer_number, "mamba")
         self.register_load_state_dict_pre_hook(load_residual_state)
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size
@@ -91,15 +86,6 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
-    @property
-    def fuses_residual_seams(self) -> bool:
-        """Whether neighbouring seam kernels may apply this lone layer's read and write."""
-        return fuses_lone_seams(self, self.norm)
-
-    def seam_read(self):
-        """The read, RMSNorm and MXFP8 consumer a fused shortcut block applies for this layer."""
-        return self.residual_read, self.norm, (self.mixer, getattr(self.mixer, "in_proj", None))
-
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""
 
@@ -112,13 +98,6 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> tuple[ResidualBranchInput[ResidualConnectionState], ResidualStreamRecomputeContext | None]:
         """Read the wide stream and optionally replay its connected input normalization."""
 
-        if isinstance(hidden_states, SeamInput):
-            return ResidualBranchInput(hidden_states.branch_input, (hidden_states.residual,)), None
-        if isinstance(hidden_states, PendingShortcutAdd):
-            residual, branch_input = apply_pending_write(
-                hidden_states, (self.residual_read,), (self.norm,)
-            )
-            return ResidualBranchInput(branch_input, (residual,)), None
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
             hidden_states, connection_state = apply_module(self.residual_read)(
@@ -154,8 +133,6 @@ class WideResidualMambaLayer(MambaLayer):
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        if self.defers_residual_write:
-            return defer_write(state[0], mixer_out_with_bias, self.residual_write)
         if recompute_context is not None and not recompute_context.is_block_end:
             return checkpoint_residual_write(
                 self.residual_write,

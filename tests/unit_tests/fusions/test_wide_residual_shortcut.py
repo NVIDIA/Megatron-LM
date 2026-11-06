@@ -22,7 +22,7 @@ import triton.language as tl
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from megatron.core.fusions.wide_residual_shortcut import (
-    PendingShortcutAdd,
+    PendingWideResidualWrites,
     api,
     backward_kernel,
     forward_kernel,
@@ -125,7 +125,7 @@ def run(raw, streams=3, epsilon=1e-5, **options):
     residual, updates, controllers, gammas = raw
     options.update(num_streams=streams, epsilon=epsilon)
     shared = updates[1] if len(updates) == 2 else None
-    pending = PendingShortcutAdd(residual, updates[0], shared, *controllers[:2])
+    pending = PendingWideResidualWrites(residual, updates[0], shared, *controllers[:2])
     if len(gammas) == 1:
         return shortcut_add_wide_residual_write_read_rmsnorm_quant(
             pending, controllers[2], gammas[0], **options

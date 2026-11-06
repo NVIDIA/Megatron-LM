@@ -2,13 +2,13 @@
 """Fused wide-residual shortcut boundaries with call-local autograd state."""
 
 from .api import (
-    PendingShortcutAdd,
+    PendingWideResidualWrites,
     shortcut_add_wide_residual_write_read_rmsnorm_quant,
     shortcut_add_wide_residual_write_two_reader_rmsnorm_quant,
 )
 
 __all__ = [
-    "PendingShortcutAdd",
+    "PendingWideResidualWrites",
     "shortcut_add_wide_residual_write_read_rmsnorm_quant",
     "shortcut_add_wide_residual_write_two_reader_rmsnorm_quant",
 ]

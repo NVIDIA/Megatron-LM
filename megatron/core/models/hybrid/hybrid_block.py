@@ -90,6 +90,10 @@ class HybridStackSubmodules:
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
     mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
+    # Submodules for the stack's first and last layers, if they differ (e.g. fused residual seams:
+    # the first layer has no predecessor write to apply, the last no successor read to defer to).
+    first_layer_submodules: Optional["HybridStackSubmodules"] = None
+    last_layer_submodules: Optional["HybridStackSubmodules"] = None
 
 
 class HybridStack(MegatronModule):
@@ -223,7 +227,13 @@ class HybridStack(MegatronModule):
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+        stack_submodules = submodules
         for i, layer_config in enumerate(self.layer_config_list):
+            submodules = (
+                (i == 0 and stack_submodules.first_layer_submodules)
+                or (i == len(self.layer_config_list) - 1 and stack_submodules.last_layer_submodules)
+                or stack_submodules
+            )
             layer_number = i + 1 + pp_layer_offset
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
@@ -830,13 +840,9 @@ class HybridStack(MegatronModule):
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
-                        # Fused seams pass unwritten writes between layers, and checkpoint replay
-                        # frees replayable residuals, so neither is observed.
-                        if (
-                            replay_manager is None
-                            and torch.is_tensor(hidden_states)
-                            and torch.is_tensor(residual_accumulator)
-                        ):
+                        # A fused seam's layer output is its unwritten input residual (its next
+                        # layer applies the write), and replay frees residuals: not observed.
+                        if not self.config.moe_shortcut_wide_residual_norm_fusion:
                             observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:
                             hidden_states = cp_layout_state.finalize_layer(

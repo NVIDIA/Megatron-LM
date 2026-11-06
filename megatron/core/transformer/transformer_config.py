@@ -91,6 +91,11 @@ def _validate_shortcut_fusion_config(config):
         f"{sorted(recompute)} recompute": bool(recompute),
         "residual_stream_recompute_num_layers < 1": interval is not None
         and (isinstance(interval, bool) or not isinstance(interval, int) or interval < 1),
+        # Seams pass unwritten writes between layers; graphs must capture whole blocks/stacks.
+        "per-layer CUDA graphs (cuda_graph_modules)": (
+            config.cuda_graph_impl != "none"
+            and bool(normalize_cuda_graph_modules(config.cuda_graph_modules)[0])
+        ),
         # The Python replay manager runs outside graph capture.
         "checkpoint replay with CUDA graphs": (
             (interval or 1) > 1 and config.cuda_graph_impl != "none"

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Optional
 
-from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
@@ -15,21 +15,18 @@ from megatron.core.transformer.residual_connection import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
-    SeamInput,
     StreamwiseSigmoidWideResidualConnection,
-    apply_pending_write,
-    defer_write,
-    fuses_lone_seams,
     load_residual_state,
 )
+
+_STREAMWISE_READ = partial(StreamwiseSigmoidWideResidualConnection, operation="read")
+_STREAMWISE_WRITE = partial(StreamwiseSigmoidWideResidualConnection, operation="write")
 
 
 class WideResidualTransformerLayer(TransformerLayer):
     """Transformer layer carrying a wide stream around ordinary-width branches."""
 
     supports_wide_residual_connections: bool = True
-    # Fused residual seams (see wide_residual.py): set when the next layer applies this write.
-    defers_residual_write: bool = False
 
     def __init__(
         self,
@@ -44,7 +41,13 @@ class WideResidualTransformerLayer(TransformerLayer):
         pp_layer_offset: Optional[int] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
+        residual_read_self_attn=_STREAMWISE_READ,
+        residual_read_mlp=_STREAMWISE_READ,
+        residual_write_self_attn=_STREAMWISE_WRITE,
+        residual_write_mlp=_STREAMWISE_WRITE,
     ) -> None:
+        """The ``residual_read_*``/``residual_write_*`` arguments build the branch connections; a
+        fused spec selects WriteReadNorm/DeferredWrite."""
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
@@ -74,22 +77,18 @@ class WideResidualTransformerLayer(TransformerLayer):
         self.residual_read_self_attn = None
         self.residual_write_self_attn = None
         if not isinstance(self.self_attention, IdentityOp):
-            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="read"
+            self.residual_read_self_attn = residual_read_self_attn(
+                config, self.layer_number, "self_attention"
             )
-            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="write"
+            self.residual_write_self_attn = residual_write_self_attn(
+                config, self.layer_number, "self_attention"
             )
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
         if not isinstance(self.mlp, IdentityOp):
-            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="read"
-            )
-            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="write"
-            )
+            self.residual_read_mlp = residual_read_mlp(config, self.layer_number, "mlp")
+            self.residual_write_mlp = residual_write_mlp(config, self.layer_number, "mlp")
 
         self.register_load_state_dict_pre_hook(load_residual_state)
         residual_connections = [
@@ -155,67 +154,3 @@ class WideResidualTransformerLayer(TransformerLayer):
                 return self.residual_write_mlp
             case _:
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
-
-    @property
-    def fuses_residual_seams(self) -> bool:
-        """Whether neighbouring seam kernels may apply this lone MLP-only layer's read and write."""
-        return (
-            isinstance(self.self_attention, IdentityOp)
-            and not isinstance(self.mlp, IdentityOp)
-            and not self.is_moe_layer
-            and fuses_lone_seams(self, self.pre_mlp_layernorm)
-        )
-
-    def seam_read(self):
-        """The read, RMSNorm and MXFP8 consumer a fused shortcut block applies for this layer."""
-        attention = self.self_attention
-        projection = getattr(attention, "in_proj", getattr(attention, "linear_qkv", None))
-        return self.residual_read_self_attn, self.input_layernorm, (attention, projection)
-
-    def _run_input_layernorm(self, hidden_states, *args, **kwargs):
-        if isinstance(hidden_states, SeamInput):
-            self._input_layernorm_checkpoint_active = False
-            return hidden_states.branch_input, hidden_states.residual, (hidden_states.residual,)
-        return super()._run_input_layernorm(hidden_states, *args, **kwargs)
-
-    def attention_bda_and_cross_attention(self, attention_output_with_bias, *args, **kwargs):
-        # Only a compute-only layer's attention write is its last write; an MLP-only layer defers
-        # its MLP write instead.
-        if self.defers_residual_write and isinstance(self.mlp, IdentityOp):
-            write = defer_write(
-                kwargs["attn_state"][0], attention_output_with_bias, self.residual_write_self_attn
-            )
-            return write, kwargs.get("context")
-        return super().attention_bda_and_cross_attention(
-            attention_output_with_bias, *args, **kwargs
-        )
-
-    def _forward_attention(self, hidden_states, *args, **kwargs):
-        if isinstance(hidden_states, PendingShortcutAdd):
-            # An MLP-only layer applies a deferred write at its MLP read.
-            return hidden_states, kwargs.get("context")
-        return super()._forward_attention(hidden_states, *args, **kwargs)
-
-    def _pre_mlp_layernorm_and_residual(self, hidden_states, *args, **kwargs):
-        if not isinstance(hidden_states, PendingShortcutAdd):
-            return super()._pre_mlp_layernorm_and_residual(hidden_states, *args, **kwargs)
-        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-
-        # In a fused shortcut block the shared expert's first Linear alone consumes this input.
-        shared = getattr(self.mlp, "shared_experts", None)
-        consumer = None
-        if (
-            shared is not None
-            and type(shared).forward is SharedExpertMLP.forward
-            and not shared.use_shared_expert_gate
-        ):
-            consumer = (shared, shared.linear_fc1)
-        residual, branch_input = apply_pending_write(
-            hidden_states, (self.residual_read_mlp,), (self.pre_mlp_layernorm,), consumer
-        )
-        return branch_input, residual, (residual,)
-
-    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=(), **kwargs):
-        if self.defers_residual_write:
-            return defer_write(mlp_state[0], mlp_output_with_bias, self.residual_write_mlp)
-        return super()._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state, **kwargs)

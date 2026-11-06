@@ -17,6 +17,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual import DeferredWrite
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.inference.engines.test_gdp_cuda_graph_e2e import (
     FLASH_ATTENTION_VERSION,
@@ -125,5 +126,6 @@ class TestFusedShortcutMoECudaGraphE2E(TestShortcutMoECudaGraphE2E):
         model = super()._create_model()
         layers = model.decoder.layers
         assert layers[2].fuses_residual_seams
-        assert layers[0].defers_residual_write and layers[1].defers_residual_write
+        assert isinstance(layers[0].residual_write, DeferredWrite)
+        assert isinstance(layers[1].residual_write_mlp, DeferredWrite)
         return model

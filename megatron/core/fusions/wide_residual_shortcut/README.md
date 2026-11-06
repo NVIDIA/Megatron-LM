@@ -18,7 +18,7 @@ tokens per call, 16384 above hidden 4096, a GB300 for training, ...) are listed 
 | block → block (shortcut add) | 2 (routed + shared) | 2 | `shortcut_add_..._two_reader_rmsnorm_quant` |
 | lone layer → block (M → [* E]) | 1 | 2 | `shortcut_add_..._two_reader_rmsnorm_quant`, no shared update |
 
-A write that the next seam applies is passed forward as a `PendingShortcutAdd`: the routed and
+A write that the next seam applies is passed forward as a `PendingWideResidualWrites`: the routed and
 shared MoE outputs (the shortcut add, whose BF16 sum is rounded before the write) or a lone
 layer's single update.
 
