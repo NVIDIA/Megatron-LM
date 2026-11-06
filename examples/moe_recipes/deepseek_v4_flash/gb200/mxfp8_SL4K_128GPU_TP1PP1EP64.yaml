@@ -1,99 +1,49 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 DEPENDENCIES:
-  pytorch_base_image: nvcr.io/nvidia/pytorch:26.06-py3
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.09-py3
   dockerfile: |
-    # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-    # IMAGE_NAME: dsv4-gb200-torch2606-te6377ca1
-    #
-    # DeepSeek-V4 training container for GB200/GB300 (arm64), based on the
-    # NVIDIA PyTorch 26.06 container with TransformerEngine built from
-    # NVIDIA/TransformerEngine commit 6377ca161c0e9859083e369909ac37ad95bd94f4.
-
-    FROM nvcr.io/nvidia/pytorch:26.06-py3 AS base
-
-    ENV SHELL=/bin/bash
-
-    # System packages + yq
-    RUN bash -ex <<"EOF"
-        rm -rf /opt/megatron-lm
-        apt-get update
-        apt-get install -y --no-install-recommends \
-            sudo gdb bash-builtins git zsh autojump tmux curl gettext libfabric-dev
-        wget https://github.com/mikefarah/yq/releases/download/v4.27.5/yq_linux_arm64 -O /usr/bin/yq
-        echo "ea360a0ecdff30c8625ccd0b97f8714b8308a429fd839cf8ccc481f311e217c6  /usr/bin/yq" | sha256sum --check -
-        chmod +x /usr/bin/yq
-        apt-get clean
-        rm -rf /var/lib/apt/lists/*
-    EOF
-
-    # Python deps (mcore + dev + test + one-logger + cutlass-dsl pin)
-    RUN unset PIP_CONSTRAINT && pip install --no-cache-dir \
-        debugpy dm-tree torch_tb_profiler einops wandb \
-        sentencepiece tokenizers transformers==4.57.1 torchvision ftfy modelcards datasets tqdm pydantic omegaconf \
-        nvidia-pytriton py-spy yapf darker \
-        tiktoken flask-restful \
-        nltk wrapt pytest pytest_asyncio pytest-cov pytest_mock pytest-random-order \
-        black==24.4.2 isort==5.13.2 flake8==7.1.0 pylint==3.2.6 coverage mypy \
-        one-logger --index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple \
-        setuptools==69.5.1 nvidia-cutlass-dsl==4.5.2
-
-    RUN pip install --no-cache-dir --upgrade --no-deps nvidia-resiliency-ext>=0.6.0
-
-    # Pin the official TransformerEngine repository to the requested commit.
-    ARG TE_COMMIT="6377ca161c0e9859083e369909ac37ad95bd94f4"
-    RUN pip install --no-cache-dir \
-            nvidia-mathdx==25.1.1 \
-            nvidia-cudnn-frontend==1.26.0 && \
-        unset PIP_CONSTRAINT && \
-        NVTE_CUDA_ARCHS="100a;103a" NVTE_BUILD_THREADS_PER_JOB=8 NVTE_FRAMEWORK=pytorch \
-        pip install --no-build-isolation --no-cache-dir \
-        "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
-
-    # HybridEP
-    WORKDIR /home/
-    RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git && \
-        cd DeepEP && git checkout 1b8f467965bb818bf2f6511e06993f5607e1721f && \
-        TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
-
-    # Fast Hadamard Transform (used by DSA indexer)
-    WORKDIR /home/
-    RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git && \
-        cd fast-hadamard-transform && \
-        TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
-
-    # Emerging-Optimizers (Muon)
-    WORKDIR /home/
-    RUN git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git && \
-        cd Emerging-Optimizers && \
-        pip install --no-build-isolation .
-
-    # FlashMLA (DSA kernels)
-    WORKDIR /opt/
-    RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
-        cd FlashMLA && \
-        FLASH_MLA_DISABLE_SM90=1 \
-        NVCC_THREADS=16 \
-        CFLAGS="-I/usr/local/cuda/include/cccl" \
-        CXXFLAGS="-I/usr/local/cuda/include/cccl" \
-        pip install --no-build-isolation .
-
-    WORKDIR /opt/
-    RUN pip install apache-tvm-ffi 'pybind11[global]' && \
-        git clone --branch develop https://github.com/NVIDIA/cudnn-frontend.git && \
-        cd cudnn-frontend && \
-        pip install --force-reinstall --no-deps --no-build-isolation . && \
-        pip install --force-reinstall 'nvidia-cutlass-dsl[cu13]==4.5.2'
-
-    # Restore the mutually compatible runtime versions after CUTLASS DSL's
-    # force-reinstall step, then make dependency consistency a build invariant.
-    RUN pip install --no-cache-dir \
-            numpy==1.26.4 \
-            grpcio==1.81.0 \
-            setuptools==81.0.0 && \
-        pip check
-
-    # Cleanup
-    RUN rm -rf /root/.cache /tmp/*
-    WORKDIR /home/
+    # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    # Build with an ARM64 builder for GB200/GB300.
+    FROM nvcr.io/nvidia/pytorch:26.09-py3
+    ENV PIP_CONSTRAINT=""
+    RUN bash -euxo pipefail <<'BUILD'
+    export PIP_CONSTRAINT=""
+    export NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS="100a;103a" NVTE_BUILD_THREADS_PER_JOB=4 MAX_JOBS=16
+    export CUDA_HOME=/usr/local/cuda
+    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}
+    # Remove unused base-image packages with incompatible CUTLASS pins.
+    python -m pip uninstall -y flash-attn-4 quack-kernels transformer-engine transformer-engine-torch transformer-engine-cu13 transformer-engine-cu12
+    python -m pip install --no-cache-dir uv ninja cmake pybind11 wheel packaging pyyaml absl-py einops \
+        omegaconf sentencepiece tiktoken datasets wandb tensorstore pytest pytest-mock 'pydantic<2.14' \
+        'nvidia-cudnn-frontend[cutedsl]==1.29.0' 'nvidia-cutlass-dsl[cu13]==4.8.0'
+    python -m pip install --no-build-isolation --no-cache-dir \
+        git+https://github.com/NVIDIA/TransformerEngine.git@b021980343e33fdd5b091f95fd13f82e05d581af
+    python -m pip install --no-build-isolation --no-cache-dir \
+        git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16
+    TORCH_CUDA_ARCH_LIST="10.0;10.3" python -m pip install --no-build-isolation --no-cache-dir \
+        git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca
+    mok_dir=$(mktemp -d)
+    git -C "$mok_dir" init
+    git -C "$mok_dir" remote add origin https://github.com/QiZhangNV/mixture-of-kittens.git
+    git -C "$mok_dir" fetch --depth 1 origin 7a8cfb7fdd96a1cfba506caf4756c6c86073399a
+    git -C "$mok_dir" checkout --detach FETCH_HEAD
+    bash "$mok_dir/scripts/prepare_thunderkittens.sh"
+    MOK_ARCH=ALL MOK_NVCC=/usr/local/cuda/bin/nvcc python -m pip install --no-build-isolation --no-cache-dir "$mok_dir"
+    rm -rf "$mok_dir"
+    python -m pip check
+    python - <<'CHECK'
+    import importlib.metadata as m, json
+    from pathlib import Path
+    versions={}
+    for name in ['torch','transformer-engine','nvidia-cudnn-frontend','emerging-optimizers','mixture-of-kittens']:
+        versions[name]=m.version(name)
+        print(name, versions[name])
+    Path('/opt/dsv4-environment.json').write_text(json.dumps(versions,indent=2))
+    CHECK
+    BUILD
+    WORKDIR /workspace/Megatron-LM
+ENTRY:
+  script: pretrain_hybrid.py
 ENV_VARS:
   TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
@@ -105,15 +55,10 @@ ENV_VARS:
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
   NCCL_GRAPH_REGISTER: '0'
-  NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
-  NVTE_CPU_OFFLOAD_V1: '1'
-  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
-  NUM_OF_STAGES_DISPATCH_API: '10'
-  NUM_OF_IN_FLIGHT_S2G_DISPATCH_API: '8'
+  CUDA_DEVICE_MAX_CONNECTIONS: '32'
 ARGS:
   tokenizer_type: HuggingFaceTokenizer
   tokenizer_model: unsloth/DeepSeek-V3
-  num_layers: 43
   hidden_size: 4096
   num_attention_heads: 64
   kv_channels: 512
@@ -134,8 +79,6 @@ ARGS:
   mscale: 1.0
   mscale_all_dim: 1.0
   qk_layernorm: true
-  o_groups: 8
-  o_lora_rank: 1024
   original_max_position_embeddings: 65536
   experimental_attention_variant: dsv4_hybrid
   csa_window_size: 128
@@ -147,7 +90,6 @@ ARGS:
   dsa_indexer_loss_coeff: 1e-2
   dsa_indexer_use_sparse_loss: true
   num_experts: 256
-  moe_n_hash_layers: 3
   moe_ffn_hidden_size: 2048
   moe_shared_expert_intermediate_size: 2048
   moe_router_load_balancing_type: seq_aux_loss
@@ -158,8 +100,6 @@ ARGS:
   moe_router_enable_expert_bias: true
   moe_router_bias_update_rate: 1e-3
   activation_func_clamp_value: 10.0
-  enable_hyper_connections: true
-  num_residual_streams: 4
   mhc_sinkhorn_iterations: 20
   use_fused_mhc: true
   mtp_num_layers: 1
@@ -175,12 +115,10 @@ ARGS:
   context_parallel_size: 1
   expert_tensor_parallel_size: 1
   use_distributed_optimizer: true
-  sequence_parallel: true
   overlap_grad_reduce: true
   overlap_param_gather: true
   moe_token_dispatcher_type: flex
   moe_flex_dispatcher_backend: hybridep
-  moe_hybridep_num_sms: 32
   moe_grouped_gemm: true
   moe_permute_fusion: true
   moe_router_fusion: true
@@ -188,23 +126,13 @@ ARGS:
   recompute_granularity: selective
   recompute_modules:
   - mla_up_proj
-  use_transformer_engine_op_fuser: true
-  moe_mlp_glu_interleave_size: 32
-  moe_paged_stash: true
-  moe_paged_stash_page_size: 64
-  moe_paged_stash_buffer_size_factor_cuda: 1.2
-  moe_paged_stash_buffer_size_factor_cpu: 0.0
-  moe_pad_experts_for_cuda_graph_inference: true
-  moe_expert_rank_capacity_factor: 1.5
-  cuda_graph_impl: local
-  cuda_graph_scope: full_iteration
+  cuda_graph_impl: full_iteration
+  te_rng_tracker: true
   use_mcore_models: true
   use_flash_attn: true
   transformer_impl: transformer_engine
   micro_batch_size: 1
   global_batch_size: 2048
-  train_samples: 585937500
-  exit_duration_in_mins: 220
   no_save_optim: true
   no_check_for_nan_in_loss_and_grad: true
   cross_entropy_loss_fusion: true
@@ -216,8 +144,6 @@ ARGS:
   min_lr: 3.9e-07
   lr_warmup_init: 3.9e-07
   lr_decay_style: cosine
-  lr_decay_samples: 584765624
-  lr_warmup_samples: 1536000
   weight_decay: 0.1
   clip_grad: 1.0
   adam_beta1: 0.9
@@ -234,15 +160,8 @@ ARGS:
   exp_avg_sq_dtype: bf16
   moe_router_padding_for_quantization: true
   init_method_std: 0.02
-  eval_iters: 32
+  eval_iters: 0
   eval_interval: 200
-  finetune: false
-  no_load_optim: true
-  no_load_rng: true
-  auto_detect_ckpt_format: true
-  load: ${LOAD_PATH}
-  save_interval: 500
-  dist_ckpt_strictness: log_all
   log_throughput: true
   log_interval: 1
   logging_level: 20
@@ -252,3 +171,26 @@ ARGS:
   tensorboard_dir: ${OUTPUT_PATH}/tensorboard
   wandb_exp_name: DeepSeek-V4-Flash-GB200-MXFP8-TP1PP1EP64-GBS2048SEQLEN4096
   enable_experimental: true
+  output_projection_groups: 8
+  output_projection_lora_rank: 1024
+  moe_num_hash_layers: 3
+  enable_mhc_connections: true
+  mhc_num_residual_streams: 4
+  moe_flex_dispatcher_num_sms: 32
+  hybrid_layer_pattern: WEWECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECEHECE/WE
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_dsv4_stack_spec
+  train_iters: 50
+  lr_decay_iters: 50
+  lr_warmup_iters: 0
+  dsa_kernel_backend: cudnn
+  dsa_indexer_precision: mxfp8
+  moe_megakernel_backend: mok
+  moe_megakernel_backend_config: '{"fwd_num_comm_sms":28,"bwd_num_comm_sms":28,"minibatch_size":4096,"macrobatch_size":32768,"schedule_capacity_multiplier":0.0625,"all_gather_top_experts_chunk_bytes":2048}'
+  moe_hybridep_routing_map_mode: bool
+  te_precision_config_file: examples/moe_recipes/deepseek_v4_flash/gb200/shared_expert_bf16.yaml
+  num_workers: 0
+  num_dataset_builder_threads: 1
+  cuda_graph_warmup_steps: 3
+  optimizer: adam

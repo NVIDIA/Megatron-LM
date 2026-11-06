@@ -36,8 +36,8 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>128</td>
       <td>1/1/64/1/1</td>
       <td>1/2048/4096</td>
-      <td>BSHD; paged stash; full CG; HybridEP</td>
-      <td>710.4</td>
+      <td>BSHD; MoK; MXFP8 indexer and batched projection; full CG; Adam</td>
+      <td>Pending refreshed measurement</td>
     </tr>
     <tr>
       <td><a href="deepseek_v4_flash/gb200/mxfp8_THD4K_128GPU_TP1PP2EP64.yaml">GB200 MXFP8 THD 4K</a></td>
@@ -52,8 +52,8 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>128</td>
       <td>1/2/64/16/1</td>
       <td>1/128/65536</td>
-      <td>THD packing; partial CG; HybridEP; Muon; Long Context</td>
-      <td>512.4</td>
+      <td>THD packing; MoK; MXFP8 indexer and batched projection; attention CG; Muon</td>
+      <td>Pending refreshed measurement</td>
     </tr>
     <tr>
       <td rowspan="5">DeepSeek-V3</td>
@@ -190,3 +190,23 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
 </table>
 
 Legend: TP = tensor parallel, PP = pipeline parallel, EP = expert parallel, CP = context parallel, ETP = expert tensor parallel, MBS = micro-batch size, GBS = global batch size, SL = sequence length, CG = CUDA graph, BSHD = fixed-length batch layout, THD = packed variable-length batch layout. The tuple orders are `TP/PP/EP/CP/ETP` and `MBS/GBS/SL`.
+
+## DeepSeek-V4 Flash MXFP8 recipes
+
+The GB200 BSHD 4K and THD 64K recipes use HybridModel and include pinned build
+instructions for TE BatchedLinear, cuDNN Frontend and Mixture-of-Kittens. Run
+from the repository root so the shared-expert precision configuration resolves.
+MoK uses MXFP8 routed experts and BF16 shared experts; it replaces the native
+TE fused-expert/paged-stash path. The 4K recipe retains Adam and full-iteration
+CUDA graphs. The 64K recipe uses compact Muon and an attention-only graph split
+that leaves mHC aggregation and recompute outside the captured region.
+
+TE's grouped output projection stores a 3D parameter. Its explicit Muon matrix
+metadata preserves the legacy flattened-matrix update rather than routing the
+weight to Adam or applying independent updates to each group.
+
+These are 50-step mock-data throughput recipes with forced routing. They do not
+establish training convergence. Keep numerical checks enabled for qualification;
+disable them only for the timed run, as in the provided benchmark settings.
+Historical throughput values belong to the previous recipe revisions and are
+not measurements of the refreshed configuration.
