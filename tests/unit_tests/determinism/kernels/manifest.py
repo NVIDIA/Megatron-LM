@@ -1004,7 +1004,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "covers the opt-in component NVTX ranges on the compressor, indexer and attention paths; "
         "test_csa_packed_kernels checks that THD layouts are bit-identical with the opt-in device "
         "metadata checks on and off, and that in-place THD padding-row zeroing "
-        "(MCORE_CSA2_SPARSE_PAD_ZERO) matches masked_fill bit for bit, forward and backward.",
+        "(MCORE_CSA2_SPARSE_PAD_ZERO) matches masked_fill bit for bit, forward and backward. "
+        "It also checks that compact Top-K selects the same keys with and without empty-K "
+        "padding segments (MCORE_CSA2_TOPK_PAD_SEGMENTS) and replays them bit-exactly.",
     ),
     KernelEntry(
         name="csa_teacher_lse",

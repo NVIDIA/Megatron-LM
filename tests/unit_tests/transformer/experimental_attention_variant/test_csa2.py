@@ -1367,3 +1367,61 @@ def test_pad_row_capacity_parsing(monkeypatch, value, expected):
             thd_utils._pad_row_capacity()
     else:
         assert thd_utils._pad_row_capacity() == expected
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_compact_topk_metadata_gives_padding_rows_empty_key_spans(cp, ratio):
+    """Padding segments (MCORE_CSA2_TOPK_PAD_SEGMENTS) keep every real row's Q segment start,
+    K span and causal offset, and give padding rows empty K spans, without new bounds."""
+    from types import SimpleNamespace
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
+        prepare_csa2_indexer_inputs,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+        build_csa2_thd_layout,
+    )
+
+    logical = torch.tensor([0, 65, 65, 322], dtype=torch.int32)
+    physical = torch.tensor([0, 66, 66, 326], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=260,
+        max_seqlen_kv=260,
+    )
+    rows = 326 // cp
+    group = SimpleNamespace(size=lambda: cp, rank=lambda: cp - 1)
+    layout = build_csa2_thd_layout(params, rows, cp_group=group)
+    compressed = layout.for_compression(ratio)
+    inputs = prepare_csa2_indexer_inputs(
+        torch.zeros(rows, 2, 8),
+        torch.zeros(compressed.capacity, 8),
+        torch.zeros(rows, 2),
+        ratio,
+        None,
+        layout,
+        compressed,
+    )
+    cu_q, cu_k, max_q, max_k = inputs.packed_metadata
+    offsets = inputs.packed_causal_offsets
+    new_q, new_k, new_max_q, new_max_k, new_offsets = inputs.compact_topk_metadata
+    assert (new_max_q, new_max_k) == (max_q, max_k)
+    assert new_q.numel() == new_k.numel() == new_offsets.numel() + 1
+    assert bool((new_q.diff() >= 0).all()) and bool((new_k.diff() >= 0).all())
+    assert new_q[0] == cu_q[0] and new_q[-1] == cu_q[-1]
+    row_ids = torch.arange(rows, dtype=cu_q.dtype)
+    old = torch.searchsorted(cu_q[1:], row_ids, right=True)
+    new = torch.searchsorted(new_q[1:], row_ids, right=True)
+    real = inputs.valid
+    assert bool(real.any()) and bool((~real).any())
+    assert torch.equal(new_q[new][real], cu_q[old][real])
+    assert torch.equal(new_k[new][real], cu_k[old][real])
+    assert torch.equal(new_k[new + 1][real], cu_k[old + 1][real])
+    assert torch.equal(new_offsets[new][real], offsets[old][real])
+    assert torch.equal(new_k[new + 1][~real], new_k[new][~real])

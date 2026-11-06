@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.component_nvtx import forward_range
+from megatron.core.env_flags import env_flag
 from megatron.core.ops.attention.csa.indexer_quantization import (
     indexer_mxfp8_thd_scale_capacity,
     indexer_mxfp8_thd_scale_shape,
@@ -53,6 +54,12 @@ except ImportError:
 
 
 _QUERY_CHUNK_SIZE = 128
+# MCORE_CSA2_TOPK_PAD_SEGMENTS=0 restores compact Top-K's previous THD segments, which score
+# padding rows against their sequence's keys. Zeroed padding rows then tie on every causal
+# candidate, the deterministic tie-break's worst case, and that one block stalls the whole
+# stage-2 launch. The default gives padding rows segments with empty key spans (see
+# CSA2IndexerInputs.compact_topk_metadata).
+_COMPACT_TOPK_PAD_SEGMENTS = env_flag("MCORE_CSA2_TOPK_PAD_SEGMENTS", True)
 _SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -117,6 +124,43 @@ class CSA2IndexerInputs:
             cu_q = self.thd_layout.cu_seqlens_padded
             offsets[: cu_q.numel() - 1] = (self.thd_layout.global_start - cu_q[:-1]).clamp_min(0)
         return offsets
+
+    @cached_property
+    def compact_topk_metadata(self) -> tuple[Tensor, Tensor, int, int, Tensor]:
+        """THD compact Top-K prefixes and causal offsets in which padding rows score no keys.
+
+        Splits each sequence's physical Q span into its real rows, which keep the
+        sequence's K span and causal offset, and its padding rows, whose K span is
+        empty at the real span's K end. Tail capacity keeps its bounded Q segments,
+        also with empty K spans. cuDNN then emits empty lists for rows whose results
+        fused_compact_topk discards anyway, instead of ranking their scores. Spans
+        only shrink, so the host-known bounds stay valid; no device value is read.
+        Returns ``(cu_q, cu_k, max_q, max_k, causal_offsets)``.
+        """
+        cu_q, cu_k, max_q, max_k = self.packed_metadata
+        offsets, layout = self.packed_causal_offsets, self.thd_layout
+        n = layout.cu_seqlens.numel() - 1
+        # Physical end of each sequence's real rows, made local like the Q prefixes under CP.
+        real_end = layout.cu_seqlens_padded[:-1] + layout.cu_seqlens.diff()
+        if layout.cp_size > 1:
+            real_end = (real_end - layout.global_start).clamp(0, self.q.shape[0])
+
+        def interleave(first: Tensor, second: Tensor, rest: Tensor) -> Tensor:
+            pairs = torch.stack((first, second.to(first.dtype)), dim=1).flatten()
+            return torch.cat((pairs, rest))
+
+        return (
+            # Q: start_0, real_end_0, start_1, ..., real_end_{n-1}, start_n, tail ends.
+            interleave(cu_q[:n], real_end, cu_q[n:]),
+            # K: real spans unchanged. Padding spans are empty at their real span's end,
+            # tail spans at the last sequence's end.
+            interleave(cu_k[:n], cu_k[1 : n + 1], cu_k[n : n + 1].expand(cu_k.numel() - n)),
+            max_q,
+            max_k,
+            # Real segments keep their offsets. Empty-K segments have no candidates at
+            # any offset; zero keeps their compact candidate slabs minimal.
+            interleave(offsets[:n], torch.zeros_like(offsets[:n]), offsets[n:]),
+        )
 
     def loss_divisor(self, calculate_per_token_loss: bool) -> Tensor:
         """Match DSv4: local sum divided by the global real-token count for mean loss."""
@@ -223,6 +267,7 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
     global keys. Dispatch-local scratch and host-known bounds keep capture
     independent of live prefix values without a second workspace/cache API.
     BF16 retains bounded scoring on devices/frontends without compact support.
+    THD padding rows get empty key spans (MCORE_CSA2_TOPK_PAD_SEGMENTS).
     """
     if precision not in ("bf16", "mxfp8"):
         raise ValueError("CSA2 compact selection precision must be bf16 or mxfp8")
@@ -245,8 +290,17 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
     if precision == "mxfp8" and heads == 32:
         q = torch.nn.functional.pad(q, (0, 0, 0, 32))
         weights = torch.nn.functional.pad(weights, (0, 32))
-    cu_q, cu_k, max_q, max_k = inputs.packed_metadata
-    offsets = inputs.packed_causal_offsets
+    if _COMPACT_TOPK_PAD_SEGMENTS and inputs.thd_layout is not None:
+        cu_q, cu_k, max_q, max_k, offsets = inputs.compact_topk_metadata
+        # max_seqlen_q only sizes cuDNN's stage-1 grid of m-block tiles per segment.
+        # Every segment lies within the local rows, so under CP they bound it more
+        # tightly than the global max_q, and the padding segments add fewer empty
+        # tiles. max_k keeps the global bound because causal offsets reach global keys.
+        grid_q = min(max_q, q.shape[0])
+    else:
+        cu_q, cu_k, max_q, max_k = inputs.packed_metadata
+        offsets = inputs.packed_causal_offsets
+        grid_q = max_q
     # Odd r2 spans can have one more causal candidate than complete K groups.
     max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
     precision_kwargs = {}
@@ -281,7 +335,7 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
         ratio=inputs.ratio,
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
-        max_seqlen_q=max_q,
+        max_seqlen_q=grid_q,
         max_seqlen_k=max_k,
         q_causal_offsets=offsets,
         precision=precision,

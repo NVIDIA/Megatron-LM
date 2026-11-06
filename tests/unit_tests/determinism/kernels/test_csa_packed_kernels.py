@@ -359,6 +359,82 @@ def test_sparse_pad_zero_attention_matches_masked_fill(monkeypatch, function, re
         assert bytes_equal(got, want), ("q", "kv", "out", "dO", "lse")[index]
 
 
+def _selection_inputs(logical, physical, max_seqlen, local_rows, cp, ratio, heads, zero_padding):
+    """Indexer inputs on the last CP rank of a packed batch."""
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor(logical, dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv=torch.tensor(logical, dtype=torch.int32, device="cuda"),
+        cu_seqlens_q_padded=torch.tensor(physical, dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv_padded=torch.tensor(physical, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+    group = SimpleNamespace(size=lambda: cp, rank=lambda: cp - 1)
+    layout = thd_utils.build_csa2_thd_layout(params, local_rows, cp_group=group)
+    compressed = layout.for_compression(ratio)
+    q = torch.randn(local_rows, heads, 128, device="cuda").bfloat16()
+    k = torch.randn(compressed.capacity, 128, device="cuda").bfloat16()
+    weights = torch.randn(local_rows, heads, device="cuda").bfloat16()
+    if zero_padding:
+        # csa2 zeroes x and qr on padding rows and the indexer projections have no bias, so
+        # padding rows reach selection with q = w = 0 and tie on every causal candidate.
+        q[~layout.valid_tokens] = 0
+        weights[~layout.valid_tokens] = 0
+    return csa2_indexer.prepare_csa2_indexer_inputs(q, k, weights, ratio, None, layout, compressed)
+
+
+def _assert_padding_segments_keep_selection(monkeypatch, inputs, topk, precision):
+    """fused_compact_topk returns the same bits with and without padding segments."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("compact selection requires SM100")
+    pytest.importorskip("cudnn")
+    csa2_indexer.fused_sparse_attention._ensure_dsa_namespace()
+    dsa = csa2_indexer.fused_sparse_attention._DSA
+    if not callable(getattr(dsa, "indexer_forward_top_k_wrapper", None)):
+        pytest.skip("requires cuDNN compact Top-K")
+    assert inputs.compact_topk_metadata[0].numel() > inputs.packed_metadata[0].numel()
+    selections = []
+    for pad_segments in (False, True):
+        monkeypatch.setattr(csa2_indexer, "_COMPACT_TOPK_PAD_SEGMENTS", pad_segments)
+        selections.append(csa2_indexer.fused_compact_topk(inputs, topk, precision))
+    torch.cuda.synchronize()
+    assert bytes_equal(selections[1], selections[0])
+    assert bool((selections[0] >= 0).any()), "degenerate test: nothing selected"
+    assert_replays_bit_exact(
+        lambda: csa2_indexer.fused_compact_topk(inputs, topk, precision),
+        (),
+        backward=False,
+        contention=True,
+        what=f"CSA2 {precision} compact Top-K with padding segments",
+    )
+
+
+@pytest.mark.parametrize("zero_padding", [False, True])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_compact_topk_padding_segments_keep_selection(
+    monkeypatch, cp, ratio, heads, precision, zero_padding
+):
+    """MCORE_CSA2_TOPK_PAD_SEGMENTS: empty, padded and CP-cut segments select the same keys."""
+    seeded()
+    inputs = _selection_inputs(
+        [0, 65, 65, 322], [0, 66, 66, 326], 260, 326 // cp, cp, ratio, heads, zero_padding
+    )
+    _assert_padding_segments_keep_selection(monkeypatch, inputs, 7, precision)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_compact_topk_padding_segments_keep_selection_at_64k_cp16(monkeypatch, ratio):
+    """The 64K CP16 shape: one 65535-token sample padded to 65536 rows, last rank, top-k 512,
+    with production padding rows (q = w = 0)."""
+    seeded()
+    inputs = _selection_inputs([0, 65535], [0, 65536], 65536, 4096, 16, ratio, 32, True)
+    _assert_padding_segments_keep_selection(monkeypatch, inputs, 512, "mxfp8")
+
+
 def test_packed_indexer_metadata_and_loss_replay():
     seeded()
     cu_q = torch.tensor([0, 65, 65, 256], device="cuda", dtype=torch.int32)
