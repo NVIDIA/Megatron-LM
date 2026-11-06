@@ -530,7 +530,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             if checkpoint.dist_ckpt_optim_fully_reshardable:
                 assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
-        if ddp.overlap_param_gather and checkpoint.save is not None:
+        if self.optimizer.overlap_param_gather and checkpoint.save is not None:
             assert checkpoint.save_params_interval is None, \
                 '--save-params-interval is not supported with --overlap-param-gather'
 
@@ -557,15 +557,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("Torch FSDP2 cannot use the distributed optimizer.")
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
-            if self.checkpoint.ckpt_format not in ("torch_dist", "torch_dcp"):
-                raise ValueError("Torch FSDP2 requires torch_dist or torch_dcp checkpoints.")
         elif isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             raise ValueError("TorchFullyShardedDataParallelConfig requires ddp.use_torch_fsdp2.")
         if self.ddp.use_megatron_fsdp:
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
-            if self.checkpoint.ckpt_format != "fsdp_dtensor":
-                raise ValueError("Megatron FSDP requires the fsdp_dtensor checkpoint format.")
         if self.ddp.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
             if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
@@ -754,20 +750,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
-        # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
-        # perform numerical validation. Loss and gradient checks otherwise remain independent.
-        fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
-        if self.dist.fake_process_group or (fp16 and not self.optimizer.loss_scale):
-            self.rerun_state_machine.check_for_nan_in_loss = False
-            self.ddp.check_for_nan_in_grad = False
-        if self.rerun_state_machine.result_rejected_tracker_filename is not None:
-            skipped = RerunStateMachine.get_skipped_iterations_from_tracker_file(
-                self.rerun_state_machine.result_rejected_tracker_filename
-            )
-            # Assign a new list: the CLI adapter may still share its original list with args.
-            self.train.iterations_to_skip = self.train.iterations_to_skip + [
-                iteration for iteration in skipped if iteration not in self.train.iterations_to_skip
-            ]
         if self.ddp.use_torch_fsdp2:
             if is_te_min_version("2.0.0"):
                 self.ddp.fp8_param_gather = False
@@ -821,6 +803,20 @@ class PretrainConfigContainer(ConfigContainerBase):
                     self.ddp.megatron_fsdp_cuda_graph_mode = True
                     if transformer.cuda_graph_impl == "full_iteration":
                         self.ddp.fsdp_all_gather_in_start_param_sync = False
+        # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
+        # perform numerical validation. Loss and gradient checks otherwise remain independent.
+        fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
+        if self.dist.fake_process_group or (fp16 and not self.optimizer.loss_scale):
+            self.rerun_state_machine.check_for_nan_in_loss = False
+            self.ddp.check_for_nan_in_grad = False
+        if self.rerun_state_machine.result_rejected_tracker_filename is not None:
+            skipped = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+                self.rerun_state_machine.result_rejected_tracker_filename
+            )
+            # Assign a new list: the CLI adapter may still share its original list with args.
+            self.train.iterations_to_skip = self.train.iterations_to_skip + [
+                iteration for iteration in skipped if iteration not in self.train.iterations_to_skip
+            ]
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
@@ -901,20 +897,6 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
-
-    def validate(self) -> None:
-        """Validate each section, then the checkpoint format against the sections inference owns."""
-        super().validate()
-        self._validate_checkpoint()
-
-    def _validate_checkpoint(self) -> None:
-        """The torch_dcp / FSDP2 pairing, the one cross-section checkpoint rule inference can
-        express: it has no ddp or optimizer section (the CLI checks those from the arguments)."""
-        if self.dist.use_torch_fsdp2:
-            assert self.checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
-                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
-        if self.checkpoint.ckpt_format == "torch_dcp":
-            assert self.dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
 
     def _finalize(self) -> None:
         super()._finalize()

@@ -2931,7 +2931,7 @@ def load_checkpoint(
     use_megatron_fsdp = (
         cfg.ddp.use_megatron_fsdp
         if hasattr(cfg, "ddp")
-        else cfg.checkpoint.ckpt_format == "fsdp_dtensor"
+        else load_format == "fsdp_dtensor"
     )
     quantized_params = (
         cfg.ddp.fp8_param_gather or cfg.ddp.fp4_param_gather

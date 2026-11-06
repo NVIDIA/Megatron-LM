@@ -110,6 +110,8 @@ def test_checkpoint_backend_uses_config(
     args.auto_detect_ckpt_format = True
     args.ckpt_format = "torch_dist"
     args.use_megatron_fsdp = not fsdp
+    run_config.checkpoint.load = "unused"
+    run_config.checkpoint.auto_detect_ckpt_format = True
     run_config.ddp.use_megatron_fsdp = fsdp
     run_config.checkpoint.ckpt_format = "fsdp_dtensor" if fsdp else "torch_dist"
     cfg = (
