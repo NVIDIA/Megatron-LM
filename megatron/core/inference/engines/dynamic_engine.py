@@ -2376,8 +2376,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
         """A resident request's expert routing, read from its blocks as its completion reads it."""
-        allocator = self.context.kv_block_allocator
-        if not allocator.block_routing:  # routing replay off: nothing was recorded
+        routing_replay = self.context.kv_block_allocator.routing_replay
+        if not routing_replay.has_data():  # routing replay off: nothing was recorded
             return None
         if not hasattr(self.context, "request_ids"):
             return None
@@ -2385,7 +2385,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if index < 0:
             return None
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        return allocator.reconstruct_routing_from_blocks(
+        return routing_replay.reconstruct_routing_from_blocks(
             self.context.get_committed_kv_block_ids(index), total_tokens - 1
         )
 
@@ -3302,8 +3302,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+                block_ref_counts = block_allocator.pc_state.block_ref_counts
+                blocks_hashed_active = int((block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -3542,10 +3543,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                        routing_replay = self.context.kv_block_allocator.routing_replay
+                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -4303,7 +4303,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -4587,7 +4587,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
 
                 if prefill_chunk_length >= remaining_len:
@@ -5067,7 +5067,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # where Mamba state is still cached).
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
-                    len(kv_alloc.kv_hash_to_block_id),
+                    len(self.context.prefix_cache_registry.kv_hash_to_block_id),
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
