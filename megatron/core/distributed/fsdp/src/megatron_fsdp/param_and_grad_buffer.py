@@ -5186,7 +5186,23 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
 
-    ``group_size`` is the reduction group's rank count; None skips the one-rank case below.
+    Scales ``grad_data`` in place wherever the returned reduce operation cannot apply the
+    scaling itself.
+
+    Args:
+        grad_data (torch.Tensor): The unreduced gradient, scaled in place if needed.
+        scaling_factor (Optional[float]): The scale to apply to the gradient sum over the
+            reduction group, or None to sum the gradients without scaling. With
+            ``average_in_collective``, the AVG reduction already divides by the group size,
+            so this is the residual scale applied on top of it instead: 1.0 for non-expert
+            parameters, and the expert data parallel size divided by the data parallel size
+            for expert parameters.
+        ddp_config (DistributedDataParallelConfig): The gradient reduction configuration.
+        group_size (Optional[int]): The reduction group's rank count; None skips the
+            one-rank case below.
+
+    Returns:
+        torch.distributed.ReduceOp: The operation to reduce ``grad_data`` with.
     """
 
     # TODO(@cspades): Clean up this logic in conjunction with
@@ -5196,7 +5212,13 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
         # No scaling - use SUM reduction.
         reduce_op = torch.distributed.ReduceOp.SUM
     elif ddp_config.average_in_collective:
-        # Scaling overridden by AVG reduction.
+        # AVG divides by the group size, so any residual scale has to be applied here.
+        # Expert gradients are averaged over the expert data parallel group, which is
+        # narrower than the data parallel group the loss is averaged over, and dropping
+        # their residual scale leaves them too large by that ratio. MCore DDP likewise
+        # applies any non-unit scale before its AVG reduction.
+        if scaling_factor != 1.0:
+            grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.AVG
     elif group_size == 1:
         # A reduction over a single rank degenerates into a copy, which does not necessarily
