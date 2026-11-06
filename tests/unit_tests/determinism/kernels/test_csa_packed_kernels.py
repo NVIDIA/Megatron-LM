@@ -8,15 +8,19 @@ import pytest
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.experimental_attention_variant import csa2
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
+    csa2_indexer,
     csa_indexer_loss_kernels,
     packed_layout,
+    packed_sparse_attention,
     thd_utils,
 )
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
+    run_once,
     seeded,
 )
 
@@ -125,6 +129,234 @@ def test_thd_metadata_device_checks_only_validate(monkeypatch, device_checks):
             ),
             512,
         )
+
+
+def _padding_values(case):
+    """BF16 rows [T, 4, 64] and their padding flags. Padding rows hold undefined kernel
+    output: NaN, infinities and signed zeros."""
+    rows = {"mixed": 48, "all_padding": 6, "no_padding": 9, "empty": 0}[case]
+    invalid = torch.zeros(rows, dtype=torch.bool, device="cuda")
+    if case == "mixed":
+        # Row 0 is padding, so unused list entries name a later valid row.
+        invalid[[0, 1, 7, 8, 9, 30, 47]] = True
+    elif case == "all_padding":
+        invalid.fill_(True)
+    values = torch.randn(rows, 4, 64, device="cuda").bfloat16()
+    special = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0, 3.0], device="cuda")
+    fill = special[torch.arange(4 * 64, device="cuda") % special.numel()].view(4, 64)
+    values[invalid] = fill.bfloat16()
+    return invalid, values
+
+
+@pytest.mark.parametrize("case", ["mixed", "all_padding", "no_padding", "empty"])
+def test_sparse_pad_zero_matches_masked_fill(case):
+    """In-place padding-row zeroing (MCORE_CSA2_SPARSE_PAD_ZERO) writes the bits masked_fill
+    writes, forward and through its gradient hook, restores saved rows exactly, and replays
+    bit-exactly under contention."""
+    seeded()
+    invalid, values = _padding_values(case)
+    mask = invalid[:, None, None]
+    rows, keep = thd_utils.padding_rows(invalid)
+    assert rows.shape == keep.shape == (thd_utils.PAD_ROW_CAPACITY,)
+
+    zeroed = values.clone()
+    saved = thd_utils.save_rows(zeroed, rows)
+    assert thd_utils.zero_rows_(zeroed, rows, keep) is zeroed
+    assert bytes_equal(zeroed, values.masked_fill(mask, 0))
+    thd_utils.restore_rows_(zeroed, rows, saved)
+    assert bytes_equal(zeroed, values)
+
+    weight = torch.randn(values.shape, device="cuda").bfloat16()
+    upstream = torch.randn(values.shape, device="cuda").bfloat16().masked_fill(mask, float("nan"))
+
+    def masked(x):
+        return (x * 2).masked_fill(mask, 0) * weight
+
+    def in_place(x):
+        (y,) = thd_utils.zero_padding_rows_(invalid, x * 2)
+        return y * weight
+
+    leaf = values.clone().requires_grad_()
+    grad_outputs = {"out": upstream}
+    expected = run_once(masked, (leaf,), grad_outputs)
+    actual = assert_replays_bit_exact(
+        in_place, (leaf,), grad_outputs=grad_outputs, contention=True, what="pad-row zeroing"
+    )
+    for want, got in zip(expected, actual):
+        assert want.keys() == got.keys()
+        for name in want:
+            assert bytes_equal(got[name], want[name]), name
+
+
+def _spy_attention_kernels(padding, calls):
+    """Deterministic stand-ins for the FlashMLA forward and the cuDNN backward.
+
+    Rows without keys get undefined forward outputs, as in the real kernels, and backward
+    scores q against lse like the real one, so a raw q padding row with lse 0 overflows.
+    ``calls`` records what MCore hands the backward kernel.
+    """
+
+    def forward(q, kv, _indices, scale, *, attn_sink, **_kwargs):
+        out = (q.float() * scale + kv.float().mean(0) + attn_sink.float()[None, :, None]).tanh()
+        lse = q.float().mean(-1)
+        out[padding] = float("nan")
+        lse[padding] = float("inf")
+        return out.to(q.dtype), lse, None
+
+    def backward(q, kv, out, grad, lse, _sink, *_args, **_kwargs):
+        calls.append([t.detach().clone() for t in (q, kv, out, grad, lse)])
+        scores = torch.exp((q.float().mean(-1) - lse) * 64)
+        ds = scores * (grad.float() * out.float()).sum(-1)
+        dq = (ds[..., None] * q.float() + grad.float()).to(q.dtype)
+        return dq, (kv.float() * ds.sum()).to(kv.dtype), ds.sum(0)
+
+    return forward, backward
+
+
+def _run_pad_zero_attention(monkeypatch, function, sparse_pad_zero, refill, inputs):
+    """One CSA2 THD attention forward/backward with SPARSE_PAD_ZERO set as given."""
+    for module in (csa2, packed_sparse_attention, csa2_indexer):
+        monkeypatch.setattr(module, "SPARSE_PAD_ZERO", sparse_pad_zero)
+    padding = inputs["padding"]
+    calls = []
+    forward, backward = _spy_attention_kernels(padding, calls)
+    monkeypatch.setattr(packed_sparse_attention, "_csa_fwd_flash_mla", forward)
+    monkeypatch.setattr(packed_sparse_attention, "_csa_sparse_attention_backward", backward)
+    monkeypatch.setattr(packed_sparse_attention, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(packed_sparse_attention, "get_flash_mla_topk_alignment", lambda: 1)
+    monkeypatch.setattr(csa2_indexer.fused_sparse_attention, "_csa_fwd_flash_mla", forward)
+    monkeypatch.setattr(
+        csa2_indexer.fused_sparse_attention, "_csa_sparse_attention_backward", backward
+    )
+
+    def indexer_loss(iq, ik, weights, *_args, **_kwargs):
+        loss = iq.sum() + ik.sum() + weights.sum()
+        return loss, (torch.ones_like(iq), torch.ones_like(ik), torch.ones_like(weights))
+
+    monkeypatch.setattr(csa2_indexer, "_precompute_indexer_loss", indexer_loss)
+
+    leaves = {
+        name: inputs[name].detach().clone().requires_grad_()
+        for name in ("q", "kv", "sink", "global_kv", "iq", "ik", "weights")
+    }
+    rows = padding.numel()
+    # Producers whose backward does not read their output, like the q/KV up-projection.
+    q_raw, kv_raw = leaves["q"] * 1.5, leaves["kv"] * 1.5
+    query, key = csa2._zero_padding_rows_inplace(~padding, q_raw, kv_raw)
+    zeros = torch.zeros(rows, 1, dtype=torch.int32, device="cuda")
+    if function == "sparse_attention":
+        out, _, _ = packed_sparse_attention.CSASparseAttnFunc.apply(
+            query,
+            key.squeeze(1),
+            leaves["sink"],
+            zeros,
+            torch.ones(rows, dtype=torch.int32, device="cuda"),
+            0.125,
+            0,
+            None,
+            padding,
+            None,
+        )
+        output = out.flatten(1)
+    else:
+        prepared = csa2_indexer.CSA2IndexerInputs(
+            leaves["iq"],
+            leaves["ik"],
+            leaves["weights"],
+            1,
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            torch.full((rows,), 2, device="cuda"),
+            ~padding,
+            2,
+            2,
+            (rows,),
+            thd_layout=SimpleNamespace(cp_size=1),
+        )
+        output, _ = csa2_indexer.fused_csa2_indexer_sparse_attn(
+            prepared,
+            query,
+            key.squeeze(1),
+            leaves["global_kv"],
+            leaves["sink"],
+            zeros,
+            zeros,
+            0.125,
+            0.25,
+            True,
+            attention_indices=torch.zeros(rows, 2, dtype=torch.int32, device="cuda"),
+            attention_topk_length=torch.where(padding, 0, 2).int(),
+            q_padding_mask=padding,
+        )
+    if refill:
+        # mla_up_proj recompute writes the producers' raw rows back into their storage.
+        q_raw.data.copy_(leaves["q"].detach() * 1.5)
+        kv_raw.data.copy_(leaves["kv"].detach() * 1.5)
+    # The upstream gradient is shared: the add hands the same tensor to both branches.
+    other = torch.zeros_like(output, requires_grad=True)
+    upstream = inputs["upstream"].clone()
+    differentiable = ("q", "kv", "sink", "global_kv")
+    if function == "sparse_attention":
+        differentiable = ("q", "kv", "sink")
+    grads = torch.autograd.grad(
+        output + other, [leaves[name] for name in differentiable] + [other], upstream
+    )
+    assert bytes_equal(upstream, inputs["upstream"]), "the shared upstream gradient changed"
+    return output.detach(), grads, calls
+
+
+@pytest.mark.parametrize("refill", [False, True], ids=["eager", "recompute_refill"])
+@pytest.mark.parametrize("function", ["sparse_attention", "indexer_sparse_attention"])
+def test_sparse_pad_zero_attention_matches_masked_fill(monkeypatch, function, refill):
+    """CSA2 THD attention with in-place padding-row zeroing is bit-identical to masked_fill.
+
+    Covers both autograd Functions (packed sparse attention and the joint attention/indexer
+    loss), an upstream gradient shared with another consumer, and q/KV storage refilled with
+    raw padding rows between forward and backward, as mla_up_proj recompute does. The kernels
+    get identical q, out, dO and lse. Refilled KV padding rows only meet zero queries and zero
+    gradients, and their gradient rows are zeroed, so only valid KV rows are compared.
+    """
+    seeded()
+    rows, heads, dim = 12, 2, 8
+    padding = torch.zeros(rows, dtype=torch.bool, device="cuda")
+    padding[[0, 5, 10, 11]] = True
+    q = torch.randn(rows, heads, dim, device="cuda").bfloat16()
+    kv = torch.randn(rows, 1, dim, device="cuda").bfloat16()
+    # Large raw padding rows: unless re-zeroed, they overflow exp(score - lse) in backward.
+    q[padding] = 200.0
+    kv[padding] = -200.0
+    inputs = dict(
+        padding=padding,
+        q=q,
+        kv=kv,
+        sink=torch.randn(heads, device="cuda"),
+        global_kv=torch.randn(3, 1, dim, device="cuda").bfloat16(),
+        iq=torch.randn(rows, 1, 2, device="cuda"),
+        ik=torch.randn(2, 2, device="cuda"),
+        weights=torch.randn(rows, 1, device="cuda"),
+        upstream=torch.randn(rows, heads * dim, device="cuda")
+        .bfloat16()
+        .masked_fill(padding[:, None], float("nan")),
+    )
+    results = [
+        _run_pad_zero_attention(monkeypatch, function, sparse_pad_zero, refill, inputs)
+        for sparse_pad_zero in (False, True)
+    ]
+    (expected_out, expected_grads, expected_calls), (out, grads, calls) = results
+    assert bytes_equal(out, expected_out)
+    assert len(grads) == len(expected_grads)
+    for got, want in zip(grads, expected_grads):
+        assert bytes_equal(got, want)
+    # Input gradients are finite; the other consumer receives the upstream gradient unchanged.
+    *input_grads, other_grad = grads
+    assert all(torch.isfinite(grad.float()).all() for grad in input_grads)
+    assert bytes_equal(other_grad, inputs["upstream"])
+    assert len(calls) == len(expected_calls) == 1
+    valid_kv = torch.cat((~padding, torch.ones(3, dtype=torch.bool, device="cuda")))
+    valid_kv = valid_kv[: calls[0][1].shape[0]]
+    for index, (got, want) in enumerate(zip(calls[0], expected_calls[0])):
+        if index == 1 and refill:
+            got, want = got[valid_kv], want[valid_kv]
+        assert bytes_equal(got, want), ("q", "kv", "out", "dO", "lse")[index]
 
 
 def test_packed_indexer_metadata_and_loss_replay():

@@ -84,12 +84,34 @@ from .csa_utils.fused_sparse_attention import (
 from .csa_utils.packed_sparse_attention import csa_sparse_attn as packed_csa_sparse_attn
 from .csa_utils.packed_sparse_attention import get_flash_mla_topk_alignment
 from .csa_utils.thd_utils import (
+    SPARSE_PAD_ZERO,
     CSA2THDCompressionLayout,
     CSA2THDLayout,
     build_csa2_thd_layout,
     get_thd_token_metadata,
     get_window_topk_idxs_thd,
+    zero_padding_rows_,
 )
+
+
+@component("pad_mask")
+def _zero_padding_rows(invalid: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Zero THD padding rows out of place (``invalid`` broadcasts over each tensor)."""
+    return tuple(t.masked_fill(invalid, 0) for t in tensors)
+
+
+@component("pad_mask")
+def _zero_padding_rows_inplace(
+    valid_rows: torch.Tensor, *tensors: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Zero THD padding rows (``valid_rows`` flags dim 0).
+
+    With MCORE_CSA2_SPARSE_PAD_ZERO (the default) and contiguous tensors, only those rows
+    are written, in place; otherwise each tensor is masked out of place.
+    """
+    if SPARSE_PAD_ZERO and all(t.is_contiguous() for t in tensors):
+        return zero_padding_rows_(~valid_rows, *tensors)
+    return tuple(t.masked_fill(~valid_rows.view(-1, *[1] * (t.ndim - 1)), 0) for t in tensors)
 
 
 @dataclass
@@ -1666,7 +1688,7 @@ class CompressedSparseAttention2(MegatronModule):
         _, _, boundary_valid = get_thd_token_metadata(
             layout.cu_seqlens, layout.cu_seqlens_padded, boundary_rows
         )
-        boundary_kv = boundary_kv.masked_fill(~boundary_valid[:, None, None], 0)
+        (boundary_kv,) = _zero_padding_rows(~boundary_valid[:, None, None], boundary_kv)
         local = torch.cat((boundary_kv, key), dim=0).squeeze(1)
         window = None
         if not self.use_fused_kernels or query.shape[0] == 0:
@@ -1761,10 +1783,10 @@ class CompressedSparseAttention2(MegatronModule):
                     "CSA2 THD hidden states and query latents must have shape [T, 1, dim]."
                 )
             invalid = ~thd_layout.valid_tokens[:, None, None]
-            query = query.masked_fill(invalid, 0)
-            key = key.masked_fill(invalid, 0)
-            x = x.masked_fill(invalid, 0)
-            qr = qr.masked_fill(invalid, 0)
+            # Query and key are the large ones. x and qr also feed the indexer and the
+            # compressor; keep them out of place.
+            query, key = _zero_padding_rows_inplace(thd_layout.valid_tokens, query, key)
+            x, qr = _zero_padding_rows(invalid, x, qr)
         elif thd_layout is not None:
             raise ValueError("CSA2 THD layout requires packed sequence metadata.")
         elif query.ndim != 4 or query.shape[0] == 0:
@@ -1824,7 +1846,7 @@ class CompressedSparseAttention2(MegatronModule):
                 query, local, indices, x, qr, csa2_state, use_indexer_loss, out_rope
             )
         if is_thd and (out_rope is None or not self.use_fused_kernels or seq_len == 0):
-            output = output.masked_fill(~thd_layout.valid_tokens[:, None], 0)
+            (output,) = _zero_padding_rows_inplace(thd_layout.valid_tokens, output)
         if indexer_loss is not None:
             # The tracker averages microbatches, so report a token mean in either
             # reduction mode. Backward still receives the raw sum in per-token mode.

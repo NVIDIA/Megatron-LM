@@ -1003,7 +1003,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "unqualified for deterministic mode; this draft rejects that mode. test_component_nvtx "
         "covers the opt-in component NVTX ranges on the compressor, indexer and attention paths; "
         "test_csa_packed_kernels checks that THD layouts are bit-identical with the opt-in device "
-        "metadata checks on and off.",
+        "metadata checks on and off, and that in-place THD padding-row zeroing "
+        "(MCORE_CSA2_SPARSE_PAD_ZERO) matches masked_fill bit for bit, forward and backward.",
     ),
     KernelEntry(
         name="csa_teacher_lse",
@@ -1031,7 +1032,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py. The opt-in device metadata "
-        "checks (MCORE_CSA2_DEVICE_CHECKS) only validate; parity is in test_csa_packed_kernels.",
+        "checks (MCORE_CSA2_DEVICE_CHECKS) only validate; parity is in test_csa_packed_kernels, "
+        "which also compares the packed attention autograd Function with in-place padding-row "
+        "zeroing (MCORE_CSA2_SPARSE_PAD_ZERO) against masked_fill bit for bit.",
     ),
     KernelEntry(
         name="v41_engram_embedding",

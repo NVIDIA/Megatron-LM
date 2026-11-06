@@ -31,7 +31,15 @@ from megatron.core.ops.attention.csa.output_rope import (
 from . import fused_sparse_attention
 from .csa2_candidates import CSA2CandidateBlocks, fused_candidate_blocks, select_compact_positions
 from .csa2_teacher_lse import fused_csa_window_lse
-from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
+from .thd_utils import (
+    SPARSE_PAD_ZERO,
+    CSA2THDCompressionLayout,
+    CSA2THDLayout,
+    padding_rows,
+    restore_rows_,
+    save_rows,
+    zero_rows_,
+)
 
 try:
     import triton
@@ -997,8 +1005,14 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             topk_length = topk_length.clone()
             if q_padding_mask is not None:
                 topk_length.masked_fill_(q_padding_mask, 1)
+        ctx.pad_rows = None
         if q_padding_mask is not None:
-            out.masked_fill_(q_padding_mask[:, None, None], 0)
+            if SPARSE_PAD_ZERO and out.is_contiguous():
+                # Touch only the padding rows; backward reuses their indices.
+                ctx.pad_rows = padding_rows(q_padding_mask)
+                zero_rows_(out, *ctx.pad_rows)
+            else:
+                out.masked_fill_(q_padding_mask[:, None, None], 0)
         if out_rope is not None:
             out_rope.apply_(out)
         ctx.out_rope = out_rope
@@ -1019,13 +1033,31 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
         dq = dlocal = dglobal = dsink = None
         if grad_out is not None:
             kv = torch.cat((local, global_kv))
+            restore = ()
             if q_padding_mask is not None:
-                grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
-                lse = lse.masked_fill(q_padding_mask[:, None], 0)
+                with forward_range("pad_mask.bwd"):
+                    if SPARSE_PAD_ZERO:
+                        rows, keep = ctx.pad_rows or padding_rows(q_padding_mask)
+                        if q.is_contiguous():
+                            # mla_up_proj recompute refills q, zeroed in place by csa2, with raw
+                            # padding rows, which backward scores against lse 0 (exp can overflow).
+                            zero_rows_(q, rows, keep)
+                        # Zero grad_out/lse padding rows in place for the kernel and restore them
+                        # after it: the incoming gradient may be shared with another autograd
+                        # consumer, and lse is this Function's saved tensor.
+                        grad_out, lse = grad_out.contiguous(), lse.contiguous()
+                        restore = tuple((t, save_rows(t, rows)) for t in (grad_out, lse))
+                        zero_rows_(grad_out, rows, keep)
+                        zero_rows_(lse, rows, keep)
+                    else:
+                        grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
+                        lse = lse.masked_fill(q_padding_mask[:, None], 0)
             out, grad_out = undo_output_rope_for_backward(ctx.out_rope, out, grad_out)
             dq, dkv, dsink = fused_sparse_attention._csa_sparse_attention_backward(
                 q, kv, out, grad_out, lse, sink, indices, ctx.scale, topk_length=topk_length
             )
+            for tensor, saved in restore:
+                restore_rows_(tensor, rows, saved)
             dlocal, dglobal = dkv.split((local.shape[0], global_kv.shape[0]))
         gradients = (
             (None, None, None)

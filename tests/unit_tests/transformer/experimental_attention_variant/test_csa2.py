@@ -1310,3 +1310,60 @@ def test_cp_compressor_rejects_empty_shard_and_short_halo(ratio):
     )
     with pytest.raises(ValueError, match="nonempty contiguous CP"):
         compressor(x[:0], thd_layout=empty, boundary_hidden=x[:4])
+
+
+def test_padding_row_list_capacity_and_degenerate_inputs(monkeypatch):
+    """The static padding-row list behind MCORE_CSA2_SPARSE_PAD_ZERO, on the host.
+
+    Unused entries rewrite the first valid row unchanged, an all-padding input rewrites row 0,
+    empty inputs are untouched, and more padding rows than MCORE_CSA2_PAD_ROW_CAPACITY trip
+    the (device-side under CUDA) assert.
+    """
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import thd_utils
+
+    def bits(tensor):
+        return tensor.view(torch.int32).tolist()
+
+    monkeypatch.setattr(thd_utils, "PAD_ROW_CAPACITY", 4)
+    invalid = torch.tensor([True, False, False, True, True, False])
+    rows, keep = thd_utils.padding_rows(invalid)
+    assert rows.tolist() == [0, 3, 4, 1] and keep.tolist() == [False, False, False, True]
+    values = torch.tensor([[float("nan")], [1.0], [-2.0], [float("inf")], [-0.0], [5.0]])
+    original = values.clone()
+    saved = thd_utils.save_rows(values, rows)
+    assert thd_utils.zero_rows_(values, rows, keep) is values
+    assert bits(values) == bits(original.masked_fill(invalid[:, None], 0))
+    thd_utils.restore_rows_(values, rows, saved)
+    assert bits(values) == bits(original)
+
+    rows, keep = thd_utils.padding_rows(torch.ones(2, dtype=torch.bool))
+    assert rows.tolist() == [0, 1, 0, 0] and not keep.any()
+    rows, keep = thd_utils.padding_rows(torch.zeros(3, dtype=torch.bool))
+    assert rows.tolist() == [0] * 4 and keep.all()
+
+    empty = torch.empty(0, 3)
+    rows, keep = thd_utils.padding_rows(torch.zeros(0, dtype=torch.bool))
+    assert thd_utils.zero_rows_(empty, rows, keep) is empty
+    assert thd_utils.save_rows(empty, rows) is None
+    assert thd_utils.restore_rows_(empty, rows, None) is empty
+
+    with pytest.raises(RuntimeError, match="MCORE_CSA2_PAD_ROW_CAPACITY"):
+        thd_utils.padding_rows(torch.ones(5, dtype=torch.bool))
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 512), ("64", 64), (" 8 ", 8), ("0", None), ("-3", None), ("x", None)]
+)
+def test_pad_row_capacity_parsing(monkeypatch, value, expected):
+    """MCORE_CSA2_PAD_ROW_CAPACITY takes a positive integer and names itself in errors."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import thd_utils
+
+    if value is None:
+        monkeypatch.delenv("MCORE_CSA2_PAD_ROW_CAPACITY", raising=False)
+    else:
+        monkeypatch.setenv("MCORE_CSA2_PAD_ROW_CAPACITY", value)
+    if expected is None:
+        with pytest.raises(ValueError, match="MCORE_CSA2_PAD_ROW_CAPACITY"):
+            thd_utils._pad_row_capacity()
+    else:
+        assert thd_utils._pad_row_capacity() == expected

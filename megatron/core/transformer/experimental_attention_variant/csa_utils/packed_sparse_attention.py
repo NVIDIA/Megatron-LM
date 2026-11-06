@@ -12,6 +12,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.component_nvtx import forward_range
 from megatron.core.ops.attention.csa.output_rope import (
     OutputRopeParams,
     undo_output_rope_for_backward,
@@ -30,6 +31,7 @@ from .fused_sparse_attention import (
 )
 from .fused_sparse_attention import _get_topk_alignment as get_flash_mla_topk_alignment
 from .fused_sparse_attention import _kl_loss_from_dense_scores
+from .thd_utils import SPARSE_PAD_ZERO, padding_rows, restore_rows_, save_rows, zero_rows_
 
 _DSA: Any = None
 
@@ -152,10 +154,16 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length = topk_length.clone()
             if q_padding_mask is not None:
                 topk_length.masked_fill_(q_padding_mask, 1)
+        ctx.pad_rows = None
         if q_padding_mask is not None:
             # This Function owns out: clear undefined padding without retaining
             # another full output allocation outside the autograd boundary.
-            out.masked_fill_(q_padding_mask[:, None, None], 0)
+            if SPARSE_PAD_ZERO and out.is_contiguous():
+                # Touch only the padding rows; backward reuses their indices.
+                ctx.pad_rows = padding_rows(q_padding_mask)
+                zero_rows_(out, *ctx.pad_rows)
+            else:
+                out.masked_fill_(q_padding_mask[:, None, None], 0)
         if out_rope is not None:
             out_rope.apply_(out)
         ctx.out_rope = out_rope
@@ -185,9 +193,25 @@ class CSASparseAttnFunc(torch.autograd.Function):
         else:
             q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
+        restore = ()
         if ctx.q_padding_mask is not None:
-            dO = dO.masked_fill(ctx.q_padding_mask[:, None, None], 0)
-            lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+            with forward_range("pad_mask.bwd"):
+                if SPARSE_PAD_ZERO:
+                    rows, keep = ctx.pad_rows or padding_rows(ctx.q_padding_mask)
+                    if q.is_contiguous():
+                        # mla_up_proj recompute refills q, zeroed in place by csa2, with raw
+                        # padding rows, which backward scores against lse 0 (exp can overflow).
+                        zero_rows_(q, rows, keep)
+                    # Zero dO/lse padding rows in place for the kernel and restore them after
+                    # it: the incoming gradient may be shared with another autograd consumer,
+                    # and lse is this Function's saved tensor.
+                    dO, lse = dO.contiguous(), lse.contiguous()
+                    restore = tuple((t, save_rows(t, rows)) for t in (dO, lse))
+                    zero_rows_(dO, rows, keep)
+                    zero_rows_(lse, rows, keep)
+                else:
+                    dO = dO.masked_fill(ctx.q_padding_mask[:, None, None], 0)
+                    lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
         out, dO = undo_output_rope_for_backward(ctx.out_rope, out, dO)
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q,
@@ -200,6 +224,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
         )
+        for tensor, saved in restore:
+            restore_rows_(tensor, rows, saved)
         return (dq, dkv, d_sink, None, None, None, None, None, None, None)[: ctx.num_forward_inputs]
 
 

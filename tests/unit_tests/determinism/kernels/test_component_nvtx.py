@@ -19,6 +19,7 @@ from megatron.core import component_nvtx
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.deepseek_v41.hybrid_adapter import DeepSeekV41Adapter
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.transformer.experimental_attention_variant import csa2
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CompressedSparseAttention2,
     CSA2Compressor,
@@ -49,6 +50,8 @@ INSTRUMENTED = (
     (CompressedSparseAttention2, "_forward_fused_indexer_training"),
     (CompressedSparseAttention2, "_forward_fused_indexer_no_loss"),
     (CompressedSparseAttention2, "_forward_fused_reuse"),
+    (csa2, "_zero_padding_rows"),
+    (csa2, "_zero_padding_rows_inplace"),
     (DSv4HybridAttention, "forward"),
     (DSv4HybridAttention, "_output_projection"),
     (DSv4HybridSelfAttention, "get_query_key_value_tensors"),
