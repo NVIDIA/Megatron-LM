@@ -1368,6 +1368,16 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
     # varlen-SBHD disjunct should short-circuit before this is consulted at all.
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
+    # NOTE(nightly-sync 2026-11-03): main (831aa66d4) moved is_dataset_built_on_rank into
+    # megatron.training.datasets.providers, which pretrain_gpt re-exports. It reads the arguments
+    # and the transformer config at call time from global_vars and arguments, so patch those too.
+    from megatron.training import arguments as training_arguments
+    from megatron.training import global_vars
+
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training_arguments, "core_transformer_config_from_args", lambda _: SimpleNamespace()
+    )
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
 
