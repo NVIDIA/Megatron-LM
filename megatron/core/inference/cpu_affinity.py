@@ -74,9 +74,9 @@ def _format_cpus(cpus: Iterable[int]) -> str:
 
 def _find_violations(
     tids: Iterable[int], caller: int, local_cpus: set[int], get_affinity: Callable[[int], set[int]]
-) -> list[str]:
-    """Return a description of each thread whose allowed CPUs are not all GPU-local."""
-    violations = []
+) -> dict[int, set[int]]:
+    """Map each thread whose allowed CPUs are not all GPU-local to its allowed CPUs."""
+    violations = {}
     for tid in tids:
         try:
             allowed = set(get_affinity(tid))
@@ -85,20 +85,47 @@ def _find_violations(
                 raise
             continue  # A helper thread may exit between enumeration and inspection.
         if not allowed or not allowed <= local_cpus:
-            violations.append(f"tid={tid} allowed=[{_format_cpus(allowed)}]")
+            violations[tid] = allowed
     return violations
 
 
-def validate_inference_cpu_affinity(*, all_threads: bool = False, warn_only: bool = False) -> None:
+def _report_violations(
+    violations: dict[int, set[int]],
+    caller: int,
+    local_cpus: set[int],
+    context: str,
+    warn_for_helper_threads: bool,
+) -> None:
+    """Raise for violations, or only log them when they are all on helper threads and allowed."""
+    if not violations:
+        return
+    details = "; ".join(
+        f"tid={tid}{' (caller)' if tid == caller else ''} allowed=[{_format_cpus(allowed)}]"
+        for tid, allowed in sorted(violations.items())
+    )
+    message = (
+        f"Inference CPU affinity check failed ({context}): {details}; "
+        f"GPU-local CPUs=[{_format_cpus(local_cpus)}]. "
+        "Bind this rank to GPU-local CPUs with your launcher before CUDA initialization."
+    )
+    if warn_for_helper_threads and caller not in violations:
+        logger.warning(message)
+    else:
+        raise RuntimeError(message)
+
+
+def validate_inference_cpu_affinity(
+    *, all_threads: bool = False, warn_for_helper_threads: bool = False
+) -> None:
     """Check that threads may only run on CPUs local to the current CUDA device.
 
     Checks the calling thread, or every thread in the process when all_threads is set.
-    Never changes affinity. With warn_only, violations are logged instead of raised;
-    failure to determine the topology always raises.
+    Never changes affinity. A violation on the calling thread always raises; with
+    warn_for_helper_threads, violations on other threads are logged instead.
 
     Raises:
-        RuntimeError: Topology is unavailable, or (unless warn_only) a checked thread
-            may run on non-local CPUs.
+        RuntimeError: Topology is unavailable, the calling thread may run on non-local
+            CPUs, or (unless warn_for_helper_threads) another thread may.
     """
     if not hasattr(os, "sched_getaffinity"):
         raise RuntimeError("Inference CPU affinity validation requires Linux sched_getaffinity.")
@@ -117,15 +144,6 @@ def validate_inference_cpu_affinity(*, all_threads: bool = False, warn_only: boo
         violations = _find_violations(sorted(tids), caller, local_cpus, os.sched_getaffinity)
     except OSError as exc:
         raise RuntimeError(f"Cannot inspect thread CPU affinity ({identity}): {exc}") from exc
-    if not violations:
-        return
-
-    message = (
-        f"Inference CPU affinity check failed ({identity}, GPU={gpu_uuid}): "
-        f"{'; '.join(violations)}; GPU-local CPUs=[{_format_cpus(local_cpus)}]. "
-        "Bind this rank to GPU-local CPUs with your launcher before CUDA initialization."
+    _report_violations(
+        violations, caller, local_cpus, f"{identity}, GPU={gpu_uuid}", warn_for_helper_threads
     )
-    if warn_only:
-        logger.warning(message)
-    else:
-        raise RuntimeError(message)

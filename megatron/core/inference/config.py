@@ -499,9 +499,9 @@ class InferenceConfig:
     require_gpu_local_cpu_affinity: bool = False
     """Check at dynamic engine init that threads are bound to GPU-local CPUs.
 
-    Raises if the calling thread can run on non-local CPUs before CUDA graph warmup, and
-    warns about any such thread after warmup. Never changes affinity. Requires Linux and
-    nvidia-ml-py.
+    Raises if the calling thread can run on non-local CPUs, checked before and after CUDA
+    graph warmup; after warmup, also warns about other threads that can. Never changes
+    affinity. Requires Linux and nvidia-ml-py.
     """
 
     # =================================
