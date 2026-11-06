@@ -1362,7 +1362,7 @@ class TextGenerationController(MTPControllerMixin):
             positions (Tensor): CPU position within the KV block for each routing row.
         """
         context = self.inference_wrapped_model.inference_context
-        context.kv_block_allocator.store_routing_per_block(
+        context.kv_block_allocator.routing_replay.scatter_routing_to_blocks(
             routing_indices, block_ids.numpy(), positions.numpy()
         )
 
@@ -1878,7 +1878,7 @@ class TextGenerationController(MTPControllerMixin):
         """
         context = self.inference_wrapped_model.inference_context
         finished_routing_block_ids = {}
-        if not context.kv_block_allocator.block_routing:
+        if not context.kv_block_allocator.routing_replay.has_data():
             return finished_routing_block_ids
 
         for finished_idx in finished_idxs.tolist():
