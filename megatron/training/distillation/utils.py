@@ -48,7 +48,7 @@ except ImportError:
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.training import get_args, get_train_state
-from megatron.training.global_vars import get_run_config
+from megatron.training.global_vars import get_run_config, is_run_config_initialized
 from megatron.training.utils import get_blend_and_blend_per_split
 
 logger = logging.getLogger(__name__)
@@ -258,14 +258,39 @@ def get_consumed_train_samples() -> int:
     return get_args().consumed_train_samples
 
 
-def _blend_identifiers(args: Any) -> Dict[str, Any]:
-    """Build a path-agnostic representation of the training data blend."""
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+def _reject_downsampled_train_blend(blend_per_split: list[tuple | None] | None) -> None:
+    """Reject subsets that the cached-logits identity format cannot represent."""
+    train_blend = None if blend_per_split is None else blend_per_split[0]
+    if (
+        train_blend is not None
+        and len(train_blend) == 3
+        and any(probability < 1.0 for probability in train_blend[2])
+    ):
+        raise ValueError(
+            "Cached-logits distillation does not support training-data downsampling; "
+            "all train probabilities must be 1.0."
+        )
 
-    def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
+
+def validate_cached_logits_dataset() -> None:
+    """Reject unsupported training subsets even when cached-logits hash checks are disabled."""
+    # Standalone tar inspection has no training dataset to validate.
+    if not is_run_config_initialized():
+        return
+    dataset = getattr(getattr(get_run_config(), "data", None), "dataset", None)
+    if dataset is not None:
+        _reject_downsampled_train_blend(dataset.blend_per_split)
+
+
+def _blend_identifiers(args: Any) -> dict[str, Any]:
+    """Build a path-agnostic representation of the training data blend."""
+    blend, blend_per_split = get_blend_and_blend_per_split(args, allow_per_source_downsampling=True)
+    _reject_downsampled_train_blend(blend_per_split)
+
+    def _normalise(blend_tuple) -> list[list[Any]] | None:
         if blend_tuple is None:
             return None
-        prefixes, weights = blend_tuple
+        prefixes, weights = blend_tuple[:2]
         if weights is None:
             weights = [1.0] * len(prefixes)
         return [
@@ -281,7 +306,7 @@ def _blend_identifiers(args: Any) -> Dict[str, Any]:
     return {"kind": "mock", "mock": True}
 
 
-def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+def compute_dataset_hash() -> tuple[str, dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
@@ -290,6 +315,11 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     """
     cfg = get_run_config()
     args = get_args()
+    # Python/YAML configuration can replace the CLI blend. Reject its subsets too, even
+    # when the legacy arguments still describe an unrestricted source.
+    dataset = getattr(getattr(cfg, "data", None), "dataset", None)
+    if dataset is not None:
+        _reject_downsampled_train_blend(dataset.blend_per_split)
     train_samples = cfg.train.train_samples
     if train_samples is None:
         train_iters = cfg.train.train_iters

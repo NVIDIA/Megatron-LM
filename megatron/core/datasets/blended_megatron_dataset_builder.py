@@ -11,9 +11,9 @@ import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Blend, Split, normalize
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,12 @@ class BlendedMegatronDatasetBuilder(object):
         # The config may have been completed after construction (its tokenizer bound later):
         # validate it before it is read.
         self.config.validate()
+
+        train_blend = (
+            None if self.config.blend_per_split is None else self.config.blend_per_split[0]
+        )
+        if train_blend is not None and len(train_blend) == 3 and not issubclass(cls, GPTDataset):
+            raise ValueError("Per-source downsampling requires a GPT dataset")
 
         log_single_rank(
             logger,
@@ -250,16 +256,22 @@ class BlendedMegatronDatasetBuilder(object):
                 sizes_spoof[i] = self.sizes[i]
 
                 # Blend is provided for the split
-                blend = self.config.blend_per_split[i]
-                if blend is not None:
-                    prefixes, weights = blend
+                split_blend: Blend | None = self.config.blend_per_split[i]
+                if split_blend is not None:
+                    prefixes, weights = split_blend[:2]
+                    probabilities = split_blend[2] if len(split_blend) == 3 else None
                     if weights is not None:
                         weights = normalize(weights)
 
                     # Blend consists of a sigle prefix
                     if len(prefixes) == 1:
                         blended_datasets[i] = self._build_megatron_dataset_splits(
-                            prefixes[0], split_spoof, sizes_spoof
+                            prefixes[0],
+                            split_spoof,
+                            sizes_spoof,
+                            train_data_down_sampling_prob=(
+                                None if probabilities is None else probabilities[0]
+                            ),
                         )[i]
                         continue
                     elif self.config.multiple_validation_sets and i == Split.valid.value:
@@ -294,7 +306,7 @@ class BlendedMegatronDatasetBuilder(object):
 
                     # Build each dataset in parallel
                     megatron_datasets = self._build_megatron_datasets_parallel(
-                        prefixes, split_spoof, sizes_per_dataset_buffer
+                        prefixes, split_spoof, sizes_per_dataset_buffer, probabilities=probabilities
                     )[i]
 
                     # Build top-level dataset
@@ -337,7 +349,11 @@ class BlendedMegatronDatasetBuilder(object):
             return blended_datasets
 
     def _build_megatron_datasets_parallel(
-        self, prefixes: List[str], split: List[float], sizes_per_dataset: List[List[int]]
+        self,
+        prefixes: List[str],
+        split: List[float],
+        sizes_per_dataset: List[List[int]],
+        probabilities: list[float] | None = None,
     ) -> List[List[Optional[MegatronDataset]]]:
         """Build the megatron datasets for a list of prefixes in parallel
 
@@ -348,6 +364,8 @@ class BlendedMegatronDatasetBuilder(object):
 
             sizes_per_dataset (List[List[int]]): The number of samples to request
             per MegatronDataset per spilt
+
+            probabilities (list[float] | None): Optional train probabilities, one per prefix.
 
         Returns:
             List[List[Optional[MegatronDataset]]]: For each split, have a list of
@@ -381,6 +399,7 @@ class BlendedMegatronDatasetBuilder(object):
                             split,
                             sizes_per_dataset[i],
                             False,  # synchronize_ranks, barrier is called in this function
+                            None if probabilities is None else probabilities[i],
                         )
                     )
                 for future in all_futures:
@@ -436,6 +455,7 @@ class BlendedMegatronDatasetBuilder(object):
         split: List[float],
         sizes: List[int],
         synchronize_ranks: bool = True,
+        train_data_down_sampling_prob: float | None = None,
     ) -> List[Optional[MidLevelDataset]]:
         """Build each MidLevelDataset split from a single LowLevelDataset
 
@@ -449,6 +469,8 @@ class BlendedMegatronDatasetBuilder(object):
 
             synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks
                 behavior. Set to False when we enforce this behavior at higher level.
+
+            train_data_down_sampling_prob (float | None): Probability for the train split only.
 
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
@@ -488,17 +510,19 @@ class BlendedMegatronDatasetBuilder(object):
                     end = int(round(split[i][1] * float(num_elements)))
                     indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
 
+                dataset_args: tuple[Any, ...] = (
+                    low_level_dataset,
+                    dataset_path,
+                    indexed_indices,
+                    sizes[i],
+                    _split,
+                    self.config,
+                )
+                if _split == Split.train and train_data_down_sampling_prob is not None:
+                    dataset_args += (train_data_down_sampling_prob,)
                 mid_level_datasets.append(
                     self.build_generic_dataset(
-                        self.cls,
-                        self.is_built_on_rank,
-                        synchronize_ranks,
-                        low_level_dataset,
-                        dataset_path,
-                        indexed_indices,
-                        sizes[i],
-                        _split,
-                        self.config,
+                        self.cls, self.is_built_on_rank, synchronize_ranks, *dataset_args
                     )
                 )
 

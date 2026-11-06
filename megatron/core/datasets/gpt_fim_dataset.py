@@ -77,9 +77,16 @@ class GPTFIMDataset(GPTDataset):
         num_samples: int,
         index_split: Split,
         config: GPTFIMDatasetConfig,
+        train_data_down_sampling_prob: float | None = None,
     ) -> None:
         super().__init__(
-            indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
+            indexed_dataset,
+            dataset_path,
+            indexed_indices,
+            num_samples,
+            index_split,
+            config,
+            train_data_down_sampling_prob,
         )
 
         self.np_rng = np.random.RandomState(seed=self.config.random_seed)

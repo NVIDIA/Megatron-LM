@@ -2,6 +2,7 @@
 
 """General utilities."""
 import json
+import math
 import os
 import sys
 import warnings
@@ -622,8 +623,8 @@ def get_device_arch_version():
     return torch.cuda.get_device_properties(torch.device("cuda:0")).major
 
 
-def get_blend_and_blend_per_split(args):
-    """Get blend and blend_per_split from passed-in arguments."""
+def get_blend_and_blend_per_split(args, *, allow_per_source_downsampling: bool = False):
+    """Get blend inputs, optionally allowing per-source probabilities for train only."""
     use_data_path = args.data_path is not None or args.data_args_path is not None
     use_per_split_data_path = (
         any(
@@ -654,18 +655,46 @@ def get_blend_and_blend_per_split(args):
                         per_split_data_args[split] = per_split_data_args[split].split()
 
                 blend_per_split = [
-                    get_blend_from_list(per_split_data_args["train"]),
+                    get_blend_from_list(
+                        per_split_data_args["train"],
+                        allow_per_source_downsampling=allow_per_source_downsampling,
+                    ),
                     get_blend_from_list(per_split_data_args["valid"]),
                     get_blend_from_list(per_split_data_args["test"]),
                 ]
         else:
             blend_per_split = [
-                get_blend_from_list(args.train_data_path),
+                get_blend_from_list(
+                    args.train_data_path,
+                    allow_per_source_downsampling=allow_per_source_downsampling,
+                ),
                 get_blend_from_list(args.valid_data_path),
                 get_blend_from_list(args.test_data_path),
             ]
     else:
         blend, blend_per_split = None, None
+
+    train_data_down_sampling_prob_override = getattr(
+        args, "train_data_down_sampling_prob_override", None
+    )
+    if train_data_down_sampling_prob_override is not None:
+        if not (
+            math.isfinite(train_data_down_sampling_prob_override)
+            and 0.0 < train_data_down_sampling_prob_override <= 1.0
+        ):
+            raise ValueError("train_data_down_sampling_prob_override must be finite and in (0, 1]")
+        if (
+            not allow_per_source_downsampling
+            or blend_per_split is None
+            or blend_per_split[0] is None
+        ):
+            raise ValueError("Downsampling overrides require a supported per-split train blend")
+        prefixes, weights = blend_per_split[0][:2]
+        blend_per_split[0] = (
+            prefixes,
+            weights,
+            [train_data_down_sampling_prob_override] * len(prefixes),
+        )
 
     return blend, blend_per_split
 

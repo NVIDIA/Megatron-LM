@@ -3203,9 +3203,16 @@ def _add_data_args(parser):
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
+    group.add_argument('--train-data-down-sampling-seed', type=int, default=1234,
+                       help='Seed used when downsampling low-level dataset indices '
+                            'for the train split')
+    group.add_argument('--train-data-down-sampling-prob-override', type=float, default=None,
+                       help='Uniform train-data downsampling probability that overrides '
+                            'per-source values in a per-split train blend.')
     group.add_argument('--train-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent train dataset. '
-                       'Follows the same pattern rules as --data-path.')
+                       'Follows the same pattern rules as --data-path. GPT and FIM also '
+                       'accept weight prefix downsampling-probability triples.')
     group.add_argument('--valid-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent validation dataset. '
                        'Follows the same pattern rules as --data-path.')

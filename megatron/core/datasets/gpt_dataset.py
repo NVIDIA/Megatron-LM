@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -84,6 +86,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
+
+    train_data_down_sampling_seed: int | None = None
+    """Seed for selecting training indexed sequences independently of sample shuffling.
+    Required for a probability below one. Must be an integer in [0, 2**32)."""
+
     sft_mock_dataset_config_json: Optional[str] = None
     """JSON string (or path to a JSON file) configuring the mock SFT dataset's
     sequence-length distribution. Two modes:
@@ -147,6 +154,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
         assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
 
+        seed = self.train_data_down_sampling_seed
+        if seed is not None and (
+            isinstance(seed, bool)
+            or not isinstance(seed, (int, numpy.integer))
+            or not 0 <= seed < 2**32
+        ):
+            raise ValueError("train_data_down_sampling_seed must be an integer in [0, 2**32)")
+
         if self.hybrid_context_parallel:
             warnings.warn(
                 "GPTDatasetConfig.hybrid_context_parallel is deprecated; use "
@@ -201,10 +216,44 @@ class GPTDataset(MegatronDataset):
         num_samples: Optional[int],
         index_split: Split,
         config: GPTDatasetConfig,
+        train_data_down_sampling_prob: float | None = None,
     ) -> None:
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
+        if index_split != Split.train and train_data_down_sampling_prob is not None:
+            raise ValueError("Downsampling probability is only valid for train")
+        probability = (
+            1.0 if train_data_down_sampling_prob is None else train_data_down_sampling_prob
+        )
+        if not 0.0 < probability <= 1.0:
+            raise ValueError("Downsampling probability must be finite and in (0, 1]")
+        self.train_data_down_sampling_prob = probability
+        if probability < 1.0:
+            seed = self.config.train_data_down_sampling_seed
+            if (
+                isinstance(seed, bool)
+                or not isinstance(seed, (int, numpy.integer))
+                or not 0 <= seed < 2**32
+            ):
+                raise ValueError("Downsampling requires an integer seed in [0, 2**32)")
+            self.unique_identifiers["train_data_down_sampling_prob"] = probability
+            self.unique_identifiers["train_data_down_sampling_seed"] = int(seed)
+            self.unique_description = json.dumps(
+                self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+            )
+            self.unique_description_hash = hashlib.md5(
+                self.unique_description.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()
+            # Select the same prefix of a seeded permutation at every probability. Fast cache
+            # loading supplies no indices and reads the indices identified by this cache key.
+            if indexed_indices is not None:
+                selected_count = ceil(probability * indexed_indices.size)
+                self.indices = (
+                    numpy.random.RandomState(seed)
+                    .permutation(indexed_indices)[:selected_count]
+                    .copy()
+                )
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -996,6 +1045,7 @@ class MockGPTDataset(GPTDataset):
         num_samples: int,
         index_split: Split,
         config: GPTDatasetConfig,
+        train_data_down_sampling_prob: float | None = None,
     ) -> None:
         assert config.mock
 
@@ -1006,6 +1056,7 @@ class MockGPTDataset(GPTDataset):
             num_samples,
             index_split,
             config,
+            train_data_down_sampling_prob,
         )
 
     @staticmethod
