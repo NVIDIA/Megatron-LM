@@ -279,7 +279,6 @@ def experimental_cls(introduced_with_version: str):
                 parent classes will be provided to the metaclass. We add a
                 `__getattribute__` to the metaclass as to allow it to fetch it from the
                 callees class.
-
                 """
 
                 def __init__(self, *args, **kwargs):

@@ -171,7 +171,6 @@ def _mxfp8_quant_swizzle_kernel(
             group    = (row % 128) // 32
             local_col = col % 4
             offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
-
     """
     row = tl.program_id(0).to(tl.int64)
     _mxfp8_quant_swizzle_row(

@@ -2589,7 +2589,6 @@ class MoETransformerLayer(TransformerLayer):
         Handles combining the expert outputs, applying biases, re-registering
         activation recomputation hooks if necessary, and performing the final
         Bias-Dropout-Add. This method is isolated so it can be captured by cudagraphs.
-
         """
 
         self.mlp.fwd_execution_map = "postprocess"

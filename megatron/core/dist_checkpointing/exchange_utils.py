@@ -636,7 +636,6 @@ def exchange_loaded_tensors_gather_object(
         Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
             needed by this rank to load a given state dict. Includes
             previously loaded tensors (from `loaded_tensors` input)
-
     """
     all_loaded_tensors_list = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(

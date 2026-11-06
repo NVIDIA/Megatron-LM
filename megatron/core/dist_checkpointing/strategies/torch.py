@@ -118,7 +118,6 @@ def flatten_state_dict(
 
     Returns:
         tuple: flattened state dict and a mapping allowing to recreate the original one
-
     """
     flattened = {}
     mappings = {}
@@ -169,7 +168,6 @@ def sharded_tensor_to_torch_sharded_tensor(
 
     Returns:
         TorchShardedTensor: PyT ShardedTensor containing all passed shards.
-
     """
     if rank is None:
         rank = torch.distributed.get_rank()

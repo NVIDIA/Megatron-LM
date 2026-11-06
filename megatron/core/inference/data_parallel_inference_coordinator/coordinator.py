@@ -664,7 +664,6 @@ class DataParallelInferenceCoordinator:
         Counting forward also refuses to credit a rank for a deep block whose
         prefix has been evicted: that KV cannot be reused, because reaching it
         requires the blocks before it.
-
         """
         n_ranks = len(self._identities_list)
         depth = np.zeros(n_ranks, dtype=np.int64)

@@ -3306,7 +3306,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This function is only used for MXFP8 params.
         Copy FP32 main params directly to param buffer for param all-gather since
         param buffer is not mapped to model params for MXFP8 case.
-
         """
         if self.ddp_config.use_megatron_fsdp:
             raise NotImplementedError(

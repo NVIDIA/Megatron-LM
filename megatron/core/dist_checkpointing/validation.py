@@ -261,7 +261,6 @@ def _determine_missing_and_unexpected_keys(
         Tuple[Set[str], Set[str]]: missing and unexpected keys. Missing keys are equal
             on all ranks, unexpected keys might differ across ranks. If passed
             `global_metadata` is empty, returned missing keys are empty as well.
-
     """
     local_accessed_keys = set(sh_base.key for sh_base in local_metadata)
     ckpt_keys = set(sh_base.key for sh_base in ckpt_sharded_metadata.values())

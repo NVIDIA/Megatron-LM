@@ -1060,7 +1060,6 @@ if HAVE_TE:
 
         Returns:
             GPTModel: The same model with wrapped linear layers (modified in-place).
-
         """
         assert Fp8Padding and Fp8Unpadding, "TE version does not have FP8 padding functions"
         # Find and wrap all TE linear layers

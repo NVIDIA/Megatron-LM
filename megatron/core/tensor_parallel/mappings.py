@@ -584,7 +584,6 @@ def all_to_all_sp2hp(input_, group=None):
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens, H/TP].
-
     """
     group = get_tensor_model_parallel_group_if_none(group)
 

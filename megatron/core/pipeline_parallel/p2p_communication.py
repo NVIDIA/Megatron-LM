@@ -303,7 +303,6 @@ class P2PCommunicator:
 
             - tensor_recv_prev: torch.Tensor if recv_prev is True, None otherwise.
             - tensor_recv_next: torch.Tensor if recv_next is True, None otherwise.
-
         """
 
         config = self.config

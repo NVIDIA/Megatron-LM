@@ -306,7 +306,6 @@ class CudagraphBufferMetadata:
           can_skip_replay_copy and when args_to_clear_buffers fires.
       fwd_cudagraph_buffer / bwd_cudagraph_buffer — the shared strong-ref buffer other
           graphs alias for this input/grad.
-
     """
 
     is_cudagraph_input: bool = False

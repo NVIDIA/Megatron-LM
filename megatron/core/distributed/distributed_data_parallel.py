@@ -104,7 +104,6 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
             dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
             instead of computing a default one.
-
     """
 
     @staticmethod

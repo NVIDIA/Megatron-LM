@@ -1227,7 +1227,6 @@ class TENorm:
        norm is followed by a residual connection)
 
     Fusion only happens when BOTH conditions are met.
-
     """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?

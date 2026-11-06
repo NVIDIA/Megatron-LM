@@ -1067,7 +1067,6 @@ class LLaVAModel(MegatronModule):
             expanded_labels (torch.Tensor): Distributed labels for image and text positions.
             expanded_loss_mask (torch.Tensor): Distributed loss mask.
             packed_seq_params (PackedSeqParams): Dict with padded token information.
-
         """
 
         # No pre or post processing needed with PP middle chunks.

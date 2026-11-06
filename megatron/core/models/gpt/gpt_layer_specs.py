@@ -193,7 +193,6 @@ def get_gpt_layer_with_transformer_engine_submodules(
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
-
     """
     if fp8 is not None:
         warnings.warn(

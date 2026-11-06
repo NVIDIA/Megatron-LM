@@ -58,7 +58,6 @@ class ParamGroupOverride(TypedDict, total=False):
     Example:
         >>> param_group_override = ParamGroupOverride(min_lr=1e-4, wd_mult=0.1)
         >>> param_group_override == ParamGroupOverride(optimizer='muon')  # per-param optimizer
-
     """
 
     max_lr: float
@@ -169,7 +168,6 @@ class OptimizerParamScheduler:
             clock that drives LR warmup and decay
         step_lr_rescale_warmup_samples (int, optional): number of samples used to linearly
             transition between LR multipliers after the initial schedule entry
-
     """
 
     def __init__(

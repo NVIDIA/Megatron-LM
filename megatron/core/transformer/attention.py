@@ -1431,7 +1431,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         Return:
             Tensor consumed by the attention output projection.
-
         """
         assert (
             packed_sequence_cp_metadata is None

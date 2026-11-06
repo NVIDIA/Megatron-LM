@@ -848,7 +848,6 @@ class TEGroupedMLP(MegatronModule):
         all-gathers. It does not support general pre-forward hooks
         since they may manipulate intermediate tensors that are never
         instantiated by the fused implementation.
-
         """
 
         def forward_pre_hook(module, *_) -> None:

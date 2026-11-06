@@ -1364,7 +1364,6 @@ class ColumnParallelLinear(torch.nn.Module):
         Returns:
             - output
             - bias
-
         """
         if weight is None:
             if self.weight is None:
@@ -1546,7 +1545,6 @@ class RowParallelLinear(torch.nn.Module):
             Communication buffer name. Not used in non-Transformer-Engine modules.
         config:
             ModelParallelConfig object
-
     """
 
     def __init__(

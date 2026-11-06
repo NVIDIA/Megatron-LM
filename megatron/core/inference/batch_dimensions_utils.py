@@ -36,7 +36,6 @@ class InferenceBatchDimensions:
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
-
     """
 
     token_count: int = 0

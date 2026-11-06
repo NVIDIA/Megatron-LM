@@ -149,7 +149,6 @@ def get_forward_backward_func(
             Otherwise, provided values are used as-is and None is treated as an explicit input.
         schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
             multi-module (cross-grid) collection is passed, select the bridge schedule.
-
     """
     if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
         return forward_backward_pipelining_without_interleaving

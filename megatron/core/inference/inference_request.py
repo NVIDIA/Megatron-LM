@@ -551,7 +551,6 @@ class InferenceRequest:
     """Class for one inference request
 
     Containing relevant data for an inference request
-
     """
 
     request_id: int
@@ -781,7 +780,6 @@ class DynamicInferenceRequest(InferenceRequest):
     """Class for one inference request
 
     Containing relevant data for an dynamic inference request
-
     """
 
     request_id: int
