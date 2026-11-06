@@ -134,3 +134,10 @@ The iterator owns all lane loaders and closes them on failure and training exit.
 The existing dependency predates a public loader close API, so cleanup has a
 small persistent-worker compatibility fallback; newer native close APIs are
 used when available.
+
+### Image metadata placement
+
+Provide dynamic image sizes as CPU `imgs_sizes` tensors. The shared MIMO batch
+mover retains this field on the host because vision encoders read its dimensions
+in Python. Pixel tensors, token tensors and `PackedSeqParams` attention indices
+still move to CUDA. This also applies when inputs are nested under a modality.
