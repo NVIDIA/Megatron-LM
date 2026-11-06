@@ -1,6 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -51,6 +51,6 @@ MODEL_ARGS:
   --bf16: true
   --log-memory-to-tensorboard: true
   --use-persistent-ckpt-worker: true
-  --disable-deterministic-mode: true
+  --exit-interval: 100
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher
