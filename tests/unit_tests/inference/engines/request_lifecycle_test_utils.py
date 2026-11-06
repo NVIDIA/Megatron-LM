@@ -395,6 +395,7 @@ def _assert_coordinator_parity(actual, expected):
     exact_fields = (
         "request_id",
         "status",
+        "finish_reason",
         "prompt",
         "prompt_tokens",
         "remaining_prompt_tokens",
