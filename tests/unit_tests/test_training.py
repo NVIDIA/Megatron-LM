@@ -584,6 +584,9 @@ class TestStepBatchSizeScheduleIterationHorizon:
 
     def _build_scheduler(self, monkeypatch, run_config, schedule, data_parallel_size, **lr_args):
         from megatron.core import num_microbatches_calculator as calculator
+        from megatron.training import global_vars
+        from megatron.training.config.container import PretrainConfigContainer
+        from megatron.training.config.training_config import SchedulerConfig
 
         # The schedule uses 8 samples per iteration for the first 400 samples (50 iterations),
         # then 16. Without --global-batch-size, validate_args sets it to mbs * dp size.
@@ -594,9 +597,11 @@ class TestStepBatchSizeScheduleIterationHorizon:
             train_iters=self.TRAIN_ITERS,
             step_batch_size_schedule=schedule,
         )
+        run_config.optimizer.lr = self.MAX_LR
+        run_config.optimizer.min_lr = self.MIN_LR
         args = SimpleNamespace(
-            lr=self.MAX_LR,
-            min_lr=self.MIN_LR,
+            batch_parallel_size=data_parallel_size,
+            seq_length=None,
             lr_warmup_init=0.0,
             lr_decay_style="cosine",
             lr_wsd_decay_style="linear",
@@ -611,8 +616,16 @@ class TestStepBatchSizeScheduleIterationHorizon:
             override_opt_param_scheduler=False,
         )
         vars(args).update(lr_args)
-        monkeypatch.setattr(training, "get_args", lambda: args)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+        run_config.scheduler = SchedulerConfig()
+        for key, value in vars(args).items():
+            if hasattr(run_config.scheduler, key):
+                setattr(run_config.scheduler, key, value)
+        # Startup order: finalize() resolves the horizons, then the runtime services create
+        # the global calculator.
         monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        PretrainConfigContainer._resolve_scheduler_step_fields(run_config)
+        assert calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
         calculator.init_num_microbatches_calculator(
             rank=0,
             global_batch_size=global_batch_size,
@@ -620,18 +633,8 @@ class TestStepBatchSizeScheduleIterationHorizon:
             data_parallel_size=data_parallel_size,
             step_batch_size_schedule=schedule,
         )
-        from megatron.training.config.container import PretrainConfigContainer
-        from megatron.training.config.training_config import SchedulerConfig
-
-        run_config.scheduler = SchedulerConfig()
-        for key, value in vars(args).items():
-            if hasattr(run_config.scheduler, key):
-                setattr(run_config.scheduler, key, value)
-        PretrainConfigContainer._resolve_scheduler_step_fields(run_config)
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
         scheduler = training.get_optimizer_param_scheduler(optimizer)
-        # Building the scheduler leaves the calculator at the start of the schedule.
-        assert calculator.get_current_global_batch_size() == 8
         return args, optimizer, scheduler
 
     @staticmethod
@@ -740,6 +743,35 @@ class TestStepBatchSizeScheduleIterationHorizon:
             )
 
         assert horizons[1] == horizons[0]
+
+    @pytest.mark.parametrize(
+        "schedule,seq_length",
+        [("0:8 400:16", None), ("0:8 51200:16", 128)],
+        ids=["sample_thresholds", "token_thresholds"],
+    )
+    def test_finalize_resolves_horizons_before_calculator_exists(
+        self, monkeypatch, run_config, schedule, seq_length
+    ):
+        from megatron.core import num_microbatches_calculator as calculator
+        from megatron.training import global_vars
+
+        run_config.train.micro_batch_size = 1
+        run_config.train.train_iters = self.TRAIN_ITERS
+        run_config.train.step_batch_size_schedule = schedule
+        run_config.scheduler.lr_warmup_iters = 10
+        args = SimpleNamespace(batch_parallel_size=1, seq_length=seq_length)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+        # initialize_megatron finalizes the config before the runtime services create the
+        # global calculator.
+        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+
+        run_config.finalize()
+
+        # 50 iterations at 8 samples, then 50 at 16.
+        assert run_config.scheduler.lr_warmup_steps == 10 * 8
+        assert run_config.scheduler.lr_decay_steps == 50 * 8 + 50 * 16
+        assert run_config.scheduler.wd_incr_steps == 50 * 8 + 50 * 16
+        assert calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
 
 
 class TestSaveGrads:
