@@ -241,8 +241,9 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 
 @pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])
 @pytest.mark.parametrize("set_to_none", [False, True])
-def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none):
-    """Singleton-inner DP matches dense training, with replicated DP as a reduction control."""
+@pytest.mark.parametrize("grad_scale", [1.0, 0.5, 1 / 3])
+def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none, grad_scale):
+    """Scaled singleton-inner accumulation matches dense training, with replicated DP as a control."""
     setup = distributed_setup
     if setup.world_size < 2:
         pytest.skip("Requires different contributions from at least two ranks.")
@@ -276,6 +277,7 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
             mixed_precision_policy=MixedPrecisionPolicy(
                 main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
             ),
+            grad_scale=grad_scale,
         )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -296,7 +298,12 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
                 with microbatch(context, is_last=index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
                     losses.append(loss.detach())
-                    (loss / num_microbatches).backward()
+                    backward_loss = loss / num_microbatches
+                    if reduce_grads:
+                        # Without FSDP, the reference averages gradients across ranks below
+                        # and applies grad_scale through its loss.
+                        backward_loss *= grad_scale
+                    backward_loss.backward()
             if reduce_grads:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
@@ -306,3 +313,45 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
     actual_losses = train(model, optimizer, reduce_grads=False)
     expected_losses = train(reference, reference_optimizer, reduce_grads=True)
     torch.testing.assert_close(torch.stack(actual_losses), torch.stack(expected_losses))
+
+
+@pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("scale", [1.0, 0.5, 1 / 64, 4.0])
+def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_comm_dtype, scale):
+    """Local accumulation matches separate FP32 scaling and addition, regardless of comm dtype.
+
+    Power-of-two scales are exact, so averaging identical contributions on every rank is too.
+    test_local_accumulation_matches_reference covers other scales with a tolerance.
+    """
+    setup = distributed_setup
+    if setup.world_size < 2 or setup.world_size & (setup.world_size - 1):
+        pytest.skip(
+            "Averaging identical contributions is exact only for a power-of-two world size."
+        )
+    mesh = init_device_mesh(setup.device.type, (setup.world_size, 1))
+    model = nn.Linear(4096, 8, bias=False, device=setup.device, dtype=torch.bfloat16)
+    context = FsdpContext(device=setup.device)
+    with fully_shard_context(context):
+        fully_shard(
+            model,
+            mesh,
+            Placements(
+                [0, 1], [Replicate(), Shard(0)], [Partial("avg"), Shard(0)], [Replicate(), Shard(0)]
+            ),
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+            ),
+            grad_scale=scale,
+        )
+    # Every rank sees the same inputs, and a weight's gradient equals its input element.
+    generator = torch.Generator(device=setup.device).manual_seed(0)
+    inputs = torch.randn(3, 1, 4096, device=setup.device, dtype=torch.bfloat16, generator=generator)
+    expected = torch.zeros(8, 4096, device=setup.device)
+    for index, x in enumerate(inputs):
+        with microbatch(context, is_last=index == len(inputs) - 1):
+            model(x).float().sum().backward()
+        context.finish_grad_sync()
+        expected = expected + x.float() * scale
+
+    actual = model.weight.grad.to_local().reshape(8, 4096)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
