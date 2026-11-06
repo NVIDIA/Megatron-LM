@@ -75,6 +75,7 @@ class EvaluationRequest(Request):
 class EvaluationResult(AgentBaseModel):
     prompt: str | list[LLMChatMessage]
     response: str | LLMChatMessage
+    completion_ids: list[str] = []
 
 
 class RewardEvaluationResult(EvaluationResult):

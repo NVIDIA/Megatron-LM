@@ -3,14 +3,22 @@
 """Parameterized coverage for durable rollout-bank persistence and replay."""
 
 import asyncio
+import dataclasses
 import json
+import os
 from collections import Counter
 from contextlib import aclosing
 
+import msgpack
 import numpy as np
 import pytest
 
-from megatron.rl import rl_utils
+from megatron.core.inference.inference_request import (
+    FinishedRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStageResult,
+)
+from megatron.rl import rl_utils, rollout_bank
 from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
@@ -20,9 +28,15 @@ from megatron.rl.rollout_bank import (
     _GENERATIONS,
     _LEDGER,
     _MANIFEST,
-    _TOKENS_BIN,
+    _REQUEST_RECORDS,
+    FinishedRequestLedgerWriter,
+    LedgerPayloadStager,
     RolloutBank,
     _segment_name,
+    gather_view,
+    load_finished_request_records,
+    request_record_backup_path,
+    request_record_paths,
 )
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
@@ -31,45 +45,63 @@ from tests.unit_tests.rl.test_rollout_generation import MockGenerator, MockInfer
 
 
 def _token_group(batch_id=0, *, empty=False):
-    members = (
-        [([], [], [])]
-        if empty
-        else [
-            (
-                [[1, 2, 3], [4, 5]],
-                [[-0.1, -0.2, -0.3], [-0.4, -0.5]],
-                [[False, True, True], [True, True]],
-            ),
-            ([[7, 8]], [[-1.5, -2.5]], [[True, True]]),
-        ]
-    )
-    return RolloutGroup(
-        rollouts=[
-            TokenRollout(
-                trajectory=tokens,
+    """A group plus the records that rebuild it: turn tokens == prompt + generation."""
+    turns_per_member = [[]] if empty else [[([1], [2, 3]), ([1, 2, 3], [5])], [([7], [8])]]
+    rollouts, records = [], {}
+    for member, turns in enumerate(turns_per_member):
+        cids = [f"chatcmpl-{batch_id}-{member}-{turn}" for turn in range(len(turns))]
+        logprobs = [[-0.125 * (i + 1) for i in range(len(generated))] for _, generated in turns]
+        for cid, turn, (prompt, generated) in zip(cids, range(len(turns)), turns):
+            records[cid] = FinishedRequestRecord(
+                policy_epoch=[(0, 3)],
+                kv_cache_epoch=[(0, 3), (2, 4)],
+                num_evictions=turn,
+                payload=OffloadedRequestPayload(
+                    prompt_token_ids=list(prompt),
+                    generated_token_ids=list(generated),
+                    generated_log_probs=logprobs[turn],
+                    prompt_log_probs=None,
+                    routing_indices=None,
+                ),
+            )
+        rollouts.append(
+            TokenRollout(  # as a restored (or joined) rollout carries the records' turns and stamps
+                trajectory=[[*prompt, *generated] for prompt, generated in turns],
                 reward=1.0,
                 logprobs=logprobs,
-                generation_mask=mask,
+                generation_mask=[[False] * len(p) + [True] * len(g) for p, g in turns],
                 env_id="test",
                 problem_id="p",
-                completion_ids=[f"completion-{index}" for index in range(len(tokens))],
+                completion_ids=cids,
+                policy_epochs=[[(0, 3)]] * len(turns),
+                kv_cache_epochs=[[(0, 3), (2, 4)]] * len(turns),
+                num_evictions=list(range(len(turns))),
             )
-            for tokens, logprobs, mask in members
-        ],
-        batch_id=batch_id,
-    )
+        )
+    return RolloutGroup(rollouts=rollouts, batch_id=batch_id), records
 
 
 def _text_group():
-    return RolloutGroup(rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")])
+    group = RolloutGroup(rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")])
+    return group, {}
 
 
 def _empty_group():
-    return RolloutGroup(rollouts=[])
+    return RolloutGroup(rollouts=[]), {}
 
 
 def _empty_token_group():
     return _token_group(empty=True)
+
+
+def _staged_token_group():
+    """The token group as the Megatron interface delivers it: the turns live only in the records."""
+    group, records = _token_group()
+    for rollout in group.rollouts:
+        rollout.trajectory = rollout.generation_mask = rollout.logprobs = None
+        rollout.policy_epochs = rollout.kv_cache_epochs = rollout.num_evictions = None
+        assert not rollout.is_placeholder
+    return group, records
 
 
 def _active_generation(bank_dir):
@@ -82,33 +114,25 @@ def _segment_dir(bank_dir, iteration=3):
 
 
 def _assert_group_matches(actual, expected):
+    """Field-exact: fp32 backups round-trip the engine's fp32 log probs bit-exactly."""
     assert actual.batch_id == expected.batch_id
-    assert len(actual.rollouts) == len(expected.rollouts)
-    for actual_rollout, expected_rollout in zip(actual.rollouts, expected.rollouts, strict=True):
-        assert type(actual_rollout) is type(expected_rollout)
-        assert actual_rollout.trajectory == expected_rollout.trajectory
-        assert actual_rollout.reward == expected_rollout.reward
-        assert actual_rollout.env_id == expected_rollout.env_id
-        if isinstance(expected_rollout, TokenRollout):
-            assert actual_rollout.generation_mask == expected_rollout.generation_mask
-            assert len(actual_rollout.logprobs) == len(expected_rollout.logprobs)
-            for actual_turn, expected_turn in zip(
-                actual_rollout.logprobs, expected_rollout.logprobs, strict=True
-            ):
-                assert np.allclose(actual_turn, expected_turn, atol=1e-3)
+    assert [r.model_dump() for r in actual.rollouts] == [r.model_dump() for r in expected.rollouts]
 
 
 @pytest.mark.parametrize(
     "group_factory",
     [
-        pytest.param(_token_group, id="ragged-token-sidecars"),
+        pytest.param(_token_group, id="ragged-token-group"),
+        pytest.param(_staged_token_group, id="staged-token-group"),
         pytest.param(_text_group, id="inline-text"),
         pytest.param(_empty_group, id="empty-group"),
         pytest.param(_empty_token_group, id="empty-token-trajectory"),
     ],
 )
 def test_rollout_bank_round_trip(tmp_path, group_factory):
-    """All supported payload shapes survive a close/restart round trip."""
+    """All supported payload shapes survive a close/restart round trip. Token groups bank as thin
+    manifests that restore rebuilds from the request records, whether the turns arrived inline or
+    staged with the engine; mismatched completion ids are refused at append."""
     assert (SharedRollout, SharedRolloutGroup, SharedTokenRollout) == (
         Rollout,
         RolloutGroup,
@@ -116,10 +140,15 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
     )
     assert Rollout(trajectory=["prompt"], reward=None).reward is None
 
-    expected = group_factory()
+    expected, records = group_factory()
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(3)
     uid = bank.append(expected)
+    if group_factory is _token_group:
+        unjoinable, _ = _token_group(batch_id=1)
+        unjoinable.rollouts[0].completion_ids = []
+        with pytest.raises(ValueError, match="completion ids"):
+            bank.append(unjoinable)
     bank.close()
 
     manifest = json.loads((tmp_path / _MANIFEST).read_text())
@@ -129,66 +158,139 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
     assert manifest["timeline"]
     assert (generation / _CONSUMED).exists()
 
-    restored = RolloutBank(str(tmp_path)).restore(trained_through=0)
+    restored = RolloutBank(str(tmp_path)).restore(trained_through=0, request_records=records)
     assert [group.uid for group in restored] == [uid]
+    if group_factory is _staged_token_group:
+        expected, _ = _token_group()  # the records rebuild what the engine staged
     _assert_group_matches(restored[0], expected)
 
-    if group_factory is _empty_token_group:
+    if group_factory not in (_text_group, _empty_group):
+        # Thin manifest: the reconstructable arrays never reach the bank.
         assert record["kind"] == "token"
-        assert record["tok"]["bytes"] == 0
-        assert not (generation / _segment_name(3) / _TOKENS_BIN).exists()
+        for member in record["group"]["rollouts"]:
+            for field in ("trajectory", "logprobs", "generation_mask", "policy_epochs"):
+                assert field not in member
 
 
-def test_restore_drops_torn_final_ledger_record(tmp_path):
-    """A partial final JSONL append is truncated and does not hide durable records."""
+@pytest.mark.parametrize(
+    "damage, expected_survivors",
+    [
+        pytest.param("torn_ledger_line", 1, id="torn-final-ledger-record"),
+        pytest.param("bad_checksum", 1, id="bad-checksum"),
+        pytest.param("missing_records", 1, id="missing-request-records"),
+        pytest.param("no_records", 0, id="no-request-records"),
+        pytest.param("short_log_probs", 0, id="record-lost-log-probs"),
+    ],
+)
+def test_restore_drops_only_the_damaged_groups(tmp_path, damage, expected_survivors):
+    """A torn final manifest line or a bad checksum drops that record alone; a token group whose
+    request records did not survive is dropped loudly rather than restored without them."""
+    group_a, records_a = _token_group(batch_id=0)
+    group_b, _ = _token_group(batch_id=1)
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
+    durable_uid = bank.append(group_a)
+    bank.append(group_b)
     bank.close()
 
     ledger = _segment_dir(tmp_path) / _LEDGER
-    lines = ledger.read_bytes().splitlines(keepends=True)
-    ledger.write_bytes(lines[0] + lines[1][: len(lines[1]) // 2])
+    records = {} if damage == "no_records" else records_a  # group_b's records never reached disk
+    if damage == "torn_ledger_line":
+        lines = ledger.read_bytes().splitlines(keepends=True)
+        ledger.write_bytes(lines[0] + lines[1][: len(lines[1]) // 2])
+    elif damage == "bad_checksum":
+        manifests = [json.loads(line) for line in ledger.read_text().splitlines()]
+        manifests[-1]["checksum"] = "0" * 32
+        ledger.write_text("".join(json.dumps(m) + "\n" for m in manifests))
+    elif damage == "short_log_probs":
+        # One turn's record kept its tokens but lost its log probs: unusable, not restorable.
+        cid, rec = next(iter(records_a.items()))
+        records = {
+            **records_a,
+            cid: dataclasses.replace(
+                rec, payload=dataclasses.replace(rec.payload, generated_log_probs=[])
+            ),
+        }
 
     restarted = RolloutBank(str(tmp_path))
-    restarted.set_collection(3)
-    assert ledger.read_bytes() == lines[0]
-    assert [group.uid for group in restarted.restore(trained_through=0)] == [durable_uid]
+    restarted.set_collection(3)  # a torn tail is truncated before appends resume
+    if damage == "torn_ledger_line":
+        assert ledger.read_bytes() == lines[0]
+    restored = restarted.restore(trained_through=0, request_records=records)
+    assert [group.uid for group in restored] == [durable_uid][:expected_survivors]
 
 
-def test_restore_drops_record_with_bad_checksum(tmp_path):
-    """Checksum corruption drops only the affected record during recovery."""
-    bank = RolloutBank(str(tmp_path))
-    bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
-    bank.close()
+def test_record_store_round_trip(tmp_path, monkeypatch):
+    """The stager pins the payload on the engine's record on a worker thread, makes it durable and
+    only then indexes it, so drain() never hands out a record without its payload. Records
+    round-trip through rotate and load with exact fields, a torn tail drops only itself, an absent
+    file contributes nothing, the gather view keeps just what the joins read, and a failed write
+    is raised at the next rotate() or close()."""
+    routing = np.arange(12, dtype=np.int64).reshape(4, 3, 1)
+    record = FinishedRequestRecord(
+        policy_epoch=[(0, 3)],
+        kv_cache_epoch=[(0, 3), (5, 4)],
+        num_evictions=2,
+        num_tokens_to_generate=8,
+        finish_reason="stop",
+    )
+    payload = OffloadedRequestPayload(
+        prompt_token_ids=[1, 2, 3],
+        generated_token_ids=[10, 11],
+        generated_log_probs=[-0.125, -1.25],
+        prompt_log_probs=[-1.0, -2.0, -3.0],
+        routing_indices=routing,
+    )
+    plain = FinishedRequestRecord(policy_epoch=None, kv_cache_epoch=None, num_evictions=0)
+    first, second = tmp_path / "a.bin", tmp_path / "b.bin"
+    stager = LedgerPayloadStager(FinishedRequestLedgerWriter(str(first)))
+    assert stager.drain() == {}
+    staged = asyncio.run(
+        asyncio.to_thread(stager.stage, "chatcmpl-0", payload, finished_metadata=record)
+    )
+    assert staged == RequestPayloadStageResult() and record.payload is payload
+    drained = stager.drain()
+    assert set(drained) == {"chatcmpl-0"} and drained["chatcmpl-0"] is record
+    assert stager.drain() == {}
+    with pytest.raises(AssertionError, match="duplicate uid"):
+        stager.stage("chatcmpl-1", payload, finished_metadata=record)
+        stager.stage("chatcmpl-1", payload, finished_metadata=record)
+    stager.writer.rotate(str(second))
+    stager.writer.append("chatcmpl-plain", plain)
+    stager.writer.append("chatcmpl-2", record)
+    stager.writer.close()
 
-    ledger = _segment_dir(tmp_path) / _LEDGER
-    records = [json.loads(line) for line in ledger.read_text().splitlines()]
-    records[-1]["checksum"] = "0" * 32
-    ledger.write_text("".join(json.dumps(record) + "\n" for record in records))
+    loaded = load_finished_request_records([str(first), str(second)])
+    assert set(loaded) == {"chatcmpl-0", "chatcmpl-1", "chatcmpl-plain", "chatcmpl-2"}
+    durable = loaded["chatcmpl-0"]
+    # Field-exact: stamps back as tuples, fp32 log probs bit-exactly, routing with its dtype.
+    assert np.array_equal(durable.payload.routing_indices, routing)
+    assert durable.payload.routing_indices.dtype == routing.dtype
+    without_routing = dataclasses.replace(payload, routing_indices=None)
+    assert dataclasses.replace(durable.payload, routing_indices=None) == without_routing
+    assert dataclasses.replace(durable, payload=None) == dataclasses.replace(record, payload=None)
+    assert loaded["chatcmpl-plain"] == plain
 
-    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
-        durable_uid
-    ]
+    gathered = gather_view(record)
+    assert dataclasses.replace(gathered, payload=None) == dataclasses.replace(record, payload=None)
+    assert gathered.payload == dataclasses.replace(without_routing, prompt_log_probs=None)
+    assert payload.routing_indices is routing  # the stager's own record keeps everything
 
+    second.write_bytes(second.read_bytes()[:-3])  # tear the final record
+    loaded = load_finished_request_records([str(first), str(second), str(tmp_path / "absent.bin")])
+    assert set(loaded) == {"chatcmpl-0", "chatcmpl-1", "chatcmpl-plain"}
 
-def test_restore_drops_record_with_truncated_sidecar(tmp_path):
-    """A short sidecar slice drops its ledger record instead of failing resume."""
-    bank = RolloutBank(str(tmp_path))
-    bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
-    bank.close()
+    def broken(uid, record):
+        raise OSError("disk full")
 
-    tokens = _segment_dir(tmp_path) / _TOKENS_BIN
-    tokens.write_bytes(tokens.read_bytes()[:-1])
-
-    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
-        durable_uid
-    ]
+    monkeypatch.setattr(rollout_bank, "pack_finished_request_record", broken)
+    writer = FinishedRequestLedgerWriter(str(tmp_path / "c.bin"))
+    writer.append("chatcmpl-3", plain)
+    with pytest.raises(RuntimeError, match="writer failed") as info:
+        writer.rotate(str(tmp_path / "d.bin"))
+    assert isinstance(info.value.__cause__, OSError)
+    with pytest.raises(RuntimeError, match="writer failed"):
+        writer.close()
 
 
 @pytest.mark.parametrize(
@@ -200,46 +302,284 @@ def test_restore_drops_record_with_truncated_sidecar(tmp_path):
     ],
 )
 def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, should_restore):
-    """Checkpoint compaction prunes trained groups and preserves future markers."""
+    """Checkpoint compaction prunes trained groups and preserves future markers. It folds only
+    the backup windows before it (the window it closes may still be open), keeps every record
+    still owed to a group, and releases a record once its group is reclaimed or rank 0 retired
+    it, even when the retirement precedes the record's arrival."""
     checkpoint_iteration = 10
+    group_a, records_a = _token_group(batch_id=0)
+    group_b, records_b = _token_group(batch_id=1)
+    all_records = {**records_a, **records_b}
+
+    def record():
+        return FinishedRequestRecord(
+            policy_epoch=[(0, 3)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=0,
+            payload=OffloadedRequestPayload(
+                prompt_token_ids=[1],
+                generated_token_ids=[2],
+                generated_log_probs=[-0.5],
+                prompt_log_probs=None,
+                routing_indices=None,
+            ),
+        )
+
+    def backup(window, records):
+        """Back records up the way an engine does, into a closed (rotated) window file."""
+        path = request_record_backup_path(str(tmp_path), rank=0, iteration=window, tag="deadbeef")
+        writer = FinishedRequestLedgerWriter(path)
+        for cid, rec in records.items():
+            writer.append(cid, rec)
+        writer.close()
+        return path
+
+    def kept():
+        return set(load_finished_request_records(request_record_paths(str(tmp_path))))
+
+    # Window 5 is closed: both groups' records, a turn of an in-flight group, a retired request.
+    backup(5, {**all_records, "chatcmpl-inflight": record(), "chatcmpl-retired": record()})
+    # Window 10 is the engines' open file (an evaluation created it); declared at each checkpoint.
+    current = backup(checkpoint_iteration, {"chatcmpl-eval": record()})
+
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(5)
-    consumed = bank.append(_token_group())
-    never_consumed = bank.append(_token_group())
-    bank.mark_consumed(consumed, checkpoint_iteration + consumed_offset)
+    consumed = bank.append(group_a)
+    never_consumed = bank.append(group_b)
+    bank.mark_consumed_many([consumed], checkpoint_iteration + consumed_offset)
+    bank.retire_records(["chatcmpl-retired", "chatcmpl-later"])  # "later" has no record yet
     old_generation = _active_generation(tmp_path)
 
-    before_checkpoint = {group.uid for group in bank.restore(checkpoint_iteration)}
+    before_checkpoint = {
+        group.uid for group in bank.restore(checkpoint_iteration, request_records=all_records)
+    }
     assert (consumed in before_checkpoint) is should_restore
     assert never_consumed in before_checkpoint
 
-    bank.checkpoint(checkpoint_iteration)
+    bank.checkpoint(checkpoint_iteration, open_window=checkpoint_iteration)
     manifest = json.loads((tmp_path / _MANIFEST).read_text())
     assert manifest["trained_through"] == checkpoint_iteration
     assert manifest["segments"] == [_segment_name(checkpoint_iteration)]
     assert not old_generation.exists()
+    # Window 5 was folded and pruned, the current window left alone. A reclaimed group releases
+    # its records and a retired id is dropped; the in-flight turn is kept, nobody owns it yet.
+    fold = _active_generation(tmp_path) / _segment_name(checkpoint_iteration) / _REQUEST_RECORDS
+    assert request_record_paths(str(tmp_path)) == [current, str(fold)]
+    owed = set(all_records) if should_restore else set(records_b)
+    assert set(load_finished_request_records([str(fold)])) == owed | {"chatcmpl-inflight"}
+    assert set(load_finished_request_records([current])) == {"chatcmpl-eval"}
 
-    restarted = RolloutBank(str(tmp_path))
-    restored = restarted.restore(checkpoint_iteration)
-    restored_uids = {group.uid for group in restored}
-    assert restored_uids == ({consumed, never_consumed} if should_restore else {never_consumed})
+    restored = RolloutBank(str(tmp_path)).restore(
+        checkpoint_iteration,
+        request_records=load_finished_request_records(request_record_paths(str(tmp_path))),
+    )
+    expected_uids = {consumed, never_consumed} if should_restore else {never_consumed}
+    assert {group.uid for group in restored} == expected_uids
     for group in restored:
-        _assert_group_matches(group, _token_group())
-
+        _assert_group_matches(group, _token_group(batch_id=0 if group.uid == consumed else 1)[0])
     markers = [
         json.loads(line)
         for line in (_active_generation(tmp_path) / _CONSUMED).read_text().splitlines()
     ]
-    expected_markers = (
+    assert markers == (
         [{"uid": consumed, "iter": checkpoint_iteration + 1}] if should_restore else []
     )
-    assert markers == expected_markers
 
-    if should_restore:
-        restarted.checkpoint(checkpoint_iteration + 1)
-        assert {group.uid for group in restarted.restore(checkpoint_iteration + 1)} == {
-            never_consumed
-        }
+    # Two windows on: the current window has closed, the retired id's record arrived late, and
+    # rank 0 retired the in-flight turn. Only the never-consumed group's records and the still
+    # unretired evaluation record remain.
+    backup(checkpoint_iteration + 1, {"chatcmpl-later": record()})
+    bank.retire_records(["chatcmpl-inflight"])
+    bank.checkpoint(checkpoint_iteration + 2, open_window=checkpoint_iteration + 2)
+    assert kept() == set(records_b) | {"chatcmpl-eval"}
+    restored = bank.restore(
+        checkpoint_iteration + 2,
+        request_records=load_finished_request_records(request_record_paths(str(tmp_path))),
+    )
+    assert {group.uid for group in restored} == {never_consumed}
+
+
+def test_checkpoint_keeps_the_engines_open_backup_window(tmp_path):
+    """After a collection at iteration L the engines stage into the window-(L + 1) backup file
+    until the next collection rotates it. A checkpoint two or more iterations later must leave
+    that file alone: folding and unlinking it while the engines still hold it open sends every
+    record staged afterwards to an unlinked inode, so no restore can find those groups."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    open_file = request_record_backup_path(str(tmp_path), rank=0, iteration=6, tag="deadbeef")
+
+    def record():
+        return FinishedRequestRecord(
+            policy_epoch=[(0, 3)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=0,
+            payload=OffloadedRequestPayload(
+                prompt_token_ids=[1],
+                generated_token_ids=[2],
+                generated_log_probs=[-0.5],
+                prompt_log_probs=None,
+                routing_indices=None,
+            ),
+        )
+
+    writer = FinishedRequestLedgerWriter(open_file)
+    writer.append("chatcmpl-eval", record())  # an evaluation during the window creates the file
+    writer.close()
+    with open(open_file, "ab") as handle:  # the engine writer's handle stays open across saves
+        bank.checkpoint(7, open_window=6)
+        bank.checkpoint(8, open_window=6)
+        handle.write(rollout_bank.pack_finished_request_record("chatcmpl-next-window", record()))
+    records = load_finished_request_records(request_record_paths(str(tmp_path)))
+    assert {"chatcmpl-eval", "chatcmpl-next-window"} <= set(records)
+
+
+def test_recover_retires_the_dead_runs_unreferenced_records(tmp_path):
+    """A crash loses rank 0's in-memory retired ids. Every loaded record that no survivor
+    references at recovery belongs to the dead run and has no consumer left, so the next
+    checkpoint must drop it from the fold instead of carrying it forward forever."""
+    group, records = _token_group(batch_id=0)
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    uid = bank.append(group)
+    bank.close()
+    # The dead run's closed window-5 backup: the group's records plus an evaluation record it
+    # had retired in memory only.
+    writer = FinishedRequestLedgerWriter(
+        request_record_backup_path(str(tmp_path), rank=0, iteration=5, tag="deadbeef")
+    )
+    for cid, rec in {**records, "chatcmpl-eval": next(iter(records.values()))}.items():
+        writer.append(cid, rec)
+    writer.close()
+
+    resumed = RolloutBank(str(tmp_path))
+    on_disk = load_finished_request_records(request_record_paths(str(tmp_path)))
+    assert [g.uid for g in resumed.recover(5, request_records=on_disk)] == [uid]
+    resumed.set_collection(5)
+    resumed.checkpoint(7, open_window=6)  # folds the dead run's window-5 file
+    assert set(load_finished_request_records(request_record_paths(str(tmp_path)))) == set(records)
+
+
+def test_placeholder_manifest_drops_the_released_call_ids(tmp_path):
+    """A failed episode's placeholder names the calls it made so the join can release their
+    records. The manifest must not reference them (nothing keeps them past the next checkpoint),
+    and the restored placeholder is a placeholder again."""
+    group, records = _token_group(batch_id=0)
+    failed = TokenRollout(
+        trajectory=[], reward=0.0, env_id="test", problem_id="p", completion_ids=["chatcmpl-gone"]
+    )
+    assert failed.is_placeholder
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    uid = bank.append(RolloutGroup(rollouts=[*group.rollouts, failed]))
+    (restored,) = bank.restore(trained_through=0, request_records=records)
+    manifest = json.loads((_segment_dir(tmp_path) / _LEDGER).read_text().splitlines()[-1])
+    assert manifest["group"]["rollouts"][-1]["completion_ids"] == []
+    assert restored.uid == uid
+    assert restored.rollouts[-1].is_placeholder and restored.rollouts[-1].completion_ids == []
+    _assert_group_matches(RolloutGroup(rollouts=restored.rollouts[:-1]), group)
+
+
+def test_old_format_bank_is_refused(tmp_path):
+    """A directory written by the previous on-disk format gets a message naming the format change
+    and the one remedy that works, not advice to recover a manifest that never existed there."""
+    (tmp_path / "MANIFEST.json").write_text("{}")
+    with pytest.raises(ValueError, match="earlier on-disk format"):
+        RolloutBank(str(tmp_path))
+
+
+def test_record_store_skips_records_that_fail_their_checks(tmp_path, caplog):
+    """A record whose arrays were corrupted or whose format version is foreign is skipped on its
+    own: the records around it still load, a fold copies the valid frames forward verbatim, and
+    the stager's rotate and close reach the writer when there is one."""
+
+    def record(log_prob):
+        return FinishedRequestRecord(
+            policy_epoch=[(0, 3)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=0,
+            payload=OffloadedRequestPayload(
+                prompt_token_ids=[1],
+                generated_token_ids=[2],
+                generated_log_probs=[log_prob],
+                prompt_log_probs=None,
+                routing_indices=None,
+            ),
+        )
+
+    def tampered(uid, **changes):
+        frame = rollout_bank.pack_finished_request_record(uid, record(-0.5))
+        payload = {**msgpack.unpackb(frame, raw=False), **changes}
+        return msgpack.packb(payload, use_bin_type=True)
+
+    good = {uid: rollout_bank.pack_finished_request_record(uid, record(-0.25)) for uid in "ad"}
+    flipped = tampered("b", generated_log_probs=b"\xff" * 4)  # arrays no longer match the digest
+    foreign = tampered("c", format_version=_FORMAT_VERSION + 1)
+    path = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(good["a"] + flipped + foreign + good["d"])
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        loaded = load_finished_request_records([path])
+    assert set(loaded) == {"a", "d"} and loaded["d"].payload.generated_log_probs == [-0.25]
+    assert sum("Skipping an unreadable request record" in r.message for r in caplog.records) == 2
+    assert rollout_bank._packed_records([path]) == good
+
+    # The stager delegates rotate and close to its writer, and tolerates having none.
+    LedgerPayloadStager().rotate(path)
+    LedgerPayloadStager().close()
+    second = request_record_backup_path(str(tmp_path), rank=0, iteration=2, tag="deadbeef")
+    stager = LedgerPayloadStager(FinishedRequestLedgerWriter(path))
+    stager.stage("e", record(-0.75).payload, finished_metadata=record(-0.75))
+    stager.rotate(second)
+    stager.stage("f", record(-1.0).payload, finished_metadata=record(-1.0))
+    stager.close()
+    assert set(load_finished_request_records([path])) == {"a", "d", "e"}
+    assert set(load_finished_request_records([second])) == {"f"}
+
+
+def test_record_store_streams_a_file_past_the_unpacker_buffer_cap(tmp_path):
+    """A record file is read in chunks: one routing-replay frame larger than a read and the
+    file as a whole past msgpack's 100 MiB default cap load completely, the frame that follows
+    is cut at the right offset and copies forward verbatim, and a torn tail drops only itself."""
+    rows = (101 << 20) // (32 * 8 * 8) + 1  # a routing array just over the cap on its own
+    routing = np.arange(rows * 32 * 8, dtype=np.int64).reshape(rows, 32, 8)
+    records = {
+        "big": FinishedRequestRecord(
+            policy_epoch=[(0, 3)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=0,
+            payload=OffloadedRequestPayload(
+                prompt_token_ids=[1],
+                generated_token_ids=[2],
+                generated_log_probs=[-0.5],
+                prompt_log_probs=None,
+                routing_indices=routing,
+            ),
+        ),
+        "small": FinishedRequestRecord(
+            policy_epoch=[(0, 3)],
+            kv_cache_epoch=[(0, 3)],
+            num_evictions=0,
+            payload=OffloadedRequestPayload(
+                prompt_token_ids=[1, 2],
+                generated_token_ids=[3],
+                generated_log_probs=[-0.25],
+                prompt_log_probs=None,
+                routing_indices=None,
+            ),
+        ),
+    }
+    frames = {uid: rollout_bank.pack_finished_request_record(uid, r) for uid, r in records.items()}
+    assert len(frames["big"]) > max(100 << 20, rollout_bank._RECORD_READ_SIZE)
+    path = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(frames["big"] + frames["small"] + frames["small"][:7])  # torn tail
+    loaded = load_finished_request_records([path])
+    assert set(loaded) == {"big", "small"}
+    assert np.array_equal(loaded["big"].payload.routing_indices, routing)
+    assert loaded["small"].payload.generated_log_probs == [-0.25]
+    assert rollout_bank._packed_records([path]) == frames
 
 
 def _env_group(env_id, problem_id):
