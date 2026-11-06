@@ -4,8 +4,7 @@ For every 64-token chunk of every sequence and head, with G the chunk-local
 log2 gate cumsum and G_last its last valid row:
 
 * qg = q 2^G and kg = k 2^(G_last - G) (zero past the sequence end);
-* w = Akk (k beta 2^G);
-* Aqk with its strict upper triangle zeroed (rows s >= t of column t kept).
+* w = Akk (k beta 2^G).
 
 These are the parts of FLA's ``recompute_w_u_fwd`` and ``chunk_kda_bwd_dAv``
 that the dS recurrence kernel (``dhu``) needs, without ``u`` or ``dA``; the
@@ -28,14 +27,12 @@ def _prep_kernel(
     k,
     gc,
     beta,
-    aqk,
     akk,
     cu_seqlens,
     chunk_offsets,
     qg,
     kg,
     w,
-    aqk_masked,
     num_sequences,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -82,33 +79,26 @@ def _prep_kernel(
         b_kb = (b_k * b_b[:, None] * gamma).to(k.dtype.element_ty)
         b_w = tl.dot(b_akk, b_kb)
         tl.store(w + p_tok, b_w.to(w.dtype.element_ty), mask=m_tok)
-    b_aqk = tl.load(aqk + p_sq, mask=m_tok, other=0.0)
-    b_aqk = tl.where(o_c[:, None] >= o_c[None, :], b_aqk, 0.0)
-    tl.store(aqk_masked + p_sq, b_aqk.to(aqk_masked.dtype.element_ty), mask=m_tok)
 
-def kda_dhu_prep(
-    q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, max_chunks, num_warps=4, block_k=64
-):
-    """Returns ``(qg, kg, w, aqk_masked)`` (BF16, shaped like ``q`` and ``aqk``).
+
+def kda_dhu_prep(q, k, gc, beta, akk, cu_seqlens, chunk_offsets, max_chunks, num_warps=4, block_k=64):
+    """Returns ``(qg, kg, w)`` (BF16, shaped like ``q``).
 
     ``max_chunks`` is an upper bound on ``chunk_offsets[-1]``.
     """
     _, _, heads, dim = q.shape
     qg, kg, w = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
-    aqk_masked = torch.empty_like(aqk)
     _prep_kernel[(max_chunks, heads)](
         q,
         k,
         gc,
         beta,
-        aqk,
         akk,
         cu_seqlens,
         chunk_offsets,
         qg,
         kg,
         w,
-        aqk_masked,
         cu_seqlens.numel() - 1,
         H=heads,
         K=dim,
@@ -116,4 +106,4 @@ def kda_dhu_prep(
         BT=_BT,
         num_warps=num_warps,
     )
-    return qg, kg, w, aqk_masked
+    return qg, kg, w

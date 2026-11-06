@@ -9,9 +9,9 @@ chunk's last valid log2 gate row, each chunk:
 * dS <- 2^G_last dS + scale qg^T dO - w^T dv2.
 
 These are the semantics of FLA's ``chunk_kda_bwd_dAv`` (dv) followed by
-``chunk_gated_delta_rule_bwd_dhu`` with a per-key gate; qg, kg, w and the
-causally masked Aqk come from ``prep``.  Only this recurrence is serial, so the kernel keeps its chain
-short: dS lives in the registers of warps 0-3 (thread = key channel), every
+``chunk_gated_delta_rule_bwd_dhu`` with a per-key gate; qg, kg and w come
+from ``prep``, and two otherwise idle warps mask Aqk causally in shared
+memory.  Only this recurrence is serial, so the kernel keeps its chain short: dS lives in the registers of warps 0-3 (thread = key channel), every
 product has the 128 key or value channels on TMEM lanes, and qg^T dO for the
 next chunk is issued while the state warps finish the current update.
 
@@ -42,7 +42,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05, warpgroup
 
 from .._cute_compat import _wrap_tma
 from ..fused_gdr_bwd_cute import tcgen05_ws
-from ..fused_gdr_bwd_cute.kernel import _store_shared_bf16x8
+from ..fused_gdr_bwd_cute.kernel import _load_shared_bf16x8, _store_shared_bf16x8
 from .kernel import (
     _column_bases,
     _copy_bf16x8_s2g,
@@ -60,10 +60,11 @@ _BT = 64
 _DK = 128
 _DV = 128
 # Three full warpgroups (setmaxnreg is per warpgroup): state, value, and
-# MMA + TMA with two idle warps.
+# MMA + TMA + two warps that mask Aqk.
 _THREADS = 384
 _MMA_WARP = 8
 _TMA_WARP = 9
+_MASK_WARP = 10
 # setmaxnreg split of the launch allocation (168 x 384): dS rows stay in the
 # state warps' registers.
 _STATE_REGISTERS = 240
@@ -87,11 +88,14 @@ _B_LOAD_A, _B_LOAD_B, _B_EMPTY_A, _B_EMPTY_B, _B_S_READY, _B_D1, _B_DV2_READY, _
     10,
     11,
 )
-_NUM_BARRIERS = 13
+# Per stage: Aqk masked in shared memory by the mask warps.
+_B_AQK_READY = 13
+_NUM_BARRIERS = 15
 
 _BAR_STATE = 1
 _BAR_VALUE = 2
 _BAR_ALL = 3
+_BAR_MASK = 4
 
 _TILE = _BT * _DK
 _SQUARE = _BT * _BT
@@ -108,7 +112,7 @@ class DhuStorage:
     bars: cute.struct.MemRange[cutlass.Int64, 16]
     tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]
     # Two stages of the TMA inputs: four 64x128 token tiles and the 64x64
-    # masked Aqk.
+    # Aqk (masked in place).
     sKg: _tile(cutlass.BFloat16, 2 * _TILE)
     sW: _tile(cutlass.BFloat16, 2 * _TILE)
     sQg: _tile(cutlass.BFloat16, 2 * _TILE)
@@ -459,6 +463,8 @@ class KdaDhuKernel:
                     mma_token,
                     mma_square,
                 )
+            elif warp >= _MASK_WARP:
+                self.run_mask(tidx - _MASK_WARP * 32, seq_len, num_chunks, bars, s_aqk)
         cute.arch.barrier(barrier_id=_BAR_ALL, number_of_threads=_THREADS)
         if warp == 0:
             cute.arch.relinquish_tmem_alloc_permit()
@@ -625,6 +631,7 @@ class KdaDhuKernel:
             self._stamp(0, j)
             if j == 0:
                 cute.arch.mbarrier_wait(bars + _B_LOAD_A, 0)
+                cute.arch.mbarrier_wait(bars + _B_AQK_READY, 0)
                 self._gemm_qdo(tmem, mma3_first, s_qg, s_do, s_aqk, j)
             # dv2^T = dv^T + dS^T kg^T (value lanes, token columns).
             self._gemm(
@@ -653,8 +660,39 @@ class KdaDhuKernel:
             if j + 1 < num_chunks:
                 # The next chunk's qg^T dO runs while the state warps update dS.
                 cute.arch.mbarrier_wait(bars + _B_LOAD_A + (j + 1) % 2, ((j + 1) // 2) & 1)
+                cute.arch.mbarrier_wait(bars + _B_AQK_READY + (j + 1) % 2, ((j + 1) // 2) & 1)
                 self._stamp(7, j)
                 self._gemm_qdo(tmem, mma3_next, s_qg, s_do, s_aqk, j + 1)
+
+    # ------------------------------------------------------------- mask
+
+    @cute.jit
+    def run_mask(self, u, seq_len, num_chunks, bars, s_aqk):
+        """Warps 10-11: keep Aqk on column <= row < valid, in shared memory.
+
+        FLA leaves Aqk above the diagonal unwritten, and rows past a sequence's
+        end belong to the next sequence, so both are zeroed before the MMA reads
+        the tile (8 columns per access, 8 rows per thread).
+        """
+        vec = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+        base = cutlass.Int32(s_aqk.toint())
+        c0 = (u % 8) * 8
+        for j in cutlass.range(num_chunks):
+            stage = j % 2
+            valid = seq_len - (num_chunks - 1 - j) * _BT
+            cute.arch.mbarrier_wait(bars + _B_LOAD_A + stage, (j // 2) & 1)
+            for i in cutlass.range_constexpr(_BT // 8):
+                row = u // 8 + 8 * i
+                address = _swz_token(base + stage * _SQUARE * 2, row, c0)
+                _load_shared_bf16x8(address, vec)
+                for e in cutlass.range_constexpr(8):
+                    keep = (c0 + e <= row) and (row < valid)
+                    vec[e] = vec[e] if keep else cutlass.BFloat16(0.0)
+                _store_shared_bf16x8(address, vec)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(barrier_id=_BAR_MASK, number_of_threads=64)
+            if u == 0:
+                cute.arch.mbarrier_arrive(bars + _B_AQK_READY + stage)
 
     # -------------------------------------------------------------- state
 

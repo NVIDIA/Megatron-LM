@@ -311,13 +311,11 @@ def kda_dhu(
     _require("dht", dht, torch.float32, (num_sequences, heads, _D, _D), device)
     if num_chunks is None:
         num_chunks = (tokens + _BT - 1) // _BT + num_sequences
-    qg, kg, w, aqk_masked = kda_dhu_prep(
-        q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks
-    )
+    qg, kg, w = kda_dhu_prep(q, k, gc, beta, akk, cu_seqlens, chunk_offsets, num_chunks)
     if flags is not None:
         if keepalive is None:
             raise ValueError("flags need a keepalive list")
-        keepalive.extend((qg, kg, w, aqk_masked))
+        keepalive.extend((qg, kg, w))
     dh = torch.empty((1, num_chunks, heads, _D, _D), device=device, dtype=torch.bfloat16)
     dv2 = torch.empty_like(do)
     dh0 = torch.empty_like(dht)
@@ -328,7 +326,7 @@ def kda_dhu(
     else:
         flags = torch.empty((1,), device=device, dtype=torch.int32)
     args = (
-        *(_dynamic(t, 1) for t in (kg, w, qg, do, aqk_masked, gc)),
+        *(_dynamic(t, 1) for t in (kg, w, qg, do, aqk, gc)),
         _dynamic(dht, 0),
         _dynamic(cu_seqlens, 0, align=4),
         _dynamic(chunk_offsets, 0, align=4),
