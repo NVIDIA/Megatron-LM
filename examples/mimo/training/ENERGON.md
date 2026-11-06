@@ -134,6 +134,57 @@ preserve their pending discarded outputs. Constructor support alone does not
 qualify that behavior; use a compatible checkpoint-safe dependency before
 resuming a fanned-out stream.
 
+### Explicit fixed-worker-count language-DP migration
+
+`--energon-dp-resume` enables a separate checkpoint format for changing the
+number of language sample lanes while keeping the global physical worker count
+fixed. It requires `--micro-batch-size 1`, positive `--num-workers`, a positive
+`--global-batch-size` divisible by `language_lanes * --num-workers`, and one
+logical stream per physical worker (`L=P`). This migration does not support
+`L<P`, zero-worker loaders, changed total worker count, or changed global batch
+size. These checks apply to the actual language-lane count used to construct
+each loader.
+
+The mode stores a format-2 profile alongside the ordinary native worker state.
+It binds application identity, dependency version, task and recipe semantics,
+global batch size, the normalized native pipeline, and ordered per-worker
+sampler partitions. Only known native dataset edges are interpreted; opaque
+factory and cooker configuration remains part of the strict semantic profile.
+The native config hash is rechecked before profile use. Migration is accepted
+only when every source lane is present once, all worker progress agrees, each
+lane is at `next_worker_id=0`, and the saved state is on a committed global
+batch boundary. Native worker states are regrouped in rank-major order; model,
+optimizer, RNG and scheduler checkpoint handling remains Megatron's normal
+resume path.
+
+
+Stock Megatron ignores saved model RNG when the total world size changes. This
+command preserves native dataloader worker RNG and leaves that model-RNG policy
+unchanged. Same-topology model RNG restoration uses the ordinary framework path.
+
+To migrate, pass each source language-lane dataloader file explicitly and write
+to a new output directory. For example:
+
+```bash
+python -m examples.mimo.training.energon_checkpoint \
+  --input-dataloader-checkpoints \
+  /checkpoints/run/iter_0000100/mp_rank_00/train_dataloader_dprank000.pt \
+  /checkpoints/run/iter_0000100/mp_rank_00/train_dataloader_dprank001.pt \
+  --new-language-lanes 1 \
+  --output-directory /checkpoints/run/dataloader-migrations/iter_0000100/mp_rank_00
+```
+
+The command accepts individual dataloader-only files, never discovers files
+from a checkpoint tree, and refuses an existing output directory. Resume using
+`--energon-dataloader-load /checkpoints/run/dataloader-migrations` and
+`--energon-dp-resume`, keeping model loading on the normal `--load` path. The
+output iteration must match that model checkpoint. Writing multiple rank files
+is not atomic: on an interrupted or failed write, preserve the partial directory
+for diagnosis and retry into a new output root. Format-2 checkpoints always
+require DP-resume mode, including same-layout restores, so their semantic and
+global-batch profiles cannot be bypassed by disabling the flag. A migrated state must first be restored and saved
+normally at the destination topology before it can be migrated again.
+
 The iterator owns all lane loaders and closes them on failure and training exit.
 The existing dependency predates a public loader close API, so cleanup has a
 small persistent-worker compatibility fallback; newer native close APIs are

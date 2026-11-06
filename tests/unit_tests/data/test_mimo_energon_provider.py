@@ -348,6 +348,7 @@ def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers,
             )
         for lane, language in enumerate(languages):
             state = language.save_state()
+            assert set(state) == {"contract", "energon"}
             if logical_workers is None:
                 assert "logical_workers" not in state["contract"]
             else:
@@ -725,6 +726,76 @@ def test_logical_worker_argument_validation(workers, lanes, logical, valid):
             validate_energon_data_args(args)
 
 
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"num_workers": 0}, "positive --num-workers"),
+        ({"micro_batch_size": 2}, "micro-batch-size 1"),
+        ({"global_batch_size": 0}, "positive --global-batch-size"),
+        ({"global_batch_size": 5}, "divisible by total physical workers"),
+        ({"energon_logical_workers": 1}, "logical workers L=P"),
+    ],
+)
+def test_dp_resume_argument_validation(overrides, message):
+    values = {
+        "mimo_llm_dp": 2,
+        "mimo_encoder_dp": 2,
+        "num_workers": 2,
+        "micro_batch_size": 1,
+        "global_batch_size": 8,
+        "energon_dp_resume": True,
+        **overrides,
+    }
+    args = _args("unused.jsonl", **values)
+    with pytest.raises(ValueError, match=message):
+        validate_energon_data_args(args)
+
+
+@pytest.mark.skipif(
+    "logical_workers" not in inspect.signature(WorkerConfig).parameters,
+    reason="installed Energon lacks native logical-worker support required for DP resume",
+)
+def test_dp_resume_writes_format2_and_restores_same_layout(tmp_path):
+    args = _args(
+        _jsonl(tmp_path / "data.jsonl"),
+        mimo_llm_dp=2,
+        mimo_encoder_dp=2,
+        num_workers=1,
+        micro_batch_size=1,
+        global_batch_size=4,
+        energon_dp_resume=True,
+    )
+    paths = {lane: tmp_path / f"lane{lane}.pt" for lane in range(2)}
+    languages = [_build(args, (lane,)) for lane in range(2)]
+    try:
+        for iterator in languages:
+            next(iterator)
+        for lane, iterator in enumerate(languages):
+            state = iterator.save_state()
+            assert set(state) == {"format", "contract", "rescale", "energon"}
+            assert state["format"] == 2
+            assert state["contract"]["logical_workers"] == 2
+            torch.save({"dataloader_state_dict": state}, paths[lane])
+    finally:
+        for iterator in languages:
+            iterator.close()
+
+    # Explicit L=P makes the ordinary contract match even with DP mode disabled.
+    # The legacy path must still reject format2 rather than ignoring its profile.
+    legacy_args = argparse.Namespace(
+        **{**vars(args), "energon_dp_resume": False, "energon_logical_workers": 2}
+    )
+    with pytest.raises(ValueError, match="incompatible Energon dataloader state"):
+        _build(legacy_args, (0,), checkpoint_paths=paths)
+
+    restored = [_build(args, (lane,), checkpoint_paths=paths) for lane in range(2)]
+    try:
+        assert all(next(iterator)["input_ids"].shape == (1, 7) for iterator in restored)
+    finally:
+        for iterator in restored:
+            iterator.close()
+
+
 def test_builder_uses_actual_language_lanes_for_logical_worker_bounds(monkeypatch):
     from examples.mimo.training import energon_provider
 
@@ -828,4 +899,31 @@ def test_explicit_logical_workers_require_native_constructor_capability(monkeypa
         side_effect=AssertionError("application factory must not be imported"),
     ):
         with pytest.raises(RuntimeError, match="logical_workers constructor parameter"):
+            _build(args)
+
+
+def test_dp_resume_requires_native_logical_worker_constructor(monkeypatch):
+    import megatron.energon
+    from examples.mimo.training import energon_provider
+
+    args = _args(
+        "unused.jsonl",
+        mimo_llm_dp=1,
+        num_workers=2,
+        micro_batch_size=1,
+        global_batch_size=2,
+        energon_dp_resume=True,
+    )
+
+    class ReleasedWorkerConfig:
+        def __init__(self, *, rank, world_size, num_workers):
+            pass
+
+    monkeypatch.setattr(megatron.energon, "WorkerConfig", ReleasedWorkerConfig)
+    with patch.object(
+        energon_provider.importlib,
+        "import_module",
+        side_effect=AssertionError("application factory must not be imported"),
+    ):
+        with pytest.raises(RuntimeError, match="--energon-dp-resume"):
             _build(args)
