@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import functools
 import os
+import subprocess
+import sys
 from argparse import Namespace
 from datetime import timedelta
 from typing import Literal
@@ -246,6 +249,45 @@ def is_nccl_ep_fp8_dispatch_available():
     if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
         return False
     return check_mxfp8_support()[0]
+
+
+_FLASH_MLA_DENSE_DECODE_PROBE = """
+import sys
+
+import torch
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+torch.cuda.set_device(int(sys.argv[1]))
+q = torch.zeros(1, 1, 16, 576, device="cuda", dtype=torch.bfloat16)
+kv_cache = torch.zeros(1, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
+cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+metadata, num_splits = get_mla_metadata(cache_seqlens, 16, 1)
+flash_mla_with_kvcache(q, kv_cache, block_table, cache_seqlens, 512, metadata, num_splits)
+torch.cuda.synchronize()
+"""
+
+
+@functools.cache
+def is_flash_mla_dense_decode_available():
+    """Whether FlashMLA's dense decode kernel runs on this device.
+
+    It needs SM90 and a FlashMLA build with its SM90 kernels. ``import flash_mla`` succeeds
+    without them, and the first launch then exits the process, so the kernel is probed in a
+    subprocess.
+    """
+    from megatron.core.transformer.attention import HAVE_FMLA
+
+    if not (HAVE_FMLA and torch.cuda.is_available()):
+        return False
+    if torch.cuda.get_device_capability() != (9, 0):
+        return False
+    probe = subprocess.run(
+        [sys.executable, "-c", _FLASH_MLA_DENSE_DECODE_PROBE, str(torch.cuda.current_device())],
+        capture_output=True,
+        timeout=600,
+    )
+    return probe.returncode == 0
 
 
 class Utils:

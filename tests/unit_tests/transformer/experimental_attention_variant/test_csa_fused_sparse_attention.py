@@ -757,8 +757,10 @@ def test_real_sbhd_teacher_lse_kernel_matches_bounded_reference():
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI because the CI image builds
-# flash_mla with FLASH_MLA_DISABLE_SM90=1. Re-enable once SM90 kernels are included.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: fails on H100 (SM90). The forward output and
+# query gradient match the native reference, but the kv gradient from the cuDNN DSA backward does
+# not: 2.6% (1 head) and 3.0% (2 heads) of its elements exceed rtol=atol=5e-2, with max relative
+# difference 7.8% and max absolute difference 0.30 and 0.56. Open issue; SM100 is unverified.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("num_heads", [1, 2])

@@ -128,18 +128,20 @@ ARG NVTE_CUDA_ARCHS="80;90;100"
 # concurrently; the uv sync below then caps concurrent sources to keep the compiler budget.
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Keep compiled wheels separate when the CPU or TE GPU targets change. The frontend
-# suffix forces TE to rebuild against the fixed 1.32 headers rather than reuse an old wheel.
-RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,target=/root/.cache/uv \
+# suffix forces TE to rebuild against the fixed 1.32 headers, and the flash-mla suffix forces
+# FlashMLA to rebuild with its SM90 kernels, rather than reuse an old wheel.
+RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32-flash-mla-sm90,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
     # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
-    # include path) and scope the build to the target archs. Skipped for the LTS image.
+    # include path). FlashMLA builds its two supported targets, sm_90a (H100) and sm_100f (GB200,
+    # GB300), whatever NVTE_CUDA_ARCHS lists. Skipped for the LTS image.
     FLASH_MLA_GROUP=""
     if [ "$IMAGE_TYPE" != "lts" ]; then
         FLASH_MLA_GROUP="--group no_pypi_wheels"
-        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+        export NVCC_THREADS=16 \
             CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
