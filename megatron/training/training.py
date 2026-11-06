@@ -825,7 +825,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
-def _dsv4_attention_flops(transformer, layer_counts, total_tokens, seqlen_squared_sum):
+def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_squared_sum):
     """Estimate DSv4 W/C/H attention FLOPs, including projections and compressors.
 
     Uses the model-FLOPs convention: multiply/add counts as two
@@ -842,13 +842,13 @@ def _dsv4_attention_flops(transformer, layer_counts, total_tokens, seqlen_square
     csa_layers = layer_counts[Symbols.CSA]
     hca_layers = layer_counts[Symbols.HCA]
     attention_layers = window_layers + csa_layers + hca_layers
-    hidden = transformer.hidden_size
-    heads = transformer.num_attention_heads
-    head_dim = transformer.v_head_dim
-    q_rank = transformer.q_lora_rank
-    output_rank = transformer.output_projection_lora_rank
-    output_groups = transformer.output_projection_groups
-    window = transformer.csa_window_size
+    hidden = transformer_cfg.hidden_size
+    heads = transformer_cfg.num_attention_heads
+    head_dim = transformer_cfg.v_head_dim
+    q_rank = transformer_cfg.q_lora_rank
+    output_rank = transformer_cfg.output_projection_lora_rank
+    output_groups = transformer_cfg.output_projection_groups
+    window = transformer_cfg.csa_window_size
     sequence_length = seqlen_squared_sum / total_tokens
 
     # Read v_head_dim directly: DSv4 derives qk_head_dim on the layer config,
@@ -865,13 +865,13 @@ def _dsv4_attention_flops(transformer, layer_counts, total_tokens, seqlen_square
     core_term = hca_layers * heads * head_dim / 128
 
     if csa_layers:
-        if transformer.csa_dense_mode:
+        if transformer_cfg.csa_dense_mode:
             # Dense CSA attends to all compressed keys and has no indexer.
             core_term += csa_layers * heads * head_dim / 4
         else:
-            indexer_heads = transformer.dsa_indexer_n_heads
-            indexer_dim = transformer.dsa_indexer_head_dim
-            topk = min(transformer.dsa_indexer_topk, sequence_length // 4)
+            indexer_heads = transformer_cfg.dsa_indexer_n_heads
+            indexer_dim = transformer_cfg.dsa_indexer_head_dim
+            topk = min(transformer_cfg.dsa_indexer_topk, sequence_length // 4)
             average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
             token_term += csa_layers * heads * average_compressed_keys * head_dim * 2
             token_term += csa_layers * (
@@ -919,15 +919,15 @@ def num_floating_point_operations(
     """
     from megatron.training.vocab_utils import model_vocab_size
 
-    transformer = model_config.transformer
+    transformer_cfg = model_config.transformer
     llm_seq_length = sequence_length
-    group_query_attention = transformer.num_query_groups != transformer.num_attention_heads
-    swiglu = transformer.gated_linear_unit and transformer.activation_func is torch.nn.functional.silu
+    group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
+    swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
     vocab_size = model_vocab_size(
         model_config.vocab_size,
         should_pad_vocab=model_config.should_pad_vocab,
         make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
-        tensor_model_parallel_size=transformer.tensor_model_parallel_size,
+        tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
     )
 
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
@@ -1095,15 +1095,15 @@ def num_floating_point_operations(
                 seqlen_squared_sum=seqlen_squared_sum,
                 hidden_size=hidden_size,
                 num_attention_heads=num_attn_heads,
-                q_lora_rank=transformer.q_lora_rank,
-                kv_lora_rank=transformer.kv_lora_rank,
-                qk_head_dim=transformer.qk_head_dim,
-                qk_pos_emb_head_dim=transformer.qk_pos_emb_head_dim,
-                v_head_dim=transformer.v_head_dim,
-                dsa_indexer_topk=transformer.dsa_indexer_topk,
-                dsa_indexer_kpool=getattr(transformer, "dsa_indexer_kpool", 1),
+                q_lora_rank=transformer_cfg.q_lora_rank,
+                kv_lora_rank=transformer_cfg.kv_lora_rank,
+                qk_head_dim=transformer_cfg.qk_head_dim,
+                qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
+                v_head_dim=transformer_cfg.v_head_dim,
+                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
+                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
                 dsa_indexer_kpool_always_select_tail=getattr(
-                    transformer, "dsa_indexer_kpool_always_select_tail", True
+                    transformer_cfg, "dsa_indexer_kpool_always_select_tail", True
                 ),
             ) if num_dsa_layers else 0
         )
@@ -1130,17 +1130,17 @@ def num_floating_point_operations(
                 total_tokens=total_tokens,
                 seqlen_squared_sum=seqlen_squared_sum,
                 hidden_size=hidden_size,
-                q_lora_rank=transformer.q_lora_rank,
-                dsa_indexer_n_heads=transformer.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=transformer.dsa_indexer_head_dim,
-                dsa_indexer_topk=transformer.dsa_indexer_topk,
+                q_lora_rank=transformer_cfg.q_lora_rank,
+                dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
+                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
                 num_dsa_layers=num_dsa_layers,
-                dsa_indexer_loss_coeff=transformer.dsa_indexer_loss_coeff,
-                dsa_indexer_use_sparse_loss=getattr(transformer, "dsa_indexer_use_sparse_loss", False),
-                dsa_indexer_skip_topk_offset=transformer.dsa_indexer_skip_topk_offset,
-                dsa_indexer_topk_freq=transformer.dsa_indexer_topk_freq,
+                dsa_indexer_loss_coeff=transformer_cfg.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=transformer_cfg.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=transformer_cfg.dsa_indexer_topk_freq,
                 hybrid_layer_pattern=model_config.hybrid_layer_pattern,
-                dsa_indexer_kpool=getattr(transformer, "dsa_indexer_kpool", 1),
+                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
             ) if num_dsa_layers else 0
         )
         return flops_fwd * 3 + indexer_flops
@@ -1149,51 +1149,51 @@ def num_floating_point_operations(
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
         # MoE.
-        if transformer.num_moe_experts is None:
+        if transformer_cfg.num_moe_experts is None:
             # Every Transformer MLP is dense.
-            num_dense_layers = transformer.num_layers
+            num_dense_layers = transformer_cfg.num_layers
             num_moe_layers = 0
             num_experts_routed_to = 0
             last_layer_is_moe = 0
         else:
             # Calculate number of dense and MoE Transformer MLPs.
-            if isinstance(transformer.moe_layer_freq, int):
+            if isinstance(transformer_cfg.moe_layer_freq, int):
                 moe_layer_pattern = [
-                    1 if (i % transformer.moe_layer_freq == 0) else 0 for i in range(transformer.num_layers)
+                    1 if (i % transformer_cfg.moe_layer_freq == 0) else 0 for i in range(transformer_cfg.num_layers)
                 ]
-            elif isinstance(transformer.moe_layer_freq, list):
-                moe_layer_pattern = transformer.moe_layer_freq
+            elif isinstance(transformer_cfg.moe_layer_freq, list):
+                moe_layer_pattern = transformer_cfg.moe_layer_freq
             else:
                 raise RuntimeError("Illegal --moe-layer-freq argument provided!")
-            assert len(moe_layer_pattern) == transformer.num_layers, (
+            assert len(moe_layer_pattern) == transformer_cfg.num_layers, (
                 f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-                f"expected {transformer.num_layers}, "
-                f"current moe layer pattern: {transformer.moe_layer_freq}"
+                f"expected {transformer_cfg.num_layers}, "
+                f"current moe layer pattern: {transformer_cfg.moe_layer_freq}"
             )
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
-            num_dense_layers = transformer.num_layers - num_moe_layers
-            num_experts_routed_to = transformer.moe_router_topk
+            num_dense_layers = transformer_cfg.num_layers - num_moe_layers
+            num_experts_routed_to = transformer_cfg.moe_router_topk
             last_layer_is_moe = moe_layer_pattern[-1]
 
-        if transformer.mtp_num_layers is not None:
-            mtp_num_layers = transformer.mtp_num_layers
+        if transformer_cfg.mtp_num_layers is not None:
+            mtp_num_layers = transformer_cfg.mtp_num_layers
             num_moe_layers += last_layer_is_moe * mtp_num_layers
             num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
-            num_layers = transformer.num_layers + mtp_num_layers
+            num_layers = transformer_cfg.num_layers + mtp_num_layers
         else:
             mtp_num_layers = 0
-            num_layers = transformer.num_layers
+            num_layers = transformer_cfg.num_layers
 
         moe_ffn_hidden_size = (
-            transformer.moe_ffn_hidden_size
-            if transformer.moe_ffn_hidden_size is not None
-            else transformer.ffn_hidden_size
+            transformer_cfg.moe_ffn_hidden_size
+            if transformer_cfg.moe_ffn_hidden_size is not None
+            else transformer_cfg.ffn_hidden_size
         )
-        moe_latent_size = transformer.moe_latent_size
+        moe_latent_size = transformer_cfg.moe_latent_size
         shared_expert_ffn_hidden_size = (
             0
-            if transformer.moe_shared_expert_intermediate_size is None
-            else transformer.moe_shared_expert_intermediate_size
+            if transformer_cfg.moe_shared_expert_intermediate_size is None
+            else transformer_cfg.moe_shared_expert_intermediate_size
         )
 
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
@@ -1212,13 +1212,13 @@ def num_floating_point_operations(
         # two are equal, so the BSHD result is unchanged. With THD/packed sequences
         # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
         # causal mask of packed attention.
-        if transformer.multi_latent_attention:
+        if transformer_cfg.multi_latent_attention:
             assert not group_query_attention
-        if transformer.experimental_attention_variant == "dsa":
+        if transformer_cfg.experimental_attention_variant == "dsa":
             # DSA attention and its indexer are counted separately below.
             standard_self_attn_term = 0
             standard_self_attn_core_term = 0
-        elif transformer.multi_latent_attention:
+        elif transformer_cfg.multi_latent_attention:
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1233,16 +1233,16 @@ def num_floating_point_operations(
             https://arxiv.org/abs/2205.05198
             '''
             ## MLA
-            if transformer.q_lora_rank is None:
+            if transformer_cfg.q_lora_rank is None:
                 q_term = (
-                    transformer.hidden_size
-                    * transformer.num_attention_heads
-                    * (transformer.qk_head_dim + transformer.qk_pos_emb_head_dim)
+                    transformer_cfg.hidden_size
+                    * transformer_cfg.num_attention_heads
+                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
                 )
             else:
-                q_term = transformer.q_lora_rank * (
-                    transformer.hidden_size
-                    + transformer.num_attention_heads * (transformer.qk_head_dim + transformer.qk_pos_emb_head_dim)
+                q_term = transformer_cfg.q_lora_rank * (
+                    transformer_cfg.hidden_size
+                    + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
                     + 1
                 )
             # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
@@ -1253,15 +1253,15 @@ def num_floating_point_operations(
                     ## q lora + rope + q norm
                     q_term
                     ## kv lora + rope + kv norm
-                    + transformer.kv_lora_rank
+                    + transformer_cfg.kv_lora_rank
                     * (
-                        transformer.hidden_size
-                        + transformer.num_attention_heads * (transformer.qk_head_dim + transformer.v_head_dim)
+                        transformer_cfg.hidden_size
+                        + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.v_head_dim)
                         + 1
                     )
-                    + transformer.hidden_size * transformer.qk_pos_emb_head_dim
+                    + transformer_cfg.hidden_size * transformer_cfg.qk_pos_emb_head_dim
                     ## o proj
-                    + (transformer.num_attention_heads * transformer.v_head_dim) * transformer.hidden_size
+                    + (transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim) * transformer_cfg.hidden_size
                 )
             )
             # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1270,26 +1270,26 @@ def num_floating_point_operations(
                 forward_backward_expansion_factor
                 * fma_expansion_factor
                 * (
-                    transformer.num_attention_heads
-                    * (transformer.qk_head_dim + transformer.qk_pos_emb_head_dim)
+                    transformer_cfg.num_attention_heads
+                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
                     / 2
-                    + transformer.num_attention_heads * transformer.v_head_dim / 2
+                    + transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim / 2
                 )
             )
 
         else:
             ## MHA or GQA
-            query_projection_size = transformer.kv_channels * transformer.num_attention_heads
-            key_projection_size = transformer.kv_channels * transformer.num_query_groups
-            value_projection_size = transformer.kv_channels * transformer.num_query_groups
-            gate_projection_size = query_projection_size if transformer.attention_output_gate else 0
+            query_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_attention_heads
+            key_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            value_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            gate_projection_size = query_projection_size if transformer_cfg.attention_output_gate else 0
             # Token-linear part of self-attention (QKV projection + output projection).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
                 * (
                     ## qkv proj
-                    transformer.hidden_size
+                    transformer_cfg.hidden_size
                     * (
                         query_projection_size
                         + key_projection_size
@@ -1298,7 +1298,7 @@ def num_floating_point_operations(
                     )
                     ## out proj
                     + query_projection_size
-                    * transformer.hidden_size
+                    * transformer_cfg.hidden_size
                 )
             )
             # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
@@ -1310,32 +1310,32 @@ def num_floating_point_operations(
                 * 2  # QK^T and (QK^T)V
             )
 
-        if is_linear_attention_variant(transformer.experimental_attention_variant):
+        if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
             # The attention pattern describes only the main decoder layers.
-            if isinstance(transformer.linear_attention_freq, int):
+            if isinstance(transformer_cfg.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
-                    0 if ((i + 1) % transformer.linear_attention_freq == 0)
-                    else 1 for i in range(transformer.num_layers)
+                    0 if ((i + 1) % transformer_cfg.linear_attention_freq == 0)
+                    else 1 for i in range(transformer_cfg.num_layers)
                 ]
-            elif isinstance(transformer.linear_attention_freq, list):
-                linear_attention_pattern = transformer.linear_attention_freq
-                assert len(linear_attention_pattern) == transformer.num_layers, (
+            elif isinstance(transformer_cfg.linear_attention_freq, list):
+                linear_attention_pattern = transformer_cfg.linear_attention_freq
+                assert len(linear_attention_pattern) == transformer_cfg.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {transformer.num_layers}, "
-                    f"current linear attention pattern: {transformer.linear_attention_freq}"
+                    f"expected {transformer_cfg.num_layers}, "
+                    f"current linear attention pattern: {transformer_cfg.linear_attention_freq}"
                 )
-            elif transformer.linear_attention_freq is None:
+            elif transformer_cfg.linear_attention_freq is None:
                 # This should be caught by config validation, but raise here as a safety check
                 raise ValueError(
-                    f"Linear attention type {transformer.experimental_attention_variant} is specified "
+                    f"Linear attention type {transformer_cfg.experimental_attention_variant} is specified "
                     "but linear_attention_freq is None. "
                     "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
                 )
             else:
                 raise ValueError(
-                    f"Invalid linear_attention_freq: {type(transformer.linear_attention_freq)},"
-                    f" {transformer.linear_attention_freq}"
+                    f"Invalid linear_attention_freq: {type(transformer_cfg.linear_attention_freq)},"
+                    f" {transformer_cfg.linear_attention_freq}"
                 )
             # MTP repeats the last decoder layer's attention type, not the pattern.
             num_linear_attention_layers = (
@@ -1343,15 +1343,15 @@ def num_floating_point_operations(
             )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if is_gated_delta_net_variant(transformer.experimental_attention_variant):
+            if is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
-                qk_head_dim = transformer.linear_key_head_dim
-                v_head_dim = transformer.linear_value_head_dim
-                num_qk_heads = transformer.linear_num_key_heads
-                num_v_heads = transformer.linear_num_value_heads
+                qk_head_dim = transformer_cfg.linear_key_head_dim
+                v_head_dim = transformer_cfg.linear_value_head_dim
+                num_qk_heads = transformer_cfg.linear_num_key_heads
+                num_v_heads = transformer_cfg.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
-                if transformer.experimental_attention_variant == "gdn2":
+                if transformer_cfg.experimental_attention_variant == "gdn2":
                     # GDN2 in_proj: q, k, v, z, f, b, w
                     in_proj_dim = 4 * qk_dim + 3 * v_dim
                 else:
@@ -1361,24 +1361,24 @@ def num_floating_point_operations(
                     * fma_expansion_factor
                     * (
                         ## in proj
-                        transformer.hidden_size
+                        transformer_cfg.hidden_size
                         * in_proj_dim
                         ## conv1d
-                        + transformer.linear_conv_kernel_dim
+                        + transformer_cfg.linear_conv_kernel_dim
                         * (2 * qk_dim + v_dim)
                         ## gated delta rule
                         + num_v_heads
                         * (v_head_dim ** 2)
                         * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
                         ## out proj
-                        + transformer.hidden_size
+                        + transformer_cfg.hidden_size
                         * v_dim
                     )
                 )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
-                    f"{transformer.experimental_attention_variant}"
+                    f"{transformer_cfg.experimental_attention_variant}"
                 )
         else:
             num_linear_attention_layers = 0
@@ -1402,10 +1402,10 @@ def num_floating_point_operations(
                 # MLP
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * transformer.hidden_size
+                * transformer_cfg.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (transformer.ffn_hidden_size * ffn_expansion_factor)
+                    (transformer_cfg.ffn_hidden_size * ffn_expansion_factor)
                     * num_dense_layers
                     # routed experts
                     + (
@@ -1417,7 +1417,7 @@ def num_floating_point_operations(
                                 * num_experts_routed_to
                                 * ffn_expansion_factor
                                 * moe_latent_size
-                                / transformer.hidden_size
+                                / transformer_cfg.hidden_size
                             )  # Routed experts run on moe_latent_size.
                             + 2 * moe_latent_size  # Up proj and down proj.
                         )
@@ -1435,14 +1435,14 @@ def num_floating_point_operations(
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
-                    3 * transformer.hidden_size
+                    3 * transformer_cfg.hidden_size
                     # MTH eh proj
-                    + 2 * transformer.hidden_size * transformer.hidden_size
+                    + 2 * transformer_cfg.hidden_size * transformer_cfg.hidden_size
                 )
                 # Logit.
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
-                * transformer.hidden_size
+                * transformer_cfg.hidden_size
                 * vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
@@ -1452,23 +1452,23 @@ def num_floating_point_operations(
             # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
-        if transformer.experimental_attention_variant == "dsa":
+        if transformer_cfg.experimental_attention_variant == "dsa":
             total_floating_point_operations += (
                 num_layers
                 * dsa_layer_flops(
                     total_tokens=total_real_tokens_in_batch,
                     seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                    hidden_size=transformer.hidden_size,
-                    num_attention_heads=transformer.num_attention_heads,
-                    q_lora_rank=transformer.q_lora_rank,
-                    kv_lora_rank=transformer.kv_lora_rank,
-                    qk_head_dim=transformer.qk_head_dim,
-                    qk_pos_emb_head_dim=transformer.qk_pos_emb_head_dim,
-                    v_head_dim=transformer.v_head_dim,
-                    dsa_indexer_topk=transformer.dsa_indexer_topk,
-                    dsa_indexer_kpool=getattr(transformer, "dsa_indexer_kpool", 1),
+                    hidden_size=transformer_cfg.hidden_size,
+                    num_attention_heads=transformer_cfg.num_attention_heads,
+                    q_lora_rank=transformer_cfg.q_lora_rank,
+                    kv_lora_rank=transformer_cfg.kv_lora_rank,
+                    qk_head_dim=transformer_cfg.qk_head_dim,
+                    qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
+                    v_head_dim=transformer_cfg.v_head_dim,
+                    dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
+                    dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
                     dsa_indexer_kpool_always_select_tail=getattr(
-                        transformer, "dsa_indexer_kpool_always_select_tail", True
+                        transformer_cfg, "dsa_indexer_kpool_always_select_tail", True
                     ),
                 )
                 * forward_backward_expansion_factor
@@ -1477,24 +1477,27 @@ def num_floating_point_operations(
             total_floating_point_operations += dsa_indexer_flops(
                 total_tokens=total_real_tokens_in_batch,
                 seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                hidden_size=transformer.hidden_size,
-                q_lora_rank=transformer.q_lora_rank,
-                dsa_indexer_n_heads=transformer.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=transformer.dsa_indexer_head_dim,
-                dsa_indexer_topk=transformer.dsa_indexer_topk,
+                hidden_size=transformer_cfg.hidden_size,
+                q_lora_rank=transformer_cfg.q_lora_rank,
+                dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
+                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
                 num_dsa_layers=num_layers,
-                dsa_indexer_loss_coeff=transformer.dsa_indexer_loss_coeff,
-                dsa_indexer_use_sparse_loss=getattr(transformer, "dsa_indexer_use_sparse_loss", False),
-                dsa_indexer_skip_topk_offset=transformer.dsa_indexer_skip_topk_offset,
-                dsa_indexer_topk_freq=transformer.dsa_indexer_topk_freq,
+                dsa_indexer_loss_coeff=transformer_cfg.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=transformer_cfg.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=transformer_cfg.dsa_indexer_topk_freq,
                 mtp_num_layers=mtp_num_layers,
-                mtp_use_repeated_layer=getattr(transformer, "mtp_use_repeated_layer", False),
-                dsa_indexer_kpool=getattr(transformer, "dsa_indexer_kpool", 1),
+                mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
+                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
             )
         return total_floating_point_operations
 
     def _uses_gated_delta_product_spec():
-        """Read the actual configured mixer rather than its CLI import alias."""
+        """Return whether the hybrid stack uses GatedDeltaProductMixer.
+
+        Used to select the gated-delta-product FLOPs calculation.
+        """
         from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 
         spec = getattr(model_config, "hybrid_stack_spec", None)
@@ -1522,7 +1525,7 @@ def num_floating_point_operations(
             )
         )
 
-        mtp_num_layers = transformer.mtp_num_layers
+        mtp_num_layers = transformer_cfg.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
         has_dsv4_attention = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
@@ -1534,47 +1537,47 @@ def num_floating_point_operations(
         flops = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
-            hidden_size=transformer.hidden_size,
+            hidden_size=transformer_cfg.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
             num_dsa_layers=num_dsa_layers,
             num_gdn_layers=num_gdn_layers,
-            mamba_state_dim=transformer.mamba_state_dim,
-            mamba_head_dim=transformer.mamba_head_dim,
-            mamba_num_groups=transformer.mamba_num_groups,
-            mamba_num_heads=transformer.mamba_num_heads,
-            gdp_num_householder=transformer.gdp_num_householder,
-            num_attn_heads=transformer.num_attention_heads,
+            mamba_state_dim=transformer_cfg.mamba_state_dim,
+            mamba_head_dim=transformer_cfg.mamba_head_dim,
+            mamba_num_groups=transformer_cfg.mamba_num_groups,
+            mamba_num_heads=transformer_cfg.mamba_num_heads,
+            gdp_num_householder=transformer_cfg.gdp_num_householder,
+            num_attn_heads=transformer_cfg.num_attention_heads,
             gqa=group_query_attention,
-            gqa_groups=transformer.num_query_groups,
-            kv_channels=transformer.kv_channels,
-            mlp_expansion=transformer.ffn_hidden_size / transformer.hidden_size,
+            gqa_groups=transformer_cfg.num_query_groups,
+            kv_channels=transformer_cfg.kv_channels,
+            mlp_expansion=transformer_cfg.ffn_hidden_size / transformer_cfg.hidden_size,
             swiglu=swiglu,
             use_gated_delta_product=_uses_gated_delta_product_spec(),
-            moe_latent_size=transformer.moe_latent_size,
-            moe_ffn_hidden_size=(transformer.moe_ffn_hidden_size if transformer.moe_ffn_hidden_size is not None
-                                 else transformer.ffn_hidden_size),
-            shared_expert_ffn_hidden_size=(0 if transformer.moe_shared_expert_intermediate_size is None
-                                           else transformer.moe_shared_expert_intermediate_size),
-            num_experts_routed_to=transformer.moe_router_topk,
-            gdn_qk_head_dim=transformer.linear_key_head_dim or 128,
-            gdn_v_head_dim=transformer.linear_value_head_dim or 128,
-            gdn_num_qk_heads=transformer.linear_num_key_heads or 16,
-            gdn_num_v_heads=transformer.linear_num_value_heads or 32,
-            gdn_conv_kernel_dim=transformer.linear_conv_kernel_dim or 4,
-            gdn_use_gdn2=(transformer.experimental_attention_variant == "gdn2"),
+            moe_latent_size=transformer_cfg.moe_latent_size,
+            moe_ffn_hidden_size=(transformer_cfg.moe_ffn_hidden_size if transformer_cfg.moe_ffn_hidden_size is not None
+                                 else transformer_cfg.ffn_hidden_size),
+            shared_expert_ffn_hidden_size=(0 if transformer_cfg.moe_shared_expert_intermediate_size is None
+                                           else transformer_cfg.moe_shared_expert_intermediate_size),
+            num_experts_routed_to=transformer_cfg.moe_router_topk,
+            gdn_qk_head_dim=transformer_cfg.linear_key_head_dim or 128,
+            gdn_v_head_dim=transformer_cfg.linear_value_head_dim or 128,
+            gdn_num_qk_heads=transformer_cfg.linear_num_key_heads or 16,
+            gdn_num_v_heads=transformer_cfg.linear_num_value_heads or 32,
+            gdn_conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim or 4,
+            gdn_use_gdn2=(transformer_cfg.experimental_attention_variant == "gdn2"),
             vocab_size=vocab_size,
             mtp_num_layers=mtp_num_layers,
         )
         if has_dsv4_attention:
             flops += _dsv4_attention_flops(
-                transformer, layer_counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+                transformer_cfg, layer_counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
             )
             # MTP normalization and the concatenated embedding/hidden projection.
             flops += 6 * mtp_num_layers * (
-                3 * transformer.hidden_size + 2 * transformer.hidden_size ** 2
+                3 * transformer_cfg.hidden_size + 2 * transformer_cfg.hidden_size ** 2
             ) * total_real_tokens_in_batch
         return int(flops)
     else:
@@ -3815,28 +3818,28 @@ def train_step(
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
-    transformer = model_config.transformer
-    tracker_layers = transformer.num_layers + (transformer.mtp_num_layers or 0)
-    if transformer.csa_compress_ratios is None:
+    transformer_cfg = model_config.transformer
+    tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 
-    ratios = transformer.csa_compress_ratios
+    ratios = transformer_cfg.csa_compress_ratios
     if is_hybrid_model(model_config):
         from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
 
         parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
         mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
-        tracker_layers = transformer.num_layers + mtp_pattern_layers
-        main_indexers = sum(ratio == 4 for ratio in ratios[: transformer.num_layers])
+        tracker_layers = transformer_cfg.num_layers + mtp_pattern_layers
+        main_indexers = sum(ratio == 4 for ratio in ratios[: transformer_cfg.num_layers])
         mtp_indexers_per_depth = sum(
-            ratio == 4 for ratio in ratios[transformer.num_layers : tracker_layers]
+            ratio == 4 for ratio in ratios[transformer_cfg.num_layers : tracker_layers]
         )
-        mtp_indexer_repeats = 1 if transformer.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        mtp_indexer_repeats = 1 if transformer_cfg.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
         indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
     else:
         indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
 
-    return tracker_layers, 0 if transformer.csa_dense_mode else indexer_layers
+    return tracker_layers, 0 if transformer_cfg.csa_dense_mode else indexer_layers
 
 
 def training_log(
