@@ -3,9 +3,7 @@
 Cross-layer state lets one module produce tensors that later modules consume,
 while preserving all consumer gradients to the producer. The same declared
 tensor interface can cross a checkpoint, CUDA graph, or pipeline boundary.
-The implementation is adapted from the general state and transport contracts
-in [#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224), by Hongxiao Bai.
-It contains no model-specific attention, compression, or routing rules.
+The feature contains no model-specific attention, compression, or routing rules.
 
 Packed (THD) batches cross pipeline boundaries through per-microbatch plans, whose
 shapes may vary. Packed CP layout conversion remains model-owned: the CP helpers'
@@ -199,10 +197,12 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
   tests/unit_tests/pipeline_parallel/test_typed_pipeline.py
 
 uv run python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  -m pytest tests/unit_tests/pipeline_parallel/test_shared_state_parallel.py
+  -m pytest tests/unit_tests/pipeline_parallel/test_shared_state_parallel.py \
+  tests/unit_tests/determinism/kernels/test_shared_tensor_state.py
 ```
 
 The four-rank cases compare CP2 x PP2/VPP against the same unpartitioned layer
 chain, including model gradients, with eager execution, recomputation, and both
-graph backends. Porting a particular model's state declarations and numerical
+graph backends. The determinism cases check that eager, checkpointed and graphed
+replays and the CP layout/gather gradients are bit-exact across runs. Porting a particular model's state declarations and numerical
 operations remains separate from this general feature.
