@@ -1,0 +1,1012 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Caller-owned sparse FlashMLA (default) or mega attention core with native parameter
+names and owners."""
+import functools
+
+import torch
+
+from .linear import linear
+
+
+def _rotate(x, positions, cache, inverse=False):
+    width = cache.shape[-1]
+    angles = cache[positions].float()
+    cos, sin = angles.chunk(2, -1)
+    while cos.ndim < x.ndim:
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    if inverse:
+        sin = -sin
+    tail = x[..., -width:].float().unflatten(-1, (-1, 2))
+    a, b = tail.unbind(-1)
+    rotated = torch.stack((a * cos - b * sin, b * cos + a * sin), -1).flatten(-2)
+    return torch.cat((x[..., :-width], rotated.to(x.dtype)), -1)
+
+
+class _QueryInputs(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, raw, qw, kw, eps):
+        from vllm.model_executor.kernels.batch_invariant import rms_norm_cuda
+        from vllm.models.deepseek_v41.common.ops.query_quant import fused_q_kv_rmsnorm_quant
+
+        q, kv = raw.split((qw.numel(), kw.numel()), -1)
+        qa, native_kv = fused_q_kv_rmsnorm_quant(q, kv, qw.bfloat16(), kw.bfloat16(), eps)
+        qr = rms_norm_cuda(q.contiguous(), qw.bfloat16(), eps)
+        ctx.save_for_backward(q, kv, qw, kw)
+        ctx.eps = eps
+        ctx.mark_non_differentiable(qa.data, qa.scale)
+        return qr, native_kv, qa.data, qa.scale
+
+    @staticmethod
+    def backward(ctx, dq, dk, unused_codes, unused_scales):
+        q, kv, qw, kw = ctx.saved_tensors
+
+        def norm_vjp(x, w, grad):
+            x = x.float()
+            g = grad.float()
+            inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + ctx.eps)
+            scaled = g * w.bfloat16().float()
+            dx = inv * (scaled - x * inv.square() * (scaled * x).mean(-1, keepdim=True))
+            return dx, (g * x * inv).sum(0).to(w.dtype)
+
+        a, b = norm_vjp(q, qw, dq)
+        c, d = norm_vjp(kv, kw, dk)
+        return torch.cat((a, c), -1).to(q.dtype), b, d, None
+
+
+class _SWAInsert(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, positions, cache, eps):
+        ctx.empty = q.shape[0] == 0
+        if ctx.empty:
+            if kv.shape[0] != 0:
+                raise ValueError('Empty SWA queries require empty KV rows')
+            records = torch.empty((0, 64, 528), dtype=torch.uint8, device=q.device)
+            ctx.mark_non_differentiable(records)
+            return q.clone(), kv.clone(), records
+        from vllm.models.deepseek_v41.common.ops.cache_utils import dequantize_and_gather_k_cache
+
+        rows, heads, dim = q.shape
+        block = 64
+        pages = (rows + block - 1) // block
+        table = torch.arange(pages, dtype=torch.int32, device=q.device)[None]
+        slots = torch.arange(rows, dtype=torch.int64, device=q.device)
+        packed = torch.zeros((pages, block, 528), dtype=torch.uint8, device=q.device)
+        padded = 64 if heads <= 64 else 128
+        rotated = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q.contiguous(),
+            kv.contiguous(),
+            packed.view(pages, -1),
+            slots,
+            positions,
+            cache,
+            padded,
+            eps,
+            block,
+            False,
+            True,
+            True,
+            False,
+        )
+        decoded = kv.new_empty((1, rows, dim))
+        lengths = torch.tensor([rows], dtype=torch.int32, device=q.device)
+        dequantize_and_gather_k_cache(decoded, packed, lengths, None, table, block, 0)
+        ctx.save_for_backward(positions, cache)
+        ctx.mark_non_differentiable(packed)
+        return rotated[:, :heads], decoded[0], packed
+
+    @staticmethod
+    def backward(ctx, dq, dkv, _records):
+        if ctx.empty:
+            return dq, dkv, None, None, None
+        positions, cache = ctx.saved_tensors
+        return (
+            _rotate(dq, positions, cache, True),
+            _rotate(dkv, positions, cache, True),
+            None,
+            None,
+            None,
+        )
+
+
+def _sparse_gradients(ctx, dq, dkv, dsink):
+    # Preserve legacy direct calls without the optional backward-policy input.
+    return (dq, dkv, dsink, None, None, None, None)[: getattr(ctx, 'sparse_inputs', 6)]
+
+
+class _Sparse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, sink, indices, lengths, scale, deterministic_backward=True):
+        ctx.attention_deterministic_backward = deterministic_backward
+        ctx.sparse_inputs = len(ctx.needs_input_grad)
+        from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+        heads = q.shape[1]
+        padded = 64 if heads <= 64 else 128
+        query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
+        bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
+        output = torch.empty_like(query)
+        flash_mla_sparse_fwd(
+            q=query,
+            kv=kv[:, None].contiguous(),
+            indices=indices[:, None],
+            sm_scale=scale,
+            attn_sink=bias,
+            topk_length=lengths,
+            out=output,
+        )
+        ctx.save_for_backward(q, kv, sink, indices)
+        ctx.scale = scale
+        return output[:, :heads]
+
+    @staticmethod
+    def backward(ctx, grad):
+        q, kv, sink, indices = ctx.saved_tensors
+        if q.shape[0] == 0:
+            return _sparse_gradients(
+                ctx, torch.zeros_like(q), torch.zeros_like(kv), torch.zeros_like(sink)
+            )
+        if not q.is_cuda or q.shape[-1] != 512:
+            # CPU/small-width common-activation reference; production accepts D512.
+            with torch.enable_grad():
+                query = q.detach().float().requires_grad_()
+                values = kv.detach().float().requires_grad_()
+                bias = sink.detach().float().requires_grad_()
+                gathered = values[indices.clamp_min(0).long()]
+                logits = (query @ gathered.transpose(-1, -2)) * ctx.scale
+                logits = logits.masked_fill((indices < 0)[:, None], -torch.inf)
+                logits = torch.cat((logits, bias[None, :, None].expand(q.shape[0], -1, 1)), -1)
+                out = logits.softmax(-1)[..., :-1] @ gathered
+                grads = torch.autograd.grad(out, (query, values, bias), grad.float())
+            return _sparse_gradients(
+                ctx, *(value.to(source.dtype) for value, source in zip(grads, (q, kv, sink)))
+            )
+        # Replay exact FlashMLA statistics for the whole-query cuDNN adjoint.
+        from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention as sparse,
+        )
+
+        heads = q.shape[1]
+        padded = 64 if heads <= 64 else 128
+        query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
+        bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
+        lengths = None
+        output, _, lse = flash_mla_sparse_fwd(
+            q=query,
+            kv=kv[:, None].contiguous(),
+            indices=indices[:, None],
+            sm_scale=ctx.scale,
+            attn_sink=bias,
+            topk_length=lengths,
+        )
+        dout = torch.nn.functional.pad(grad, (0, 0, 0, padded - heads)).contiguous()
+        sparse._ensure_dsa_namespace()
+        result = sparse._DSA.sparse_attention_backward_wrapper(
+            query,
+            kv,
+            output,
+            dout,
+            lse,
+            bias,
+            indices,
+            softmax_scale=ctx.scale,
+            topk_length=lengths,
+            **(
+                sparse._deterministic_sparse_bwd_kwargs(
+                    query,
+                    kv,
+                    output,
+                    lse,
+                    bias,
+                    indices,
+                    lengths,
+                    ctx.scale,
+                    requested=torch.are_deterministic_algorithms_enabled(),
+                )
+                if getattr(ctx, 'attention_deterministic_backward', True)
+                else {'deterministic': False}
+            ),
+        )
+        return _sparse_gradients(
+            ctx,
+            result["dq"][:, :heads],
+            result["dkv"].to(kv.dtype),
+            result["d_sink"][:heads].to(sink.dtype),
+        )
+
+
+class _InverseRoPE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, positions, cache, groups):
+        if not x.is_cuda:
+            raise RuntimeError("Deployment inverse RoPE requires CUDA")
+        from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+            fused_inv_rope_fp8_quant,
+        )
+
+        ctx.save_for_backward(positions, cache)
+        ctx.shape = x.shape
+        out, _ = fused_inv_rope_fp8_quant(
+            x,
+            positions,
+            cache,
+            n_groups=groups,
+            heads_per_group=x.shape[1] // groups,
+            nope_dim=x.shape[-1] - cache.shape[-1],
+            rope_dim=cache.shape[-1],
+            quant_group_size=128,
+            tma_aligned_scales=True,
+            quantize=False,
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        positions, cache = ctx.saved_tensors
+        return _rotate(grad.reshape(ctx.shape), positions, cache), None, None, None
+
+
+def inverse_rope_bf16(x, positions, cache, groups):
+    """LoRA input: native BF16 inverse-RoPE before the base path FP8 quantizer."""
+    return _InverseRoPE.apply(x, positions, cache, groups)
+
+
+class _FP8OutputProjection(torch.autograd.Function):
+    """Native inverse-RoPE/FP8 einsum, with the decoded-operand STE adjoint."""
+
+    @staticmethod
+    def forward(ctx, x, weight, positions, cache, groups):
+        if not x.is_cuda or not weight.is_cuda:
+            raise RuntimeError("Deployment FP8 wo_a requires CUDA")
+        from types import SimpleNamespace
+
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+        )
+        from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+            fused_inv_rope_fp8_quant,
+        )
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import _compile_einsum_configs
+        from vllm.utils.deep_gemm import fp8_einsum
+
+        from megatron.lite.model.deepseek_v41.lite.export import to_release
+
+        heads, dim = x.shape[-2:]
+        inner = heads * dim // groups
+        rank = weight.numel() // (groups * inner)
+        ctx.shape, ctx.weight_shape, ctx.weight_dtype = (x.shape, weight.shape, weight.dtype)
+        ctx.like = weight
+        if x.shape[0] == 0:
+            ctx.save_for_backward(
+                x.new_empty((0, groups, inner)),
+                weight.reshape(groups, rank, inner),
+                positions,
+                cache,
+            )
+            return x.new_empty((0, groups, rank))
+        encoded, scale = fused_inv_rope_fp8_quant(
+            x,
+            positions,
+            cache,
+            n_groups=groups,
+            heads_per_group=heads // groups,
+            nope_dim=dim - cache.shape[-1],
+            rope_dim=cache.shape[-1],
+            quant_group_size=32,
+            tma_aligned_scales=True,
+            quantize=True,
+        )
+        # Exactly the serialization used for live publication, including its
+        # canonicalization. Do not independently requantize each output row.
+        tensors = dict(
+            to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
+        )
+        codes, descale = (tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"])
+        saved_codes, saved_scale = codes.clone(), descale.clone()
+        codes, native_scale = deepgemm_post_process_fp8_weight_block(
+            codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
+        )
+        _compile_einsum_configs(
+            x.shape[0],
+            SimpleNamespace(weight=codes),
+            native_scale,
+            cache,
+            n_groups=groups,
+            heads_per_group=heads // groups,
+            nope_dim=dim - cache.shape[-1],
+            rope_dim=cache.shape[-1],
+            o_lora_rank=rank,
+            einsum_recipe=(1, 1, 32),
+            tma_aligned_scales=True,
+        )
+        result = x.new_empty((x.shape[0], groups, rank))
+        fp8_einsum(
+            "bhr,hdr->bhd", (encoded, scale), (codes, native_scale), result, recipe=(1, 1, 32)
+        )
+        ctx.compact, ctx.input_dtype = True, x.dtype
+        ctx.save_for_backward(encoded, scale, saved_codes, saved_scale, positions, cache)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad):
+        if getattr(ctx, 'compact', False):
+            from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+
+            encoded, scale, codes, sf, positions, cache = ctx.saved_tensors
+            groups, rank = grad.shape[-2:]
+            inner = codes.shape[-1]
+            # FP8 code times a power of two is exact in BF16: decode all groups at once.
+            dtype = torch.bfloat16 if ctx.input_dtype == torch.bfloat16 else torch.float32
+            rows = encoded.shape[0]
+            raw = scale.contiguous().view(torch.uint8).reshape(rows, groups, -1)[..., : inner // 32]
+            sf_rows = (raw.to(torch.int32) << 23).view(torch.float32).to(dtype)
+            activation = (
+                (encoded.to(dtype).reshape(rows, groups, -1, 32) * sf_rows.unsqueeze(-1))
+                .reshape(rows, groups, inner)
+                .to(ctx.input_dtype)
+            )
+            weight = (
+                dequantize_block_fp8(codes, sf, (32, 32))
+                .reshape(groups, rank, inner)
+                .to(ctx.input_dtype)
+            )
+        else:
+            activation, weight, positions, cache = ctx.saved_tensors
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            g = grad.permute(1, 0, 2).bfloat16()
+            a = activation.permute(1, 0, 2).bfloat16()
+            w = weight.bfloat16()
+
+            def bmm(left, right):
+                return (
+                    torch.bmm(left, right, out_dtype=torch.float32)
+                    if left.is_cuda
+                    else torch.bmm(left.float(), right.float())
+                )
+
+            dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
+            dw = bmm(g.transpose(1, 2), a).reshape(ctx.weight_shape)
+        like = getattr(ctx, 'like', None)
+        from .linear import accumulate_wgrad
+
+        return (
+            _rotate(dx.reshape(ctx.shape), positions, cache),
+            dw.to(ctx.weight_dtype) if like is None else accumulate_wgrad((like,), dw, like),
+            None,
+            None,
+            None,
+        )
+
+
+def _projections(attention, x, row_perm=None):
+    raw = linear(
+        x, (attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight), fp8=True
+    )
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+
+    qr, kv, codes, scales = _QueryInputs.apply(
+        raw,
+        attention.q_layernorm.weight,
+        attention.kv_layernorm.weight,
+        attention.config.layernorm_epsilon,
+    )
+    qa = QuantizedActivation(codes, scales, qr.dtype, qr.shape, kMxfp8Dynamic)
+    q = linear(
+        qr, (attention.linear_q_up_proj.weight,), fp8=True, activation=qa, row_perm=row_perm
+    ).bfloat16()
+    q = q.reshape(-1, attention.num_attention_heads_per_partition, attention.q_head_dim)
+    from .linear import _row_scales
+
+    return raw, qr, kv, q, qa, _row_scales(qa.scale, *qr.shape)
+
+
+class _PagedSparse(_Sparse):
+    """Forward is ``attend()``, the serving paged path; backward is :class:`_Sparse`'s
+    on the gathered KV and indices (no bitwise requirement)."""
+
+    @staticmethod
+    def forward(ctx, q, kv, sink, indices, lengths, scale, attend, deterministic_backward=True):
+        ctx.attention_deterministic_backward = deterministic_backward
+        ctx.sparse_inputs = len(ctx.needs_input_grad) - 1
+        ctx.save_for_backward(q, kv, sink, indices)
+        ctx.scale = scale
+        return attend()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return (*_Sparse.backward(ctx, grad), None)
+
+
+def inference_path():
+    """The BI attention path the installed vLLM serves FLASHMLA_SPARSE_DSV41 with:
+    ``paged`` (vllm#62365: every causal row on FlashMLA's unsplit sparse decode kernel
+    over the quantized caches) or ``gather`` (dequantize-and-gather, then the sparse
+    prefill kernel)."""
+    from vllm.model_executor.kernels import batch_invariant
+
+    return 'paged' if hasattr(batch_invariant, 'sparse_paged_indices') else 'gather'
+
+
+def _paged_plan(layout, ratio, device):
+    """Each document as a vLLM request whose SWA and compressed caches start on a
+    64-row block: block tables, and each record's slot there (records are in THD row /
+    document-compressed-row order as written above)."""
+    key = ('paged', ratio)
+    if key not in layout.remap:
+        from types import SimpleNamespace
+
+        lengths = layout.lengths
+        counts = [n // ratio if ratio else 0 for n in lengths]
+        swa_blocks = [-(-n // 64) for n in lengths]
+        comp_blocks = [-(-c // 64) for c in counts]
+        swa_first = [sum(swa_blocks[:d]) for d in range(len(lengths))]
+        comp_first = [sum(comp_blocks[:d]) for d in range(len(lengths))]
+        swa_table = torch.zeros(len(lengths), max(swa_blocks, default=1), dtype=torch.int32)
+        comp_table = torch.zeros(
+            len(lengths), max(max(comp_blocks, default=1), 1), dtype=torch.int32
+        )
+        for d, (b, c) in enumerate(zip(swa_blocks, comp_blocks)):
+            swa_table[d, :b] = swa_first[d] + torch.arange(b)
+            comp_table[d, :c] = comp_first[d] + torch.arange(c)
+        swa_slots = torch.cat([swa_first[d] * 64 + torch.arange(n) for d, n in enumerate(lengths)])
+        comp_slots = torch.cat(
+            [torch.zeros(0, dtype=torch.int64)]
+            + [comp_first[d] * 64 + torch.arange(c) for d, c in enumerate(counts)]
+        )
+        token_to_req = torch.cat(
+            [torch.full((n,), d, dtype=torch.int32) for d, n in enumerate(lengths)]
+        )
+        layout.remap[key] = SimpleNamespace(
+            swa_blocks=max(sum(swa_blocks), 1),
+            comp_blocks=max(sum(comp_blocks), 1),
+            swa_table=swa_table.to(device),
+            comp_table=comp_table.to(device),
+            swa_slots=swa_slots.to(device),
+            comp_slots=comp_slots.to(device),
+            comp_rows=sum(counts),
+            token_to_req=token_to_req[layout.offset : layout.offset + layout.local_rows].to(device),
+            is_valid=torch.ones(layout.local_rows, dtype=torch.bool, device=device),
+            replay_start=torch.zeros(len(lengths), dtype=torch.int32, device=device),
+        )
+    return layout.remap[key]
+
+
+def _paged_attention(q, swa_records, comp_records, topk, ratio, sink, scale, layout, window):
+    """vllm#62365's BI attention (``DeepseekV4FlashMLAAttention._forward_bi``):
+    ``sparse_paged_indices`` and the unsplit ``flash_mla_with_kvcache`` on the
+    quantized caches. The records are the ones written above, moved to block-aligned
+    per-document pages (the kernels read records by slot, so moving them keeps bits)."""
+    from vllm.model_executor.kernels.batch_invariant import sparse_paged_indices
+    from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, flash_mla_with_kvcache
+
+    rows, heads = q.shape[:2]
+    device = q.device
+    plan = _paged_plan(layout, ratio, device)
+    swa = torch.zeros((plan.swa_blocks, 64, 528), dtype=torch.uint8, device=device)
+    swa.view(-1, 528)[plan.swa_slots] = swa_records.view(-1, 528)[: layout.total]
+    extra = None
+    if ratio:
+        extra = torch.zeros((plan.comp_blocks, 64, 288), dtype=torch.uint8, device=device)
+        extra.view(-1, 288)[plan.comp_slots] = comp_records.view(-1, 288)[: plan.comp_rows]
+    top_k = topk.shape[1] if ratio else 0
+    indices = torch.empty((rows, window + top_k), dtype=torch.int32, device=device)
+    swa_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    extra_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    sparse_paged_indices(
+        topk if ratio else None,
+        plan.token_to_req,
+        plan.is_valid,
+        layout.query_cu,
+        layout.query_seq,
+        plan.replay_start,
+        plan.comp_table if ratio else None,
+        64,
+        plan.swa_table,
+        64,
+        0,
+        rows,
+        window,
+        ratio,
+        top_k,
+        indices[:, :window],
+        swa_lens,
+        indices[:, window:] if ratio else None,
+        extra_lens if ratio else None,
+    )
+    padded = 64 if heads <= 64 else 128
+    query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
+    bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
+    out = torch.empty_like(query)
+    for start in range(0, rows, 65535):  # one CTA per row along grid.y
+        end = min(start + 65535, rows)
+        flash_mla_with_kvcache(
+            q=query[start:end].unsqueeze(1),
+            k_cache=swa.unsqueeze(-2),
+            block_table=None,
+            head_dim_v=q.shape[-1],
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            cache_seqlens=None,
+            is_fp8_kvcache=True,
+            indices=indices[start:end, :window].unsqueeze(1),
+            topk_length=swa_lens[start:end],
+            softmax_scale=scale,
+            attn_sink=bias,
+            extra_k_cache=extra.unsqueeze(-2) if ratio else None,
+            extra_indices_in_kvcache=indices[start:end, window:].unsqueeze(1) if ratio else None,
+            extra_topk_length=extra_lens[start:end] if ratio else None,
+            out=out[start:end].unsqueeze(1),
+            enable_batch_invariant=True,
+        )
+    return out[:, :heads]
+
+
+def _projection_rows(projected, lo, hi):
+    from dataclasses import replace
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import swizzle_mxfp8_scale
+
+    raw, qr, kv, q, qa, scales = projected
+    sliced = replace(
+        qa,
+        data=qa.data[lo:hi],
+        scale=swizzle_mxfp8_scale(scales[lo:hi].contiguous(), hi - lo, qr.shape[-1]),
+        orig_shape=qr[lo:hi].shape,
+    )
+    return raw[lo:hi], qr[lo:hi], kv[lo:hi], q[lo:hi], sliced
+
+
+def _documents(documents, device, *, local_rows=None, rank=0, world=1):
+    """Vectorized request metadata; CPU planning once per packed batch, no doc loop."""
+    from types import SimpleNamespace
+
+    values = torch.as_tensor(documents, dtype=torch.int64, device='cpu')
+    cu = values if values.ndim == 1 else torch.cat((values[:, 0], values[-1:, 1]))
+    lengths = cu[1:] - cu[:-1]
+    total = int(cu[-1])
+    if (
+        cu[0] != 0
+        or (lengths < 0).any()
+        or (local_rows is not None and total != local_rows * world)
+    ):
+        raise ValueError('Contiguous CP document tiling must cover all physical rows exactly')
+    local_rows = total if local_rows is None else local_rows
+    offset = rank * local_rows
+    owner = torch.repeat_interleave(torch.arange(len(lengths)), lengths, output_size=total)
+    positions = torch.arange(total) - cu[owner]
+    lo, hi = cu[:-1].clamp_min(offset), cu[1:].clamp_max(offset + local_rows)
+    queries = (hi - lo).clamp_min(0)
+    prefix = (cu[1:].clamp_max(offset + local_rows) - cu[:-1]).clamp_min(0)
+    return SimpleNamespace(
+        documents=torch.stack((cu[:-1], cu[1:]), 1),
+        lengths=lengths.tolist(),
+        host_cu=cu,
+        positions=positions[offset : offset + local_rows].to(device),
+        global_positions=positions,
+        requests=owner,
+        cu=cu.to(device=device, dtype=torch.int32),
+        query_cu=torch.cat((cu.new_zeros(1), queries.cumsum(0))).to(
+            device=device, dtype=torch.int32
+        ),
+        seq=lengths.to(device=device, dtype=torch.int32),
+        query_seq=prefix.to(device=device, dtype=torch.int32),
+        max_length=int(lengths.max()) if lengths.numel() else 0,
+        offset=offset,
+        total=total,
+        local_rows=local_rows,
+        remap={},
+        compression={},
+        cp_group=None,
+    )
+
+
+def _remap(layout, ratio, width, total, device):
+    if ratio not in layout.remap:
+        lengths = layout.host_cu[1:] - layout.host_cu[:-1]
+        counts = lengths // ratio if ratio else torch.zeros_like(lengths)
+        first = torch.cat((counts.new_zeros(1), counts.cumsum(0)))[:-1].to(device)
+        starts = layout.host_cu[:-1].to(device)
+        stride = width + layout.max_length
+        v = torch.arange(len(counts) * stride, device=device)
+        request, row = v // stride, v % stride
+        compressed = first[request] + row
+        swa = total + starts[request] + row - width
+        layout.remap[ratio] = stride, torch.where(row < width, compressed, swa).int()
+    return layout.remap[ratio]
+
+
+def swa_forward(
+    attention,
+    hidden,
+    positions,
+    rope_cache,
+    *,
+    observe=None,
+    source=None,
+    projected=None,
+    layout=None,
+    project=True,
+):
+    """All packed documents in one pass: every op is row-wise or per request, so each
+    document's rows carry the bits of a single-document call."""
+    emit = observe or (lambda name, value: None)
+    x = hidden.reshape(-1, hidden.shape[-1])
+    raw, qr, kv, q, qa = (_projections(attention, x) if projected is None else projected)[:5]
+    for name, value in (
+        ('qkv_projection', raw),
+        ('q_norm', qr),
+        ('kv_norm', kv),
+        ('q_projection', q),
+    ):
+        emit(name, value)
+    q, kv, swa_records = _SWAInsert.apply(
+        q, kv, positions, rope_cache, attention.config.layernorm_epsilon
+    )
+    emit('q_rope', q)
+    emit('kv_cache_decoded', kv)
+    from vllm.models.deepseek_v41.common.ops import combine_topk_swa_indices
+
+    rows = x.shape[0]
+    if layout is None:
+        layout = _documents([(0, rows)], x.device)
+    from .parallel import gather_rows
+
+    kv = gather_rows(kv, layout.cp_group)
+    if inference_path() == 'paged':
+        swa_records = gather_rows(swa_records.view(-1, 528)[:rows], layout.cp_group)
+    ratio, width, total, comp_records = 0, 0, 0, None
+    topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
+    if source is not None:
+        compressed, topk, ratio, comp_records = source(x, qr, qa)
+        width = layout.max_length // ratio
+        total = compressed.shape[0]
+        kv = torch.cat((compressed, kv), 0)
+    stride, table = _remap(layout, ratio, width, total, x.device)
+    indices, lens = combine_topk_swa_indices(
+        topk,
+        layout.query_cu,
+        layout.query_seq,
+        layout.query_seq,
+        attention.config.csa_window_size,
+        ratio,
+        topk.shape[1],
+        stride,
+        width,
+    )
+    indices = torch.where(indices >= 0, table[indices.clamp_min(0).long()], indices)
+    emit('swa_indices', indices)
+    sink = attention.core_attention.native.attn_sink
+    scale = attention.q_head_dim**-0.5
+    if inference_path() == 'paged':
+
+        def attend():
+            return _paged_attention(
+                q.detach(),
+                swa_records,
+                comp_records,
+                topk,
+                ratio,
+                sink.detach(),
+                scale,
+                layout,
+                attention.config.csa_window_size,
+            )
+
+        out = _PagedSparse.apply(
+            q,
+            kv,
+            sink,
+            indices,
+            lens,
+            scale,
+            attend,
+            getattr(attention, 'attention_deterministic_backward', True),
+        )
+    else:
+        out = _Sparse.apply(
+            q,
+            kv,
+            sink,
+            indices,
+            lens,
+            scale,
+            getattr(attention, 'attention_deterministic_backward', True),
+        )
+    emit('core_attn', out)
+    if not project:
+        return out
+    return output_projection(attention, out, positions, rope_cache, emit).reshape_as(hidden)
+
+
+def output_projection(attention, out, positions, rope_cache, emit=None):
+    """wo_a/wo_b over all THD rows at once: both are row-wise, so batching documents
+    keeps every output row's bits and encodes each weight once per layer call."""
+    emit = emit or (lambda name, value: None)
+    weight = attention.linear_o_group_proj
+    groups = attention.config.o_groups
+    z = _FP8OutputProjection.apply(out, weight, positions, rope_cache, groups)
+    emit('wo_a', z)
+    result = linear(z.flatten(1), (attention.linear_proj.weight,), fp8=True).bfloat16()
+    emit('wo_b', result)
+    return result
+
+
+@functools.lru_cache(maxsize=None)
+def _fused_permutations(heads, dim, groups, device):
+    from vllm.models.deepseek_v41.common.ops.fused_layout import (
+        o_fused_permutation,
+        q_fused_permutation,
+    )
+
+    q = q_fused_permutation(heads, dim).to(device)
+    o = o_fused_permutation(groups, dim).to(device)
+    blocks = o.view(-1, 32)
+    if (blocks - blocks[:, :1] != torch.arange(32, device=device)).any() or (
+        blocks[:, 0] % 32
+    ).any():
+        raise ValueError("The fused output layout must move whole 32-column blocks")
+    return q, o
+
+
+def fused_permutations(attention, device):
+    """``wq_b`` output rows (vLLM's load-time row gather) and ``wo_a`` input columns
+    (32-wide blocks move whole, so block-FP8 codes and scales permute with them) in the
+    mega kernel's fused query/output layouts."""
+    return _fused_permutations(
+        attention.num_attention_heads_per_partition,
+        attention.q_head_dim,
+        attention.config.o_groups,
+        torch.device(device),
+    )
+
+
+class _MegaWoA(torch.autograd.Function):
+    """``wo_a`` on the mega core's FP8 output: vLLM's ``fp8_einsum('bhr,hdr->bhd')`` over
+    the release-encoded weight with columns in the fused output layout. Backward: the
+    output FP8 cast is an identity STE into the core's gradient carrier; BF16 tensor-core
+    products with FP32 accumulation, all groups in one batched call."""
+
+    @staticmethod
+    def forward(ctx, data, scale, carrier, weight, groups, perm):
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+        )
+        from vllm.utils.deep_gemm import fp8_einsum
+
+        from megatron.lite.model.deepseek_v41.lite.export import to_release
+
+        width = weight.shape[-1]
+        rank = weight.numel() // (groups * width)
+        # The release serialization (as published to vLLM), then vLLM's column gather.
+        tensors = dict(to_release("layers.0.attn.wo_a.weight", weight.reshape(-1, width)))
+        codes = tensors["layers.0.attn.wo_a.weight"].view(torch.uint8)[:, perm]
+        blocks = tensors["layers.0.attn.wo_a.scale"].view(torch.uint8)[:, perm[::32] // 32]
+        codes = codes.contiguous().view(torch.float8_e4m3fn)
+        blocks = blocks.contiguous().view(torch.float8_e8m0fnu)
+        rows = (blocks.view(torch.uint8).repeat_interleave(32, 0).to(torch.int32) << 23).view(
+            torch.float32
+        )
+        wq, ws = deepgemm_post_process_fp8_weight_block(
+            wq=codes,
+            ws=rows,
+            quant_block_shape=(1, 32),
+            use_e8m0=False,
+            is_bmm=True,
+            bmm_batch_size=groups,
+        )
+        z = torch.empty((data.shape[0], groups, rank), dtype=torch.bfloat16, device=data.device)
+        if data.shape[0]:
+            fp8_einsum(
+                "bhr,hdr->bhd",
+                (data[:, :groups], scale[:, :groups]),
+                (wq, ws),
+                z,
+                recipe=(1, 1, 32),
+            )
+        ctx.save_for_backward(data, scale, codes, blocks, perm)
+        ctx.weight, ctx.groups = weight, groups
+        return z
+
+    @staticmethod
+    def backward(ctx, grad):
+        from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+
+        from .linear import accumulate_wgrad
+        from .mega_attention import dequantize_output
+
+        data, scale, codes, blocks, perm = ctx.saved_tensors
+        decoded = dequantize_block_fp8(codes, blocks, (32, 32)).to(torch.bfloat16)
+        groups, width = ctx.groups, decoded.shape[-1]
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            o = dequantize_output(data, scale).bfloat16().transpose(0, 1)  # [g, T, r]
+            w = decoded.view(groups, -1, width)  # [g, d, r]
+            g = grad.bfloat16().transpose(0, 1)  # [g, T, d]
+            d_o = torch.bmm(g, w).transpose(0, 1)
+            if g.is_cuda:
+                dw_fused = torch.bmm(g.transpose(1, 2), o, out_dtype=torch.float32)
+            else:  # CPU derivative references: the same rounded operands in FP32
+                dw_fused = torch.bmm(g.transpose(1, 2).float(), o.float())
+            dw_fused = dw_fused.reshape(-1, width)
+            dw = torch.empty_like(dw_fused)
+            dw[:, perm] = dw_fused
+        weight = ctx.weight
+        dw = accumulate_wgrad((weight,), dw.reshape(weight.shape), weight)
+        return None, None, d_o, dw, None, None
+
+
+def _local_boundaries(layout, ratio):
+    """This rank's contiguous range of the globally ordered group-boundary rows
+    (``(position + 1) % ratio == 0``); host-only, once per packed batch and ratio."""
+    key = ('mega_boundaries', ratio)
+    if key not in layout.remap:
+        flag = ((layout.global_positions + 1) % ratio == 0).long().cumsum(0)
+        before = int(flag[layout.offset - 1]) if layout.offset else 0
+        layout.remap[key] = before, int(flag[layout.offset + layout.local_rows - 1])
+    return layout.remap[key]
+
+
+def mega_forward(attention, hidden, layout, cu_seqlens, source):
+    """``attention_core=mega``: vLLM's ``FLASHMLA_MEGA_ATTN_DSV41`` prefill.
+
+    Same projections, compressor and indexer as the FlashMLA core; ``wq_b`` rows and
+    ``wo_a`` columns use the kernel's fused layouts. The core inserts and quantizes the
+    SWA KV and the compressed latent itself (:mod:`.mega_attention`). Under context
+    parallelism the core gathers SWA KV and latents across the contiguous equal row
+    slices; it takes this rank's queries and boundary-row latents."""
+    from .mega_attention import mega_attention
+
+    x = hidden.reshape(-1, hidden.shape[-1])
+    q_perm, o_perm = fused_permutations(attention, x.device)
+    _, qr, kv, q, qa = _projections(attention, x, row_perm=q_perm)[:5]
+    ratio = attention._dsv4_compress_ratio
+    latent = topk = None
+    if ratio:
+        _, topk, _, latent = source(x, qr, qa)  # boundary rows of every rank
+        if layout.cp_group is not None:
+            lo, hi = _local_boundaries(layout, ratio)
+            latent = latent[lo:hi]
+    out = mega_attention(
+        q,
+        kv,
+        latent,
+        topk,
+        layout.positions,
+        attention.core_attention.native.attn_sink,
+        compress_ratio=ratio,
+        cos_sin_cache=attention._deployment_rope,
+        window=attention.config.csa_window_size,
+        top_k=attention.release.index_topk,
+        cu_seqlens=cu_seqlens,
+        cp_group=layout.cp_group,
+        deterministic=bool(getattr(attention.config, 'deterministic_mode', False)),
+    )
+    z = _MegaWoA.apply(
+        out.data,
+        out.scale,
+        out.grad,
+        attention.linear_o_group_proj,
+        attention.config.o_groups,
+        o_perm,
+    )
+    result = linear(z.flatten(1), (attention.linear_proj.weight,), fp8=True).bfloat16()
+    return result.reshape_as(hidden)
+
+
+def build_attention(config, index, context):
+    """Reuse the native allocation/spec and replace only the attention forward."""
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttentionSubmodules,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.lite.model.deepseek_v41.lite.components.assembly import ModelNorm
+    from megatron.lite.model.deepseek_v41.lite.model import CoreAttentionSources
+
+    attention = SWAAttention(
+        config,
+        DSv4HybridSelfAttentionSubmodules(
+            q_layernorm=ModelNorm,
+            kv_layernorm=ModelNorm,
+            linear_q_down_proj=TELinear,
+            linear_q_up_proj=TEColumnParallelLinear,
+            linear_kv_proj=TEColumnParallelLinear,
+            core_attention=ModuleSpec(CoreAttentionSources, params={'context': context}),
+            linear_proj=TERowParallelLinear,
+        ),
+        index + 1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=context.groups,
+        compress_ratio=config.csa_compress_ratios[index],
+    )
+    attention.release = context.release
+    return attention
+
+
+from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
+
+
+class SWAAttention(DS41SelfAttention):
+    def forward(self, hidden_states, attention_mask=None, *, packed_seq_params=None, **kwargs):
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            raise ValueError('Deployment SWA requires native packed THD metadata')
+        if not hasattr(self, '_deployment_rope'):
+            from types import SimpleNamespace
+
+            from vllm.config import VllmConfig, set_current_vllm_config
+            from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+
+            r = self.release
+            hf = SimpleNamespace(
+                rope_theta=r.rope_theta,
+                compress_rope_theta=r.compress_rope_theta,
+                rope_parameters={
+                    'rope_type': 'yarn',
+                    'factor': r.rotary_scaling_factor,
+                    'original_max_position_embeddings': r.original_max_position_embeddings,
+                    'beta_fast': r.beta_fast,
+                    'beta_slow': r.beta_slow,
+                },
+            )
+            with set_current_vllm_config(VllmConfig()), torch.device(hidden_states.device):
+                self._deployment_rope = build_deepseek_v4_rope(
+                    hf,
+                    head_dim=r.head_dim,
+                    rope_head_dim=r.qk_rope_head_dim,
+                    max_position_embeddings=r.max_position_embeddings,
+                    compress_ratio=self._dsv4_compress_ratio,
+                ).cos_sin_cache
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        cached = getattr(packed_seq_params, '_deployment_documents', None)
+        if cached is None or cached[0] is not cu or cached[1] != cu._version:
+            group = self.pg_collection.cp
+            world = group.size()
+            documents = _documents(
+                cu.cpu(),
+                cu.device,
+                local_rows=hidden_states.shape[0],
+                rank=group.rank() if world > 1 else 0,
+                world=world,
+            )
+            documents.cp_group = group if world > 1 else None
+            cached = (cu, cu._version, documents)
+            packed_seq_params._deployment_documents = cached
+        if hidden_states.shape[0] == 0:
+            return hidden_states * 0, None
+        layout = cached[2]
+        if layout.max_length > self._deployment_rope.shape[0]:
+            raise ValueError(
+                f"Document length {layout.max_length} exceeds RoPE cache capacity {self._deployment_rope.shape[0]}"
+            )
+
+        def sources(x, qr, qa):
+            from .compressed import source
+
+            decoded, topk, records, _ = source(self, x, qr, qa, self._deployment_rope, layout, None)
+            return decoded, topk, self._dsv4_compress_ratio, records
+
+        if getattr(self, 'attention_core', 'flashmla') == 'mega':
+            from .compressed import source
+
+            def boundary_sources(x, qr, qa):
+                return source(self, x, qr, qa, self._deployment_rope, layout, None)
+
+            return mega_forward(self, hidden_states, layout, layout.host_cu, boundary_sources), None
+
+        out = swa_forward(
+            self,
+            hidden_states,
+            layout.positions,
+            self._deployment_rope,
+            source=sources if self._dsv4_compress_ratio else None,
+            projected=_projections(self, hidden_states.reshape(-1, hidden_states.shape[-1])),
+            layout=layout,
+        )
+        return out, None

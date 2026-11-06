@@ -67,6 +67,8 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+    chunked_state_offload: bool | None = None
+    state_offload_chunk_size_mb: int | None = None
 
 
 @dataclass

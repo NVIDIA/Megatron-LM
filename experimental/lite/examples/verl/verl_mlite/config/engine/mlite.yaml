@@ -5,6 +5,9 @@ custom_backend_module: verl_mlite.engine.mlite_engine
 param_offload: false
 optimizer_offload: false
 grad_offload: false
+# Post-microbatch allocator reclamation is opt-in; threshold reads driver free bytes.
+post_backward_cache_policy: "off"
+post_backward_cache_free_gib: 4.0
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +36,9 @@ class MegatronLiteEngineConfig(EngineConfig):
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
     router_replay_mode: str = "disabled"
+    post_backward_cache_policy: str = "off"
+    post_backward_cache_free_gib: float = 4.0
+    grad_offload: bool = False
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -44,16 +48,19 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
             )
+        if self.post_backward_cache_policy not in ("off", "threshold", "always"):
+            raise ValueError("post_backward_cache_policy must be off, threshold or always")
+        if (
+            not math.isfinite(self.post_backward_cache_free_gib)
+            or self.post_backward_cache_free_gib < 0
+        ):
+            raise ValueError("post_backward_cache_free_gib must be finite and nonnegative")
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
         if self.resync_format is not None:
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
-            object.__setattr__(
-                self,
-                "resync_format",
-                ResyncFormat.parse(self.resync_format).value,
-            )
+            object.__setattr__(self, "resync_format", ResyncFormat.parse(self.resync_format).value)
         if not isinstance(self.resync_config, Mapping):
             raise TypeError("resync_config must be a mapping")
         object.__setattr__(self, "resync_config", dict(self.resync_config))
@@ -63,9 +70,7 @@ class MegatronLiteEngineConfig(EngineConfig):
         if self.resync_config and self.resync_format is None:
             raise ValueError("resync_config requires resync_format")
         if self.qat.get("enable", False) and self.resync_format is not None:
-            raise ValueError(
-                "qat online export and native resync_format are mutually exclusive"
-            )
+            raise ValueError("qat online export and native resync_format are mutually exclusive")
         if self.router_replay_mode not in ("disabled", "R3"):
             raise ValueError(
                 "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "
