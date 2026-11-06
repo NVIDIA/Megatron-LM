@@ -321,6 +321,12 @@ class BaseTransformerLayer(ABC):
     #: Whether the layer accepts mHC n-stream hidden states ([s, b, n*C])
     #: when owned directly by a TransformerBlock. Custom layer implementations
     #: that implement this contract should override the marker with ``True``.
+    #: While mHC selective recompute is active, TransformerBlock calls every layer
+    #: with a ``residual_stream_recompute_context`` keyword argument
+    #: (``ResidualStreamRecomputeContext``) and finalizes each replay block after its
+    #: last layer. This replaces the ``mhc_recompute_manager`` keyword and the manager's
+    #: ``is_last_layer_in_recompute_block`` flag. The context holds a live checkpoint
+    #: manager, so keep it out of CUDA-graph kwargs.
     supports_mhc_connections: bool = False
 
     #: Whether the layer owns wide-residual branch connections.

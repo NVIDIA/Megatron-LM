@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import torch
@@ -36,6 +37,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
     Replay uses the shared residual-stream recompute contract, accepting
     ``ResidualStreamRecomputeContext`` via ``residual_stream_recompute_context``.
+    The deprecated ``mhc_recompute_manager`` keyword is still converted to a context.
 
     Cross-attention hyper connection is not supported.
     """
@@ -144,7 +146,27 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # Remove the context from kwargs because CUDA graphs cannot accept its live manager.
         # Store it on the layer for the residual hooks; when omitted, store None to avoid
         # reusing the previous call's replay state.
-        self._mhc_recompute_context = kwargs.pop("residual_stream_recompute_context", None)
+        context = kwargs.pop("residual_stream_recompute_context", None)
+        legacy_manager = kwargs.pop("mhc_recompute_manager", None)
+        if legacy_manager is not None:
+            # Deprecated entry point: snapshot the manager's mutable block-end flag.
+            if context is not None:
+                raise ValueError(
+                    "Pass residual_stream_recompute_context or the deprecated "
+                    "mhc_recompute_manager, not both."
+                )
+            warnings.warn(
+                "HyperConnectionTransformerLayer's mhc_recompute_manager keyword is deprecated "
+                "and will be removed in a future release. Pass "
+                "residual_stream_recompute_context=ResidualStreamRecomputeContext(manager, "
+                "is_block_end) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            context = ResidualStreamRecomputeContext(
+                legacy_manager, is_block_end=legacy_manager.is_last_layer_in_recompute_block
+            )
+        self._mhc_recompute_context = context
         return super().__call__(*args, **kwargs)
 
     def _residual_recompute_context(
