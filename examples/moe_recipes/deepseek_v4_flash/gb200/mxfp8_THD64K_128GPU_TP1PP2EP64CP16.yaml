@@ -14,7 +14,7 @@ DEPENDENCIES:
     # Remove unused base-image packages with incompatible CUTLASS pins.
     python -m pip uninstall -y flash-attn-4 quack-kernels transformer-engine transformer-engine-torch transformer-engine-cu13 transformer-engine-cu12
     python -m pip install --no-cache-dir uv ninja cmake pybind11 wheel packaging pyyaml absl-py einops \
-        omegaconf sentencepiece tiktoken datasets wandb tensorstore pytest pytest-mock 'pydantic<2.14' 'nvidia-cuda-cupti==13.4.92' \
+        omegaconf sentencepiece tiktoken datasets 'transformers==5.19.0' wandb tensorstore pytest pytest-mock 'pydantic<2.14' 'nvidia-cuda-cupti==13.4.92' \
         'nvidia-cudnn-frontend[cutedsl]==1.29.0' 'nvidia-cutlass-dsl[cu13]==4.8.0'
     python -m pip install --no-build-isolation --no-cache-dir \
         git+https://github.com/NVIDIA/TransformerEngine.git@b021980343e33fdd5b091f95fd13f82e05d581af
@@ -39,7 +39,7 @@ DEPENDENCIES:
     import importlib.metadata as m, json
     from pathlib import Path
     versions={}
-    for name in ['torch','transformer-engine','nvidia-cudnn-frontend','emerging-optimizers','mixture-of-kittens','flash-mla']:
+    for name in ['torch','transformer-engine','nvidia-cudnn-frontend','emerging-optimizers','mixture-of-kittens','flash-mla','transformers']:
         versions[name]=m.version(name)
         print(name, versions[name])
     Path('/opt/dsv4-environment.json').write_text(json.dumps(versions,indent=2))
