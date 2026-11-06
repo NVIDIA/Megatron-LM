@@ -1126,27 +1126,27 @@ class TestRegisterUbPoolHook:
                 params, None, 1, ddp_config, list(range(len(params)))
             )
         nccl_pools = iter([object(), object()])
-        pgb = 'megatron.core.distributed.param_and_grad_buffer'
+        pgb = "megatron.core.distributed.param_and_grad_buffer"
         with (
-            mock.patch('torch.cuda.current_device', return_value='cpu'),
+            mock.patch("torch.cuda.current_device", return_value="cpu"),
             mock.patch(
-                'torch.cuda.use_mem_pool', side_effect=lambda pool: contextlib.nullcontext()
+                "torch.cuda.use_mem_pool", side_effect=lambda pool: contextlib.nullcontext()
             ),
-            mock.patch(f'{pgb}.vmm_symm_allocator.create_symm_mem_pool', return_value=object()),
-            mock.patch(f'{pgb}.nccl_allocator.init'),
+            mock.patch(f"{pgb}.vmm_symm_allocator.create_symm_mem_pool", return_value=object()),
+            mock.patch(f"{pgb}.nccl_allocator.init"),
             mock.patch(
-                f'{pgb}.nccl_allocator.create_nccl_mem_pool',
+                f"{pgb}.nccl_allocator.create_nccl_mem_pool",
                 side_effect=lambda **_: next(nccl_pools),
             ),
             mock.patch(
-                f'{pgb}.nccl_allocator.nccl_mem',
+                f"{pgb}.nccl_allocator.nccl_mem",
                 side_effect=lambda *_, **__: contextlib.nullcontext(),
             ),
-            mock.patch.object(_ParamAndGradBuffer, '_register_nccl_mem_pool'),
-            mock.patch('torch.distributed.barrier'),
-            mock.patch('torch.distributed.all_reduce'),
+            mock.patch.object(_ParamAndGradBuffer, "_register_nccl_mem_pool"),
+            mock.patch("torch.distributed.barrier"),
+            mock.patch("torch.distributed.all_reduce"),
             mock.patch(
-                f'{pgb}._param_uses_quantized_storage',
+                f"{pgb}._param_uses_quantized_storage",
                 side_effect=lambda p: any(p is params[i] for i in quantized),
             ),
         ):
@@ -1236,7 +1236,7 @@ def test_ub_pool_hook_reaches_dense_and_expert_buffers(grad_buffer_offload):
         ddp_config,
     )
     with mock.patch(
-        'megatron.core.distributed.param_and_grad_buffer.vmm_symm_allocator.create_symm_mem_pool',
+        "megatron.core.distributed.param_and_grad_buffer.vmm_symm_allocator.create_symm_mem_pool",
         side_effect=torch.cuda.MemPool,
     ):
         ddp_model = DistributedDataParallel(

@@ -1238,7 +1238,7 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         elif self.ddp_config.use_distributed_optimizer and any(
-            getattr(p, 'needs_nccl_mem', False) for p in self.params
+            getattr(p, "needs_nccl_mem", False) for p in self.params
         ):
             # Params opted into symmetric-pool backing of param_data; they register the pool on
             # their own groups (register_ub_pool below), so this branch only allocates.
@@ -1490,7 +1490,7 @@ class _ParamAndGradBuffer:
                                     "storage into DDP param_data."
                                 )
                     # Hand the pool now backing this param to it if it asked; it registers it.
-                    if getattr(param, 'needs_nccl_mem', False):
+                    if getattr(param, "needs_nccl_mem", False):
                         param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
 
             # Grad buffer always uses full-numel offsets from param_index_map.

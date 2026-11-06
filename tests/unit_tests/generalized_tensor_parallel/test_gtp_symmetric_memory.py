@@ -374,6 +374,35 @@ class TestRegisterExternalPool:
         ]
         assert not gtp_symm._registered_ext_pools
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="warmup tensor needs CUDA")
+    def test_failed_registration_is_rolled_back(self, monkeypatch):
+        calls = []
+
+        def register(pool, group):
+            calls.append(("reg", pool, group.group_name))
+            if group.group_name == "b":
+                raise RuntimeError("window registration failed")
+
+        monkeypatch.setattr(gtp_symm.dist, "all_reduce", lambda *args, **kwargs: None)
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "register_mem_pool", register)
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "deregister_mem_pool",
+            lambda pool, group: calls.append(("dereg", pool, group.group_name)),
+        )
+        pool, group_a, group_b = object(), _StubGroup(name="a"), _StubGroup(name="b")
+        try:
+            gtp_symm.register_external_pool(pool, group_a)
+            with pytest.raises(RuntimeError, match="window registration failed"):
+                gtp_symm.register_external_pool(pool, group_b)
+            # Only the failed pair is undone and left unrecorded; the good pair stays registered.
+            assert calls == [("reg", pool, "a"), ("reg", pool, "b"), ("dereg", pool, "b")]
+            assert list(gtp_symm._registered_ext_pools) == [(pool, "a")]
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+        assert calls[-1] == ("dereg", pool, "a")
+        assert not gtp_symm._registered_ext_pools
+
     def test_param_hook_registers_on_its_group(self, monkeypatch):
         seen = []
         monkeypatch.setattr(
