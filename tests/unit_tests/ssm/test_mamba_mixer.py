@@ -165,6 +165,24 @@ class TestMambaMixer:
             fp8_utils.prepare_model_for_fp8_inference(mixer)
         assert not mixer._use_batch_first_ssm(inference_mode=False)
 
+    @pytest.mark.parametrize(
+        "config_overrides",
+        [
+            {"sequence_parallel": True},
+            {"recompute_granularity": "selective", "recompute_modules": ["mhc"]},
+            {"recompute_granularity": "selective", "recompute_modules": ["residual_stream"]},
+        ],
+        ids=["sequence_parallel", "mhc_recompute", "residual_stream_recompute"],
+    )
+    def test_batch_first_ssm_config_fallbacks(self, config_overrides):
+        """Sequence parallel and replay of the mixer input by recompute stay sequence-first."""
+        mixer = self.get_mixer()
+        assert mixer._use_batch_first_ssm(inference_mode=False)
+        # Set after construction: the gate reads them per call, and SP needs TP > 1 to validate.
+        for name, value in config_overrides.items():
+            setattr(mixer.config, name, value)
+        assert not mixer._use_batch_first_ssm(inference_mode=False)
+
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()
 

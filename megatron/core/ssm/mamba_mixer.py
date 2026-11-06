@@ -514,23 +514,29 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         The SSM kernel is batch-first, so this moves the two l<->b transposes from the
         in_proj/SSM outputs to the d_model-wide input and output. Sequence parallel and context
         parallel communicate along the sequence dim, and the FP8 inference padding wrapper pads
-        dim 0 as the sequence, so they keep the sequence-first layout. So does any config where
-        batch-first would copy more (TP shards the in_proj/SSM outputs, not the input and output).
+        dim 0 as the sequence, so they keep the sequence-first layout. So does residual-stream or
+        mHC recompute, which discards the mixer input that in_proj would otherwise save, and any
+        config where batch-first could copy more (TP shards the in_proj/SSM outputs only).
         """
         # Copies per token, forward + backward. Sequence-first: the in_proj output and its grad,
         # and the SSM output (the kernel reads its strided grad in place): 2 * in_proj + d_inner.
         # Batch-first: the input, the output and the out_proj grad, plus the input grad when its
-        # producer makes it contiguous (a separate norm, the wide-residual read): <= 4 * d_model.
+        # producer makes it contiguous (a separate norm, the wide-residual read): <= 4 * d_model
+        # with TE linears. MCore-local linears copy each strided grad twice, on both sides.
         in_proj_width = (
             2 * self.d_inner_local_tp
             + 2 * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp
+        )
+        replays_mixer_input = self.config.recompute_granularity == "selective" and any(
+            module in ("residual_stream", "mhc") for module in self.config.recompute_modules or ()
         )
         return (
             self.use_mem_eff_path
             and not inference_mode
             and self.cp.cp_size == 1
             and not self.config.sequence_parallel
+            and not replays_mixer_input
             and 4 * self.d_model < 2 * in_proj_width + self.d_inner_local_tp
             and not is_wrapped_for_fp8_inference(self.in_proj)
             and not is_wrapped_for_fp8_inference(self.out_proj)
