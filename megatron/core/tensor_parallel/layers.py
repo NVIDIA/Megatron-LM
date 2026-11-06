@@ -874,6 +874,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
 
+        wgrad_chunked = False
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
@@ -926,6 +927,13 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
+        elif ctx.gtp_remat_size > 1 and sharded_weight.wgrad_is_chunked():
+            # Vocabulary-sized weight: GEMM + reduce-scatter in row-block chunks, so no
+            # full-table send buffer exists (see GTPShardedParam._reduce_scatter_chunked).
+            grad_weight = sharded_weight.wgrad_reduce_scatter(
+                sharded_weight.chunked_wgrad(grad_output, total_input, _wgrad_gemm)
+            )
+            wgrad_chunked = True
         elif ctx.gtp_remat_size > 1 and sharded_weight.main_grad.dtype != total_input.dtype:
             # Fusion is off for GTP (main_grad is SHARDED, the GEMM output is not), so the wgrad
             # takes three hops, and get_wgrad_tensor() types it from main_grad:
@@ -957,8 +965,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
-        # GTP: reduce-scatter wgrad
-        if ctx.gtp_remat_size > 1 and grad_weight is not None:
+        # GTP: reduce-scatter wgrad (the chunked path has already done so)
+        if ctx.gtp_remat_size > 1 and grad_weight is not None and not wgrad_chunked:
             grad_weight = sharded_weight.wgrad_reduce_scatter(grad_weight)
 
         if ctx.sequence_parallel:
