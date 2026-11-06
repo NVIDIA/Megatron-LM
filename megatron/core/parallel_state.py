@@ -264,37 +264,6 @@ def update_pg_timeout(
             raise e
 
 
-# Roles of initialize_model_parallel() whose single-rank groups may be shared with any other
-# listed role's single-rank group of the same rank (see _ProcessGroupSharing).
-_SINGLE_RANK_SHAREABLE_ROLES = frozenset(
-    {
-        "gtp_remat",
-        "dp_cp",
-        "intra_dp_cp",
-        "dp",
-        "gtp_remat_dp",
-        "gtp_remat_dp_cp",
-        "cp",
-        "mp",
-        "tp",
-        "pp",
-        "embd",
-        "pos_embd",
-        "tp_dp_cp",
-        "tp_dp",
-        "tp_cp",
-        "expt_gtp_remat",
-        "ep",
-        "ep_tp",
-        "tp_ep_mp",
-        "tp_ep_pp",
-        "tp_ep_gtp_remat_pp",
-        "ep_dp",
-        "ep_gtp_remat_dp",
-        "intra_dist_opt_instance",
-    }
-)
-
 _NO_SHARED_GROUP = object()
 
 
@@ -309,21 +278,25 @@ class _ProcessGroupSharing:
     returns, so independently built grids never share groups.
 
     A request for ``role`` returns an earlier group only if that group was created for a role
-    listed in ``source_roles[role]``, or if both roles are single-rank-shareable and the group has
-    one rank, and if both requests use the same ranks, timeout, ``backend`` argument, NCCL
+    listed in ``source_roles[role]``, or if single-rank sharing is enabled and the group has one
+    rank, and if both requests use the same ranks, timeout, ``backend`` argument, NCCL
     communicator config and ``NCCL_COLLNET_ENABLE`` value. These inputs are identical on every
     rank, so every rank skips the same ``new_group()`` calls and creation order stays matched.
     """
 
-    def __init__(self, source_roles, single_rank_roles, nccl_comm_cfgs) -> None:
+    def __init__(self, source_roles, nccl_comm_cfgs, *, share_single_rank_groups=True) -> None:
         self._source_roles = {role: tuple(sources) for role, sources in source_roles.items()}
-        self._single_rank_roles = frozenset(single_rank_roles)
+        self._share_single_rank_groups = share_single_rank_groups
         self._nccl_comm_cfgs = nccl_comm_cfgs or {}
         self._groups: Dict[tuple, object] = {}
         self._single_rank_groups: Dict[tuple, Tuple[str, object]] = {}
         self.aliases: Dict[str, set[str]] = {}
         self.created = 0
         self.reused = 0
+
+    def get_nccl_options(self, role):
+        """Use the sharing role as the single configuration name for NCCL options."""
+        return get_nccl_options(role, self._nccl_comm_cfgs)
 
     def _key(self, role, ranks, timeout, backend):
         cfg = self._nccl_comm_cfgs.get(role)
@@ -338,7 +311,7 @@ class _ProcessGroupSharing:
             group = self._groups.get((source, key), _NO_SHARED_GROUP)
             if group is not _NO_SHARED_GROUP:
                 return self._reuse(role, source, group)
-        if role in self._single_rank_roles and len(key[0]) == 1:
+        if self._share_single_rank_groups and len(key[0]) == 1:
             source, group = self._single_rank_groups.get(key, (None, _NO_SHARED_GROUP))
             if group is not _NO_SHARED_GROUP:
                 return self._reuse(role, source, group)
@@ -348,7 +321,7 @@ class _ProcessGroupSharing:
         """Record a newly created group (non-members record their non-member handle)."""
         key = self._key(role, ranks, timeout, backend)
         self._groups[(role, key)] = group
-        if role in self._single_rank_roles and len(key[0]) == 1:
+        if self._share_single_rank_groups and len(key[0]) == 1:
             self._single_rank_groups.setdefault(key, (role, group))
         self.created += 1
 
@@ -373,8 +346,8 @@ def create_group(
     pg_options=None,
     use_local_synchronization=False,
     group_desc=None,
-    sharing=None,
-    role=None,
+    sharing: Optional[_ProcessGroupSharing] = None,
+    role: Optional[str] = None,
 ):
     """Creates a ProcessGroup.
 
@@ -382,7 +355,13 @@ def create_group(
     ``_ProcessGroupSharing`` instance as ``sharing`` and the group's role name as ``role``; the
     call then returns an existing group when that role may share it (see
     ``_ProcessGroupSharing``). A shared group keeps the description of the first role.
+    When a registry and role are supplied, NCCL options are derived from that role in the
+    registry; explicit ``pg_options`` cannot be combined with them.
     """
+    if sharing is not None and role is not None:
+        if pg_options is not None:
+            raise ValueError("Pass NCCL options through the sharing registry configuration")
+        pg_options = sharing.get_nccl_options(role)
     shareable = (
         sharing is not None
         and role is not None
@@ -390,6 +369,7 @@ def create_group(
         and not use_local_synchronization
     )
     if shareable:
+        assert sharing is not None
         shared = sharing.lookup(role, ranks, timeout, backend)
         if shared is not _NO_SHARED_GROUP:
             return shared
@@ -419,6 +399,7 @@ def create_group(
     if torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
     if shareable:
+        assert sharing is not None
         sharing.register(role, ranks, group, timeout, backend)
     return group
 
@@ -971,7 +952,9 @@ def initialize_model_parallel(
             and dynamic context-parallel, Gloo and all-gather groups always stay independent.
             This avoids allocating a communicator per duplicate group on backends
             that initialize communicators eagerly. Must be the same on all ranks. Set to False
-            to create one group per role.
+            to create one group per role. Sharing singleton gradient-statistics groups can
+            select the joint grad-norm calculation in ChainedOptimizer. This changes floating-
+            point summation order, so enabled and disabled runs need not be bit-identical.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1165,9 +1148,7 @@ def initialize_model_parallel(
     # Roles that may share a group with an earlier role of this grid; see _ProcessGroupSharing.
     # Each pair also needs identical ranks, timeout, backend, NCCL options and SHARP setting.
     shared_group_sources: Dict[str, Tuple[str, ...]] = {}
-    shared_single_rank_roles: frozenset[str] = frozenset()
     if share_process_groups:
-        shared_single_rank_roles = _SINGLE_RANK_SHAREABLE_ROLES
         # Gradient-norm reductions run after gradient synchronization.
         shared_group_sources["intra_dist_opt_instance"] = ("dp_cp", "tp_dp_cp")
         if context_parallel_size == 1:
@@ -1182,7 +1163,9 @@ def initialize_model_parallel(
             shared_group_sources["ep_dp"] = ("dp_cp",)
         if expert_gtp_remat_size == 1:
             shared_group_sources["tp_ep_gtp_remat_pp"] = ("tp_ep_pp",)
-    sharing = _ProcessGroupSharing(shared_group_sources, shared_single_rank_roles, nccl_comm_cfgs)
+    sharing = _ProcessGroupSharing(
+        shared_group_sources, nccl_comm_cfgs, share_single_rank_groups=share_process_groups
+    )
 
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
@@ -1211,7 +1194,6 @@ def initialize_model_parallel(
         group = create_group(
             gtp_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("gtp_remat", nccl_comm_cfgs),
             group_desc="GTP_WEIGHT_REMAT_GROUP",
             sharing=sharing,
             role="gtp_remat",
@@ -1239,7 +1221,6 @@ def initialize_model_parallel(
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
-            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
             sharing=sharing,
             role="dp_cp",
@@ -1269,7 +1250,6 @@ def initialize_model_parallel(
                 intra_partial_dp_group_with_cp = create_group(
                     intra_partial_dp_ranks_with_cp,
                     timeout=timeout,
-                    pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
                     group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
                     sharing=sharing,
                     role="intra_dp_cp",
@@ -1400,12 +1380,7 @@ def initialize_model_parallel(
 
     for ranks in token_rank_generator.get_ranks("dp"):
         group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("dp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP",
-            sharing=sharing,
-            role="dp",
+            ranks, timeout=timeout, group_desc="DATA_PARALLEL_GROUP", sharing=sharing, role="dp"
         )
         if create_gloo_process_groups:
             group_gloo = create_group(
@@ -1431,7 +1406,6 @@ def initialize_model_parallel(
             group = create_group(
                 dp_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("gtp_remat_dp", nccl_comm_cfgs),
                 group_desc="DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
                 sharing=sharing,
                 role="gtp_remat_dp",
@@ -1443,7 +1417,6 @@ def initialize_model_parallel(
             group = create_group(
                 dp_cp_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("gtp_remat_dp_cp", nccl_comm_cfgs),
                 group_desc="DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
                 sharing=sharing,
                 role="gtp_remat_dp_cp",
@@ -1470,12 +1443,7 @@ def initialize_model_parallel(
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in token_rank_generator.get_ranks("cp"):
         group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("cp", nccl_comm_cfgs),
-            group_desc="CONTEXT_PARALLEL_GROUP",
-            sharing=sharing,
-            role="cp",
+            ranks, timeout=timeout, group_desc="CONTEXT_PARALLEL_GROUP", sharing=sharing, role="cp"
         )
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
@@ -1502,12 +1470,7 @@ def initialize_model_parallel(
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in weight_rank_generator.get_ranks("tp-gtp_remat-pp"):
         group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-            group_desc="MODEL_PARALLEL_GROUP",
-            sharing=sharing,
-            role="mp",
+            ranks, timeout=timeout, group_desc="MODEL_PARALLEL_GROUP", sharing=sharing, role="mp"
         )
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
@@ -1523,7 +1486,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp", nccl_comm_cfgs),
             group_desc="TENSOR_MODEL_PARALLEL_GROUP",
             sharing=sharing,
             role="tp",
@@ -1602,13 +1564,8 @@ def initialize_model_parallel(
             ranks,
             timeout=timeout,
             backend=pipeline_model_parallel_comm_backend,
-            pg_options=(
-                None
-                if pipeline_model_parallel_comm_backend == "ucc"
-                else get_nccl_options("pp", nccl_comm_cfgs)
-            ),
             group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
-            sharing=sharing,
+            sharing=sharing if pipeline_model_parallel_comm_backend != "ucc" else None,
             role="pp",
         )
         assert (
@@ -1632,7 +1589,6 @@ def initialize_model_parallel(
         group = create_group(
             embedding_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("embd", nccl_comm_cfgs),
             group_desc="EMBEDDING_GROUP",
             sharing=sharing,
             role="embd",
@@ -1645,7 +1601,6 @@ def initialize_model_parallel(
         group = create_group(
             position_embedding_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
             group_desc="POSITION_EMBEDDING_GROUP",
             sharing=sharing,
             role="pos_embd",
@@ -1667,7 +1622,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
             group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
             sharing=sharing,
             role="tp_dp_cp",
@@ -1678,7 +1632,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
             group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
             sharing=sharing,
             role="tp_dp",
@@ -1694,7 +1647,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
             group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
             sharing=sharing,
             role="tp_cp",
@@ -1716,7 +1668,6 @@ def initialize_model_parallel(
         group = create_group(
             egtp_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("expt_gtp_remat", nccl_comm_cfgs),
             group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
             sharing=sharing,
             role="expt_gtp_remat",
@@ -1732,7 +1683,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
             group_desc="EXPERT_MODEL_PARALLEL_GROUP",
             sharing=sharing,
             role="ep",
@@ -1750,7 +1700,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
             group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
             sharing=sharing,
             role="ep_tp",
@@ -1767,7 +1716,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
             group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
             sharing=sharing,
             role="tp_ep_mp",
@@ -1784,7 +1732,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
             group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
             sharing=sharing,
             role="tp_ep_pp",
@@ -1802,7 +1749,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_gtp_remat_pp", nccl_comm_cfgs),
             group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
             sharing=sharing,
             role="tp_ep_gtp_remat_pp",
@@ -1842,7 +1788,6 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
             group_desc="EXPERT_DATA_PARALLEL_GROUP",
             sharing=sharing,
             role="ep_dp",
@@ -1908,7 +1853,6 @@ def initialize_model_parallel(
             group = create_group(
                 dp_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("ep_gtp_remat_dp", nccl_comm_cfgs),
                 group_desc="EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
                 sharing=sharing,
                 role="ep_gtp_remat_dp",
@@ -1962,7 +1906,6 @@ def initialize_model_parallel(
         intra_dist_opt_instance_group = create_group(
             all_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
             group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
             sharing=sharing,
             role="intra_dist_opt_instance",
@@ -1979,7 +1922,6 @@ def initialize_model_parallel(
                 intra_dist_opt_instance_group = create_group(
                     intra_dist_opt_ranks,
                     timeout=timeout,
-                    pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
                     group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
                     sharing=sharing,
                     role="intra_dist_opt_instance",

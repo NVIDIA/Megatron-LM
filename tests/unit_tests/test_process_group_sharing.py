@@ -2,14 +2,16 @@
 
 """Tests for the process groups that initialize_model_parallel() lets roles share.
 
-The CPU tests replay initialize_model_parallel() for every rank of a layout with
+These tests replay initialize_model_parallel() for every rank of a layout with
 torch.distributed.new_group() replaced by a recorder, so they can check which roles share a group
-and that every rank issues the same new_group() calls. The GPU test builds the same layouts on a
-real NCCL world and runs a collective on every group.
+and that every rank issues the same new_group() calls. The companion GPU test runs in an
+isolated CI bucket with its own device-bound WORLD.
 """
 
 import os
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -259,7 +261,7 @@ def test_backend_device_map_keeps_sharing(replay, monkeypatch):
 
 def test_different_backend_or_timeout_is_never_shared(replay):
     replay(rank=0)
-    sharing = ps._ProcessGroupSharing({"dp": ("dp_cp",)}, {"tp", "cp"}, {})
+    sharing = ps._ProcessGroupSharing({"dp": ("dp_cp",)}, {})
     timeout = timedelta(minutes=1)
     world = list(range(8))
     dp_cp = ps.create_group(world, timeout=timeout, sharing=sharing, role="dp_cp")
@@ -275,14 +277,70 @@ def test_different_backend_or_timeout_is_never_shared(replay):
     assert ps.create_group(world, timeout=timeout, sharing=sharing, role="ep") is not dp_cp
     tp = ps.create_group([0], timeout=timeout, sharing=sharing, role="tp")
     assert ps.create_group([0], timeout=timeout, sharing=sharing, role="cp") is tp
-    assert ps.create_group([0], timeout=timeout, sharing=sharing, role="ep") is not tp
-    assert sharing.describe() == "cp->tp, dp->dp_cp"
+    assert ps.create_group([0], timeout=timeout, sharing=sharing, role="ep") is tp
+    assert sharing.describe() == "cp->tp, dp->dp_cp, ep->tp"
 
 
 def test_independent_builds_never_share_groups(replay):
     first = replay(rank=0).groups()
     second = replay(rank=0).groups()
     assert _distinct(first).isdisjoint(_distinct(second))
+
+
+def test_sharing_options_use_the_role_configuration(replay, monkeypatch):
+    replay(rank=0)
+    config = {"dp": {"max_ctas": 4}, "dp_cp": {"max_ctas": 4}}
+    sharing = ps._ProcessGroupSharing({"dp": ("dp_cp",)}, config)
+    options = object()
+    get_options = Mock(return_value=options)
+    monkeypatch.setattr(ps, "get_nccl_options", get_options)
+    new_group = Mock(return_value=object())
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    first = ps.create_group([0, 1], sharing=sharing, role="dp_cp")
+    assert ps.create_group([0, 1], sharing=sharing, role="dp") is first
+    assert new_group.call_count == 1
+    assert new_group.call_args.kwargs["pg_options"] is options
+    assert get_options.call_args_list == [(("dp_cp", config),), (("dp", config),)]
+    with pytest.raises(ValueError, match="sharing registry"):
+        ps.create_group([0, 1], sharing=sharing, role="dp", pg_options=object())
+
+
+def test_gpu_fixture_preserves_existing_world(monkeypatch):
+    from tests.unit_tests.test_process_group_sharing_gpu import device_bound_world
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    initialize, destroy = Mock(), Mock()
+    monkeypatch.setattr(torch.distributed, "init_process_group", initialize)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", destroy)
+    fixture = device_bound_world.__wrapped__()
+    with pytest.raises(pytest.skip.Exception, match="pre-existing WORLD"):
+        next(fixture)
+    initialize.assert_not_called()
+    destroy.assert_not_called()
+
+
+def test_gpu_fixture_owns_and_cleans_up_device_bound_world(monkeypatch):
+    from tests.unit_tests.test_process_group_sharing_gpu import device_bound_world
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    initialize, destroy = Mock(), Mock()
+    monkeypatch.setattr(torch.distributed, "init_process_group", initialize)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", destroy)
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_get_default_group",
+        lambda: SimpleNamespace(bound_device_id=torch.device("cuda", 2)),
+    )
+    fixture = device_bound_world.__wrapped__()
+    next(fixture)
+    assert initialize.call_args.kwargs["device_id"] == torch.device("cuda", 2)
+    destroy.assert_not_called()
+    fixture.close()
+    destroy.assert_called_once_with()
 
 
 def test_shared_groups_are_registered_once_and_cleared_on_teardown(replay):
@@ -299,90 +357,3 @@ def test_alias_map_is_logged(replay, caplog):
     message = next(r.getMessage() for r in caplog.records if "shared roles" in r.getMessage())
     assert "dp->dp_cp" in message
     assert "share_process_groups=True" in message
-
-
-# ---------------------------------------------------------------------------------------------
-# Real multi-rank test (8 GPUs). Ranks join different groups (PP2, EP2, ...), so a rank that
-# skipped a different new_group() call than its peers would hang in group creation or in the
-# collectives below.
-
-MULTI_RANK_LAYOUTS = [
-    "pp2",
-    "ep2",
-    "ep8_expert_dp1",
-    "tp2_cp2_ep4_expert_dp1",
-    "pp2_ep4_expert_dp1",
-    "cp8_dp1",
-]
-
-
-def _initialize_device_bound_world():
-    """Start WORLD bound to this rank's GPU if no test started it yet (eager comm split)."""
-    if torch.distributed.is_initialized():
-        return
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(
-        backend="nccl", device_id=torch.device("cuda", torch.cuda.current_device())
-    )
-
-
-def _run_multi_rank_layout(layout, share_process_groups):
-    from tests.unit_tests.test_utilities import Utils
-
-    _initialize_device_bound_world()
-    calls = []
-    real_new_group = torch.distributed.new_group
-
-    def recording_new_group(*args, **kwargs):
-        calls.append((kwargs.get("group_desc"), tuple(kwargs.get("ranks") or args[0])))
-        return real_new_group(*args, **kwargs)
-
-    torch.distributed.new_group = recording_new_group
-    try:
-        Utils.initialize_model_parallel(
-            share_process_groups=share_process_groups, **LAYOUTS[layout]
-        )
-    finally:
-        torch.distributed.new_group = real_new_group
-    try:
-        every_rank_calls = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(every_rank_calls, calls)
-        assert all(rank_calls == calls for rank_calls in every_rank_calls), layout
-
-        # One all-reduce per role, in the same order on every rank.
-        for role, name in ROLE_GLOBALS.items():
-            group = getattr(ps, name, None)
-            if group is None or isinstance(group, list):
-                continue
-            value = torch.ones(1, device="cuda")
-            torch.distributed.all_reduce(value, group=group)
-            assert value.item() == torch.distributed.get_world_size(group=group), (layout, role)
-        torch.cuda.synchronize()
-
-        groups = {role: getattr(ps, name, None) for role, name in ROLE_GLOBALS.items()}
-        if share_process_groups and layout in ("ep8_expert_dp1", "pp2_ep4_expert_dp1"):
-            assert groups["ep"] is not groups["dp_cp"]
-        if share_process_groups and layout == "cp8_dp1":
-            assert groups["cp"] is not groups["dp_cp"]
-        return len(calls)
-    finally:
-        # destroy_model_parallel() drops the NCCL groups without destroying them; destroy each
-        # communicator this build created exactly once, shared or not, so layouts do not pile up.
-        created = [group for group in ps._global_process_group_list or [] if group is not None]
-        Utils.destroy_model_parallel()
-        live_groups = torch.distributed.distributed_c10d._world.pg_map
-        for group in reversed(created):
-            if live_groups.get(group) is not None:
-                torch.distributed.destroy_process_group(group)
-        ps._global_process_group_list = None
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs")
-@pytest.mark.parametrize("layout", MULTI_RANK_LAYOUTS)
-def test_shared_groups_on_a_real_world(layout):
-    shared = _run_multi_rank_layout(layout, share_process_groups=True)
-    separate = _run_multi_rank_layout(layout, share_process_groups=False)
-    assert shared < separate
-    # Initializing again builds new groups that also work.
-    assert _run_multi_rank_layout(layout, share_process_groups=True) == shared
