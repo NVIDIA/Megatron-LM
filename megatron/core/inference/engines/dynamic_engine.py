@@ -635,7 +635,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.create_cuda_graphs()
 
         if inference_config.require_gpu_local_cpu_affinity:
-            validate_inference_cpu_affinity(all_threads=True)
+            # Library threads (NCCL, ZMQ, CUDA driver) may set their own affinity, and failing
+            # here would discard CUDA graph capture, so only warn after warmup.
+            validate_inference_cpu_affinity(all_threads=True, warn_only=True)
 
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
