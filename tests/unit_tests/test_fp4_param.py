@@ -28,7 +28,12 @@ from megatron.training.global_vars import (
     set_args,
     set_run_config,
 )
-from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
+from megatron.training.training import (
+    force_param_sync,
+    get_model,
+    setup_model_and_optimizer,
+    should_disable_forward_pre_hook,
+)
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -56,13 +61,6 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
-
-
-def should_disable_forward_pre_hook(args):
-    """Block forward pre-hook for certain configurations."""
-    return (
-        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
-    )
 
 
 _SEED = 1234
@@ -156,7 +154,10 @@ class TestFP4Param:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        set_run_config(cfg)
+        # Finalization resolves the scheduler step fields that setup_model_and_optimizer reads.
+        cfg.finalize()
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
@@ -171,10 +172,10 @@ class TestFP4Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def run_eval_transition(self, args, model_chunks, batch):
+    def run_eval_transition(self, args, model_chunks, optimizer, batch):
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model_chunks, param_sync=True)
 
         model_chunks[0].eval()
@@ -190,7 +191,7 @@ class TestFP4Param:
         eval_loss = eval_output.mean()
         model_chunks[0].train()
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             enable_forward_pre_hook(model_chunks)
 
         return eval_loss.item()
@@ -268,10 +269,10 @@ class TestFP4Param:
             # CUDA graph: capture after warmup steps (warmup_steps=0 means capture on first iter)
             cuda_graph_warmup_steps = 0
             if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
                 cuda_graph_helper.create_cudagraphs()
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     enable_forward_pre_hook(gpt_model)
                     cuda_graph_helper.cuda_graph_set_manual_hooks()
 
@@ -311,6 +312,7 @@ class TestFP4Param:
                     self.run_eval_transition(
                         args,
                         gpt_model,
+                        optimizer,
                         (input_ids, labels, position_ids, attention_mask, loss_mask),
                     )
                 )

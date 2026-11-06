@@ -1,8 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
 import os
+import re
 import signal
 import sys
 from argparse import Namespace
@@ -19,7 +20,6 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -165,16 +165,28 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct training runtime services."""
+    """Register caller-provided args/config and construct their runtime services."""
+
+    from megatron.training.config import PretrainConfigContainer
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    training = isinstance(cfg_container, PretrainConfigContainer)
     cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
+    if training:
+        cfg_container.finalize()
+    initialize_runtime_services(
+        args,
+        build_tokenizer=build_tokenizer,
+        training=training,
+    )
+    if not training:
+        # Legacy checkpoint converters preserve progress without training services.
+        _set_train_state()
 
 
 def initialize_runtime_services(
@@ -185,8 +197,9 @@ def initialize_runtime_services(
 
     cfg = get_run_config()
     if build_tokenizer:
-        _build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+        _build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
+    _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -202,20 +215,21 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
-    if args.step_batch_size_schedule is not None:
+    cfg = get_run_config()
+    if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
         from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
+        global_batch_size=cfg.train.global_batch_size,
+        micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
         data_parallel_size=get_batch_parallel_size(args),
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
+        decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+        step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
     _set_tensorboard_writer(args)
@@ -225,10 +239,10 @@ def initialize_training_runtime_services(args: Namespace) -> None:
     _set_energy_monitor(args)
     _set_train_state()
 
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
+    if cfg.train.exit_signal_handler:
+        _set_signal_handler(cfg.train.exit_signal)
 
-    if args.exit_signal_handler_for_training:
+    if cfg.train.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
@@ -288,11 +302,23 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
-def _build_tokenizer(args):
+def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
+    from megatron.training.models.gpt import GPTModelConfig
+    from megatron.training.models.hybrid import HybridModelConfig
+    from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
+
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer(args)
+
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)):
+        make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
+        tp_size = cfg.model.transformer.tensor_model_parallel_size
+    else:
+        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+        tp_size = args.tensor_model_parallel_size
+
+    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
@@ -305,10 +331,31 @@ def _build_tokenizer(args):
     return _GLOBAL_TOKENIZER
 
 
-def rebuild_tokenizer(args):
+def rebuild_tokenizer(cfg, args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
-    return _build_tokenizer(args)
+    return _build_tokenizer(cfg, args)
+
+
+def _bind_dataset_tokenizer(cfg) -> None:
+    """Bind the run's tokenizer to ``cfg.data.dataset`` (Megatron Core's ``validate()`` runs then).
+
+    Only GPT entry points carry a dataset there, and nothing happens without a tokenizer
+    (``build_tokenizer=False``: the provider then reports the unbound config). The container must
+    be finalized first, as ``initialize_megatron`` and ``set_global_variables`` do (the fields other
+    sections own are written then). ``DataConfig.bind_tokenizer`` decides the rest: a config bound
+    earlier to this tokenizer is left as is, one bound to another tokenizer is an error.
+    """
+    data = getattr(cfg, "data", None)
+    if getattr(data, "dataset", None) is None or _GLOBAL_TOKENIZER is None:
+        return
+    if not getattr(cfg, "_finalized", False):
+        raise RuntimeError(
+            "cfg.data.dataset cannot bind the tokenizer before the container is finalized: call "
+            "cfg.finalize() before initialize_runtime_services(), as initialize_megatron() and "
+            "set_global_variables() do."
+        )
+    data.bind_tokenizer(_GLOBAL_TOKENIZER)
 
 
 def _set_tensorboard_writer(args):
@@ -329,6 +376,16 @@ def _set_tensorboard_writer(args):
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
+
+
+def _wandb_run_id(exp_name: str) -> str:
+    """A wandb run id derived from the experiment name.
+
+    The id is part of the run URL, so wandb rejects the characters that would be
+    ambiguous there. Experiment names are often paths, so substitute rather than fail;
+    the unmodified name is still what gets displayed.
+    """
+    return re.sub(r"[/\\#?%:]", "-", exp_name)
 
 
 def _set_wandb_writer(args):
@@ -354,11 +411,23 @@ def _set_wandb_writer(args):
             # settings were.
             with open(wandb_config['kitchen_config_file'], "r") as f:
                 wandb_config['kitchen_config_file_contents'] = f.read()
+        # wandb.init() creates a new run unless it is given an id to resume, and this
+        # runs on every process start. A long job restarts many times -- a requeue, a
+        # node failure, an in-job restarter -- and each restart would otherwise open a
+        # fresh run, scattering one training run across many and leaving every chart
+        # covering only the stretch between two failures. Deriving a stable id from the
+        # experiment name and resuming it keeps them a single timeline. An unnamed run has
+        # nothing stable to derive an id from, so wandb assigns one as before.
+        run_id = cfg.logger.wandb_run_id or (
+            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
+        )
         wandb_kwargs = {
             'dir': save_dir,
+            "id": run_id,
             'name': cfg.logger.wandb_exp_name,
             'project': cfg.logger.wandb_project,
-            'config': wandb_config}
+            'config': wandb_config,
+            "resume": "allow"}
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)

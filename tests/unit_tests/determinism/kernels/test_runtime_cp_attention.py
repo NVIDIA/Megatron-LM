@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Replay packed attention while switching its runtime CP topology.
+"""Replay attention across activation offload and runtime CP transitions.
 
 Comparisons are bit-exact for repeated execution at the *same* CP size, including after
 intervening microbatches with other CP sizes. Different reduction topologies are not
 required to produce identical bits. The real RoPE, TE attention, and projection kernels
-run here; no compute kernel is mocked.
+run here; no compute kernel is mocked. Offload replays also compare against resident
+execution across warmup and steady state for supported Q/K input layouts.
 """
 
 from contextlib import contextmanager
@@ -14,20 +15,13 @@ import pytest
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from tests.unit_tests.context_parallel.runtime.replay_test_utils import _zigzag_shard
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
     bytes_equal,
     seeded,
 )
-
-
-def _zigzag_shard(hidden_states, lengths, cp_size, cp_rank):
-    """Slice each packed sequence into its rank's paired front/back CP chunks."""
-    parts = []
-    for sequence in hidden_states.split(lengths):
-        chunks = sequence.chunk(2 * cp_size)
-        parts.extend((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]))
-    return torch.cat(parts).contiguous()
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -73,6 +67,106 @@ def _assert_same_replay(reference, actual):
         assert expected.keys() == observed.keys()
         for name in expected:
             assert bytes_equal(expected[name], observed[name]), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("input_layout", ["qk_norm", "rope"])
+def test_core_attention_offload_replays_bit_exact(input_layout, fraction, monkeypatch):
+    """Unpacked attention inputs must replay across warmup and steady-state offload."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE:
+        pytest.skip("requires Transformer Engine")
+
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", dict(te_dpa._attention_backends, attention_params=None)
+    )
+    Utils.initialize_model_parallel()
+    off_interface.reset_instance()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        qk_norm = input_layout == "qk_norm"
+
+        def build_model(offload):
+            config = TransformerConfig(
+                num_layers=3,
+                hidden_size=256,
+                num_attention_heads=4,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                attention_backend=AttnBackend.fused,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+                qk_layernorm=qk_norm,
+                deterministic_mode=True,
+                fine_grained_activation_offloading=offload,
+                offload_modules=["core_attn", "attn_proj"] if offload else None,
+                activation_offload_fraction=fraction,
+                min_offloaded_tensor_size=1024,
+            )
+            return (
+                GPTModel(
+                    config,
+                    get_gpt_layer_with_transformer_engine_spec(qk_layernorm=qk_norm),
+                    vocab_size=512,
+                    max_sequence_length=512,
+                    position_embedding_type="learned_absolute" if qk_norm else "rope",
+                )
+                .cuda()
+                .bfloat16()
+            )
+
+        inputs = dict(
+            input_ids=torch.arange(512, device="cuda").unsqueeze(0),
+            position_ids=torch.arange(512, device="cuda").unsqueeze(0),
+            attention_mask=None,
+        )
+        baseline = build_model(False)
+        reference = assert_module_replays_bit_exact(baseline, inputs, replays=2)
+        model = build_model(True)
+        model.load_state_dict(baseline.state_dict())
+        del baseline
+        # Each replay is a new iteration: the first discovers groups, subsequent
+        # iterations apply the fraction and reserve the per-module margin groups.
+        model.register_forward_pre_hook(lambda _module, _args: off_interface.reset())
+        actual = assert_module_replays_bit_exact(
+            model,
+            inputs,
+            replays=3,
+            contention=True,
+            what=f"core attention offload {input_layout}, fraction={fraction}",
+        )
+        _assert_same_replay(reference, actual)
+        assert actual[1], "must compare parameter gradients as well as logits"
+        assert te_dpa._attention_backends["use_fused_attention"]
+        assert PipelineOffloadManager.get_instance().offload_summary_total_bytes > 0
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
@@ -182,6 +276,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     max_seqlen_kv=max(lengths),
                     local_cp_size=runtime_size,
                     cp_group=None if runtime_size is None else group,
+                    tp_cp_group=None if runtime_size is None else group,
                 )
                 local = _zigzag_shard(hidden, lengths, group.size(), group.rank())
                 inputs = dict(
@@ -198,6 +293,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     what=f"packed attention build CP{build_cp_size}, runtime CP{runtime_size}",
                 )
                 assert_restored()
+                assert packed.tp_cp_group is (None if runtime_size is None else group)
                 assert "in.hidden_states" in result[1]
                 assert any("linear_qkv" in name for name in result[1])
                 assert any("linear_proj" in name for name in result[1])
@@ -225,5 +321,122 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     )
                     _assert_same_replay(result, recovered)
                     assert_restored()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("path", ["prefill", "decode"])
+def test_flash_decode_dispatch_config_softmax_scale_replays(path):
+    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
+    from megatron.core.transformer import attention as attention_module
+
+    if (
+        attention_module.flash_attn_varlen_func is None
+        or attention_module.flash_attn_with_kvcache is None
+    ):
+        pytest.skip("requires flash-attn")
+
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        heads, kv_heads, head_dim = 4, 2, 128
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=kv_heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
+            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        module = SelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        module.eval()
+        scale_probe = torch.empty(1, heads, head_dim, device="cuda")
+        assert module.get_softmax_scale(scale_probe) == 0.25
+
+        # Paged KV cache: two requests with 24 and 32 cached tokens. Flash-attn requires the block
+        # size to be divisible by 256, so each request gets one 256-token page.
+        page_size, num_pages = 256, 2
+        lengths_k = (24, 32)
+        inputs = dict(
+            k=torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+            ),
+            v=torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+            ),
+            cu_seqlens_k=torch.tensor(
+                [0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32
+            ),
+            seqlens_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+            block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            max_seqlen_k=max(lengths_k),
+        )
+        if path == "prefill":
+            tokens_per_request = 8
+            inputs.update(
+                # q: [total_tokens, 1, heads, head_dim] — squeezed to [total, heads, head_dim].
+                q=torch.randn(
+                    2 * tokens_per_request, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16
+                ),
+                cu_seqlens_q=torch.tensor(
+                    [0, tokens_per_request, 2 * tokens_per_request],
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+                max_seqlen_q=tokens_per_request,
+            )
+            is_decode_only = False
+        else:
+            inputs.update(
+                # q: [num_requests * tokens_per_request, 1, heads, head_dim] with one token each.
+                q=torch.randn(2, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16),
+                cu_seqlens_q=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+                max_seqlen_q=1,
+            )
+            is_decode_only = True
+
+        def fn(**call):
+            return module.flash_decode_and_prefill(**call, is_decode_only=is_decode_only)
+
+        scaled = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=3,
+            backward=False,
+            contention=True,
+            what=f"flash_decode_and_prefill[{path}, config softmax_scale]",
+        )
+        assert torch.isfinite(scaled[0]["out"]).all()
+
+        # Drop back to the default scale; the kernel output must change, proving the config-driven
+        # value actually reached the kernel.
+        module.config.softmax_scale = None
+        assert module.get_softmax_scale(scale_probe) == head_dim**-0.5
+        default = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=2,
+            backward=False,
+            what=f"flash_decode_and_prefill[{path}, default softmax_scale]",
+        )
+        assert not bytes_equal(scaled[0]["out"], default[0]["out"])
     finally:
         Utils.destroy_model_parallel()

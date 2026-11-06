@@ -26,6 +26,16 @@ from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.transformer.enums import AttnBackend
 
+
+@pytest.fixture(autouse=True)
+def tokenizer_config(monkeypatch):
+    from examples.mimo.model_providers import nemotron_moe_vlm as provider
+
+    tokenizer = SimpleNamespace(padded_vocab_size=512, vocab_size=256)
+    monkeypatch.setattr(provider, "get_run_config", lambda: SimpleNamespace(tokenizer=tokenizer))
+    return tokenizer
+
+
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
 # the pattern length (get_hybrid_total_layer_count): 20 and 54 layer-tokens.
@@ -483,6 +493,7 @@ def test_language_model_spec_builds_mamba():
     args.expert_tensor_parallel_num_weight_shards = args.mimo_llm_expt_tp
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
     assert spec.module is MambaModel
+    assert spec.params["vocab_size"] == 512
     assert spec.params["config"].num_layers == 20
     assert spec.params["config"].expert_model_parallel_size == 2
     assert spec.params["config"].expert_tensor_parallel_size == 2
@@ -516,6 +527,31 @@ def test_language_model_spec_propagates_logit_dtype(cli_dtype, expected_dtype):
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
 
     assert spec.params["logit_dtype"] is getattr(torch, expected_dtype)
+
+
+@pytest.mark.parametrize(
+    "position_type,rotary_base,rotary_percent,interpolation_factor",
+    [("none", 10000, 1.0, None), ("rope", 10000, 1.0, 1), ("rope", 123456, 0.5, 4)],
+)
+def test_language_model_spec_honors_rotary_args(
+    position_type, rotary_base, rotary_percent, interpolation_factor
+):
+    """Both language config and model construction honor the requested RoPE geometry."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+
+    argv = _build_argv(*_PRESET_20L)
+    argv[argv.index("--position-embedding-type") + 1] = position_type
+    argv += ["--rotary-base", str(rotary_base), "--rotary-percent", str(rotary_percent)]
+    if interpolation_factor is not None:
+        argv += ["--rotary-seq-len-interpolation-factor", str(interpolation_factor)]
+    args = _parse_validate(argv)
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].position_embedding_type == position_type
+    assert spec.params["position_embedding_type"] == position_type
+    assert spec.params["rotary_base"] == rotary_base
+    assert spec.params["rotary_percent"] == rotary_percent
+    assert spec.params["seq_len_interpolation_factor"] == interpolation_factor
 
 
 def test_vision_submodules_spec_wires_radio_encoder():
@@ -644,6 +680,10 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
         vocab_size=64,
         seq_length=32,
         hybrid_layer_pattern="*",
+        position_embedding_type="none",
+        rotary_base=10000,
+        rotary_percent=1.0,
+        rotary_seq_len_interpolation_factor=None,
         logit_dtype=None,
     )
     monkeypatch.setattr(
