@@ -305,11 +305,14 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
-        self.tp_ep_group = pg_collection.tp_ep
-        self.dp_group = pg_collection.expt_dp
-        # Full expert data-distribution group (expt_dp x EGTP_remat): replicated extra states
-        # need distinct replica ids across EGTP_remat peers (see TEGroupedLinear).
-        self.dp_group_gtp_remat = pg_collection.expt_dp_gtp_remat
+        # Replica coordinates of the shared TE activation extra state (see sharded_state_dict):
+        # the joint ETP x EP group and the full expert data-distribution group
+        # (expt_dp x EGTP_remat), which gives EGTP_remat peers distinct replica ids like
+        # TEGroupedLinear. Resolved leniently because unit tests build this module with
+        # minimal duck-typed collections that only carry ``ep`` and ``expt_tp``.
+        self.tp_ep_group = getattr(pg_collection, "tp_ep", None)
+        self.dp_group = getattr(pg_collection, "expt_dp", None)
+        self.dp_group_gtp_remat = getattr(pg_collection, "expt_dp_gtp_remat", None)
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -1474,6 +1477,11 @@ class TEGroupedMLP(MegatronModule):
             # expt_dp x EGTP_remat group as its DP coordinate so exactly one rank is selected
             # without changing the checkpoint object's global shape or key.
             is_activation_module = name == "activation_func"
+            if is_activation_module:
+                assert self.tp_ep_group is not None and self.dp_group_gtp_remat is not None, (
+                    "TEGroupedMLP.sharded_state_dict needs the tp_ep and expt_dp_gtp_remat "
+                    "process groups to select one owner of the shared TE activation extra state"
+                )
             sub_sd = sharded_state_dict_default(
                 module,
                 f'{name}.',
