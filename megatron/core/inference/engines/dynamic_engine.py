@@ -2456,8 +2456,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
         """A resident request's expert routing, read from its blocks as its completion reads it."""
-        allocator = self.context.kv_block_allocator
-        if not allocator.block_routing:  # routing replay off: nothing was recorded
+        routing_replay = self.context.kv_block_allocator.routing_replay
+        if not routing_replay.has_data():  # routing replay off: nothing was recorded
             return None
         if not hasattr(self.context, "request_ids"):
             return None
@@ -2465,7 +2465,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if index < 0:
             return None
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        return allocator.reconstruct_routing_from_blocks(
+        return routing_replay.reconstruct_routing_from_blocks(
             self.context.get_committed_kv_block_ids(index), total_tokens - 1
         )
 
@@ -3623,10 +3623,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                        routing_replay = self.context.kv_block_allocator.routing_replay
+                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
