@@ -1615,6 +1615,14 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
+    mamba_kernel_backend: Literal["triton", "cudnn"] = "triton"
+    """Kernel backend for the Mamba layers' training conv + SSD. ``triton`` runs mamba_ssm's
+    fused kernel. ``cudnn`` runs causal-conv1d plus the cuDNN frontend's CuTe DSL Mamba-2
+    kernels (nvidia-cudnn-frontend[cutedsl]>=1.32.0), which need SM100 / SM103 / SM107,
+    mamba_head_dim=64 and mamba_state_dim=128. The selected backend is required to be
+    available; there is no automatic fallback. Inference and the non-memory-efficient path
+    always use the Triton kernels."""
+
     gdp_cutedsl_kernel: bool = False
     """Whether to use the CuTeDSL kernel for the GatedDeltaProduct mixer."""
 
@@ -1937,6 +1945,12 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
                 f"got {self.gdn_kernel_backend!r}."
+            )
+
+        if self.mamba_kernel_backend not in {"triton", "cudnn"}:
+            raise ValueError(
+                "mamba_kernel_backend must be one of {'triton', 'cudnn'}, "
+                f"got {self.mamba_kernel_backend!r}."
             )
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):

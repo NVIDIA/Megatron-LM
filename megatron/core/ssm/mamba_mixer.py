@@ -31,8 +31,12 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_ssm,
 )
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+from megatron.core.ssm.ops.mamba2.cudnn_ssd import (
+    cudnn_mamba2_unsupported_reason,
+    cudnn_mamba_split_conv1d_scan_combined,
+)
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
-from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
+from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -246,6 +250,22 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         assert self.d_state is not None and self.d_state > 0
         assert self.headdim is not None and self.headdim > 0
         assert self.ngroups is not None and self.ngroups > 0
+
+        self.use_cudnn_kernels = self.config.mamba_kernel_backend == "cudnn"
+        if self.use_cudnn_kernels:
+            if not self.use_mem_eff_path:
+                raise ValueError(
+                    "mamba_kernel_backend='cudnn' replaces the memory-efficient training kernel "
+                    "and cannot be combined with use_mamba_mem_eff_path=False."
+                )
+            if config.mamba_training_ssm_states_dtype is not None:
+                raise ValueError(
+                    "mamba_kernel_backend='cudnn' does not support "
+                    "mamba_training_ssm_states_dtype."
+                )
+            reason = cudnn_mamba2_unsupported_reason(self.headdim, self.d_state)
+            if reason is not None:
+                raise ValueError(f"mamba_kernel_backend='cudnn' is unavailable: {reason}.")
 
         if self.config.mamba_num_heads is not None:
             self.nheads = self.config.mamba_num_heads
@@ -497,6 +517,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 "in the non-memory-efficient code path."
             )
             y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+        elif self.use_cudnn_kernels:
+            assert ssm_state is None
+            y = self._ssm_training_cudnn(zxBCdt, packed_seq_params)
         else:
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
@@ -763,6 +786,68 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
             **state_dtype_kwarg,
+        )
+
+        y = rearrange(y, "b l d -> l b d").contiguous()
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
+
+        if self.rmsnorm:
+            y = self.norm(y)
+
+        return y
+
+    def _ssm_training_cudnn(
+        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
+        """
+        Performs SSM computation for training step on the cuDNN frontend's Mamba-2 kernels
+        (`mamba_kernel_backend='cudnn'`), with the same inputs and outputs as `_ssm_training`.
+        """
+
+        # transpose: l b pd --> b l pd
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        batch, seqlen, _ = zxBCdt.shape
+
+        # (nheads_local_tpcp)
+        A = -torch.exp(self.cp.get_A_log().float())
+
+        seq_idx = None
+        if packed_seq_params is not None:
+            sequence_packing_available, reason_for_no_sequence_packing = (
+                _check_mamba_sequence_packing_support(for_inference_not_training=False)
+            )
+            assert sequence_packing_available, reason_for_no_sequence_packing
+            assert batch == 1, "Packed sequences must be passed with a batch size of 1."
+            seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None:
+                seq_idx = build_packed_seq_idx(packed_seq_params, seqlen)
+            # Like build_packed_seq_idx, the tokens after cu_seqlens[-1] form one more
+            # (possibly empty) sequence. Padded boundaries can run past the packed length,
+            # which the kernel would read beyond.
+            cu_seqlens = get_cu_seqlens(packed_seq_params)
+            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_full((1,), seqlen)])
+            cu_seqlens = cu_seqlens.clamp(max=seqlen)
+        else:
+            cu_seqlens = torch.arange(
+                0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device=zxBCdt.device
+            )
+
+        y = cudnn_mamba_split_conv1d_scan_combined(
+            zxBCdt,
+            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            self.cp.get_conv1d_bias(),
+            self.cp.get_dt_bias().float(),
+            A,
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            cu_seqlens=cu_seqlens,
+            headdim=self.headdim,
+            ngroups=self.cp.ngroups_local_tpcp,
+            seq_idx=seq_idx,
+            batch_invariant=self.config.batch_invariant_mode,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()

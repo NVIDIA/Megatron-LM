@@ -200,6 +200,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
+    "mamba_kernel_backend": "triton",
     "mamba_num_groups": 8,
     "mamba_num_heads": 64,
     "mamba_state_dim": 128,
