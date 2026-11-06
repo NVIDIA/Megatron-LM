@@ -22,6 +22,7 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+docs/fern/versions/*-content/
 
 # Git worktrees
 .worktrees/
