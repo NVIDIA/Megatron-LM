@@ -4,6 +4,7 @@ import logging
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -114,13 +115,21 @@ class LanguageModule(MegatronModule):
 
     # pylint: disable=line-too-long
     def compute_language_model_loss(
-        self, labels: Tensor, logits: Tensor, return_argmax: bool = False
+        self,
+        labels: Tensor,
+        logits: Tensor,
+        return_argmax: bool = False,
+        logits_are_gathered: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Computes the language model loss (Cross entropy across vocabulary)
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
             logits (Tensor): The final logits returned by the output layer of the transformer model
+            logits_are_gathered (bool): The output layer gathered the full vocabulary onto every
+                TP rank (``parallel_output=False`` or ``runtime_gather_output=True``). Uses plain
+                cross entropy over each rank's own full copy instead of the vocab-parallel
+                kernel, whose sharded-input contract the gathered logits would violate.
             return_argmax (bool): Also return the argmax of the logits over the full vocabulary,
                 [seq length, batch size], when the cross entropy finds it in the same pass (TE's
                 fused cross entropy), else None.
@@ -132,7 +141,20 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         argmax = None
-        if return_argmax and (
+        if logits_are_gathered:
+            # The vocab-parallel kernel reads the last dimension as one vocabulary
+            # shard: with the full vocabulary replicated on every TP rank it counts
+            # the softmax denominator TP times, so the loss is off by log(TP) (more
+            # when the target is not the max logit) and the gradients are wrong.
+            # Plain CE over each rank's own full copy is exact, and the backward of
+            # the output gather splits the gradient, so each vocab shard still
+            # receives softmax - one_hot on its own slice.
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="none"
+            ).view_as(labels)
+            if return_argmax:
+                argmax = logits.argmax(dim=-1)
+        elif return_argmax and (
             "return_argmax" in inspect.signature(self.vocab_parallel_cross_entropy).parameters
         ):
             loss, argmax = self.vocab_parallel_cross_entropy(
