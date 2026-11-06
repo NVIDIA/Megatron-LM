@@ -36,8 +36,9 @@ def test_invalid_buffer_reuse_is_rejected_before_ddp_setup(fp8_param_gather):
     )
     error = ValueError if fp8_param_gather else AssertionError
     match = "Gradient-buffer offload" if fp8_param_gather else "Reuse grad buffer"
+    ddp_config = DistributedDataParallelConfig(**kwargs)
     with pytest.raises(error, match=match):
-        DistributedDataParallelConfig(**kwargs)
+        ddp_config.finalize()
 
     # Standalone callers can also edit the config after construction.
     ddp_config = DistributedDataParallelConfig()
@@ -93,6 +94,8 @@ class TestDistributedDataParallel:
         ddp_model1 = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=model1
         )
+        assert ddp_config.expert_data_parallel_sharding_strategy == "no_shard"
+        assert ddp_config.expert_outer_dp_sharding_strategy == "no_shard"
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():

@@ -754,8 +754,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
-        if self.optimizer.use_layer_wise_distributed_optimizer:
-            self.ddp.use_distributed_optimizer = False
         # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
         # perform numerical validation. Loss and gradient checks otherwise remain independent.
         fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
@@ -770,11 +768,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.train.iterations_to_skip = self.train.iterations_to_skip + [
                 iteration for iteration in skipped if iteration not in self.train.iterations_to_skip
             ]
-        # Bridge defers MCore's construction-time defaults; resolve them here as well.
-        if self.ddp.expert_data_parallel_sharding_strategy is None:
-            self.ddp.expert_data_parallel_sharding_strategy = self.ddp.data_parallel_sharding_strategy
-        if self.ddp.expert_outer_dp_sharding_strategy is None:
-            self.ddp.expert_outer_dp_sharding_strategy = self.ddp.outer_dp_sharding_strategy
         if self.ddp.use_torch_fsdp2:
             if is_te_min_version("2.0.0"):
                 self.ddp.fp8_param_gather = False
@@ -799,8 +792,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.ddp.nccl_ub:
                 self.ddp.fsdp_manual_registration = True
                 self.ddp.fsdp_double_buffer = True
-        if self.ddp.megatron_fsdp_max_pool_double_buffer:
-            self.ddp.fsdp_double_buffer = True
         # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
         self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
             not self.ddp.use_torch_fsdp2
@@ -840,7 +831,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
-        self.ddp._validate_buffer_layout()
+        self.ddp.finalize()
 
 
 def update_train_iters(train: TrainingConfig) -> None:

@@ -429,7 +429,7 @@ def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
     from megatron.core.distributed import DistributedDataParallelConfig
 
     with pytest.raises(AssertionError, match="Cannot specify both"):
-        DistributedDataParallelConfig(num_buckets=2, bucket_size=1024)
+        DistributedDataParallelConfig(num_buckets=2, bucket_size=1024).validate()
     run_config.ddp = DistributedDataParallelConfig(
         overlap_grad_reduce=overlap,
         num_buckets=2 if policy == "count" else None,

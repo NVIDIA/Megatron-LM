@@ -1754,25 +1754,38 @@ def test_wrapper_validation_uses_optimizer_buffer_policy(
     assert run_config.ddp.grad_buffer_offload is offload
 
 
-def test_wrapper_deferred_defaults_are_resolved_at_finalization(monkeypatch, run_config):
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("expert_override", [None, "no_shard"])
+def test_wrapper_deferred_defaults_are_resolved_at_finalization(
+    monkeypatch, run_config, standalone, expert_override
+):
     from megatron.core.distributed import DistributedDataParallelConfig
-
-    class DeferredDDPConfig(DistributedDataParallelConfig):
-        def __post_init__(self):
-            pass  # Bridge defers construction-time derivations until framework startup.
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     run_config.train.micro_batch_size = 1
-    run_config.ddp = DeferredDDPConfig()
-    run_config.ddp.data_parallel_sharding_strategy = "optim_grads_params"
-    run_config.validate()
-    assert run_config.ddp.expert_data_parallel_sharding_strategy is None
-    run_config.finalize()
-    assert run_config.ddp.expert_data_parallel_sharding_strategy == "optim_grads_params"
-    assert (
-        run_config.ddp.expert_outer_dp_sharding_strategy
-        == run_config.ddp.outer_dp_sharding_strategy
+    run_config.ddp = DistributedDataParallelConfig(
+        expert_data_parallel_sharding_strategy=expert_override,
+        expert_outer_dp_sharding_strategy=expert_override,
     )
+    run_config.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    run_config.ddp.outer_dp_sharding_strategy = "optim"
+    run_config.ddp.megatron_fsdp_max_pool_double_buffer = True
+    run_config.validate()
+    assert run_config.ddp.expert_data_parallel_sharding_strategy == expert_override
+    assert run_config.ddp.expert_outer_dp_sharding_strategy == expert_override
+    assert not run_config.ddp.fsdp_double_buffer
+    if standalone:
+        run_config.ddp.finalize()
+    else:
+        run_config.finalize()
+    assert run_config.ddp.expert_data_parallel_sharding_strategy == (
+        expert_override or "optim_grads_params"
+    )
+    assert run_config.ddp.fsdp_double_buffer
+    assert run_config.ddp.expert_outer_dp_sharding_strategy == (expert_override or "optim")
+    resolved = deepcopy(run_config.to_dict())
+    run_config.ddp.finalize()
+    assert run_config.to_dict() == resolved
 
 
 def test_optimizer_consumes_the_owner_used_for_wrapper_derivation(monkeypatch, run_config):

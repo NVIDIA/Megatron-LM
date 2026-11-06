@@ -134,7 +134,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      None is replaced with `data_parallel_sharding_strategy` during initialization."""
+      None is replaced with `data_parallel_sharding_strategy` during finalization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -212,7 +212,7 @@ class DistributedDataParallelConfig:
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
     Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
     ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during initialization.
+    ``outer_dp_sharding_strategy`` during finalization.
     """
 
     disable_symmetric_registration: bool = False
@@ -339,15 +339,26 @@ class DistributedDataParallelConfig:
         # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
-    def __post_init__(self):
-        """Preserve construction-time defaults for standalone MCore callers."""
+    def finalize(self) -> None:
+        """Resolve local defaults after recipe edits and before wrapper construction.
+
+        Training containers first derive optimizer-owned fields. Standalone MCore
+        wrappers also call this method; repeated calls preserve resolved settings.
+        """
+        self.validate()
+        if self.reuse_grad_buf_for_mxfp8_param_ag:
+            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+            )
+
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
-
-        self.validate()
-        self._validate_buffer_layout()
         if self.megatron_fsdp_max_pool_double_buffer:
             self.fsdp_double_buffer = True
 
@@ -355,7 +366,7 @@ class DistributedDataParallelConfig:
         """Check user settings without mutation, including edits after construction.
 
         Optimizer-owned buffer policy may still be stale here. Its resolved layout
-        is checked by _validate_buffer_layout at construction and before DDP setup.
+        is checked by finalize before wrapper setup.
         """
         import os
 
@@ -399,17 +410,6 @@ class DistributedDataParallelConfig:
             if not self._bucket_size_resolved:
                 assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
-
-    def _validate_buffer_layout(self) -> None:
-        """Check resolved buffer policy before allocating or sharing gradient storage."""
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
-
-        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
-            )
 
     def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
         """Resolve buckets in place after model construction and process-group setup.
