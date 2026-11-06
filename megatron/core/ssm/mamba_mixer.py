@@ -515,12 +515,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         in_proj/SSM outputs to the d_model-wide input and output. Sequence parallel and context
         parallel communicate along the sequence dim, and the FP8 inference padding wrapper pads
         dim 0 as the sequence, so they keep the sequence-first layout. So does any config where
-        the TP-local in_proj + SSM outputs are narrower than the input and output together.
+        batch-first would copy more (TP shards the in_proj/SSM outputs, not the input and output).
         """
-        # Forward copies per token. In MambaLayer, backward adds the in_proj grad copy (old) vs
-        # the out_proj grad copy (batch-first), which only favors batch-first more when this holds.
-        local_proj_width = (
-            3 * self.d_inner_local_tp
+        # Copies per token, forward + backward. Sequence-first: the in_proj output and its grad,
+        # and the SSM output (the kernel reads its strided grad in place): 2 * in_proj + d_inner.
+        # Batch-first: the input, the output and the out_proj grad, plus the input grad when its
+        # producer makes it contiguous (a separate norm, the wide-residual read): <= 4 * d_model.
+        in_proj_width = (
+            2 * self.d_inner_local_tp
             + 2 * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp
         )
@@ -529,7 +531,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             and not inference_mode
             and self.cp.cp_size == 1
             and not self.config.sequence_parallel
-            and 2 * self.d_model < local_proj_width
+            and 4 * self.d_model < 2 * in_proj_width + self.d_inner_local_tp
             and not is_wrapped_for_fp8_inference(self.in_proj)
             and not is_wrapped_for_fp8_inference(self.out_proj)
         )

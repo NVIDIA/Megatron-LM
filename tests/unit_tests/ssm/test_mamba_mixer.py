@@ -143,8 +143,8 @@ class TestMambaMixer:
         if Utils.world_size < tp_size:
             pytest.skip(f"needs {tp_size} GPUs")
         mixer = self.get_mixer(tp_size=tp_size)
-        # hidden 256 -> d_inner 512, 8 heads, 8 groups of state 128: the old layout copies
-        # 3592 / tp elements per token (449 at TP 8), the batch-first one 2 * 256 = 512.
+        # hidden 256 -> d_inner 512 and in_proj 3080 (8 heads, 8 groups of state 128): the old
+        # layout copies 6672 / tp elements per token (834 at TP 8), batch-first up to 4 * 256.
         assert mixer._use_batch_first_ssm(inference_mode=False) == expected
         assert not mixer._use_batch_first_ssm(inference_mode=True)
 
