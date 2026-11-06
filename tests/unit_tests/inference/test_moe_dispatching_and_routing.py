@@ -642,7 +642,6 @@ class TestNVLSAllGatherVDispatcher:
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            HAVE_DEEPGEMM_BF16,
             set_batch_invariant_mode,
         )
         from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -653,8 +652,6 @@ class TestNVLSAllGatherVDispatcher:
             pytest.skip("NVLS RSV branch test requires expert-parallel world_size > 1.")
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
-        if not HAVE_DEEPGEMM_BF16:
-            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
 
         torch.manual_seed(2027)
         torch.cuda.manual_seed(2027)
@@ -789,7 +786,6 @@ class TestNVLSAllGatherVDispatcher:
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            HAVE_DEEPGEMM_BF16,
             set_batch_invariant_mode,
         )
         from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -800,12 +796,6 @@ class TestNVLSAllGatherVDispatcher:
             pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
-        if (
-            inference_grouped_gemm_backend == "torch"
-            and not mxfp8_swiglu
-            and not HAVE_DEEPGEMM_BF16
-        ):
-            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
         if mxfp8_swiglu:
             from megatron.core.fp8_utils import get_fp8_context
             from megatron.core.inference.moe.fused_moe import HAVE_SCALED_GMM
