@@ -196,3 +196,55 @@ Provide dynamic image sizes as CPU `imgs_sizes` tensors. The shared MIMO batch
 mover retains this field on the host because vision encoders read its dimensions
 in Python. Pixel tensors, token tensors and `PackedSeqParams` attention indices
 still move to CUDA. This also applies when inputs are nested under a modality.
+
+## Prepared BinIdx causal training with RADIO
+
+Use the prepared-token cooker and image-safe streaming task through the ordinary
+application hook:
+
+```text
+--dataset-provider energon \
+--energon-data-config examples.mimo.training.prepared_binidx:make_config \
+--data-path /data/recipe.yaml \
+--tokenizer-type NullTokenizer --vocab-size 262144 \
+--energon-eos-token-id 2 --energon-pad-token-id 3 --image-token-id 18 \
+--energon-image-token-budget 1024 --seq-length 8192 \
+--patch-dim 16 \
+--dynamic-resolution --disable-vision-class-token --pixel-shuffle
+```
+
+The encoder bounds IDs using the initialized runtime tokenizer vocabulary,
+including model padding. The null tokenizer supplies only that vocabulary for
+already prepared IDs; it does not process the documents. Token IDs and the
+vocabulary size in this example are illustrative: pass the actual prepared corpus and
+model IDs. No tokenizer, BOS replacement, EOS insertion or second target shift
+runs in this application. The EOS/PAD flags are required only by this selected
+factory. `--energon-image-token-budget` limits emitted visual embeddings per image
+and must fit the sequence length; source image-end/break IDs remain ordinary text
+positions with their original eligibility. Dynamic resizing uses existing RADIO
+normalization and aspect-ratio planning, with optional 2x2 pixel shuffle and no
+thumbnail. Decoded image dimensions must agree with the original width/height metadata;
+realized emitted geometry must also agree with the planned visual spans. Both
+checks run before model forward.
+
+The recipe uses the prepared cooker tags and native auxiliary stores described
+in [PREPARED_BINIDX.md](../../multimodal/data_loading/PREPARED_BINIDX.md). Optional
+`indexed-token-mask` companions use the same source-bound target eligibility
+protocol. The factory registers that protocol and uses native `NoCachePool`;
+no custom filesystem, image-storage or sampling implementation is required.
+
+Native packing stays isolated per source. Each batch has fixed `[B,S]` IDs,
+already aligned labels/masks and row positions `0..S-1`. Attention is ordinary
+causal attention across each packed row, including source document boundaries;
+positions do not reset at fragments. Targetless completed packs reject as described
+in the streaming task documentation. Other attention/BOS/fully-masked policies
+are separate capabilities.
+
+Language ranks consume IDs and targets without reading image pixels. The encoder
+merger realizes the selected lazy plans in lane-major, then batch-row order and
+supplies the actual RADIO wrapper's `x`, host `imgs_sizes` and packed-attention
+metadata. It checks realized patch geometry against the visual spans. Native
+checkpoint cursors remain authoritative; the application identity fingerprints
+all selected token/objective/sequence/image policies hidden inside callbacks.
+The initial application supports dynamic RADIO with dropped class tokens; it
+does not add other towers, video, token-budget dataset subsets or custom storage.
