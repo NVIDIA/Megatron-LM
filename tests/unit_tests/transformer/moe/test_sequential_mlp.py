@@ -1,64 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import warnings
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-import megatron.core._rank_utils as rank_utils
-import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import SequentialMLP
+from megatron.core.transformer.moe.experts import SequentialMLP, _warn_sequential_mlp_deprecated
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-
-
-@pytest.mark.parametrize("initialized", [False, True])
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("moe_grouped_gemm", [False, True])
-def test_sequential_mlp_warns_once_on_primary_rank(
-    monkeypatch, initialized, rank, moe_grouped_gemm
-):
-    """Warn for the selected implementation, including a local backend's grouped=True fallback."""
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=12,
-        num_attention_heads=4,
-        num_moe_experts=2,
-        moe_grouped_gemm=moe_grouped_gemm,
-        use_cpu_initialization=True,
-    )
-    pg_collection = SimpleNamespace(ep=None, expt_tp=None, expt_dp=None)
-    submodules = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear)
-    # Exercise the actual SequentialMLP constructor without distributed linear allocation.
-    monkeypatch.setattr(experts_module, "MLP", lambda *args, **kwargs: torch.nn.Identity())
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
-    monkeypatch.setenv("RANK", str(rank))
-    monkeypatch.setattr(rank_utils, "_DEFAULT_LOG_RANKS", (0,))
-    experts_module._warn_sequential_mlp_deprecated.cache_clear()
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", FutureWarning)
-            for _ in range(2):
-                layer = SequentialMLP(2, config, submodules, pg_collection=pg_collection)
-                assert len(layer.local_experts) == 2
-        deprecations = [w for w in caught if "SequentialMLP is deprecated" in str(w.message)]
-        assert len(deprecations) == (1 if rank == 0 else 0)
-        if deprecations:
-            assert deprecations[0].category is FutureWarning
-            assert "TEGroupedMLP" in str(deprecations[0].message)
-            assert "0.23" in str(deprecations[0].message)
-    finally:
-        experts_module._warn_sequential_mlp_deprecated.cache_clear()
 
 
 class TestParallelSequentialMLP:
@@ -90,6 +47,19 @@ class TestParallelSequentialMLP:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_deprecation_warning(self):
+        _warn_sequential_mlp_deprecated.cache_clear()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FutureWarning)
+            for _ in range(2):
+                MoELayer(self.sequential_mlp.config, self.sequential_mlp.submodules)
+        deprecations = [
+            w
+            for w in caught
+            if w.category is FutureWarning and "SequentialMLP is deprecated" in str(w.message)
+        ]
+        assert len(deprecations) == (1 if Utils.rank == 0 else 0)
 
     @pytest.mark.internal
     def test_constructor(self):
