@@ -3219,6 +3219,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # named here, so it dies with it -- otherwise a request that restarts at a new offset
         # after this reset could still match a carry describing its pre-reset chunk.
         self.chunked_prefill_request_id = -1
+        self.chunked_prefill_reserved_blocks = 0
         self.mtp_metadata.invalidate_chunk_boundary()
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
@@ -3674,6 +3675,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 raise BlockOverflowError(req.request_id)
             self._initialize_mha_value_pages(new_block_ids)
 
+        # Hold back the blocks a partial chunk's remaining prompt needs, including the
+        # completing chunk's draft lookahead (see get_chunked_prefill_reserved_block_count).
+        self.chunked_prefill_reserved_blocks = 0
+        if prefill_chunk_length < req.remaining_prompt_length:
+            prompt_end = req.finished_chunk_token_count + req.remaining_prompt_length
+            prompt_blocks = (prompt_end + self.block_size_tokens - 1) // self.block_size_tokens
+            prompt_blocks += self._mtp_prefill_reserve_blocks(req, req.remaining_prompt_length)
+            self.chunked_prefill_reserved_blocks = max(0, prompt_blocks - overall_required_blocks)
+
         # Track prefix cache hits only after allocation succeeds. Matched blocks
         # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
         # actually skipped after Mamba and minimum-prefill backoff.
@@ -4071,6 +4081,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return matches[0].item()
         return -1
 
+    def get_chunked_prefill_reserved_block_count(self) -> int:
+        """Blocks the partial chunked prefill still needs to finish its prompt.
+
+        A partial prefill keeps its blocks until it finishes and is never preempted,
+        so decode growth must leave these blocks free. Otherwise a decode can take
+        them, pause within the paused-block budget, and leave nothing able to run.
+
+        Return:
+            (int) Reserved block count, or 0 if no chunked prefill is in progress.
+        """
+        if self.chunked_prefill_request_id == -1:
+            return 0
+        return self.chunked_prefill_reserved_blocks
+
     def get_index_of_request(self, request_id: int) -> int:
         """Row of a resident request, paused or active, or -1 when it is not resident."""
         matches = torch.where(self.request_ids[: self.total_request_count] == request_id)[0]
@@ -4212,9 +4236,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if candidate_count > 0:
                 new_block_counts_cumsum = needs_new_block[:candidate_count].cumsum(dim=0)
                 max_new_block_count = int(new_block_counts_cumsum[-1].item())
-                block_count_avail = self.kv_block_allocator.pool_avail
+                reserved = self.get_chunked_prefill_reserved_block_count()
+                block_count_avail = max(0, self.kv_block_allocator.pool_avail - reserved)
                 if max_new_block_count > block_count_avail:
-                    block_count_avail = self.kv_block_allocator.get_allocatable_count()
+                    block_count_avail = max(
+                        0, self.kv_block_allocator.get_allocatable_count() - reserved
+                    )
                 resume_request_count = int(
                     torch.count_nonzero(new_block_counts_cumsum <= block_count_avail).item()
                 )
@@ -4307,7 +4334,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         new_block_counts_by_survivor_count = torch.cat(
             (new_block_counts_by_survivor_count.new_zeros(1), new_block_counts_by_survivor_count)
         )
-        block_count_avail = self.kv_block_allocator.get_allocatable_count()
+        block_count_avail = max(
+            0,
+            self.kv_block_allocator.get_allocatable_count()
+            - self.get_chunked_prefill_reserved_block_count(),
+        )
 
         # Preserve current ordering: evict the smallest right-most suffix whose
         # physical releases let every remaining overflow request resume.
@@ -4445,7 +4476,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         counts = self._next_decode_block_counts(
             slice(self.paused_request_count, self.total_request_count)
         )
-        return int(counts.sum().item()) <= self.kv_block_allocator.get_allocatable_count()
+        return int(counts.sum().item()) <= (
+            self.kv_block_allocator.get_allocatable_count()
+            - self.get_chunked_prefill_reserved_block_count()
+        )
 
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
