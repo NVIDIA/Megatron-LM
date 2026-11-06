@@ -169,15 +169,14 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ### Choose focused behavioral coverage
 
-- **Add the minimum tests needed to protect changed behavior.** Bug fixes
-  should include a focused regression test where practical.
+- **Write succinct, necessary tests only. There is a limited GPU budget.**
+  Protect changed behavior with focused coverage. Bug fixes should include
+  a focused regression test where practical, even when the fix is small or
+  mechanically simple; change size is not a reason to omit regression
+  coverage.
 - **Inspect nearby tests before adding coverage.** Extend or parameterize
   existing tests when appropriate; do not duplicate behavior checks.
   Identical line coverage alone does not establish redundancy.
-- **Do not add tests for trivial changes.** Documentation, formatting,
-  simple re-exports, and straightforward getters/setters generally do not
-  need new unit tests unless they protect a meaningful contract or known
-  regression.
 - **Assert meaningful results against independent expectations.** Do not
   reproduce production logic, assert only mocked return values, or check
   private call sequences without a behavioral reason.
