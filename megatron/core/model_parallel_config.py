@@ -79,6 +79,12 @@ class ModelParallelConfig:
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
+    gtp_remat_nccl_ub: bool = False
+    """Register dense GTP weight-rematerialization symmetric memory with NCCL."""
+
+    gtp_expert_remat_nccl_ub: bool = False
+    """Register expert GTP weight-rematerialization symmetric memory with NCCL."""
+
     tensor_parallel_num_sequence_shards: Optional[int] = None
     """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
 

@@ -2553,9 +2553,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=cfg_container.tokenizer.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4425,7 +4423,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,

@@ -295,7 +295,8 @@ def pretrain_until_warmup(monkeypatch):
     monkeypatch.setattr(training.ft_integration, "setup", lambda: None)
     monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: None)
     monkeypatch.setattr(training, "get_timers", lambda: None)
-    monkeypatch.setattr(training, "set_jit_fusion_options", lambda **kwargs: None)
+    monkeypatch.setattr(training, "get_train_state", lambda: Namespace())
+    monkeypatch.setattr(training, "set_jit_fusion_options", lambda *args, **kwargs: None)
 
     def invoke(args, model_config, tp_group):
         monkeypatch.setattr(training, "get_args", lambda: args)
