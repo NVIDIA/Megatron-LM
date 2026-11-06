@@ -208,14 +208,13 @@ class LogitsSaverHooks:
         min_k: Minimum number of entries kept per token when top-P masking
             is active, regardless of cumulative mass.  Defaults to 1.
         save_dtype: String name of the dtype for top-K log-probabilities on
-            disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
+            disk.  Either ``'fp16'`` or ``'fp32'``.
     """
 
     _max_vocab_size = 2 ** 17  # V1/V2 use 17-bit vocabulary indices.
 
     _DTYPE_MAP = {
         'fp16': torch.float16,
-        'bf16': torch.bfloat16,
         'fp32': torch.float32,
     }
 

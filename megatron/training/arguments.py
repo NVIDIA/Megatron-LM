@@ -3669,7 +3669,7 @@ def _add_logits_distillation_args(parser):
                             'top-P masking is active, regardless of '
                             'cumulative mass. Default: 1.')
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
-                       choices=['fp16', 'bf16', 'fp32'],
+                       choices=['fp16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
     # -- Student loading --
     group.add_argument('--logits-load-dir', type=str, default=None,

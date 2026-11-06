@@ -106,7 +106,7 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 | `--logits-save-top-k` | Number of top log-probs to save per token. Default: `128`. |
 | `--logits-save-top-p` | Optional top-P (nucleus) threshold applied after top-K selection — keeps only the smallest prefix of entries whose cumulative probability mass reaches this value. Must be in `(0, 1]`. Default: `None` (disabled). |
 | `--logits-save-top-p-min-k` | Minimum entries kept per token when top-P masking is active, regardless of cumulative mass. Default: `1`. |
-| `--logits-save-dtype` | On-disk dtype for saved log-probabilities: `fp16`, `bf16`, or `fp32`. Default: `fp16`. |
+| `--logits-save-dtype` | On-disk dtype for saved log-probabilities: `fp16` or `fp32`. Default: `fp16`. |
 | `--freeze-all-layers` | Freezes all model parameters. Not required by `--logits-save-dir`, but recommended for a dedicated teacher-dump run: without it, the LM loss is still computed and gradients still update the model while logits are being saved. |
 
 **Student loading:**

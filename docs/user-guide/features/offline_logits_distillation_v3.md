@@ -263,8 +263,8 @@ rows back at their positions; positions without a row get sentinel targets.
   probability mass outside each row's retained entries, including entries masked by
   top-P: `log(1 - sum(exp(retained)))`. Writers compute it from full-precision log
   probabilities **before** casting values to `save_dtype` (`v3_format.tail_logprob`);
-  computing it afterwards from rounded values can be badly wrong for confident rows
-  (with bf16 values, a 0.1% tail can come out about half its true size). A row whose
+  computing it afterwards from rounded values distorts small tails of confident rows
+  (with fp16 values, a 0.1% tail can be off by about 2%). A row whose
   distribution is fully retained stores `-1000`. Readers reject a stored tail unless
   `sum(exp(retained)) + exp(tail)` is within 0.05 of 1 for every row. Without the field,
   readers derive the tail from the stored values.

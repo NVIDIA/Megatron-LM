@@ -20,7 +20,7 @@ from safetensors.torch import save as save_tensors
 FORMAT_VERSION = 3
 MAX_VOCAB_SIZE = 1 << 24
 LOGPROB_SENTINEL = -1000.0
-# Allowed |retained + tail - 1| per row; generous enough for bf16-rounded values.
+# Allowed |retained + tail - 1| per row; generous enough for fp16-rounded values.
 MASS_TOLERANCE = 0.05
 PADDING_POLICY = "strip"
 ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")

@@ -239,7 +239,7 @@ def test_zstd_checksum_detects_corruption():
 
 def test_members_are_plain_safetensors_inside_zstd():
     payload = {
-        "values": torch.tensor([[-0.5, -1000.0]], dtype=torch.bfloat16),
+        "values": torch.tensor([[-0.5, -1000.0]], dtype=torch.float16),
         "indices_low": torch.tensor([[7, 0xFFFF]], dtype=torch.uint16),
         "loss_mask": torch.tensor([True, False]),
         "empty": torch.zeros(0, dtype=torch.int32),
@@ -264,11 +264,11 @@ def test_tail_is_the_full_precision_mass_outside_retained_entries():
     # A fully retained distribution has no tail; a row with nothing retained is all tail.
     assert codec.tail_logprob(full).item() == codec.LOGPROB_SENTINEL
     assert codec.tail_logprob(torch.full((1, 2), codec.LOGPROB_SENTINEL)).item() == 0
-    # Rounding the head to bf16 first distorts a small tail; the stored fp32 tail does not.
+    # Rounding the head to fp16 first distorts a small tail; the stored fp32 tail does not.
     confident = torch.tensor([[9.0, 5.0, 4.5, 4.0, 3.0, 2.0, 2.0]]).log_softmax(-1)
     exact = confident[:, 6:].logsumexp(-1)  # About 0.09% of the mass.
-    rounded = codec.tail_logprob(confident[:, :6].to(torch.bfloat16))
-    assert (rounded - exact).abs() > 0.5  # Off by about half the tail mass.
+    rounded = codec.tail_logprob(confident[:, :6].to(torch.float16))
+    assert (rounded - exact).abs() > 0.01  # Off by about 2% of the tail mass.
     assert torch.allclose(codec.tail_logprob(confident[:, :6]), exact, atol=1e-4)
 
 
@@ -2073,7 +2073,7 @@ def test_tp_transport_preserves_wide_indices(local_vocab_size, monkeypatch):
     assert values.dtype == torch.float32
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     helpers = legacy_saver_methods()
     full = torch.tensor([[[5.0, 3.0, 1.0, 6.0, 4.0, 2.0]], [[2.0, 4.0, 6.0, 1.0, 3.0, 5.0]]])
@@ -2261,7 +2261,7 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     assert torch.equal(tail, full_tail[rows])
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_tp_target_broadcast_preserves_shape_dtype_and_virtual_stage(
     runtime_environment, monkeypatch, dtype
 ):
