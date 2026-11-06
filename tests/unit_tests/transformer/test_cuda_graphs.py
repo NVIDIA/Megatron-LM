@@ -2660,6 +2660,148 @@ class TestSkipFp8WeightUpdateTensor:
             self._reset_skip_tensor()
 
 
+class _TELinearModule(MegatronModule):
+    """A single TE Linear with high-precision (bf16) parameters."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        import transformer_engine.pytorch as te
+
+        self.linear = te.Linear(
+            config.hidden_size, config.hidden_size, bias=False, params_dtype=torch.bfloat16
+        )
+
+    def my_op(self, x):
+        return self.linear(x)
+
+
+@pytest.mark.skipif(not fp8_available, reason="FP8 not supported on this device")
+class TestInferenceCudaGraphQuantizedWeightRefresh:
+    """In-place weight updates must reach quantized weight casts cached by inference graphs.
+
+    Under graph capture TE caches the quantized cast of each high-precision weight and refreshes
+    it on replay only when its global skip flag is 0. The first graph captured for a module
+    creates the cache (and casts unconditionally); graphs captured later reuse it and only
+    refresh it through the skip flag, so they are the ones that can go stale.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+    def teardown_method(self, method):
+        cuda_graphs_module.delete_cuda_graphs()
+        CudaGraphManager.global_mempool = None
+        Utils.destroy_model_parallel()
+
+    def _build(self, fp8_recipe, disable_parameter_transpose_cache):
+        from transformer_engine.common.recipe import Float8CurrentScaling, MXFP8BlockScaling
+        from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+        if fp8_recipe == "mxfp8" and not check_mxfp8_support()[0]:
+            pytest.skip("MXFP8 not supported on this device")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            inference_rng_tracker=True,
+            fp8="e4m3",
+            fp8_recipe=fp8_recipe,
+            disable_parameter_transpose_cache=disable_parameter_transpose_cache,
+        )
+        module = _TELinearModule(config).cuda().eval()
+        module.cudagraph_manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=1,
+            need_backward=False,
+        )
+        # Graph "a" is captured first, graph "b" second (e.g. two decode batch sizes).
+        inputs = {
+            key: torch.randn(rows, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+            for key, rows in (("a", 32), ("b", 64))
+        }
+        recipe = MXFP8BlockScaling() if fp8_recipe == "mxfp8" else Float8CurrentScaling()
+        return module, inputs, recipe
+
+    @staticmethod
+    def _graph(module, inputs, recipe, key):
+        import transformer_engine.pytorch as te
+
+        with torch.inference_mode(), te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            return module.my_op(inputs[key], cache_key=key).clone()
+
+    @staticmethod
+    def _eager(module, inputs, recipe, key):
+        import transformer_engine.pytorch as te
+
+        with torch.inference_mode(), te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            return module.my_op(inputs[key], eager=True).clone()
+
+    @staticmethod
+    def _update_weight(module):
+        # Refit-style in-place write; `.data` writes do not bump the parameter version counter.
+        module.linear.weight.data.copy_(torch.randn_like(module.linear.weight))
+
+    @pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8"])
+    def test_disable_parameter_transpose_cache_requantizes_every_replay(self, fp8_recipe):
+        """With disable_parameter_transpose_cache (no cached casts in eager mode), every graph
+        replay must use the current weights, without any signal from the caller."""
+        module, inputs, recipe = self._build(fp8_recipe, disable_parameter_transpose_cache=True)
+        for key in ("a", "b"):
+            assert torch.equal(
+                self._graph(module, inputs, recipe, key), self._eager(module, inputs, recipe, key)
+            )
+
+        for _ in range(2):
+            before = self._eager(module, inputs, recipe, "b")
+            self._update_weight(module)
+            out = self._graph(module, inputs, recipe, "b")
+            assert not torch.equal(out, before)
+            assert torch.equal(out, self._eager(module, inputs, recipe, "b"))
+            for key in ("a", "b"):
+                assert torch.equal(
+                    self._graph(module, inputs, recipe, key),
+                    self._eager(module, inputs, recipe, key),
+                )
+        assert TestSkipFp8WeightUpdateTensor._read_skip_tensor().item() == 0.0
+
+    @pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8"])
+    def test_set_is_first_microbatch_refreshes_all_graphs(self, fp8_recipe):
+        """By default casts are cached and refreshed after `set_is_first_microbatch()`. The skip
+        flag is global, so this must hold whichever graph replays first after the update."""
+        module, inputs, recipe = self._build(fp8_recipe, disable_parameter_transpose_cache=False)
+        for key in ("a", "b"):
+            self._graph(module, inputs, recipe, key)
+        # Without an update signal, replays reuse the cached casts.
+        assert TestSkipFp8WeightUpdateTensor._read_skip_tensor().item() == 1.0
+
+        # After each update, `first` is the first graph replayed, then `then` graphs replay
+        # without a new update signal. The third update used to leave graph "b" stale, because
+        # its runner had last seen is_first_microbatch=True while graph "a" had since set the
+        # global skip flag.
+        for first, then in (("b", ()), ("a", ("a",)), ("b", ("b", "a", "b"))):
+            before = self._eager(module, inputs, recipe, first)
+            self._update_weight(module)
+            module.set_is_first_microbatch()
+            out = self._graph(module, inputs, recipe, first)
+            assert not torch.equal(out, before)
+            assert torch.equal(out, self._eager(module, inputs, recipe, first))
+            for key in then:
+                assert torch.equal(
+                    self._graph(module, inputs, recipe, key),
+                    self._eager(module, inputs, recipe, key),
+                )
+        assert TestSkipFp8WeightUpdateTensor._read_skip_tensor().item() == 1.0
+
+
 if __name__ == "__main__":
 
     test = TestParallelTransformerBlockCudagraphs()

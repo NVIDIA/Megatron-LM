@@ -216,6 +216,23 @@ def get_gtp_runner_streams() -> List[torch.cuda.Stream]:
     return _GTP_RUNNER_STREAMS
 
 
+def _get_skip_fp8_weight_update_tensor():
+    """Return TE's FP8 "skip weight refresh" flag tensor (None if not allocated yet)."""
+    if not HAVE_TE_GRAPHS:
+        return None
+    # TE <= 2.14: classmethod getter still exists.
+    if hasattr(FP8GlobalStateManager, "get_skip_fp8_weight_update_tensor"):
+        return FP8GlobalStateManager.get_skip_fp8_weight_update_tensor()
+    # TE >= 2.15: dataclass field.
+    return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
+
+
+# (flag tensor, value) last written by `_set_skip_fp8_weight_update_tensor`. TE's flag is a single
+# process-wide tensor read by every captured graph, so the value last written to it must be
+# tracked globally rather than per runner.
+_LAST_SKIP_FP8_WEIGHT_UPDATE = (None, None)
+
+
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
     """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
 
@@ -223,21 +240,32 @@ def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
     to a dataclass field on FP8GlobalStateManager.quantization_state, with no
     shim. This helper handles both layouts.
     """
+    global _LAST_SKIP_FP8_WEIGHT_UPDATE
     if not HAVE_TE_GRAPHS:
         return
 
     # TE <= 2.14: classmethod setter still exists.
     if hasattr(FP8GlobalStateManager, "set_skip_fp8_weight_update_tensor"):
         FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(skip)
-        return
+    else:
+        # TE >= 2.15: write the dataclass field directly. Allocate the persistent
+        # 1-element CUDA scalar once so its data pointer stays valid across
+        # cudagraph replays, then fill the value in place.
+        qstate = FP8GlobalStateManager.quantization_state
+        if qstate.skip_fp8_weight_update_tensor is None:
+            qstate.skip_fp8_weight_update_tensor = torch.empty(
+                1, dtype=torch.float32, device="cuda"
+            )
+        qstate.skip_fp8_weight_update_tensor.fill_(skip)
+    _LAST_SKIP_FP8_WEIGHT_UPDATE = (_get_skip_fp8_weight_update_tensor(), bool(skip))
 
-    # TE >= 2.15: write the dataclass field directly. Allocate the persistent
-    # 1-element CUDA scalar once so its data pointer stays valid across
-    # cudagraph replays, then fill the value in place.
-    qstate = FP8GlobalStateManager.quantization_state
-    if qstate.skip_fp8_weight_update_tensor is None:
-        qstate.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-    qstate.skip_fp8_weight_update_tensor.fill_(skip)
+
+def _update_skip_fp8_weight_update_tensor(skip: bool) -> None:
+    """Like `_set_skip_fp8_weight_update_tensor`, but skips the write if the flag already holds
+    `skip`, so the flag is only written when its value changes."""
+    tensor, value = _LAST_SKIP_FP8_WEIGHT_UPDATE
+    if tensor is None or value != skip or tensor is not _get_skip_fp8_weight_update_tensor():
+        _set_skip_fp8_weight_update_tensor(skip)
 
 
 # Freeze GC during capture.
@@ -1000,10 +1028,16 @@ class _CudagraphReplayNode(torch.autograd.Function):
                             )
 
             # Note that FP8GlobalStateManager.is_first_fp8_module() is inacccurate as each
-            # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling
-            if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
-                _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
-                runner.fp8_param_cache_updated = is_first_microbatch
+            # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling.
+            # Under graph capture TE caches each quantized cast of a high-precision weight and
+            # refreshes it on replay only when the skip flag is 0. Mirror the eager weight-cache
+            # policy (`_resolve_is_first_microbatch` in extensions/transformer_engine.py):
+            # with `disable_parameter_transpose_cache` weights are re-quantized on every forward,
+            # otherwise on the first microbatch, i.e. after `set_is_first_microbatch()`.
+            if runner.is_first_layer:
+                _update_skip_fp8_weight_update_tensor(
+                    not (is_first_microbatch or runner.disable_parameter_transpose_cache)
+                )
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
@@ -1142,11 +1176,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.is_first_layer = getattr(base_module, "is_first_layer", True)
         self.is_last_layer = getattr(base_module, "is_last_layer", True)
 
-        # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph
-        # replay so that way we only update the value of this flag in FP8GlobalStateManager when
-        # it changes which incurs an HtoD sync
-        if self.is_first_layer:
-            self.fp8_param_cache_updated = None
+        self.disable_parameter_transpose_cache = False
 
         if hasattr(self.base_module, "config") and isinstance(
             self.base_module.config, TransformerConfig
@@ -1159,6 +1189,9 @@ class _CudaGraphRunner(torch.nn.Module):
             )
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.fp4_enabled = self.base_module.config.fp4 is not None
+            self.disable_parameter_transpose_cache = (
+                self.base_module.config.disable_parameter_transpose_cache
+            )
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
             self.gtp_remat = self.base_module.config.gtp_weight_remat_size > 1
