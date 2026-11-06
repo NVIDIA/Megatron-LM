@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import gc
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -137,6 +138,10 @@ def snapshot_process_state():
     state = {
         # Set by every engine, cleared only by suspend(); breaks TestInferenceTopKRouter.
         "inference_mode": (InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows),
+        # Engines freeze the heap in the freeze gc modes and disable automatic collection in
+        # freeze_overlap; only suspend() or shutdown() undoes it, so a test that stops short
+        # leaves gc disabled and its frozen garbage unreclaimable for every later test.
+        "gc": (gc.isenabled(), gc.get_freeze_count()),
         # The first init fixes the tracker type;
         # TestPartialCudaGraph forces TE, TestMTPCudaGraphInference the no-op one.
         "rng_tracker": (
@@ -157,6 +162,13 @@ def snapshot_process_state():
 def restore_process_state(state):
     """Return every item captured by `snapshot_process_state` to its captured value."""
     InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows = state["inference_mode"]
+    gc_enabled, frozen = state["gc"]
+    (gc.enable if gc_enabled else gc.disable)()
+    if gc.get_freeze_count() != frozen:
+        # Unfrozen garbage is only reclaimed by a collection; run it now rather than leave it
+        # for CPython's deferred full collection.
+        gc.unfreeze()
+        gc.collect()
     tp_random._CUDA_RNG_STATE_TRACKER, tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = state[
         "rng_tracker"
     ]
