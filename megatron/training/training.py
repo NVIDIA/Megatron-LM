@@ -2119,6 +2119,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.train_state = train_state
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
@@ -3839,6 +3840,7 @@ def training_log(
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
+    embedding_min_norm_metrics: Dict[str, float] | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -4090,7 +4092,7 @@ def training_log(
 
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
-        indexer_loss_scale = 1 / get_num_microbatches()
+        indexer_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (
                 "DSA indexer logging requires a language-model ProcessGroupCollection"
@@ -4100,7 +4102,7 @@ def training_log(
             # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
             # The core logger still receives explicit groups and does not read MPU globals.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
+                required_pgs=['pp', 'dp', 'dp_cp', 'gtp_remat']
             )
         assert isinstance(
             pg_collection, ProcessGroupCollection
@@ -4230,6 +4232,18 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
+        if embedding_min_norm_metrics is not None:
+            log_string += (
+                " embedding norm floor row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/row-events-rescaled"])} |'
+                " fraction: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/fraction-rescaled"]:.3E} |'
+                " delta RMS: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/projection-delta-rms"]:.3E} |'
+                " zero-row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/zero-row-events"])} |'
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -4313,6 +4327,37 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
             and iteration % cfg.logger.tensorboard_log_interval == 0
         )
     )
+
+
+@torch.no_grad()
+def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
+    """Globally aggregate and reset embedding norm-floor interval statistics."""
+    # [rows scaled, rows checked, squared norm delta, exact-zero rows].
+    local_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
+    leaf_optimizers = (
+        getattr(optimizer, "chained_optimizers", [optimizer]) if optimizer is not None else ()
+    )
+    for current_optimizer in leaf_optimizers:
+        consume_stats = getattr(current_optimizer, "_consume_embedding_min_norm_stats", None)
+        if consume_stats is not None:
+            stats = consume_stats()
+            if stats is not None:
+                local_stats.add_(stats)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+
+    rows_rescaled, rows_checked, norm_delta_squared, zero_rows = local_stats.tolist()
+    fraction_rescaled = rows_rescaled / rows_checked if rows_checked > 0.0 else 0.0
+    norm_delta_rms = (
+        math.sqrt(norm_delta_squared / rows_rescaled) if rows_rescaled > 0.0 else 0.0
+    )
+    return {
+        "embedding-min-norm/row-events-rescaled": rows_rescaled,
+        "embedding-min-norm/fraction-rescaled": fraction_rescaled,
+        "embedding-min-norm/projection-delta-rms": norm_delta_rms,
+        "embedding-min-norm/zero-row-events": zero_rows,
+    }
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -4588,7 +4633,11 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % cfg.logger.log_interval == 0 and args.log_straggler:
+    if (
+        iteration % cfg.logger.log_interval == 0
+        and cfg.straggler is not None
+        and cfg.straggler.log_straggler
+    ):
         # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, cfg.logger.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
@@ -5000,17 +5049,17 @@ def train(
         gc.collect()
 
     # Singleton initialization of straggler detector.
-    if args.log_straggler:
+    if cfg.straggler is not None and cfg.straggler.log_straggler:
         global stimer
         world = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        mmcnt = args.straggler_minmax_count
+        mmcnt = cfg.straggler.straggler_minmax_count
         stimer.configure(
             world,
             rank,
             mmcnt=mmcnt,
-            enabled=not args.disable_straggler_on_startup,
-            port=args.straggler_ctrlr_port,
+            enabled=not cfg.straggler.disable_straggler_on_startup,
+            port=cfg.straggler.straggler_ctrlr_port,
         )
     num_floating_point_operations_since_last_log_event = 0.0
 
@@ -5506,6 +5555,20 @@ def train(
             else:
                 loss_scale = 1.0
             params_norm = None
+            embedding_min_norm_metrics = None
+
+            if (
+                getattr(args, "embedding_min_norm", None) is not None
+                and iteration % cfg.logger.log_interval == 0
+            ):
+                embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
+                writer = get_tensorboard_writer()
+                if writer:
+                    for name, value in embedding_min_norm_metrics.items():
+                        writer.add_scalar(name, value, iteration)
+                wandb_writer = get_wandb_writer()
+                if wandb_writer:
+                    wandb_writer.log(embedding_min_norm_metrics, iteration)
 
             if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
@@ -5541,6 +5604,7 @@ def train(
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                     num_microbatches=scheduled_num_microbatches,
+                    embedding_min_norm_metrics=embedding_min_norm_metrics,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5736,6 +5800,12 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    # Return training's cached blocks to the driver. Evaluation can route tokens very unevenly
+    # across experts, so its allocations do not match the training-shaped cache and would
+    # otherwise map new memory on top of it.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
+
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
@@ -5910,6 +5980,12 @@ def evaluate(
     # Move model back to the train mode.
     for model_module in model:
         model_module.train()
+
+    # Return evaluation's cached blocks to the driver. The caching allocator frees its cache and
+    # retries when its own allocations fail, but NCCL allocates from the driver directly, so a
+    # checkpoint save right after evaluation can otherwise fail to allocate collective buffers.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
