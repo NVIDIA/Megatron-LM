@@ -696,6 +696,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         ), f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
 
         # Register unified recompute hook at block boundary.
+        assert layer._mhc_recompute_context is None, "The layer must clear its context"
         assert manager.checkpoints, "The real mHC layer must register replay work"
         manager.discard_all_outputs_and_register_unified_recompute(output)
 
@@ -1072,27 +1073,40 @@ class TestMHCRecomputeMemorySaving:
 
 
 @pytest.mark.parametrize("has_mlp", [False, True])
-def test_mhc_context_survives_deferred_cuda_graph_runner_call(has_mlp):
-    """Exercise the real runner callable after public entry, without capturing CUDA graphs."""
+def test_mhc_context_is_cleared_before_deferred_cuda_graph_runner_call(has_mlp):
+    """The context is live only inside the public call; a deferred runner call sees none."""
     layer = HyperConnectionTransformerLayer.__new__(HyperConnectionTransformerLayer)
     MegatronModule.__init__(layer, _make_mhc_config(hidden_size=8, num_streams=2))
     layer.residual_write_mlp = torch.nn.Identity() if has_mlp else None
     manager = CheckpointWithoutOutputManager()
     recompute_context = ResidualStreamRecomputeContext(manager, is_block_end=True)
     hidden_states = torch.randn(2, 1, 16)
+    live_views = []
 
-    # Stop after the public entry point, as a deferred capture would do.
-    with patch.object(TransformerLayer, "__call__", return_value="deferred") as base_call:
+    def record_live_views(*args, **kwargs):
+        # Eager execution and local graph recording run here, inside the public call.
+        live_views.append(
+            (layer._residual_recompute_context(), layer._residual_recompute_context(is_mlp=True))
+        )
+        return "recorded"
+
+    with patch.object(TransformerLayer, "__call__", side_effect=record_live_views) as base_call:
         assert (
-            layer(hidden_states, residual_stream_recompute_context=recompute_context) == "deferred"
+            layer(hidden_states, residual_stream_recompute_context=recompute_context) == "recorded"
         )
     assert len(base_call.call_args.args) == 1
     assert base_call.call_args.args[0] is hidden_states
     assert not base_call.call_args.kwargs
-    assert layer._mhc_recompute_context is recompute_context
+    [(attention_context, mlp_context)] = live_views
+    assert attention_context.manager is manager
+    assert attention_context.is_block_end == (not has_mlp)
+    assert mlp_context is recompute_context
+    if not has_mlp:
+        assert attention_context is recompute_context
+    assert layer._mhc_recompute_context is None
 
-    # Only the CUDA event is inert. The runner constructor chooses its real func,
-    # which deliberately bypasses HyperConnectionTransformerLayer.__call__.
+    # Only the CUDA event is inert. The runner constructor chooses its real func, which
+    # bypasses HyperConnectionTransformerLayer.__call__ as deferred local graph capture does.
     with patch("torch.cuda.Event"):
         runner = _CudaGraphRunner(
             base_module=layer,
@@ -1106,19 +1120,15 @@ def test_mhc_context_survives_deferred_cuda_graph_runner_call(has_mlp):
     assert not runner.fwd_graph_input_kwarg_metas
 
     def forward(hidden_states):
-        attention_context = layer._residual_recompute_context()
-        assert attention_context.manager is manager
-        assert attention_context.is_block_end == (not has_mlp)
-        if has_mlp:
-            assert layer._residual_recompute_context(is_mlp=True) is recompute_context
-        else:
-            assert attention_context is recompute_context
+        # The block was finalized before deferred capture, so mHC must run without replay.
+        assert layer._residual_recompute_context() is None
+        assert layer._residual_recompute_context(is_mlp=True) is None
         return hidden_states
 
     with patch.object(layer, "forward", side_effect=forward) as deferred_forward:
         assert runner.func(*base_call.call_args.args, **base_call.call_args.kwargs) is hidden_states
     assert deferred_forward.call_count == 1
-    assert layer._mhc_recompute_context is recompute_context
+    assert layer._mhc_recompute_context is None
 
 
 class TestMHCWithCudaGraph:
@@ -1398,7 +1408,7 @@ class TestMHCWithCudaGraph:
         """The layer consumes the shared context before CUDA-graph argument validation.
 
         The context contains a live manager that CUDA-graph kwargs cannot carry.
-        HyperConnectionTransformerLayer.__call__ retains it on the host instead.
+        HyperConnectionTransformerLayer.__call__ holds it on the layer only while the call runs.
         """
         layer, config = self._create_mhc_layer(cuda_graph_impl="local", cuda_graph_scope="attn")
         layer.train()

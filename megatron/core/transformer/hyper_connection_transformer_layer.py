@@ -137,15 +137,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # mHC has always bypassed this legacy hook, which cannot carry residual state.
         self._legacy_forward_post_mlp = None
 
-        # Keep replay state out of CUDA-graph kwargs and route it through mHC's hooks
-        # in the shared residual-stream schedule. Deferred graph callables bypass __call__,
-        # so retain the context after the public call.
+        # Replay state for the current public call only (set and cleared in __call__). Deferred
+        # local CUDA-graph capture bypasses __call__ after the block was finalized, so it sees
+        # None and runs mHC eagerly, like TE capture.
         self._mhc_recompute_context: ResidualStreamRecomputeContext | None = None
 
     def __call__(self, *args, **kwargs):
         # Remove the context from kwargs because CUDA graphs cannot accept its live manager.
-        # Store it on the layer for the residual hooks; when omitted, store None to avoid
-        # reusing the previous call's replay state.
+        # The residual and norm hooks read it from the layer while this call runs.
         context = kwargs.pop("residual_stream_recompute_context", None)
         legacy_manager = kwargs.pop("mhc_recompute_manager", None)
         if legacy_manager is not None:
@@ -167,7 +166,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 legacy_manager, is_block_end=legacy_manager.is_last_layer_in_recompute_block
             )
         self._mhc_recompute_context = context
-        return super().__call__(*args, **kwargs)
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_context = None
 
     def _residual_recompute_context(
         self, *, is_mlp: bool = False

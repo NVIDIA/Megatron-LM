@@ -125,40 +125,96 @@ def test_dedicated_inherits_dispatch_and_preserves_owner_and_manager_boundaries(
     }
 
 
-def test_dedicated_context_entry_resets_between_calls():
+def _call_with_base(layer, body, *args, **kwargs):
+    """Call the layer, running body as its base call while the replay context is live."""
+    with patch.object(TransformerLayer, "__call__", side_effect=body) as base_call:
+        result = layer(*args, **kwargs)
+    base_call.assert_called_once()
+    assert layer._mhc_recompute_context is None
+    return result
+
+
+def _assert_norm_managers(layer, manager):
+    """Both norm overrides forward the live call's manager to the shared schedule."""
+    with (
+        patch.object(TransformerLayer, "_run_input_layernorm") as attention_norm,
+        patch.object(TransformerLayer, "_pre_mlp_layernorm_and_residual") as mlp_norm,
+    ):
+        layer._run_input_layernorm("input")
+        layer._pre_mlp_layernorm_and_residual("input")
+    attention_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
+    mlp_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
+
+
+def _hook_checker(layer, manager, mlp_context, others=()):
+    """Build a base call that checks the layer's live stage views and norm managers."""
+
+    def check(*args, **kwargs):
+        # A live context belongs to this layer's call only.
+        assert all(other._mhc_recompute_context is None for other in others)
+        attention_context = layer._residual_recompute_context()
+        if manager is None:
+            assert attention_context is None
+        else:
+            assert attention_context.manager is manager and not attention_context.is_block_end
+        assert layer._residual_recompute_context(is_mlp=True) is mlp_context
+        _assert_norm_managers(layer, manager)
+
+    return check
+
+
+def test_dedicated_context_is_live_only_during_the_call():
     layer = _make_layer()
     manager = CheckpointWithoutOutputManager()
     context = ResidualStreamRecomputeContext(manager, is_block_end=True)
     next_context = ResidualStreamRecomputeContext(
         CheckpointWithoutOutputManager(), is_block_end=False
     )
-    with patch.object(TransformerLayer, "__call__", return_value="base") as call:
-        assert layer("input", residual_stream_recompute_context=context, marker=1) == "base"
-        assert layer._residual_recompute_context(is_mlp=True) is context
-        assert call.call_args.kwargs == {"marker": 1}
+    seen = []
 
-        layer("input", residual_stream_recompute_context=next_context)
-        assert layer._residual_recompute_context(is_mlp=True) is next_context
-        assert call.call_args.kwargs == {}
-        layer("input")
-        assert layer._residual_recompute_context(is_mlp=True) is None
-        assert layer._residual_recompute_context() is None
-        layer("input", residual_stream_recompute_context=None)
-        assert call.call_args.kwargs == {}
+    def record(*args, **kwargs):
+        attention_view = layer._residual_recompute_context()
+        seen.append((kwargs, attention_view, layer._residual_recompute_context(is_mlp=True)))
+        return "base"
+
+    result = _call_with_base(
+        layer, record, "input", residual_stream_recompute_context=context, marker=1
+    )
+    assert result == "base"
+    kwargs, attention, mlp = seen.pop()
+    assert kwargs == {"marker": 1} and mlp is context
+    assert attention.manager is manager and not attention.is_block_end
+
+    _call_with_base(layer, record, "input", residual_stream_recompute_context=next_context)
+    assert seen.pop() == ({}, next_context, next_context)
+    for omitted in ({}, {"residual_stream_recompute_context": None}):
+        _call_with_base(layer, record, "input", **omitted)
+        assert seen.pop() == ({}, None, None)
+
+    # A failing call clears its context too.
+    with patch.object(TransformerLayer, "__call__", side_effect=RuntimeError("base failed")):
+        with pytest.raises(RuntimeError, match="base failed"):
+            layer("input", residual_stream_recompute_context=context)
+    assert layer._mhc_recompute_context is None
 
     # The deprecated keyword snapshots the manager's mutable flag into an immutable context.
-    manager.is_last_layer_in_recompute_block = True
-    with patch.object(TransformerLayer, "__call__", return_value="base") as call:
+    for legacy_boundary in (True, False):
+        manager.is_last_layer_in_recompute_block = legacy_boundary
         with pytest.warns(DeprecationWarning, match="mhc_recompute_manager"):
-            assert layer("input", mhc_recompute_manager=manager, marker=1) == "base"
-        assert call.call_args.kwargs == {"marker": 1}
-        manager.is_last_layer_in_recompute_block = False
-        legacy_context = layer._residual_recompute_context(is_mlp=True)
-        assert legacy_context.manager is manager and legacy_context.is_block_end
-        assert not layer._residual_recompute_context().is_block_end
+            result = _call_with_base(
+                layer, record, "input", mhc_recompute_manager=manager, marker=1
+            )
+        manager.is_last_layer_in_recompute_block = not legacy_boundary
+        kwargs, attention, mlp = seen.pop()
+        assert result == "base" and kwargs == {"marker": 1}
+        assert mlp.manager is manager and mlp.is_block_end is legacy_boundary
+        assert attention.manager is manager and not attention.is_block_end
 
+    with patch.object(TransformerLayer, "__call__", side_effect=record) as base_call:
         with pytest.raises(ValueError, match="not both"):
             layer("input", residual_stream_recompute_context=context, mhc_recompute_manager=manager)
+    base_call.assert_not_called()
+    assert not seen and layer._mhc_recompute_context is None
 
 
 def test_dedicated_context_preserves_shared_manager_and_immutable_boundaries():
@@ -168,37 +224,17 @@ def test_dedicated_context_preserves_shared_manager_and_immutable_boundaries():
         ResidualStreamRecomputeContext(manager, is_block_end=False),
         ResidualStreamRecomputeContext(manager, is_block_end=True),
     ]
-    with patch.object(TransformerLayer, "__call__", return_value=None):
-        for layer, context in zip(layers, contexts):
-            layer("input", residual_stream_recompute_context=context)
 
     # The old mutable flag cannot change either layer's boundary or attention's view.
     for legacy_boundary in (True, False):
         manager.is_last_layer_in_recompute_block = legacy_boundary
         for layer, context in zip(layers, contexts):
-            attention_context = layer._residual_recompute_context()
-            assert attention_context.manager is manager and not attention_context.is_block_end
-            assert layer._residual_recompute_context(is_mlp=True) is context
-            with (
-                patch.object(TransformerLayer, "_run_input_layernorm") as attention_norm,
-                patch.object(TransformerLayer, "_pre_mlp_layernorm_and_residual") as mlp_norm,
-            ):
-                layer._run_input_layernorm("input")
-                layer._pre_mlp_layernorm_and_residual("input")
-                attention_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
-                mlp_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
+            others = [other for other in layers if other is not layer]
+            checker = _hook_checker(layer, manager, context, others)
+            _call_with_base(layer, checker, "input", residual_stream_recompute_context=context)
 
-    with patch.object(TransformerLayer, "__call__", return_value=None):
-        layers[0]("input")
-    with (
-        patch.object(TransformerLayer, "_run_input_layernorm") as attention_norm,
-        patch.object(TransformerLayer, "_pre_mlp_layernorm_and_residual") as mlp_norm,
-    ):
-        layers[0]._run_input_layernorm("input")
-        layers[0]._pre_mlp_layernorm_and_residual("input")
-        attention_norm.assert_called_once_with("input", mhc_recompute_manager=None)
-        mlp_norm.assert_called_once_with("input", mhc_recompute_manager=None)
-    assert layers[1]._residual_recompute_context(is_mlp=True) is contexts[1]
+    # Without a context, the stage views are empty and the norms receive no manager.
+    _call_with_base(layers[0], _hook_checker(layers[0], None, None), "input")
 
 
 @pytest.mark.parametrize("stages", ["attention", "mlp", "both"])
@@ -563,8 +599,6 @@ def test_dedicated_shared_schedule_preserves_mhc_policy(
     context = (
         None if manager is None else ResidualStreamRecomputeContext(manager, is_block_end=terminal)
     )
-    with patch.object(TransformerLayer, "__call__", return_value=None):
-        layer("input", residual_stream_recompute_context=context)
     if manager is not None:
         # Actual residual operations must use the immutable layer context, not this flag.
         manager.is_last_layer_in_recompute_block = not terminal
@@ -595,20 +629,26 @@ def test_dedicated_shared_schedule_preserves_mhc_policy(
         )
     initial = torch.randn(2, 1, 32, device=device, requires_grad=True)
     biases = [torch.randn(8, device=device, requires_grad=True) for _ in owners]
-    value = initial
-    with torch.no_grad() if no_grad else nullcontext():
-        for index, (read, write) in enumerate(
-            (
-                (layer._run_input_layernorm, layer._apply_self_attn_bda_step),
-                (layer._pre_mlp_layernorm_and_residual, layer._apply_mlp_bda_step),
-            )
-        ):
-            branch, residual, state = read(value)
-            assert residual is value and state[0] is value and branch.dtype == value.dtype
-            assert state[1] is owner_outputs[-1][1] and state[2] is owner_outputs[-1][2]
-            branch_module = layer.self_attention if index == 0 else layer.mlp
-            branch_output, _ = branch_module(branch)
-            value = write((branch_output, biases[index]), residual, state)
+
+    def run_schedule(*args, **kwargs):
+        value = initial
+        with torch.no_grad() if no_grad else nullcontext():
+            for index, (read, write) in enumerate(
+                (
+                    (layer._run_input_layernorm, layer._apply_self_attn_bda_step),
+                    (layer._pre_mlp_layernorm_and_residual, layer._apply_mlp_bda_step),
+                )
+            ):
+                branch, residual, state = read(value)
+                assert residual is value and state[0] is value and branch.dtype == value.dtype
+                assert state[1] is owner_outputs[-1][1] and state[2] is owner_outputs[-1][2]
+                branch_module = layer.self_attention if index == 0 else layer.mlp
+                branch_output, _ = branch_module(branch)
+                value = write((branch_output, biases[index]), residual, state)
+        return value
+
+    # The residual and norm hooks see the context only while the layer's call runs.
+    value = _call_with_base(layer, run_schedule, "input", residual_stream_recompute_context=context)
     assert [owner for owner, _ in calls] == [owners[0], owners[0], owners[1], owners[1]]
     if manager is not None:
         assert all(context.manager is manager for _, context in calls)
