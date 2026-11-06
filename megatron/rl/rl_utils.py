@@ -97,6 +97,7 @@ from megatron.rl.agent.api import (
 )
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
+from megatron.rl.config import get_rl_run_config
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
@@ -120,6 +121,7 @@ from megatron.rl.sequence_packing_utils import (
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
+from megatron.training.config import InferenceConfigContainer
 from megatron.training.global_vars import (
     get_args,
     get_run_config,
@@ -146,7 +148,7 @@ _INFERENCE_MODEL_IS_PAUSED = False
 
 def inference_model_alloc_context():
     """Return the allocation context for a separate RL inference model."""
-    rl_config = get_run_config().rl
+    rl_config = get_rl_run_config().posttrain.rl
     uvm_level = rl_config.rl_inference_model_unified_memory_level
     if rl_config.rl_offload_inference_model_weights and uvm_level == 0 and HAVE_TORCH_MEMORY_SAVER:
         return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
@@ -158,7 +160,7 @@ def inference_model_alloc_context():
 def refit_inference_model(model, inference_model, args) -> int:
     """Copy training weights and return the number of destination pools."""
 
-    rl_config = get_run_config().rl
+    rl_config = get_rl_run_config().posttrain.rl
     num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
     prepare_swap_model_weights(
         src_model=model,
@@ -221,12 +223,12 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     Gated by the run config's RL section; this assumes the separate inference model was allocated
     with UVM or torch_memory_saver when enabled.
     """
-    cfg = get_run_config()
-    if not cfg.rl.rl_offload_inference_model_weights:
+    rl_cfg = get_rl_run_config().posttrain.rl
+    if not rl_cfg.rl_offload_inference_model_weights:
         return
 
     # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
-    if cfg.rl.rl_inference_model_unified_memory_level != 1:
+    if rl_cfg.rl_inference_model_unified_memory_level != 1:
         _torch_saver_swap_inference_model(to_cpu=to_cpu)
         return
 
@@ -450,7 +452,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -466,7 +468,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
 
         # For sequence packing, break down into compute vs actual tokens
-        if cfg.rl.rl_use_sequence_packing:
+        if rl_cfg.rl_use_sequence_packing:
             runtime_state = get_rl_runtime_state()
             if runtime_state.packing_context is not None:
                 dp_world_size = mpu.get_data_parallel_world_size()
@@ -526,12 +528,12 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     # Log average sequence length. With packing this shows real sequence
     # lengths; without packing it equals seq_length as a baseline.
     packing_ctx = runtime_state.packing_context
-    if cfg.rl.rl_use_sequence_packing and packing_ctx is not None:
+    if rl_cfg.rl_use_sequence_packing and packing_ctx is not None:
         avg_seq_length = get_packing_avg_seq_length(packing_ctx)
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif cfg.logger.log_throughput:
+    elif get_run_config().logger.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string
@@ -689,13 +691,15 @@ def _eager_train_comm_warmup():
     )
 
 
-def get_inference_interface(args, loop, model):
+def get_inference_interface(args, loop, model, inference_container):
+    """Launch the rollout engine described by ``inference_container`` once and reuse it."""
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
         _eager_train_comm_warmup()
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
+                inference_container,
                 host='0.0.0.0',
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
@@ -712,8 +716,8 @@ _ROLLOUT_BANK = None
 def maybe_get_rollout_bank(args):
     """Return the durable rollout bank singleton, creating it on first use."""
     global _ROLLOUT_BANK
-    cfg = get_run_config()
-    if not cfg.rl.rl_durable_rollout_bank:
+    rl_cfg = get_rl_run_config().posttrain.rl
+    if not rl_cfg.rl_durable_rollout_bank:
         logger.debug("Durable rollout bank is disabled; proceeding without it.")
         return None
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
@@ -722,8 +726,8 @@ def maybe_get_rollout_bank(args):
     if _ROLLOUT_BANK is None:
         from megatron.rl.rollout_bank import RolloutBank
 
-        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
-        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
+        bank_dir = rl_cfg.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=rl_cfg.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
     return _ROLLOUT_BANK
@@ -813,7 +817,9 @@ def colocated_inference(
     inference_model: LanguageModule,
     optimizer: MegatronOptimizer,
     n_prompts: int,
-    samples_per_group: int
+    samples_per_group: int,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Swap to the inference engine and collect rollout groups from it.
 
@@ -828,13 +834,13 @@ def colocated_inference(
         Collected rollout groups (on rank 0) and the merged per-request metadata ledger.
     """
     args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
 
-    if cfg.rl.rl_offload_optimizer_during_inference:
+    if rl_cfg.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-            if not cfg.rl.rl_training_cuda_graphs:
+            if not rl_cfg.rl_training_cuda_graphs:
                 with nvtx_range("rl/offload/grad-buffers", time=True):
                     model[0].offload_grad_buffers()
             else:
@@ -852,11 +858,11 @@ def colocated_inference(
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         num_dst_pools = refit_inference_model(model, inference_model, args)
-        if cfg.rl.rl_verify_model_weights_swap and num_dst_pools == 1:
+        if rl_cfg.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
-                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
+                padded_vocab_size=get_run_config().tokenizer.padded_vocab_size,
                 atol=.1,
                 rtol=5e-4,
             )
@@ -875,12 +881,13 @@ def colocated_inference(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
+            inference_container=inference_container,
         ) as inference_interface:
 
             runtime_state = get_rl_runtime_state()
             bank = maybe_get_rollout_bank(args)
             if bank is not None:
-                agent = _get_or_create_rollout_agent(cfg.rl.langrl_env_config)
+                agent = _get_or_create_rollout_agent(rl_cfg.langrl_env_config)
                 if not runtime_state.bank_restored:
                     restored_groups: GroupedRollouts = bank.recover(train_state.resume_iteration)
                     total_restored_groups = agent.set_restored_groups(restored_groups)
@@ -901,16 +908,16 @@ def colocated_inference(
                     n_prompts,
                     samples_per_group,
                     generation_args={
-                        'temperature': cfg.rl.rl_default_temperature,
+                        'temperature': rl_cfg.rl_default_temperature,
                         'max_tokens': args.inference_max_seq_length,
-                        'top_p': cfg.rl.rl_default_top_p,
-                        'top_k': cfg.rl.rl_default_top_k,
+                        'top_p': rl_cfg.rl_default_top_p,
+                        'top_k': rl_cfg.rl_default_top_k,
                     },
-                    filter_groups_with_same_reward=cfg.rl.grpo_filter_groups_with_same_reward,
-                    submission_granularity=cfg.rl.rl_submission_granularity,
-                    consumption_granularity=cfg.rl.rl_consumption_granularity,
+                    filter_groups_with_same_reward=rl_cfg.grpo_filter_groups_with_same_reward,
+                    submission_granularity=rl_cfg.rl_submission_granularity,
+                    consumption_granularity=rl_cfg.rl_consumption_granularity,
                     generation_lag=inference_interface.generation_lag,
-                    env_config_path=cfg.rl.langrl_env_config,
+                    env_config_path=rl_cfg.langrl_env_config,
                     current_iteration=train_state.iteration,
                 )
 
@@ -926,7 +933,7 @@ def colocated_inference(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
-                    if not cfg.rl.rl_partial_rollouts:
+                    if not rl_cfg.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
                     # Record consumption for every group handed to the trainer. On a
                     # rollback (restart before this update) the marker > T rule restores
@@ -952,6 +959,8 @@ def get_environment_rollouts(
     n_prompts: int,
     samples_per_group: int,
     run_inference: bool = True,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Sample environment rollouts from an LLM.
 
@@ -966,8 +975,7 @@ def get_environment_rollouts(
     Returns:
         (GroupedRollouts, per-request metadata ledger)
     """
-    args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
@@ -976,7 +984,8 @@ def get_environment_rollouts(
     request_ledger: dict[str, FinishedRequestRecord] = {}
     if run_inference:
         rollouts, request_ledger = colocated_inference(
-            model, inference_model, optimizer, n_prompts, samples_per_group
+            model, inference_model, optimizer, n_prompts, samples_per_group,
+            inference_container=inference_container,
         )
     elif rank == 0:
         log_single_rank(
@@ -1012,7 +1021,7 @@ def get_environment_rollouts(
             with open(
                 lang_rl_log_dir
                 + f'/rollouts_rank{rank}_iteration{train_state.iteration}_'
-                + f'{Path(cfg.rl.langrl_env_config).stem}.json',
+                + f'{Path(rl_cfg.langrl_env_config).stem}.json',
                 'w',
             ) as f:
                 json.dump([[r.model_dump() for r in group] for group in rollouts], f)
@@ -1336,7 +1345,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
     # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
     # When sequence_packing is disabled, construct a single-sequence default so the CUDA
@@ -1346,7 +1355,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         if sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
-                max_sequences_per_bin=cfg.rl.rl_sequence_packing_max_sequences_per_bin,
+                max_sequences_per_bin=rl_cfg.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
         else:
@@ -2545,11 +2554,12 @@ def prepare_data_for_update(
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
     """
     args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
+    train_cfg = get_run_config().train
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    if args.cuda_graph_impl != "none" and not cfg.rl.rl_training_cuda_graphs:
+    if args.cuda_graph_impl != "none" and not rl_cfg.rl_training_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
@@ -2579,7 +2589,7 @@ def prepare_data_for_update(
         rollouts = [r for g in rollouts for r in g]
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = cfg.train.global_batch_size / cfg.rl.grpo_samples_per_iteration
+        samples_ratio_per_step = train_cfg.global_batch_size / rl_cfg.grpo_samples_per_iteration
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         # Build training rows. A rollout collapses to one combined row when its turns form a
@@ -2607,7 +2617,7 @@ def prepare_data_for_update(
         # The rollout count is data-dependent (oversampling, group filtering), so it need not
         # divide evenly across ranks and microbatches. Pad to the next multiple of
         # (DP size * micro_batch_size) with inert rows (zero advantage, no loss contribution).
-        pad_to_multiple = data_parallel_world_size * cfg.train.micro_batch_size
+        pad_to_multiple = data_parallel_world_size * train_cfg.micro_batch_size
         if pad_n := -len(rows) % pad_to_multiple:
             rows = rows + [PAD_ROW] * pad_n
             advantages = global_advantages = torch.cat(
@@ -2630,7 +2640,7 @@ def prepare_data_for_update(
 
         with nvtx_range("rl/prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rows, tokenizer, args.seq_length, cfg.rl.rl_skip_bos_token,
+                rows, tokenizer, args.seq_length, rl_cfg.rl_skip_bos_token,
             )
         if not has_inference_logprobs:
             inference_logprobs = None
@@ -2649,8 +2659,8 @@ def prepare_data_for_update(
                     inference_logprobs,
                     global_advantages,
                     args.seq_length,
-                    cfg.rl.rl_sequence_packing_max_sequences_per_bin,
-                    cfg.rl.rl_sequence_packing_algo
+                    rl_cfg.rl_sequence_packing_max_sequences_per_bin,
+                    rl_cfg.rl_sequence_packing_algo
                     )
 
                 compute_trajs = packing_context.packed_trajs
@@ -2680,9 +2690,9 @@ def prepare_data_for_update(
                 compute_position_ids = original_position_ids
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=cfg.train.micro_batch_size,
+                    batch_size=train_cfg.micro_batch_size,
                 )
-                logprobs_batch_size = cfg.train.micro_batch_size
+                logprobs_batch_size = train_cfg.micro_batch_size
 
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
@@ -2718,7 +2728,7 @@ def prepare_data_for_update(
                     decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
                     pp_group=pp_group,
-                    is_correction=cfg.rl.rl_inference_logprobs_is_correction,
+                    is_correction=rl_cfg.rl_inference_logprobs_is_correction,
                 )
 
             with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
@@ -2738,7 +2748,7 @@ def prepare_data_for_update(
                     decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
                     pp_group=pp_group,
-                    is_correction=cfg.rl.rl_inference_logprobs_is_correction,
+                    is_correction=rl_cfg.rl_inference_logprobs_is_correction,
                 )
 
                 # logprobs are [b, seq, h] now.
@@ -2791,11 +2801,11 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=cfg.train.global_batch_size,
-                    micro_batch_size=cfg.train.micro_batch_size,
-                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+                    global_batch_size=train_cfg.global_batch_size,
+                    micro_batch_size=train_cfg.micro_batch_size,
+                    decrease_batch_size_if_needed=train_cfg.decrease_batch_size_if_needed,
                )
-                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), cfg.train.micro_batch_size)
+                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), train_cfg.micro_batch_size)
         else:
             with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
@@ -2808,7 +2818,7 @@ def prepare_data_for_update(
                     # We run the above to fill in the inference/train side mismatch stats.
                     # We do the above for logging purposes.
                     # Nullify logprobs if not used in IS correction,
-                    if not cfg.rl.rl_inference_logprobs_is_correction:
+                    if not rl_cfg.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
             with nvtx_range("rl/create-dataloader", time=True):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
@@ -2818,8 +2828,8 @@ def prepare_data_for_update(
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
                     global_batch_size=math.ceil(samples_ratio_per_step*total_rows),
-                    micro_batch_size=cfg.train.micro_batch_size,
-                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+                    micro_batch_size=train_cfg.micro_batch_size,
+                    decrease_batch_size_if_needed=train_cfg.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
@@ -2836,7 +2846,7 @@ def prepare_data_for_update(
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
-                loader = DataLoader(data, batch_size=cfg.train.micro_batch_size)
+                loader = DataLoader(data, batch_size=train_cfg.micro_batch_size)
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
@@ -2855,6 +2865,8 @@ def get_grpo_data_iterator(
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
     optimizer_is_on_cpu: bool = False,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -2898,6 +2910,7 @@ def get_grpo_data_iterator(
         rollouts, fresh_ledger = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
             run_inference=run_inference,
+            inference_container=inference_container,
         )
         # Records persist until their rollout's join pops them (partial rollouts
         # deliver across window boundaries); never-joined residents are accepted.
@@ -2940,6 +2953,8 @@ def evaluate_and_print_results_rl(
     iteration: int,
     write_to_tensorboard: bool = True,
     training_model: Optional[list[LanguageModule]] = None,
+    *,
+    inference_container: InferenceConfigContainer,
 ):
     """Helper function to evaluate and dump results on screen.
 
@@ -2951,7 +2966,7 @@ def evaluate_and_print_results_rl(
             grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     train_state = get_train_state()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
@@ -2964,8 +2979,9 @@ def evaluate_and_print_results_rl(
             model,
             optimizer,
             args.cuda_graph_impl,
-            cfg.rl.rl_offload_optimizer_during_inference,
+            rl_cfg.rl_offload_optimizer_during_inference,
             training_model,
+            inference_container=inference_container,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -2973,17 +2989,17 @@ def evaluate_and_print_results_rl(
             rank = torch.distributed.get_rank()
             if rank == 0:
                 logger.info("Collecting evaluation results...")
-                agent = get_agent(cfg.rl.langrl_env_config)
+                agent = get_agent(rl_cfg.langrl_env_config)
                 request = EvaluationRequest(
                     inference_interface=inference_interface,
-                    num_prompts=cfg.rl.rl_prompts_per_eval,
+                    num_prompts=rl_cfg.rl_prompts_per_eval,
                     validation=True,
                     rank_info=None,
                     generation_args={
-                        'temperature': cfg.rl.rl_default_temperature,
+                        'temperature': rl_cfg.rl_default_temperature,
                         'max_tokens': args.seq_length,
-                        'top_p': cfg.rl.rl_default_top_p,
-                        'top_k': cfg.rl.rl_default_top_k,
+                        'top_p': rl_cfg.rl_default_top_p,
+                        'top_k': rl_cfg.rl_default_top_k,
                     },
                 )
                 with get_nvtx_range()("rl/run-evaluation", time=True):
@@ -3053,7 +3069,7 @@ def evaluate_and_print_results_rl(
                 with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{iteration}_'
-                    + f'{Path(cfg.rl.langrl_env_config).stem}.json',
+                    + f'{Path(rl_cfg.langrl_env_config).stem}.json',
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
@@ -3069,6 +3085,7 @@ def next_rollout_iterator(
     ref_state_dict: Optional[dict],
     rl_config: Any,
     train_config: Any,
+    inference_container: InferenceConfigContainer,
 ) -> Any:
     """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
     assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
@@ -3090,6 +3107,7 @@ def next_rollout_iterator(
             buffered_rollouts=current_iterator,
             is_correction=rl_config.rl_inference_logprobs_is_correction,
             optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+            inference_container=inference_container,
         )
 
 
@@ -3098,6 +3116,7 @@ def evaluate_rollouts(
     model: list,
     inference_model: Optional[list],
     optimizer: Any,
+    inference_container: InferenceConfigContainer,
     prefix: str,
     iteration: int,
     verbose: bool,
@@ -3118,6 +3137,7 @@ def evaluate_rollouts(
         iteration,
         write_to_tensorboard=write_to_tensorboard,
         training_model=training_model,
+        inference_container=inference_container,
     )
 
 
@@ -3222,6 +3242,8 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
+    *,
+    inference_container: InferenceConfigContainer,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -3238,7 +3260,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
-    cfg = get_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     train_state = get_train_state()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
@@ -3260,7 +3282,7 @@ def megatron_rl_inference_mode(
     )
 
     # Switch MoE layers to full CUDA graph capture for inference
-    if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
+    if rl_cfg.rl_training_cuda_graphs and args.num_experts is not None:
         transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()
@@ -3294,7 +3316,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-                if not cfg.rl.rl_training_cuda_graphs:
+                if not rl_cfg.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
                         model_for_grad_offload = (
                             training_model if training_model is not None else model
@@ -3307,10 +3329,10 @@ def megatron_rl_inference_mode(
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
-        if cuda_graph_impl != "none" and not cfg.rl.rl_training_cuda_graphs:
+        if cuda_graph_impl != "none" and not rl_cfg.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
-        inference_interface = get_inference_interface(args, loop, model)
+        inference_interface = get_inference_interface(args, loop, model, inference_container)
         inference_interface.set_generation_epoch(train_state.iteration)
         loop.run_until_complete(inference_interface.resume())
 
@@ -3320,7 +3342,7 @@ def megatron_rl_inference_mode(
         with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
 
-        if cuda_graph_impl != "none" and not cfg.rl.rl_training_cuda_graphs:
+        if cuda_graph_impl != "none" and not rl_cfg.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
 
         # Reset drop_and_pad leaked from inference decode
@@ -3349,7 +3371,7 @@ def megatron_rl_inference_mode(
             )
 
         # Switch MoE layers to partial CUDA graph capture for training
-        if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
+        if rl_cfg.rl_training_cuda_graphs and args.num_experts is not None:
             transition_moe_cudagraphs(lang_module, 'partial')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they

@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Tests for the RL config section and the argument group generated from it."""
+"""Tests for the RL config section, its container, and the argument group generated from it."""
 
 import argparse
 import dataclasses
@@ -13,9 +13,29 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.arguments import _add_rl_args, parse_args, validate_args
-from megatron.training.config import RLConfig, rl_config
+from megatron.rl.config import (
+    add_rl_args,
+    finalize_rl_run,
+    get_rl_run_config,
+    rollout_inference_container_from_args,
+    rollout_model_is_separate,
+    set_rl_run_config,
+    validate_rl_run,
+)
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+)
+from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import (
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+    PosttrainConfigContainer,
+    RLConfig,
+    RunConfigRecord,
+    rl_config,
+)
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.utils import sanitize_dataclass_config
 
@@ -24,7 +44,7 @@ GRPO_4x3 = dict(grpo_prompts_per_step=4, grpo_group_size=3)  # 12 samples per it
 
 
 def _parse(argv):
-    return _add_rl_args(argparse.ArgumentParser()).parse_args(argv)
+    return add_rl_args(argparse.ArgumentParser()).parse_args(argv)
 
 
 def _cli_cases():
@@ -59,15 +79,23 @@ CLI_CASES = _cli_cases()
 
 class TestGeneratedArgumentGroup:
     def test_group_mirrors_dataclass(self):
-        parser = _add_rl_args(argparse.ArgumentParser())
+        parser = add_rl_args(argparse.ArgumentParser())
         assert "rl" in [g.title for g in parser._action_groups]
         ns = parser.parse_args(["--grpo-prompts-per-step", "4", "--grpo-group-size", "3"])
-        # Every init field is a flag with the dataclass default; the derived field is not a flag.
-        assert set(vars(ns)) == {f.name for f in INIT_FIELDS}
+        # Every init field is a flag with the dataclass default; the derived field is not a flag;
+        # the rollout engine's deployment flags ride along in their own group.
+        deployment_dests = {
+            "rl_inference_tensor_model_parallel_size",
+            "rl_inference_pipeline_model_parallel_size",
+            "rl_inference_expert_model_parallel_size",
+            "rl_inference_expert_tensor_model_parallel_size",
+        }
+        assert set(vars(ns)) == {f.name for f in INIT_FIELDS} | deployment_dests
         assert all(getattr(_parse([]), f.name) == getattr(RLConfig(), f.name) for f in INIT_FIELDS)
         # A stray derived value on the namespace is ignored when the section is rebuilt.
         ns.grpo_samples_per_iteration = 999
         assert _default_config_from_args(RLConfig, ns).grpo_samples_per_iteration == 12
+        # The section spells the granularity choices itself (it must not import megatron.rl).
         from megatron.rl import rollout_granularity
 
         for name in ("SubmissionGranularity", "ConsumptionGranularity"):
@@ -184,7 +212,6 @@ RUN = dict(
     load_optim=True,
     save_interval=None,
     exit_interval=None,
-    separate_inference_model=False,
 )
 
 
@@ -215,13 +242,6 @@ RUN = dict(
         (dict(rl_rollout_only=True), dict(train_iters=0), "needs --train-iters"),
         (dict(), dict(skip_train=True), "--rl-rollout-only collects"),
         (dict(rl_rollout_only=True), dict(skip_train=True), "--rl-rollout-only collects"),
-        (
-            dict(
-                rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
-            ),
-            dict(),
-            "requires a separate inference model",
-        ),
     ],
 )
 def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_overrides, match):
@@ -231,32 +251,13 @@ def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_
         cfg.validate_run(**{**RUN, **run_overrides})
 
 
-@pytest.mark.parametrize(
-    "rl_kwargs, context_parallel_size, inference_shards, separate",
-    [
-        (dict(), 1, None, False),
-        # Shards without roles do not by themselves build a separate model.
-        (dict(), 1, "tp=1+tp=1", False),
-        (dict(), 1, "tp=1,role=prefill+tp=1,role=decode", True),
-        (dict(), 2, None, True),
-        (dict(rl_inference_tensor_model_parallel_size=2), 1, None, True),
-        (dict(rl_inference_pipeline_model_parallel_size=2), 1, None, True),
-        (dict(rl_inference_expert_model_parallel_size=2), 1, None, True),
-        (dict(rl_inference_expert_tensor_model_parallel_size=2), 1, None, True),
-    ],
-)
-def test_uses_separate_inference_model(
-    rl_kwargs, context_parallel_size, inference_shards, separate
-):
-    assert (
-        RLConfig(**rl_kwargs).uses_separate_inference_model(
-            context_parallel_size=context_parallel_size, inference_shards=inference_shards
-        )
-        is separate
-    )
+MINIMAL_ARGV = (
+    "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
+    "--seq-length 32 --max-position-embeddings 32"
+).split()
 
 
-def test_validate_run_at_every_call_site():
+def _pretrain_container(micro_batch_size=4, model=None):
     from megatron.core.optimizer import OptimizerConfig
     from megatron.training.config import (
         CheckpointConfig,
@@ -266,6 +267,65 @@ def test_validate_run_at_every_call_site():
         TrainingConfig,
     )
 
+    return PretrainConfigContainer(
+        train=TrainingConfig(micro_batch_size=micro_batch_size, global_batch_size=12),
+        model=model,
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(),
+    )
+
+
+def _inference_container():
+    """A rollout deployment sharing the training model, as the record of a colocated run holds."""
+    return InferenceConfigContainer(model=None, inference=InferenceSetupConfig())
+
+
+def _model_with_layout(**layout):
+    """A model config whose transformer section carries only the parallel layout."""
+    from megatron.training.models.base import ModelConfig
+
+    defaults = dict(
+        cuda_graph_impl="none",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+    )
+
+    @dataclasses.dataclass
+    class LayoutModelConfig(ModelConfig):
+        builder: typing.ClassVar[str] = "tests.layout"
+        transformer: types.SimpleNamespace = dataclasses.field(
+            default_factory=lambda: types.SimpleNamespace(**{**defaults, **layout})
+        )
+
+    return LayoutModelConfig()
+
+
+def _rl_run(pretrain, inference=None, **rl_kwargs):
+    return RunConfigRecord(
+        pretrain=pretrain,
+        inference=_inference_container() if inference is None else inference,
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs)
+        ),
+    )
+
+
+def _record_from_args(args):
+    """What the RL entry point composes from its parsed arguments."""
+    pretrain = pretrain_cfg_container_from_args(args, gpt_config_from_args(args))
+    return RunConfigRecord(
+        pretrain=pretrain,
+        inference=rollout_inference_container_from_args(args, pretrain),
+        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+    )
+
+
+def test_validate_run_from_the_container_and_the_entry_point():
     # Direct: a consistent run passes, the CUDA-graph rule is skipped without a model config, and
     # nothing is checked unless the run is an RL run.
     cfg = RLConfig(
@@ -274,16 +334,6 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "save_interval": 4, "exit_interval": 2})
     cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
     RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
-    # The weight-offload rule needs the deployment: it passes with a separate model and is skipped
-    # when the caller cannot see the inference shards.
-    offload_weights = RLConfig(
-        perform_rl_step=True,
-        rl_offload_inference_model_weights=True,
-        rl_inference_model_unified_memory_level=1,
-        **GRPO_4x3,
-    )
-    offload_weights.validate_run(**{**RUN, "separate_inference_model": True})
-    offload_weights.validate_run(**{**RUN, "separate_inference_model": None})
 
     cfg.validate_run(**{**RUN, "global_batch_size": None})
     # The RL modes: rollout-only with or without the optimizer (either horizon form), and
@@ -304,8 +354,9 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
     RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
 
-    # Through the container: the sections supply the inputs.
-    # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
+    # Through the RL container, against the pretrain container it drives; the pretrain
+    # container itself carries no RL section. The CUDA-graph rule reads the model's transformer
+    # section and is skipped for a model without one.
     from megatron.training.models.base import ModelConfig
 
     @dataclasses.dataclass
@@ -316,81 +367,80 @@ def test_validate_run_at_every_call_site():
     class TransformerModelConfig(ModelConfig):
         builder: typing.ClassVar[str] = "tests.transformer"
         transformer: types.SimpleNamespace = dataclasses.field(
-            default_factory=lambda: types.SimpleNamespace(cuda_graph_impl="none")
+            default_factory=lambda: types.SimpleNamespace(
+                cuda_graph_impl="none", context_parallel_size=1
+            )
         )
 
-    def container(model=None, rl=None, **rl_kwargs):
-        return PretrainConfigContainer(
-            train=TrainingConfig(micro_batch_size=4, global_batch_size=12),
-            model=model,
-            optimizer=OptimizerConfig(),
-            scheduler=SchedulerConfig(),
-            logger=LoggerConfig(),
-            checkpoint=CheckpointConfig(),
-            rl=rl if rl is not None else RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
-        )
+    assert not hasattr(_pretrain_container(), "rl")
 
-    offload_container = container(rl_offload_optimizer_during_inference=True)
-    offload_container.validate()
-    assert not offload_container.ddp.grad_buffer_offload
-    offload_container.rl.rl_offload_optimizer_during_inference = False
-    offload_container.validate()
-    assert not offload_container.ddp.grad_buffer_offload
-    offload_container.rl.rl_offload_optimizer_during_inference = True
-    offload_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    pretrain = _pretrain_container()
+    offload_run = _rl_run(pretrain, rl_offload_optimizer_during_inference=True)
+    validate_rl_run(offload_run)
+    assert not pretrain.ddp.grad_buffer_offload
+    offload_run.posttrain.rl.rl_offload_optimizer_during_inference = False
+    validate_rl_run(offload_run)
+    assert not pretrain.ddp.grad_buffer_offload
+    offload_run.posttrain.rl.rl_offload_optimizer_during_inference = True
+    pretrain.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        offload_container.validate()
+        validate_rl_run(offload_run)
 
-    cuda_graph_container = container(
-        rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
+    pretrain = _pretrain_container()
+    cuda_graph_run = _rl_run(
+        pretrain, rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
     )
-    cuda_graph_container.validate()
-    assert not cuda_graph_container.ddp.grad_buffer_offload
-    cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
-    assert not cuda_graph_container.ddp.grad_buffer_offload
-    explicit_layout_container = container(rl=RLConfig())
-    explicit_layout_container.ddp.grad_buffer_offload = True
-    explicit_layout_container.validate()
-    assert explicit_layout_container.ddp.grad_buffer_offload
-    explicit_layout_container.ddp.fp8_param_gather = True
-    explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    validate_rl_run(cuda_graph_run)
+    assert not pretrain.ddp.grad_buffer_offload
+    finalize_rl_run(cuda_graph_run)
+    assert not pretrain.ddp.grad_buffer_offload
+    pretrain = _pretrain_container()
+    pretrain.ddp.grad_buffer_offload = True
+    explicit_layout_run = RunConfigRecord(
+        pretrain=pretrain,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig()),
+    )
+    validate_rl_run(explicit_layout_run)
+    assert pretrain.ddp.grad_buffer_offload
+    pretrain.ddp.fp8_param_gather = True
+    pretrain.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        explicit_layout_container.validate()
-    container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
-    container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
-    # The container has no inference section, so it leaves the weight-offload rule to validate_args.
-    container(
-        rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
-    ).validate()
+        validate_rl_run(explicit_layout_run)
+    validate_rl_run(_rl_run(_pretrain_container(), rl_training_cuda_graphs=True))
+    validate_rl_run(
+        _rl_run(_pretrain_container(model=TopologyOnlyModelConfig()), rl_training_cuda_graphs=True)
+    )
+    validate_rl_run(
+        RunConfigRecord(
+            pretrain=_pretrain_container(model=TopologyOnlyModelConfig()),
+            inference=_inference_container(),
+            posttrain=PosttrainConfigContainer(rl=RLConfig()),
+        )
+    )
     with pytest.raises(ValueError, match="no CUDA graphs"):
-        container(model=TransformerModelConfig(), rl_training_cuda_graphs=True).validate()
+        validate_rl_run(
+            _rl_run(
+                _pretrain_container(model=TransformerModelConfig()), rl_training_cuda_graphs=True
+            )
+        )
     with pytest.raises(ValueError, match="must be 1"):
-        container(rl_use_sequence_packing=True).validate()
+        validate_rl_run(_rl_run(_pretrain_container(), rl_use_sequence_packing=True))
 
-    # Through validate_args: CLI runs still fail at parse time.
+    # Through the entry point: parsing with the RL group and validate_args both pass; the
+    # containers built from args reject the run.
     dp = int(os.environ.get("WORLD_SIZE", "1"))
     argv = (
-        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
-        f"--micro-batch-size 2 --global-batch-size {2 * dp} --seq-length 32 "
-        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {dp} "
-        "--grpo-group-size 2 --rl-use-sequence-packing"
-    ).split()
-    with patch("sys.argv", argv), pytest.raises(ValueError, match="must be 1"):
-        validate_args(parse_args())
-    argv = (
-        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
-        f"--micro-batch-size 1 --global-batch-size {2 * dp} --seq-length 32 "
-        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {dp} "
-        "--grpo-group-size 2 --rl-offload-inference-model-weights "
-        "--rl-inference-model-unified-memory-level 1"
-    ).split()
-    with (
-        patch("sys.argv", argv),
-        pytest.raises(ValueError, match="requires a separate inference model"),
-    ):
-        validate_args(parse_args())
-    with patch("sys.argv", argv + ["--rl-inference-tensor-model-parallel-size", "1"]):
-        validate_args(parse_args())
+        MINIMAL_ARGV
+        + (
+            f"--micro-batch-size 2 --global-batch-size {2 * dp} --perform-rl-step "
+            f"--grpo-prompts-per-step {dp} --grpo-group-size 2 --rl-use-sequence-packing"
+        ).split()
+    )
+    with patch("sys.argv", argv):
+        args = validate_args(parse_args(extra_args_provider=add_rl_args))
+    with pytest.raises(ValueError, match="must be 1"):
+        validate_rl_run(_record_from_args(args))
     # The retired inference-only spelling points at the new flag, which does not combine with
     # --skip-train; the variant without an optimizer is --rl-rollout-only --no-load-optim.
     argv = (
@@ -400,29 +450,32 @@ def test_validate_run_at_every_call_site():
         "--grpo-group-size 2 --train-iters 10"
     ).split()
     for retired in (["--skip-train"], ["--skip-train", "--rl-rollout-only"]):
-        with (
-            patch("sys.argv", argv + retired),
-            pytest.raises(ValueError, match="--rl-rollout-only collects"),
-        ):
-            validate_args(parse_args())
+        with patch("sys.argv", argv + retired):
+            args = validate_args(parse_args(extra_args_provider=add_rl_args))
+        assert args.no_load_optim  # --skip-train still coerces --no-load-optim with the RL group
+        with pytest.raises(ValueError, match="--rl-rollout-only collects"):
+            validate_rl_run(_record_from_args(args))
     with patch("sys.argv", argv + ["--rl-rollout-only", "--no-load-optim"]):
-        args = validate_args(parse_args())
+        args = validate_args(parse_args(extra_args_provider=add_rl_args))
+    validate_rl_run(_record_from_args(args))
     assert args.rl_rollout_only and args.no_load_optim
 
 
-def test_validate_args_leaves_derived_values_on_the_section():
+def test_entry_point_parse_leaves_the_section_to_the_container():
     dp = int(os.environ.get("WORLD_SIZE", "1"))
     samples = 12 * dp
     argv = (
-        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
-        f"--micro-batch-size 1 --global-batch-size {samples} --seq-length 32 "
-        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {4 * dp} "
-        f"--grpo-group-size 3 --rl-partial-rollouts --rl-max-inflight-requests {2 * samples}"
-    ).split()
+        MINIMAL_ARGV
+        + (
+            f"--micro-batch-size 1 --global-batch-size {samples} --perform-rl-step "
+            f"--grpo-prompts-per-step {4 * dp} --grpo-group-size 3 --rl-partial-rollouts "
+            f"--rl-max-inflight-requests {2 * samples}"
+        ).split()
+    )
     with patch("sys.argv", argv):
-        args = validate_args(parse_args())
-    cfg = _default_config_from_args(RLConfig, args)
-    # validate_args checks the section but does not mirror its derived values onto args.
+        args = validate_args(parse_args(extra_args_provider=add_rl_args))
+    cfg = _record_from_args(args).posttrain.rl
+    # validate_args neither derives nor mirrors RL values; the container does.
     assert not hasattr(args, "grpo_samples_per_iteration")
     assert args.rl_generation_lag is None
     assert (cfg.grpo_samples_per_iteration, cfg.rl_generation_lag) == (samples, 1.0)
@@ -491,16 +544,20 @@ def test_model_setup_uses_owned_ddp_config(
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    # The container, not legacy args, owns the RL policy.
+    # The RL container, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
     args.batch_parallel_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
-    run_config.rl = RLConfig(
-        perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
+    rl_run = RunConfigRecord(
+        pretrain=run_config,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True)
+        ),
     )
     ddp = run_config.ddp
-    finalize = Mock(wraps=run_config.rl.finalize_ddp_config)
-    monkeypatch.setattr(run_config.rl, "finalize_ddp_config", finalize)
+    finalize = Mock(wraps=rl_run.posttrain.rl.finalize_ddp_config)
+    monkeypatch.setattr(rl_run.posttrain.rl, "finalize_ddp_config", finalize)
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -528,11 +585,126 @@ def test_model_setup_uses_owned_ddp_config(
     else:
         run_config.model = None
         monkeypatch.setattr(training, "get_model", construct)
-    # Runtime initialization owns finalization; model setup only consumes its result.
+    # The RL entry point finalizes the layout before runtime initialization; model setup only
+    # consumes its result.
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
+    finalize_rl_run(rl_run)
     run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
             Mock(), model_provider_func=Mock(), cfg_container=run_config
         )
+
+
+def test_global_parser_has_no_rl_flags():
+    """RL flags come from add_rl_args; the global parser rejects them, and its --skip-train
+    normalization has no RL term."""
+    dp = int(os.environ.get("WORLD_SIZE", "1"))
+    argv = MINIMAL_ARGV + f"--micro-batch-size 1 --global-batch-size {dp} --skip-train".split()
+    with patch("sys.argv", argv + ["--perform-rl-step"]), pytest.raises(SystemExit):
+        parse_args()
+    with patch("sys.argv", argv):
+        assert validate_args(parse_args()).no_load_optim is True
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_weight_offload_needs_a_separate_rollout_model(offload):
+    """The RL section's weight offload is checked against the deployment: serving the training
+    model itself leaves nothing to offload; a different layout or disaggregated shards mean a
+    separately built model."""
+    pretrain = _pretrain_container(model=_model_with_layout())
+    rl = dict(rl_offload_inference_model_weights=offload, rl_inference_model_unified_memory_level=1)
+    shared = InferenceConfigContainer(model=pretrain.model, inference=InferenceSetupConfig())
+    assert not rollout_model_is_separate(shared, pretrain.model)
+    if offload:
+        with pytest.raises(ValueError, match="requires a separate inference model"):
+            validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
+    else:
+        validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
+    refit = InferenceConfigContainer(
+        model=_model_with_layout(tensor_model_parallel_size=2), inference=InferenceSetupConfig()
+    )
+    shards = InferenceConfigContainer(
+        model=pretrain.model,
+        inference=InferenceSetupConfig(inference_shards="tp=1,role=prefill+tp=1,role=decode"),
+    )
+    for deployment in (refit, shards):
+        assert rollout_model_is_separate(deployment, pretrain.model)
+        validate_rl_run(_rl_run(pretrain, inference=deployment, **rl))
+
+
+def test_rl_run_config_is_a_singleton():
+    with pytest.raises(AssertionError, match="not initialized"):
+        get_rl_run_config()
+    record = RunConfigRecord(
+        pretrain=_pretrain_container(),
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig()),
+    )
+    set_rl_run_config(record)
+    assert get_rl_run_config() is record
+    with pytest.raises(AssertionError, match="already initialized"):
+        set_rl_run_config(record)
+    with pytest.raises(AssertionError, match="inference and posttrain members"):
+        set_rl_run_config(RunConfigRecord(pretrain=_pretrain_container()))
+
+
+def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
+    """Every process writes a RunConfigRecord whose members are its containers: a training run
+    records `pretrain`, an inference run `inference`, an RL run adds `inference` and `rl`; absent
+    members stay out of the document; any record plus the missing members is the larger run's
+    record; and a legacy flat record still yields its sections."""
+    import yaml
+
+    from megatron.training import checkpointing, global_vars
+    from megatron.training.utils.checkpoint_utils import run_config_sections
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
+    pretrain = _pretrain_container()
+    global_vars.set_run_config(pretrain)
+    assert global_vars.get_run_config_record() is None
+    # A plain training run records its run config under `pretrain`, an inference run under
+    # `inference`; the writer wraps what the process registered.
+    plain = checkpointing._run_config_record()
+    assert isinstance(plain, RunConfigRecord) and plain.pretrain is pretrain
+    assert set(plain.to_dict()) == {"_target_", "pretrain"}
+    inference_record = RunConfigRecord.wrap(_inference_container()).to_dict()
+    assert set(inference_record) == {"_target_", "inference"}
+
+    record = RunConfigRecord(
+        pretrain=pretrain,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig(**GRPO_4x3)),
+    )
+    set_rl_run_config(record)
+    assert global_vars.get_run_config() is pretrain  # the loop keeps the pretrain container
+    assert checkpointing._run_config_record() is record
+
+    path = str(tmp_path / "run_config.yaml")
+    record.to_yaml(path)
+    rebuilt = RunConfigRecord.from_yaml(path)
+    # The pretrain member's own YAML round trip turns one tuple field into a list (its own
+    # serialization); the document and the RL-side members round-trip exactly.
+    assert rebuilt.to_dict() == record.to_dict()
+    assert (rebuilt.posttrain, rebuilt.inference) == (record.posttrain, record.inference)
+    with open(path) as f:
+        document = yaml.safe_load(f)
+    assert document["_target_"] == "megatron.training.config.container.RunConfigRecord"
+    assert set(document) == {"_target_", "pretrain", "inference", "posttrain"}
+    assert document["pretrain"]["_target_"].endswith(".PretrainConfigContainer")
+    assert document["posttrain"]["_target_"].endswith(".PosttrainConfigContainer")
+    assert document["posttrain"]["rl"]["_target_"] == "megatron.training.config.rl_config.RLConfig"
+    # Symmetry: an inference run's record plus the training and RL members is the RL record.
+    as_dict = record.to_dict()
+    grown = RunConfigRecord.from_dict(
+        {**inference_record, "pretrain": as_dict["pretrain"], "posttrain": as_dict["posttrain"]}
+    )
+    assert grown.to_dict() == as_dict
+    # Readers that look sections up by name get the pretrain member of a record, nothing from a
+    # record without one, and a legacy flat record as it is.
+    assert run_config_sections(document) is document["pretrain"]
+    assert run_config_sections(inference_record) is None
+    assert run_config_sections(document["pretrain"]) is document["pretrain"]
+    assert run_config_sections(None) is None

@@ -9,12 +9,15 @@ import pytest
 
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
+from megatron.rl.config import finalize_rl_run, validate_rl_run
 from megatron.training import global_vars
 from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
+    RunConfigRecord,
 )
 from megatron.training.models import GPTModelConfig
 
@@ -33,25 +36,36 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         else run_config
     )
     cfg.model = model
+    rl_run = None
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        cfg.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        # The RL run's root validates the RL section against the run and derives its DDP layout.
+        rl_run = RunConfigRecord(
+            pretrain=cfg,
+            inference=InferenceConfigContainer(model=None, inference=InferenceSetupConfig()),
+            posttrain=PosttrainConfigContainer(
+                rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+            ),
+        )
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
         cfg.validate()
+        if rl_run is not None:
+            validate_rl_run(rl_run)
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     rng_finalize = Mock(wraps=cfg.rng.finalize_model_config)
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
+    if rl_run is not None:
+        finalize_rl_run(rl_run)
+        assert cfg.ddp.grad_buffer_offload
     cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker
     assert transformer.use_te_rng_tracker
-    if not inference:
-        assert cfg.ddp.grad_buffer_offload
     after = copy.deepcopy(cfg.to_dict())
     cfg.validate()
     cfg.finalize()
@@ -68,18 +82,25 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+    rl_run = RunConfigRecord(
+        pretrain=run_config,
+        inference=InferenceConfigContainer(model=None, inference=InferenceSetupConfig()),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        ),
+    )
     run_config.ddp.fp8_param_gather = True
     run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
     before = copy.deepcopy(run_config.to_dict())
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        run_config.finalize()
+        finalize_rl_run(rl_run)
     assert run_config.to_dict() == before
     assert not run_config._finalized
     assert not run_config.rng.te_rng_tracker
 
     # A rejected configuration remains editable and can be finalized after correction.
     run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+    finalize_rl_run(rl_run)
     run_config.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
