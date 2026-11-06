@@ -38,18 +38,16 @@ logit_layers: ["output_layer", "output_layer"]
 intermediate_layer_pairs:
   - ["decoder.layers.0.input_layernorm", "decoder.layers.0.input_layernorm"]
   - ["decoder.final_layernorm", "decoder.layers.30.input_layernorm"]
-skip_lm_loss: true
-kd_loss_scale: 10.0
+kd_loss_alpha: 1.0
 logit_kl_temperature: 1.0
 ```
 
 * `logit_layers` defines the names of the student and teacher submodules, respectively, whose outputs are the logits.
 * `intermediate_layer_pairs` defines the potentially multiple – or zero – pairs of intermediate activation layers to also perform loss on.
-* `skip_lm_loss` decides whether or not to compute and combine the original training LM loss with the KD loss.
-* `kd_loss_scale` will scale the KD loss before adding it to the LM loss, if `skip_lm_loss` is `False`.
+* `kd_loss_alpha` (in [0, 1]) weights the KD loss in `(1 - kd_loss_alpha) * lm_loss + kd_loss_alpha * kd_loss`. At the default `1.0` the LM loss is skipped entirely.
 * `logit_kl_temperature` is the temperature smoothing factor to multiply the logits by prior to softmax and loss.
 
-Without this configuration file, the default logits-only distillation with scale and temperatures of 1.0 will be performed.
+Without this configuration file, the default logits-only distillation with `kd_loss_alpha` and temperature of 1.0 will be performed.
 
 ### Training
 
