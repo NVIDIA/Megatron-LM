@@ -54,6 +54,7 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -243,7 +244,7 @@ def initialize_megatron(
             # VLM overlap uses the padded text+image decoder length.
             sequence_length = (
                 args.decoder_seq_length
-                if getattr(args, "decoder_tp_comm_overlap", False)
+                if isinstance(cfg.model, LLaVAModelConfig)
                 else args.seq_length
             )
             _initialize_tp_communicators(
