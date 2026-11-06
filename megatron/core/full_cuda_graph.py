@@ -4,6 +4,7 @@
 
 import gc
 import logging
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import Optional
 
@@ -67,13 +68,39 @@ class FullIterationGradCopy:
     Replay must stay ordered: forward/backward, gradient conversion, then the
     eager optimizer update. Retained gradient handles are rebound after zero_grad;
     their values may be overwritten by the next forward/backward replay.
+
+    The training graph is referenced weakly so that its owner, ``FullCudaGraphWrapper``,
+    alone decides when it is freed. A live graph keeps the NCCL resources of the
+    collectives it captured; a strong reference from the optimizer kept the graph alive
+    after it was deleted, and ``torch.distributed.destroy_process_group()`` then hung
+    at the end of training.
     """
 
     def __init__(self) -> None:
         self.graph = None
-        self.forward_backward_graph = None
+        self._forward_backward_graph_ref = None
         self.outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.source_signature = None
+
+    @property
+    def forward_backward_graph(self) -> Optional[torch.cuda.CUDAGraph]:
+        """The training graph the conversion graph was captured for, while it is alive."""
+        if self._forward_backward_graph_ref is None:
+            return None
+        return self._forward_backward_graph_ref()
+
+    def reset(self) -> None:
+        """Drop the conversion graph, its retained gradients and the training-graph reference."""
+        self.graph = None
+        self._forward_backward_graph_ref = None
+        self.outputs = []
+        self.source_signature = None
+
+    def _is_built_for(self, fb_graph: Optional[torch.cuda.CUDAGraph]) -> bool:
+        """Whether the conversion state belongs to ``fb_graph``; a freed graph never matches."""
+        if self._forward_backward_graph_ref is None:
+            return fb_graph is None
+        return fb_graph is not None and self._forward_backward_graph_ref() is fb_graph
 
     @torch.no_grad()
     def copy(
@@ -104,14 +131,13 @@ class FullIterationGradCopy:
             return
         assert not torch.cuda.is_current_stream_capturing()
         fb_graph = FullCudaGraphWrapper.cuda_graph.get("training")
-        if self.forward_backward_graph is not fb_graph:
+        if not self._is_built_for(fb_graph):
             # reset_cuda_graph() can discard the training graph without rebuilding
             # the optimizer. Conversion state belongs to that graph's pool and must
             # be rebuilt if training is warmed up or captured again.
-            self.graph = None
-            self.outputs = []
-            self.source_signature = None
-            self.forward_backward_graph = fb_graph
+            self.reset()
+            if fb_graph is not None:
+                self._forward_backward_graph_ref = weakref.ref(fb_graph)
         stream = get_shared_capture_stream()
         if fb_graph is None:
             caller = torch.cuda.current_stream()

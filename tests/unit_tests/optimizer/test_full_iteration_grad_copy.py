@@ -3,6 +3,8 @@
 """Gradient values, update order, storage aliasing and construction gating of the full-CG
 gradient-conversion graph."""
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -236,6 +238,47 @@ def test_gradient_copy_rebuilds_after_training_graph_reset(monkeypatch):
     # A rank without parameters in this optimizer has nothing to capture: plain eager call.
     master.grad = None
     copier.copy(copy, [])
+    torch.testing.assert_close(master.grad, source.float())
+
+
+def test_gradient_copy_does_not_keep_training_graph_alive(monkeypatch):
+    """Deleting the training graph frees it even after a conversion graph was captured for it.
+
+    A live training graph keeps the NCCL resources of its captured collectives, so a copier
+    that held it made torch.distributed.destroy_process_group() hang at the end of training.
+    """
+    Utils.initialize_distributed()
+    monkeypatch.setattr(FullCudaGraphWrapper, "cuda_graph", {"training": None})
+    copier = FullIterationGradCopy()
+    source = torch.full((1024,), 3.0, device="cuda", dtype=torch.bfloat16)
+    model = torch.nn.Parameter(torch.empty_like(source), requires_grad=False)
+    model.main_grad = source
+    master = torch.nn.Parameter(torch.zeros(1024, device="cuda"))
+
+    def copy():
+        master.grad = source.float()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=get_shared_capture_stream()):
+        source.fill_(3.0)
+    FullCudaGraphWrapper.cuda_graph["training"] = graph
+    graph.replay()
+    copier.copy(copy, [([model], [master])])
+    assert copier.graph is not None
+    assert copier.forward_backward_graph is graph
+
+    graph_ref = weakref.ref(graph)
+    FullCudaGraphWrapper.cuda_graph["training"] = None
+    del graph
+    gc.collect()
+    assert graph_ref() is None
+    assert copier.forward_backward_graph is None
+
+    # State captured for the freed graph is dropped; without a training graph the copy is eager.
+    master.grad = None
+    copier.copy(copy, [([model], [master])])
+    assert copier.graph is None
+    assert copier.outputs == []
     torch.testing.assert_close(master.grad, source.float())
 
 
