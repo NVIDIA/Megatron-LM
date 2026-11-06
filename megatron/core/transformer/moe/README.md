@@ -110,17 +110,16 @@ We have provided some pre-defined config to train the popular MoE models in the 
 
 ### Default backends and SequentialMLP deprecation
 
-Starting in Megatron Core 0.21, the default training token dispatcher is `alltoall`, and
-`moe_grouped_gemm=True` selects grouped experts on the Transformer Engine backend. Existing
+The default training token dispatcher is `alltoall`, and `moe_grouped_gemm=True` selects grouped
+experts on the Transformer Engine backend. Existing
 `--moe-grouped-gemm` launch arguments remain valid. To explicitly use the previous choices,
 pass `--moe-token-dispatcher-type allgather` and `--no-moe-grouped-gemm` (also spelled
 `--disable-moe-grouped-gemm`). Python callers can set `moe_grouped_gemm=False`.
 
-`SequentialMLP` is deprecated in 0.21 and will be removed no earlier than 0.23. Constructing it
-emits a `FutureWarning` once on the primary rank. It remains available during the migration
-period for local-backend, checkpoint, and per-expert post-training workflows. The local backend
-still selects `SequentialMLP` even with `moe_grouped_gemm=True`; migrate to the Transformer Engine
-backend to use `TEGroupedMLP`. Grouped experts require `add_bias_linear=False` or
+`SequentialMLP` is deprecated. Constructing it emits a `FutureWarning` once on the primary rank.
+It remains available for local-backend, checkpoint, and per-expert post-training workflows.
+The local backend still selects `SequentialMLP` even with `moe_grouped_gemm=True`; migrate to
+the Transformer Engine backend to use `TEGroupedMLP`. Grouped experts require `add_bias_linear=False` or
 `bias_dropout_fusion=False` when using linear biases.
 
 With `--use-checkpoint-args`, an explicitly saved `moe_grouped_gemm` setting is still restored;
