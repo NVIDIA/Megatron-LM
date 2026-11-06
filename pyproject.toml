@@ -123,9 +123,10 @@ dev = [
 
 inference = [
     "torch-memory-saver",
-    # Minimum versions from NGC PyTorch 26.09 (excluding FA2's local build suffix).
-    "flash-attn>=2.8.3.post1; sys_platform == 'linux'",
-    "flash-attn-4[cu13]>=4.0.0b24; sys_platform == 'linux'",
+    # FA2 matches NGC PyTorch 26.09, excluding its local build suffix.
+    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
+    # FA4's image version (b24) pins CUTLASS below cuDNN Frontend's requirement.
+    "flash-attn-4[cu13]==4.0.0b36; sys_platform == 'linux'",
     "tilelang; sys_platform == 'linux'",
 ]
 
