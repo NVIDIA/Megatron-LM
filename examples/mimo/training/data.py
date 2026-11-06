@@ -42,7 +42,30 @@ def add_mimo_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     from examples.mimo.training.energon_provider import add_energon_data_args
 
     add_mock_data_args(parser, dataset_providers=("mock", "energon"))
-    return add_energon_data_args(parser)
+    add_energon_data_args(parser)
+    prepared = parser.add_argument_group("prepared BinIdx MIMO data")
+    prepared.add_argument(
+        "--energon-eos-token-id",
+        type=int,
+        default=None,
+        help="Existing terminal EOS ID in prepared documents; required by prepared_binidx:make_config. "
+        "No tokenization or EOS replacement is performed.",
+    )
+    prepared.add_argument(
+        "--energon-pad-token-id",
+        type=int,
+        default=None,
+        help="Padding ID for prepared fixed-length rows; required by prepared_binidx:make_config. "
+        "Padding labels are ignored; this may equal EOS but must differ from the image sentinel.",
+    )
+    prepared.add_argument(
+        "--energon-image-token-budget",
+        type=int,
+        default=None,
+        help="Maximum emitted visual embeddings per image for prepared_binidx:make_config. "
+        "Excludes source end/break tokens, must fit --seq-length, and bounds dynamic resizing.",
+    )
+    return parser
 
 
 def _dynamic_patch_grid(num_patches: int, require_even: bool) -> tuple[int, int]:
