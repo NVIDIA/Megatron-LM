@@ -1,9 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import io
+import json
 import logging
 import os
 import pathlib
+import shlex
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -145,6 +148,7 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
+@click.option("--functional-coverage", is_flag=True, help="Collect per-workload Python coverage")
 @click.option(
     "--unit-testmon-mode",
     type=click.Choice(["full", "enforce", "preselected", "baseline"]),
@@ -185,6 +189,7 @@ def main(
     unit_testmon_mode: str = "full",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
+    functional_coverage: bool = False,
 ):
     cadence_arg = cadence or None
 
@@ -214,7 +219,39 @@ def main(
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
 
-    inline_script = run.Script(inline=workload.spec["script"])
+    script = workload.spec["script"]
+    if functional_coverage:
+        if model == "unit-tests":
+            raise click.UsageError("--functional-coverage is only for functional workloads")
+        coverage_dir = pathlib.Path("assets_dir/functional-coverage")
+        coverage_dir.mkdir(parents=True, exist_ok=True)
+        (coverage_dir / "workload.sh").write_text(script)
+        metadata = {
+            "model": model,
+            "test_case": test_case,
+            "platform": platform,
+            "environment": environment,
+            "scope": scope,
+            "cadence": cadence,
+            "n_repeat": n_repeat,
+            "lightweight": enable_lightweight_mode,
+            "container_image": container_image,
+            "source_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "nodes": workload.spec["nodes"],
+            "gpus_per_node": workload.spec["gpus"],
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        }
+        (coverage_dir / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        container_dir = "/opt/megatron-lm/assets_dir/functional-coverage"
+        script = (
+            "cd /opt/megatron-lm\n"
+            "uv run --no-sync python tests/test_utils/python_scripts/functional_coverage.py "
+            f"--script {shlex.quote(container_dir + '/workload.sh')} "
+            f"--metadata {shlex.quote(container_dir + '/manifest.json')} "
+            f'--output "{container_dir}/attempt-${{FUNCTIONAL_COVERAGE_ATTEMPT}}"\n'
+        )
+    inline_script = run.Script(inline=script)
 
     artifacts = []
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
@@ -267,6 +304,8 @@ def main(
 
     n_attempts = 0
     while n_attempts < 3:
+        if functional_coverage:
+            executor.env_vars["FUNCTIONAL_COVERAGE_ATTEMPT"] = str(n_attempts)
         tee_buffer = _ThreadSafeBuffer()
         original_stdout = sys.stdout
         original_stderr = sys.stderr
