@@ -2702,7 +2702,9 @@ def test_snapshot_live_requests(replay):
     engine.context = types.SimpleNamespace(
         request_ids=object(),  # resident: the bookkeeping tensors exist (not suspended)
         kv_block_allocator=types.SimpleNamespace(
-            block_routing=routing if replay else {}, reconstruct_routing_from_blocks=reconstruct
+            routing_replay=types.SimpleNamespace(
+                has_data=mock.Mock(return_value=replay), reconstruct_routing_from_blocks=reconstruct
+            )
         ),
         get_index_of_request={1: 2, 2: 0, 3: 1, 5: 3, 6: -1}.__getitem__,
         get_committed_kv_block_ids=[[20, 21], [30], [40], [50]].__getitem__,
@@ -3541,7 +3543,8 @@ def _engine_for_resumes(max_sequence_length=32):
     engine.finished_request_count = 0
     engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = set(), set()
     engine.controller.terminating_token_ids.return_value = frozenset()
-    engine.context.kv_block_allocator.block_routing = {}  # no routing replay: snapshots read none
+    # No routing replay: snapshots read no routing.
+    engine.context.kv_block_allocator.routing_replay.has_data.return_value = False
     engine._loop = asyncio.new_event_loop()
     return engine
 
