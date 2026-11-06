@@ -2597,6 +2597,11 @@ class MultiTokenPredictionLayer(MegatronModule):
     https://arxiv.org/pdf/2412.19437.pdf
     """
 
+    # Class-level default so layers assembled without ``__init__`` (unit tests build them
+    # with ``__new__`` and a minimal config namespace) take the plain MTP forward path;
+    # ``__init__`` overrides it from ``config.enable_attention_residuals``.
+    attn_res_enabled: bool = False
+
     def __init__(
         self,
         config: TransformerConfig,
