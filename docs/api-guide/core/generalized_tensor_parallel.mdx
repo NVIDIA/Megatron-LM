@@ -84,7 +84,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
 
 ## 1. Features
 
-### 1.1 Fine-grained, per-weight materialization & gradient reduction
+### 1.1 Fine-grained, per-weight materialization and gradient reduction
 
 Each weight is sharded 1/N across a GTP_remat group along `out_features`, stored as a `GTPShardedParam` subclass of `nn.Parameter`. Materialization and gradient reduction are both **per-weight, per-call** — not per-model or per-module:
 
