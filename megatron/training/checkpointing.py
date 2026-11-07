@@ -1738,7 +1738,9 @@ def maybe_save_dataloader_state(
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
     torch.distributed.barrier(group=data_parallel_group)
 
-    if dp_rank == 0:
+    # Directory creation may not be visible across node-local filesystem mounts.
+    # Each writing rank must ensure its own parent directory exists.
+    if writes_state_file:
         ensure_directory_exists(data_state_save_path)
 
     torch.distributed.barrier(group=data_parallel_group)
