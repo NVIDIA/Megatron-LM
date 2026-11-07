@@ -147,6 +147,13 @@ class DistributedInitConfig:
     use_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
     """If enabled, create Gloo process groups for communications."""
 
+    share_process_groups: bool = True
+    """Share process groups between compatible parallelism roles within one initialization.
+    Disable with --no-share-process-groups to create separate communicators. This setting
+    must match on every rank. Sharing can change gradient-norm summation order, so runs
+    with sharing enabled and disabled need not be bit-identical.
+    """
+
     use_sharp: bool = False
     """Set the use of SHARP for the collective communications of data-parallel process groups.
     When `True`, run barrier within each data-parallel process group,
