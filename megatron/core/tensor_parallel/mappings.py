@@ -3,12 +3,16 @@
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,
 )
 
+from .batch_invariant_reduction import batch_invariant_all_reduce, batch_invariant_reduce_scatter
 from .utils import split_tensor_along_last_dim
 
 try:
@@ -35,6 +39,10 @@ def _reduce(input_, group):
     # Note: If input_ is contiguous, it is mutated in-place.
     # If not, a new contiguous tensor is created and returned;
     # callers must use the returned value to ensure the reduced result is captured.
+    if is_batch_invariant_mode_enabled():
+        # Sum in rank order, so a token's result does not depend on its position.
+        input_, _ = batch_invariant_all_reduce(input_, group)
+        return input_
     input_ = input_.contiguous()
     torch.distributed.all_reduce(input_, group=group)
 
@@ -187,7 +195,11 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_reduce_scatter_func(output, input_.contiguous(), group=group)
+        if is_batch_invariant_mode_enabled():
+            # Sum in rank order, so a token's result does not depend on its chunk.
+            batch_invariant_reduce_scatter(input_, group, output=output)
+        else:
+            dist_reduce_scatter_func(output, input_.contiguous(), group=group)
     else:
         rank = group.rank()
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
@@ -198,7 +210,12 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             )
         else:
             output = torch.empty_like(input_tensor_list[rank])
-        torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
+        if is_batch_invariant_mode_enabled():
+            batch_invariant_reduce_scatter(
+                input_, group, output=output, input_split_sizes=input_split_sizes
+            )
+        else:
+            torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
     return output
 
 
@@ -706,6 +723,10 @@ def async_reduce_scatter_along_first_dim(input_, group=None):
     handle = _AsyncCollectiveHandle()
     if group.size() == 1:
         handle.tensor = input_
+        return handle
+    if is_batch_invariant_mode_enabled():
+        # The rank-ordered reduce-scatter completes in stream order; wait() just returns it.
+        handle.tensor, _ = batch_invariant_reduce_scatter(input_, group)
         return handle
 
     dim_size = list(input_.size())

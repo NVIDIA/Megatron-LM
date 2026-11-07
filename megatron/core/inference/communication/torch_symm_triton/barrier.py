@@ -69,9 +69,13 @@ def symm_mem_sync(
     world_size: tl.constexpr,
     hasPreviousMemAccess: tl.constexpr = False,
     hasSubsequentMemAccess: tl.constexpr = False,
+    padded_world_size: tl.constexpr = None,
 ):
     """
     Synchronizes blocks with matching block_id across participating devices.
+
+    tl.arange needs a power of two: a caller whose world_size may not be one passes
+    padded_world_size, a power of two >= world_size, and the extra lanes are masked.
 
     Note: the function itself is not a system level barrier/fence. It is a
     building block for expressing different synchronization patterns.
@@ -102,9 +106,14 @@ def symm_mem_sync(
         block_id = get_flat_bid()
     flat_tid = get_flat_tid()
 
-    remote_ranks = tl.arange(0, world_size)
+    if padded_world_size is None:
+        remote_ranks = tl.arange(0, world_size)
+    else:
+        remote_ranks = tl.arange(0, padded_world_size)
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
+    remote_signal_pad_addrs = tl.load(
+        signal_pad_ptrs + remote_ranks, mask=remote_ranks < world_size, other=0
+    ).to(tl.pointer_type(tl.uint32))
     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
 
     local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))

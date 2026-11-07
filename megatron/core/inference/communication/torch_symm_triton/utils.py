@@ -103,3 +103,16 @@ def sync_threads():
     Synchronize all threads within a block.
     """
     tl.inline_asm_elementwise("bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def add_rn_f32(a, b):
+    """a + b in fp32, rounded to nearest even, as one instruction the compiler cannot reorder.
+
+    Rank-ordered reductions chain these to fix their add order. A chain of plain adds is not
+    safe: LLVM's SLP vectorizer may turn it into an ordered vector reduction whose lanes it
+    fills in reverse, so the sum would run from the last rank.
+    """
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
