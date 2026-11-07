@@ -44,6 +44,20 @@ spec:
     ENVIRONMENT={environment}
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
+    export NVTE_FLASH_ATTN_V4=0
+
+    # GTP scales to any world size; the test fixtures don't — most GTP cases
+    # pytest.skip unless world_size==4 exactly (a few also run at 8, see
+    # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
+    if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" || "$BUCKET" == "tests/unit_tests/core/tensor_parallel/test_*gtp*.py" ]]; then
+        export GPUS_PER_NODE=4
+    elif [[ "$BUCKET" == "tests/unit_tests/core/inference/engines/test_batch_invariant_handoff.py" ]]; then
+        # One prefill worker and one decode worker exchange a real NIXL handoff.
+        export GPUS_PER_NODE=2
+    elif [[ "$BUCKET" =~ ^tests/unit_tests/core/inference/(test_coordinator_(execution|media|sampling|schedule)_pairwise|engines/test_batch_invariant_coordinator)\.py$ ]]; then
+        # These owner-selection schedules are written for exactly two DP replicas.
+        export GPUS_PER_NODE=2
+    fi
 
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
@@ -51,23 +65,203 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    case "$BUCKET" in
+      tests/unit_tests/core/inference/test_batch_invariant_fp8.py)
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+          h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
+        ;;
+      tests/unit_tests/core/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/core/inference/test_disagg_transfer_pairwise.py)
+        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
+          "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
+        ;;
+      *)
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+        ;;
+    esac
 
     ls -al 
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
-
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 # Legacy selectors refer to the historical test checkout. Latest selectors
 # mirror megatron/ and keep specialized tests in their own CI jobs.
 products:
+  # Runtime CP keeps its dev-only job; the ordinary context-parallel tests below
+  # are excluded from this bucket and retain LTS coverage.
+  - test_case: [tests/unit_tests/core/context_parallel/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/engines/test_batch_invariant_handoff.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/engines/test_batch_invariant_coordinator.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_coordinator_execution_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_coordinator_media_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_coordinator_sampling_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_coordinator_schedule_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_batch_invariant_fp8.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/ops/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/engines/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/engines/test_disagg_coordinator_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/inference/test_disagg_transfer_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net2.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/ssm/test_gdn_gated_output_norm_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/tensor_parallel/test_*gtp*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # These tests retain both environments instead of joining the runtime CP job.
+  - test_case: [tests/unit_tests/core/context_parallel/test_layout.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/context_parallel/test_batch_api_compat.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # These ordinary tensor-parallel tests match the GTP glob but retain their
+  # original eight-rank jobs rather than the four-rank GTP job.
+  - test_case: [tests/unit_tests/core/tensor_parallel/test_gtp_fp32_accumulation_reduce_scatter.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/core/tensor_parallel/test_gtp_parallel_layout.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/integrations/dynamo/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/test_model_configs.py]
     products:
       - environment: [lts, dev]
@@ -356,13 +550,6 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/core/resharding/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

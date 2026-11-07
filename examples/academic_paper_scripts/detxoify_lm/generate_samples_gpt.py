@@ -23,7 +23,9 @@ from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.
@@ -37,6 +39,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         GPTModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
@@ -65,7 +68,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
@@ -221,11 +224,12 @@ def generate_and_write_samples_conditional(model):
 def main():
     """Main program."""
 
-    parse_and_validate_args(extra_args_provider=add_text_generate_args,
+    args = parse_and_validate_args(extra_args_provider=add_text_generate_args,
                             args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
     # Set up model and load checkpoint

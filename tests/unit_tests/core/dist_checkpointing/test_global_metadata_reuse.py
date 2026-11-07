@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from unittest import mock
@@ -13,7 +13,7 @@ from tests.unit_tests.core.dist_checkpointing import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class TestGlobalMetadataReuse:
@@ -39,7 +39,6 @@ class TestGlobalMetadataReuse:
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"
             ) as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -51,6 +50,7 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     1,
                     model,
@@ -65,8 +65,13 @@ class TestGlobalMetadataReuse:
             assert save_ckpt_context['save_strategy'].cached_global_metadata is None
 
             resume_ckpt_context = {}
+            sync_checkpoint_config(mock_args)
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                restore_training_state=True,
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[
@@ -79,6 +84,7 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     2,
                     model,
@@ -112,7 +118,6 @@ class TestGlobalMetadataReuse:
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"
             ) as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -129,6 +134,7 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     1,
                     model,
@@ -150,8 +156,13 @@ class TestGlobalMetadataReuse:
             mock_args.no_load_rng = True
 
             resume_ckpt_context = {}
+            sync_checkpoint_config(mock_args)
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                restore_training_state=True,
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[
@@ -165,6 +176,7 @@ class TestGlobalMetadataReuse:
             with mock.patch(
                 'torch.distributed.checkpoint.utils._DistWrapper.reduce_scatter'
             ) as reduce_scatter_mock:
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     2,
                     model,

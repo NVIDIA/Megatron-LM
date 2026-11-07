@@ -15,6 +15,7 @@ assertions, so they hold at any size.
 
 import os
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, exchange_utils
@@ -196,3 +197,81 @@ class TestPgDistributionCache:
             assert shard.shape == (10 * (i + 1),)
             assert torch.equal(shard, torch.full_like(shard, shard[0].item()))
             assert 0 <= shard[0].item() < Utils.world_size
+
+    def test_groups_sharing_min_rank_use_distinct_cache_entries(self, tmp_path_dist_ckpt):
+        """Distinct groups that share a minimum rank must not share a cache entry.
+
+        A data-parallel group over ranks [0, 1, 2, 3] and expert-data-parallel style
+        subgroups [0, 2] and [1, 3] share minimum ranks 0 and 1. If the cache were
+        keyed by the minimum rank, creating the subgroup cache would overwrite the
+        full group's file, and a later read for the full group would return the
+        subgroup's distribution.
+        """
+        if Utils.world_size < 4:
+            pytest.skip("Requires at least 4 ranks.")
+        Utils.initialize_model_parallel(1, 1)
+        rank = torch.distributed.get_rank()
+
+        # new_group is collective over the default group: every rank creates every
+        # group in the same order, including ranks that are not members.
+        full_ranks = [0, 1, 2, 3]
+        full_group = torch.distributed.new_group(full_ranks)
+        sub_ranks_list = [[0, 2], [1, 3]]
+        sub_groups = [torch.distributed.new_group(ranks) for ranks in sub_ranks_list]
+        my_sub_group = None
+        for ranks, group in zip(sub_ranks_list, sub_groups):
+            if rank in ranks:
+                my_sub_group = group
+        in_full_group = rank in full_ranks
+
+        with TempNamedDir(tmp_path_dist_ckpt / "pg_cache_min_rank", sync=True) as cache_dir:
+            cache_path = str(cache_dir)
+
+            # CREATE for the full group, then (with a fresh memo, as in a separate
+            # job) for the subgroups that share its minimum ranks.
+            if in_full_group:
+                determine_main_replica_uniform_distribution(
+                    _state_dict(), full_group, pg_cache_path=cache_path, pg_cache_create=True
+                )
+            torch.distributed.barrier()
+            exchange_utils._PG_DIST_CACHE.clear()
+            if my_sub_group is not None:
+                determine_main_replica_uniform_distribution(
+                    _state_dict(), my_sub_group, pg_cache_path=cache_path, pg_cache_create=True
+                )
+            torch.distributed.barrier()
+            exchange_utils._PG_DIST_CACHE.clear()
+
+            # Each group has its own file, written once by its minimum-rank member.
+            if rank == 0:
+                cache_files = sorted(os.listdir(cache_path))
+                assert len(cache_files) == 1 + len(sub_ranks_list), cache_files
+            if in_full_group:
+                full_file = _pg_dist_cache_file_path(cache_path, full_group)
+                sub_file = _pg_dist_cache_file_path(cache_path, my_sub_group)
+                assert full_file != sub_file
+                assert os.path.exists(full_file)
+                assert os.path.exists(sub_file)
+
+            # READ each group's distribution from disk and compare it with the
+            # distribution computed without the cache for the same group.
+            if in_full_group:
+                read_full = determine_main_replica_uniform_distribution(
+                    _state_dict(), full_group, pg_cache_path=cache_path, pg_cache_create=False
+                )
+                read_sub = determine_main_replica_uniform_distribution(
+                    _state_dict(), my_sub_group, pg_cache_path=cache_path, pg_cache_create=False
+                )
+                expected_full = determine_main_replica_uniform_distribution(
+                    _state_dict(), full_group
+                )
+                expected_sub = determine_main_replica_uniform_distribution(
+                    _state_dict(), my_sub_group
+                )
+                assert read_full.main_rank_for_shard == expected_full.main_rank_for_shard
+                assert read_full.all_ranks_for_shard == expected_full.all_ranks_for_shard
+                assert read_sub.main_rank_for_shard == expected_sub.main_rank_for_shard
+                assert read_sub.all_ranks_for_shard == expected_sub.all_ranks_for_shard
+                # Guard against a vacuous comparison: the two layouts differ.
+                assert read_full.all_ranks_for_shard != read_sub.all_ranks_for_shard
+            torch.distributed.barrier()

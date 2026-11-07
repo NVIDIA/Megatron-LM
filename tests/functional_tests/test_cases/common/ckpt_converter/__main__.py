@@ -23,10 +23,15 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
-from megatron.training.global_vars import set_global_variables, unset_global_variables
+from megatron.training.global_vars import (
+    get_run_config,
+    set_global_variables,
+    unset_global_variables,
+)
 from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
@@ -209,7 +214,8 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        set_global_variables(args)
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        set_global_variables(args, cfg)
 
         # Random seed.
         torch.manual_seed(123)
@@ -236,13 +242,14 @@ class Pipeline:
         if is_model_parallel_rank_0():
             # Generate different data on each DP rank.
             args = get_args()
+            cfg = get_run_config()
 
             orig_numpy_seed = np.random.get_state()[1][0]
             temp_numpy_seed = orig_numpy_seed + torch.distributed.get_rank()
 
             np.random.seed(temp_numpy_seed)
             numpy_input_ids = np.random.randint(
-                low=0, high=args.vocab_size, size=(args.seq_length,), dtype=np.int64
+                low=0, high=cfg.tokenizer.vocab_size, size=(args.seq_length,), dtype=np.int64
             )
             np.random.seed(orig_numpy_seed)
 
@@ -519,9 +526,10 @@ class Pipeline:
             world_size = torch.distributed.get_world_size()
             if rank == world_size - 1:
                 args = get_args()
+                cfg = get_run_config()
                 get_mse = lambda dst_output_tensor: torch.nn.MSELoss()(
-                    src_output_tensor[:, :, : args.vocab_size],
-                    dst_output_tensor[:, :, : args.vocab_size],
+                    src_output_tensor[:, :, : cfg.tokenizer.vocab_size],
+                    dst_output_tensor[:, :, : cfg.tokenizer.vocab_size],
                 ).item()
                 mse_real = get_mse(dst_output_tensor_real)
                 mse_fake = get_mse(dst_output_tensor_fake)
@@ -658,6 +666,7 @@ class LLaVAPipeline(Pipeline):
         if is_model_parallel_rank_0():
             # Generate different data on each DP rank.
             args = get_args()
+            cfg = get_run_config()
 
             orig_numpy_seed = np.random.get_state()[1][0]
             temp_numpy_seed = orig_numpy_seed + torch.distributed.get_rank()
@@ -665,7 +674,7 @@ class LLaVAPipeline(Pipeline):
             np.random.seed(temp_numpy_seed)
             # TODO: CHANGE TEMP SIZE TO SOMETHING REAL
             numpy_input_ids = np.random.randint(
-                low=0, high=args.vocab_size, size=(args.seq_length,), dtype=np.int64
+                low=0, high=cfg.tokenizer.vocab_size, size=(args.seq_length,), dtype=np.int64
             )
             np.random.seed(orig_numpy_seed)
 
@@ -813,7 +822,8 @@ class LLaVAPipeline(Pipeline):
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        set_global_variables(args)
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        set_global_variables(args, cfg)
 
         # Random seed.
         torch.manual_seed(123)

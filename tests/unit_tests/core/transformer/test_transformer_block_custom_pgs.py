@@ -169,15 +169,22 @@ def _gpt_te_layer_spec_with_hetro_pgs(
 ):
 
     def build_mlp(
-        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        name: str | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ):
-        del pg_collection, is_mtp_layer
-        return MLP(
-            config,
+        del pg_collection
+        return MLP.as_mlp_submodule(
+            config=config,
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
             ),
-            tp_group=mlp_pg_collection.tp,
+            pg_collection=mlp_pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
 
     return ModuleSpec(
@@ -208,8 +215,6 @@ class TestTransformerBlockWithProcessGroups:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

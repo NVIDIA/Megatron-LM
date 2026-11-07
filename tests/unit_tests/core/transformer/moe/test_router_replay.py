@@ -87,6 +87,38 @@ def test_global_action_set_and_clear():
     assert r1.router_replay_action is None and r2.router_replay_action is None
 
 
+def test_global_operations_can_select_base_model_routers():
+    base_1 = RouterReplay()
+    mtp = RouterReplay(is_mtp_layer=True)
+    base_2 = RouterReplay()
+    base_1_indices = torch.tensor([[0, 1]], dtype=torch.long)
+    base_2_indices = torch.tensor([[1, 0]], dtype=torch.long)
+    base_1.record_indices(base_1_indices)
+    base_2.record_indices(base_2_indices)
+
+    assert RouterReplay.get_instances(is_mtp_layer=False) == [base_1, base_2]
+    recorded = RouterReplay.get_recorded_data(is_mtp_layer=False)
+    assert len(recorded) == 2
+    assert torch.equal(recorded[0], base_1_indices)
+    assert torch.equal(recorded[1], base_2_indices)
+
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD, is_mtp_layer=False)
+    assert base_1.router_replay_action == RouterReplayAction.RECORD
+    assert base_2.router_replay_action == RouterReplayAction.RECORD
+    assert mtp.router_replay_action is None
+
+    static_buffer = torch.empty(4, 2, 2)
+    RouterReplay.set_global_static_buffers(static_buffer, is_mtp_layer=False)
+    assert base_1.static_buffer is not None
+    assert base_2.static_buffer is not None
+    assert base_1.static_buffer.data_ptr() == static_buffer[:, 0, :].data_ptr()
+    assert base_2.static_buffer.data_ptr() == static_buffer[:, 1, :].data_ptr()
+    assert mtp.static_buffer is None
+
+    RouterReplay.clear_global_static_buffers(is_mtp_layer=False)
+    assert base_1.static_buffer is None and base_2.static_buffer is None
+
+
 def test_set_replay_data_length_mismatch():
     _ = RouterReplay()
     with pytest.raises(ValueError):

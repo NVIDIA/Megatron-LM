@@ -8,18 +8,12 @@ import pytest
 import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
-from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -30,73 +24,20 @@ from megatron.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.utils import get_device_arch_version
-from tests.unit_tests.core.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
+from tests.unit_tests.core.transformer.mla_test_utils import check_mla_parallel_correctness
+from tests.unit_tests.core.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params as make_test_packed_seq_params,
+)
+from tests.unit_tests.core.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params_with_padding as make_test_packed_seq_params_with_padding,
 )
 from tests.unit_tests.test_utilities import Utils
 
-
-def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [0, 6, 19, 22, sequence_length]
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
-
-
-def make_test_packed_seq_params_with_padding(
-    sequence_length=None, cu_seqlens=None, cu_seqlens_padded=None
-):
-    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [
-            0,
-            6,
-            19,
-            22,
-            sequence_length - 8,
-        ]  # Actual sequence lengths (with some padding removed)
-    if cu_seqlens_padded is None:
-        assert sequence_length is not None
-        cu_seqlens_padded = [0, 8, 22, 28, sequence_length]  # Padded sequence lengths
-
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    cu_seqlens_padded = torch.IntTensor(cu_seqlens_padded).cuda()
-
-    # Use padded lengths for max_seqlen calculation
-    seqlens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen, _ = seqlens_padded.max(dim=0, keepdim=True)
-    max_seqlen = max_seqlen.tolist()[0]
-
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
@@ -1432,12 +1373,7 @@ class TestMLAClipQK:
 
 @pytest.mark.experimental
 @pytest.mark.parametrize(
-    ("rope_type", "apply_rope_fusion"),
-    [
-        ("rope", False),
-        ("yarn", False),
-        ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ],
+    ("rope_type", "apply_rope_fusion"), [("rope", False), ("yarn", False), ("yarn", True)]
 )
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -1451,220 +1387,163 @@ class TestMLAClipQK:
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, run_config
 ):
-    if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
-        pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
-    if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
-        pytest.skip("MLA yarn rope fusion requires PyTorch >= 2.5.0")
-    if (
-        cp > 1
-        and rope_type == "yarn"
-        and apply_rope_fusion
-        and not is_te_min_version("2.6.0", check_equality=True)
-    ):
-        pytest.skip("MLA CP + yarn rope fusion requires PyTorch >= 2.6.0")
+    check_mla_parallel_correctness(tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp)
 
-    # Non-deterministic mode has bug to be fixed with MLA
-    _environ = os.environ.copy()
-    os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = "1"
-    os.environ['NVTE_FUSED_ATTN'] = "1"
-    os.environ['NVTE_FLASH_ATTN'] = "0"
 
-    # Constants
-    seed = 123
-    sequence_length = 256
-    micro_batch_size = 4
-    hidden_size = 128
-
-    # Model initialization function
-    def initialize_gpt_model(
-        pre_process=True, post_process=True, vp_stage=None, pg_collection=None, config=None
-    ):
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=True)
-        gpt_model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=128,
-            max_sequence_length=sequence_length,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-        )
-        return gpt_model
-
-    # Initialize baseline parallel state
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+@pytest.mark.parametrize("mla_down_proj_fusion", [False, True])
+def test_moe_pre_mlp_layernorm_has_residual(mla_down_proj_fusion):
+    """The MoE pre-MLP norm of both MLA specs declares its residual, so that
+    ``fused_residual_rmsnorm`` fuses the residual-gradient add into the norm backward."""
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=8,
+        moe_grouped_gemm=True,
+        multi_latent_attention=True,
+        mla_down_proj_fusion=mla_down_proj_fusion,
     )
+    assert submodules.pre_mlp_layernorm is backend.layer_norm(has_residual=True)
 
-    # Initialize input hidden states
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
-    input_hidden_states = (
-        torch.rand((sequence_length, micro_batch_size, hidden_size))
-        .cuda()
-        .bfloat16()
-        .requires_grad_(True)
-    )
 
-    # Initialize transformer config
-    transformer_config = MLATransformerConfig(
-        num_layers=1,
-        hidden_size=hidden_size,
-        num_attention_heads=4,
-        q_lora_rank=32,
-        kv_lora_rank=32,
-        qk_head_dim=128,
-        v_head_dim=128,
-        qk_pos_emb_head_dim=64,
-        rotary_base=10000,
-        original_max_position_embeddings=64,
-        context_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
-        bf16=True,
-        rope_type=rope_type,
-        apply_rope_fusion=apply_rope_fusion,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-    )
+@pytest.mark.skipif(not is_te_min_version("1.13.0"), reason="Requires TE >= 1.13.0")
+class TestFusedMLAPreMLPResidualNorm:
+    """``fused_residual_rmsnorm`` on a MoE layer built from the ``mla_down_proj_fusion`` spec."""
 
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:
-        # Set argument
-        mock_args = parse_args(ignore_unknown_args=True)
-        mock_args.save_tokenizer_assets = False
-        set_args(mock_args)
-
-        # Initialize baseline model
-        init_basic_mock_args(mock_args, 1, 1, bf16=True)
-        mock_args.context_parallel_size = 1
-        mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-
-        # Initialize args and save checkpoint
-        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
-        mock_args.no_save_optim = True
-        mock_args.no_save_rng = True
-        mock_args.no_load_optim = True
-        mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0)
-
-        # Calculate baseline output
-        attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_baseline, bias_hidden_states_baseline = attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_baseline.sum().backward()
-
-        # Save baseline output
-        input_grad_baseline = input_hidden_states.grad.detach()
-        output_hidden_states_baseline = output_hidden_states_baseline.detach()
-        bias_hidden_states_baseline = bias_hidden_states_baseline.detach()
-
-        # Initialize parallel model
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
-        )
-        torch.manual_seed(seed)
-        model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
-        transformer_config.tensor_model_parallel_size = tp
-        transformer_config.sequence_parallel = sp
-        init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
-        mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None)
-
-        # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-        def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
-            if tp > 1 and sp:
-                sp_seg = sequence_length // tp // cp
-                tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
-            return tensor
-
-        # Calculate parallel model output
-        input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
-        input_hidden_states = input_hidden_states.detach().requires_grad_(True)
-        parallel_attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_parallel.sum().backward()
-        input_grad_parallel = input_hidden_states.grad.detach()
-
-        # Check if the output is the same
-        if cp:
-            atol, rtol = 5e-3, 5e-3
-        else:
-            atol, rtol = 5e-4, 5e-4
-        output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
-        input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
-
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains inf"
-        assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
-        assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains inf"
-        assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
-        assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
-
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            bias_hidden_states_baseline,
-            bias_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
-
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        yield
         Utils.destroy_model_parallel()
 
-    os.environ.clear()
-    os.environ.update(_environ)
+    @staticmethod
+    def _build_layer(fused_residual_rmsnorm):
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            normalization="RMSNorm",
+            fused_residual_rmsnorm=fused_residual_rmsnorm,
+            mla_down_proj_fusion=True,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=256,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=config.num_moe_experts,
+            multi_latent_attention=True,
+            mla_down_proj_fusion=True,
+        )
+        return TransformerLayer(config, submodules).cuda()
+
+    @staticmethod
+    def _assert_close_up_to_rounding(actual, expected, name):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2, f"{name}: relative error {error.item():.2e}"
+
+    def test_fused_residual_norm_matches_unfused(self):
+        """Fusing the residual-gradient add into the norm backward keeps the forward bitwise and
+        the gradients equal up to the rounding of that add."""
+        reference = self._build_layer(fused_residual_rmsnorm=False)
+        fused = self._build_layer(fused_residual_rmsnorm=True)
+        fused.load_state_dict(reference.state_dict())
+        assert not reference.pre_mlp_layernorm.returns_residual
+        assert fused.pre_mlp_layernorm.returns_residual
+
+        seq_len, batch, hidden_size = 64, 2, reference.config.hidden_size
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            seq_len, batch, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        output_grad = torch.randn_like(hidden_states)
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+
+        results = []
+        for layer in (reference, fused):
+            layer_input = hidden_states.clone().requires_grad_(True)
+            output, _ = layer(layer_input, attention_mask=attention_mask)
+            output.backward(output_grad)
+            grads = {
+                name: param.grad
+                for name, param in layer.named_parameters()
+                if param.grad is not None
+            }
+            results.append((output.detach(), layer_input.grad, grads))
+        (ref_output, ref_input_grad, ref_grads), (output, input_grad, grads) = results
+
+        torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
+        # The MoE backward runs before the residual-gradient add, so its gradients are unchanged.
+        # The gradients that flow through the add differ only by its bf16 rounding.
+        assert grads.keys() == ref_grads.keys()
+        for name, ref_grad in ref_grads.items():
+            if name.startswith("mlp."):
+                torch.testing.assert_close(grads[name], ref_grad, rtol=0, atol=0)
+            else:
+                self._assert_close_up_to_rounding(grads[name], ref_grad, name)
+        self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
+
+
+class TestMLAUpProjectionInput:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_local_up_projection_reads_the_slice_without_a_copy(self):
+        """Only Transformer Engine projections get the vectorized copy; a local (non-TE)
+        up-projection receives the row-strided kv slice of the down-projection output as it is."""
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        submodules.linear_q_up_proj = ColumnParallelLinear
+        submodules.linear_kv_up_proj = ColumnParallelLinear
+        attention = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        received = []
+        hook = attention.linear_kv_up_proj.register_forward_pre_hook(
+            lambda module, args: received.append(args[0])
+        )
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            attention(hidden_states, attention_mask)
+        hook.remove()
+        assert copy.call_count == 0
+        assert len(received) == 1 and not received[0].is_contiguous()
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
@@ -1703,6 +1582,20 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_up_projection_inputs_copied_as_contiguous_rows(self):
+        config = self.transformer_config
+        self.fused_attention.cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            self.fused_attention(hidden_states, attention_mask)
+        # The q and kv slices of the fused down-projection output take the vectorized copy.
+        assert copy.call_count == 2
+        assert not any(call.args[0].is_contiguous() for call in copy.call_args_list)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config
@@ -2271,3 +2164,224 @@ class TestFusedMLAQUpProjIntegration:
                 assert grad is not None
                 assert torch.isfinite(grad).all()
                 assert torch.count_nonzero(grad) > 0
+
+
+def _fused_kv_rope_quant_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=512,
+        num_attention_heads=16,
+        attention_dropout=0.0,
+        use_cpu_initialization=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        qk_layernorm=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_dot_product_attention=True,
+        q_lora_rank=512,
+        kv_lora_rank=512,
+        qk_head_dim=128,
+        v_head_dim=128,
+        qk_pos_emb_head_dim=64,
+        rope_type="yarn",
+        rotary_base=10000,
+        original_max_position_embeddings=256,
+        apply_rope_fusion=True,
+        use_fused_mla_kv_rope_quant=True,
+    )
+    kwargs.update(overrides)
+    return MLATransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("dpa_option", ["fp8_dot_product_attention", "attention_dropout"])
+def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
+    overrides = (
+        {"fp8_dot_product_attention": False}
+        if dpa_option == "fp8_dot_product_attention"
+        else {"attention_dropout": 0.1}
+    )
+    with pytest.raises(ValueError, match="use_fused_mla_kv_rope_quant"):
+        _fused_kv_rope_quant_config(**overrides)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    get_device_arch_version() < 10,
+    reason="The fused MLA key/value RoPE + MXFP8 kernel requires Blackwell architecture",
+)
+class TestFusedMLAKVRoPEQuant:
+    """use_fused_mla_kv_rope_quant feeds attention the same MXFP8 q/k/v as the unfused path."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("variant", ["mla", "fused_mla", "fused_q_uproj"])
+    def test_matches_unfused_path(self, variant):
+        if mla_module.fused_mla_kv_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
+        overrides, hidden_size, batch_size = {}, 512, 2
+        if variant == "fused_q_uproj":
+            fused_q_up_proj = mla_module.FusedMLAQUpProjRopeQuant
+            if fused_q_up_proj is None or not fused_q_up_proj.is_supported():
+                pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
+            # Both modules take the fused Q up-projection (with its DeepSeek-V3 head count and
+            # q_lora_rank), whose query is already quantized; only the key/value path differs.
+            overrides = dict(
+                use_fused_mla_q_uproj=True,
+                hidden_size=256,
+                num_attention_heads=128,
+                q_lora_rank=1536,
+                kv_lora_rank=32,
+            )
+            hidden_size, batch_size = 256, 1
+        env = {
+            "NVTE_FUSED_ATTN": "1",
+            "NVTE_FLASH_ATTN": "0",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            attention_cls, submodules = (
+                (FusedMLASelfAttention, get_fused_mla_submodules())
+                if variant == "fused_mla"
+                else (MLASelfAttention, get_mla_self_attn_submodules())
+            )
+            modules = []
+            for fused in (False, True):
+                config = _fused_kv_rope_quant_config(use_fused_mla_kv_rope_quant=fused, **overrides)
+                modules.append(
+                    attention_cls(
+                        config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+                    )
+                    .cuda()
+                    .bfloat16()
+                )
+            reference, fused = modules
+            fused.load_state_dict(reference.state_dict())
+            assert fused._use_fused_kv_rope_quant and not reference._use_fused_kv_rope_quant
+            if variant == "fused_q_uproj":
+                assert fused._use_fused_q_uproj and reference._use_fused_q_uproj
+
+            torch.manual_seed(0)
+            hidden_states = torch.randn(
+                256, batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+            )
+            grad_output = torch.randn_like(hidden_states)
+            spy = mock.patch.object(
+                mla_module, "fused_mla_kv_rope_mxfp8", wraps=mla_module.fused_mla_kv_rope_mxfp8
+            )
+            results = []
+            for attention in (reference, fused):
+                x = hidden_states.clone().requires_grad_(True)
+                with spy as kernel, get_fp8_context(config):
+                    output, _ = attention(x, None)
+                output.backward(grad_output)
+                calls = kernel.call_count
+                grads = {
+                    name: p.grad for name, p in attention.named_parameters() if p.grad is not None
+                }
+                results.append((output.detach(), x.grad, grads, calls))
+            (ref_out, ref_dx, ref_grads, ref_calls), (out, dx, grads, calls) = results
+
+        assert ref_calls == 0 and calls == 1
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        assert grads.keys() == ref_grads.keys()
+        assert "linear_kv_up_proj.weight" in grads
+        for name, grad in grads.items():
+            assert torch.equal(grad, ref_grads[name]), name
+
+    @pytest.mark.parametrize("case", ["fp16", "fp8_dpa_bwd_off"])
+    def test_falls_back_to_unfused_path(self, case):
+        """FP16 inputs (the kernel takes BF16) and NVTE_FP8_DPA_BWD=0 (attention keeps the BF16
+        q/k/v for its backward) take the unfused path: the kernel is not called and outputs and
+        gradients match the option off."""
+        if mla_module.fused_mla_kv_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
+        dtype, overrides = torch.bfloat16, {}
+        env = {
+            "NVTE_FUSED_ATTN": "1",
+            "NVTE_FLASH_ATTN": "0",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        }
+        if case == "fp16":
+            dtype = torch.float16
+            overrides = dict(bf16=False, fp16=True, params_dtype=torch.float16)
+        else:
+            env["NVTE_FP8_DPA_BWD"] = "0"
+        with mock.patch.dict(os.environ, env, clear=False):
+            modules = []
+            for fused in (False, True):
+                config = _fused_kv_rope_quant_config(use_fused_mla_kv_rope_quant=fused, **overrides)
+                modules.append(
+                    MLASelfAttention(
+                        config,
+                        get_mla_self_attn_submodules(),
+                        layer_number=1,
+                        attn_mask_type=AttnMaskType.causal,
+                    )
+                    .cuda()
+                    .to(dtype)
+                )
+            reference, fused = modules
+            fused.load_state_dict(reference.state_dict())
+            assert fused._use_fused_kv_rope_quant
+
+            torch.manual_seed(0)
+            hidden_states = torch.randn(256, 2, 512, dtype=dtype, device="cuda")
+            grad_output = torch.randn_like(hidden_states)
+            results = []
+            for attention in (reference, fused):
+                x = hidden_states.clone().requires_grad_(True)
+                with (
+                    mock.patch.object(
+                        mla_module,
+                        "fused_mla_kv_rope_mxfp8",
+                        wraps=mla_module.fused_mla_kv_rope_mxfp8,
+                    ) as kernel,
+                    get_fp8_context(config),
+                ):
+                    output, _ = attention(x, None)
+                output.backward(grad_output)
+                grads = {
+                    name: p.grad for name, p in attention.named_parameters() if p.grad is not None
+                }
+                results.append((output.detach(), x.grad, grads, kernel.call_count))
+            (ref_out, ref_dx, ref_grads, ref_calls), (out, dx, grads, calls) = results
+
+        assert ref_calls == 0 and calls == 0
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        assert grads.keys() == ref_grads.keys()
+        for name, grad in grads.items():
+            assert torch.equal(grad, ref_grads[name]), name
+
+    def test_eval_uses_unfused_path(self):
+        if mla_module.fused_mla_kv_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
+        config = _fused_kv_rope_quant_config()
+        attention = (
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            .cuda()
+            .bfloat16()
+            .eval()
+        )
+        hidden_states = torch.randn(256, 2, 512, dtype=torch.bfloat16, device="cuda")
+        with (
+            mock.patch.object(
+                mla_module, "fused_mla_kv_rope_mxfp8", wraps=mla_module.fused_mla_kv_rope_mxfp8
+            ) as kernel,
+            torch.no_grad(),
+            get_fp8_context(config),
+        ):
+            attention(hidden_states, None)
+        assert kernel.call_count == 0

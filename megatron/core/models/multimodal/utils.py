@@ -5,10 +5,8 @@ import torch
 
 try:
     from einops import rearrange
-
-    HAVE_EINOPS = True
 except ImportError:
-    HAVE_EINOPS = False
+    rearrange = None
 
 
 def patchify_image(x: torch.Tensor, patch_dim: int) -> torch.Tensor:
@@ -16,7 +14,7 @@ def patchify_image(x: torch.Tensor, patch_dim: int) -> torch.Tensor:
     Option 1: (C,H,W) == (3,H,W) -> (L,3*patch_dim*patch_dim)
     Option 2: (B,C,H,W) == (B,3,H,W) -> (B,L,3*patch_dim*patch_dim)
     """
-    if not HAVE_EINOPS:
+    if rearrange is None:
         raise ImportError(
             "einops is required for patchify_image, please install it with `pip install einops`"
         )
@@ -57,7 +55,7 @@ def unpatchify_image(x: torch.Tensor, img_H: int, img_W: int, patch_dim: int) ->
     Option 1: (L,C) == (L,3*patch_dim*patch_dim) -> (3,H,W)
     Option 2: (B,L,C) == (B,L,3*patch_dim*patch_dim) -> (B,3,H,W)
     """
-    if not HAVE_EINOPS:
+    if rearrange is None:
         raise ImportError(
             "einops is required for unpatchify_image, please install it with `pip install einops`"
         )

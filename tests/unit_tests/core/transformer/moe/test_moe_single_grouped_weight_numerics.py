@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import inspect
@@ -21,18 +21,21 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.core.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 try:
     from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
@@ -133,6 +136,7 @@ class TestMoESingleGroupedWeightNumerics:
     ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         if config is None:
             config = core_transformer_config_from_args(args)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -141,7 +145,7 @@ class TestMoESingleGroupedWeightNumerics:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -170,7 +174,6 @@ class TestMoESingleGroupedWeightNumerics:
         sys.argv = ["test_moe_single_grouped_weight_numerics.py"]
         args = parse_args()
         args.num_layers = 1
-        args.vocab_size = 1024
         args.hidden_size = 256
         args.ffn_hidden_size = 256
         args.num_attention_heads = 8
@@ -226,7 +229,14 @@ class TestMoESingleGroupedWeightNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.vocab_size = 1024
+        cfg.finalize()
+        set_run_config(cfg)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self):
@@ -459,6 +469,9 @@ class TestMoESingleGroupedWeightNumerics:
             args.no_load_rng = True
             args.load_main_params_from_ckpt = True
         set_args(args)
+        # The fixture built the run config before the save/load settings above were chosen; the
+        # setup load reads the registered checkpoint section, not the namespace.
+        sync_checkpoint_config(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
@@ -497,6 +510,7 @@ class TestMoESingleGroupedWeightNumerics:
         for step in range(4):
             if checkpoint_before_step is not None and step == checkpoint_before_step:
                 force_param_sync(model, optimizer=optimizer)
+                sync_checkpoint_config(get_args())
                 save_checkpoint(step, model, optimizer, opt_param_scheduler, 0)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
@@ -513,6 +527,7 @@ class TestMoESingleGroupedWeightNumerics:
         for _ in range(2):
             self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
         force_param_sync(model, optimizer=optimizer)
+        sync_checkpoint_config(get_args())
         save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -522,7 +537,10 @@ class TestMoESingleGroupedWeightNumerics:
         args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
             single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
         )
-        loaded_iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+        sync_checkpoint_config(get_args())
+        loaded_iteration, _ = load_checkpoint(
+            model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+        )
         assert loaded_iteration == 2
         return self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
 

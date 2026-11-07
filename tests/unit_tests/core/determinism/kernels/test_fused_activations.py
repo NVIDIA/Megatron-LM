@@ -10,10 +10,13 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
@@ -24,12 +27,15 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.transformer.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.core.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -95,6 +101,11 @@ GATED_CASES = {
         lambda x, w: weighted_squared_relu_impl(x, w, clamp_scale=10.0),
         (_act((TOKENS, FFN)), _weights(TOKENS)),
     ),
+    # Unweighted clamped path (weights=None) used by the dense MLP; saves only x for backward.
+    "clamped_squared_relu": lambda: (
+        lambda x: weighted_squared_relu_impl(x, None, clamp_scale=10.0),
+        (_act((TOKENS, FFN)),),
+    ),
 }
 
 
@@ -103,6 +114,91 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.skipif(
+    te_ext._te_mark_grouped_tensor is None,
+    reason="Transformer Engine does not provide mark_grouped_tensor",
+)
+@pytest.mark.parametrize(
+    "name,activation",
+    [("swiglu", weighted_bias_swiglu_impl), ("quick_geglu", weighted_bias_quick_geglu_impl)],
+)
+@pytest.mark.parametrize(
+    "bf16_override",
+    [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)],
+    ids=["bf16", "bf16_override_under_mxfp8"],
+)
+def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation, bf16_override):
+    """Marked activations retain bit-exact outputs and gradients under BF16 overrides."""
+    if bf16_override:
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        available, reason = te_ext.FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+
+    seeded()
+    x = _act((TOKENS, 2 * FFN))
+    weights = _weights(TOKENS)
+
+    def fn(x, weights):
+        te_ext.mark_grouped_tensor(x)
+        return activation(x, None, weights)
+
+    reference = assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+    if not bf16_override:
+        return
+
+    qparams = te_ext.TEQuantizationParams(
+        training_recipe=te_ext.TEQuantizationRecipe(), evaluation_recipe=None
+    )
+    initial_fp8_enabled = te_ext.FP8GlobalStateManager.is_fp8_enabled()
+
+    def with_bf16_override(x, weights):
+        with te_ext.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+            with te_ext._get_fp8_autocast_for_quant_params(qparams, training=True):
+                assert not te_ext.FP8GlobalStateManager.is_fp8_enabled()
+                output = fn(x, weights)
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+        assert te_ext.FP8GlobalStateManager.is_fp8_enabled() == initial_fp8_enabled
+        return output
+
+    overridden = assert_replays_bit_exact(
+        with_bf16_override, (x, weights), replays=3, what=f"marked_{name}[BF16 override]"
+    )
+    for actual, expected in zip(overridden, reference):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            assert bytes_equal(actual[key], expected[key]), f"BF16 override changed {name}: {key}"
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
+    seeded()
+    # Include both endpoints and their adjacent BF16 values in each clamp branch.
+    bounds = torch.tensor(
+        [-10.0625, -10.0, -9.9375, 9.9375, 10.0, 10.0625], device="cuda", dtype=DTYPE
+    )
+    x = torch.cat((bounds, bounds)).repeat(32, 1).requires_grad_(True)
+    if weighted:
+        fn = lambda x, w: weighted_bias_swiglu_impl(x, None, w, clamp_value=10.0)
+        inputs = (x, _weights(32) + 1.0)
+    else:
+        fn = lambda x: bias_swiglu_impl(x, None, clamp_value=10.0)
+        inputs = (x,)
+    _, grads = assert_replays_bit_exact(fn, inputs, replays=3, what="clamped SwiGLU boundaries")
+
+    # Replay alone would also accept a consistently wrong endpoint derivative.
+    # Compare its zero mask with the installed PyTorch scalar-clamp contract.
+    reference_x = x.detach().clone().requires_grad_(True)
+    gate, linear = reference_x.float().chunk(2, dim=-1)
+    reference = (F.silu(gate.clamp(max=10.0)) * linear.clamp(-10.0, 10.0)).to(DTYPE)
+    if weighted:
+        reference = (reference * inputs[1]).to(DTYPE)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_x)[0]
+    assert torch.equal(grads["in[0]"] == 0, reference_grad == 0)
 
 
 # --- plain compiled activations -----------------------------------------------------------
@@ -146,6 +242,25 @@ def test_l2norm_replays_bit_exactly():
     norm = L2Norm(hidden_size=128).cuda()
     x = _act((4096, 2, 32, 128))
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
+
+
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
+    seeded()
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_zero_centered_gamma=False,
+        persist_layer_norm=False,
+        sequence_parallel=False,
+        memory_efficient_layer_norm=False,
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=2048).cuda().to(dtype=DTYPE)
+    assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
+    x = _act((4096, 2, 2048))
+    assert_module_replays_bit_exact(
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
+    )
 
 
 # --- bias + dropout + residual --------------------------------------------------------------
@@ -194,20 +309,59 @@ class TestFusedCrossEntropy:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
     @pytest.mark.xfail(
         strict=False,
         reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
     )
-    def test_fused_vocab_parallel_cross_entropy_replays(self):
+    def test_fused_vocab_parallel_cross_entropy_replays(self, dtype):
+        """Both logits dtypes: fp32 logits skip the internal upcast, and the backward must
+        hand back a gradient in the logits dtype rather than a hardcoded one."""
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        logits = _act((TOKENS, 32768))
+        logits = _act((TOKENS, 32768), dtype=dtype)
         target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
-        assert_replays_bit_exact(
+        _, grads = assert_replays_bit_exact(
             lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
             (logits, target),
             replays=4,
             what="fused_vocab_parallel_cross_entropy",
+        )
+        assert grads["in[0]"].dtype == dtype
+
+    @staticmethod
+    def _peak_bytes(fn, logits, target):
+        """Peak allocation of one forward + backward beyond what is live before it."""
+        fn(logits, target).sum().backward()  # warm up compilation outside the measurement
+        logits.grad = None
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        live = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        fn(logits, target).sum().backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - live
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_fused_vocab_parallel_cross_entropy_needs_no_logits_sized_temporary(self, dtype):
+        """The compiled pieces are split so that Inductor keeps the exp / gradient scaling in
+        place: the fused path must not need more transient memory than the unfused one. With
+        the reductions and the target scatter inside the compiled graphs Inductor copied the
+        mutated [s, b, v] tensor into a fresh buffer, one extra logits-sized allocation."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        logits = _act((TOKENS, 32768), dtype=dtype)
+        target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
+        logits_bytes = logits.numel() * logits.element_size()
+        fused = self._peak_bytes(
+            lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group), logits, target
+        )
+        unfused = self._peak_bytes(
+            lambda l, t: vocab_parallel_cross_entropy(l, t, 0.0, tp_group), logits, target
+        )
+        assert fused <= unfused + logits_bytes // 8, (
+            f"fused cross entropy peaked at {fused / logits_bytes:.2f}x the logits size, unfused "
+            f"at {unfused / logits_bytes:.2f}x: a logits-sized temporary is back"
         )
 
 

@@ -1,6 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-
 def compare_helpers(pipeline_parallel_size, num_microbatches, num_model_chunks):
     total_num_microbatches = num_microbatches * num_model_chunks
 

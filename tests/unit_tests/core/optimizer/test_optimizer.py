@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import io
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -29,7 +31,12 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+from megatron.core.optimizer.optimizer import (
+    Float16OptimizerWithFloat16Params,
+    MegatronOptimizer,
+    copy_optimizer_param_metadata,
+    get_param_group_identifier_tuple,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -82,6 +89,17 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class WideResidualRetentionOptimizerNet(nn.Module):
+    """Small parameter set covering retention and ordinary weight-decay routing."""
+
+    def __init__(self):
+        super().__init__()
+        self.retention = nn.Parameter(torch.ones(128))
+        self.retention.is_wide_residual_retention_parameter = True
+        self.ordinary_vector = nn.Parameter(torch.ones(6))
+        self.ordinary_matrix = nn.Parameter(torch.ones(6, 6))
 
 
 def test_copy_optimizer_param_metadata_preserves_allreduce():
@@ -150,6 +168,7 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
         'wd_mult',
         'lr_mult',
         'is_decoupled_lr',
+        'is_dsa_indexer',
         'max_lr',
         'min_lr',
     }
@@ -159,8 +178,255 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['wd_mult'] == 1.0
     assert pg0['lr_mult'] == 1.0
     assert pg0['is_decoupled_lr'] == False
+    assert pg0['is_dsa_indexer'] == False
     assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
     assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_get_param_groups_separates_only_exact_dsa_indexer_submodules(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.block = nn.Module()
+            self.block.indexer = nn.Linear(4, 3)
+            self.indexer_aux = nn.Linear(4, 2)
+            self.not_an_indexer = nn.Linear(4, 2)
+
+    model = ModelWithIndexer()
+    groups = _get_param_groups(
+        [model], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides={}
+    )
+    assert len(groups) == 2
+
+    names_by_id = {id(param): name for name, param in model.named_parameters()}
+    indexer_names = {
+        names_by_id[id(param)]
+        for group in groups
+        if group['is_dsa_indexer']
+        for param in group['params']
+    }
+    non_indexer_names = {
+        names_by_id[id(param)]
+        for group in groups
+        if not group['is_dsa_indexer']
+        for param in group['params']
+    }
+
+    assert indexer_names == {'block.indexer.weight', 'block.indexer.bias'}
+    assert 'indexer_aux.weight' in non_indexer_names
+    assert 'not_an_indexer.weight' in non_indexer_names
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_get_param_groups_excludes_frozen_dsa_indexer(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.indexer = nn.Linear(4, 3)
+
+    model = ModelWithIndexer()
+    for param in model.indexer.parameters():
+        param.requires_grad_(False)
+
+    groups = _get_param_groups(
+        [model], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides={}
+    )
+
+    assert all(not group['is_dsa_indexer'] for group in groups)
+    grouped_params = {param for group in groups for param in group['params']}
+    assert grouped_params == set(model.backbone.parameters())
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_dsa_indexer_flag_is_preserved_across_weight_decay_groups(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.indexer = nn.Sequential(nn.Linear(4, 3), nn.LayerNorm(3))
+
+    model = ModelWithIndexer()
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    groups = _get_param_groups([model], config, get_standard_config_overrides(config))
+    indexer_groups = [group for group in groups if group['is_dsa_indexer']]
+
+    assert {group['wd_mult'] for group in indexer_groups} == {0.0, 1.0}
+    indexer_params = {param for group in indexer_groups for param in group['params']}
+    assert indexer_params == {
+        param for name, param in model.named_parameters() if name.startswith('indexer.')
+    }
+
+
+def test_separate_dsa_clipping_uses_independent_norms_and_thresholds(monkeypatch):
+    import megatron.core.optimizer.optimizer as optimizer_module
+
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_param = torch.nn.Parameter(torch.ones(3))
+    calls = []
+    monkeypatch.setattr(
+        optimizer_module,
+        'clip_grad_by_total_norm_fp32',
+        lambda params, max_norm, total_norm, use_decoupled_grad: calls.append(
+            (list(params), max_norm, total_norm, use_decoupled_grad)
+        ),
+    )
+    optimizer = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'get_dsa_split_parameters': lambda self: ([indexer_param], [main_param]),
+            'get_dsa_split_grad_norms': lambda self: (4.0, 2.0),
+            'config': type(
+                '_Config',
+                (),
+                {
+                    'dsa_indexer_clip_grad': 0.5,
+                    'use_precision_aware_optimizer_no_fp8_or_ds_fp8': False,
+                    'use_precision_aware_optimizer': False,
+                },
+            )(),
+            '_last_dsa_split_grad_norms': None,
+            # The real helper, so the harness exercises the same decision production makes.
+            '_uses_decoupled_grad': MegatronOptimizer._uses_decoupled_grad,
+        },
+    )()
+
+    combined_norm = MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(optimizer, clip_grad=1.0)
+
+    assert combined_norm == pytest.approx((4.0**2 + 2.0**2) ** 0.5)
+    assert optimizer._last_dsa_split_grad_norms == (4.0, 2.0)
+    assert len(calls) == 2
+    assert calls[0][0][0] is main_param
+    assert calls[0][1:] == (1.0, 2.0, False)
+    assert calls[1][0][0] is indexer_param
+    assert calls[1][1:] == (0.5, 4.0, False)
+
+
+def test_separate_dsa_clipping_reads_decoupled_grad_under_mfsdp_v1(monkeypatch):
+    """The split clip must ask the parameters, not the config, where the gradient lives.
+
+    Megatron-FSDP v1 with a precision-aware optimizer keeps gradients in `.decoupled_grad`
+    while `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is False. Deciding from that flag
+    alone passed use_decoupled_grad=False, and clip_grad_by_total_norm_fp32 skips any parameter
+    whose chosen attribute is absent -- so clipping silently did nothing.
+    """
+    import megatron.core.optimizer.optimizer as optimizer_module
+
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_param = torch.nn.Parameter(torch.ones(3))
+    for param in (main_param, indexer_param):
+        param.__fsdp_param__ = True
+
+    calls = []
+    monkeypatch.setattr(
+        optimizer_module,
+        'clip_grad_by_total_norm_fp32',
+        lambda params, max_norm, total_norm, use_decoupled_grad: calls.append(
+            (list(params), max_norm, total_norm, use_decoupled_grad)
+        ),
+    )
+    optimizer = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'get_dsa_split_parameters': lambda self: ([indexer_param], [main_param]),
+            'get_dsa_split_grad_norms': lambda self: (4.0, 2.0),
+            'config': type(
+                '_Config',
+                (),
+                {
+                    'dsa_indexer_clip_grad': 0.5,
+                    'use_precision_aware_optimizer_no_fp8_or_ds_fp8': False,
+                    'use_precision_aware_optimizer': True,
+                },
+            )(),
+            '_last_dsa_split_grad_norms': None,
+            '_uses_decoupled_grad': MegatronOptimizer._uses_decoupled_grad,
+        },
+    )()
+
+    MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(optimizer, clip_grad=1.0)
+
+    assert len(calls) == 2
+    assert calls[0][3] is True, "non-indexer group must read .decoupled_grad under MFSDP v1"
+    assert calls[1][3] is True, "indexer group must read .decoupled_grad under MFSDP v1"
+
+
+def test_dsa_split_parameters_follow_param_group_metadata():
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_weight = torch.nn.Parameter(torch.ones(3))
+    indexer_bias = torch.nn.Parameter(torch.ones(1))
+    harness = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'optimizer': type(
+                '_TorchOptimizer',
+                (),
+                {
+                    'param_groups': [
+                        {'params': [main_param], 'is_dsa_indexer': False},
+                        {'params': [indexer_weight], 'is_dsa_indexer': True, 'wd_mult': 1.0},
+                        {'params': [indexer_bias], 'is_dsa_indexer': True, 'wd_mult': 0.0},
+                    ]
+                },
+            )()
+        },
+    )()
+
+    indexer_params, non_indexer_params = MegatronOptimizer.get_dsa_split_parameters(harness)
+    assert indexer_params == [indexer_weight, indexer_bias]
+    assert non_indexer_params == [main_param]
+
+
+def test_global_clipping_path_records_preclip_dsa_split_norms_for_logging():
+    harness = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'optimizer': type(
+                '_TorchOptimizer', (), {'param_groups': [{'params': [], 'is_dsa_indexer': True}]}
+            )(),
+            'get_dsa_split_grad_norms': lambda self: (3.0, 4.0),
+            '_last_dsa_split_grad_norms': None,
+        },
+    )()
+
+    MegatronOptimizer._maybe_store_dsa_split_grad_norms(harness)
+    assert harness._last_dsa_split_grad_norms == (3.0, 4.0)
+
+
+def test_old_optimizer_param_group_metadata_defaults_to_non_indexer():
+    old_group = {
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+    }
+    new_non_indexer_group = {**old_group, 'is_dsa_indexer': False}
+    new_indexer_group = {**old_group, 'is_dsa_indexer': True}
+
+    assert get_param_group_identifier_tuple(old_group) == get_param_group_identifier_tuple(
+        new_non_indexer_group
+    )
+    assert get_param_group_identifier_tuple(old_group) != get_param_group_identifier_tuple(
+        new_indexer_group
+    )
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -179,6 +445,45 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+@pytest.mark.parametrize("apply_wd_to_qk_layernorm", [False, True])
+def test_standard_overrides_apply_weight_decay_to_wide_residual_retention(
+    monkeypatch, apply_wd_to_qk_layernorm
+):
+    """Retention logits inherit ordinary WD despite being represented as 1-D parameters."""
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    net = WideResidualRetentionOptimizerNet()
+    config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        weight_decay=0.1,
+        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+    )
+    overrides = get_standard_config_overrides(config)
+    check_config_overrides_consistency(config, overrides)
+    param_groups = _get_param_groups([net], config, overrides)
+
+    def group_for(parameter):
+        matches = [
+            group for group in param_groups if any(param is parameter for param in group['params'])
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    retention_group = group_for(net.retention)
+    vector_group = group_for(net.ordinary_vector)
+    matrix_group = group_for(net.ordinary_matrix)
+    assert retention_group['wd_mult'] == 1.0
+    assert vector_group['wd_mult'] == 0.0
+    assert matrix_group['wd_mult'] == 1.0
+    assert config.weight_decay * retention_group['wd_mult'] == pytest.approx(0.1)
+    assert config.weight_decay * vector_group['wd_mult'] == 0.0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -1192,8 +1497,8 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
 
 def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state_dict():
     """Fused-LN MLA keeps the input LayerNorm params on linear_qkv_down_proj at runtime while the
-    checkpoint canonicalizes them to input_layernorm.*; reloading main params through a
-    DDP-wrapped model must still match every parameter."""
+    checkpoint keeps them fused on linear_qkv_down_proj.layer_norm_*; reloading main
+    params through a DDP-wrapped model must still match every parameter."""
     if not is_te_min_version("1.10.0"):
         pytest.skip("Requires TE >= 1.10.0")
 
@@ -1243,8 +1548,10 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
             for key, sh_ten in sharded_state_dict.items()
             if isinstance(sh_ten, ShardedTensor)
         }
-        assert any(key.startswith("decoder.layers.0.input_layernorm.") for key in state_dict)
-        assert not any("linear_qkv_down_proj.layer_norm_" in key for key in state_dict)
+        assert any(
+            key.startswith("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_")
+            for key in state_dict
+        )
 
         optim.reload_model_params(state_dict)
 
@@ -1281,8 +1588,14 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     Test that get_megatron_optimizer works correctly with custom process groups
     provided via pg_collection parameters.
     """
-    # Skip if world size doesn't match available GPUs
-    actual_world_size = torch.cuda.device_count()
+    # Process-group world size, not visible device count, determines whether
+    # the requested TP/CP/DP mesh can be constructed. A single pytest process
+    # may legitimately see every GPU on the node.
+    actual_world_size = (
+        torch.distributed.get_world_size()
+        if torch.distributed.is_initialized()
+        else Utils.world_size
+    )
     if actual_world_size != world_size:
         pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
@@ -1480,3 +1793,143 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             use_gloo_process_groups=True,  # Should be False when using custom groups
             pg_collection=pg_collection_complete,
         )
+
+
+def _chain_member(param_groups):
+    """A MegatronOptimizer whose ``param_groups`` come from the given raw groups.
+
+    ``MegatronOptimizer.param_groups`` just forwards to ``self.optimizer.param_groups``,
+    so a namespace is enough and no real torch optimizer (or CUDA) is needed.
+    """
+    member = object.__new__(DistributedOptimizer)
+    member.is_stub_optimizer = False
+    member.optimizer = SimpleNamespace(param_groups=param_groups)
+    return member
+
+
+def _chain(*members):
+    chain = object.__new__(ChainedOptimizer)
+    chain.chained_optimizers = list(members)
+    return chain
+
+
+def test_synchronize_steps_with_nested_chained_optimizer():
+    """``_synchronize_steps`` must tolerate a member that is itself a ChainedOptimizer.
+
+    ``LayerWiseDistributedOptimizer`` subclasses ChainedOptimizer and holds more than one
+    inner optimizer whenever the model mixes optimizers, muon plus AdamW for instance, so
+    it presents to an outer chain as a nested ChainedOptimizer. Reaching through
+    ``.optimizer`` asserts on those; going through ``param_groups`` does not.
+    """
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 3}])
+    expert = _chain_member([{'params': [param], 'step': 3}])
+    # TE FusedAdam does not accumulate 'step' for empty param groups, which is the
+    # case _synchronize_steps exists to paper over; it must stay untouched.
+    empty = _chain_member([{'params': [], 'step': 99}])
+    nested = _chain(expert, empty)
+    outer = _chain(dense, nested)
+
+    # The bug this guards: the nested chain has >1 inner optimizer, so the
+    # ``.optimizer`` shortcut the old implementation used is not available.
+    with pytest.raises(AssertionError, match="more than one optimizer"):
+        nested.optimizer
+
+    step = outer._synchronize_steps()
+
+    assert step == 3
+    assert dense.param_groups[0]['step'] == 3
+    assert expert.param_groups[0]['step'] == 3
+    assert empty.param_groups[0]['step'] == 99
+
+
+def test_synchronize_steps_aligns_lagging_group():
+    """A group missing 'step' is left alone; populated groups converge on the one value."""
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 7}])
+    expert = _chain_member([{'params': [param]}])  # no 'step' yet
+    outer = _chain(dense, _chain(expert))
+
+    assert outer._synchronize_steps() == 7
+    assert dense.param_groups[0]['step'] == 7
+    assert 'step' not in expert.param_groups[0]
+
+
+def _decay_layer_params(fp32_decay):
+    """Two GDP-like layers plus one native FP32 parameter, in optimizer order."""
+    decay_dtype = torch.float32 if fp32_decay else torch.bfloat16
+    params = {}
+    for layer in range(2):
+        params[f'{layer}.weight'] = (8, 8), torch.bfloat16
+        params[f'{layer}.A_log'] = (4,), decay_dtype
+        params[f'{layer}.dt_bias'] = (4,), decay_dtype
+        params[f'{layer}.norm'] = (4,), torch.bfloat16
+    params['scale'] = (3,), torch.float32
+    return {
+        name: torch.nn.Parameter(torch.zeros(shape, dtype=dtype, device='cuda'))
+        for name, (shape, dtype) in params.items()
+    }
+
+
+def _float16_optimizer(params):
+    return Float16OptimizerWithFloat16Params(
+        Adam(list(params.values()), lr=0.01),
+        OptimizerConfig(optimizer='adam', bf16=True),
+        None,
+        lambda optimizer, config=None: None,
+    )
+
+
+def test_float16_optimizer_restores_main_params_saved_before_fp32_marking():
+    """A torch-format checkpoint from before ``mark_keep_in_fp32`` resumes per parameter.
+
+    Saved main params are one list per group, ordered by the float16 params of the
+    saving run. Once ``A_log`` and ``dt_bias`` stay in FP32, their saved entries must
+    land on those parameters and not shift onto the next float16 parameters.
+    """
+    torch.manual_seed(0)
+    old_params = _decay_layer_params(fp32_decay=False)
+    old_optimizer = _float16_optimizer(old_params)
+    main_params = {}
+    for name, param in old_params.items():
+        main_param = getattr(param, 'main_param', param)
+        main_param.data.copy_(torch.randn_like(main_param, dtype=torch.float32))
+        param.data.copy_(main_param.data)
+        main_params[name] = main_param.detach().clone()
+        state = old_optimizer.optimizer.state[main_param]
+        state['step'] = torch.tensor(1.0)
+        state['exp_avg'] = torch.randn_like(main_param)
+        state['exp_avg_sq'] = torch.rand_like(main_param)
+    old_states = {
+        name: {key: value.clone() for key, value in old_optimizer.optimizer.state[main].items()}
+        for name, main in (
+            (name, getattr(param, 'main_param', param)) for name, param in old_params.items()
+        )
+    }
+    buffer = io.BytesIO()
+    torch.save(old_optimizer.state_dict(), buffer)
+
+    new_params = _decay_layer_params(fp32_decay=True)
+    # Training loads the model weights before the optimizer state.
+    for name, param in new_params.items():
+        param.data.copy_(old_params[name].data)
+    new_optimizer = _float16_optimizer(new_params)
+    buffer.seek(0)
+    new_optimizer.load_state_dict(torch.load(buffer, weights_only=False))
+
+    for name, param in new_params.items():
+        main_param = getattr(param, 'main_param', param)
+        torch.testing.assert_close(main_param, main_params[name], atol=0, rtol=0)
+        for key, value in new_optimizer.optimizer.state[main_param].items():
+            torch.testing.assert_close(value, old_states[name][key], atol=0, rtol=0)
+
+
+def test_float16_optimizer_rejects_unmatchable_main_params():
+    """Saved main params that match no parameter raise instead of shifting silently."""
+    old_params = _decay_layer_params(fp32_decay=False)
+    state_dict = _float16_optimizer(old_params).state_dict()
+    state_dict['fp32_from_fp16_params'][0].insert(0, torch.ones(5, device='cuda'))
+
+    new_optimizer = _float16_optimizer(_decay_layer_params(fp32_decay=True))
+    with pytest.raises(RuntimeError, match="Cannot match the 9 saved main params"):
+        new_optimizer.load_state_dict(state_dict)

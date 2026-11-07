@@ -376,7 +376,7 @@ def _compare_against_golden_values(
 # Test class
 # ---------------------------------------------------------------------------
 
-_GOLDEN_BASE = Path(__file__).parents[3] / "functional_tests/test_cases/hybrid"
+_GOLDEN_BASE = Path(__file__).parents[3] / ("functional_tests/test_cases/hybrid")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

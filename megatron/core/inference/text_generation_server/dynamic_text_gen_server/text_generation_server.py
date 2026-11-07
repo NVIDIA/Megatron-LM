@@ -7,7 +7,8 @@ import multiprocessing as mp
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional
+from multiprocessing import connection as mp_connection
+from typing import List, Optional, Tuple
 
 try:
     from hypercorn.asyncio import serve
@@ -23,10 +24,17 @@ from megatron.core.inference.config import MultimodalPromptConfig, PrefixCaching
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
+from .endpoints.common import apply_optional_sampling_default
+
 logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
+# The policy worker is a live Ray/CUDA process with background threads by the
+# time it starts HTTP replicas. Forking it copies locks and runtime state
+# without the threads that own them, which can leave a child alive but unable
+# to make progress. Every frontend must therefore start from a clean interpreter.
+_SERVER_PROCESS_CONTEXT = mp.get_context("spawn")
 
 
 @contextmanager
@@ -52,16 +60,18 @@ async def _run_text_gen_server(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
     manages its own InferenceClient connected to the provided coordinator address.
+    ``ready_conn`` receives one message once this replica's listener accepts connections.
     """
     if not HAS_BACKEND:
         raise RuntimeError(f"Web backend framework (Quart) not available")
@@ -105,9 +115,12 @@ async def _run_text_gen_server(
         app.config['multimodal_prompt_config'] = (
             multimodal_prompt_config or MultimodalPromptConfig()
         )
-        app.config['default_temperature'] = default_temperature
-        app.config['default_top_p'] = default_top_p
-        app.config['default_top_k'] = default_top_k
+        # Only set when the operator actually configured a value -- see
+        # apply_optional_sampling_default's docstring for why unconditional
+        # assignment here would break resolve_sampling_default's precedence.
+        apply_optional_sampling_default(app.config, 'default_temperature', default_temperature)
+        apply_optional_sampling_default(app.config, 'default_top_p', default_top_p)
+        apply_optional_sampling_default(app.config, 'default_top_k', default_top_k)
         app.config['eval_mode'] = eval_mode
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
@@ -132,7 +145,13 @@ async def _run_text_gen_server(
 
         # Held for this worker's lifetime; closing it would drop the listener.
         own_socket = _bind_reuseport_socket(server_port, bind_host)
+        # Listen now so connections queue in the kernel from this point on;
+        # hypercorn re-issues listen() on the fd when it starts accepting.
+        own_socket.listen(config.backlog)
         config.bind = [f"fd://{own_socket.fileno()}"]
+        if ready_conn is not None:
+            ready_conn.send(True)
+            ready_conn.close()
 
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
@@ -166,12 +185,13 @@ def _server_process_worker(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -194,6 +214,7 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                ready_conn,
             )
         )
     except KeyboardInterrupt:
@@ -251,14 +272,14 @@ def start_text_gen_server(
     sock: Optional[socket.socket] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ) -> Optional[str]:
-    """Start the text generation server.
+    """Start the text generation server and wait until every replica is listening.
 
     Every replica binds its own socket on ``server_port`` with SO_REUSEPORT, so
     each gets its own accept queue and the kernel spreads connections across
@@ -284,6 +305,10 @@ def start_text_gen_server(
     Returns:
         The base URL this rank serves on, or None if the server was already
         running.
+
+    Raises:
+        RuntimeError: a replica exited before listening; the whole replica group is
+            terminated first so a retry does not hit the guard.
     """
     global _SERVER_PROCESSES
 
@@ -303,8 +328,10 @@ def start_text_gen_server(
     elif server_port == 0:
         server_port = _reserve_port(hostname)
 
+    replicas = []
     for i in range(num_replicas):
-        p = mp.Process(
+        ready_reader, ready_writer = mp.Pipe(duplex=False)
+        p = _SERVER_PROCESS_CONTEXT.Process(
             target=_server_process_worker,
             args=(
                 coordinator_addr,
@@ -322,17 +349,41 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                ready_writer,
             ),
             daemon=True,
         )
         p.start()
+        # Drop the parent's copy so a replica that dies before signalling reads as EOF.
+        ready_writer.close()
         _SERVER_PROCESSES.append(p)
+        replicas.append((p, ready_reader))
         logger.info(
             f"Started text gen frontend replica {i+1}/{num_replicas} "
             f"on port {server_port} (PID: {p.pid})"
         )
 
+    _wait_until_listening(replicas)
+
     return f"http://{hostname or socket.gethostname()}:{server_port}"
+
+
+def _wait_until_listening(replicas: List[Tuple[mp.Process, mp_connection.Connection]]) -> None:
+    """Block until every replica has bound and is listening, or fail loudly."""
+    global _SERVER_PROCESSES
+    for p, ready_reader in replicas:
+        ready = mp_connection.wait([ready_reader, p.sentinel])
+        try:
+            listening = ready_reader in ready and ready_reader.recv() is True
+        except EOFError:
+            listening = False
+        finally:
+            ready_reader.close()
+        if listening:
+            continue
+        _terminate(_SERVER_PROCESSES, "Text Gen frontend")
+        _SERVER_PROCESSES = []
+        raise RuntimeError(f"Text gen frontend replica (PID {p.pid}) exited before listening")
 
 
 def _terminate(processes: List[mp.Process], what: str):

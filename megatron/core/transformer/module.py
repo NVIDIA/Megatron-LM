@@ -3,7 +3,7 @@
 """Megatron Module."""
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -21,6 +21,24 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+
+class TwoStageAttentionLayer:
+    """Interface for attention-like modules that expose core and post-core stages."""
+
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this module instance supports two-stage execution."""
+        return True
+
+    def forward_pre_attn_and_core_attn(
+        self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
+    ) -> Any:
+        """Run the pre-attention and core-attention stage."""
+        raise NotImplementedError
+
+    def forward_post_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the post-core-attention stage."""
+        raise NotImplementedError
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
@@ -247,11 +265,27 @@ class GraphableMegatronModule(MegatronModule):
             partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
         )
 
+    def _te_cuda_graph_index(self, microbatch_idx):
+        """Select the replay slot shared by forward and deferred weight gradients."""
+        if (
+            self.config.sequence_packing_scheduler == "dp_balanced"
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.pipeline_model_parallel_size > 1
+            and microbatch_idx >= len(self.cuda_graphs)
+        ):
+            raise RuntimeError(
+                "Packed microbatch count exceeds the captured source-batch bound; "
+                "recapture CUDA graphs before increasing the source batch size."
+            )
+        # PP1 captures one slot. Preserve modulo reuse for non-packed TE callers too;
+        # only scheduler-produced packed PP batches guarantee a fixed source-batch bound.
+        return microbatch_idx % len(self.cuda_graphs)
+
     def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
         """
         CUDA Graph backward weight gradient computation for current layer.
         """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
         if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
             return
         self.cuda_graphs[cg_index].backward_dw()
@@ -331,7 +365,8 @@ class GraphableMegatronModule(MegatronModule):
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
 
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+        microbatch_idx = getattr(self, 'current_microbatch', 0)
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
         for hook, hook_args in self.cuda_graph_manual_hooks:

@@ -39,7 +39,7 @@ from megatron.core.utils import is_fa_min_version
 # in a separate edit to ``DynamicEngineTestConfig``.
 from tests.unit_tests.core.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
-    set_rounder,
+    reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -82,7 +82,7 @@ class TestDynamicEngineSinkAttention(DynamicInferenceEngineTestBase):
         # Deliberately NOT calling delete_cuda_graphs() — these tests do
         # not enable CUDA graphs, so there is nothing to clean up, and
         # avoiding the call sidesteps the known teardown SIGABRT.
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @staticmethod

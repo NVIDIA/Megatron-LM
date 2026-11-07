@@ -259,7 +259,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                pre_mlp_layernorm=(
+                    backend.layer_norm(has_residual=True) if num_experts else IdentityOp
+                ),
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map=(
@@ -560,6 +562,9 @@ def get_gpt_decoder_layer_specs(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    if normalization is None:
+        normalization = config.normalization
+
     assert config.experimental_attention_variant is None, (
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
@@ -717,10 +722,8 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    # MTP has only ever used the Transformer Engine or the local backend, never the
-    # inference one, so it does not go through _base_backend_name().
     backend: BackendSpecProvider = get_backend_from_config(
-        config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
+        config, transformer_impl=_base_backend_name(config, use_transformer_engine)
     )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank

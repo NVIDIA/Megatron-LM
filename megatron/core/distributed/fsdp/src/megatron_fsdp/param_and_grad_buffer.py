@@ -162,6 +162,17 @@ def _free_storage(tensor: torch.Tensor):
                 tensor._typed_storage()._resize_(0)
 
 
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device) -> None:
+    """Replace ``module``'s own meta parameters and buffers with uninitialized tensors on
+    ``device``, leaving its tensors that are already on a device unchanged.
+    """
+
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(tensor, device=device) if tensor.is_meta else tensor
+
+    module._apply(materialize, recurse=False)
+
+
 TensorItemIndex = namedtuple(
     "TensorItemIndex", ["global_data_index", "size", "item_id", "bucket_id", "shape"]
 )
@@ -1954,9 +1965,13 @@ def _get_parameter_groups(
                 ):
                     same_factor_params.append(param)
                 else:
-                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_shape[1:].numel())
-                    chunk_size_factor = lcm_chunk_size_factor
-                    same_factor_params.append(param)
+                    # Defer to a later group rather than widening this group's factor to the LCM.
+                    # Buckets are padded to a multiple of data_parallel_world_size *
+                    # chunk_size_factor, so folding incompatible row sizes into one group makes the
+                    # factor grow multiplicatively and the padding grow with it. For DeepSeek-V3
+                    # row sizes 18432, 16384 and 7168 the LCM is 1032192, which at 512-way data
+                    # parallelism pads a single bucket by up to 528M elements.
+                    remaining_params.append(param)
             # Create a new parameter group with the same chunk size factor.
             new_bucket_groups.append(
                 ParameterGroup(
@@ -2549,21 +2564,32 @@ class ParamAndGradBuffer:
             self.dist_index.use_hybrid_fsdp
             and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
         )
-        # DP-Outer sharding is only supported for fully-sharded DP-Shard. Every parameter
-        # class has to qualify: the helper buffers re-index the DP-Shard layout, which is
-        # only defined here for fully-sharded groups.
-        # NOTE(@cspades): Important guard for HFSDP functionality!
-        if should_create_hfsdp_helper_buffers and not all_sharding_strategies_in(
-            self.ddp_config, ["optim_grads_params"]
-        ):
-            raise NotImplementedError(
-                "[Megatron-FSDP] Optimizer fully-sharded HFSDP is only supported "
-                "with full-sharding on DP-Shard.\nMegatron-FSDP DP-Shard Strategy: "
-                f"{self.ddp_config.data_parallel_sharding_strategy}\nMegatron-FSDP "
-                "DP-Shard Expert Strategy: "
-                f"{self.ddp_config.expert_data_parallel_sharding_strategy}\nMegatron-FSDP "
-                f"DP-Outer Strategy: {self.ddp_config.outer_dp_sharding_strategy}"
-            )
+        # DP-Outer sharding indexes every DP-wide shard by logical hybrid rank, so all of the
+        # buffers it touches are communicated through a DP-Shard helper (created per buffer
+        # below) rather than on the hybrid group directly. Weights may be replicated on
+        # DP-Shard: such a group reassembles the whole bucket from the DP-wide shards.
+        #
+        # Gradients may not: DP-Outer reduction reduce-scatters the DP-Shard gradient shard
+        # into the DP-wide main gradient shard, which needs a gradient buffer that is sharded
+        # on DP-Shard. Strategies that replicate gradients have no such shard to feed it.
+        if should_create_hfsdp_helper_buffers:
+            unsupported = [
+                s
+                for s in get_sharding_strategies_in_use(self.ddp_config)
+                if s in ("no_shard", "optim")
+            ]
+            if unsupported:
+                # Defense in depth: fully_shard() rejects the same configuration first, so this
+                # is only reachable by constructing the buffer directly.
+                raise NotImplementedError(  # pragma: no cover
+                    "[Megatron-FSDP] DP-Outer sharding requires a DP-Shard strategy that shards "
+                    f"gradients (optim_grads or optim_grads_params), but got {unsupported}.\n"
+                    "Megatron-FSDP DP-Shard Strategy: "
+                    f"{self.ddp_config.data_parallel_sharding_strategy}\nMegatron-FSDP "
+                    "DP-Shard Expert Strategy: "
+                    f"{self.ddp_config.expert_data_parallel_sharding_strategy}\nMegatron-FSDP "
+                    f"DP-Outer Strategy: {self.ddp_config.outer_dp_sharding_strategy}"
+                )
 
         if self.ddp_config.nccl_ub:
             assert self.ddp_config.fsdp_double_buffer, (
@@ -2574,6 +2600,30 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+
+        if self.ddp_config.gradient_reduce_div_fusion:
+            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
+            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
+            requires_grad_only = (
+                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
+            )
+            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
+                if bucket_id != bucket_group[0]:
+                    continue
+                grad_comm_dtypes = {
+                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
+                    for i in bucket_group
+                    if self.parameter_groups[i].requires_grad or not requires_grad_only
+                }
+                if len(grad_comm_dtypes) > 1:
+                    raise ValueError(
+                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
+                        "mixed gradient communication dtypes in a coalesced bucket group "
+                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
+                        "Set gradient_reduce_div_fusion=False "
+                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
+                    )
+
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
@@ -2797,29 +2847,49 @@ class ParamAndGradBuffer:
 
             # Initialize the HSDP weight and grad buffers if hsdp full sharding is enabled.
             if should_create_hfsdp_helper_buffers:
-                # Initialize the HSDP weight buffer.
-                wbuf = group.model_weight_buffer
-                group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
-                    group.model_weight_buffer,
-                    inner_dp_group=inner_dp_group,
-                    is_data_distributed=is_main_weight_buffer_distributed
-                    and inner_dp_group.size() > 1,
-                )
-
-                if group.transpose_weight_buffer is not None:
-                    group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(
-                        group.transpose_weight_buffer,
+                # Every weight buffer gets a DP-Shard helper, whether or not the group shards
+                # its weights. DP-Outer sharding indexes shards by logical hybrid rank
+                # (inner-major, outer-minor), which does not match the rank ordering of the
+                # hybrid process group, so an all-gather issued on the hybrid group would
+                # scatter each rank's shard to the wrong offset. The helper re-indexes the
+                # bucket onto DP-Shard, whose rank ordering does match, so the weights are
+                # always reassembled DP-Outer first and DP-Shard second.
+                #
+                # When the group shards its weights the helper owns the DP-Shard shard and
+                # the group's buffer is a view of one DP-Outer slice of it. When the group
+                # keeps them replicated the helper shares the group's storage and only
+                # re-indexes it, so the DP-Shard shard is a view into the full bucket.
+                if group.model_weight_buffer is not None:
+                    group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
+                        group.model_weight_buffer,
                         inner_dp_group=inner_dp_group,
-                        is_data_distributed=is_main_weight_buffer_distributed
+                        is_data_distributed=group.model_weight_buffer.is_data_distributed
                         and inner_dp_group.size() > 1,
                     )
 
-                if should_create_grad_buffer_or_main_weight_buffer:
+                    if group.transpose_weight_buffer is not None:
+                        # Transpose buffers exist only for MXFP8 parameters, which no unit test
+                        # constructs: the mxfp8 cases are launched on the H100 runners, where
+                        # they skip on device capability, and Blackwell only launches files
+                        # carrying the launch_on_gb200 marker, which no FSDP test carries.
+                        group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(  # pragma: no cover
+                            group.transpose_weight_buffer,
+                            inner_dp_group=inner_dp_group,
+                            is_data_distributed=(
+                                group.transpose_weight_buffer.is_data_distributed
+                                and inner_dp_group.size() > 1
+                            ),
+                        )
+
+                if (
+                    should_create_grad_buffer_or_main_weight_buffer
+                    and group.main_grad_buffer is not None
+                    and group.main_grad_buffer.is_data_distributed
+                ):
                     group.hfsdp_helper_gbuf = _create_hfsdp_helper_buffer(
                         group.main_grad_buffer,
                         inner_dp_group=inner_dp_group,
-                        is_data_distributed=is_grad_buffer_distributed
-                        and inner_dp_group.size() > 1,
+                        is_data_distributed=inner_dp_group.size() > 1,
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hfsdp_helper_gbuf.data_size
@@ -2920,7 +2990,7 @@ class ParamAndGradBuffer:
             tbuf = group.transpose_weight_buffer
             if tbuf:
                 with self.mem_alloc_context():
-                    if group.hfsdp_helper_wbuf:
+                    if group.hfsdp_helper_wtbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
                             tbuf,
@@ -2968,7 +3038,7 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            _materialize_meta_tensors(m, self.device)
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
@@ -3661,7 +3731,10 @@ class ParamAndGradBuffer:
         self._all_gather_unsharded_transpose_weights()
 
     @torch.no_grad()
-    def _all_gather_unsharded_transpose_weights(self):
+    # Excluded from coverage because it runs only for MXFP8 parameters, which no unit test
+    # constructs: the mxfp8 cases are launched on the H100 runners, where they skip on device
+    # capability, and Blackwell only launches files carrying the launch_on_gb200 marker.
+    def _all_gather_unsharded_transpose_weights(self):  # pragma: no cover
         """Complete the column-wise FP8 weight buffer from every rank's optimizer shard.
 
         Quantization writes only the region of the weight buffers that this rank optimizes, because
@@ -3683,11 +3756,40 @@ class ParamAndGradBuffer:
                 continue
             if tbuf.data_parallel_group.size() == 1:
                 continue
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=tbuf.data,
-                input_tensor=tbuf.get_shard_from_local_buffer(),
-                group=tbuf.data_parallel_group,
+            helper = group.hfsdp_helper_wtbuf
+            if helper is None:
+                _assert_shard_index_matches_group(tbuf, "transpose weight all-gather")
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor=tbuf.data,
+                    input_tensor=tbuf.get_shard_from_local_buffer(),
+                    group=tbuf.data_parallel_group,
+                )
+                continue
+
+            # Under DP-Outer sharding the main weight shards are indexed by logical hybrid
+            # rank, which does not match the hybrid group's rank ordering, so this buffer is
+            # completed in the same two stages as the parameter all-gather: DP-Outer first
+            # into the DP-Shard shard, then DP-Shard into the whole bucket.
+            outer_fsdp_group = self.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
             )
+            inner_dp_shard = helper.get_shard_from_local_buffer()
+            shard_size = inner_dp_shard.numel() // outer_fsdp_group.size()
+            outer_rank = outer_fsdp_group.rank()
+            torch.distributed.all_gather_into_tensor(
+                output_tensor=inner_dp_shard,
+                input_tensor=inner_dp_shard[
+                    outer_rank * shard_size : (outer_rank + 1) * shard_size
+                ],
+                group=outer_fsdp_group,
+            )
+            if helper.data_parallel_group.size() > 1:
+                _assert_shard_index_matches_group(helper, "transpose weight all-gather")
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor=tbuf.data,
+                    input_tensor=inner_dp_shard,
+                    group=helper.data_parallel_group,
+                )
 
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
@@ -3741,7 +3843,12 @@ class ParamAndGradBuffer:
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data,
+                scaling_factor,
+                self.ddp_config,
+                group_size=gbuf.data_parallel_group.size(),
+            )
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
                 output=gbuf.get_shard_from_local_buffer(),
                 input=gbuf.data,
@@ -3781,7 +3888,12 @@ class ParamAndGradBuffer:
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data,
+                scaling_factor,
+                self.ddp_config,
+                group_size=gbuf.data_parallel_group.size(),
+            )
             all_reduce_handler = torch.distributed.all_reduce(
                 gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
             )
@@ -3790,6 +3902,25 @@ class ParamAndGradBuffer:
 
         for op in all_reduce_ops:
             op.wait()
+
+
+def _assert_shard_index_matches_group(dp_buffer: DataParallelBuffer, collective: str) -> None:
+    """
+    Check that a buffer about to be communicated indexes its shards by its own group's
+    rank ordering.
+
+    Collectives like all-gather and reduce-scatter address the shard of rank `r` at offset
+    `r * shard_size` in the group they are issued on. A buffer whose `dp_rank` differs from
+    its group rank -- which is the case for buffers sharded by logical hybrid FSDP rank --
+    would silently have its shards permuted, producing wrong weights or gradients at full
+    speed. Communicate such a buffer through its DP-Shard helper instead.
+    """
+    assert dp_buffer.dp_rank == dp_buffer.data_parallel_group.rank(), (
+        f"[Megatron-FSDP] {collective} on bucket {dp_buffer.bucket_id} would permute shards: "
+        f"the buffer indexes shards by dp_rank={dp_buffer.dp_rank} but the collective places "
+        f"them by group rank={dp_buffer.data_parallel_group.rank()} "
+        f"(group size {dp_buffer.dp_world_size})."
+    )
 
 
 def _create_hfsdp_helper_buffer(
@@ -3836,6 +3967,10 @@ def _create_hfsdp_helper_buffer(
         data_parallel_group=inner_dp_group,
         is_transpose_buffer=dp_buffer.is_transpose_buffer,
         temporary_bucket_allocator=dp_buffer.temporary_bucket_allocator,
+        # The DP-Shard reduce-scatter is issued on the helper, so it has to carry the
+        # scaling that turns the sum of gradients over the whole DP group into an average.
+        # The DP-Outer reduction that follows deliberately applies no further scaling.
+        gradient_scaling_factor=dp_buffer.gradient_scaling_factor,
         bucket_id=dp_buffer.bucket_id,
         chunk_size_factor=dp_buffer.chunk_size_factor,
         mem_alloc_context=dp_buffer.mem_alloc_context,
@@ -3891,6 +4026,13 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     hfsdp_helper_buffer.init_data(
         mem_alloc(dtype=hfsdp_helper_buffer.dtype, size=hfsdp_helper_buffer.data_size)
     )
+
+    if not dp_buffer.is_data_distributed:
+        # The DP buffer holds the whole bucket, so there is no DP-Outer slice to view: it
+        # shares the helper's storage outright. The helper still re-indexes that storage
+        # onto DP-Shard, which is what the DP-Outer and DP-Shard collectives address.
+        dp_buffer.init_data(hfsdp_helper_buffer.data)
+        return
 
     rank = outer_dp_group.rank()
     shard_size = dp_buffer.data_size
@@ -4110,7 +4252,9 @@ class GradReducePipeline:
     def get_fsdp_buffer(self, bucket_id: int) -> DataParallelBuffer:
         """Get the FSDP buffer for the given bucket ID."""
         param_group = self.buffer.parameter_groups[bucket_id]
-        if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
+        # A group only has a DP-Outer helper when its gradients are sharded on the hybrid group.
+        # Otherwise the main grad buffer already spans DP-Shard.
+        if param_group.hfsdp_helper_gbuf is not None:
             return param_group.hfsdp_helper_gbuf
         return param_group.main_grad_buffer
 
@@ -4182,7 +4326,10 @@ class GradReducePipeline:
                     # Pre-scale unsharded bucket gradient and prepare the ReduceOp.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        unreduced_grad, scaling_factor, ddp_config
+                        unreduced_grad,
+                        scaling_factor,
+                        ddp_config,
+                        group_size=gbuf.data_parallel_group.size(),
                     )
 
                     # Gradients are copied into an unsharded buffer under 'no_shard' and
@@ -4205,6 +4352,8 @@ class GradReducePipeline:
                     else:
                         # Slice a gradient shard from the communication bucket.
                         grad_shard = gbuf.get_shard_from_bucket(unreduced_grad_bucket)
+
+                        _assert_shard_index_matches_group(gbuf, "gradient reduce-scatter")
 
                         # Execute the reduce-scatter collective.
                         torch.distributed.reduce_scatter_tensor(
@@ -4249,7 +4398,12 @@ class GradReducePipeline:
         if outer_fsdp_group_grad_reduce:
             # Wait on the DP-Shard reduction before further reduction.
             self.outer_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
-            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+            # Expert and non-expert parameters have their own DP-Outer groups, and a bucket
+            # group is homogeneous in that respect (the DP-Shard group above is also taken
+            # from its first bucket).
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=self.buffer.parameter_groups[bucket_group[0]].is_expert_param
+            )
             with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
                 with _coalescing_manager(outer_fsdp_group):
                     # List of gradient accumulation closure tasks.
@@ -4405,6 +4559,8 @@ class AllGatherPipeline:
         self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
         # One DP-Outer event may be shared by all buckets in a coalesced group.
         self.outer_bucket_ready_events: Dict[Tuple[int, bool], torch.cuda.Event] = {}
+        # Buckets whose row-wise weights are re-gathered by activation recompute in backward.
+        self.recompute_buckets: set = set()
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4560,23 +4716,23 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
+        outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that need
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
+        stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
+        group added may exceed it."""
         parameter_groups = self.buffer.parameter_groups
-        result = list(bucket_ids)
+        allgathered_bucket_ids = set(bucket_ids)
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                candidate = result[0] + 1
-                for existing_bucket_id in result[1:]:
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = min(allgathered_bucket_ids) + 1
+                while candidate in allgathered_bucket_ids:
                     candidate += 1
             else:
-                candidate = result[-1] - 1
-                for existing_bucket_id in reversed(result[:-1]):
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = max(allgathered_bucket_ids) - 1
+                while candidate in allgathered_bucket_ids:
                     candidate -= 1
             if candidate < 0 or candidate >= self.buffer.num_buckets:
                 return None
@@ -4585,33 +4741,38 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
-        base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
-        )
-        bucket_id = next_bucket_id()
-        while bucket_id is not None:
-            prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
-                - base_all_gather_size
+        def needs_outer_gather(bucket_id):
+            group = parameter_groups[bucket_id]
+            if not outer_fsdp_group_param_gather or group.hfsdp_helper_wbuf is None:
+                return False
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
             )
-            if prefetched_size >= suggested_prefetch_size:
-                break
+            return outer_fsdp_group.size() > 1
 
+        def all_gather_size(bucket_id):
+            if not (
+                needs_outer_gather(bucket_id) or self.get_fsdp_buffer(bucket_id).is_data_distributed
+            ):
+                return 0
+            return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+
+        prefetched_size = 0
+        bucket_id = next_bucket_id()
+        while bucket_id is not None and prefetched_size < suggested_prefetch_size:
             if self.buffer.ddp_config.fsdp_double_buffer:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 double_buffer_units.add(fsdp_unit_id)
                 if len(double_buffer_units) > 2:
                     break
 
-            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            result = list(sorted(set(result)))
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id])
+            new_bucket_ids -= allgathered_bucket_ids
+            prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
+            allgathered_bucket_ids |= new_bucket_ids
             bucket_id = next_bucket_id()
 
-        return result
+        return sorted(allgathered_bucket_ids)
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
@@ -4637,13 +4798,17 @@ class AllGatherPipeline:
             with _coalescing_manager(outer_fsdp_group, async_ops=False):
                 for bucket_id in buckets:
                     inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
-                    shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
+                    # DP-Shard shard of the bucket: the helper's own storage when the weights
+                    # are sharded, a view into the replicated bucket when they are not. Either
+                    # way its DP-Outer slices are contiguous and ordered by DP-Outer rank, so
+                    # this rank's optimizer shard sits at slice `rank` and the gather fills the
+                    # DP-Shard shard in place.
+                    inner_dp_shard = inner_dp_wbuf.get_shard_from_local_buffer()
+                    shard_size = inner_dp_shard.numel() // outer_fsdp_group.size()
                     rank = outer_fsdp_group.rank()
                     torch.distributed.all_gather_into_tensor(
-                        output_tensor=inner_dp_wbuf.data,
-                        input_tensor=inner_dp_wbuf.data[
-                            rank * shard_size : (rank + 1) * shard_size
-                        ],
+                        output_tensor=inner_dp_shard,
+                        input_tensor=inner_dp_shard[rank * shard_size : (rank + 1) * shard_size],
                         group=outer_fsdp_group,
                     )
             if record_ready_event:
@@ -4673,6 +4838,7 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
+        recompute: bool = False,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4689,10 +4855,72 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
+            recompute (bool, optional): Whether this is a row-wise (`bwd=False`) gather for
+                the forward that activation recompute re-runs during the backward pass. The
+                gathered buckets that have a transpose buffer are recorded, and later backward
+                gathers also gather the row-wise weights of recorded buckets in their window.
         """
+        assert not (bwd and recompute), "Recompute gathers are row-wise (bwd=False)."
         if len(params) == 0:
             return
 
+        gather_kwargs = dict(
+            prefetch_order=prefetch_order,
+            suggested_AG_prefetch_size=suggested_AG_prefetch_size,
+            async_param_gather=async_param_gather,
+            outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+        )
+        window = self._all_gather_bucket_window(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        if recompute:
+            self._record_recompute_buckets(window)
+        elif bwd:
+            self._gather_recompute_buckets(window, gather_kwargs)
+
+    def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
+        """Record the buckets whose row-wise weights a recomputed forward re-gathered.
+        Buckets without a transpose buffer use the same weights in forward and backward.
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            return
+        parameter_groups = self.buffer.parameter_groups
+        self.recompute_buckets.update(
+            bucket_id
+            for bucket_id in bucket_ids
+            if parameter_groups[bucket_id].transpose_weight_buffer is not None
+        )
+
+    def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
+        """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
+        not already gathered, so that their recomputed forward does not wait on them."""
+        pending = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.recompute_buckets
+            and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
+        ]
+        if not pending:
+            return
+        params = [
+            param
+            for bucket_id in pending
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        self._all_gather_bucket_window(params, prefetch=False, bwd=False, **gather_kwargs)
+
+    def _all_gather_bucket_window(
+        self,
+        params: List[torch.Tensor],
+        prefetch: bool = False,
+        prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_AG_prefetch_size: Optional[int] = None,
+        async_param_gather: bool = True,
+        outer_fsdp_group_param_gather: bool = False,
+        bwd: bool = False,
+    ) -> List[int]:
+        """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
+        them, as described in `all_gather_params`. Return all of these bucket IDs, including
+        those that were already gathered."""
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
@@ -4735,7 +4963,11 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                double_buf_units,
+                outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
@@ -4746,6 +4978,7 @@ class AllGatherPipeline:
         if outer_ag_buckets:
             self._launch_outer_prefetches(outer_ag_buckets, bwd)
 
+        extended_buckets = ag_buckets
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
         ag_buckets = [
@@ -4755,7 +4988,7 @@ class AllGatherPipeline:
             in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
-            return
+            return extended_buckets
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
@@ -4805,6 +5038,8 @@ class AllGatherPipeline:
         if not async_param_gather:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
+
+        return extended_buckets
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
         """Wait for the bucket to be ready."""
@@ -4894,15 +5129,16 @@ class AllGatherPipeline:
         If bwd=True, return the FSDP transpose buffer instead.
         """
         param_group = self.buffer.parameter_groups[bucket_id]
-        if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
-            if bwd and param_group.transpose_weight_buffer is not None:
-                return param_group.hfsdp_helper_wtbuf
-            else:
-                return param_group.hfsdp_helper_wbuf
+        # Weight helpers exist only under DP-Outer sharding, where they carry the DP-Shard
+        # view of the bucket. Otherwise the group's own buffer already spans DP-Shard.
         if bwd and param_group.transpose_weight_buffer is not None:
+            # See _all_gather_unsharded_transpose_weights: no unit test builds a transpose buffer.
+            if param_group.hfsdp_helper_wtbuf is not None:  # pragma: no cover
+                return param_group.hfsdp_helper_wtbuf
             return param_group.transpose_weight_buffer
-        else:
-            return param_group.model_weight_buffer
+        if param_group.hfsdp_helper_wbuf is not None:
+            return param_group.hfsdp_helper_wbuf
+        return param_group.model_weight_buffer
 
     @torch.no_grad()
     def async_bucket_gather(self, bucket_id, bwd) -> None:
@@ -4927,6 +5163,8 @@ class AllGatherPipeline:
 
         # Allocate an empty bucket to store the module weights.
         bucket = wbuf.fetch_bucket(set_param_data=True)
+
+        _assert_shard_index_matches_group(wbuf, "parameter all-gather")
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
@@ -4955,9 +5193,11 @@ class AllGatherPipeline:
 
 
 @torch.no_grad()
-def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
+def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_size=None):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
+
+    ``group_size`` is the reduction group's rank count; None skips the one-rank case below.
     """
 
     # TODO(@cspades): Clean up this logic in conjunction with
@@ -4969,6 +5209,14 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
     elif ddp_config.average_in_collective:
         # Scaling overridden by AVG reduction.
         reduce_op = torch.distributed.ReduceOp.AVG
+    elif group_size == 1:
+        # A reduction over a single rank degenerates into a copy, which does not necessarily
+        # carry the pre-multiplier of a premul-sum reduction, so scale the gradient directly.
+        # The scale is 1/dp_cp_size while the reduction runs over a narrower group, so a
+        # one-rank group arises whenever expert parallelism spans the data parallel domain,
+        # and again under HFSDP when DP-Shard holds a single rank.
+        grad_data.mul_(scaling_factor)
+        reduce_op = torch.distributed.ReduceOp.SUM
     elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
         # Fused SUM reduction.
         reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)

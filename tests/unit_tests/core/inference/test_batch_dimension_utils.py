@@ -248,6 +248,42 @@ class TestGenerateCUDAGraphEdgeCases:
                 assert g.token_count == g.decode_req_count * (num_spec + 1)
                 assert g.decode_req_count <= 32
 
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    def test_extra_prefill_token_counts_are_captured(self, monkeypatch, batch_invariant):
+        """A prefill budget below the step capacity gets its own graph instead of padding
+        prefill-only steps to the capacity (batch-invariant hybrid chunked prefill)."""
+        from megatron.core.inference import batch_dimensions_utils
+
+        monkeypatch.setattr(
+            batch_dimensions_utils, "_batch_invariant_mode_enabled", lambda: batch_invariant
+        )
+        kwargs = dict(
+            tp_size=8,
+            num_cuda_graphs=-1,
+            cuda_graph_max_tokens=384,
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=128,
+            max_tokens=384,
+            max_sequence_length=8192,
+            use_cuda_graphs_for_non_decode_steps=True,
+        )
+        _, without = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            **kwargs
+        )
+        extra = dict(extra_prefill_token_counts=(256, 384, 1000))
+        if not batch_invariant:
+            # Only batch-invariant hybrid chunked prefill has a prefill budget below max_tokens.
+            with pytest.raises(AssertionError, match="extra_prefill_token_counts"):
+                CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                    **kwargs, **extra
+                )
+            return
+        _, counts = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            **kwargs, **extra
+        )
+        assert 256 not in without and 256 in counts
+        assert set(counts) == set(without) | {256}  # at/above the ceiling: ignored
+
 
 class TestSizingDistributions:
     """Coverage for `sizing_distribution`, in particular the HYBRID default.

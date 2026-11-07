@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import pytest
 
 from megatron.core.export.trtllm.trtllm_layers import TRTLLMLayers, get_layer_name_without_prefix

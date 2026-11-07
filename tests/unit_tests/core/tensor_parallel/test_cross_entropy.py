@@ -76,6 +76,36 @@ def test_language_module_loss_calls_the_selected_cross_entropy():
     assert loss.shape == labels.shape
 
 
+def test_language_module_loss_returns_argmax_of_the_cross_entropy():
+    """With return_argmax, the loss passes on the argmax a cross entropy returns."""
+    tp_group = _FakeTPGroup()
+    logits = torch.randn(3, 2, 4)
+    argmax = torch.argmax(logits, dim=-1)
+
+    def fake_cross_entropy_with_argmax(logits, labels, tp_group=None, return_argmax=False):
+        loss = torch.zeros_like(labels, dtype=logits.dtype)
+        return (loss, argmax) if return_argmax else loss
+
+    def fake_cross_entropy(logits, labels, tp_group=None):
+        return torch.zeros_like(labels, dtype=logits.dtype)
+
+    labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    for cross_entropy, expected_argmax in (
+        (fake_cross_entropy_with_argmax, argmax),
+        (fake_cross_entropy, None),
+    ):
+        module = SimpleNamespace(tp_group=tp_group, vocab_parallel_cross_entropy=cross_entropy)
+        loss, returned_argmax = language_module_module.LanguageModule.compute_language_model_loss(
+            module, labels=labels, logits=logits, return_argmax=True
+        )
+        assert loss.shape == labels.shape
+        assert returned_argmax is expected_argmax
+        loss = language_module_module.LanguageModule.compute_language_model_loss(
+            module, labels=labels, logits=logits
+        )
+        assert loss.shape == labels.shape
+
+
 def test_vocab_parallel_cross_entropy():
     Utils.initialize_model_parallel(4, 2)
     vocab_parallel_logits = torch.range(0, 7).repeat(16, 4).cuda()

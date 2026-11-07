@@ -1,4 +1,6 @@
 ENV_VARS:
+  # Keep the recipe's five-repeat default within its 90-minute budget.
+  N_REPEAT: 5
   NCCL_GRAPH_REGISTER: 0
   NCCL_NVLS_ENABLE: 0
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
@@ -13,8 +15,10 @@ ENV_VARS:
   NVTE_FWD_LAYERNORM_SM_MARGIN: 20
   NVTE_NORM_BWD_USE_CUDNN: 1
   NVTE_NORM_FWD_USE_CUDNN: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
-  NON_DETERMINSTIC_RESULTS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  TRITON_CACHE_AUTOTUNING: 1
 
 TEST_TYPE: regular
 
@@ -37,9 +41,7 @@ MODEL_ARGS:
   --train-iters: 20
   --manual-gc: true
   --manual-gc-interval: 100
-  --cross-entropy-loss-fusion: true
-  # Bridge uses TE here, but current MCore rejects TE cross-entropy fusion.
-  --cross-entropy-fusion-impl: native
+  --deterministic-mode: true
   --attention-backend: fused
   --te-rng-tracker: true
 
