@@ -37,7 +37,7 @@ def _ordered_topk_from_routing_map(
     masked_ids = torch.where(
         routing_map, expert_ids, torch.full_like(expert_ids, probs_dense.size(-1))
     )
-    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
+    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk].contiguous()
     topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
     return topk_scores, topk_indices
 
