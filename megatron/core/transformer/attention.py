@@ -131,8 +131,12 @@ try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
 
     HAVE_FUSED_QKV_ROPE = True
+    HAVE_FUSED_QKV_ROPE_FP8_ATTENTION = (
+        "defer_for_fp8_attention" in inspect.signature(apply_fused_qkv_rotary_pos_emb).parameters
+    )
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+    HAVE_FUSED_QKV_ROPE_FP8_ATTENTION = False
 
 
 class LinearQkvInterface(Protocol):
@@ -1655,9 +1659,30 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
-                query, key, value = apply_fused_qkv_rotary_pos_emb(
-                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                # The FP8 attention fusion hands TE placeholders that its core attention fills
+                # (or fuses with the FP8 quantization), so they must not be offloaded or
+                # recomputed from.
+                defer_for_fp8_attention = (
+                    self.config.fused_qkv_rope_fp8_attention
+                    and not (self.checkpoint_core_attention and self.training)
+                    and not (self.offload_core_attention and self.training)
                 )
+                if defer_for_fp8_attention:
+                    assert HAVE_FUSED_QKV_ROPE_FP8_ATTENTION, (
+                        "fused_qkv_rope_fp8_attention requires a TransformerEngine version whose "
+                        "apply_fused_qkv_rotary_pos_emb supports defer_for_fp8_attention."
+                    )
+                    query, key, value = apply_fused_qkv_rotary_pos_emb(
+                        mixed_qkv,
+                        q_pos_emb,
+                        k_pos_emb,
+                        qkv_split_arg_list,
+                        defer_for_fp8_attention=True,
+                    )
+                else:
+                    query, key, value = apply_fused_qkv_rotary_pos_emb(
+                        mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                    )
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
