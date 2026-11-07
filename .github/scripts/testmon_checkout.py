@@ -13,6 +13,10 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
+PRODUCER = ".github/workflows/populate-build-cache.yml"
+# Producer events whose Testmon generations each PR target may pin. Main records on
+# its schedule or a dispatch; dev has no schedule and records each push as artifacts.
+PRODUCER_EVENTS = {"main": {"schedule", "workflow_dispatch"}, "dev": {"push", "workflow_dispatch"}}
 
 
 def run(
@@ -44,25 +48,63 @@ def sha(value: object) -> str:
     return value
 
 
-def latest_baseline() -> tuple[str, str]:
-    """Find a successful trusted main producer with a common cache generation."""
+def published_dev_baseline(candidate: dict, tip: str) -> bool:
+    """Require a dev producer run from dev's history that published Testmon artifacts."""
+    if candidate["head_branch"] != "dev" or candidate["path"] != PRODUCER:
+        return False
+    # A tag or other ref can share the branch name; the commit must be in dev.
+    compare = f'repos/{REPOSITORY}/compare/{sha(candidate["head_sha"])}...{tip}?per_page=1'
+    if run("gh", "api", compare, "--jq", ".status").decode().strip() not in {"ahead", "identical"}:
+        return False
+    names = run(
+        "gh",
+        "api",
+        "--paginate",
+        f'repos/{REPOSITORY}/actions/runs/{candidate["id"]}/artifacts?per_page=100',
+        "--jq",
+        ".artifacts[] | select(.expired == false) | .name",
+    ).decode()
+    # Pushes recorded while selective unit tests were disabled publish no baselines.
+    generation = re.compile(rf'unit-testmon-v[0-9]+-dev-.+-{candidate["id"]}-1')
+    return any(generation.fullmatch(name) for name in names.split())
+
+
+def latest_baseline(target_branch: str = "main") -> tuple[str, str]:
+    """Find a successful trusted producer of the PR target with a common cache generation."""
+    if target_branch not in PRODUCER_EVENTS:
+        raise ValueError(f"No trusted Testmon baseline producer for {target_branch}")
     response = json.loads(
         run(
             "gh",
             "api",
             f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=success&per_page=100",
+            f"runs?branch={target_branch}&status=success&per_page=100",
         )
     )
+    tip = ""
     for candidate in response["workflow_runs"]:
         # Retried runs can publish different generations for different buckets.
         if (
-            candidate["event"] in {"schedule", "workflow_dispatch"}
+            candidate["event"] in PRODUCER_EVENTS[target_branch]
             and candidate["head_repository"]["full_name"] == REPOSITORY
             and candidate["run_attempt"] == 1
         ):
+            if target_branch != "main":
+                tip = tip or sha(
+                    run(
+                        "gh",
+                        "api",
+                        f"repos/{REPOSITORY}/git/ref/heads/{target_branch}",
+                        "--jq",
+                        ".object.sha",
+                    )
+                    .decode()
+                    .strip()
+                )
+                if not published_dev_baseline(candidate, tip):
+                    continue
             return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
-    raise ValueError("No successful first-attempt main Testmon baseline found")
+    raise ValueError(f"No successful first-attempt {target_branch} Testmon baseline found")
 
 
 def outputs(manifest: dict[str, str]) -> None:
@@ -94,7 +136,7 @@ def prepare(args: argparse.Namespace) -> None:
         metadata = json.loads(original_metadata)
         if metadata["tested_sha"] != original:
             raise ValueError("PR files metadata does not match the original tested commit")
-        source, generation = latest_baseline()
+        source, generation = latest_baseline(args.target_branch)
         git("fetch", "--no-tags", "origin", source)
         merge_base = git("merge-base", base, head)
         patch = run("git", "diff", "--binary", "--full-index", "--no-ext-diff", merge_base, head)
@@ -184,6 +226,7 @@ def main() -> None:
     prepare_parser = commands.add_parser("prepare")
     for option in ("pr-head", "pr-base", "tested-sha", "pr-files-dir", "output-dir"):
         prepare_parser.add_argument(f"--{option}", required=True)
+    prepare_parser.add_argument("--target-branch", default="main")
     restore_parser = commands.add_parser("restore")
     restore_parser.add_argument("--directory", required=True)
     restore_parser.add_argument("--expected-sha", required=True)

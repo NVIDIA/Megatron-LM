@@ -216,13 +216,74 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
 
 
 @pytest.mark.parametrize(
-    "source_ref", ["refs/heads/main", "refs/heads/pull-request/6934", "refs/tags/main"]
+    "source_ref",
+    [
+        "refs/heads/main",
+        "refs/heads/dev",
+        "refs/heads/pull-request/6934",
+        "refs/heads/dev-feature",
+        "refs/tags/main",
+        "refs/tags/dev",
+    ],
 )
-def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> None:
+def test_producer_requires_a_baseline_branch(tmp_path: Path, source_ref: str) -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
     guard = workflow["jobs"]["validate-source"]["steps"][0]["run"]
     result, _ = _run(guard, tmp_path, {"SOURCE_REF": source_ref})
-    assert (result.returncode == 0) == (source_ref == "refs/heads/main")
+    assert (result.returncode == 0) == (source_ref in {"refs/heads/main", "refs/heads/dev"})
+
+
+def _expression(value: str) -> str:
+    """Translate a GitHub expression with dotted contexts into Python syntax."""
+    expression = value.strip().removeprefix("${{").removesuffix("}}").strip()
+    expression = re.sub(
+        r"\b(steps|inputs|github|needs|matrix|vars)((?:\.[A-Za-z0-9_-]+)+)",
+        lambda match: f"context[{match.group(0)!r}]",
+        expression,
+    )
+    expression = expression.replace("!cancelled()", "True")
+    expression = re.sub(r"!(?!=)", " not ", expression)
+    return expression.replace("&&", " and ").replace("||", " or ")
+
+
+def _evaluate(value: str, context: dict[str, str]):
+    return eval(_expression(value), {"__builtins__": {}}, {"context": context})
+
+
+@pytest.mark.parametrize(
+    ("event", "ref", "enabled", "records"),
+    [
+        ("push", "refs/heads/dev", "true", True),
+        ("push", "refs/heads/dev", "false", False),
+        ("push", "refs/heads/dev", "", False),
+        ("workflow_dispatch", "refs/heads/dev", "false", True),
+        ("schedule", "refs/heads/main", "false", True),
+        ("workflow_dispatch", "refs/heads/main", "true", True),
+        ("push", "refs/heads/main", "true", False),
+    ],
+)
+def test_dev_producer_records_each_dev_push(
+    event: str, ref: str, enabled: str, records: bool
+) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
+    triggers = workflow[True]
+    # Scheduled workflows run only from main; dev records every push without path filters.
+    assert triggers["push"] == {"branches": ["dev"]}
+    assert "schedule" not in triggers and "workflow_dispatch" in triggers
+    assert workflow["concurrency"] == {
+        "group": "populate-ci-caches-${{ github.ref_name }}",
+        "cancel-in-progress": False,
+    }
+    context = {
+        "github.event_name": event,
+        "github.ref": ref,
+        "vars.ENABLE_SELECTIVE_UNIT_TESTS": enabled,
+    }
+    assert _evaluate(workflow["jobs"]["parse-unit-tests"]["if"], context) is records
+    producer = workflow["jobs"]["populate-testmon-cache"]["steps"][-1]["with"]
+    assert producer["unit_testmon_mode"] == "baseline"
+    assert producer["unit_testmon_target_branch"] == "${{ github.ref_name }}"
+    assert producer["sha"] == "${{ github.sha }}"
 
 
 @pytest.fixture
@@ -461,6 +522,7 @@ def configure_environment(
         "IS_MERGE_GROUP": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/6934",
+        "TARGET_BRANCH": "main",
         "FORCE_RUN_ALL": "false",
         "TEST_PR_LABEL_LOOKUP_EXIT": "0",
         "H100_TRAFFIC_MODE": "aws",
@@ -716,6 +778,8 @@ def test_selective_variable_and_label_precedence(
         "unit_testmon_eligible": expected_requested,
     }.items():
         assert f"| `{name}` | `{str(expected).lower()}` |" in summary
+    assert "| `unit_testmon_target_branch` | `main` |" in summary
+    assert "| `unit_testmon_baseline` | `main-actions-cache` |" in summary
 
 
 @pytest.mark.parametrize("request_source", ["default", "label"])
@@ -767,6 +831,38 @@ def test_full_test_guards_override_selective_requests(
     assert "| `unit_testmon_eligible` | `false` |" in summary
 
 
+@pytest.mark.parametrize(
+    ("target_branch", "baseline", "eligible"),
+    [
+        ("main", "main-actions-cache", True),
+        ("dev", "dev-producer-artifacts", True),
+        ("core_r0.16.0", "none", False),
+        ("devel", "none", False),
+        ("", "none", False),
+    ],
+)
+def test_selective_requests_need_a_trusted_baseline_branch(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    target_branch: str,
+    baseline: str,
+    eligible: bool,
+) -> None:
+    step = _step("cicd-main.yml", "configure", "configure")
+    assert step["env"]["TARGET_BRANCH"] == (
+        "${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}"
+    )
+    configure_environment.update(ENABLE_SELECTIVE_UNIT_TESTS="true", TARGET_BRANCH=target_branch)
+    result, outputs = _run_configure(tmp_path, configure_environment, [])
+    assert result.returncode == 0, result.stderr
+    assert outputs["unit_testmon_eligible"] == str(eligible).lower()
+    summary = (tmp_path / "summary").read_text()
+    assert "| `unit_testmon_requested` | `true` |" in summary
+    assert f"| `unit_testmon_target_branch` | `{target_branch or 'none'}` |" in summary
+    assert f"| `unit_testmon_baseline` | `{baseline}` |" in summary
+    assert "requests CPU Testmon planning only" in summary
+
+
 @pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
 def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_environment, has_tests):
     # Hosted runners provide zstd, but the existing GPU baselines use gzip.
@@ -806,11 +902,25 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == (
-        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    supported = (
+        "(inputs.unit_testmon_target_branch == 'main' || "
+        "inputs.unit_testmon_target_branch == 'dev')"
     )
+    assert workflow["jobs"]["select"]["if"] == (
+        f"inputs.unit_testmon_mode == 'enforce' && {supported}"
+    )
+    for target, selects in (("main", True), ("dev", True), ("core_r0.16.0", False), ("", False)):
+        context = {
+            "inputs.unit_testmon_mode": "enforce",
+            "inputs.unit_testmon_target_branch": target,
+        }
+        assert _evaluate(workflow["jobs"]["select"]["if"], context) is selects
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
+    # Dev baselines are artifacts of other workflow runs.
+    assert workflow["permissions"]["actions"] == "read"
+    assert workflow["jobs"]["select"]["permissions"] == {"actions": "read", "contents": "read"}
+    assert restore["env"]["GH_TOKEN"] == "${{ github.token }}"
     for platform, parser_job, output in (
         ("h100", "cicd-parse-unit-tests", "unit-tests"),
         ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
@@ -835,21 +945,29 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     )
     inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
-    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    for target in ("main", "dev"):
+        inputs.unit_testmon_target_branch = target
+        assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
-    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ inputs.unit_testmon_mode == 'enforce' && "
-        "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
+    run_inputs = workflow["jobs"]["run"]["steps"][-1]["with"]
+    assert run_inputs["unit_testmon_mode"] == (
+        "${{ inputs.unit_testmon_mode == 'enforce' && " + supported + " && 'enforce' || 'full' }}"
     )
-    assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
+    assert "unit_testmon_plan_artifact" not in run_inputs
+    for name in ("run_id", "artifact_id", "key", "source_sha"):
+        assert run_inputs[f"unit_testmon_baseline_{name}"] == f"${{{{ matrix.baseline_{name} }}}}"
 
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
     needs.select.result = "failure"
     assert not eval(expression, {"__builtins__": {}}, context)
     needs.select.result = "skipped"
     assert not eval(expression, {"__builtins__": {}}, context)
+    # Targets without a trusted baseline skip selection and run every bucket in full.
+    inputs.unit_testmon_target_branch = "core_r0.16.0"
+    assert eval(expression, {"__builtins__": {}}, context)
+    inputs.unit_testmon_target_branch = "dev"
     inputs.unit_testmon_mode = "full"
     assert eval(expression, {"__builtins__": {}}, context)
     callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
@@ -858,6 +976,12 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         ("cicd-unit-tests-latest-gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
     ):
         assert "strategy" not in callers[caller]
+        # A called workflow cannot elevate the caller's token permissions.
+        assert callers[caller]["permissions"] == {
+            "actions": "read",
+            "contents": "read",
+            "id-token": "write",
+        }
         assert parser in callers[caller]["needs"]
         assert callers[caller]["with"]["buckets"] == (
             "${{ needs." + parser + ".outputs." + output + " }}"
@@ -905,11 +1029,14 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
 @pytest.mark.parametrize(
     ("requested_mode", "target_branch", "cpu_mode", "expected_mode"),
     [
-        pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
-        pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("enforce", "main", "preselected", "enforce", id="main-cpu-selected"),
+        pytest.param("enforce", "main", "full", "enforce", id="main-cpu-fallback"),
+        pytest.param("enforce", "dev", "preselected", "enforce", id="dev-cpu-selected"),
+        pytest.param("enforce", "dev", "full", "enforce", id="dev-cpu-fallback"),
         pytest.param("full", "main", "", "full", id="explicit-full"),
+        pytest.param("full", "dev", "", "full", id="dev-explicit-full"),
         pytest.param("full", "", "", "full", id="merge-group-full"),
-        pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
+        pytest.param("enforce", "core_r0.16.0", "", "full", id="unsupported-target"),
     ],
 )
 def test_gpu_reselection_respects_full_run_guards(
@@ -917,16 +1044,13 @@ def test_gpu_reselection_respects_full_run_guards(
 ):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
     mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
-    expression = mode.removeprefix("${{").removesuffix("}}")
-    expression = expression.replace("&&", "and").replace("||", "or")
-    inputs = SimpleNamespace(
-        unit_testmon_mode=requested_mode, unit_testmon_target_branch=target_branch
-    )
-    matrix = SimpleNamespace(mode=cpu_mode)
-    assert (
-        eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix})
-        == expected_mode
-    )
+    context = {
+        "inputs.unit_testmon_mode": requested_mode,
+        "inputs.unit_testmon_target_branch": target_branch,
+        "matrix.mode": cpu_mode,
+    }
+    # Every dispatched bucket reselects natively, including CPU full fallbacks.
+    assert _evaluate(mode, context) == expected_mode
 
 
 @pytest.mark.parametrize(
@@ -989,6 +1113,7 @@ def test_grouped_cpu_selection(
         "TARGET_BRANCH": "main",
         "TESTMON_GENERATION": "111-1" if scenario.startswith("pinned") else "",
         "TESTMON_BASE_SHA": "b" * 40 if scenario.startswith("pinned") else "",
+        "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
         "PR_FILES_DIR": str(pr_files),
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_RUN_ID": "123",
@@ -1132,3 +1257,609 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             assert matches[0]["plan_artifact"] == upload["name"]
     assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
+
+
+def test_baseline_branch_lists_agree_with_the_cache_helper() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "branch_testmon_cache", ROOT / "tests/unit_tests/testmon_cache.py"
+    )
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    branches = set(helper.BASELINE_BRANCHES)
+    assert branches == {"main", "dev"}
+    unit = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())["jobs"]
+    for expression in (
+        unit["select"]["if"],
+        unit["run"]["if"],
+        unit["run"]["steps"][-1]["with"]["unit_testmon_mode"],
+    ):
+        assert set(re.findall(r"unit_testmon_target_branch [!=]= '([^']*)'", expression)) == (
+            branches
+        )
+    configure = _step("cicd-main.yml", "configure", "configure")["run"]
+    assert set(re.findall(r"^\s+([a-z]+)\) UNIT_TESTMON_BASELINE=", configure, re.M)) == branches
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    guard = next(
+        step["run"]
+        for step in action["runs"]["steps"]
+        if step["name"] == "Validate unit Testmon baseline producer"
+    )
+    assert set(re.findall(r'"\$TARGET_BRANCH" == "([^"]+)"', guard)) == branches
+    producer = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
+    source_guard = producer["jobs"]["validate-source"]["steps"][0]["run"]
+    assert set(re.findall(r'"refs/heads/([^"]+)"', source_guard)) == branches
+
+
+@pytest.mark.parametrize("transport", ["cache", "artifact", ""])
+def test_action_restores_and_publishes_each_transport_once(transport: str) -> None:
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    steps = {step.get("id") or step["name"]: step for step in action["runs"]["steps"]}
+    branch = "dev" if transport == "artifact" else "main"
+    context = {
+        "inputs.is_unit_test": "true",
+        "inputs.unit_testmon_mode": "enforce",
+        "inputs.unit_testmon_target_branch": branch,
+        "inputs.test_case": "tests/unit_tests/models/**/*.py",
+        "inputs.unit_testmon_baseline_artifact_id": "13",
+        "inputs.unit_testmon_baseline_run_id": "250",
+        "steps.unit-testmon-identity.outcome": "success",
+        "steps.unit-testmon-identity.outputs.baseline_transport": transport,
+    }
+
+    def evaluate(expression: str, overrides: dict[str, str] | None = None) -> bool:
+        functions = {
+            "startsWith(": "_starts(",
+            "contains(": "_has(",
+            "format('refs/heads/{0}', ": "_ref(",
+        }
+        for name, replacement in functions.items():
+            expression = expression.replace(name, replacement)
+        return eval(
+            _expression(expression),
+            {
+                "__builtins__": {},
+                "_starts": lambda value, prefix: value.startswith(prefix),
+                "_has": lambda value, part: part in value,
+                "_ref": lambda value: f"refs/heads/{value}",
+            },
+            {"context": {**context, **(overrides or {})}},
+        )
+
+    # Consumers: main restores Actions caches; dev downloads the CPU-resolved artifact.
+    # Helpers that predate dev baselines print no transport; they only knew main's cache.
+    assert evaluate(steps["restore-unit-testmon"]["if"]) is (transport != "artifact")
+    assert evaluate(steps["download-unit-testmon-baseline"]["if"]) is (transport == "artifact")
+    assert not evaluate(
+        steps["download-unit-testmon-baseline"]["if"],
+        {"inputs.unit_testmon_baseline_artifact_id": ""},
+    )
+    download = steps["download-unit-testmon-baseline"]
+    assert download["continue-on-error"] is True
+    assert download["with"] == {
+        "artifact-ids": "${{ inputs.unit_testmon_baseline_artifact_id }}",
+        "run-id": "${{ inputs.unit_testmon_baseline_run_id }}",
+        "github-token": "${{ github.token }}",
+        "path": "assets_dir/testmon",
+        "merge-multiple": True,
+    }
+    resolve = steps["unit-testmon"]["env"]
+    assert resolve["MATCHED_KEY"] == "${{ steps.unit-testmon-baseline.outputs.matched_key }}"
+    assert resolve["BASELINE_SOURCE_SHA"] == "${{ inputs.unit_testmon_baseline_source_sha }}"
+
+    # Producers: main saves caches; dev uploads the validated generation under its key.
+    context.update(
+        {
+            "steps.unit-testmon.outputs.mode": "baseline",
+            "steps.prepare-unit-testmon-cache.outcome": "success",
+            "steps.validate-unit-testmon-artifact.outcome": "success",
+            "github.repository": "NVIDIA/Megatron-LM",
+            "github.event_name": "push" if transport == "artifact" else "schedule",
+            "github.ref": f"refs/heads/{branch}",
+        }
+    )
+    for step, cache_only in (
+        ("Save unit Testmon baseline", True),
+        ("verify-unit-testmon-cache", True),
+        ("confirm-unit-testmon-cache", True),
+        ("validate-unit-testmon-artifact", False),
+        ("upload-unit-testmon-artifact", False),
+    ):
+        assert evaluate(steps[step]["if"]) is ((transport != "artifact") == cache_only), step
+    key = (
+        "${{ steps.unit-testmon-identity.outputs.cache_prefix }}"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert steps["upload-unit-testmon-artifact"]["with"] == {
+        "name": key,
+        "path": "assets_dir/testmon",
+        "include-hidden-files": True,
+        "if-no-files-found": "error",
+        "retention-days": 30,
+    }
+    assert steps["validate-unit-testmon-artifact"]["env"] == {
+        "EXPECTED_KEY": key,
+        "SOURCE_SHA": "${{ github.sha }}",
+    }
+    assert steps["confirm-unit-testmon-artifact"]["env"]["ARTIFACT_NAME"] == key
+    if transport == "artifact":
+        for untrusted in (
+            {"github.ref": "refs/heads/pull-request/6934"},
+            {"github.ref": "refs/heads/main"},
+            {"github.repository": "fork/Megatron-LM"},
+            {"github.event_name": "pull_request"},
+            {"github.event_name": "merge_group"},
+            {"steps.validate-unit-testmon-artifact.outcome": "failure"},
+        ):
+            assert not evaluate(steps["upload-unit-testmon-artifact"]["if"], untrusted), untrusted
+    assert steps["check"]["env"]["CACHE_PUBLICATION"] == (
+        "${{ steps.unit-testmon-identity.outputs.baseline_transport == 'artifact' && "
+        "steps.confirm-unit-testmon-artifact.outcome || steps.confirm-unit-testmon-cache.outcome }}"
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "trusted",
+        "listing-error",
+        "download-error",
+        "pinned",
+        "pinned-untrusted",
+        "pinned-source-mismatch",
+    ],
+)
+def test_grouped_cpu_selection_reads_only_trusted_dev_artifacts(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dev buckets select from dev producer artifacts; anything untrusted runs in full."""
+    pytest.importorskip("testmon")
+    names = ["selected", "empty", "missing", "main-only", "wrong-commit"]
+    buckets = [{"bucket": f"tests/unit_tests/{name}/**/*.py"} for name in names]
+    unit_tests = tmp_path / "tests/unit_tests"
+    unit_tests.mkdir(parents=True)
+    for script in (
+        "testmon_cache.py",
+        "testmon_selector.py",
+        "testmon_plan.py",
+        "testmon_mandatory.py",
+        "find_test_cases.py",
+    ):
+        (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
+    (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
+    dataset = tmp_path / "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("")
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
+    )
+    for name in names:
+        if name != "empty":
+            test_file = unit_tests / name / "test_case.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_case(): pass\n")
+    pr_files = tmp_path / "pr-files"
+    pr_files.mkdir()
+    (pr_files / "changed-files").write_text("")
+    (pr_files / "metadata.json").write_text(
+        json.dumps({"tested_sha": "a" * 40, "changed_paths": 0})
+    )
+    tip, older, newer, outside = "e" * 40, "1" * 40, "2" * 40, "3" * 40
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "PYTHONPATH": str(unit_tests),
+        "BUCKETS": json.dumps(buckets),
+        "RECIPE_PLATFORM": "dgx_h100",
+        "SOURCE_SHA": "a" * 40,
+        "TARGET_BRANCH": "dev",
+        "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+        "PR_FILES_DIR": str(pr_files),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "900",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        # A prepared checkout pins the generation of one producer run.
+        "TESTMON_GENERATION": {"pinned-untrusted": "310-1"}.get(
+            scenario, "250-1" if scenario.startswith("pinned") else ""
+        ),
+        "TESTMON_BASE_SHA": {"pinned-source-mismatch": newer}.get(
+            scenario, older if scenario.startswith("pinned") else ""
+        ),
+    }
+    # Record real generations exactly as the dev producer does. "main-only" has
+    # only a main-namespace artifact; "wrong-commit" claims a different source.
+    producer = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json, os, sys
+from pathlib import Path
+from testmon.db import DB
+from testmon_cache import PHASES, cache_identity, record_phase, finalize
+keys = {}
+for name, branch, sha, generation in json.loads(sys.argv[1]):
+    bucket = f'tests/unit_tests/{name}/**/*.py'
+    identity = cache_identity(Path.cwd(), bucket, 'dgx_h100', target_branch=branch)
+    key = identity['cache_prefix'] + generation
+    directory = Path('saved') / key
+    for phase in PHASES:
+        database = directory / phase / '.testmondata'
+        database.parent.mkdir(parents=True)
+        DB(str(database)).con.close()
+        record_phase(directory, phase)
+    finalize(directory, identity, sha, generation)
+    keys[f'{name}/{branch}/{generation}'] = key
+print(json.dumps(keys))
+""",
+            json.dumps(
+                [
+                    ["selected", "dev", older, "250-1"],
+                    ["selected", "dev", older, "250-2"],
+                    ["selected", "dev", outside, "270-1"],
+                    ["empty", "dev", newer, "260-1"],
+                    ["empty", "dev", older, "250-1"],
+                    ["main-only", "main", older, "250-1"],
+                    ["wrong-commit", "dev", "f" * 40, "250-1"],
+                ]
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    keys = json.loads(producer.stdout)
+
+    def run(run_id, sha, **overrides):
+        return {
+            "id": run_id,
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": sha,
+            "path": ".github/workflows/populate-build-cache.yml",
+            "repository": {"full_name": "NVIDIA/Megatron-LM"},
+            "head_repository": {"full_name": "NVIDIA/Megatron-LM"},
+            **overrides,
+        }
+
+    def artifact(artifact_id, key, run_id, sha, **overrides):
+        return {
+            "id": artifact_id,
+            "name": key,
+            "expired": False,
+            "digest": f"sha256:{artifact_id:064x}",
+            "workflow_run": {"id": run_id, "head_sha": sha},
+            **overrides,
+        }
+
+    selected = keys["selected/dev/250-2"]
+    runs = [
+        # Untrusted or unrelated runs, newest first, even with plausible artifacts.
+        run(310, newer, event="pull_request"),
+        run(300, newer, head_repository={"full_name": "fork/Megatron-LM"}),
+        run(290, newer, head_branch="dev-feature"),
+        run(280, newer, path=".github/workflows/other.yml"),
+        run(270, outside),
+        run(260, newer),
+        run(250, older, event="workflow_dispatch"),
+        run(240, older, id="240"),
+    ]
+    artifacts = {
+        270: [artifact(27, keys["selected/dev/270-1"], 270, outside)],
+        260: [
+            artifact(26, keys["empty/dev/260-1"], 260, newer),
+            artifact(31, selected.replace("-250-2", "-260-1"), 250, older),
+        ],
+        250: [
+            artifact(21, keys["selected/dev/250-1"], 250, older),
+            artifact(22, selected, 250, older),
+            artifact(23, selected.replace("-250-2", "-250-3"), 250, older, expired=True),
+            artifact(24, keys["empty/dev/250-1"], 250, older),
+            artifact(25, keys["main-only/main/250-1"], 250, older),
+            artifact(28, keys["wrong-commit/dev/250-1"], 250, older),
+            artifact(29, "logs-tests-unit_tests-selected-250", 250, older),
+        ],
+    }
+    compare = {newer: "ahead", older: "ahead", outside: "diverged"}
+    downloads = []
+
+    def gh(*args):
+        if args[0] == "api":
+            if scenario == "listing-error":
+                raise subprocess.CalledProcessError(1, ["gh", *args])
+            endpoint = next(arg for arg in args[1:] if arg != "--paginate")
+            query = args[-1]
+            if endpoint == "repos/NVIDIA/Megatron-LM/git/ref/heads/dev":
+                assert query == ".object.sha"
+                return tip + "\n"
+            if endpoint.startswith(
+                "repos/NVIDIA/Megatron-LM/actions/workflows/populate-build-cache.yml/runs?"
+                "branch=dev&"
+            ):
+                assert not scenario.startswith("pinned"), "a pinned run needs no discovery"
+                assert query == ".workflow_runs[] | @json" and "--paginate" not in args
+                return "".join(json.dumps(entry) + "\n" for entry in runs)
+            if endpoint.startswith("repos/NVIDIA/Megatron-LM/compare/"):
+                base, head = endpoint.split("/compare/")[1].split("?")[0].split("...")
+                assert head == tip and query == ".status"
+                return compare[base] + "\n"
+            if re.fullmatch(r"repos/NVIDIA/Megatron-LM/actions/runs/[0-9]+", endpoint):
+                # A pinned generation names one run; it gets the same trust checks.
+                assert scenario.startswith("pinned") and query == ". | @json"
+                pinned = next(
+                    entry for entry in runs if str(entry["id"]) == endpoint.split("/")[-1]
+                )
+                return json.dumps(pinned) + "\n"
+            run_id = int(endpoint.split("/actions/runs/")[1].split("/")[0])
+            assert query == ".artifacts[] | @json" and "--paginate" in args
+            assert run_id in {270, 260, 250}, f"untrusted run {run_id} was inspected"
+            return "".join(json.dumps(entry) + "\n" for entry in artifacts[run_id])
+        raise AssertionError(f"unexpected gh command: {args}")
+
+    spec = importlib.util.spec_from_file_location(
+        "select_dev_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    monkeypatch.chdir(tmp_path)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    uploads = []
+    artifact_names = {
+        entry["id"]: entry["name"]
+        for run_artifacts in artifacts.values()
+        for entry in run_artifacts
+    }
+
+    def actions(operation, *args):
+        # Dev baselines never use the Actions cache.
+        assert operation in {"upload", "download"}, args
+        if operation == "upload":
+            uploads.append(json.loads(Path(args[1]).read_text()))
+            return
+        artifact_id, directory, run_id, repository, digest = args
+        assert directory == "assets_dir/testmon" and repository == "NVIDIA/Megatron-LM"
+        assert digest == f"sha256:{int(artifact_id):064x}"
+        assert not Path(directory).exists(), "previous bucket baseline was not cleared"
+        name = artifact_names[int(artifact_id)]
+        downloads.append((run_id, name))
+        if scenario == "download-error" and name == selected:
+            raise subprocess.CalledProcessError(1, ["node", operation, *args])
+        shutil.copytree(tmp_path / "saved" / name, directory)
+
+    monkeypatch.setattr(selector, "_actions", actions)
+    monkeypatch.setattr(selector, "_gh", gh)
+    selector.main()
+
+    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
+    matrix = {entry["bucket"].split("/")[2]: entry for entry in json.loads(outputs["matrix"])}
+    plans = {plan["bucket"].split("/")[2]: plan for plan in uploads}
+    summary = (tmp_path / "summary").read_text()
+    assert outputs["has_tests"] == "true"
+    assert "Target branch: `dev`" in summary
+    if scenario == "listing-error":
+        # Without a verified baseline even an apparently empty bucket runs in full.
+        assert downloads == [] and plans == {}
+        assert set(matrix) == set(names)
+        assert all(
+            entry["mode"] == "full" and "baseline_key" not in entry for entry in matrix.values()
+        )
+        assert "Unable to list trusted dev baselines" in caplog.text
+        assert summary.count("no trusted `dev` artifact") == len(names)
+        return
+    if scenario in {"pinned-untrusted", "pinned-source-mismatch"}:
+        # An untrusted pinned run, or a source that differs from the prepared
+        # checkout's baseline, yields no baseline: every bucket runs in full.
+        assert downloads == [] and plans == {}
+        assert set(matrix) == set(names)
+        assert all(
+            entry["mode"] == "full" and "baseline_key" not in entry for entry in matrix.values()
+        )
+        return
+    if scenario == "pinned":
+        # Only the pinned run and generation count, even when a newer run exists.
+        assert downloads == [
+            ("250", keys["selected/dev/250-1"]),
+            ("250", keys["empty/dev/250-1"]),
+            ("250", keys["wrong-commit/dev/250-1"]),
+        ]
+        assert matrix["selected"]["baseline_key"] == keys["selected/dev/250-1"]
+        assert matrix["selected"]["mode"] == "preselected"
+        assert plans["empty"]["phases"] == {"prod": [], "experimental": []}
+        assert matrix["wrong-commit"]["mode"] == "full"
+        assert "expected producer commit" in summary
+        return
+    # The newest trusted run wins per bucket, then the newest attempt in that run.
+    assert downloads == [
+        ("250", selected),
+        ("260", keys["empty/dev/260-1"]),
+        ("250", keys["wrong-commit/dev/250-1"]),
+    ]
+    assert set(matrix) == {"selected", "missing", "main-only", "wrong-commit"}
+    baseline = {
+        "baseline_run_id": "250",
+        "baseline_artifact_id": "22",
+        "baseline_key": selected,
+        "baseline_source_sha": older,
+    }
+    assert {key: matrix["selected"][key] for key in baseline} == baseline
+    if scenario == "trusted":
+        assert matrix["selected"]["mode"] == "preselected"
+        assert plans["selected"]["phases"] == {
+            "prod": ["tests/unit_tests/selected/test_case.py"],
+            "experimental": ["tests/unit_tests/selected/test_case.py"],
+        }
+        assert plans["selected"]["baseline_source_sha"] == older
+        assert "| 1 affected file(s), 0 mandatory | Testmon reselects |" in summary
+    else:
+        assert matrix["selected"]["mode"] == "full"
+        assert "download failed | full bucket: no baseline | Testmon reselects |" in summary
+    # A dev baseline with no affected tests skips the GPU entirely.
+    assert plans["empty"]["phases"] == {"prod": [], "experimental": []}
+    assert (
+        f"| `{keys['empty/dev/260-1']}` (`{newer[:12]}`) | no affected tests | not allocated |"
+        in summary
+    )
+    # Missing, main-only, and unverifiable artifacts run full; never silently skip.
+    for name in ("missing", "main-only"):
+        assert matrix[name]["mode"] == "full" and "baseline_key" not in matrix[name]
+    assert matrix["wrong-commit"]["mode"] == "full"
+    assert matrix["wrong-commit"]["baseline_key"] == keys["wrong-commit/dev/250-1"]
+    assert "expected producer commit" in summary
+    assert summary.count("no trusted `dev` artifact") == 2
+
+
+def test_grouped_cpu_selection_rejects_targets_without_a_trusted_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unit_tests = tmp_path / "tests/unit_tests"
+    unit_tests.mkdir(parents=True)
+    (unit_tests / "testmon_cache.py").symlink_to(ROOT / "tests/unit_tests/testmon_cache.py")
+    spec = importlib.util.spec_from_file_location(
+        "select_release_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    monkeypatch.chdir(tmp_path)
+    for key, value in {
+        "BUCKETS": json.dumps([{"bucket": "tests/unit_tests/example/**/*.py"}]),
+        "RECIPE_PLATFORM": "dgx_h100",
+        "TARGET_BRANCH": "core_r0.16.0",
+        "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+        "GITHUB_RUN_ID": "1",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    def unexpected(*args):
+        raise AssertionError(f"unexpected baseline access: {args}")
+
+    monkeypatch.setattr(selector, "_actions", unexpected)
+    monkeypatch.setattr(selector, "_gh", unexpected)
+    with pytest.raises(subprocess.CalledProcessError):
+        selector.main()
+    assert not (tmp_path / "outputs").exists()
+
+
+@pytest.mark.parametrize("mismatch", [False, True], ids=["verified", "digest-mismatch"])
+def test_selection_sdk_adapter_downloads_artifacts_from_other_runs(
+    tmp_path: Path, mismatch: bool
+) -> None:
+    node = shutil.which("node") or ""
+    if not node:
+        pytest.skip("Adapter validation requires Node.js")
+    script = _step("_unit-tests.yml", "select", "plan")["with"]["script"]
+    client = script.split("const client = `", 1)[1].split("`;", 1)[0]
+    modules = tmp_path / "testmon/node_modules/@actions"
+    calls = tmp_path / "calls.jsonl"
+    for package, body in (
+        (
+            "artifact",
+            "class DefaultArtifactClient {\n"
+            "  async downloadArtifact(id, options) {\n"
+            "    record(['download', id, options]);\n"
+            "    return {digestMismatch: process.env.TEST_MISMATCH === 'true'};\n"
+            "  }\n"
+            "  async uploadArtifact(...args) { record(['upload', ...args]); }\n"
+            "}\n"
+            "module.exports = {DefaultArtifactClient};\n",
+        ),
+        (
+            "cache",
+            "module.exports = {restoreCache: async (...args) => {\n"
+            "  record(['restore', ...args]); return args[1] + '-matched';\n"
+            "}};\n",
+        ),
+    ):
+        (modules / package).mkdir(parents=True)
+        (modules / package / "index.js").write_text(
+            "const record = entry => require('node:fs').appendFileSync(\n"
+            "  process.env.TEST_CALLS, JSON.stringify(entry) + '\\n');\n" + body
+        )
+    environment = {
+        **os.environ,
+        "RUNNER_TEMP": str(tmp_path),
+        "GH_TOKEN": "token-value",
+        "TEST_CALLS": str(calls),
+        "TEST_MISMATCH": str(mismatch).lower(),
+    }
+
+    def adapter(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [node, "-e", client, *args],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    download = adapter("download", "13", "assets_dir/testmon", "250", "NVIDIA/Megatron-LM", "")
+    assert (download.returncode != 0) is mismatch, download.stderr
+    assert ("Artifact 13 digest mismatch" in download.stderr) is mismatch
+    restored = adapter("restore", "assets_dir/testmon", "prefix-lookup-1-1", "prefix-", "key")
+    assert restored.returncode == 0, restored.stderr
+    assert (tmp_path / "key").read_text() == "prefix-lookup-1-1-matched"
+    uploaded = adapter("upload", "plan-artifact", "plan.json", "plan-root")
+    assert uploaded.returncode == 0, uploaded.stderr
+    assert [json.loads(line) for line in calls.read_text().splitlines()] == [
+        [
+            "download",
+            13,
+            {
+                "path": "assets_dir/testmon",
+                "findBy": {
+                    "token": "token-value",
+                    "workflowRunId": 250,
+                    "repositoryOwner": "NVIDIA",
+                    "repositoryName": "Megatron-LM",
+                },
+            },
+        ],
+        ["restore", ["assets_dir/testmon"], "prefix-lookup-1-1", ["prefix-"]],
+        ["upload", "plan-artifact", ["plan.json"], "plan-root"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("base_ref", "ready", "use_cache_base", "prepares"),
+    [
+        ("main", "true", "", True),
+        ("dev", "true", "", True),
+        ("dev", "true", "false", False),
+        ("main", "true", "false", False),
+        ("dev", "", "", False),
+        ("core_r0.16.0", "true", "", False),
+    ],
+)
+def test_configure_prepares_baseline_checkouts_for_trusted_targets(
+    base_ref: str, ready: str, use_cache_base: str, prepares: bool
+) -> None:
+    steps = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"][
+        "configure"
+    ]["steps"]
+    checkout = next(
+        step for step in steps if step.get("name") == "Checkout PR for Testmon baseline preparation"
+    )
+    prepare = next(step for step in steps if step.get("id") == "prepare-testmon-checkout")
+    assert checkout["if"] == prepare["if"]
+    base = "fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref"
+    context = {
+        "steps.unit-test-pr-files.outputs.ready": ready,
+        "vars.UNIT_TESTMON_USE_CACHE_BASE": use_cache_base,
+        "base": base_ref,
+    }
+    assert _evaluate(prepare["if"].replace(base, "context['base']"), context) is prepares
+    # The producer lookup follows the PR target: dev pins a trusted dev producer run.
+    assert prepare["env"]["TARGET_BRANCH"] == "${{ " + base + " }}"
+    assert '--target-branch "$TARGET_BRANCH"' in prepare["run"]

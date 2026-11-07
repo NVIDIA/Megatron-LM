@@ -270,6 +270,7 @@ jobs:
           REF: ${{ github.ref }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
+          TARGET_BRANCH: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
           H100_TRAFFIC_MODE: ${{ env.H100_RUNNER_TRAFFIC_MODE }}
           PREFLIGHT_IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
           IS_PR: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/') }}
@@ -453,11 +454,19 @@ jobs:
             UNIT_TESTMON_REQUESTED=false
           fi
 
-          # Eligible PRs only read the shared main baseline. A missing or
-          # incompatible cache runs the full bucket without recording a database.
+          # Only main and dev publish trusted baselines: main as scheduled Actions
+          # caches, dev as artifacts of each dev push. PRs only read them; a
+          # missing or incompatible baseline runs the full bucket without
+          # recording a database. Other target branches always run in full.
+          case "${TARGET_BRANCH:-}" in
+            main) UNIT_TESTMON_BASELINE=main-actions-cache ;;
+            dev) UNIT_TESTMON_BASELINE=dev-producer-artifacts ;;
+            *) UNIT_TESTMON_BASELINE=none ;;
+          esac
           UNIT_TESTMON_ELIGIBLE=false
           if [[ "$LABELS_VALID" == "true" \
             && "$UNIT_TESTMON_REQUESTED" == "true" \
+            && "$UNIT_TESTMON_BASELINE" != "none" \
             && "$EVENT_NAME" == "push" \
             && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
             && "$IS_MERGE_GROUP" != "true" \
@@ -522,6 +531,8 @@ jobs:
           | \`unit_testmon_enable_label\` | \`$HAS_UNIT_TESTMON\` |
           | \`unit_testmon_disable_label\` | \`$HAS_DISABLE_UNIT_TESTMON\` |
           | \`unit_testmon_requested\` | \`$UNIT_TESTMON_REQUESTED\` |
+          | \`unit_testmon_target_branch\` | \`${TARGET_BRANCH:-none}\` |
+          | \`unit_testmon_baseline\` | \`$UNIT_TESTMON_BASELINE\` |
           | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree
@@ -558,6 +569,7 @@ jobs:
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
+          - **\`unit_testmon_eligible\`**: requests CPU Testmon planning only. The _unit tests selection_ and per-bucket _Unit Testmon_ summaries report the effective mode, baseline, and any full-bucket fallback.
           SUMMARY
 
       - name: Get changed files for mandatory unit tests
@@ -609,9 +621,10 @@ jobs:
           fi
 
       # Set UNIT_TESTMON_USE_CACHE_BASE=false to keep testing the normal PR merge.
-      # Eligibility excludes merge groups, full-suite requests, and LTS runs.
+      # Eligibility excludes merge groups, full-suite requests, and LTS runs. Dev
+      # targets pin a trusted dev producer run whose artifacts hold the baseline.
       - name: Checkout PR for Testmon baseline preparation
-        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        if: steps.unit-test-pr-files.outputs.ready == 'true' && (fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'dev') && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.resolve-sha.outputs.sha }}
@@ -619,14 +632,15 @@ jobs:
 
       - name: Prepare PR on the Testmon baseline
         id: prepare-testmon-checkout
-        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        if: steps.unit-test-pr-files.outputs.ready == 'true' && (fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'dev') && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_HEAD: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
           PR_BASE: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
           TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
+          TARGET_BRANCH: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
         run: |
-          python .github/scripts/testmon_checkout.py prepare \
+          python .github/scripts/testmon_checkout.py prepare --target-branch "$TARGET_BRANCH" \
             --pr-head "$PR_HEAD" --pr-base "$PR_BASE" --tested-sha "$TESTED_SHA" \
             --pr-files-dir "$RUNNER_TEMP/unit-test-pr-files" \
             --output-dir "$RUNNER_TEMP/unit-test-pr-files/testmon-checkout"
@@ -1036,6 +1050,11 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+    # Selection reads dev baselines from artifacts of dev producer runs.
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
     uses: ./.github/workflows/_unit-tests.yml
     with:
       buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
@@ -1114,6 +1133,10 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
     uses: ./.github/workflows/_unit-tests.yml
     with:
       buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}

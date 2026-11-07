@@ -67,11 +67,27 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
+    description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (trusted main/dev producers only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
-    description: "Baseline source branch. Selective unit tests currently support main only."
+    description: "Baseline source branch. Selective unit tests support main (Actions cache) and dev (producer artifacts)."
+    required: false
+    default: ""
+  unit_testmon_baseline_run_id:
+    description: "Trusted producer run whose artifact holds this bucket's baseline (artifact transport only)."
+    required: false
+    default: ""
+  unit_testmon_baseline_artifact_id:
+    description: "Artifact ID of this bucket's baseline in the producer run (artifact transport only)."
+    required: false
+    default: ""
+  unit_testmon_baseline_key:
+    description: "Artifact name of this bucket's baseline: the lookup prefix plus its generation."
+    required: false
+    default: ""
+  unit_testmon_baseline_source_sha:
+    description: "Commit of the producer run that published the baseline artifact."
     required: false
     default: ""
   unit_test_pr_files_artifact_id:
@@ -153,9 +169,11 @@ runs:
         TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
         SUITE_TAG: ${{ inputs.tag }}
       run: |
-        [[ "$SOURCE_REPOSITORY" == "NVIDIA/Megatron-LM" && "$SOURCE_REF" == "refs/heads/main" ]]
+        # Each baseline branch records only its own pushed or scheduled commit.
+        [[ "$TARGET_BRANCH" == "main" || "$TARGET_BRANCH" == "dev" ]]
+        [[ "$SOURCE_REPOSITORY" == "NVIDIA/Megatron-LM" && "$SOURCE_REF" == "refs/heads/$TARGET_BRANCH" ]]
         [[ "$SOURCE_EVENT" == "schedule" || "$SOURCE_EVENT" == "workflow_dispatch" || "$SOURCE_EVENT" == "push" ]]
-        [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
+        [[ "$SUITE_TAG" == "latest" ]]
         [[ "$REQUESTED_SHA" == "$SOURCE_SHA" && "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
 
     - name: Pull container
@@ -177,11 +195,16 @@ runs:
         SUITE_TAG: ${{ inputs.tag }}
         CONTAINER_IMAGE: ${{ inputs.container-image }}
       run: |
-        [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
+        # The helper rejects target branches without a trusted baseline producer.
+        # Main keeps its original call: a prepared checkout may carry older helpers.
+        [[ "$SUITE_TAG" == "latest" ]]
+        TARGET_ARGS=()
+        [[ "$TARGET_BRANCH" == "main" ]] || TARGET_ARGS=(--target-branch "$TARGET_BRANCH")
         sudo rm -rf -- assets_dir/testmon
         IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE") || IMAGE_ID=unknown
         python tests/unit_tests/testmon_cache.py identity \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
+          "${TARGET_ARGS[@]}" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
 
     - name: Download CPU unit Testmon plan
@@ -209,7 +232,7 @@ runs:
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport != 'artifact' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
@@ -217,9 +240,40 @@ runs:
         key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ steps.testmon-checkout.outputs.generation || format('lookup-{0}-{1}', github.run_id, github.run_attempt) }}
         restore-keys: ${{ steps.testmon-checkout.outputs.generation == '' && steps.unit-testmon-identity.outputs.cache_prefix || '' }}
 
+    # PR pushes cannot read dev-branch caches. The CPU selection job resolved
+    # this artifact from a trusted dev producer run; validation below rechecks it.
+    - name: Download unit Testmon baseline artifact
+      id: download-unit-testmon-baseline
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport == 'artifact' && inputs.unit_testmon_baseline_artifact_id != '' && inputs.unit_testmon_baseline_run_id != ''
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ inputs.unit_testmon_baseline_artifact_id }}
+        run-id: ${{ inputs.unit_testmon_baseline_run_id }}
+        github-token: ${{ github.token }}
+        path: assets_dir/testmon
+        merge-multiple: true
+
+    - name: Record restored unit Testmon baseline
+      id: unit-testmon-baseline
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        CACHE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
+        CACHE_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        ARTIFACT_OUTCOME: ${{ steps.download-unit-testmon-baseline.outcome }}
+        ARTIFACT_KEY: ${{ inputs.unit_testmon_baseline_key }}
+        ARTIFACT_RUN_ID: ${{ inputs.unit_testmon_baseline_run_id }}
+      run: |
+        if [[ "$CACHE_OUTCOME" == "success" && -n "$CACHE_KEY" ]]; then
+          printf 'matched_key=%s\nsource=%s\n' "$CACHE_KEY" "Actions cache" >> "$GITHUB_OUTPUT"
+        elif [[ "$ARTIFACT_OUTCOME" == "success" && -n "$ARTIFACT_KEY" ]]; then
+          printf 'matched_key=%s\nsource=%s\n' "$ARTIFACT_KEY" "artifact of producer run $ARTIFACT_RUN_ID" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Prepare PR file download
       id: unit-test-pr-files-directory
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.unit-testmon-baseline.outputs.matched_key != ''
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       run: |
@@ -246,8 +300,11 @@ runs:
         # Precision profiles and disaggregation collectives must always run in full.
         REQUESTED_MODE: ${{ (inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' || (startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))) && 'full' || inputs.unit_testmon_mode }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
-        RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
-        MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        RESTORE_OUTCOME: ${{ steps.unit-testmon-baseline.outcome }}
+        MATCHED_KEY: ${{ steps.unit-testmon-baseline.outputs.matched_key }}
+        BASELINE_SOURCE: ${{ steps.unit-testmon-baseline.outputs.source }}
+        BASELINE_SOURCE_SHA: ${{ inputs.unit_testmon_baseline_source_sha }}
+        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
         PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
         PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         TESTED_SHA: ${{ steps.testmon-checkout.outputs.sha || inputs.sha || github.sha }}
@@ -274,7 +331,8 @@ runs:
                 '.source_sha == $sha and .generation == $generation' assets_dir/testmon/manifest.json; } \
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
-                --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
+                --matched-key "$MATCHED_KEY" ${BASELINE_SOURCE_SHA:+--source-sha "$BASELINE_SOURCE_SHA"} \
+                | tee -a "$GITHUB_STEP_SUMMARY"; then
               # Configure fetches the PR's files once for all buckets. The
               # artifact is tied to the tested commit, not the Testmon baseline.
               if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
@@ -294,7 +352,7 @@ runs:
               fi
             else
               EFFECTIVE_MODE=full
-              FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
+              FALLBACK_REASON="no valid compatible $TARGET_BRANCH baseline; running the full bucket without recording or saving"
               echo "::notice::Testmon baseline unavailable or invalid; running the full unit-test bucket."
             fi
             ;;
@@ -312,7 +370,9 @@ runs:
           echo "- Requested mode: $REQUESTED_MODE"
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
-            echo "- Restored cache key: ${MATCHED_KEY:-none}"
+            echo "- Baseline branch: $TARGET_BRANCH"
+            echo "- Baseline source: ${BASELINE_SOURCE:-none}"
+            echo "- Restored baseline key: ${MATCHED_KEY:-none}"
           fi
           if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
             echo "- Changed paths in PR: ${CHANGED_PATHS}"
@@ -438,7 +498,7 @@ runs:
           --source-sha "$SOURCE_SHA" --generation "$GENERATION"
 
     - name: Save unit Testmon baseline
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport != 'artifact' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
       uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         path: assets_dir/testmon
@@ -447,7 +507,7 @@ runs:
     # cache/save warns on upload failures, so verify publication explicitly.
     - name: Verify unit Testmon cache publication
       id: verify-unit-testmon-cache
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success'
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport != 'artifact'
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         path: assets_dir/testmon
@@ -457,7 +517,7 @@ runs:
 
     - name: Confirm unit Testmon cache generation
       id: confirm-unit-testmon-cache
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success'
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport != 'artifact'
       shell: bash -e -u -o pipefail {0}
       env:
         EXPECTED_KEY: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
@@ -469,6 +529,42 @@ runs:
         python tests/unit_tests/testmon_cache.py validate \
           --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
           --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Dev PR pushes can read only default-branch caches, so dev publishes each
+    # validated generation as an artifact of this trusted push or dispatch run.
+    - name: Validate unit Testmon baseline artifact
+      id: validate-unit-testmon-artifact
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outputs.baseline_transport == 'artifact'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        EXPECTED_KEY: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        SOURCE_SHA: ${{ github.sha }}
+      run: |
+        python tests/unit_tests/testmon_cache.py validate \
+          --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+          --matched-key "$EXPECTED_KEY" --source-sha "$SOURCE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload unit Testmon baseline artifact
+      id: upload-unit-testmon-artifact
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.validate-unit-testmon-artifact.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == format('refs/heads/{0}', inputs.unit_testmon_target_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      with:
+        name: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        path: assets_dir/testmon
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 30
+
+    - name: Confirm unit Testmon artifact publication
+      id: confirm-unit-testmon-artifact
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.validate-unit-testmon-artifact.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        ARTIFACT_ID: ${{ steps.upload-unit-testmon-artifact.outputs.artifact-id }}
+        ARTIFACT_NAME: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+      run: |
+        [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+        echo "- Published artifact: $ARTIFACT_NAME ($ARTIFACT_ID)" | tee -a "$GITHUB_STEP_SUMMARY"
 
     - name: Publish unit Testmon summary
       if: always() && inputs.is_unit_test == 'true'
@@ -487,7 +583,7 @@ runs:
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
         TESTMON_MODE: ${{ steps.unit-testmon.outputs.mode }}
-        CACHE_PUBLICATION: ${{ steps.confirm-unit-testmon-cache.outcome }}
+        CACHE_PUBLICATION: ${{ steps.unit-testmon-identity.outputs.baseline_transport == 'artifact' && steps.confirm-unit-testmon-artifact.outcome || steps.confirm-unit-testmon-cache.outcome }}
         MAIN_CONCLUSION: ${{ steps.run-main-script.conclusion }}
         MAIN_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
       run: |

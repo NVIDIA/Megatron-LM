@@ -410,6 +410,9 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     ("overrides", "expected"),
     [
         ({}, "true"),
+        ({"TARGET_BRANCH": "dev"}, "true"),
+        ({"TARGET_BRANCH": "core_r0.16.0"}, "false"),
+        ({"TARGET_BRANCH": ""}, "false"),
         ({"UNIT_TESTMON_REQUESTED": "false"}, "false"),
         ({"EVENT_NAME": "merge_group"}, "false"),
         ({"REF": "refs/heads/main"}, "false"),
@@ -422,11 +425,12 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
 )
 def test_pr_resolved_testmon_gate(overrides, expected):
     workflow = _source(".github/workflows/cicd-main.yml")
-    start = workflow.index("          UNIT_TESTMON_ELIGIBLE=false")
+    start = workflow.index('          case "${TARGET_BRANCH:-}" in')
     end = workflow.index('\n\n          echo "scope=', start)
     gate = textwrap.dedent(workflow[start:end])
     environment = {
         **os.environ,
+        "TARGET_BRANCH": "main",
         "LABELS_VALID": "true",
         "UNIT_TESTMON_REQUESTED": "true",
         "IS_CI_WORKLOAD": "false",
@@ -620,6 +624,79 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
     else:
         assert plan["phases"] == {} and plan["reason"]
     assert {phase: _snapshot(directory / phase) for phase in before} == before
+
+
+@pytest.mark.parametrize(
+    ("target", "producer", "producer_sha", "change", "mode", "selected"),
+    [
+        ("dev", "dev", "d", "unchanged", "selected", []),
+        ("dev", "dev", "d", "dependency", "selected", ["test_app.py"]),
+        ("dev", "dev", "d", "dev-only-test", "selected", ["test_dev_only.py"]),
+        ("dev", "dev", "e", "unchanged", "full", None),
+        ("dev", "main", "d", "unchanged", "full", None),
+        ("main", "dev", None, "unchanged", "full", None),
+    ],
+)
+def test_cpu_selection_uses_only_the_target_branch_baseline(
+    cpu_baseline, target, producer, producer_sha, change, mode, selected
+):
+    """Dev-target PRs select from dev producer generations and never from main's."""
+    cache_module = sys.modules["testmon_cache"]
+    project, directory = cpu_baseline["root"], cpu_baseline["cache_dir"]
+    bucket, platform = cpu_baseline["bucket"], cpu_baseline["recipe_platform"]
+    producer_identity = cache_module.cache_identity(
+        project, bucket, platform, target_branch=producer
+    )
+    cache_module.finalize(directory, producer_identity, "d" * 40, "456-1")
+    consumer = cache_module.cache_identity(project, bucket, platform, target_branch=target)
+    if change == "dependency":
+        (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    elif change == "dev-only-test":
+        # A test file the baseline never recorded must run.
+        (project / "tests/unit_tests/example/test_dev_only.py").write_text(
+            "def test_dev_only():\n    assert False\n"
+        )
+    plan_path = project / "plan.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRAPPER_PATH),
+            "select",
+            "--cache-dir",
+            str(directory),
+            "--bucket",
+            bucket,
+            "--platform",
+            platform,
+            "--source-sha",
+            cpu_baseline["source_sha"],
+            "--matched-key",
+            consumer["cache_prefix"] + "456-1",
+            "--pr-files-dir",
+            str(cpu_baseline["pr_files_dir"]),
+            "--target-branch",
+            target,
+            *(["--baseline-source-sha", producer_sha * 40] if producer_sha else []),
+            "--output",
+            str(plan_path),
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    plan = json.loads(plan_path.read_text())
+    assert plan["mode"] == mode, plan["reason"]
+    assert plan["target_branch"] == target
+    if mode == "selected":
+        expected = [f"tests/unit_tests/example/{filename}" for filename in selected]
+        assert plan["phases"] == {"prod": expected, "experimental": expected}
+        assert plan["baseline_source_sha"] == "d" * 40
+        assert plan["reason"] == f"selected on CPU from the compatible {target} baseline"
+    else:
+        assert plan["phases"] == {}
+        assert "baseline source" in plan["reason"] or "producer commit" in plan["reason"]
 
 
 @pytest.mark.parametrize(

@@ -131,6 +131,9 @@ def _run_plan(argv: list[str]) -> int:
     select_parser.add_argument("--matched-key", required=True)
     select_parser.add_argument("--pr-files-dir", type=Path, required=True)
     select_parser.add_argument("--output", type=Path, required=True)
+    select_parser.add_argument("--target-branch", default="main")
+    # Commit of the trusted producer run that published an artifact baseline.
+    select_parser.add_argument("--baseline-source-sha")
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("--plan", type=Path, required=True)
     for child in (select_parser, prepare_parser):
@@ -160,6 +163,8 @@ def _run_plan(argv: list[str]) -> int:
         args.source_sha,
         args.matched_key,
         args.pr_files_dir,
+        args.target_branch,
+        args.baseline_source_sha,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(plan, sort_keys=True, indent=2) + "\n")

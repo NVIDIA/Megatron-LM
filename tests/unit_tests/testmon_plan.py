@@ -121,6 +121,8 @@ def select(
     source_sha: str,
     matched_key: str,
     pr_files_dir: Path,
+    target_branch: str = "main",
+    baseline_source_sha: str | None = None,
 ) -> dict:
     """Decide on CPU whether to execute selected files or the full bucket."""
     plan = {
@@ -128,13 +130,14 @@ def select(
         "source_sha": source_sha,
         "bucket": bucket,
         "platform": recipe_platform,
+        "target_branch": target_branch,
         "mode": "full",
         "reason": "",
         "phases": {},
     }
     try:
-        identity = cache_identity(root, bucket, recipe_platform)
-        validate_cache(cache_dir, identity, matched_key)
+        identity = cache_identity(root, bucket, recipe_platform, target_branch=target_branch)
+        manifest = validate_cache(cache_dir, identity, matched_key, baseline_source_sha)
         changed_files = _changed_files(pr_files_dir, source_sha)
         test_files, mandatory = _bucket_files(root, bucket, recipe_platform, changed_files)
         # Recollect affected files in both modes: production dependencies can change
@@ -147,9 +150,10 @@ def select(
         phases = {phase: sorted(affected_files) for phase in PHASES}
         plan.update(
             mode="selected",
-            reason="selected on CPU from the compatible main baseline",
+            reason=f"selected on CPU from the compatible {target_branch} baseline",
             phases=phases,
             mandatory_files=mandatory,
+            baseline_source_sha=manifest["source_sha"],
         )
     except (
         ImportError,

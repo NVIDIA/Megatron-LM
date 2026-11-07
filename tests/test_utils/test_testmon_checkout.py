@@ -46,7 +46,9 @@ def repository(tmp_path, monkeypatch):
     git(repo, "remote", "add", "origin", str(repo))
     monkeypatch.chdir(repo)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    monkeypatch.setattr(checkout, "latest_baseline", lambda: (baseline, "123-1"))
+    monkeypatch.setattr(
+        checkout, "latest_baseline", lambda target_branch="main": (baseline, "123-1")
+    )
     return repo, baseline
 
 
@@ -61,6 +63,7 @@ def arguments(repo, base, head):
         tested_sha=head,
         pr_files_dir=str(pr_files),
         output_dir=str(pr_files / "testmon-checkout"),
+        target_branch="main",
     )
 
 
@@ -157,3 +160,89 @@ def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
     candidates.pop()
     with pytest.raises(ValueError, match="No successful first-attempt"):
         checkout.latest_baseline()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "trusted-push",
+        "trusted-dispatch",
+        "newest-without-baselines",
+        "tag-outside-dev",
+        "other-branch",
+        "other-workflow",
+        "schedule",
+        "retry",
+        "fork",
+        "none",
+    ],
+)
+def test_dev_baseline_lookup_requires_a_published_dev_producer(monkeypatch, case):
+    """Dev pins the newest successful dev push or dispatch run that published baselines."""
+    tip, inside, outside = "e" * 40, "1" * 40, "2" * 40
+    trusted = {
+        "event": "push",
+        "head_repository": {"full_name": checkout.REPOSITORY},
+        "head_branch": "dev",
+        "path": checkout.PRODUCER,
+        "run_attempt": 1,
+        "id": 250,
+        "head_sha": inside,
+    }
+    variants = {
+        "trusted-push": trusted,
+        "trusted-dispatch": {**trusted, "event": "workflow_dispatch"},
+        "newest-without-baselines": {**trusted, "id": 260},
+        "tag-outside-dev": {**trusted, "id": 270, "head_sha": outside},
+        "other-branch": {**trusted, "head_branch": "dev-feature"},
+        "other-workflow": {**trusted, "path": ".github/workflows/other.yml"},
+        "schedule": {**trusted, "event": "schedule"},
+        "retry": {**trusted, "run_attempt": 2},
+        "fork": {**trusted, "head_repository": {"full_name": "fork/Megatron-LM"}},
+    }
+    runs = [] if case == "none" else [variants[case]]
+    if case == "newest-without-baselines":
+        runs.append(trusted)
+    artifacts = {
+        250: [
+            "logs-tests-unit_tests-models-250",
+            "unit-testmon-v1-dev-dgx_h100-0123456789abcdef-250-1",
+        ],
+        260: ["logs-tests-unit_tests-models-260"],
+        270: ["unit-testmon-v1-dev-dgx_h100-0123456789abcdef-270-1"],
+    }
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        assert args[:2] == ("gh", "api")
+        endpoint = next(arg for arg in args[2:] if not arg.startswith("--"))
+        if endpoint.endswith("runs?branch=dev&status=success&per_page=100"):
+            return json.dumps({"workflow_runs": runs})
+        if endpoint == f"repos/{checkout.REPOSITORY}/git/ref/heads/dev":
+            return (tip + "\n").encode()
+        if "/compare/" in endpoint:
+            base = endpoint.split("/compare/")[1].split("...")[0]
+            return ({inside: "ahead", outside: "diverged"}[base] + "\n").encode()
+        run_id = int(endpoint.split("/actions/runs/")[1].split("/")[0])
+        assert "--paginate" in args
+        return "".join(f"{name}\n" for name in artifacts[run_id]).encode()
+
+    monkeypatch.setattr(checkout, "run", fake_run)
+    expected = {
+        "trusted-push": (inside, "250-1"),
+        "trusted-dispatch": (inside, "250-1"),
+        "newest-without-baselines": (inside, "250-1"),
+    }.get(case)
+    if expected:
+        assert checkout.latest_baseline("dev") == expected
+    else:
+        with pytest.raises(ValueError, match="No successful first-attempt dev"):
+            checkout.latest_baseline("dev")
+    # Main's lookup is unchanged and never inspects dev producers.
+    assert all("branch=main" not in " ".join(call) for call in calls)
+
+
+def test_baseline_lookup_rejects_targets_without_a_producer():
+    with pytest.raises(ValueError, match="No trusted Testmon baseline producer"):
+        checkout.latest_baseline("core_r0.16.0")

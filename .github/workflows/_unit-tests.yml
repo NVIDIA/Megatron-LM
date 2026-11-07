@@ -37,16 +37,19 @@ on:
         default: ""
 
 permissions:
+  # Read artifact baselines published by dev's producer runs.
+  actions: read
   contents: read
   id-token: write
 
 jobs:
   select:
     name: unit tests selection
-    # Only main has a supported Testmon baseline. Other targets run full buckets.
-    if: inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'
+    # Only main and dev publish trusted Testmon baselines. Other targets run full buckets.
+    if: inputs.unit_testmon_mode == 'enforce' && (inputs.unit_testmon_target_branch == 'main' || inputs.unit_testmon_target_branch == 'dev')
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -125,6 +128,8 @@ jobs:
           TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
           PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
           PATH: ${{ steps.cache-compression.outputs.path }}
+          # Lists and downloads dev producer artifacts.
+          GH_TOKEN: ${{ github.token }}
         with:
           script: |
             // Only SDK transport lives here; Python owns selection and the matrix.
@@ -136,6 +141,17 @@ jobs:
                   const key = await require(modules + '@actions/cache').restoreCache(
                     [args[0]], args[1], args[2] ? [args[2]] : []);
                   require('node:fs').writeFileSync(args[3], key || '');
+                } else if (operation === 'download') {
+                  // A baseline artifact of another run, checked against its listed digest.
+                  const [id, path, runId, repository, digest] = args;
+                  const [repositoryOwner, repositoryName] = repository.split('/');
+                  const {DefaultArtifactClient} = require(modules + '@actions/artifact');
+                  const result = await new DefaultArtifactClient().downloadArtifact(Number(id), {
+                    path, expectedHash: digest || undefined,
+                    findBy: {token: process.env.GH_TOKEN, workflowRunId: Number(runId),
+                             repositoryOwner, repositoryName},
+                  });
+                  if (result.digestMismatch) throw new Error('Artifact ' + id + ' digest mismatch');
                 } else {
                   const {DefaultArtifactClient} = require(modules + '@actions/artifact');
                   await new DefaultArtifactClient().uploadArtifact(args[0], [args[1]], args[2]);
@@ -151,7 +167,7 @@ jobs:
     needs: select
     # CPU failures stop GPU dispatch; empty selections never allocate a GPU.
     # Full-suite requests and unsupported target branches bypass selective planning.
-    if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || inputs.unit_testmon_target_branch != 'main' || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
+    if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || (inputs.unit_testmon_target_branch != 'main' && inputs.unit_testmon_target_branch != 'dev') || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -180,7 +196,11 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
+          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && (inputs.unit_testmon_target_branch == 'main' || inputs.unit_testmon_target_branch == 'dev') && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
+          unit_testmon_baseline_run_id: ${{ matrix.baseline_run_id }}
+          unit_testmon_baseline_artifact_id: ${{ matrix.baseline_artifact_id }}
+          unit_testmon_baseline_key: ${{ matrix.baseline_key }}
+          unit_testmon_baseline_source_sha: ${{ matrix.baseline_source_sha }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
           unit_testmon_checkout_artifact_id: ${{ inputs.unit_testmon_checkout_artifact_id }}
