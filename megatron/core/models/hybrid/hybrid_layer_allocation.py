@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TypeAlias
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
@@ -38,7 +39,7 @@ class MTPSplit:
 
 
 # A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
-# Parsing enforces the supported config types and marker placement within each section.
+# Parsing accepts built-in configs and HybridLayerConfig implementations, validating markers.
 HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
@@ -96,20 +97,25 @@ class ParsedHybridConfigList:
 def _validate_layer_config_sequence(
     layer_configs: Sequence[TransformerConfig], section_name: str
 ) -> None:
-    """Validate exact config types and attention-family compatibility."""
+    """Validate built-in/custom config contracts and shared attention compatibility."""
     config_types = set()
+    needs_shared_rotary = False
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
-        if type(layer_config) not in supported_types:
+        if type(layer_config) not in supported_types and not isinstance(
+            layer_config, HybridLayerConfig
+        ):
             raise ValueError(
                 f"{section_name} entry {index} has unsupported hybrid layer config type "
-                f"{type(layer_config).__name__}. Exact built-in layer config types are required."
+                f"{type(layer_config).__name__}. Expected an exact built-in layer config type "
+                "or a HybridLayerConfig implementation."
             )
         config_types.add(type(layer_config))
+        needs_shared_rotary |= layer_utils.uses_shared_rotary_embeddings(layer_config)
 
     attention_type = Symbols.LAYER_CONFIG_MAP[Symbols.ATTENTION]
     mla_types = {Symbols.LAYER_CONFIG_MAP[symbol] for symbol in Symbols.MLA_ATTENTION}
-    if attention_type in config_types and config_types & mla_types:
+    if (attention_type in config_types or needs_shared_rotary) and config_types & mla_types:
         raise ValueError(
             f"Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in the {section_name}"
         )

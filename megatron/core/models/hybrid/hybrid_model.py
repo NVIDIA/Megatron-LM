@@ -17,7 +17,9 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
+from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -67,7 +69,6 @@ def _get_hash_moe_layer_threshold(
         return 0
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit, Symbols
-    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     if isinstance(main_pattern, str) or main_pattern is None:
         global_layers = (main_pattern or '').replace(Symbols.PIPE, '')
@@ -76,7 +77,7 @@ def _get_hash_moe_layer_threshold(
     moe_layer_numbers = [
         layer_number
         for layer_number, layer_type in enumerate(global_layers, start=1)
-        if layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig
+        if layer_type == Symbols.MOE or layer_utils.is_moe_layer_config(layer_type)
     ]
     if n_hash_layers > len(moe_layer_numbers):
         raise ValueError(
@@ -97,12 +98,11 @@ def _validate_hash_moe_pipeline_placement(
         return
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     local_hash_layer_numbers = [
         layer_offset + local_layer_number
         for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
-        if (layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig)
+        if (layer_type == Symbols.MOE or layer_utils.is_moe_layer_config(layer_type))
         and layer_offset + local_layer_number <= hash_moe_layer_threshold
     ]
     if local_hash_layer_numbers:
@@ -118,7 +118,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     Args:
         config (TransformerConfig): Model config
-        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        hybrid_stack_spec (ModuleSpec, optional): Legacy override for built-in layer construction.
+            When omitted, use the standard Core stack; custom configs construct their own layers.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
@@ -169,9 +170,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
+        hybrid_stack_spec: ModuleSpec | None = None,
+        vocab_size: int | None = None,
+        max_sequence_length: int | None = None,
         hybrid_layer_pattern: Optional[str] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
@@ -192,6 +193,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vp_stage: Optional[int] = None,
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
     ) -> None:
+        if vocab_size is None or max_sequence_length is None:
+            raise ValueError("vocab_size and max_sequence_length must be provided.")
+        if hybrid_stack_spec is None:
+            # Resolve the existing built-in construction only at the model boundary. External
+            # configs construct their modules directly, independently of this compatibility API.
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                hybrid_stack_spec as default_hybrid_stack_spec,
+            )
+
+            hybrid_stack_spec = default_hybrid_stack_spec
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
         hybrid_layer_config_list_snapshot = (
@@ -219,6 +230,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
+        self._has_custom_layers = any(
+            isinstance(entry, HybridLayerConfig)
+            for entry in (hybrid_layer_config_list_snapshot or ())
+        )
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
@@ -326,6 +341,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 for entry in parsed_config_list.main_layer_config_list
                 if entry is not PipelineSplit
             ) + (self.mtp_layer_config_list or ())
+            # Validate the complete architecture on every rank before creating any modules,
+            # including custom layers assigned to other pipeline stages or MTP depths.
+            for layer_config in architecture_layer_configs:
+                if isinstance(layer_config, HybridLayerConfig):
+                    layer_config.validate_hybrid_layer(self.config, self.pg_collection)
             layer_utils.validate_shared_rotary_config(
                 architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
             )
@@ -347,10 +367,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self._mtp_uses_mla = any(
                 type(entry) in mla_config_types for entry in (self.mtp_layer_config_list or ())
             )
-            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-
             self.config._hybrid_has_moe_layers = any(
-                type(entry) is MoELayerConfig for entry in architecture_layer_configs
+                layer_utils.is_moe_layer_config(entry) for entry in architecture_layer_configs
             )
             if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
                 self.config.mtp_num_layers = self.mtp_num_depths
@@ -594,6 +612,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def estimate_flops(
+        self, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float | None:
+        """Estimate global-batch training FLOPs for a list-defined model.
+
+        Args:
+            total_real_tokens_in_batch: Sum of unpadded sequence lengths in the global batch.
+            seqlen_squared_sum_in_batch: Sum of squared unpadded sequence lengths in the
+                global batch.
+
+        Returns:
+            Whole-model forward/backward FLOPs, including all MTP depths regardless of
+            PP/VPP placement. Returns ``None`` for pattern-defined models so callers can
+            retain their existing args-based estimator.
+        """
+        if self.hybrid_layer_config_list is None:
+            return None
+        return estimate_hybrid_config_list_flops(
+            self.hybrid_layer_config_list,
+            self.hybrid_stack_spec,
+            self.config,
+            self.vocab_size,
+            total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch,
+        )
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -727,6 +771,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
+        if self._has_custom_layers and (inference_context is not None or in_inference_mode):
+            raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -769,7 +815,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
         hash_input_ids = None
-        if self.config.moe_num_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0 or self._has_custom_layers:
             hash_input_ids = input_ids
         if (
             self.config.sequence_parallel

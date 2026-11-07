@@ -313,6 +313,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     model = SimpleNamespace(
         config=config,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         decoder=decoder,
         position_embedding_type='none',
         pre_process=True,
@@ -356,6 +357,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     )
     model = SimpleNamespace(
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
@@ -440,6 +442,7 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         decoder=decoder,
         embedding=embedding,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         position_embedding_type="none",
         pre_process=True,
         post_process=False,
@@ -508,6 +511,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         ),
         decoder=decoder,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         position_embedding_type="none",
         pre_process=pre_process,
         post_process=False,

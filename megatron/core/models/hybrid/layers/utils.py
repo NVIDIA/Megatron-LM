@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 
 from torch import Tensor
 
+from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -121,6 +122,20 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
 
 
+def uses_shared_rotary_embeddings(layer_config: TransformerConfig) -> bool:
+    """Return whether a layer consumes HybridModel's shared position embeddings."""
+    return type(layer_config) is AttentionLayerConfig or (
+        isinstance(layer_config, HybridLayerConfig) and layer_config.uses_shared_rotary_embeddings
+    )
+
+
+def is_moe_layer_config(layer_config: TransformerConfig) -> bool:
+    """Identify configs participating in the standard MoE tracker contract."""
+    return type(layer_config) is MoELayerConfig or (
+        isinstance(layer_config, HybridLayerConfig) and layer_config.is_moe_layer
+    )
+
+
 def validate_shared_rotary_config(
     layer_configs: Sequence[TransformerConfig], kv_channels: int, position_embedding_type: str
 ) -> None:
@@ -131,9 +146,10 @@ def validate_shared_rotary_config(
     if position_embedding_type not in ("rope", "yarn"):
         return
     for layer_config in layer_configs:
-        if type(layer_config) is AttentionLayerConfig and layer_config.kv_channels != kv_channels:
+        if uses_shared_rotary_embeddings(layer_config) and layer_config.kv_channels != kv_channels:
             raise ValueError(
-                f"AttentionLayerConfig.kv_channels ({layer_config.kv_channels}) must match "
+                f"{type(layer_config).__name__}.kv_channels "
+                f"({layer_config.kv_channels}) must match "
                 f"HybridModel config.kv_channels ({kv_channels}) when using "
                 f"position_embedding_type={position_embedding_type!r}: decoder and MTP "
                 "attention layers use the model's shared rotary embeddings."
