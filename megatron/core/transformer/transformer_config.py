@@ -867,8 +867,15 @@ class TransformerConfig(ModelParallelConfig):
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "mhc", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv",
     "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
-    "dsa_indexer_k", "dsa_selected_scores".
+    "dsa_indexer_k", "dsa_selected_scores", "attn_res".
     default: ["core_attn"].
+    "attn_res": recompute the Attention Residuals depth aggregation: its output (the
+            sublayer's norm input, or the normalized input under attn_res_norm_fusion) is
+            released after the sublayer's forward and rebuilt from the depth sources when
+            the sublayer output's gradient arrives, before the "layernorm" checkpoint of the
+            same sublayer replays. The depth sources and partial sums stay saved. Requires
+            enable_attention_residuals=True; incompatible with attn_norm/mlp_norm offloading.
+            Uses output-discarding checkpointing.
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
@@ -1755,6 +1762,64 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     ####################
+    # Attention Residuals (AttnRes) Configuration
+    ####################
+    enable_attention_residuals: bool = False
+    """Enable Attention Residuals (AttnRes, arXiv:2603.15031): replaces the fixed residual
+    accumulation with per-token softmax attention over depth sources (token embedding, completed
+    depth-block sums, and the running intra-block partial sum). Each self-attention and MLP
+    sublayer aggregates the sources with its own zero-initialized pseudo-query, and the final
+    output head aggregates all sources before the final layernorm. Mutually exclusive with
+    enable_hyper_connections / enable_mhc_connections, wide_residual and
+    moe_shortcut_connection."""
+
+    attn_res_block_layers: Optional[int] = None
+    """Block AttnRes: number of transformer layers per depth block for GPT stacks (the paper's
+    block size S counted in sublayers is twice this value), or number of pattern entries per
+    depth block for hybrid stacks (each entry is one sublayer). Required when
+    enable_attention_residuals=True. The total number of trunk depth sources at the network
+    output is
+    floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
+    trailing partial block); every MTP depth reuses this immutable trunk source tuple and adds
+    its own running partial. The paper finds ~8-10 sources recover most of the quality gain."""
+
+    attn_res_impl: str = "fla"
+    """Implementation of the AttnRes depth aggregation.
+
+    Options:
+
+    - 'eager': a memory-lean custom autograd Function built from plain PyTorch ops.
+    - 'compile': a plain PyTorch forward wrapped in torch.compile, with AOTAutograd generating
+      its backward and one specialization per depth arity; falls back to the eager custom
+      Function with a warning if compilation is unavailable.
+    - 'fla': FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+      flash-linear-attention.
+
+    The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
+    at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
+    optimized path."""
+
+    attn_res_norm_fusion: bool = False
+    """Fuse the RMSNorm that consumes each AttnRes aggregation (the sublayer's input_layernorm
+    or pre_mlp_layernorm) into FLA's fused AttnRes kernel (``fused_attnres(output_rms_weight=...)``,
+    flash-linear-attention >= 0.5.1): the kernel emits the normalized sublayer input directly and
+    the mixed residual is never materialized. The norm modules keep owning their weights, so
+    checkpoints are interchangeable with the unfused path; only their forward is bypassed.
+    Requires attn_res_impl='fla', RMSNorm without zero-centered gamma and no attn_norm/mlp_norm
+    fine-grained offloading. Sublayers whose norm is folded into their first linear (TE
+    LayerNormLinear specs, e.g. the dense MLP entry of Kimi-K3; mla_down_proj_fusion is rejected)
+    keep the unfused aggregation, and so does the final-norm aggregation. With selective recompute,
+    'attn_res' and 'layernorm' must be enabled together or not at all: the fused output is the
+    norm output, so one output-discarding checkpoint covers both."""
+
+    hybrid_layer_pattern: Optional[str] = None
+    """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
+    automatically by the argument bridge). Consumed by config-only consumers that need the
+    hybrid pipeline segmentation — currently the attention-residual pipeline payload widths,
+    whose per-boundary slice counts derive from the cumulative '|' segment lengths. The
+    HybridModel itself keeps receiving the pattern through its constructor argument."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -2229,6 +2294,206 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
+            )
+
+    def _validate_attention_residuals(self):
+        """Validate the Attention Residuals (AttnRes) configuration.
+
+        Supported: eager/compile/FLA training with TP/SP/CP/EP, pipeline parallelism
+        (non-interleaved: full depth-source prefix concatenated along the
+        sequence dimension; interleaved VPP: per-boundary deltas padded to a
+        uniform width plus a rank-local source cache — see
+        attention_residual.AttnResStageSources), selective recompute of modules
+        that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
+        overlap), fine-grained activation offloading, and MTP in the standard
+        or hybrid last-stage placement. Everything rejected below either has no
+        mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
+        schedule, zero-layer virtual chunks, the per-layer CP layout manager,
+        wide residuals, shortcut MoE blocks) or
+        would silently bypass the AttnRes residual interception (fused residual
+        norms, fp32 residual connection) or the interleaved schedule's uniform
+        payload-width reasoning (variable sequence lengths with VPP).
+
+        Two memory knobs are validated here as well: ``'attn_res'`` in
+        ``recompute_modules`` (output-discarding recompute of the aggregation) and
+        ``attn_res_norm_fusion`` (the consuming RMSNorm fused into the FLA kernel).
+        """
+        recompute_attn_res = (
+            self.recompute_granularity == "selective"
+            and self.recompute_modules is not None
+            and "attn_res" in self.recompute_modules
+        )
+        if not self.enable_attention_residuals:
+            if self.attn_res_block_layers is not None:
+                raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
+            if self.attn_res_norm_fusion:
+                raise ValueError("attn_res_norm_fusion requires enable_attention_residuals=True.")
+            if recompute_attn_res:
+                raise ValueError(
+                    "'attn_res' in recompute_modules requires enable_attention_residuals=True."
+                )
+            return
+
+        if self.enable_hyper_connections or self.enable_mhc_connections:
+            raise ValueError(
+                "enable_attention_residuals and enable_hyper_connections / "
+                "enable_mhc_connections are mutually exclusive residual-stream generalizations."
+            )
+        if (
+            not isinstance(self.attn_res_block_layers, int)
+            or isinstance(self.attn_res_block_layers, bool)
+            or self.attn_res_block_layers < 1
+        ):
+            raise ValueError(
+                "enable_attention_residuals requires attn_res_block_layers to be a "
+                f"positive integer, got {self.attn_res_block_layers!r}."
+            )
+        if self.attn_res_impl not in ("eager", "compile", "fla"):
+            raise ValueError(
+                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                f"got {self.attn_res_impl!r}."
+            )
+        norm_offload_modules = set()
+        if self.fine_grained_activation_offloading and self.offload_modules:
+            norm_offload_modules = {"attn_norm", "mlp_norm"} & set(self.offload_modules)
+        if recompute_attn_res and norm_offload_modules:
+            # Both target the aggregation output (the norm input): the recompute releases it
+            # and regenerates it in backward, so there is nothing for the offload to transfer.
+            raise ValueError(
+                "'attn_res' in recompute_modules is incompatible with offload_modules "
+                f"{sorted(norm_offload_modules)}: they offload the AttnRes aggregation output "
+                "that the recompute discards. Remove one of the two."
+            )
+        if self.attn_res_norm_fusion:
+            if self.attn_res_impl != "fla":
+                raise ValueError(
+                    "attn_res_norm_fusion requires attn_res_impl='fla' (the consuming RMSNorm is "
+                    f"applied by FLA's fused_attnres kernel), got {self.attn_res_impl!r}."
+                )
+            if self.normalization != "RMSNorm" or self.layernorm_zero_centered_gamma:
+                raise ValueError(
+                    "attn_res_norm_fusion fuses a plain RMSNorm (y = x * rsqrt(mean(x^2) + eps) "
+                    "* w) into the aggregation; it requires normalization='RMSNorm' without "
+                    "layernorm_zero_centered_gamma."
+                )
+            if getattr(self, "mla_down_proj_fusion", False):
+                raise ValueError(
+                    "attn_res_norm_fusion requires standalone input norms; mla_down_proj_fusion "
+                    "folds the MLA input norm into the down projections."
+                )
+            if norm_offload_modules:
+                raise ValueError(
+                    "attn_res_norm_fusion is incompatible with offload_modules "
+                    f"{sorted(norm_offload_modules)}: the norm input is never materialized."
+                )
+            recompute_layernorm = (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "layernorm" in self.recompute_modules
+            )
+            if recompute_layernorm != recompute_attn_res:
+                raise ValueError(
+                    "With attn_res_norm_fusion, 'attn_res' and 'layernorm' in recompute_modules "
+                    "must be enabled together or not at all: the fused kernel's output is the "
+                    "norm output, so one output-discarding checkpoint covers both (got "
+                    f"layernorm={recompute_layernorm}, attn_res={recompute_attn_res})."
+                )
+        unsupported = []
+        has_variable_sequences = (
+            self.variable_seq_lengths or self.sequence_packing_scheduler is not None
+        )
+        if has_variable_sequences and self.virtual_pipeline_model_parallel_size is not None:
+            # The packing scheduler sets variable_seq_lengths later in
+            # __post_init__, so check the scheduler itself here as well.
+            # Non-interleaved pipeline parallelism is fine with per-microbatch
+            # shapes: the boundary payload is one plain [s * slices, b, h]
+            # tensor whose shape p2p_communication exchanges dynamically, and
+            # unpacking only needs the static slice count derived from the
+            # layer layout. The interleaved schedule instead pads every
+            # boundary to a single uniform width computed from seq_length and
+            # keys its rank-local source cache by microbatch, neither of which
+            # has been reasoned through for variable shapes.
+            unsupported.append(
+                "variable_seq_lengths (incl. sequence packing) together with the "
+                "interleaved (VPP) schedule"
+            )
+        if self.virtual_pipeline_model_parallel_size is not None and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            # Zero-layer virtual chunks (standalone embedding/loss stages) are
+            # not covered by the delta-payload window bookkeeping yet.
+            unsupported.append(
+                "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
+            )
+        if self.cuda_graph_impl != "none":
+            unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.recompute_granularity == "full":
+            unsupported.append("recompute_granularity='full'")
+        if self.overlap_moe_expert_parallel_comm:
+            unsupported.append("overlap_moe_expert_parallel_comm")
+        if self.fused_residual_rmsnorm:
+            unsupported.append("fused_residual_rmsnorm (bypasses residual interception)")
+        if self.fp32_residual_connection:
+            unsupported.append("fp32_residual_connection")
+        if self.apply_residual_connection_post_layernorm:
+            unsupported.append("apply_residual_connection_post_layernorm")
+        if self.cpu_offloading:
+            unsupported.append(
+                "cpu_offloading (depth sources outlive the per-layer lifetime model)"
+            )
+        if self.heterogeneous_block_specs:
+            unsupported.append("heterogeneous_block_specs")
+        if self.pipeline_model_parallel_layout is not None:
+            unsupported.append("pipeline_model_parallel_layout (incl. standalone MTP stages)")
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            unsupported.append("num_layers_in_first/last_pipeline_stage")
+        if (
+            self.mtp_num_layers is not None
+            and self.pipeline_model_parallel_size > 1
+            and (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+        ):
+            # With these splits the final-layernorm stage (which aggregates and
+            # consumes the depth sources) can differ from the post_process stage
+            # that runs MTP; the depth-source hand-off does not cross that
+            # boundary yet.
+            unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
+        if self.wide_residual is not None:
+            # Wide residual streams generalize the residual stream in their own way
+            # (ResidualConnection read/write sites); AttnRes intercepts the same sites.
+            unsupported.append("wide_residual")
+        if self.moe_shortcut_connection:
+            # ShortcutMoEBlock runs an attention + MoE pair as one execution unit and
+            # bypasses the per-entry residual interception of the hybrid stack.
+            unsupported.append("moe_shortcut_connection")
+        if self.is_hybrid_model:
+            if self.pipeline_model_parallel_size > 1:
+                if not self.hybrid_layer_pattern:
+                    raise ValueError(
+                        "enable_attention_residuals with a hybrid model and pipeline "
+                        "parallelism requires hybrid_layer_pattern (the pipeline payload "
+                        "widths derive from the pattern's '|' segmentation)."
+                    )
+                main_pattern = self.hybrid_layer_pattern.split('/')[0]
+                if '|' in main_pattern:
+                    num_segments = main_pattern.count('|') + 1
+                    expected_segments = self.pipeline_model_parallel_size * (
+                        self.virtual_pipeline_model_parallel_size or 1
+                    )
+                    if num_segments != expected_segments:
+                        unsupported.append(
+                            f"hybrid pattern with {num_segments} pipe segments != "
+                            f"pipeline_model_parallel_size x virtual_pipeline_model_parallel_size "
+                            f"= {expected_segments}"
+                        )
+        if unsupported:
+            raise ValueError(
+                "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
             )
 
     def __post_init__(self):
@@ -3869,6 +4134,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_simple_routing",
                     "dsa_indexer_k",
                     "dsa_selected_scores",
+                    "attn_res",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -4148,6 +4414,8 @@ class TransformerConfig(ModelParallelConfig):
                     f"152.5); got fine_grained_offloading_buffer_size_gib={buffer_size} "
                     f"({buffer_bytes} bytes)"
                 )
+
+        self._validate_attention_residuals()
 
         if self.fine_grained_activation_offloading:
             assert (

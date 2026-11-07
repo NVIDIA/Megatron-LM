@@ -27,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.hybrid_attention_residual import AttnResHybridLayer
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
@@ -40,6 +41,11 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention_residual import (
+    AttentionResidual,
+    AttnResStageSources,
+    attn_res_final_num_sources,
+)
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
@@ -65,7 +71,16 @@ from megatron.core.transformer.wide_residual import (
     wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+# ``AttnResHybridLayer`` lives in layers/hybrid_attention_residual.py; importing it here keeps
+# ``from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer`` working.
 
 
 @dataclass
@@ -110,6 +125,8 @@ class HybridStack(MegatronModule):
             ``layer_config_list`` must be provided.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
+        vp_stage (int, optional): the virtual pipeline stage of this segment. Consumed by
+            the attention-residual depth-source bookkeeping under interleaved VPP.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -132,6 +149,7 @@ class HybridStack(MegatronModule):
         pre_process: bool = True,
         layer_type_list: list[str] | None = None,
         pp_layer_offset: int = 0,
+        vp_stage: Optional[int] = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -177,6 +195,8 @@ class HybridStack(MegatronModule):
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
+        self.pp_layer_offset = pp_layer_offset
+        self.vp_stage = vp_stage
         uses_stack_cp_layout = getattr(self.config, "_linear_cp_layout_explicit", True)
         # MTP consumes the decoder readout and shifted-token embedding at hidden_size.
         # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
@@ -228,6 +248,25 @@ class HybridStack(MegatronModule):
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
+            )
+        if self.config.enable_attention_residuals:
+            # AttnRes owns the residual stream of every entry; the other residual-stream
+            # generalizations and the grouped shortcut execution unit bypass that ownership.
+            assert not self.config.enable_mhc_connections, (
+                "enable_attention_residuals and enable_mhc_connections / enable_hyper_connections "
+                "are mutually exclusive in HybridStack."
+            )
+            assert not self.config.moe_shortcut_connection, (
+                "enable_attention_residuals does not support moe_shortcut_connection: "
+                "ShortcutMoEBlock bypasses the per-entry residual interception."
+            )
+            assert (
+                not self.uses_wide_residual_stream
+            ), "enable_attention_residuals does not support wide_residual streams."
+            assert self._cp_layout_manager is None, (
+                "enable_attention_residuals does not support the per-layer CP layout manager "
+                "(explicit linear_cp_layout / attention_cp_layout): depth sources stay in the "
+                "stack boundary layout and would not follow per-layer layout conversions."
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -399,6 +438,12 @@ class HybridStack(MegatronModule):
                 )
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
+            if self.config.enable_attention_residuals:
+                # Same construction-time wrap precedent as mHC; checkpoint keys stay
+                # nested under ``inner_layer.``.
+                layer = AttnResHybridLayer(
+                    config=layer_config, layer=layer, is_mtp_layer=self.is_mtp_layer
+                )
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -433,6 +478,15 @@ class HybridStack(MegatronModule):
                     setattr(self.hc_head_fn, 'sequence_parallel', True)
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+        if self.config.enable_attention_residuals and self.post_process and not self.is_mtp_layer:
+            assert self.post_layer_norm, (
+                "Attention residuals in an outer hybrid stack require the final norm on the "
+                "post-process stage (the depth-source aggregation precedes it)."
+            )
+            # Final AttnRes output head: aggregates all depth sources plus the
+            # trailing partial block right before the final norm.
+            self.final_attn_res = AttentionResidual(self.config)
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -584,6 +638,7 @@ class HybridStack(MegatronModule):
         padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        attn_res_sources: Optional[Tuple[Tensor, ...]] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -601,8 +656,15 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
+            attn_res_sources: Fixed complete trunk depth-source tuple for an
+                AttnRes-enabled nested MTP stack. Outer stacks build this state
+                themselves and must not receive it.
         Returns:
-            Tensor: the output tensor.
+            Tensor in the common case. With MTP, an outer post-process stack may
+            return a 2-tuple whose second element is either the pre-contraction
+            mHC multi-stream tensor or the complete AttnRes trunk source tuple.
+            The two modes are mutually exclusive. Nested MTP stacks always
+            return only their updated partial tensor.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -659,6 +721,51 @@ class HybridStack(MegatronModule):
             hidden_states = expand_wide_residual_stream(
                 hidden_states, self.config.wide_residual.num_streams
             )
+
+        # Attention residuals: recover (depth sources, partial sum) for this stage.
+        # On the first stage the embedding output is the initial partial sum (it
+        # becomes depth source b_0 when entry 1 opens the first block); later
+        # stages unpack the seq-dim-concatenated payload from the previous stage.
+        # Under interleaved VPP the payload is a padded delta and the rest of
+        # the prefix comes from the rank-local source cache.
+        attn_res_state: Optional[AttnResStageSources] = None
+        if self.config.enable_attention_residuals:
+            if self.is_mtp_layer:
+                if attn_res_sources is None:
+                    raise RuntimeError(
+                        "An AttnRes-enabled nested MTP HybridStack requires the complete "
+                        "trunk attn_res_sources tuple."
+                    )
+                expected_num_sources = attn_res_final_num_sources(
+                    self.config.num_layers, self.config.attn_res_block_layers
+                )
+                assert len(attn_res_sources) == expected_num_sources, (
+                    f"nested MTP HybridStack expected {expected_num_sources} complete trunk "
+                    f"depth sources, got {len(attn_res_sources)}"
+                )
+            else:
+                assert attn_res_sources is None, (
+                    "Only a nested MTP HybridStack may receive attn_res_sources; outer "
+                    "HybridStack instances own their pipeline depth-source state."
+                )
+                current_microbatch = None
+                if self.config.virtual_pipeline_model_parallel_size is not None:
+                    current_microbatch = (
+                        getattr(self.layers[0], 'current_microbatch', None) if self.layers else None
+                    )
+                attn_res_state, hidden_states = AttnResStageSources.enter(
+                    self.config,
+                    hidden_states,
+                    layers_before=self.pp_layer_offset,
+                    pp_rank=(
+                        torch.distributed.get_rank(self.pp_group)
+                        if self.config.virtual_pipeline_model_parallel_size is not None
+                        else 0
+                    ),
+                    vp_stage=self.vp_stage,
+                    microbatch_id=current_microbatch,
+                    pre_process=self.pre_process,
+                )
 
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
@@ -818,7 +925,37 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
-                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                            if isinstance(layer, AttnResHybridLayer):
+                                if residual_stream_recompute_context is not None:
+                                    raise TypeError(
+                                        "'residual_stream' recomputation cannot be applied to "
+                                        "AttnResHybridLayer."
+                                    )
+                                if layer.attn_res_is_block_start:
+                                    # Block boundary: the completed partial sum becomes
+                                    # a depth source; the entry starts a fresh partial.
+                                    assert attn_res_state is not None
+                                    attn_res_state.append_block_start(hidden_states)
+                                if self.is_mtp_layer:
+                                    layer_attn_res_sources = attn_res_sources
+                                else:
+                                    assert attn_res_state is not None
+                                    layer_attn_res_sources = tuple(attn_res_state.graph_sources)
+                                layer_kwargs = dict(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    sequence_len_offset=sequence_len_offset,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=padding_mask,
+                                    input_ids=input_ids,
+                                    attn_res_sources=layer_attn_res_sources,
+                                )
+                                if layer_cp_metadata is not None:
+                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                                hidden_states = layer(**layer_kwargs)
+                            elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
@@ -946,6 +1083,29 @@ class HybridStack(MegatronModule):
                     .to(hidden_states.dtype)
                 )
 
+        mtp_attn_res_sources = None
+        if self.config.enable_attention_residuals and not self.is_mtp_layer:
+            assert attn_res_state is not None
+            # The network end is a block boundary: the trailing partial sum always
+            # holds the last (possibly incomplete) depth block and is never in the
+            # source list, so it must be aggregated (and shipped) alongside them.
+            if self.post_process:
+                attn_res_values = attn_res_state.exit_aggregate_values(hidden_states)
+                if (self.config.mtp_num_layers or 0) > 0:
+                    # MTP depths all consume the same immutable complete trunk
+                    # history. Preserve it before the trunk's final aggregation.
+                    mtp_attn_res_sources = tuple(attn_res_values)
+                nvtx_range_push(msg="attn_res.final_aggregate")
+                hidden_states = self.final_attn_res(attn_res_values)
+                nvtx_range_pop(msg="attn_res.final_aggregate")
+            else:
+                # Not the final stage: pack the pipeline payload (full prefix, or
+                # delta + padding under interleaved VPP), concatenated along the
+                # sequence dim.
+                nvtx_range_push(msg="attn_res.pack_payload")
+                hidden_states = attn_res_state.exit_pack(hidden_states)
+                nvtx_range_pop(msg="attn_res.pack_payload")
+
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
@@ -964,6 +1124,8 @@ class HybridStack(MegatronModule):
 
         if mhc_multistream is not None:
             return hidden_states, mhc_multistream
+        if mtp_attn_res_sources is not None:
+            return hidden_states, mtp_attn_res_sources
         return hidden_states
 
     def sharded_state_dict(

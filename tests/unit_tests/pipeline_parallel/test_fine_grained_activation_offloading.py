@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import importlib
 import logging
 import math
 import os
@@ -12,7 +13,10 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -342,6 +346,30 @@ def _offload_summary_groups(offload_modules):
     return groups
 
 
+def _enable_te_cpu_offload_v1(monkeypatch) -> None:
+    """Match the V1 CPU-offload launch Megatron requires for fine-grained offloading.
+
+    ``megatron/training/arguments.py`` insists on ``NVTE_CPU_OFFLOAD_V1=1`` with TE >= 2.10 so
+    that TE's ``is_cpu_offload_enabled()`` follows the V1 ``CPUOffloadEnabled`` flag toggled by
+    ``PipelineOffloadManager.__enter__``; without it TE builds its saved tensors for a run
+    without offloading (e.g. fused attention keeps the packed ``sbh3d`` q/k/v layout that the
+    reloaded tensors no longer satisfy). Tests that build ``TransformerConfig`` directly bypass
+    that check, and TE caches the flag at import time, so patch the cached module attributes
+    as well. No-op when the installed TE does not know the flag.
+    """
+    monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
+    for module_name in (
+        "transformer_engine.pytorch.cpu_offload",
+        "transformer_engine.pytorch.attention.dot_product_attention.backends",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "NVTE_CPU_OFFLOAD_V1"):
+            monkeypatch.setattr(module, "NVTE_CPU_OFFLOAD_V1", True)
+
+
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
 
@@ -666,8 +694,8 @@ def test_warmup_fraction_counts_every_group_per_module_and_keeps_view_metadata()
         torch.cuda.synchronize()
 
 
-def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
-    """Drive post_warmup_callback over a single hand-built chunk."""
+def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> PipelineOffloadManager:
+    """Drive post_warmup_callback over a single hand-built chunk and return the manager."""
     manager = PipelineOffloadManager.__new__(PipelineOffloadManager)
     manager._is_warmup = True
     manager._cached_chunks_forward = [chunk]
@@ -677,6 +705,7 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     manager._delta_offload_bytes_across_pp_ranks = 0
     manager._activation_offload_fraction = 1.0
     manager.post_warmup_callback()
+    return manager
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
@@ -732,7 +761,7 @@ def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkey
 
         monkeypatch.setattr(torch.distributed, "all_gather_object", counting_all_gather_object)
         with caplog.at_level(logging.WARNING, logger=off_module.__name__):
-            _run_post_warmup_callback(chunk)
+            manager = _run_post_warmup_callback(chunk)
 
         assert all_gather_object_calls == 1
 
@@ -750,6 +779,12 @@ def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkey
         # The duplicated offloading is diagnosed, not suppressed.
         assert groups[0].offload
         assert groups[0].total_tensor_count == len(views)
+        # The redundant bytes of the surviving group are cached per name next to
+        # the offload bytes so consumers can count each storage once.
+        assert manager.offload_summary_bytes == {"core_attn": groups[0].total_offload_bytes}
+        assert manager.offload_summary_duplicate_bytes == (
+            {"core_attn": storage_bytes} if rank == duplicate_rank else {}
+        )
     finally:
         Utils.destroy_model_parallel()
 
@@ -773,6 +808,48 @@ def test_bulk_offload_group_flags_disjoint_views_taking_the_whole_storage_path()
     assert group.total_offload_bytes == 2 * storage_bytes
     assert group.duplicate_storage_tensor_count == 1
     assert group.duplicate_storage_bytes == storage_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_group_flags_contiguous_whole_storage_aliases(monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+    base = torch.randn(1024, 512, device="cuda")
+    storage_bytes = base.numel() * base.element_size()
+    # Two autograd aliases of one contiguous storage (MLA's q/kv down projections
+    # both save the same hidden_states under qkv_linear) each copy the whole
+    # storage through the plain contiguous path. Neither is a strided view, yet
+    # the second copy is as redundant as a second whole-storage view copy.
+    aliases = (base.detach(), base.detach())
+    assert all(alias.is_contiguous() for alias in aliases)
+    # post_warmup_callback disables the last group of each name (offload margin),
+    # so build two same-named groups and assert on the surviving one.
+    groups = []
+    for group_idx in range(2):
+        group = OffloadTensorGroup("qkv_linear")
+        for tensor_idx, alias in enumerate(aliases):
+            group.push_tensor((group_idx, tensor_idx), alias)
+        groups.append(group)
+
+    chunk = _make_warmup_chunk(groups)
+    for group in groups:
+        chunk.bulk_offload_group(group)
+    torch.cuda.synchronize()
+
+    for group in groups:
+        assert all(state[3] is None for state in group._tensors.values())
+        assert group.total_offload_bytes == 2 * storage_bytes
+        assert group.duplicate_storage_tensor_count == 1
+        assert group.duplicate_storage_bytes == storage_bytes
+
+    # Diagnosed, not suppressed: both copies stay in the summary, and the
+    # redundant bytes are cached per group so the GPU saving (one storage) can
+    # be derived from it.
+    monkeypatch.setattr(off_module, "print_offload_summary_table", lambda *args, **kwargs: None)
+    manager = _run_post_warmup_callback(chunk)
+    assert groups[0].offload and not groups[1].offload
+    assert manager.offload_summary_bytes == {"qkv_linear": 2 * storage_bytes}
+    assert manager.offload_summary_duplicate_bytes == {"qkv_linear": storage_bytes}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
@@ -892,12 +969,23 @@ def _build_gpt_model(
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
     mhc_recompute_layer_num: Optional[int] = None,
+    enable_attention_residuals: bool = False,
+    attn_res_block_layers: int = 2,
+    attn_res_impl: str = "eager",
+    mtp_num_layers: Optional[int] = None,
+    use_transformer_engine_op_fuser: bool = False,
+    recompute_modules: Optional[List[str]] = None,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
-    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    if recompute_modules is None:
+        recompute_modules = ["layernorm"]
+        if num_experts is not None and not use_transformer_engine_op_fuser:
+            recompute_modules.append("moe_act")
+    else:
+        recompute_modules = list(recompute_modules)
     if enable_hyper_connections and mhc_recompute_layer_num is not None:
         recompute_modules.append("mhc")
     transformer_config = ConfigClass(
@@ -911,30 +999,61 @@ def _build_gpt_model(
         params_dtype=torch.bfloat16,
         # Recompute
         recompute_modules=recompute_modules,
-        recompute_granularity="selective",
+        recompute_granularity="selective" if recompute_modules else None,
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
+        gated_linear_unit=use_transformer_engine_op_fuser,
+        # The TE operation-fuser GroupedLinear reduces its bias gradients with fp32 atomic
+        # adds across row splits (TE refuses that kernel under NVTE_ALLOW_NONDETERMINISTIC_ALGO=0),
+        # so two otherwise identical runs can round a BF16 bias gradient to neighbouring values
+        # (one BF16 ulp is 0.25 at |grad| ~ 40, far above this test's 1e-3 tolerance). Keep the
+        # op-fuser model bias-free so the baseline-vs-offload comparison below only sees the
+        # deterministic GEMMs; biases are parameters, not activations, so the offload boundary
+        # under test is unchanged.
+        add_bias_linear=not use_transformer_engine_op_fuser,
+        activation_func=(
+            torch.nn.functional.silu
+            if use_transformer_engine_op_fuser
+            else torch.nn.functional.gelu
+        ),
         # Fine-grained activation offloading
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
         activation_offload_fraction=activation_offload_fraction,
         fine_grained_offloading_buffer_size_gib=fine_grained_offloading_buffer_size_gib,
+        use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
         # Hyper Connection settings
         enable_hyper_connections=enable_hyper_connections,
         num_residual_streams=num_residual_streams,
         mhc_recompute_layer_num=mhc_recompute_layer_num,
+        # Attention Residual settings
+        enable_attention_residuals=enable_attention_residuals,
+        attn_res_block_layers=attn_res_block_layers if enable_attention_residuals else None,
+        attn_res_impl=attn_res_impl,
+        mtp_num_layers=mtp_num_layers,
+    )
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=num_experts,
+        moe_grouped_gemm=num_experts is not None,
+        multi_latent_attention=is_mla,
+        qk_layernorm=qk_layernorm and not is_mla,
+        use_te_op_fuser=use_transformer_engine_op_fuser,
+        enable_hyper_connection=enable_hyper_connections,
+        enable_attention_residual=enable_attention_residuals,
+    )
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(
+            config=transformer_config, spec=transformer_layer_spec, use_transformer_engine=True
+        )
+        if mtp_num_layers is not None
+        else None
     )
     gpt_model = GPTModel(
         config=transformer_config,
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_experts,
-            moe_grouped_gemm=num_experts is not None,
-            multi_latent_attention=is_mla,
-            qk_layernorm=qk_layernorm and not is_mla,
-            enable_hyper_connection=enable_hyper_connections,
-        ),
+        transformer_layer_spec=transformer_layer_spec,
+        mtp_block_spec=mtp_block_spec,
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
     ).bfloat16()
@@ -1299,23 +1418,159 @@ def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attentio
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules, activation_offload_fraction, buffer_size_gib",
+    "is_moe, is_mla, offload_modules, activation_offload_fraction, buffer_size_gib, "
+    "enable_attention_residuals, attn_res_impl, mtp_num_layers, recompute_modules",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"], 1.0, 0.0),
-        (True, False, ["qkv_linear"], 1.0, 0.0),
-        (True, False, ["core_attn"], 1.0, 0.0),
+        (False, True, ["attn_norm"], 1.0, 0.0, False, "eager", None, None),
+        (True, False, ["qkv_linear"], 1.0, 0.0, False, "eager", None, None),
+        (True, False, ["core_attn"], 1.0, 0.0, False, "eager", None, None),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"], 1.0, 0.0),
-        (True, False, ["mlp_norm"], 1.0, 0.0),
-        (True, False, ["expert_fc1"], 1.0, 0.0),
-        (True, False, ["moe_act"], 1.0, 0.0),
+        (True, True, ["core_attn", "attn_proj"], 1.0, 0.0, False, "eager", None, None),
+        (True, False, ["mlp_norm"], 1.0, 0.0, False, "eager", None, None),
+        (True, False, ["expert_fc1"], 1.0, 0.0, False, "eager", None, None),
+        (True, False, ["moe_act"], 1.0, 0.0, False, "eager", None, None),
         # One eager partial-offload case across attention and MoE groups.
-        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 0.5, 0.0),
+        (
+            True,
+            False,
+            ["core_attn", "attn_proj", "expert_fc1"],
+            0.5,
+            0.0,
+            False,
+            "eager",
+            None,
+            None,
+        ),
         # Non-power-of-two pinned storage with fixed and variable activation shapes.
-        (False, True, ["attn_norm"], 1.0, 1.5),
-        (True, False, ["moe_act"], 1.0, 1.5),
-        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 1.0, 1.5),
+        (False, True, ["attn_norm"], 1.0, 1.5, False, "eager", None, None),
+        (True, False, ["moe_act"], 1.0, 1.5, False, "eager", None, None),
+        (
+            True,
+            False,
+            ["core_attn", "attn_proj", "expert_fc1"],
+            1.0,
+            1.5,
+            False,
+            "eager",
+            None,
+            None,
+        ),
+        # Attention Residuals with every non-fused offload boundary enabled together.
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            1.0,
+            0.0,
+            True,
+            "eager",
+            None,
+            [],
+            id="attnres-all-non-fused-eager",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            1.0,
+            0.0,
+            True,
+            "compile",
+            None,
+            [],
+            id="attnres-all-non-fused-compile",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            1.0,
+            0.0,
+            True,
+            "fla",
+            None,
+            [],
+            id="attnres-all-non-fused-fla",
+        ),
+        # The whole fused grouped MLP boundary is mutually exclusive with expert_fc1/moe_act.
+        pytest.param(
+            True,
+            False,
+            ["fused_group_mlp"],
+            1.0,
+            0.0,
+            True,
+            "fla",
+            None,
+            [],
+            id="attnres-fused-group-mlp",
+        ),
+        # Two MTP depths exercise the longer-lived trunk source tuple with all non-fused groups.
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            1.0,
+            0.0,
+            True,
+            "eager",
+            2,
+            ["layernorm", "moe_act"],
+            id="attnres-mtp2-all-non-fused",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            1.0,
+            0.0,
+            True,
+            "fla",
+            None,
+            ["layernorm", "moe_act"],
+            id="attnres-all-non-fused-selective-recompute",
+        ),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
@@ -1324,6 +1579,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     offload_modules: List[str],
     activation_offload_fraction: float,
     buffer_size_gib: float,
+    enable_attention_residuals: bool,
+    attn_res_impl: str,
+    mtp_num_layers: Optional[int],
+    recompute_modules: Optional[List[str]],
+    monkeypatch,
 ):
     """
     Initialize a GPTModel and verify:
@@ -1331,11 +1591,18 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     - backward gradient correctness (subset)
     - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
     """
+    if attn_res_impl == "fla":
+        from megatron.core.transformer.attention_residual import _get_fla_fused_attnres
+
+        if _get_fla_fused_attnres() is None:
+            pytest.skip("FLA fused AttnRes is not installed")
+
     # setup distributed/model-parallel (same pattern as other UTs)
     os.environ.pop("NVTE_FUSED_ATTN", None)
     os.environ.pop("NVTE_FLASH_ATTN", None)
     os.environ.pop("NVTE_UNFUSED_ATTN", None)
     # os.environ["NVTE_FLASH_ATTN"] = "1"
+    _enable_te_cpu_offload_v1(monkeypatch)
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     seed = 123
@@ -1348,6 +1615,15 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     seq_length = 1024
     micro_batch_size = 2
     device = torch.device("cuda")
+    use_transformer_engine_op_fuser = "fused_group_mlp" in offload_modules
+    if use_transformer_engine_op_fuser:
+        if not is_te_min_version("2.14.0"):
+            pytest.skip("TE operation fuser requires transformer-engine>=2.14.0")
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("Installed Transformer Engine does not provide the operation-fuser API")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
     input_ids, position_ids, attention_mask = _make_gpt_inputs(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
@@ -1356,6 +1632,22 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
     off_interface.reset_instance()
+
+    # Shape-level record of what the qkv_linear group offloads during warm-up,
+    # taken before bulk_offload_group replaces the group's tensors by CPU states.
+    qkv_linear_offloaded_shapes = set()
+    real_bulk_offload_group = off.ChunkOffloadHandler.bulk_offload_group
+
+    def spying_bulk_offload_group(handler, group_to_offload):
+        if handler.is_warmup and group_to_offload._name == "qkv_linear":
+            for tensor in group_to_offload._tensors.values():
+                if isinstance(tensor, torch.Tensor) and handler.tensor_need_offloading_checker(
+                    tensor
+                ):
+                    qkv_linear_offloaded_shapes.add(tuple(tensor.shape))
+        return real_bulk_offload_group(handler, group_to_offload)
+
+    monkeypatch.setattr(off.ChunkOffloadHandler, "bulk_offload_group", spying_bulk_offload_group)
 
     try:
         # 1) Baseline run (no offloading)
@@ -1372,6 +1664,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
+            mtp_num_layers=mtp_num_layers,
+            use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            recompute_modules=recompute_modules,
         ).cuda()
         base_model.train()
         base_params = _capture_params(base_model)
@@ -1411,6 +1708,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             is_mla=is_mla,
             activation_offload_fraction=activation_offload_fraction,
             fine_grained_offloading_buffer_size_gib=buffer_size_gib,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
+            mtp_num_layers=mtp_num_layers,
+            use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            recompute_modules=recompute_modules,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -1431,6 +1733,45 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
+        # The summary records GroupedMLP's expert_fc1 + moe_act pair under the single
+        # "fused_group_mlp" group, so check the recorded group names, not the request.
+        for module in _offload_summary_groups(offload_modules):
+            if (
+                enable_attention_residuals
+                and module == "qkv_linear"
+                and "layernorm" in off_model.config.recompute_modules
+            ):
+                # AttnRes uses an explicit norm: checkpointing its output makes
+                # the QKV input [s, b, h] recompute-owned rather than
+                # offload-owned, so that shape must not be among the group's
+                # offloads. MLA still legitimately offloads its own saved
+                # activations in this group (the down-projected latents
+                # [s, b, lora_rank] and the RoPE tables [s, 1, 1, rotary_dim]),
+                # so its byte count is > 0 while a plain QKV linear saves only
+                # the recompute-owned input and records 0.
+                assert (
+                    seq_length,
+                    micro_batch_size,
+                    hidden_size,
+                ) not in qkv_linear_offloaded_shapes, (
+                    f"qkv_linear offloaded the recompute-owned QKV input: "
+                    f"{sorted(qkv_linear_offloaded_shapes)}"
+                )
+                if is_mla:
+                    assert mgr.offload_summary_bytes.get(module, 0) > 0, (
+                        f"Expected MLA {module} to offload its latents/RoPE tables, got "
+                        f"{mgr.offload_summary_bytes.get(module, 0)} bytes"
+                    )
+                else:
+                    assert mgr.offload_summary_bytes.get(module, 0) == 0
+                continue
+            assert mgr.offload_summary_bytes.get(module, 0) > 0, (
+                f"Expected {module} to offload at least one activation, got "
+                f"{mgr.offload_summary_bytes.get(module, 0)} bytes"
+            )
+        # A storage copied twice within one group (MLA's q/kv down projections both
+        # save hidden_states) frees GPU memory only once, so expect the per-storage
+        # saving.
         expected_offload_bytes = _expected_unique_offload_bytes(
             mgr, _offload_summary_groups(offload_modules)
         )

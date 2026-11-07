@@ -186,6 +186,7 @@ Offloading and recomputation are complementary:
 |---|---|
 | PP / Interleaved PP / PP=1 | Yes |
 | Fine-grained recomputation | Yes |
+| Attention Residuals | Attention scopes are supported; broader module coverage is experimental and awaits the offloading follow-up validation matrix |
 | FP8 training | Yes |
 | MTP (Multi-Token Prediction) | Yes |
 | Mixed dense & MoE layers | Yes |
@@ -203,6 +204,11 @@ The implementation consists of three layers:
 1. **`PipelineOffloadManager`** (singleton): Global coordinator that manages CUDA streams, CPU tensor pools, and chunk lifecycle across pipeline stages.
 2. **`ChunkOffloadHandler`**: Per-microbatch handler that tracks tensor groups, executes D2H/H2D transfers, and decides which groups to actually offload.
 3. **`FineGrainedActivationOffloadingInterface`**: Lightweight interface used by transformer modules (attention, MoE, etc.) to mark offload boundaries.
+
+Attention Residuals keeps its running partial sum separate from the aggregated input consumed by
+the attention/MLP norm. Norm offload groups therefore release and reload the aggregated norm input,
+while the partial sum remains owned by the AttnRes depth graph. The remaining attention and expert
+boundaries use the same module-local offload interfaces as a standard transformer layer.
 
 ### Offload/Reload Flow
 
