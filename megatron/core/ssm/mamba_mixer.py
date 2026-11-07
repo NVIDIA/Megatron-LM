@@ -132,6 +132,28 @@ class ExtendedRMSNorm(RMSNormGated):
 
 
 @dataclass
+class MambaInferenceParamCache:
+    """FP32 copies of the mixer parameters that inference reads at every step.
+
+    Allocated in ``MambaMixer.__init__`` (outside any later CUDA-graph capture) so the
+    addresses live in the default memory pool and stay valid across every graph capture
+    and replay, including across RL train/eval cycles. Never freed: a few KB per layer.
+    ``MambaMixer.refresh_cache`` refills them in place from the parameters; ``stale`` marks
+    that a refill is due (after training, a refit or a dtype conversion).
+    """
+
+    A_neg_exp: torch.Tensor
+    """``-exp(A_log.float())``, [nheads]: decode and batch-invariant decode."""
+    conv_weight: torch.Tensor
+    """The conv1d weight as ``[conv_dim, d_conv]`` in FP32, for FP32 conv states."""
+    conv_bias: torch.Tensor
+    """The conv1d bias in FP32, for FP32 conv states."""
+    dt_bias: Optional[torch.Tensor]
+    """``dt_bias.float()``, [nheads]; only allocated in batch-invariant mode."""
+    stale: bool = True
+
+
+@dataclass
 class MambaMixerSubmodules:
     """
     Contains the module specs for the input and output linear layers.
@@ -416,14 +438,18 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
-            # Persistent inference cache for -exp(A_log.float()). Allocated
-            # here (outside any later CUDA-graph capture) so its address
-            # lives in the default memory pool and stays valid across every
-            # graph capture and replay, including across RL train/eval
-            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
-            # layer (a few KB across a full model).
-            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
-            self._A_neg_exp_cache_stale = True
+            # Persistent FP32 inference caches (see MambaInferenceParamCache).
+            device = torch.cuda.current_device()
+            self._inference_cache = MambaInferenceParamCache(
+                A_neg_exp=torch.empty_like(A_log, dtype=torch.float32),
+                conv_weight=torch.empty(conv_dim, d_conv, dtype=torch.float32, device=device),
+                conv_bias=torch.empty(conv_dim, dtype=torch.float32, device=device),
+                dt_bias=(
+                    torch.empty(self.nheads_local_tp, dtype=torch.float32, device=device)
+                    if config.batch_invariant_mode
+                    else None
+                ),
+            )
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -906,8 +932,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         conv_state_dtype = conv_state.dtype
 
         xBC = xBC.to(conv_state_dtype)
-        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w").to(conv_state_dtype)
-        conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
+        conv_weight, conv_bias = self._get_conv_params(
+            self.cp.get_conv1d_weight(), self.cp.get_conv1d_bias(), conv_state_dtype
+        )
 
         xBC_pre_conv = xBC if intermediate_conv_out is not None else None
         from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
@@ -1091,9 +1118,54 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
     @torch.no_grad()
     def refresh_cache(self) -> None:
-        """Refresh the existing decode-cache storage from the current ``A_log``."""
-        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
-        self._A_neg_exp_cache_stale = False
+        """Refresh the inference caches in place from the current parameters."""
+        cache = self._inference_cache
+        cache.A_neg_exp.copy_(-torch.exp(self.A_log.float()))
+        cache.conv_weight.copy_(rearrange(self.conv1d_weight, "d 1 w -> d w").float())
+        cache.conv_bias.copy_(self.conv1d_bias.float())
+        if cache.dt_bias is not None:
+            cache.dt_bias.copy_(self.dt_bias.float())
+        cache.stale = False
+
+    def _fresh_inference_cache(self) -> MambaInferenceParamCache:
+        """The inference caches, refreshed first if stale."""
+        if self._inference_cache.stale:
+            self.refresh_cache()
+        return self._inference_cache
+
+    def _use_inference_param_caches(self) -> bool:
+        """Whether this forward may read the parameter-derived inference caches."""
+        return not self.training and not torch.is_grad_enabled() and self.cp.cp_size == 1
+
+    def _get_conv_params(
+        self, weight: torch.Tensor, bias: torch.Tensor, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Conv ``weight`` as ``(d, w)`` and ``bias``, both in ``dtype``, for the conv kernels.
+
+        When FP32 is requested for lower-precision parameters (FP32 conv states), the values
+        come from caches refreshed with the A cache, bitwise the per-step casts. Otherwise,
+        and in training, grad mode or context parallelism, the given tensors are cast per call.
+        """
+        if (
+            dtype == torch.float32
+            and weight.dtype != torch.float32
+            and self._use_inference_param_caches()
+        ):
+            cache = self._fresh_inference_cache()
+            return cache.conv_weight, cache.conv_bias
+        return rearrange(weight, "d 1 w -> d w").to(dtype), bias.to(dtype)
+
+    def _get_batch_invariant_decode_params(self) -> Optional[MambaInferenceParamCache]:
+        """The refreshed inference caches for batch-invariant decode, or None.
+
+        Batch-invariant decode reads ``A_neg_exp`` and ``dt_bias``, exactly
+        ``-exp(A_log.float())`` and ``dt_bias.float()``. None where the per-step computation
+        must be kept (training, grad mode, context parallelism) or outside batch-invariant
+        mode (no ``dt_bias`` cache).
+        """
+        if self._inference_cache.dt_bias is None or not self._use_inference_param_caches():
+            return None
+        return self._fresh_inference_cache()
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
@@ -1107,9 +1179,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             base = -torch.exp(self.A_log.float())
             return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
         # Inference path. Refill when stale
-        if self._A_neg_exp_cache_stale:
-            self.refresh_cache()
-        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        a_neg_exp = self._fresh_inference_cache().A_neg_exp
+        return a_neg_exp.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
     def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
         """Batch-invariant decode adapter, created on first use."""
@@ -1117,11 +1188,25 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
         return self._batch_invariant_decoder
 
+    def _apply(self, fn, recurse=True):
+        """Parameter conversions such as ``bfloat16()`` invalidate the inference caches.
+
+        The caches are plain tensors, so the conversion leaves them as they were. In eval
+        mode they are refreshed right away, because CUDA graph replay bypasses the lazy
+        refresh; in training mode they are refreshed at the next ``eval()``.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        if hasattr(self, "_inference_cache"):
+            self._inference_cache.stale = True
+            if not self.training and self.A_log.device.type != "meta":
+                self.refresh_cache()
+        return result
+
     def train(self, mode: bool = True):
         """Mark the decode cache stale in training and refresh it for evaluation."""
         if mode:
-            self._A_neg_exp_cache_stale = True
-        elif self._A_neg_exp_cache_stale:
+            self._inference_cache.stale = True
+        elif self._inference_cache.stale:
             # CUDA graph replay bypasses the Python lazy-refresh path.
             self.refresh_cache()
         return super().train(mode)
@@ -1181,11 +1266,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             ), "Batch-invariant Mamba decode requires int32 dynamic-batching indices"
 
             xBC_dtype = xBC.dtype
+            conv_weight, conv_bias = self._get_conv_params(
+                self.conv1d_weight, self.conv1d_bias, conv_state.dtype
+            )
             xBC = causal_conv1d_update_cuda(
                 xBC.to(conv_state.dtype).squeeze(1),
                 conv_state,
-                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
-                self.conv1d_bias.to(conv_state.dtype),
+                conv_weight,
+                conv_bias,
                 self.activation,
                 conv_state_indices=batch_indices,
             ).unsqueeze(1)
@@ -1206,11 +1294,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
             # back to the original dtype
             xBC_dtype = xBC.dtype
+            conv_weight, conv_bias = self._get_conv_params(
+                self.conv1d_weight, self.conv1d_bias, conv_state.dtype
+            )
             xBC = causal_conv1d_update(
                 xBC.to(conv_state.dtype),
                 conv_state,
-                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
-                self.conv1d_bias.to(conv_state.dtype),
+                conv_weight,
+                conv_bias,
                 self.activation,
                 conv_state_indices=batch_indices,
                 intermediate_conv_states=intermediate_conv_state,

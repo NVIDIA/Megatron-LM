@@ -164,6 +164,19 @@ def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
         layer(torch.zeros(2, 4), weight=weight)
 
 
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_column_parallel_linear_forward_output_dtype_override(output_dtype):
+    """A per-call `output_dtype` replaces the constructor's for that call; None keeps it."""
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    layer.output_dtype = torch.bfloat16
+    seen = {}
+    layer._forward_impl = lambda **kwargs: seen.update(kwargs) or kwargs["input"]
+
+    layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), output_dtype=output_dtype)
+
+    assert seen["output_dtype"] is (torch.bfloat16 if output_dtype is None else output_dtype)
+
+
 @pytest.mark.parametrize(
     "inference_optimized,inference_active,expected",
     [(True, True, "inference"), (True, False, "default"), (False, True, "default")],

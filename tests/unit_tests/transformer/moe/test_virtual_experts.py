@@ -106,52 +106,11 @@ def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
 
 
 @pytest.fixture
-def grouped_mlp_fusions(monkeypatch, virtual_expert_environment):
-    """Refresh TE fusion support after setting this test's environment."""
-    from transformer_engine.pytorch.ops.fused import grouped_mlp
-    from transformer_engine.pytorch.ops.fuser import (
-        OperationFuser,
-        register_forward_backward_fusion,
-    )
-
-    # TE caches capability checks and registers these fusions at import time.
-    # Refresh the checks under this test's settings; preserve the original registry.
-    checks = (
-        grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
-        grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
-        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
-    )
-    for check in checks:
-        check.cache_clear()
-    monkeypatch.setattr(
-        OperationFuser,
-        "forward_backward_fusion_functions",
-        list(OperationFuser.forward_backward_fusion_functions),
-    )
-    try:
-        for cls, name, legacy_name in (
-            (grouped_mlp.GroupedMLP_CuTeGEMMGLU, "fuse_glu_ops", "fuse_ops"),
-            (grouped_mlp.GroupedMLP_CuTeGEMMUnary, "fuse_unary_activation_ops", "fuse_srelu_ops"),
-        ):
-            fuse = getattr(grouped_mlp, name, None)
-            if fuse is None:
-                fuse = getattr(grouped_mlp, legacy_name)
-            if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
-                register_forward_backward_fusion(fuse, prepend=True)
-        yield grouped_mlp
-    finally:
-        for check in checks:
-            check.cache_clear()
-
-
-@pytest.fixture
-def mxfp8_grouped_mlp(grouped_mlp_fusions):
+def mxfp8_grouped_mlp(request):
     """Require real Blackwell fused kernels for MXFP8 numerical comparisons."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 requires Blackwell")
-    assert (
-        grouped_mlp_fusions.GroupedMLP_CuTeGEMMUnary.is_supported()
-    ), "MXFP8 parity requires TE's fused SReLU kernels and a compatible cuDNN frontend"
+    request.getfixturevalue("require_te_fused_srelu_mlp")
 
 
 @pytest.fixture
@@ -428,9 +387,8 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             fp8_recipe='mxfp8',
             fp8_param=True,
             moe_router_padding_for_quantization=True,
-            # Fused FP8 EGTP backward requires native FP8 weights when re-gathering.
-            # The op fuser does not honor the BF16 override's execution policy yet;
-            # keep that MTP parameter-storage override in the unsharded-expert case.
+            # Cover mixed BF16/MXFP8 experts without EGTP and joint MXFP8 fusion with EGTP.
+            # BF16 MTP experts retain the op-fuser path; TE selects their kernel implementation.
             quant_recipe=recipe if egtp_size == 1 else None,
             mtp_num_layers=2,
             mtp_use_repeated_layer=True,
@@ -507,7 +465,11 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                 assert is_mxfp8tensor(layer.experts.linear_fc1.weight0) == (
                     egtp_size > 1 or 'mtp' not in name
                 )
+                assert layer.experts._with_fused_impl
                 for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
+                    assert linear.will_execute_quantized(True) == (
+                        egtp_size > 1 or 'mtp' not in name
+                    )
                     for weight in linear.parameters():
                         assert getattr(weight, 'is_gtp_weight_remat', False) == (egtp_size > 1)
                         assert (
@@ -521,7 +483,6 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                     dispatch = manager.plan_dispatch
 
                     expected_alignment = moe_utils.get_align_size_for_quantization(layer.config)
-                    assert layer.experts._with_fused_impl == (egtp_size > 1 or 'mtp' not in name)
 
                     def record(
                         *args,
@@ -560,14 +521,13 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                 if virtual:
                     managers = [layer.token_dispatcher._comm_manager for _, layer in experts]
                     assert len({id(manager.planner) for manager in managers}) == 1
-                    for (_, layer), manager in zip(experts, managers):
+                    for (name, layer), manager in zip(experts, managers):
                         assert manager.pad_multiple == manager._alignment
                         assert (manager.tokens_per_expert % manager._alignment == 0).all()
                         assert manager.tokens_per_expert.sum() <= manager.rank_capacity
-                        assert (
-                            layer.experts._fused_ops is not None
-                        ) == layer.experts._with_fused_impl
-                        if layer.experts._with_fused_impl:
+                        assert layer.experts._fused_ops is not None
+                        # Retain MXFP8 fusion coverage; BF16 kernel selection belongs to TE.
+                        if egtp_size > 1 or 'mtp' not in name:
                             (sequence,) = layer.experts._fused_ops
                             assert any(
                                 type(op).__name__ == 'GroupedMLP_CuTeGEMMUnary'
