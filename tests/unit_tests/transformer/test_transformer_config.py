@@ -134,6 +134,37 @@ def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int
         _make_overlap_config(mtp_num_layers)
 
 
+@pytest.mark.parametrize("arch", [9, 10])
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+def test_batch_invariant_multimem_collective_is_rejected_on_hopper(monkeypatch, arch, collective):
+    # The NVLS in-switch reduction of "multimem" may not be batch-invariant on Hopper
+    # (NVIDIA/nccl#2360), so only "ordered" is accepted there. The device is faked: CPU only.
+    from megatron.core.transformer.enums import AttnBackend
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (arch, 0))
+
+    def build():
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=3,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_collective=collective,
+        )
+
+    if arch == 9 and collective == "multimem":
+        with pytest.raises(ValueError, match="'multimem' is not supported on Hopper"):
+            build()
+    else:
+        assert build().batch_invariant_collective == collective
+
+
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
     # Programmatic construction bypasses argparse's Literal choices, so
     # __post_init__ must catch typos before model init.

@@ -279,10 +279,13 @@ def _unpermute_loop(
     #   accumulates in fp64 with unit weights -> mirror in fp64, round each
     #   rank partial to fp32 (the engine stores fp32 partials into the RSV
     #   buffer before the collective).
-    # - The cross-rank stage matches the configured collective: "multimem"
-    #   returns the correctly-rounded exact fp32 sum of the partials (mirror =
-    #   fp64 accumulate, single final rounding); "ordered" is an ascending
-    #   rank-order fp32 chain.
+    # - The cross-rank stage matches the configured collective: "ordered" is an
+    #   ascending rank-order fp32 chain; "multimem" is mirrored as the correctly
+    #   rounded fp32 sum of the partials (fp64 accumulate, single final
+    #   rounding). The in-switch sum returned exactly that on B200 and on GB200
+    #   at 2 and 4 GPUs (larger NVLink domains are unmeasured). "multimem" is
+    #   rejected on Hopper, where the in-switch sum is not correctly rounded at 4
+    #   or more GPUs.
     within_rank_fp64 = probs is None
     cross_rank_fp64 = get_batch_invariant_collective() == "multimem"
     acc_dtype = torch.float64 if cross_rank_fp64 else torch.float32
