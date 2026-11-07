@@ -10,7 +10,6 @@ import torch
 from megatron.core.dist_checkpointing import load_common_state_dict
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
@@ -20,6 +19,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
 )
+from megatron.training.config.utils import serialize_value
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
@@ -74,7 +74,7 @@ def _assert_saved_config(ckpt_dir, run_config, checkpoint):
     loaded_config = read_run_config(run_config_filename)
     assert loaded_config["train"]["global_batch_size"] == 8
     # The saved checkpoint section describes the policy of this save.
-    assert loaded_config["checkpoint"] == run_config._convert_value_to_dict(checkpoint)
+    assert loaded_config["checkpoint"] == serialize_value(checkpoint)
     return loaded_config
 
 
@@ -204,7 +204,7 @@ def test_save_with_explicit_values_records_the_policy_of_the_save(
             get_checkpoint_run_config_filename(str(save_dir / "converted" / "iter_0000123"))
         )
         assert loaded["checkpoint"] == {
-            **run_config._convert_value_to_dict(registered),
+            **serialize_value(registered),
             "ckpt_format": "torch",
             "save": converted_dir,
         }
