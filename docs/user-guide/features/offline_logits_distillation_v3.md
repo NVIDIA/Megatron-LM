@@ -26,6 +26,9 @@ omit it only when intentionally collecting targets while training the teacher.
 and each flush writes one inputs tar and one targets tar per teacher DP rank.
 Teacher batch-size ramp-up, `--iterations-to-skip` (including iterations added from
 `--result-rejected-tracker-filename`), and `--allow-ambiguous-pad-tokens` are rejected.
+A frozen teacher must score deterministically: it still runs in train mode, so set
+`--hidden-dropout 0 --attention-dropout 0` (both default to 0.1); MoE input jitter and
+token dropping (`--moe-expert-capacity-factor`, `--moe-token-dropping`) are rejected too.
 
 A frozen teacher resumes from what the cache has actually published, not from its
 progress tracker, so a failed or interrupted flush never leaves a resubmitted job past
@@ -58,9 +61,10 @@ exits before running a step. Without `--override-ckpt-iteration`, a job is the c
 single sequential writer and `--exit-interval` keeps its usual periodic meaning (for
 example, to requeue every N iterations).
 
-Every tar records the cache settings. A teacher checks them against an existing tar at
-startup, and students check every tar before using its data, so a job launched with
-different settings is detected rather than silently mixed in.
+Every tar records the cache settings (see [Metadata](#metadata)). A teacher checks them
+against an existing tar at startup, and students check every tar before using its data:
+a tar whose required settings differ is rejected, and differences in recorded settings
+(teacher, data, split, seed, sample budget, ...) are reported by name but don't block.
 
 ## Loading
 
@@ -87,7 +91,7 @@ Use the same tokenizer as the teacher (checked by fingerprint, see
 need not equal the teacher's. Target entries whose index is beyond the student vocabulary
 (teacher padding rows) are masked into the ghost bucket, counted, and reported when they
 exceed 0.01% of entries. Stored labels, loss weights and positions are replayed exactly.
-Dataset identity is provenance rather than a student alignment constraint;
+The teacher's dataset settings are recorded rather than checked against the student;
 `--logits-load-ignore-hash` is unnecessary for V3. Member checksums and pairing identities
 are always checked; `--logits-load-ignore-errors` is rejected.
 
@@ -142,17 +146,19 @@ Dumps store no padding (see [Stored records](#stored-records)); the student lays
 sample out again for its own configuration. Only CP rank 0 of each data-parallel replica
 reads storage; it maps targets for every CP rank and scatters them.
 
-- Non-packed samples keep their prefix up to the student sequence length (prefix
-  shortening) and pad the tail; the student length cannot exceed the teacher's.
-  Shortening requires a `prefix_stable` cache (see the contract below). A sample whose
-  supervised tokens all lie beyond the student length trains on nothing; the first one is
-  reported and the rest are counted.
+Lengths are checked per sample, not against the producer's recorded `seq_length` or
+`padding_divisor`:
+
+- Non-packed samples pad their tail to the student sequence length. A longer sample
+  keeps its prefix (prefix shortening), which requires a `prefix_stable` cache (see
+  [Metadata](#metadata)); otherwise it is an error naming the sample. A sample whose
+  supervised tokens all lie beyond the student length trains on nothing; the first one
+  is reported and the rest are counted.
 - Packed samples (`isolated_segments`) pad each segment to the student's own SFT divisor
   (`2·CP` when CP > 1, times TP with sequence parallelism) and extend the last segment to
-  the student sequence length, as Megatron SFT does. The student divisor must divide the
-  cache's `padding_divisor`, which guarantees every pack still fits; a smaller divisor
-  yields less padding than the teacher used. A packed student sequence length may exceed
-  the teacher's but not fall below it.
+  the student sequence length, as Megatron SFT does. A pack that no longer fits is an
+  error naming the sample, except a single segment, which is prefix-shortened like a
+  non-packed sample.
 
 Replay cannot recover tokens discarded by the teacher's dataset builder. Changing TP or PP
 also requires a compatible model checkpoint and Megatron configuration.
@@ -195,33 +201,48 @@ identically in every implementation.
 ### Metadata
 
 ```json
-{"format_version": 3, "producer": "megatron",
+{"format_version": 3,
  "kind": "inputs", "dp_rank": 0, "range": [0, 51200], "generation": "<job id>",
  "contract": {...},
+ "recorded": {...},
  "provenance": {...}}
 ```
 
-`contract` must be identical across every tar of a cache, whichever producer wrote it:
+Every tar stores its inputs next to its targets, so a tar is self-consistent on its own.
+Only settings that change how a reader interprets a tar are required (`contract`); they
+must be identical across every tar of a cache, whichever producer wrote it, and a
+mismatch is an error:
 
-| Contract key | Meaning |
+| Required key | Meaning |
 | --- | --- |
+| `tokenizer` | `{"sha256", "size", "special_ids", "eod_id"}` (see [Tokenizer fingerprint](#tokenizer-fingerprint)); must match the student's |
+| `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it, and it fixes the index encoding (`u16` up to 65536, else `u16+u8`) |
+| `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)); must match the student's |
+| `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten samples only when it is true |
+| `writers`, `writer_mbs`, `writer_gbs` | Writer layout: sample `x` of an iteration starting at `s` lives in writer `((x-s)//mbs) % writers`, row `((x-s)//(mbs·writers))·mbs + (x-s)%mbs`; one record per iteration of `writer_gbs` samples |
 | `first_sample` | Global sample index where replay starts |
-| `dp_size_save`, `mbs_save`, `gbs_save` | Writer layout: sample `x` of an iteration starting at `s` lives in rank `((x-s)//mbs) % dp`, row `((x-s)//(mbs·dp))·mbs + (x-s)%mbs`; one record per iteration of `gbs` samples |
-| `seq_length` | Sample (pack) capacity |
-| `padding_divisor` | Per-segment padding granularity the writer used (1 when segments were not padded) |
-| `padding_policy` | Always `"strip"` (see [Stored records](#stored-records)) |
-| `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)) |
-| `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten non-packed samples only when it is true |
-| `tokenizer` | `{"sha256", "size", "special_ids", "eod_id"}` (see [Tokenizer fingerprint](#tokenizer-fingerprint)) |
-| `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it |
-| `temperature` | Always `1.0` |
-| `targets` | `{"k", "p", "min_k", "save_dtype", "index_encoding"}` |
 
-`provenance` is producer-specific and never compared across producers. Megatron records
-`cp_size_save`, `save_interval`, `train_budget`, `sft`, `inter_document_masking`,
-`reset_attention_mask`, `dataset_identity` and `teacher_checkpoint`; Megatron dump jobs
-additionally require matching `save_interval` and `train_budget` among themselves so
-parallel jobs share flush boundaries and dataset order.
+`format_version` 3 implies T=1 log probabilities and stripped padding (see
+[Stored records](#stored-records)).
+
+`recorded` settings describe how the data was produced. They are optional for other
+producers, and differences between tars or dump jobs are reported by name, never fatal:
+
+| Recorded key | Megatron writes |
+| --- | --- |
+| `teacher` | `--load` plus the checkpoint iteration, e.g. `/ckpts/teacher@2000` |
+| `seq_length` | `--seq-length` |
+| `padding_divisor` | Per-segment padding granularity the writer used (1 when segments were not padded) |
+| `data` | `--data-path` as `[[weight, file basename], ...]` |
+| `split` | `--split` |
+| `seed` | `--seed` |
+| `num_samples` | The training sample budget |
+| `builder` | The dataset class, e.g. `GPTDataset` or `SFTDataset` |
+
+`provenance` is free-form and never compared. Megatron records `producer`,
+`teacher_precision` (params dtype plus any FP8/FP4 format and recipe, e.g.
+`bf16+fp8:e4m3/delayed`), `top_k`, `top_p`, `min_k`, `save_dtype`, `cp_size` and
+`save_interval`.
 
 ### Stored records
 
@@ -281,9 +302,9 @@ rows back at their positions; positions without a row get sentinel targets.
 
 | Targets field | Encoding |
 | --- | --- |
-| `values` | `[rows, K]`, `save_dtype` |
+| `values` | `[rows, K]`, float16 or float32 |
 | `indices_low` | `[rows, K]`, uint16 lower 16 bits |
-| `indices_high` | `[rows, K]`, uint8 bits 16–23; present exactly when `contract.targets.index_encoding` is `"u16+u8"` |
+| `indices_high` | `[rows, K]`, uint8 bits 16–23; present exactly when the index encoding is `"u16+u8"` |
 | `tail_logprobs` | `[rows]`, float32, optional |
 
 `index_encoding` is `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to
@@ -326,8 +347,10 @@ excluded because inputs are stored as IDs. Megatron's EOD is recorded as `eod_id
 
 ### Writing V3 from vLLM
 
-A non-Megatron teacher writes the same tars with `producer` set accordingly. The writer
-owns tokenization and packing; vLLM only scores token IDs.
+A non-Megatron teacher writes the same tars, filling the required settings and whatever
+recorded settings and provenance (including `producer` and `teacher_precision`, e.g.
+vLLM's `dtype` and `quantization`) it can. The writer owns tokenization and packing; vLLM
+only scores token IDs.
 
 **Scoring existing documents (default).**
 
@@ -362,12 +385,11 @@ row, but its final label is then the sampled token rather than a data label.
 
 **Layout.**
 
-- Pack segments into samples of `seq_length` tokens in an `isolated_segments` cache, one
-  writer per `dp_rank`, `mbs_save=1`, `gbs_save` samples per record; store no padding.
-- `padding_divisor` promises that the samples still fit when each segment is padded to a
-  multiple of it. Packing with headroom for, say, 64 lets a Megatron student use any SFT
-  divisor (`2·CP`, times TP with sequence parallelism) that divides 64; 1 restricts packed
-  students to CP 1 without sequence parallelism.
+- Pack segments into samples in an `isolated_segments` cache, one writer per `dp_rank`,
+  `writer_mbs=1`, `writer_gbs` samples per record; store no padding.
+- A student checks each pack against its own length after re-padding every segment to
+  its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
+  students you expect; record the headroom you used as `padding_divisor`.
 - Set `logprob_vocab_size` to the model's `config.vocab_size` and fingerprint the
   tokenizer with `hf_tokenizer_identity`.
 - Set `prefix_stable` to false when the model's `rope_scaling` depends on the sequence
@@ -439,7 +461,9 @@ boundaries.
 ## Implementation map
 
 The new modules in `megatron/training/distillation/` isolate the format, publication,
-replay and token mappings, saver, runtime hooks, and paired loss (`v3_*.py`).
+replay and token mappings, saver, runtime hooks, and paired loss (`v3_*.py`). The
+producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation)
+live in `format/contract.py`, which imports nothing from Megatron.
 Small hooks in `arguments.py`, `training.py`, `checkpointing.py`, `pretrain_gpt.py`, and
 `pretrain_hybrid.py` select the V3 path. V3 reuses existing sparse top-K extraction,
 student output capture, the shared LM/sparse-KD loss and reporting, and the persistent

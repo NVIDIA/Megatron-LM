@@ -158,8 +158,8 @@ def discover_groups(
     """
     validate_metadata(metadata)
     contract = metadata["contract"]
-    ranges = complete_ranges(list_tars(storage), contract["dp_size_save"])
-    gbs = contract["gbs_save"]
+    ranges = complete_ranges(list_tars(storage), contract["writers"])
+    gbs = contract["writer_gbs"]
     previous = None
     for start, end in ranges:
         if end <= start or (end - start) % gbs:
@@ -329,9 +329,12 @@ class ReplayReader:
         self.storage = storage
         self.metadata = metadata
         self.contract = metadata["contract"]
-        self.gbs = self.contract["gbs_save"]
-        self.mbs = self.contract["mbs_save"]
-        self.dp = self.contract["dp_size_save"]
+        self.gbs = self.contract["writer_gbs"]
+        self.mbs = self.contract["writer_mbs"]
+        self.dp = self.contract["writers"]
+        self.prefix_stable = self.contract["prefix_stable"]
+        # Recorded settings that differ between tars are reported once each, never fatal.
+        self.reported_differences: set[str] = set()
         self.isolated = self.contract["attention_mode"] == "isolated_segments"
         self.student_vocab_size = student_vocab_size
         # Entries whose index the student vocabulary lacks are masked into the ghost bucket.
@@ -403,11 +406,19 @@ class ReplayReader:
         """Validate a tar's ``_meta.json`` against the cache and return its job generation."""
         meta = json.loads(raw)
         validate_metadata(meta)
-        mismatched = mismatched_settings(meta, self.metadata)
-        if mismatched:
+        required, recorded = mismatched_settings(meta, self.metadata)
+        if required:
             raise ValueError(
                 f"Offline KD v3 tar dp{dp_rank} {span[0]}-{span[1]} ({kind}) disagrees with the "
-                f"cache on {', '.join(mismatched)}; it was written by an incompatible dump job"
+                f"cache on {', '.join(required)}; it was written by an incompatible dump job"
+            )
+        new = [key for key in recorded if key not in self.reported_differences]
+        if new:
+            self.reported_differences.update(new)
+            print(
+                f"WARNING: offline KD v3 tar dp{dp_rank} {span[0]}-{span[1]} differs from the "
+                f"cache in recorded settings ({', '.join(new)}); it is still used",
+                flush=True,
             )
         if (meta.get("kind"), meta.get("dp_rank"), meta.get("range")) != (
             kind,
@@ -526,7 +537,7 @@ class ReplayReader:
 
 
 def _layout_sample(
-    sample: dict, seq_length: int, *, packed: bool, divisor: int
+    sample: dict, seq_length: int, *, packed: bool, divisor: int, prefix_stable: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Place a stored (padding-free) sample at the student's fixed length.
 
@@ -535,18 +546,32 @@ def _layout_sample(
     plus the padded segment boundaries for packed samples. Packed segments are padded
     to ``divisor`` and the pack tail extends the last segment, as Megatron SFT does;
     non-packed samples keep their prefix and pad the tail.
+
+    Lengths are checked per sample, whatever length the producer used: a sample that
+    fits is used as is; a longer non-packed or single-segment sample keeps its prefix
+    when the producer's targets are prefix-stable; anything else is an error.
     """
     length = sample["tokens"].numel()
-    if not packed:
+    single = not packed or len(sample["segments"]) == 1
+    if single and length > seq_length and not prefix_stable:
+        raise ValueError(
+            f"Offline KD sample {sample.get('sample_id')} has {length} tokens, more than the "
+            f"student sequence length ({seq_length}), and its targets are not prefix-stable "
+            "(e.g. dynamic RoPE scaling), so it cannot be shortened"
+        )
+    if not packed or (single and length > seq_length):
         kept = min(length, seq_length)
         source = torch.cat((torch.arange(kept), torch.full((seq_length - kept,), -1)))
-        return source, torch.arange(seq_length), None
+        # A shortened single-segment pack stays one segment spanning the student length.
+        boundaries = torch.tensor([0, seq_length], dtype=torch.int32) if packed else None
+        return source, torch.arange(seq_length), boundaries
     lengths = sample["segments"].tolist()
     padded = [-(-n // divisor) * divisor for n in lengths]
     if sum(padded) > seq_length:
         raise ValueError(
-            f"Offline KD packed sample needs {sum(padded)} tokens after padding segments to a "
-            f"multiple of {divisor}; the student sequence length is {seq_length}"
+            f"Offline KD packed sample {sample.get('sample_id')} needs {sum(padded)} tokens after "
+            f"padding segments to a multiple of {divisor}; the student sequence length is "
+            f"{seq_length}"
         )
     if padded:
         padded[-1] += seq_length - sum(padded)
@@ -569,6 +594,7 @@ def collate_samples(
     divisor: int = 1,
     cp_size: int = 1,
     layout: dict[str, Any] | None = None,
+    prefix_stable: bool = True,
 ) -> dict[str, Any]:
     """Build a student CPU microbatch from stored samples.
 
@@ -584,7 +610,7 @@ def collate_samples(
     with_targets = "teacher_values" in samples[0]
     for sample in samples:
         source, positions, boundaries = _layout_sample(
-            sample, seq_length, packed=packed, divisor=divisor
+            sample, seq_length, packed=packed, divisor=divisor, prefix_stable=prefix_stable
         )
         real = source >= 0
         take = source.clamp_min(0)
@@ -687,8 +713,7 @@ class ReplayIterator:
 
     def _load(self, start: int, end: int) -> dict[str, Any]:
         samples = self.reader.samples(list(range(start, start + self.mbs)), end)
-        if not self.reader.isolated:
-            self._note_shortening(samples)
+        self._note_shortening(samples)
         return collate_samples(
             samples,
             self.seq_length,
@@ -696,6 +721,7 @@ class ReplayIterator:
             divisor=self.divisor,
             cp_size=self.cp_size,
             layout=self.layout,
+            prefix_stable=self.reader.prefix_stable,
         )
 
     def _note_shortening(self, samples: list[dict]) -> None:

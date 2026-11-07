@@ -10,9 +10,9 @@ import torch
 import torch.distributed as dist
 
 from .v3_format import (
+    FORMAT_VERSION,
     attention_mode_for_layout,
     hf_tokenizer_identity,
-    index_encoding_for_vocab,
     mismatched_settings,
     segment_padding_divisor,
     tokenizer_fingerprint,
@@ -103,12 +103,28 @@ def _validate_dump_options(args: Any) -> None:
         raise ValueError(
             "Paired teacher dumping requires --exit-interval to be a multiple of --save-interval"
         )
+    frozen = getattr(args, "freeze_all_layers", False)
+    if frozen:
+        # A frozen teacher still runs in train mode (the saver hooks rely on it), so any
+        # stochastic or batch-dependent layer would make its targets irreproducible.
+        stochastic = [
+            flag
+            for flag, value in (
+                ("--hidden-dropout", getattr(args, "hidden_dropout", 0)),
+                ("--attention-dropout", getattr(args, "attention_dropout", 0)),
+                ("--moe-input-jitter-eps", getattr(args, "moe_input_jitter_eps", None)),
+                ("--moe-expert-capacity-factor", getattr(args, "moe_expert_capacity_factor", None)),
+                ("--moe-token-dropping", getattr(args, "moe_token_dropping", False)),
+            )
+            if value
+        ]
+        if stochastic:
+            raise ValueError(
+                "A frozen offline KD teacher must score deterministically; disable "
+                f"{', '.join(stochastic)} (dropout defaults to 0.1)"
+            )
     start = getattr(args, "override_ckpt_iteration", None)
-    if (
-        getattr(args, "freeze_all_layers", False)
-        and start is not None
-        and start % args.save_interval
-    ):
+    if frozen and start is not None and start % args.save_interval:
         raise ValueError(
             "Paired teacher dumping requires --override-ckpt-iteration to be a multiple of "
             "--save-interval"
@@ -222,22 +238,44 @@ def frozen_resume_iteration(args: Any) -> int:
     return result[0]["iteration"]
 
 
+def _teacher_identity(args: Any) -> str:
+    """The teacher checkpoint: ``--load`` plus the iteration it resolves to, if known."""
+    step = getattr(args, "ckpt_step", None)
+    if step is None and args.load:
+        try:
+            with Storage(args.load).open("latest_checkpointed_iteration.txt") as tracker:
+                step = tracker.read().decode().strip()
+        except Exception:
+            step = None
+    return f"{args.load}@{step}" if step is not None else str(args.load)
+
+
+def _teacher_precision(args: Any) -> str:
+    """The teacher's numerics, e.g. ``bf16`` or ``bf16+fp8:e4m3/delayed`` (provenance only)."""
+    names = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
+    precision = names.get(
+        getattr(args, "params_dtype", None), str(getattr(args, "params_dtype", None))
+    )
+    for low in ("fp8", "fp4"):
+        if getattr(args, low, None):
+            precision += f"+{low}:{getattr(args, low)}/{getattr(args, f'{low}_recipe', None)}"
+    return precision
+
+
 def _dump_settings(saver: Any) -> dict[str, Any]:
-    """This dump job's metadata: the shared contract (minus ``first_sample``) and provenance."""
+    """This dump job's metadata: required settings (minus ``first_sample``), recorded
+    settings, and provenance."""
     from megatron.training import get_args
+
+    from .utils import _blend_identifiers
 
     args = get_args()
     targets = saver.metadata_dict["saver"]
     settings = {
-        "format_version": 3,
-        "producer": "megatron",
+        "format_version": FORMAT_VERSION,
         "contract": {
-            "dp_size_save": saver.dp_size,
-            "mbs_save": args.micro_batch_size,
-            "gbs_save": args.global_batch_size,
-            "seq_length": args.seq_length,
-            "padding_divisor": student_padding_divisor(args),
-            "padding_policy": "strip",
+            "tokenizer": tokenizer_identity(),
+            "logprob_vocab_size": args.padded_vocab_size,
             "attention_mode": attention_mode_for_layout(
                 sft=args.sft,
                 inter_document_masking=args.dataloader_inter_document_masking,
@@ -247,29 +285,47 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             # Megatron's position embeddings (learned, rope, yarn, mrope) depend only on
             # the position, so a causal teacher's row t never depends on later tokens.
             "prefix_stable": True,
-            "tokenizer": tokenizer_identity(),
-            "logprob_vocab_size": args.padded_vocab_size,
-            "temperature": 1.0,
-            "targets": {
-                "k": targets["k"],
-                "p": targets["p"],
-                "min_k": targets["min_k"],
-                "save_dtype": targets["save_dtype"],
-                "index_encoding": index_encoding_for_vocab(args.padded_vocab_size),
-            },
+            "writers": saver.dp_size,
+            "writer_mbs": args.micro_batch_size,
+            "writer_gbs": args.global_batch_size,
+        },
+        "recorded": {
+            "teacher": _teacher_identity(args),
+            "seq_length": args.seq_length,
+            "padding_divisor": student_padding_divisor(args),
+            "data": _blend_identifiers(args),
+            "split": getattr(args, "split", None),
+            "seed": args.seed,
+            "num_samples": args.train_samples or args.train_iters * args.global_batch_size,
+            "builder": (
+                "SFTDataset"
+                if args.sft
+                else "MockGPTDataset" if getattr(args, "mock_data", False) else "GPTDataset"
+            ),
         },
         "provenance": {
-            "cp_size_save": saver.cp_size,
+            "producer": "megatron",
+            "teacher_precision": _teacher_precision(args),
+            "top_k": targets["k"],
+            "top_p": targets["p"],
+            "min_k": targets["min_k"],
+            "save_dtype": targets["save_dtype"],
+            "cp_size": saver.cp_size,
             "save_interval": args.save_interval,
-            "train_budget": args.train_samples or args.train_iters * args.global_batch_size,
-            "sft": bool(args.sft),
-            "inter_document_masking": bool(args.dataloader_inter_document_masking),
-            "reset_attention_mask": bool(args.reset_attention_mask),
-            "dataset_identity": saver.metadata_dict["identifiers"],
         },
     }
     # Compare exactly what a JSON round trip through a tar's _meta.json preserves.
     return json.loads(json.dumps(settings))
+
+
+def _report_recorded_differences(differing: list[str], where: str) -> None:
+    """Warn (world rank 0) about recorded settings that differ; they never block."""
+    if differing and (not dist.is_initialized() or dist.get_rank() == 0):
+        print(
+            f"WARNING: offline KD {where} differ in recorded settings ({', '.join(differing)}); "
+            "files remain usable, but check this was intended",
+            flush=True,
+        )
 
 
 def initialize_dump_metadata(saver: Any) -> dict:
@@ -290,20 +346,21 @@ def initialize_dump_metadata(saver: Any) -> dict:
                 raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
             tars = list_tars(storage)
             first_sample = 0 if frozen else args.consumed_train_samples
+            differing = []
             if tars:
                 existing = read_meta(storage, tars[0].name)
                 validate_metadata(existing)
                 first_sample = existing["contract"]["first_sample"]
-                mismatched = mismatched_settings(
+                required, differing = mismatched_settings(
                     existing,
                     {
                         **expected,
                         "contract": {**expected["contract"], "first_sample": first_sample},
                     },
                 )
-                if mismatched:
+                if required:
                     raise ValueError(
-                        f"Teacher settings differ from existing v3 tars ({', '.join(mismatched)}); "
+                        f"Teacher settings differ from existing v3 tars ({', '.join(required)}); "
                         "use a new save directory"
                     )
             start_iteration, end_iteration = dump_range(args)
@@ -321,11 +378,11 @@ def initialize_dump_metadata(saver: Any) -> dict:
                 "metadata": {
                     **expected,
                     "contract": {**expected["contract"], "first_sample": first_sample},
-                    "provenance": {**expected["provenance"], "teacher_checkpoint": str(args.load)},
                     "generation": uuid.uuid4().hex,
                     "published_through": published,
                     "range_end": end,
-                }
+                },
+                "differing": differing,
             }
         except Exception as error:
             return {"error": f"{type(error).__name__}: {error}"}
@@ -333,6 +390,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
     result = _broadcast_without_pp(create)
     if "error" in result:
         raise RuntimeError(result["error"])
+    _report_recorded_differences(result["differing"], "dump job and existing v3 tars")
     return result["metadata"]
 
 
@@ -356,23 +414,8 @@ def _check_student_compatibility(args: Any, metadata: dict) -> None:
         raise ValueError(
             f"Student attention_mode {mode} differs from the cache's {contract['attention_mode']}"
         )
-    if mode == "isolated_segments":
-        if args.seq_length < contract["seq_length"]:
-            raise ValueError("Packed student sequence length must be at least the teacher's")
-        divisor = student_padding_divisor(args)
-        if contract["padding_divisor"] % divisor:
-            raise ValueError(
-                f"Student segment padding ({divisor}, from its CP/SP layout) must divide the "
-                f"teacher's ({contract['padding_divisor']}) so re-padded packs always fit"
-            )
-    elif args.seq_length > contract["seq_length"]:
-        raise ValueError("Only non-packed prefix shortening is supported by v3 replay")
-    elif args.seq_length < contract["seq_length"] and not contract["prefix_stable"]:
-        raise ValueError(
-            "Offline KD v3 cache is not prefix-stable (its teacher's outputs depend on the "
-            "sequence length, e.g. dynamic RoPE scaling); the student sequence length must "
-            f"equal the teacher's ({contract['seq_length']})"
-        )
+    # Sample lengths are checked per sample at collation (see v3_replay._layout_sample),
+    # not against the producer's recorded sequence length or padding divisor.
     if args.context_parallel_size > 1 and args.seq_length % (2 * args.context_parallel_size):
         raise ValueError("Student sequence length must be divisible by 2 * CP")
 

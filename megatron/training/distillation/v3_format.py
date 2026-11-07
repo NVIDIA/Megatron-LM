@@ -7,9 +7,7 @@ also be inspected, written, and tested on CPU without initializing Megatron, and
 reused by non-Megatron producers and consumers.
 """
 
-import hashlib
 import itertools
-import json
 from typing import Any
 
 import torch
@@ -17,41 +15,29 @@ import zstandard
 from safetensors.torch import load as load_tensors
 from safetensors.torch import save as save_tensors
 
-FORMAT_VERSION = 3
-MAX_VOCAB_SIZE = 1 << 24
-LOGPROB_SENTINEL = -1000.0
-# Allowed |retained + tail - 1| per row; generous enough for fp16-rounded values.
-MASS_TOLERANCE = 0.05
-PADDING_POLICY = "strip"
-ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
+from .format.contract import (  # noqa: F401  (re-exported for V3 callers)
+    ATTENTION_MODES,
+    FORMAT_VERSION,
+    LOGPROB_SENTINEL,
+    MASS_TOLERANCE,
+    MAX_VOCAB_SIZE,
+    RECORDED_KEYS,
+    REPLAY_KEYS,
+    REQUIRED_KEYS,
+    digest,
+    hf_tokenizer_identity,
+    index_encoding_for_vocab,
+    mismatched_settings,
+    pack_targets,
+    tail_logprob,
+    tokenizer_fingerprint,
+    unpack_targets,
+    validate_metadata,
+)
+
 # Token-aligned input fields. Only ``tokens`` is required; the rest have defaults.
 TOKEN_FIELDS = ("tokens", "labels", "position_ids", "loss_mask")
 OPTIONAL_TOKEN_FIELDS = ("labels", "position_ids", "loss_mask")
-# Contract settings every tar in a cache must share, whichever producer wrote it.
-CONTRACT_KEYS = (
-    "first_sample",
-    "dp_size_save",
-    "mbs_save",
-    "gbs_save",
-    "seq_length",
-    "padding_divisor",
-    "padding_policy",
-    "attention_mode",
-    "prefix_stable",
-    "tokenizer",
-    "logprob_vocab_size",
-    "temperature",
-    "targets",
-)
-# Megatron provenance that Megatron dump jobs must also share (parallel-dump alignment).
-MEGATRON_ALIGNMENT_KEYS = ("save_interval", "train_budget")
-
-
-def index_encoding_for_vocab(vocab_size: int) -> str:
-    """Return the vocabulary-index encoding for a normalization domain size."""
-    if type(vocab_size) is not int or not 1 <= vocab_size <= MAX_VOCAB_SIZE:
-        raise ValueError("Offline KD vocabulary size must be an integer in [1, 2**24]")
-    return "u16" if vocab_size <= 1 << 16 else "u16+u8"
 
 
 def attention_mode_for_layout(
@@ -73,88 +59,6 @@ def segment_padding_divisor(*, context_parallel_size: int, sequence_parallel_tp:
     """Megatron SFT's per-segment padding divisor (``SFTDataset._calculate_padding_divisor``)."""
     cp_pad = 2 * context_parallel_size if context_parallel_size > 1 else 1
     return cp_pad * max(1, sequence_parallel_tp)
-
-
-def validate_metadata(meta: dict[str, Any]) -> None:
-    """Reject unsupported or internally inconsistent V3 metadata."""
-    if meta.get("format_version") != FORMAT_VERSION:
-        raise ValueError("Expected offline KD v3 metadata")
-    if not isinstance(meta.get("producer"), str):
-        raise ValueError("Offline KD v3 metadata requires a producer")
-    contract = meta.get("contract")
-    if not isinstance(contract, dict) or any(key not in contract for key in CONTRACT_KEYS):
-        raise ValueError("Offline KD v3 metadata is missing contract settings")
-    encoding = index_encoding_for_vocab(contract["logprob_vocab_size"])
-    if contract["targets"].get("index_encoding") != encoding:
-        raise ValueError("Offline KD target index_encoding disagrees with logprob_vocab_size")
-    if contract["temperature"] != 1.0:
-        raise ValueError("Offline KD v3 targets must be temperature-1 log probabilities")
-    if contract["attention_mode"] not in ATTENTION_MODES:
-        raise ValueError("Unsupported offline KD attention_mode")
-    if type(contract["prefix_stable"]) is not bool:
-        raise ValueError("Offline KD v3 contract prefix_stable must be a boolean")
-    if contract["padding_policy"] != PADDING_POLICY:
-        raise ValueError(f"Offline KD v3 requires padding_policy={PADDING_POLICY}")
-    for key in ("padding_divisor", "seq_length", "dp_size_save", "mbs_save", "gbs_save"):
-        if type(contract[key]) is not int or contract[key] < 1:
-            raise ValueError(f"Offline KD v3 contract {key} must be a positive integer")
-
-
-def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
-    """Return contract (and, between Megatron jobs, alignment) settings that disagree."""
-    mismatched = [
-        key
-        for key in CONTRACT_KEYS
-        if meta.get("contract", {}).get(key) != expected.get("contract", {}).get(key)
-    ]
-    if meta.get("producer") == expected.get("producer") == "megatron":
-        mismatched += [
-            key
-            for key in MEGATRON_ALIGNMENT_KEYS
-            if meta.get("provenance", {}).get(key) != expected.get("provenance", {}).get(key)
-        ]
-    return mismatched
-
-
-def digest(data: bytes) -> str:
-    """Return a stable SHA-256 fingerprint."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def tokenizer_fingerprint(
-    vocab: dict[str, int], special_ids: dict[str, int | None], size: int
-) -> str:
-    """Hash the ID-to-token mapping that cached inputs and targets depend on.
-
-    The canonical object is ``{"vocab": [[token, id], ...] sorted by id,
-    "special_ids": {bos, eos, pad, unk}, "size": n}`` serialized as compact,
-    key-sorted UTF-8 JSON. Normalizers, pre-tokenizers, and chat templates are
-    deliberately excluded: inputs are stored as token IDs.
-    """
-    canonical = {
-        "vocab": sorted(
-            ([str(token), int(index)] for token, index in vocab.items()), key=lambda item: item[1]
-        ),
-        "special_ids": {role: special_ids.get(role) for role in ("bos", "eos", "pad", "unk")},
-        "size": int(size),
-    }
-    return digest(
-        json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    )
-
-
-def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[str, Any]:
-    """Describe a Hugging Face tokenizer for the ``tokenizer`` contract setting."""
-    special_ids = {
-        role: getattr(tokenizer, f"{role}_token_id", None) for role in ("bos", "eos", "pad", "unk")
-    }
-    size = len(tokenizer)
-    return {
-        "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, size),
-        "size": size,
-        "special_ids": special_ids,
-        "eod_id": eod_id,
-    }
 
 
 def encode(payload: dict[str, torch.Tensor]) -> bytes:
@@ -181,20 +85,6 @@ def int32(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.numel() and (tensor.min().item() < limits.min or tensor.max().item() > limits.max):
         raise ValueError("Offline KD input does not fit in int32")
     return tensor.detach().to(device="cpu", dtype=torch.int32).contiguous().clone()
-
-
-def tail_logprob(values: torch.Tensor) -> torch.Tensor:
-    """Log of the probability mass outside each row's retained entries.
-
-    Writers call this on full-precision log probabilities before casting them to the
-    save dtype, so rounding of the retained values does not distort the tail. Readers
-    of records without a stored tail fall back to calling it on the stored values.
-    Sentinel entries count as not retained; an empty tail is ``LOGPROB_SENTINEL``.
-    """
-    values = values.float()
-    retained = torch.logsumexp(values.masked_fill(values == LOGPROB_SENTINEL, -torch.inf), -1)
-    tail = torch.log(-torch.expm1(retained.clamp(max=0.0)))
-    return tail.clamp(min=LOGPROB_SENTINEL)
 
 
 def capture_batch(batch: dict[str, Any]) -> dict[str, Any]:
@@ -349,83 +239,6 @@ def finalize_record(
         record["segment_final_labels"] = final_labels
     rows = keep & (weights != 0)
     return record, values[rows], indices[rows], tail[rows]
-
-
-def pack_targets(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    vocab_size: int,
-    tail: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Encode [rows, K] targets: indices as uint16 low words plus, above 2**16, a uint8
-    high byte, and the optional float32 ``[rows]`` tail log probability (see
-    :func:`tail_logprob`)."""
-    encoding = index_encoding_for_vocab(vocab_size)
-    if values.shape != indices.shape or values.ndim != 2:
-        raise ValueError("Offline KD targets must have matching [tokens, K] shapes")
-    if not values.is_floating_point() or indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Offline KD targets require floating values and int32/int64 indices")
-    values = values.detach().cpu().contiguous()
-    indices = indices.detach().to(device="cpu", dtype=torch.int64)
-    if indices.numel() and (
-        (indices < -1).any()
-        or (indices >= vocab_size).any()
-        or ((indices == -1) & (values != LOGPROB_SENTINEL)).any()
-    ):
-        raise ValueError("Offline KD vocabulary index is out of range or has an unmasked sentinel")
-    payload = {"values": values, "indices_low": (indices & 0xFFFF).to(torch.uint16)}
-    if encoding == "u16+u8":
-        payload["indices_high"] = ((indices >> 16) & 0xFF).to(torch.uint8)
-    if tail is not None:
-        if tail.shape != values.shape[:1]:
-            raise ValueError("Offline KD tail log probabilities must have one value per row")
-        payload["tail_logprobs"] = tail.detach().to(device="cpu", dtype=torch.float32)
-    return payload
-
-
-def unpack_targets(
-    payload: dict[str, torch.Tensor], *, vocab_size: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(values, indices, tail)`` target rows.
-
-    The index encoding is implied by ``indices_high``'s presence; with ``vocab_size`` it
-    must also be the one :func:`index_encoding_for_vocab` prescribes. Without a stored
-    ``tail_logprobs`` the tail is derived from the stored values.
-    """
-    values, low = payload.get("values"), payload.get("indices_low")
-    high = payload.get("indices_high")
-    if values is None or low is None:
-        raise ValueError("Malformed offline KD target tensors")
-    encoding = "u16" if high is None else "u16+u8"
-    if vocab_size is not None and encoding != index_encoding_for_vocab(vocab_size):
-        raise ValueError("Offline KD target index_encoding disagrees with logprob_vocab_size")
-    if (
-        values.shape != low.shape
-        or values.ndim != 2
-        or not values.is_floating_point()
-        or low.dtype != torch.uint16
-        or (high is not None and (high.dtype != torch.uint8 or high.shape != low.shape))
-    ):
-        raise ValueError("Malformed offline KD target tensors")
-    indices = low.to(torch.int64)
-    if high is not None:
-        indices |= high.to(torch.int64) << 16
-    if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
-        raise ValueError("Offline KD target vocabulary index is out of range")
-    tail = payload.get("tail_logprobs")
-    if tail is None:
-        return values, indices, tail_logprob(values)
-    if tail.dtype != torch.float32 or tail.shape != values.shape[:1] or tail.isnan().any():
-        raise ValueError("Malformed offline KD tail_logprobs")
-    tail = tail.clamp(min=LOGPROB_SENTINEL, max=0.0)
-    retained = values.float().masked_fill(values == LOGPROB_SENTINEL, -torch.inf).exp().sum(-1)
-    if values.numel() and ((retained + tail.exp() - 1).abs() > MASS_TOLERANCE).any():
-        raise ValueError(
-            "Offline KD retained and tail probabilities do not sum to 1; targets must be "
-            "full-vocabulary log probabilities with the tail of the retained entries"
-        )
-    return values, indices, tail
 
 
 def validate_inputs(payload: dict[str, Any]) -> None:

@@ -47,39 +47,39 @@ def inputs(ids, length=8, packed=False):
     return batch
 
 
-def settings(dp=2, mbs=2, gbs=8, *, contract=None, provenance=None, producer="megatron"):
-    """Cache metadata shared by every tar: the portable contract plus provenance."""
-    shared = {
+def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=None):
+    """Cache metadata shared by every tar: required settings, recorded settings, provenance.
+
+    Overrides of recorded keys may also be passed through ``contract`` for brevity.
+    """
+    required = {
         "first_sample": 0,
-        "dp_size_save": dp,
-        "mbs_save": mbs,
-        "gbs_save": gbs,
-        "seq_length": 8,
-        "padding_divisor": 1,
-        "padding_policy": "strip",
+        "writers": dp,
+        "writer_mbs": mbs,
+        "writer_gbs": gbs,
         "attention_mode": "causal",
         "prefix_stable": True,
         "tokenizer": {"sha256": "test", "size": 3, "special_ids": {}, "eod_id": 2},
         "logprob_vocab_size": 1 << 17,
-        "temperature": 1.0,
-        "targets": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32"},
     }
-    shared.update(contract or {})
-    shared["targets"] = {
-        **shared["targets"],
-        "index_encoding": codec.index_encoding_for_vocab(shared["logprob_vocab_size"]),
+    noted = {
+        "teacher": "/teacher@100",
+        "seq_length": 8,
+        "padding_divisor": 1,
+        "data": {"kind": "blend", "blend": [[1.0, "corpus"]]},
+        "split": "99,1,0",
+        "seed": 7,
+        "num_samples": 1024,
+        "builder": "GPTDataset",
     }
+    for key, value in (contract or {}).items():
+        (noted if key in codec.RECORDED_KEYS else required)[key] = value
+    noted.update(recorded or {})
     return {
         "format_version": 3,
-        "producer": producer,
-        "contract": shared,
-        "provenance": {
-            "save_interval": 2,
-            "train_budget": 1024,
-            "cp_size_save": 1,
-            "dataset_identity": {"seed": 7},
-            **(provenance or {}),
-        },
+        "contract": required,
+        "recorded": noted,
+        "provenance": {"producer": "megatron", "save_interval": 2, **(provenance or {})},
     }
 
 
@@ -125,7 +125,7 @@ def write_flush(
 ):
     """Write one teacher DP rank's flush exactly as the saver does."""
     contract = metadata["contract"]
-    dp, mbs, gbs = contract["dp_size_save"], contract["mbs_save"], contract["gbs_save"]
+    dp, mbs, gbs = contract["writers"], contract["writer_mbs"], contract["writer_gbs"]
     members = {"inputs": [], "targets": []}
     for iteration in range(begin, finish):
         start, end = iteration * gbs, (iteration + 1) * gbs
@@ -420,42 +420,46 @@ def test_target_encoder_rejects_invalid_ids(index, value):
     "contract",
     [
         {"attention_mode": "unknown"},
-        {"padding_policy": "preserve"},
-        {"temperature": 0.7},
-        {"padding_divisor": 0},
         {"prefix_stable": "yes"},
-        {"targets": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32", "index_encoding": "u16"}},
+        {"logprob_vocab_size": 0},
+        {"tokenizer": {"size": 3}},
+        {"writers": 0},
+        {"first_sample": -1},
     ],
 )
-def test_unsupported_contract_metadata_rejected(contract):
-    metadata = settings(contract=contract)
-    if "targets" in contract:
-        metadata["contract"]["targets"] = contract["targets"]
+def test_unsupported_required_metadata_rejected(contract):
     with pytest.raises(ValueError):
-        codec.validate_metadata(metadata)
+        codec.validate_metadata(settings(contract=contract))
 
 
-def test_metadata_requires_producer_and_every_contract_key():
+@pytest.mark.parametrize("key", [*codec.REQUIRED_KEYS, *codec.REPLAY_KEYS])
+def test_metadata_requires_every_required_key(key):
     metadata = settings()
-    del metadata["producer"]
-    with pytest.raises(ValueError, match="producer"):
+    del metadata["contract"][key]
+    with pytest.raises(ValueError, match=f"missing required settings: {key}"):
         codec.validate_metadata(metadata)
+
+
+def test_recorded_settings_and_provenance_are_optional():
     metadata = settings()
-    del metadata["contract"]["tokenizer"]
-    with pytest.raises(ValueError, match="contract"):
-        codec.validate_metadata(metadata)
+    del metadata["recorded"], metadata["provenance"]
+    codec.validate_metadata(metadata)
+    # A corpus file (another producer) needs no replay layout.
+    for key in codec.REPLAY_KEYS:
+        del metadata["contract"][key]
+    codec.validate_metadata(metadata, replay=False)
 
 
-def test_contract_and_megatron_alignment_comparisons():
+def test_required_and_recorded_comparisons():
     base = settings()
-    assert codec.mismatched_settings(settings(provenance={"dataset_identity": {}}), base) == []
-    assert codec.mismatched_settings(settings(contract={"seq_length": 16}), base) == ["seq_length"]
-    assert codec.mismatched_settings(settings(provenance={"save_interval": 4}), base) == [
-        "save_interval"
-    ]
-    # Alignment provenance only binds Megatron jobs to each other.
-    other = settings(producer="vllm", provenance={"save_interval": 4})
-    assert codec.mismatched_settings(other, base) == []
+    assert codec.mismatched_settings(settings(provenance={"save_interval": 4}), base) == ([], [])
+    assert codec.mismatched_settings(settings(contract={"seq_length": 16}), base) == (
+        [],
+        ["seq_length"],
+    )
+    assert codec.mismatched_settings(
+        settings(contract={"writers": 4}, recorded={"teacher": "other", "seed": 1}), base
+    ) == (["writers"], ["seed", "teacher"])
 
 
 @pytest.mark.parametrize(
@@ -614,7 +618,7 @@ def test_tars_are_self_describing_and_immutable(tmp_path):
         for kind in ("inputs", "targets")
     )
     meta = storage_module.read_meta(storage, "dp1__16-32.targets.tar")
-    assert codec.mismatched_settings(meta, metadata) == []
+    assert codec.mismatched_settings(meta, metadata) == ([], [])
     assert (meta["kind"], meta["dp_rank"], meta["range"]) == ("targets", 1, [16, 32])
     with pytest.raises(RuntimeError, match="replace published"):
         storage_module.write_tar(storage, "dp1__16-32.targets.tar", meta, [])
@@ -829,14 +833,20 @@ def test_input_only_readers_never_open_targets(tmp_path, monkeypatch):
     assert opened and all(name.endswith(".inputs.tar") for name in opened)
 
 
-def test_mismatched_tar_is_rejected_before_any_record_is_used(tmp_path):
+def test_tars_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp_path, capsys):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    write_cache(tmp_path, iterations=4, contract={"seq_length": 16}, generation="bad")
+    write_cache(tmp_path, iterations=4, contract={"seq_length": 16, "teacher": "other"})
+    write_cache(tmp_path, iterations=6, contract={"prefix_stable": False}, generation="bad")
     live = reader(storage, metadata)
-    assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
-    with pytest.raises(ValueError, match="seq_length"):
-        live.samples([16], 17)
-    live.close()
+    try:
+        assert ids_of(live.samples(list(range(32)), 32)) == list(range(32))
+        assert (
+            "recorded settings (seq_length, teacher); it is still used" in capsys.readouterr().out
+        )
+        with pytest.raises(ValueError, match="prefix_stable"):
+            live.samples([32], 33)  # Rejected before any of its records is used.
+    finally:
+        live.close()
 
 
 def test_inputs_and_targets_from_different_jobs_are_rejected(tmp_path):
@@ -1119,6 +1129,9 @@ def runtime_environment(monkeypatch):
         load="original-weights",
         override_ckpt_iteration=None,
         iterations_to_skip=[],
+        seed=1234,
+        split="99,1,0",
+        params_dtype=torch.bfloat16,
     )
     training = types.ModuleType("megatron.training")
     training.get_args = lambda: args
@@ -1153,6 +1166,7 @@ def runtime_environment(monkeypatch):
     monkeypatch.setitem(sys.modules, legacy_saver.__name__, legacy_saver)
     utils = types.ModuleType(f"{_namespace}.utils")
     utils._broadcast_without_pp = lambda factory: factory()
+    utils._blend_identifiers = lambda args: {"kind": "blend", "blend": [[1.0, "corpus"]]}
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
     runtime = importlib.import_module(f"{_namespace}.v3_runtime")
     runtime._PLAN = None
@@ -1209,6 +1223,11 @@ def dump_args(args):
         ({"save_interval": None}, "save-interval"),
         ({"exit_interval": 3}, "exit-interval to be a multiple"),
         ({"override_ckpt_iteration": 3}, "override-ckpt-iteration to be a multiple"),
+        ({"hidden_dropout": 0.1}, "deterministically; disable --hidden-dropout"),
+        ({"attention_dropout": 0.1}, "--attention-dropout"),
+        ({"moe_input_jitter_eps": 0.01}, "--moe-input-jitter-eps"),
+        ({"moe_expert_capacity_factor": 1.0}, "--moe-expert-capacity-factor"),
+        ({"moe_token_dropping": True}, "--moe-token-dropping"),
     ],
 )
 def test_dump_validation_rejects_unsafe_options(runtime_environment, change, message):
@@ -1221,6 +1240,51 @@ def test_dump_validation_rejects_unsafe_options(runtime_environment, change, mes
         setattr(args, key, value)
     with pytest.raises(ValueError, match=message):
         runtime.validate_options(args)
+
+
+def test_unfrozen_teacher_may_use_dropout(runtime_environment):
+    # An unfrozen teacher's dump is a record of its training run, dropout included.
+    args, runtime, _ = runtime_environment
+    dump_args(args)
+    args.freeze_all_layers = False
+    args.hidden_dropout = args.attention_dropout = 0.1
+    runtime.validate_options(args)
+
+
+@pytest.mark.parametrize(
+    "fp8,fp4,expected",
+    [
+        (None, None, "bf16"),
+        ("e4m3", None, "bf16+fp8:e4m3/delayed"),
+        (None, "e2m1", "bf16+fp4:e2m1/nvfp4"),
+    ],
+)
+def test_teacher_identity_and_precision_are_recorded(
+    tmp_path, runtime_environment, fp8, fp4, expected
+):
+    args, runtime, _ = runtime_environment
+    args.fp8, args.fp8_recipe, args.fp4, args.fp4_recipe = fp8, "delayed", fp4, "nvfp4"
+    args.load = str(tmp_path)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("2000\n")
+    metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
+    assert metadata["provenance"]["teacher_precision"] == expected
+    assert metadata["recorded"]["teacher"] == f"{tmp_path}@2000"
+    assert metadata["recorded"]["num_samples"] == args.train_iters * args.global_batch_size
+
+
+def test_format_contract_imports_without_megatron():
+    import importlib.util
+    import subprocess
+
+    path = Path(_package.__path__[0]) / "format" / "contract.py"
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('contract', {str(path)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "assert not any(name == 'megatron' or name.startswith('megatron.') for name in sys.modules)\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def replay_cache(tmp_path, args, runtime, *, iterations=4, generation="gen"):
@@ -1590,10 +1654,10 @@ def test_teacher_and_student_use_effective_attention_mode(
     expected = "causal_eod_reset" if create_attention_mask else "causal"
     contract = metadata["contract"]
     assert contract["attention_mode"] == expected
-    assert (contract["padding_policy"], contract["temperature"]) == ("strip", 1.0)
     assert contract["prefix_stable"] is True
-    assert contract["targets"]["index_encoding"] == "u16+u8"
-    assert metadata["producer"] == "megatron" and metadata["provenance"]["reset_attention_mask"]
+    assert set(contract) == {*codec.REQUIRED_KEYS, *codec.REPLAY_KEYS}
+    assert set(metadata["recorded"]) == set(codec.RECORDED_KEYS)
+    assert metadata["provenance"]["producer"] == "megatron"
     runtime._check_student_compatibility(args, metadata)
     args.create_attention_mask_in_dataloader = not create_attention_mask
     with pytest.raises(ValueError, match="attention_mode"):
@@ -1601,21 +1665,23 @@ def test_teacher_and_student_use_effective_attention_mode(
 
 
 @pytest.mark.parametrize(
-    "seq_length,prefix_stable,ok", [(4, True, True), (4, False, False), (8, False, True)]
+    "seq_length,prefix_stable,ok",
+    [(4, True, True), (4, False, False), (8, False, True), (12, False, True)],
 )
-def test_prefix_shortening_requires_a_prefix_stable_cache(
-    runtime_environment, seq_length, prefix_stable, ok
-):
-    args, runtime, _ = runtime_environment
-    args.seq_length = seq_length
-    metadata = settings(
-        contract={"prefix_stable": prefix_stable, "tokenizer": runtime.tokenizer_identity()}
+def test_prefix_shortening_is_checked_per_sample(tmp_path, seq_length, prefix_stable, ok):
+    # Stored samples have 8 tokens; the producer's recorded seq_length plays no role.
+    storage, metadata = write_cache(
+        tmp_path, iterations=2, contract={"prefix_stable": prefix_stable, "seq_length": 64}
     )
+    live = reader(storage, metadata)
+    samples = live.samples([0, 1], 2)
+    live.close()
     if ok:
-        runtime._check_student_compatibility(args, metadata)
+        result = replay.collate_samples(samples, seq_length, prefix_stable=prefix_stable)
+        assert result["tokens"].shape == (2, seq_length)
     else:
         with pytest.raises(ValueError, match="prefix-stable"):
-            runtime._check_student_compatibility(args, metadata)
+            replay.collate_samples(samples, seq_length, prefix_stable=prefix_stable)
 
 
 def test_isolated_records_require_segments(tmp_path):
@@ -1664,7 +1730,7 @@ def test_reader_checks_target_width_against_tar_metadata(tmp_path):
         raw_inputs = next(input_stream)[1]
         payload = codec.decode(next(target_stream)[1])
         del payload["indices_high"]  # u16 encoding, but the cache vocabulary needs u16+u8.
-        with pytest.raises(ValueError, match="index_encoding"):
+        with pytest.raises(ValueError, match="index encoding"):
             live.decode_record(0, 0, 8, raw_inputs, codec.encode(payload))
     finally:
         input_stream.close()
@@ -1709,36 +1775,48 @@ def test_megatron_hf_tokenizer_fingerprint_matches_other_producers(
 
 
 @pytest.mark.parametrize(
-    "student,teacher_divisor,seq_length,ok",
+    "divisor,seq_length,ok",
     [
-        ({"context_parallel_size": 1}, 4, 8, True),
-        ({"context_parallel_size": 2}, 4, 8, True),
-        ({"context_parallel_size": 2}, 8, 8, True),
-        ({"context_parallel_size": 4}, 4, 8, False),
-        ({"context_parallel_size": 1}, 1, 16, True),  # Longer packs re-pad into more room.
-        ({"context_parallel_size": 1}, 1, 4, False),
+        (1, 8, True),
+        (4, 8, True),  # Segments of 4 re-pad to 4 for a CP=2 student.
+        (8, 8, False),  # A CP=4 student's padding no longer fits.
+        (1, 16, True),  # Longer packs re-pad into more room.
+        (8, 16, True),
+        (1, 4, False),  # Two segments can't be shortened.
     ],
 )
-def test_student_packing_checks(
-    tmp_path, runtime_environment, student, teacher_divisor, seq_length, ok
-):
-    args, runtime, _ = runtime_environment
-    args.sft = True
-    args.seq_length = seq_length
-    for key, value in student.items():
-        setattr(args, key, value)
-    metadata = settings(
-        contract={
-            "attention_mode": "isolated_segments",
-            "padding_divisor": teacher_divisor,
-            "tokenizer": runtime.tokenizer_identity(),
-        }
+def test_packed_samples_are_checked_per_sample(tmp_path, divisor, seq_length, ok):
+    # The producer recorded divisor 1 and a longer seq_length; neither is checked per file.
+    storage, metadata = write_cache(
+        tmp_path, packed=True, contract={"padding_divisor": 1, "seq_length": 64}
     )
+    live = reader(storage, metadata)
+    samples = live.samples([0, 1], 2)
+    live.close()
     if ok:
-        runtime._check_student_compatibility(args, metadata)
+        replay.collate_samples(samples, seq_length, packed=True, divisor=divisor)
     else:
-        with pytest.raises(ValueError):
-            runtime._check_student_compatibility(args, metadata)
+        with pytest.raises(ValueError, match="student sequence length"):
+            replay.collate_samples(samples, seq_length, packed=True, divisor=divisor)
+
+
+@pytest.mark.parametrize("prefix_stable", [True, False])
+def test_long_single_segment_packed_sample_is_prefix_shortened(prefix_stable):
+    sample = {
+        "tokens": torch.arange(8),
+        "labels": torch.arange(1, 9),
+        "position_ids": torch.arange(8),
+        "loss_mask": torch.ones(8),
+        "segments": torch.tensor([8]),
+        "sample_id": 0,
+    }
+    if not prefix_stable:
+        with pytest.raises(ValueError, match="prefix-stable"):
+            replay.collate_samples([sample], 4, packed=True, prefix_stable=False)
+        return
+    result = replay.collate_samples([sample], 4, packed=True, divisor=2)
+    assert result["tokens"].tolist() == [[0, 1, 2, 3]]
+    assert result["cu_seqlens"].tolist() == [[0, 4]]
 
 
 @pytest.mark.parametrize(
@@ -1815,7 +1893,7 @@ def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runti
         runtime.initialize_dump_metadata(saver)
     args.consumed_train_samples = 6 * 8
     args.micro_batch_size = 1
-    with pytest.raises(RuntimeError, match="mbs_save"):
+    with pytest.raises(RuntimeError, match="writer_mbs"):
         runtime.initialize_dump_metadata(saver)
 
 
@@ -1832,7 +1910,7 @@ def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
     args.consumed_train_samples = 24
     metadata = runtime.initialize_dump_metadata(saver)
     assert (metadata["contract"]["first_sample"], metadata["published_through"]) == (16, 32)
-    assert metadata["provenance"]["teacher_checkpoint"] == "resumed-training-checkpoint"
+    assert metadata["recorded"]["teacher"] == "resumed-training-checkpoint"
 
 
 def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeypatch):
@@ -2597,7 +2675,7 @@ def test_golden_fixtures_decode(tmp_path, name):
     storage = Storage(str(golden))
     meta = storage_module.read_meta(storage, storage_module.list_tars(storage)[0].name)
     codec.validate_metadata(meta)
-    assert codec.mismatched_settings(meta, expected_meta) == []
+    assert codec.mismatched_settings(meta, expected_meta) == ([], [])
     count = groups(storage, meta)[-1][1]
     got_reader, want_reader = reader(storage, meta), reader(expected_storage, expected_meta)
     try:
