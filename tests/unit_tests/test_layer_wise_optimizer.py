@@ -307,6 +307,7 @@ class TestLayerWiseOptimizer:
         chunked_optimizer_state_offload=False,
         optimizer_state_offload_chunk_size_mb=0,
         optimizer_state_offload_fraction=1.0,
+        chunked_optimizer_main_params=False,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -361,6 +362,7 @@ class TestLayerWiseOptimizer:
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
+            chunked_optimizer_main_params=chunked_optimizer_main_params,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
             optimizer_state_offload_fraction=optimizer_state_offload_fraction,
         )
@@ -565,13 +567,15 @@ class TestLayerWiseOptimizer:
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
 
-    def test_compact_muon_chunked_state_and_master_offload(self):
+    @pytest.mark.parametrize('chunked_masters', [False, True])
+    def test_compact_muon_chunked_state_and_master_offload(self, chunked_masters):
         """Compact-layout Muon updates whole tensors while state and masters live on CPU."""
 
         model, optimizer, _ = self.create_model_and_optimizer(
             use_param_layout=True,
             chunked_optimizer_state_offload=True,
             optimizer_state_offload_chunk_size_mb=1,
+            chunked_optimizer_main_params=chunked_masters,
         )
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
             use_param_layout=True, copy_from=model
@@ -628,6 +632,9 @@ class TestLayerWiseOptimizer:
         reference_model(inputs).sum().backward()
         assert reference_optimizer.step()[0]
 
+        if chunked_masters:
+            for child in managed_children:
+                assert all(p.device.type == 'cpu' for p in child._optimizer_state_offloader.selected_params)
         optimizer.offload_optimizer_state_for_forward()
         for child in managed_children:
             manager = child._optimizer_state_offloader
