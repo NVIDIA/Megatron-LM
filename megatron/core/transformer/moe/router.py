@@ -738,6 +738,21 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
         )
+
+        # The token counts are reduced over tp_dp_cp_group, so each rank holds a partial term
+        # and the partials sum to the global-batch loss across DP too. Gradient finalization
+        # assumes every DP rank holds a full loss:
+        # - Without per-token loss, the router gradient ends up averaged over DP (DDP divides
+        #   by the dp_cp size; the schedule's loss scale restores the CP factor). Multiply the
+        #   attached loss by dp_size to cancel that average, and scale the coefficient alike so
+        #   the logged value is unchanged.
+        # - With per-token loss, weight the loss by the tp_dp_cp-reduced token count it covers,
+        #   not by the DP-local count.
+        if not self.calculate_per_token_loss:
+            dp_size = self.tp_dp_cp_group.size() // self.tp_cp_group.size()
+            global_aux_loss = global_aux_loss * dp_size
+            global_aux_loss_coeff = global_aux_loss_coeff * dp_size
+
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             global_aux_loss_coeff,
@@ -746,7 +761,7 @@ class TopKRouter(Router):
             self.tp_dp_cp_group,
             needs_dp_avg=False,
             valid_token_count=local_num_tokens,
-            aux_loss_scale_reduce_groups=(self.tp_cp_group,),
+            aux_loss_scale_num_tokens=total_num_tokens,
         )
         return probs
 
@@ -794,7 +809,8 @@ class TopKRouter(Router):
 
         Args:
             activation (torch.Tensor): Activation tensor to attach the aux loss to.
-            aux_loss_coeff (float): Coefficient for the aux loss.
+            aux_loss_coeff (float): Coefficient already applied to aux_loss. The logged value is
+                aux_loss / aux_loss_coeff.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup, optional): Deferred metric sum group.

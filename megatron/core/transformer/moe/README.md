@@ -295,7 +295,7 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 |----------|-------------|--------|
 | **aux_loss** | Auxiliary loss for balancing expert usage on a micro-batch | `--moe-router-load-balancing-type aux_loss` |
 | **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
-| **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
+| **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks. Its gradient does not depend on the data-parallel size; before this was fixed it was divided by it, so coefficients tuned at DP>1 before the fix should be divided by about DP to keep the same strength | `--moe-router-load-balancing-type global_aux_loss` |
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
 | **quantile_balancing** | Exact micro-batch or Kimi K3 global-batch histogram quantile bias updates | `--moe-router-load-balancing-type quantile_balancing --moe-router-score-function sigmoid --moe-aux-loss-coeff 0` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
