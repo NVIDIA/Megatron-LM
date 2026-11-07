@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Minimal generic kernel-classification taxonomy for nsys traces.
+# Order matters: first match wins. Put SPECIFIC categories before catch-alls.
+#
+# This is a STARTING POINT, not a golden reference. After running categorize.py
+# you MUST inspect the matched-kernel list per category and the uncategorized
+# list, then iterate the regexes until both look correct for your workload.
+# See SKILL.md "YAML verification" section.
+#
+# Categories typically reported in the SKILL workflow:
+#   Step 3 (heavy compute, never fused into anything else):
+#     gemm, conv, flash_attn, cudnn_sdpa
+#   Step 4 (op-group breakdown of the residual):
+#     rmsnorm, layer_norm, group_norm, rope, elementwise, fp8_cast, fp8_swizzle,
+#     reduce, concat, triton, mta_adam, mta_l2norm, mta_scale, sincos, inf_check,
+#     and any workload-specific custom-fused category you add.
+#   Step 5 (comm): nccl
+
+Overall:
+  # ---- Heavy compute (Step 3) ----
+  gemm: 'xmma_gemm|cutlass::Kernel|cublasLt::|cutlass3x(?:.*?)(?<!implicit_)gemm|nvjet|gemmk1|^ampere_|^volta_'
+  conv: 'implicit_gemm|(?:xmma|cutlass)_cudnn_(?:train|infer)::|(?:nchw|nhwc).*cudnnKernel|cutlass__\dx_cudnn|conv3d|conv2d'
+  flash_attn: 'flash_(?:fwd|bwd)'
+  cudnn_sdpa: 'cudnn_generated_fort_native_sdpa|cudnn::fusion::compute_dot_do_o|cudnn::fusion::convert_dq_to|transformer_engine::fused_attn'
+
+  # ---- Norm (always Step 4 — fusion partner-dependent) ----
+  rmsnorm: 'transformer_engine::normalization::rmsnorm_(?:fwd|bwd)|rms_norm|rmsnorm_(?:fwd|bwd)'
+  # NOTE: ln_(fwd|bwd) anchored to start-of-name or `::` to avoid false-matching
+  # custom fused kernels like `_fused_ln_adaln_fwd_kernel` (where `_ln_fwd` appears
+  # as a substring but is NOT a layernorm kernel).
+  layer_norm: 'layer_norm|GammaBetaBackwardCUDAKernel|cudnn::cnn::LayerNorm|(?:^|::)ln_(?:tma_)?[fb]wd|cudnn_generated_layer_norm|native_layer_norm'
+  group_norm: 'GroupNorm|RowwiseMomentsCUDAKernel|Compute1dBackward|GammaBeta1dBackward|group_norm_nhwc'
+
+  # ---- Attention/Transformer helpers ----
+  rope: 'fused_rope|rotary'
+  fp8_cast: 'transformer_engine::cast_(?:fp8|mxfp8)|quantize_(?:mxfp8|fp8)_kernel|cast_fp8'
+  fp8_amax_scale: 'amax_and_scale_update_impl|amax_kernel|compute_scale_from_amax_kernel'
+  fp8_swizzle: 'swizzle_(?:row|col)_scaling_kernel'
+
+  # ---- Optimizer / training utilities ----
+  mta_adam: 'multi_tensor_apply_kernel.*Adam'
+  mta_l2norm: 'multi_tensor_apply_kernel.*UnscaleL2Norm|L2NormFunctor|multi_tensor_l2norm'
+  mta_scale: 'multi_tensor_scale'
+  inf_check: '_amp_foreach_non_finite_check_and_unscale_cuda_'
+
+  # ---- Reductions / shape ops ----
+  reduce: 'reduce_kernel|reduce_dbias_kernel|reduce_dbias'
+  concat: 'CatArrayBatchedCopy|cat_kernel'
+  sincos: '(?:sin|cos)_kernel_cuda'
+
+  # ---- Generic catch-all buckets (must come LAST) ----
+  # `triton` matches Triton-compiled kernels (torch.compile / Inductor / hand
+  # Triton). Note: a Triton kernel that implements norm/gemm/etc. ideally
+  # belongs in the specific category instead. Keep this rule LAST so specific
+  # categories get first crack.
+  triton: '^triton_'
+  # `elementwise` is the residual ATen/native pointwise bucket. Keep LAST.
+  elementwise: 'elementwise|vectorized_elementwise_kernel|unrolled_elementwise_kernel|direct_copy_kernel|bfloat16_copy_kernel'
+
+  # ---- Communication (always Step 5) ----
+  nccl: '^ncclDevKernel|^nccl'
+
+# ---- Workload-specific examples (commented out — add as needed) ----
+# Uncomment / adapt for your workload. Custom fused kernels usually need
+# their own bucket so they don't get caught by `triton` or `elementwise`.
+#
+# Overall:
+#   flux_fused_norm_rope: '_qkv_split_norm_rope_kernel|_rope_norm_join_kernel'
+#   flux_fused_adaln: '_fused_ln_adaln_(?:fwd|bwd)_kernel'
+#   flux_fused_gate: '_gate_residual.*_kernel|_gate_bwd_kernel'
+#   flux_fused_seq: '_seq_(?:split|join)_kernel|_sum_cat\d+_kernel'
+#   ...followed by the standard categories above.
