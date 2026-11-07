@@ -1048,16 +1048,6 @@ def validate_args(args, defaults={}):
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
     )
 
-    if args.overlap_param_gather:
-        assert (
-            args.use_distributed_optimizer
-            or args.use_megatron_fsdp
-            or args.optimizer == 'dist_muon'
-        ), '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
-        assert (
-            args.overlap_grad_reduce
-        ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
-
     # A shortcut block calls its paired layers' sub-methods directly rather than their forward, so
     # the FSDP parameter all-gather hooks registered on the TransformerLayer/MambaLayer FSDP units
     # never fire and those parameters stay sharded. The expert-parallel overlap schedule hit the
@@ -1079,9 +1069,6 @@ def validate_args(args, defaults={}):
         assert (
             args.expert_model_parallel_size == 1
         ), '--use-torch-fsdp2 is not supported with expert parallelism'
-        assert (
-            not args.use_distributed_optimizer
-        ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
         assert (
             not args.gradient_accumulation_fusion
         ), '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
@@ -1112,20 +1099,6 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-    if args.overlap_param_gather_with_optimizer_step:
-        assert (
-            args.use_distributed_optimizer
-        ), '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
-        assert (
-            args.overlap_param_gather
-        ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
-        assert (
-            args.virtual_pipeline_model_parallel_size is not None
-        ), '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
-        assert (
-            not args.use_dist_ckpt
-        ), '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
-
     # Map string data-type to torch.dtype.
     dtype_map = {
         'fp32': torch.float32,
@@ -1137,10 +1110,6 @@ def validate_args(args, defaults={}):
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
-    args.main_grads_dtype = map_dtype(args.main_grads_dtype)
-    args.main_params_dtype = map_dtype(args.main_params_dtype)
-    args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
-    args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
     args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
@@ -1317,6 +1286,9 @@ def validate_args(args, defaults={}):
                 'Setting args.check_for_nan_in_loss_and_grad to False since '
                 'dynamic loss scaling is being used'
             )
+    # main_grads_dtype is still the CLI string here; it is mapped to a torch.dtype later, in
+    # OptimizerConfig.finalize_optimizer_config.
+    main_grads_is_fp32 = args.main_grads_dtype in ('fp32', torch.float32)
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
@@ -1324,12 +1296,12 @@ def validate_args(args, defaults={}):
         # be done in fp32.
         if args.accumulate_allreduce_grads_in_fp32:
             assert (
-                args.main_grads_dtype == torch.float32
+                main_grads_is_fp32
             ), "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
 
         if args.grad_reduce_in_bf16:
             args.accumulate_allreduce_grads_in_fp32 = False
-        elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
+        elif not args.accumulate_allreduce_grads_in_fp32 and main_grads_is_fp32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
 
@@ -1367,8 +1339,6 @@ def validate_args(args, defaults={}):
             'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1'
             '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
         )
-
-    print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -1443,8 +1413,6 @@ def validate_args(args, defaults={}):
         )
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
-    if args.lr is not None:
-        assert args.min_lr <= args.lr
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
@@ -1906,6 +1874,18 @@ def validate_args(args, defaults={}):
             f'must be >= single sequence max length ({args.seq_length})'
         )
 
+    if (
+        args.sequence_packing_scheduler == "dp_balanced"
+        and args.cuda_graph_impl == "transformer_engine"
+    ):
+        assert args.use_varlen_dataset and args.micro_batch_size == 1, (
+            "Scheduler CUDA graphs require one variable-length sample per dataset item "
+            "and --micro-batch-size 1."
+        )
+        assert (
+            args.step_batch_size_schedule is None
+        ), "Scheduler CUDA graphs require a fixed source global batch size."
+
     # Data blend checks
     assert (
         args.mock_data
@@ -1959,16 +1939,10 @@ def validate_args(args, defaults={}):
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # emerging optimizer check
+    # Dev keeps resolving the effective LayerWise optimizer (including the deprecated dist_muon
+    # alias) on the legacy args namespace for args-based consumers. The rule is identical to
+    # OptimizerConfig.finalize_optimizer_config(), so the run config resolves to the same values.
     args.use_layer_wise_distributed_optimizer = False
-    # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
-    # sgd/adam that block is skipped entirely, which would silently ignore the
-    # mode — the one case where the loud failure matters most.
-    if getattr(args, 'muon_tp_mode', 'duplicated') == 'layer_sharded':
-        assert args.optimizer in ('muon', 'dist_muon'), (
-            f"--muon-tp-mode layer_sharded is only supported with --optimizer muon "
-            f"(got --optimizer {args.optimizer}). Other optimizers, including "
-            "adaptive_muon, do not implement layer sharding."
-        )
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
@@ -1981,13 +1955,14 @@ def validate_args(args, defaults={}):
         if args.use_distributed_optimizer:
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
-
+    will_be_layer_wise = args.use_layer_wise_distributed_optimizer
+    if args.optimizer not in ('sgd', 'adam'):
         if (
             args.optimizer == 'muon'
             and (args.chunked_optimizer_state_offload or args.offload_optimizer_states)
             and args.optimizer_state_offload_fraction > 0.0
         ):
-            assert args.use_layer_wise_distributed_optimizer, (
+            assert will_be_layer_wise, (
                 "Muon optimizer state offload requires the LayerWise distributed optimizer "
                 "(--use-distributed-optimizer) so non-Muon parameter groups are routed through "
                 "a sibling DistributedOptimizer"
@@ -2002,21 +1977,7 @@ def validate_args(args, defaults={}):
             "torch_dist",
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
-        if args.muon_tp_mode == 'layer_sharded':
-            # optimizer == 'muon' is already guaranteed by the hoisted assert above.
-            # Note: making layer sharding a tp_mode also removed the old
-            # "--muon-tp-mode is ignored under layer sharding" ambiguity — the
-            # two can no longer be set at the same time.
-            assert args.use_layer_wise_distributed_optimizer, (
-                "--muon-tp-mode layer_sharded requires the layer-wise distributed "
-                "optimizer path (--optimizer muon with --use-distributed-optimizer)."
-            )
-            assert not args.muon_split_qkv, (
-                "--muon-tp-mode layer_sharded does not implement split-QKV "
-                "Newton-Schulz yet; pass --muon-no-split-qkv."
-            )
-
-    if args.use_layer_wise_distributed_optimizer:
+    if will_be_layer_wise:
         if not args.use_layer_wise_param_layout:
             # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
             # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
@@ -2060,15 +2021,9 @@ def validate_args(args, defaults={}):
                     "--reuse-grad-buf-for-mxfp8-param-ag."
                 )
 
-    assert not (args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight), (
-        "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
-        "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
-        "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
-    )
-
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
-        if args.use_distributed_optimizer:
+        if args.use_distributed_optimizer and args.optimizer in ('sgd', 'adam'):
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.
@@ -2254,17 +2209,6 @@ def validate_args(args, defaults={}):
         ),
     )
 
-    # Optimizer CPU offload check
-    if args.optimizer_cpu_offload:
-        assert args.use_precision_aware_optimizer, (
-            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
-            "as the hybrid device optimizer reuses the code path of this flag."
-        )
-        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
-            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
-            "must be used in conjunction with `--fp8-recipe delayed`."
-        )
-
     # Optimizer configuration normalizes the deprecated spelling. Include it here so
     # cross-config validation still runs before that configuration is constructed.
     if (
@@ -2296,7 +2240,11 @@ def validate_args(args, defaults={}):
         assert (
             args.cuda_graph_impl != 'full_iteration'
         ), "chunked optimizer state offload does not support full-iteration CUDA graphs"
-        if args.optimizer == 'muon' and args.fp8_param_gather and args.overlap_param_gather:
+        if (
+            args.optimizer in ('muon', 'dist_muon')
+            and args.fp8_param_gather
+            and args.overlap_param_gather
+        ):
             warn_rank_0(
                 "Muon compact FP8 parameter gather with chunked optimizer state offload "
                 "forces LayerWise-owned pre-forward parameter buckets to complete before "
@@ -3082,7 +3030,8 @@ def _add_network_size_args(parser):
         type=json.loads,
         default=None,
         metavar='JSON',
-        help='Backend-specific MoE megakernel options as a JSON object.',
+        help='MCore common options (shared_expert_mode) and backend-specific MoE '
+        'megakernel options as a JSON object.',
     )
 
     group = parser.add_argument_group(title='network size')
@@ -3540,6 +3489,15 @@ def _add_regularization_args(parser):
         type=float,
         default=0.01,
         help='Weight decay coefficient for L2 regularization.',
+    )
+    group.add_argument(
+        '--rmsnorm-weight-decay-mult',
+        type=float,
+        default=None,
+        help='Multiplier on scheduled global weight decay for RMSNorm gamma '
+        'only (e.g. 0.5 for half decay, 1.0 for full decay, 0.0 for none). '
+        'Unset preserves the existing policy. Overrides '
+        '--apply-wd-to-qk-layernorm for RMSNorm gamma only.',
     )
     group.add_argument(
         '--apply-wd-to-qk-layernorm',
@@ -4341,6 +4299,11 @@ def _add_distributed_args(parser):
         default=1,
         choices=[1, 2],
         help='Megatron-FSDP implementation version. Defaults to 1.',
+    )
+    group.add_argument(
+        '--overlap-outer-communication',
+        action='store_true',
+        help="Overlap outer-DP and inner-DP gradient reductions with Megatron-FSDP v2.",
     )
     group.add_argument(
         '--no-use-layer-wise-param-layout',

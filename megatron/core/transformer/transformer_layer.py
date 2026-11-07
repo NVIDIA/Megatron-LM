@@ -1802,13 +1802,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
-                # Static cu_seqlens shaped [thd_max_packed_sequences + 1]. We seed it as
+                # Static cu_seqlens shaped [capacity + 1]. The capacity is
+                # thd_max_packed_sequences or cuda_graph_thd_max_packed_sequences; the
+                # config allows only one of them. We seed it as
                 # one full-length sequence (covers the worst case at capture):
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
                 # entries. cu_seqlens_q / kv / *_padded all share this layout.
                 max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
                 max_num_seqs = self.config.thd_max_packed_sequences
+                if max_num_seqs is None:
+                    max_num_seqs = self.config.cuda_graph_thd_max_packed_sequences
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
 
@@ -2223,7 +2227,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
-        graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        graph_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+        }
         hidden_states = args[0] if args else kwargs["hidden_states"]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device

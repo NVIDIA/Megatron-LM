@@ -184,6 +184,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
+    "hca_aligned_backward": False,
     "hetereogenous_dist_checkpoint": False,
     "heterogeneous_block_specs": False,
     "hidden_dropout": 0.0,
@@ -197,6 +198,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "init_method_std": 0.014,
     "init_model_with_meta_device": False,
     "is_hybrid_model": True,
+    "kda_f_lora_rank": None,
+    "kda_gate_lora_rank": None,
     "kda_lower_bound": None,
     "kda_safe_gate": False,
     "kitchen_attention_backend": "sdpa",
@@ -345,6 +348,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
     "overlap_p2p_comm_warmup_flush": False,
+    "pad_packed_seq_alignment": None,
     "param_sync_func": None,
     "params_dtype": "torch.bfloat16",
     "perform_initialization": True,
@@ -377,6 +381,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
     "thd_max_packed_sequences": None,
+    "cuda_graph_thd_max_packed_sequences": None,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -437,6 +442,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_flashinfer_mxfp8_token_capacity": None,
     "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
+    "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
     "linear_attention_type": None,
     "mlp_chunks_for_training": 1,
@@ -449,6 +455,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "head_wise_attn_gate": False,
     "moe_hybridep_pad_variable_tokens": False,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
+    "attention_output_gate_fusion": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

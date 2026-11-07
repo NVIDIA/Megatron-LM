@@ -429,6 +429,7 @@ def run_full_recompute_case(
             for layer in segment.layers:
                 for node in layer._iter_recomputed_nodes():
                     assert node.output is None, f"{node.name} kept its forward output"
+                    assert node._output_edges is None, f"{node.name} kept its forward graph edge"
                     assert node.inputs is None, f"{node.name} kept its forward inputs"
         # What survives the gap is the segment input alone, not the graph that built it.
         assert_segment_inputs_are_graph_free(plan)

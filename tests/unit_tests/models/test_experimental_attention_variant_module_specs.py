@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,6 +45,10 @@ class _FakeQKNorm:
 
 
 class _FakeCoreAttention:
+    pass
+
+
+class _FakeBatchedLinear:
     pass
 
 
@@ -280,10 +285,12 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.metainfo == {"fuse_input_layernorm": True}
 
     def test_kda_uses_direct_projection_submodules(self):
-        """KDA uses separate input and beta projections without fused input norm."""
+        """KDA specs use the expected direct and tensor-parallel projections."""
+        from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_gated_delta_net_module_spec,
         )
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
         from megatron.core.ssm.gated_delta_net import (
             KimiDeltaAttention,
             KimiDeltaAttentionSubmodules,
@@ -296,8 +303,25 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.module is KimiDeltaAttention
         assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
         assert spec.submodules.in_proj == _FakeColumnParallelLinear
-        assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.submodules.beta_proj == _FakeLinear
+        assert spec.submodules.f_proj == _FakeColumnParallelLinear
+        assert spec.submodules.f_a_proj == _FakeLinear
+        assert spec.submodules.f_b_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_a_proj == _FakeLinear
+        assert spec.submodules.g_b_proj == _FakeColumnParallelLinear
         assert spec.metainfo == {"fuse_input_layernorm": False}
+
+        hybrid_submodules = (
+            hybrid_stack_spec.submodules.kda_layer.submodules.self_attention.submodules
+        )
+        assert hybrid_submodules.beta_proj is TELinear
+        assert hybrid_submodules.f_proj is TEColumnParallelLinear
+        assert hybrid_submodules.f_a_proj is TELinear
+        assert hybrid_submodules.f_b_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_a_proj is TELinear
+        assert hybrid_submodules.g_b_proj is TEColumnParallelLinear
 
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
@@ -459,6 +483,65 @@ class TestGetDsaModuleSpec:
         # column_parallel_linear() is called for q_proj, q_up_proj, kv_up_proj, and gate.
         assert backend.column_parallel_linear.call_count == 4
         assert backend.row_parallel_linear.call_count == 1
+
+
+# ===================================================================
+# Tests for get_dsv4_hybrid_module_spec_for_backend
+# ===================================================================
+
+
+class TestGetDSv4HybridModuleSpec:
+    MODULE = (
+        "megatron.core.transformer.experimental_attention_variant."
+        "deepseek_v4_hybrid_attention_module_specs"
+    )
+
+    @staticmethod
+    def _config():
+        return _make_config(
+            multi_latent_attention=True,
+            qk_l2_norm=False,
+            qk_layernorm=True,
+            experimental_attention_variant="dsv4_hybrid",
+        )
+
+    def _call(self):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_dsv4_hybrid_module_spec_for_backend,
+        )
+
+        return get_dsv4_hybrid_module_spec_for_backend(
+            config=self._config(), backend=_make_backend()
+        )
+
+    def test_uses_te_batched_linear_when_available(self):
+        """The canonical DSv4 spec should select TE's BatchedLinear operation."""
+        fake_te = SimpleNamespace(
+            pytorch=SimpleNamespace(ops=SimpleNamespace(BatchedLinear=_FakeBatchedLinear))
+        )
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is _FakeBatchedLinear
+
+    @pytest.mark.parametrize(
+        "fake_pytorch",
+        [SimpleNamespace(), SimpleNamespace(ops=SimpleNamespace())],
+        ids=["ops_unavailable", "batched_linear_unavailable"],
+    )
+    def test_sets_none_when_te_batched_linear_is_unavailable(self, fake_pytorch):
+        """Old TE installations should leave construction to the einsum fallback."""
+        fake_te = SimpleNamespace(pytorch=fake_pytorch)
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is None
 
 
 # ===================================================================
