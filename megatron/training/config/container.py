@@ -473,7 +473,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         if sequence_shards > 1:
             if self.checkpoint.ckpt_format != "torch_dist":
                 raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
-            if self.ddp.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
+            if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
@@ -483,7 +483,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
-            use_torch_fsdp2=self.ddp.use_torch_fsdp2,
+            use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
             ckpt_format=self.checkpoint.ckpt_format,
         )
         optimizer.validate_model(
@@ -503,11 +503,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         other side (ddp, dist, optimizer). Read-only; the CLI runs the same checks from the
         arguments in ``validate_args``."""
         checkpoint, ddp, dist = self.checkpoint, self.ddp, self.dist
-        if ddp.use_torch_fsdp2:
+        if isinstance(ddp, TorchFullyShardedDataParallelConfig):
             assert checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
                 '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         if checkpoint.ckpt_format == "torch_dcp":
-            assert ddp.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+            assert isinstance(ddp, TorchFullyShardedDataParallelConfig), "--ckpt-format torch_dcp is only tested with FSDP."
         if ddp.use_megatron_fsdp:
             assert checkpoint.ckpt_format == "fsdp_dtensor", \
                 "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
@@ -546,9 +546,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
             assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
         transformer = getattr(self.model, "transformer", None)
-        if self.ddp.use_torch_fsdp2:
-            if not isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
-                raise ValueError("Torch FSDP2 requires TorchFullyShardedDataParallelConfig.")
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             if self.ddp.use_megatron_fsdp:
                 raise ValueError("Torch FSDP2 and Megatron FSDP cannot be used together.")
             if not is_torch_min_version("2.4.0"):
@@ -557,12 +555,10 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("Torch FSDP2 cannot use the distributed optimizer.")
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
-        elif isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
-            raise ValueError("TorchFullyShardedDataParallelConfig requires ddp.use_torch_fsdp2.")
         if self.ddp.use_megatron_fsdp:
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
-        if self.ddp.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
             if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
             if transformer is not None and transformer.moe_shortcut_connection:
@@ -574,7 +570,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("FP8 parameter gathering requires FP8 compute.")
             if self.ddp.fp4_param_gather and not transformer.fp4:
                 raise ValueError("FP4 parameter gathering requires FP4 compute.")
-            if self.ddp.use_torch_fsdp2:
+            if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
                 if transformer.pipeline_model_parallel_size != 1:
                     raise ValueError("Torch FSDP2 does not support pipeline parallelism.")
                 if transformer.expert_model_parallel_size != 1:
@@ -750,7 +746,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
-        if self.ddp.use_torch_fsdp2:
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             if is_te_min_version("2.0.0"):
                 self.ddp.fp8_param_gather = False
             if not is_te_min_version("2.7.0.dev0"):
@@ -785,7 +781,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.ddp.fsdp_all_gather_in_start_param_sync = False
         # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
         self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
-            not self.ddp.use_torch_fsdp2
+            not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
             and not self.ddp.use_megatron_fsdp
             and self.optimizer.use_layer_wise_distributed_optimizer
             and self.optimizer.use_layer_wise_param_layout
@@ -835,8 +831,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
             dataset.hybrid_context_parallel = False
         self.data.finalize()
-        if self.rl.perform_rl_step:
-            self.rl.finalize_ddp_config(self.ddp)
+        if self.rl.requires_grad_buffer_offload:
+            self.ddp.grad_buffer_offload = True
         self.ddp.finalize()
 
 

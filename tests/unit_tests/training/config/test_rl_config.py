@@ -349,8 +349,6 @@ def test_validate_run_at_every_call_site():
     cuda_graph_container.model.transformer.cuda_graph_impl = "local"
     cuda_graph_container.validate()
     assert not cuda_graph_container.ddp.grad_buffer_offload
-    cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
-    assert not cuda_graph_container.ddp.grad_buffer_offload
     explicit_layout_container = container(rl=RLConfig())
     explicit_layout_container.ddp.grad_buffer_offload = True
     explicit_layout_container.validate()
@@ -438,50 +436,65 @@ def test_validate_args_leaves_derived_values_on_the_section():
 @pytest.mark.parametrize("cuda_graphs", [False, True])
 @pytest.mark.parametrize("explicit_layout", [False, True])
 def test_ddp_layout_validation_and_finalization(
-    perform_rl_step, offload, cuda_graphs, explicit_layout
+    run_config, perform_rl_step, offload, cuda_graphs, explicit_layout
 ):
     from megatron.core.distributed import DistributedDataParallelConfig
 
-    cfg = RLConfig(
+    run_config.rl = RLConfig(
         perform_rl_step=perform_rl_step,
         rl_offload_optimizer_during_inference=offload,
         rl_training_cuda_graphs=cuda_graphs,
     )
     ddp = DistributedDataParallelConfig(grad_buffer_offload=explicit_layout)
+    run_config.ddp = ddp
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    if cuda_graphs:
+        run_config.model.transformer.cuda_graph_impl = "local"
     before = dataclasses.asdict(ddp)
     for _ in range(2):
-        cfg.validate_ddp_config(ddp)
+        run_config.validate()
         assert dataclasses.asdict(ddp) == before
-    cfg.finalize_ddp_config(ddp)
+    run_config.finalize()
     assert ddp.grad_buffer_offload == (
         explicit_layout or (perform_rl_step and offload and not cuda_graphs)
     )
     assert serialize_value(ddp)["grad_buffer_offload"] == (ddp.grad_buffer_offload)
 
 
-def test_ddp_finalization_rejects_aliasing_before_mutation():
+def test_ddp_finalization_rejects_aliasing_before_mutation(run_config):
     from megatron.core.distributed import DistributedDataParallelConfig
 
-    cfg = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+    run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     ddp = DistributedDataParallelConfig(
         fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True
     )
+    run_config.ddp = ddp
+    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
     before = dataclasses.asdict(ddp)
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        cfg.finalize_ddp_config(ddp)
+        run_config.finalize()
     assert dataclasses.asdict(ddp) == before
 
 
-def test_ddp_finalization_preserves_subclass_fields():
+def test_ddp_finalization_preserves_subclass_fields(monkeypatch, run_config):
     from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 
-    cfg = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     ddp = TorchFullyShardedDataParallelConfig(reshard_after_forward=False)
-    before = dataclasses.asdict(ddp)
-    cfg.validate_ddp_config(ddp)
-    cfg.finalize_ddp_config(ddp)
+    run_config.ddp = ddp
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    run_config.model.transformer.gradient_accumulation_fusion = False
+    run_config.model.share_embeddings_and_output_weights = False
+    run_config.validate()
+    run_config.finalize()
     assert type(ddp) is TorchFullyShardedDataParallelConfig
-    assert dataclasses.asdict(ddp) == {**before, "grad_buffer_offload": True}
+    assert not ddp.reshard_after_forward
+    assert ddp.grad_buffer_offload
 
 
 @pytest.mark.parametrize("native_builder", [False, True])
@@ -506,8 +519,6 @@ def test_model_setup_uses_owned_ddp_config(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )
     ddp = run_config.ddp
-    finalize = Mock(wraps=run_config.rl.finalize_ddp_config)
-    monkeypatch.setattr(run_config.rl, "finalize_ddp_config", finalize)
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -523,10 +534,6 @@ def test_model_setup_uses_owned_ddp_config(
         assert kwargs["ddp_config"] is ddp
         assert ddp.grad_buffer_offload is perform_rl_step
         assert run_config.ddp is ddp
-        if perform_rl_step:
-            finalize.assert_called_once_with(ddp)
-        else:
-            finalize.assert_not_called()
         raise ReachedConstruction
 
     if native_builder:

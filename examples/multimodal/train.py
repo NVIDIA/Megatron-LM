@@ -16,6 +16,7 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -164,7 +165,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     if imgs.shape == torch.Size([1, 1]):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
-        if cfg.ddp.use_torch_fsdp2:
+        if isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig):
             imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.

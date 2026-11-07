@@ -9,7 +9,6 @@ import time
 _TRAIN_START_TIME = time.time()  # The earliest we can measure the start time.
 
 # Standard library.
-import argparse
 import copy
 import dataclasses
 import functools
@@ -2752,7 +2751,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if (
         not (
             ddp_config is not None
-            and ddp_config.use_torch_fsdp2
+            and isinstance(ddp_config, TorchFullyShardedDataParallelConfig)
             and config.use_cpu_initialization
         )
         and not config.init_model_with_meta_device
@@ -2768,7 +2767,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if config.init_model_with_meta_device and not (
         ddp_config is not None
-        and (ddp_config.use_torch_fsdp2 or ddp_config.use_megatron_fsdp)
+        and (isinstance(ddp_config, TorchFullyShardedDataParallelConfig) or ddp_config.use_megatron_fsdp)
     ):
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
@@ -2780,7 +2779,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if ddp_config.use_torch_fsdp2:
+        if isinstance(ddp_config, TorchFullyShardedDataParallelConfig):
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         elif ddp_config.use_megatron_fsdp:
@@ -2790,7 +2789,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        if not ddp_config.use_torch_fsdp2:
+        if not isinstance(ddp_config, TorchFullyShardedDataParallelConfig):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.resolve_bucket_size(
                 num_parameters=num_parameters,
@@ -2894,53 +2893,6 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
-def get_megatron_ddp_config(
-    args: argparse.Namespace, *, use_torch_fsdp2: bool
-) -> DistributedDataParallelConfig:
-    """Return an MCore DDPConfig from the argparse arguments."""
-
-    if use_torch_fsdp2:
-        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(
-            reshard_after_forward=reshard_after_forward,
-            fp8_param_gather=getattr(args, "fp8_param_gather", False),
-            fp4_param_gather=getattr(args, "fp4_param_gather", False),
-        )
-    else:
-        kwargs = {}
-        for f in dataclasses.fields(DistributedDataParallelConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-        kwargs["check_for_large_grads"] = args.check_for_large_grads
-        kwargs["num_buckets"] = args.ddp_num_buckets
-        kwargs["bucket_size"] = args.ddp_bucket_size
-        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-        kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
-        kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
-            tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
-        kwargs["average_in_collective"] = args.ddp_average_in_collective
-        # Megatron-FSDP arguments.
-        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-        if args.use_megatron_fsdp and args.megatron_fsdp_version == 1:
-            kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
-        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
-            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
-            # operations (such as pointer dereferencing) that can break CUDA graph replay.
-            kwargs["megatron_fsdp_cuda_graph_mode"] = True
-            if args.cuda_graph_impl == "full_iteration":
-                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
-                # during start_param_sync(), which is called during the DistOpt.step(). This
-                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
-                # the scope of the full-iter / FWD-BWD CUDA graph capture.
-                kwargs["fsdp_all_gather_in_start_param_sync"] = False
-
-        return DistributedDataParallelConfig(**kwargs)
-
-
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -2995,7 +2947,7 @@ def setup_model_and_optimizer(
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
-                use_torch_fsdp2=cfg.ddp.use_torch_fsdp2,
+                use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
@@ -3186,7 +3138,7 @@ def setup_model_and_optimizer(
                 restore_training_state=True,
                 record_finetune=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
-                and cfg.ddp.use_torch_fsdp2
+                and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
                 and cfg.checkpoint.ckpt_format == "torch_dist",
                 tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
                 pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,

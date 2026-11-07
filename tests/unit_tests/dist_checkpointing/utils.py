@@ -16,9 +16,10 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
+from megatron.training.argument_utils import get_megatron_ddp_config
 from megatron.training.arguments import parse_args
 from megatron.training.global_vars import get_run_config, is_run_config_initialized
-from megatron.training.training import get_megatron_ddp_config, get_model
+from megatron.training.training import get_model
 from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 try:

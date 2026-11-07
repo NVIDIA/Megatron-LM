@@ -22,6 +22,10 @@ import torch.nn.functional as F
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
@@ -1134,6 +1138,53 @@ def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
     return deepcopy(_default_config_from_args(DataloaderConfig, args))
 
 
+def get_megatron_ddp_config(
+    args: Namespace, *, use_torch_fsdp2: bool
+) -> DistributedDataParallelConfig:
+    """Return an MCore DDPConfig from the argparse arguments."""
+
+    if use_torch_fsdp2:
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(
+            reshard_after_forward=reshard_after_forward,
+            fp8_param_gather=getattr(args, "fp8_param_gather", False),
+            fp4_param_gather=getattr(args, "fp4_param_gather", False),
+        )
+    else:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+        kwargs["check_for_large_grads"] = args.check_for_large_grads
+        kwargs["num_buckets"] = args.ddp_num_buckets
+        kwargs["bucket_size"] = args.ddp_bucket_size
+        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
+        kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
+            tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
+        kwargs["average_in_collective"] = args.ddp_average_in_collective
+        # Megatron-FSDP arguments.
+        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        if args.use_megatron_fsdp and args.megatron_fsdp_version == 1:
+            kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
+            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
+            # operations (such as pointer dereferencing) that can break CUDA graph replay.
+            kwargs["megatron_fsdp_cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "full_iteration":
+                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
+                # during start_param_sync(), which is called during the DistOpt.step(). This
+                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
+                # the scope of the full-iter / FWD-BWD CUDA graph capture.
+                kwargs["fsdp_all_gather_in_start_param_sync"] = False
+
+        return DistributedDataParallelConfig(**kwargs)
+
+
 def pretrain_cfg_container_from_args(
     args: Namespace, model_cfg=None, *, data_cfg: DataConfig | None = None
 ) -> PretrainConfigContainer:
@@ -1144,8 +1195,6 @@ def pretrain_cfg_container_from_args(
     settings only, for entry points whose datasets are built by their own callbacks (nothing
     dataset-related is validated, bound or read for them).
     """
-    from megatron.training.training import get_megatron_ddp_config
-
     if data_cfg is None:
         data_cfg = DataConfig(dataloader=dataloader_config_from_args(args))
 

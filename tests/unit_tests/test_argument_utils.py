@@ -124,7 +124,7 @@ def test_gtp_userbuffer_flags_preserve_cli_contract(name):
 
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
-    from megatron.training.training import get_megatron_ddp_config
+    from megatron.training.argument_utils import get_megatron_ddp_config
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -1438,7 +1438,9 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
+    with patch(
+        "megatron.training.argument_utils.get_megatron_ddp_config", return_value=mock_ddp_config
+    ):
         yield
 
 
@@ -1449,7 +1451,7 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
     def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)

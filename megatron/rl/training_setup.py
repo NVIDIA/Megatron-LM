@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 from megatron.core import mpu
 from megatron.core._rank_utils import safe_get_world_size
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.num_microbatches_calculator import (
@@ -122,7 +123,7 @@ def load_reference_state_dict(
 
     print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
     skip_load_to_model_and_opt = (
-        HAVE_FSDP2 and cfg.ddp.use_torch_fsdp2 and cfg.checkpoint.ckpt_format == "torch_dist"
+        HAVE_FSDP2 and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig) and cfg.checkpoint.ckpt_format == "torch_dist"
     )
     # The reference weights come from --pretrained-checkpoint, weights-only: the load directory
     # is cleared so the pretrained fallback applies, for this load only (the run's checkpoint

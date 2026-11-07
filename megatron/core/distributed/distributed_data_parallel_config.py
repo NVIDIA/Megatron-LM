@@ -103,9 +103,6 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
-    use_torch_fsdp2: bool = False
-    """Use Torch FSDP2 with TorchFullyShardedDataParallelConfig, instead of Megatron DDP/FSDP."""
-
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
@@ -357,12 +354,15 @@ class DistributedDataParallelConfig:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
         if self.megatron_fsdp_max_pool_double_buffer:
             self.fsdp_double_buffer = True
+        if self.use_megatron_fsdp and self.megatron_fsdp_version == 1 and self.nccl_ub:
+            self.fsdp_double_buffer = True
 
     def validate(self) -> None:
         """Check user settings without mutation, including edits after construction.
 
         Optimizer-owned buffer policy may still be stale here. Its resolved layout
         is checked by the training container and at DDP wrapper construction.
+        Unresolved defaults are checked without requiring canonicalization first.
         """
         for name in (
             "data_parallel_sharding_strategy",
@@ -412,6 +412,7 @@ class DistributedDataParallelConfig:
         when provided, remains authoritative. An explicit or previously resolved
         bucket_size is otherwise retained. Per-chunk bucketing overrides stay local
         to the wrappers and must not overwrite this run-wide setting.
+        Re-resolution is supported before wrapper construction, not after buffers exist.
         """
         if self.num_buckets is not None:
             assert self.num_buckets > 0, "num_buckets must be greater than 0"

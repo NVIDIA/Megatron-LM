@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
@@ -804,7 +805,7 @@ def test_callback_model_config_owns_shared_inputs(
     "section, name, value, error",
     [
         ("checkpoint", "ckpt_format", "torch", "requires torch_dist"),
-        ("ddp", "use_torch_fsdp2", True, "not FSDP"),
+        ("ddp", None, TorchFullyShardedDataParallelConfig(), "not FSDP"),
         ("ddp", "use_megatron_fsdp", True, "not FSDP"),
         ("dist", "use_tp_pp_dp_mapping", True, "TP-PP-DP mapping"),
     ],
@@ -826,9 +827,12 @@ def test_native_gtp_sequence_sharding_validates_cross_config_inputs(
         seq_length=32,
     )
     run_config.validate()
-    owner = getattr(run_config, section)
-    assert hasattr(owner, name)
-    setattr(owner, name, value)
+    if name is None:
+        setattr(run_config, section, value)
+    else:
+        owner = getattr(run_config, section)
+        assert hasattr(owner, name)
+        setattr(owner, name, value)
     with pytest.raises(ValueError, match=error):
         run_config.validate()
 

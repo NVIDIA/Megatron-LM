@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.training import async_utils, global_vars, training
 from megatron.training.argument_utils import (
     checkpoint_config_from_args,
@@ -278,7 +279,7 @@ def test_construction_runs_no_checks():
     "setup, match",
     [
         (
-            dict(ddp=dict(use_torch_fsdp2=True), checkpoint=dict(ckpt_format="torch")),
+            dict(ddp=TorchFullyShardedDataParallelConfig(), checkpoint=dict(ckpt_format="torch")),
             "--use-torch-fsdp2 requires",
         ),
         (dict(checkpoint=dict(ckpt_format="torch_dcp")), "only tested with FSDP"),
@@ -303,8 +304,11 @@ def test_construction_runs_no_checks():
 )
 def test_training_container_checks_the_format_against_its_other_sections(run_config, setup, match):
     for section, values in setup.items():
-        for name, value in values.items():
-            setattr(getattr(run_config, section), name, value)
+        if isinstance(values, dict):
+            for name, value in values.items():
+                setattr(getattr(run_config, section), name, value)
+        else:
+            setattr(run_config, section, values)
     with pytest.raises(AssertionError, match=match):
         run_config.validate()
 

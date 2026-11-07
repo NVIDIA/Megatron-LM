@@ -305,7 +305,7 @@ def test_megatron_fsdp_finalization(
         assert run_config.to_dict() == before
         run_config.finalize()
         assert ddp.fsdp_manual_registration is (version == 1)
-        assert not ddp.fsdp_double_buffer
+        assert ddp.fsdp_double_buffer is (version == 1)
         assert ddp.average_in_collective is (version != 1 or disable_symmetric_registration)
         assert ddp.use_distributed_optimizer is (version == 1)
         assert run_config.optimizer.use_distributed_optimizer is (version == 1)
@@ -509,3 +509,8 @@ def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
     restored.ddp.validate()
     restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
     assert restored.to_dict()["ddp"] == run_config.to_dict()["ddp"]
+    if policy == "count":
+        # A restored count remains authoritative when rebuilding wrappers for a new run.
+        restored.ddp.num_buckets = 4
+        restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+        assert restored.ddp.bucket_size == (2048 if overlap else None)
