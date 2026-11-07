@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Bitwise ON-vs-OFF check for muon + ``--fp8-param-gather`` on the DECOUPLED
-compact LayerWise layout (the default; ``--use-layer-wise-param-layout`` opts into
-the padded layout).
+compact LayerWise layout (``--emerging-optimizer-grad-collective all-reduce``; the padded
+layout is the default).
 
 Construction mirrors tests/unit_tests/test_muon_mxfp8_fp8_param_gather.py
 (PR #4987), but on the decouple path — the route where FP8 param-gather is
@@ -194,8 +194,8 @@ class TestMuonDecoupleFP8ParamGather:
         args.exp_avg_dtype = 'fp32'
         args.exp_avg_sq_dtype = 'fp32'
         args.use_distributed_optimizer = True
-        # DECOUPLED compact LayerWise layout (the supported FP8 param-gather route).
-        args.use_layer_wise_param_layout = False
+        # Compact LayerWise layout (whole-param FP8 gathers from the owners' masters).
+        args.emerging_optimizer_grad_collective = 'all-reduce'
         # --overlap-param-gather requires --overlap-grad-reduce (arguments.py); co-enable.
         args.overlap_param_gather = overlap
         args.overlap_grad_reduce = overlap

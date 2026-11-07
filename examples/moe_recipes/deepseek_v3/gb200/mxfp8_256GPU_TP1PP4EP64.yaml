@@ -243,7 +243,6 @@ ARGS:
   fp8_recipe: mxfp8
   fp8_format: e4m3
   fp8_param_gather: true
-  reuse_grad_buf_for_mxfp8_param_ag: true
   overlap_grad_reduce: true
   overlap_param_gather: true
   use_precision_aware_optimizer: true

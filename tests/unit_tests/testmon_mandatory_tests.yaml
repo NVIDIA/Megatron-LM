@@ -75,7 +75,7 @@ mappings:
     test_buckets:
       dgx_h100:
         - tests/unit_tests/test_emerging_optimizers.py
-        - tests/unit_tests/optimizer/test_muon_sync_qkv_cpu.py
+        - tests/unit_tests/optimizer/test_muon_qkv_split.py
   - source_dirs:
       - megatron/core/optimizer/layer_wise_optimizer.py
     test_buckets:

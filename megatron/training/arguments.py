@@ -1180,8 +1180,6 @@ def validate_args(args, defaults={}):
                     args.rank,
                 )
             args.use_distributed_optimizer = True
-        # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
-        args.reuse_grad_buf_for_mxfp8_param_ag = False
         if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
             # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
             # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
@@ -1272,6 +1270,22 @@ def validate_args(args, defaults={}):
             args.use_megatron_fsdp
         ), "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+
+    # MXFP8 params cannot be mapped into DDP's param buffer (TE has no replace_raw_data for
+    # MXFP8Tensor), so their all-gather always goes through the grad buffer; FSDP keeps its own
+    # buffers. The flag is therefore derived rather than chosen.
+    if args.reuse_grad_buf_for_mxfp8_param_ag:
+        warn_rank_0(
+            '--reuse-grad-buf-for-mxfp8-param-ag is deprecated and ignored: the grad buffer is '
+            'reused for the MXFP8 parameter all-gather whenever --fp8-param-gather is set.',
+            args.rank,
+        )
+    args.reuse_grad_buf_for_mxfp8_param_ag = (
+        args.fp8 is not None
+        and args.fp8_recipe == 'mxfp8'
+        and args.fp8_param_gather
+        and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
+    )
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1699,14 +1713,6 @@ def validate_args(args, defaults={}):
                 "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
                 "GTP does not keep or re-quantize a bf16 weight)."
             )
-            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
-            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
-            # all-gather must reuse the grad buffer instead.
-            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
-                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
-                "(MXFP8 params keep their own quantized storage; mapping them into the param "
-                "buffer via replace_raw_data is unsupported)."
-            )
 
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
@@ -1976,50 +1982,6 @@ def validate_args(args, defaults={}):
             "torch",
             "torch_dist",
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
-
-    if will_be_layer_wise:
-        if not args.use_layer_wise_param_layout:
-            # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
-            # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
-            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
-            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
-            # flatten path.
-            assert not getattr(args, 'fp4_param_gather', False), (
-                "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
-                "(mxfp8 or blockwise); fp4_param_gather is out of scope."
-            )
-            if args.fp8_param_gather:
-                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
-                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
-                    f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
-                )
-                if args.fp8_recipe == 'mxfp8':
-                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
-                        "mxfp8 + --fp8-param-gather on the decoupled compact LayerWise DDP layout "
-                        "requires --reuse-grad-buf-for-mxfp8-param-ag (or use fp8_recipe='blockwise')."
-                    )
-            assert args.num_distributed_optimizer_instances == 1, (
-                "the decoupled compact LayerWise DDP layout (the default; pass "
-                "--use-layer-wise-param-layout for the padded layout) requires "
-                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
-                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
-                "instance) would under-reduce Muon gradients across the full data-parallel domain."
-            )
-        else:
-            assert not getattr(
-                args, 'fp4_param_gather', False
-            ), "Padded LayerWise parameter layout does not support FP4 parameter gather."
-            if args.fp8_param_gather:
-                # Main's padded MXFP8 path stages masters through the BF16 grad buffer
-                # before the fixed-size gather. Other recipes still use dev's compact path.
-                assert args.fp8_recipe == 'mxfp8', (
-                    "Padded LayerWise parameter layout supports FP8 parameter gather only "
-                    "with fp8_recipe='mxfp8'; use the compact layout for blockwise FP8."
-                )
-                assert args.reuse_grad_buf_for_mxfp8_param_ag, (
-                    "Padded LayerWise MXFP8 parameter gather requires "
-                    "--reuse-grad-buf-for-mxfp8-param-ag."
-                )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3541,7 +3503,9 @@ def _add_regularization_args(parser):
         action='store_true',
         help='Orthogonalize each Q, gate, K, and V head independently. '
         'Uniform head sizes use batched Newton-Schulz. '
-        'MLA up-projections additionally require --muon-split-mla-qkv.',
+        'MLA up-projections additionally require --muon-split-mla-qkv. '
+        'Like the projection split, applies only when every tensor-parallel rank holds '
+        'whole query groups.',
     )
     group.add_argument(
         '--muon-split-mla-qkv',
@@ -4115,7 +4079,8 @@ def _add_mixed_precision_args(parser):
     group.add_argument(
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
-        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+        help='Deprecated and ignored: the grad buffer is reused for the MXFP8 '
+        'parameter all-gather whenever --fp8-param-gather is set.',
     )
     group.add_argument(
         '--mamba-training-ssm-states-dtype',
@@ -4306,13 +4271,19 @@ def _add_distributed_args(parser):
         help="Overlap outer-DP and inner-DP gradient reductions with Megatron-FSDP v2.",
     )
     group.add_argument(
-        '--no-use-layer-wise-param-layout',
-        action='store_false',
-        dest='use_layer_wise_param_layout',
-        default=False,
-        help='Use the compact decoupled LayerWise parameter layout (the default). '
-        'Muon parameters use compact LayerWise buffers while other parameters remain in '
-        'the sibling optimizer. --use-layer-wise-param-layout selects the padded layout.',
+        '--emerging-optimizer-grad-collective',
+        type=str,
+        default='reduce-scatter',
+        choices=['reduce-scatter', 'all-reduce'],
+        help='Data-parallel gradient collective for the parameters that an '
+        'emerging optimizer with --use-distributed-optimizer (e.g. Muon) '
+        'updates whole on one rank. reduce-scatter (default): those tensors '
+        'stay whole inside padded, equal-size shards. all-reduce: no padding, '
+        'twice the gradient traffic and an uneven all-gather of whole tensors; '
+        'needed for blockwise FP8 params and Muon chunked optimizer-state '
+        'offload. Other parameters always use reduce-scatter, and torch_dist '
+        'checkpoints load with either. The legacy layer-wise layout was '
+        'removed; see docs/user-guide/features/dist_optimizer.md.',
     )
     group.add_argument(
         '--use-nccl-ub',
@@ -4509,21 +4480,6 @@ def _add_distributed_args(parser):
         default=None,
         help="Pad packed THD inputs to a CP-local multiple or 'max'. "
         "MXFP8 additionally aligns to 32 tokens after SP sharding.",
-    )
-    group.add_argument(
-        '--use-layer-wise-param-layout',
-        action='store_true',
-        dest='use_layer_wise_param_layout',
-        default=False,
-        help='Opt INTO the padded shard-aligned LayerWise param layout. The default is the compact '
-        'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
-        'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
-        'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
-        'dp_size * max(shard_load) padding. The compact layout supports --fp8-param-gather (mxfp8 or '
-        'blockwise): the Muon buffers stay non-DistOpt and the param sync runs through the FP8-aware '
-        'allgather_params ping-pong path (stage fp32 master -> bf16, uneven all-gather, requantize '
-        'per rank); mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag. Pass this flag to restore the '
-        'padded layout (e.g. for bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 

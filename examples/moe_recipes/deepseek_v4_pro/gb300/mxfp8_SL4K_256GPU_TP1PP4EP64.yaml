@@ -233,7 +233,6 @@ ARGS:
   fp8_recipe: mxfp8
   fp8_format: e4m3
   fp8_param_gather: true
-  reuse_grad_buf_for_mxfp8_param_ag: true
   use_precision_aware_optimizer: true
   main_grads_dtype: bf16
   main_params_dtype: fp32
