@@ -2320,3 +2320,93 @@ def test_disagg_engine_resolves_handoff_methods_from_mixin():
             engine_cls.add_request_with_kv_handoff
             is InferenceStateHandoffMixin.add_request_with_kv_handoff
         )
+
+
+class TestAsyncSchedHiddenChunkedPrefill(_DynamicInferenceEngineTestBase):
+    """Overlap steps keep a chunked prefill request that waits outside the active rows."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        _reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_overlap_finish_keeps_hidden_chunk_blocks(self) -> None:
+        """Requests 0-3 (1-token prompts) decode 6 tokens each with one speculative token,
+        so their 4 decodes fill the 8-token step budget. Request 4 prefills a first chunk of
+        its 30-token prompt and then waits outside the active rows while overlap steps run.
+        Requests 0-3 finish in those overlap steps; request 4 must keep its prefilled
+        blocks and finish, and every block must be freed."""
+        env = self._build_test_env(
+            _DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_max_requests=6,
+                context_max_tokens=8,
+                enable_chunked_prefill=True,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                model_provider="gpt",
+                num_speculative_tokens=1,
+                position_embedding_type="rope",
+                use_flashinfer_fused_rope=False,
+                sampling_backend="torch",
+                top_k=1,
+            )
+        )
+        engine = env.engine
+        context = engine.context
+        allocator = context.kv_block_allocator
+        free_blocks = allocator.pool_avail
+
+        # Witness overlap steps that start while request 4 is hidden.
+        decide = engine._should_run_async_sched_overlap
+        hidden_overlaps = []
+
+        def record_overlap_decision():
+            overlap = decide()
+            active_ids = context.request_ids[: context.total_request_count].tolist()
+            hidden_overlaps.append(
+                overlap and context.chunked_prefill_request_id == 4 and 4 not in active_ids
+            )
+            return overlap
+
+        engine._should_run_async_sched_overlap = record_overlap_decision
+
+        limits = {0: 6, 1: 6, 2: 6, 3: 6, 4: 2}
+        for request_id, limit in limits.items():
+            prompt_length = 30 if request_id == 4 else 1
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        1, prompt_length + 1, dtype=torch.int64, device=torch.cuda.current_device()
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=limit, termination_id=-1),
+                )
+            )
+
+        finished, finished_while_hidden = {}, 0
+        for _ in range(80):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+                finished_while_hidden += bool(hidden_overlaps) and hidden_overlaps[-1]
+
+        assert finished_while_hidden, "no request finished in an overlap step while 4 was hidden"
+        assert sorted(finished) == [0, 1, 2, 3, 4]
+        for request_id, request in finished.items():
+            assert request.status == Status.COMPLETED, request_id
+            assert len(request.generated_tokens) == limits[request_id], request_id
+        assert allocator.pool_avail == free_blocks, "KV blocks leaked"
