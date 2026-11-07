@@ -62,7 +62,11 @@ from ..fp8_utils import (
     quantize_param_shard,
 )
 from ..full_cuda_graph import FullIterationGradCopy
-from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from ..transformer.fsdp_dtensor_checkpoint import (
+    get_pp_global_layer_prefixes,
+    handle_experts_in_state_dict,
+    rename_pp_layer_keys,
+)
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
@@ -1750,11 +1754,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.zero_grad()
 
     def _param_name(self, param: torch.nn.Parameter) -> str:
-        """Get the name of the parameter."""
+        """Get the name of the parameter.
+
+        Names use global pipeline-parallel layer and expert indices, like
+        :func:`~megatron.core.transformer.fsdp_dtensor_checkpoint.get_global_unique_param_name`,
+        so that they are unique across ranks.
+        """
         if not hasattr(self, "param_to_name"):
             name_to_param = {}
             for model_chunk in self.model_chunks:
-                _name_to_param = dict(model_chunk.named_parameters())
+                _name_to_param = rename_pp_layer_keys(
+                    dict(model_chunk.named_parameters()), get_pp_global_layer_prefixes(model_chunk)
+                )
                 common_keys = name_to_param.keys() & _name_to_param.keys()
                 if common_keys:
                     raise ValueError(
