@@ -227,6 +227,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": None,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
+    "moe_ep_invariant_combine": False,
     "moe_combine_bwd_dtype": "bf16",
     "moe_dispatch_fwd_dtype": "bf16",
     "moe_expert_rank_capacity_factor": None,
