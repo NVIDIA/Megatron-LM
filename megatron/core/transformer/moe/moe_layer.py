@@ -44,6 +44,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+    launch_shared_experts_on_side_stream,
 )
 from megatron.core.transformer.moe.training_matches_inference import (
     training_matches_inference_forward,
@@ -609,10 +610,9 @@ class MoELayer(BaseMoELayer):
             and self.shared_expert_overlap
             and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
         ):
-            stream = SharedExpertMLP.stream
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+            self._latent_shared_expert_output = launch_shared_experts_on_side_stream(
+                self.shared_experts, hidden_states
+            )
         elif self.config.moe_latent_size:
             if self.shared_expert_overlap:
                 if self.training:
