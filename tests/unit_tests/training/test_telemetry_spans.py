@@ -6,17 +6,19 @@ import signal
 from types import SimpleNamespace
 
 import pytest
+from opentelemetry import trace
 
 from megatron.training import telemetry_spans
 
 
-class FakeSpan:
+class FakeSpan(trace.NonRecordingSpan):
     """Minimal span that records lifecycle operations."""
 
-    def __init__(self):
-        self.attributes = {}
-        self.end_calls = []
-        self.context = object()
+    def __init__(self, span_id: int = 1) -> None:
+        self.attributes: dict[str, object] = {}
+        self.end_calls: list[int | None] = []
+        self.context = trace.SpanContext(trace_id=span_id, span_id=span_id, is_remote=False)
+        super().__init__(self.context)
 
     def set_attribute(self, name, value):
         self.attributes[name] = value
@@ -35,7 +37,7 @@ class FakeTracer:
         self.calls = []
 
     def start_span(self, name, **kwargs):
-        span = FakeSpan()
+        span = FakeSpan(span_id=len(self.calls) + 1)
         self.calls.append((name, kwargs, span))
         return span
 
@@ -92,24 +94,46 @@ def test_startup_span_opens_and_closes_once(monkeypatch):
 
 
 def test_interval_reroots_at_save_boundaries(monkeypatch):
-    reroot_steps = []
+    telemetry = FakeTelemetry()
+    startup_context = FakeSpan(span_id=99).get_span_context()
+    previous_span = trace.get_current_span()
+    monkeypatch.setattr(telemetry_spans, "get_telemetry", lambda: telemetry)
     monkeypatch.setattr(
         telemetry_spans,
         "get_run_config",
         lambda: SimpleNamespace(checkpoint=SimpleNamespace(save_interval=2)),
     )
     monkeypatch.setattr(telemetry_spans, "_otel_sg_enabled", lambda group: group == "job")
-    monkeypatch.setattr(
-        telemetry_spans,
-        "_reroot_otel_interval",
-        lambda: reroot_steps.append(telemetry_spans._otel_trace_interval_step),
-    )
+    monkeypatch.setattr(telemetry_spans, "_otel_startup_span_ctx", startup_context)
 
     telemetry_spans._start_otel_train_span()
-    for _ in range(5):
-        telemetry_spans._maybe_reroot_otel_interval()
+    try:
+        for step in range(5):
+            telemetry_spans._maybe_reroot_otel_interval()
 
-    assert reroot_steps == [0, 2, 4]
+            assert len(telemetry.tracer.calls) == step // 2 + 1
+            current = telemetry.tracer.calls[-1][2]
+            assert telemetry_spans._otel_interval_span is current
+            assert trace.get_current_span() is current
+            assert current.end_calls == []
+            assert all(span.end_calls == [None] for _, _, span in telemetry.tracer.calls[:-1])
+
+        assert [name for name, _, _ in telemetry.tracer.calls] == ["megatron.train"] * 3
+        for index, (_, kwargs, span) in enumerate(telemetry.tracer.calls):
+            expected_context = (
+                startup_context if index == 0 else telemetry.tracer.calls[index - 1][2].context
+            )
+            assert len(kwargs["links"]) == 1
+            assert kwargs["links"][0].context is expected_context
+            assert trace.get_current_span(kwargs["context"]) is trace.INVALID_SPAN
+            assert span.attributes == {"is_goodput_span": True}
+    finally:
+        telemetry_spans._end_otel_train_span()
+
+    assert all(span.end_calls == [None] for _, _, span in telemetry.tracer.calls)
+    assert telemetry_spans._otel_interval_span is None
+    assert telemetry_spans._otel_interval_ctx_token is None
+    assert trace.get_current_span() is previous_span
 
 
 def test_atexit_hook_is_installed_once_and_closes_spans(monkeypatch):
@@ -144,7 +168,8 @@ def test_atexit_hook_is_installed_once_and_closes_spans(monkeypatch):
 def test_hard_sigterm_closes_spans_only_once(monkeypatch):
     telemetry = FakeTelemetry()
     signal_handlers = []
-    close_calls = []
+    startup_span = FakeSpan()
+    interval_span = FakeSpan()
     monkeypatch.setattr(telemetry_spans, "get_telemetry", lambda: telemetry)
     monkeypatch.setattr(telemetry_spans.atexit, "register", lambda callback: None)
     monkeypatch.setattr(telemetry_spans.signal, "getsignal", lambda signum: signal.SIG_IGN)
@@ -153,23 +178,27 @@ def test_hard_sigterm_closes_spans_only_once(monkeypatch):
         "signal",
         lambda signum, handler: signal_handlers.append((signum, handler)),
     )
-    monkeypatch.setattr(
-        telemetry_spans, "_end_otel_job_spans", lambda: close_calls.append("closed")
-    )
+    monkeypatch.setattr(telemetry_spans, "_otel_startup_span", startup_span)
+    monkeypatch.setattr(telemetry_spans, "_otel_interval_span", interval_span)
 
     telemetry_spans._install_otel_exit_hooks(graceful_drain=False)
     sigterm_handler = signal_handlers[0][1]
     sigterm_handler(signal.SIGTERM, None)
     sigterm_handler(signal.SIGTERM, None)
 
-    assert close_calls == ["closed"]
+    assert startup_span.end_calls == [None]
+    assert interval_span.end_calls == [None]
+    assert telemetry_spans._otel_startup_span is None
+    assert telemetry_spans._otel_interval_span is None
+    assert telemetry.shutdown_calls == 1
 
 
 def test_graceful_sigterm_flushes_without_closing(monkeypatch):
     telemetry = FakeTelemetry()
     signal_handlers = []
     flush_calls = []
-    close_calls = []
+    startup_span = FakeSpan()
+    interval_span = FakeSpan()
     monkeypatch.setattr(telemetry_spans, "get_telemetry", lambda: telemetry)
     monkeypatch.setattr(telemetry_spans.atexit, "register", lambda callback: None)
     monkeypatch.setattr(telemetry_spans.signal, "getsignal", lambda signum: signal.SIG_IGN)
@@ -178,13 +207,22 @@ def test_graceful_sigterm_flushes_without_closing(monkeypatch):
         "signal",
         lambda signum, handler: signal_handlers.append((signum, handler)),
     )
-    monkeypatch.setattr(telemetry_spans, "_force_flush_otel", lambda: flush_calls.append("flushed"))
     monkeypatch.setattr(
-        telemetry_spans, "_end_otel_job_spans", lambda: close_calls.append("closed")
+        trace,
+        "get_tracer_provider",
+        lambda: SimpleNamespace(force_flush=lambda: flush_calls.append("flushed")),
     )
+    monkeypatch.setattr(telemetry_spans, "_otel_startup_span", startup_span)
+    monkeypatch.setattr(telemetry_spans, "_otel_interval_span", interval_span)
 
     telemetry_spans._install_otel_exit_hooks(graceful_drain=True)
-    signal_handlers[0][1](signal.SIGTERM, None)
+    sigterm_handler = signal_handlers[0][1]
+    sigterm_handler(signal.SIGTERM, None)
+    sigterm_handler(signal.SIGTERM, None)
 
     assert flush_calls == ["flushed"]
-    assert close_calls == []
+    assert startup_span.end_calls == []
+    assert interval_span.end_calls == []
+    assert telemetry_spans._otel_startup_span is startup_span
+    assert telemetry_spans._otel_interval_span is interval_span
+    assert telemetry.shutdown_calls == 0
