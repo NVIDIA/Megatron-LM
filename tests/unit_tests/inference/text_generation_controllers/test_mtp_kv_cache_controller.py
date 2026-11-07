@@ -88,6 +88,7 @@ def _make_context(
         ),
         # The step's GPU bookkeeping, which the EP dummy MTP forwards must leave intact.
         _buf=torch.zeros(64, dtype=torch.uint8, device=DEVICE),
+        real_token_count=torch.zeros(1, dtype=torch.int32, device=DEVICE),
     )
 
     context = SimpleNamespace(
@@ -124,6 +125,9 @@ def _make_context(
     )
 
     context._mtp_forward_phase = MethodType(MTPContextMixin._mtp_forward_phase, context)
+    context.set_forward_real_token_count = MethodType(
+        DynamicInferenceContext.set_forward_real_token_count, context
+    )
     # The real lookup, so a chunked id with no active row behaves as it does in the engine.
     context.get_index_of_chunked_prefill_request = MethodType(
         DynamicInferenceContext.get_index_of_chunked_prefill_request, context
@@ -615,26 +619,23 @@ class TestMtpCommitPassMixedBatch:
         # Rows 2 and 3 of request_to_kv_block_ids, not rows 0 and 1.
         assert block_table[:, 0].cpu().tolist() == [2 * MAX_KV_BLOCK_COUNT, 3 * MAX_KV_BLOCK_COUNT]
 
-    def test_nvls_dispatcher_is_told_the_unpadded_token_count(self):
+    def test_real_token_count_is_the_unpadded_token_count(self):
+        """Padding-row zeroing and the NVLS routing mask read the commit pass's row count on
+        device, with or without NVLS."""
         context = _make_context(prefill_query_lengths=(5,), prefill_kv_offsets=(0,))
-        context._nvls_dispatcher = object()
         model = _make_model()
         controller = _make_controller(context, model)
 
-        with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
-            "NVLSAllGatherVDispatcher"
-        ) as nvls:
-            controller._mtp_commit_pass(
-                context,
-                model,
-                _hidden(5),
-                num_decode_requests=0,
-                active_request_count=1,
-                base_position=torch.tensor([5], device=DEVICE),
-            )
+        controller._mtp_commit_pass(
+            context,
+            model,
+            _hidden(5),
+            num_decode_requests=0,
+            active_request_count=1,
+            base_position=torch.tensor([5], device=DEVICE),
+        )
 
-        nvls.modify_real_token_count_for_mtp.assert_called_once_with(4)
+        assert context.gpu_view.real_token_count.item() == 4
 
 
 class TestMtpCommitPassSequenceParallel:
@@ -1509,22 +1510,21 @@ class TestExpertParallelForwardParity:
         dummy_widths = {kw["next_token_ids"].shape[-1] for tag, kw in dummy if tag == "mtp_step"}
         assert real_widths == dummy_widths == {4}
 
-    def test_nvls_routing_mask_is_repointed_for_the_request_shaped_forwards(self):
-        """MTP forwards are request-count shaped; the mask must follow, else padding rows route."""
+    def test_real_token_count_is_repointed_for_the_request_shaped_forwards(self):
+        """MTP forwards are request-count shaped. The real token count, which padding-row zeroing
+        and the NVLS routing mask read, must follow, else padding rows route to experts and
+        reach FP8/FP4 scales unzeroed. It does without NVLS too."""
         controller, model, context, _ = _build_step(
             num_decode_requests=1, prefill=((5, 0, 200),), accepted=(2,), num_mtp_depths=2
         )
-        context._nvls_dispatcher = object()
+        publish = mock.Mock(wraps=context.set_forward_real_token_count)
+        context.set_forward_real_token_count = publish
 
-        with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
-            "NVLSAllGatherVDispatcher"
-        ) as nvls:
-            controller._compute_serial_mtp_and_sample(
-                base_position=torch.tensor([10, 5], device=DEVICE)
-            )
+        controller._compute_serial_mtp_and_sample(
+            base_position=torch.tensor([10, 5], device=DEVICE)
+        )
 
-        counts = [call.args[0] for call in nvls.modify_real_token_count_for_mtp.call_args_list]
+        counts = [call.args[0] for call in publish.call_args_list]
         # First the commit pass's packed token total (2 accepted + 4 prompt), then the draft
         # loop's request count.
         assert counts == [6, 2]
