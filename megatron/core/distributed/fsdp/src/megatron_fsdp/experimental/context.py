@@ -47,7 +47,7 @@ class FsdpContext:
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
-    _post_backward_hook_registered: bool
+    _autograd_callback_registered: bool
 
     def __init__(
         self,
@@ -81,7 +81,7 @@ class FsdpContext:
         self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
-        self._post_backward_hook_registered = False
+        self._autograd_callback_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -183,7 +183,7 @@ class FsdpContext:
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
-        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+        if self.caller_managed_grad_sync or self._autograd_callback_registered:
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
@@ -227,7 +227,7 @@ class FsdpContext:
     def _post_autograd_backward(self) -> None:
         """Clean up this backward; caller-managed schedules complete explicitly."""
         self.run_delayed_post_backward_callbacks()
-        self._post_backward_hook_registered = False
+        self._autograd_callback_registered = False
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.post_backward()
 
@@ -240,10 +240,10 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self._post_backward_hook_registered:
+        if self._autograd_callback_registered:
             # Another root sharing this context already queued the completion wait.
             return
-        self._post_backward_hook_registered = True
+        self._autograd_callback_registered = True
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
