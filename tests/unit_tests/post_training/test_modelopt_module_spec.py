@@ -137,11 +137,11 @@ class TestModelOptGPTModel:
         metadata = {
             "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
         }
-        expected = {
-            name: value.clone()
-            for name, value in model.state_dict().items()
-            if isinstance(value, torch.Tensor)
-        }
+        # Distinct, rank-independent values so every DP replica expects the stored weights.
+        with torch.no_grad():
+            for i, param in enumerate(model.parameters()):
+                param.fill_(i + 1)
+        expected = {name: param.detach().clone() for name, param in model.named_parameters()}
 
         # Reproduce the old ModelOpt spec's checkpoint naming for the fixture only.
         originals = []
@@ -186,9 +186,8 @@ class TestModelOptGPTModel:
             remap_sharded_state_dict_for_load([model], request, legacy_dir)
             loaded = dist_checkpointing.load(request, legacy_dir, strict="raise_all")
             model.load_state_dict(loaded["model"])
-            for name, value in model.state_dict().items():
-                if isinstance(value, torch.Tensor):
-                    torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+            for name, param in model.named_parameters():
+                torch.testing.assert_close(param, expected[name], rtol=0, atol=0)
             for value in loaded["optimizer"].values():
                 torch.testing.assert_close(value, torch.full_like(value, 0.25), rtol=0, atol=0)
 

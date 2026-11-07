@@ -29,7 +29,6 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
     args = Namespace(
         use_legacy_models=False,
         spec=["stock.module", "stock_spec"],
-        padded_vocab_size=128,
         max_position_embeddings=16,
         hybrid_layer_pattern="M*",
         fp16_lm_cross_entropy=False,
@@ -40,9 +39,11 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
     )
     model = Mock(decoder=SimpleNamespace(num_layers_per_pipeline_rank=0))
     stock_spec = object()
+    run_config = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=128))
 
     with (
         patch.object(module, "get_args", return_value=args),
+        patch.object(module, "get_run_config", return_value=run_config),
         patch.object(module, "core_transformer_config_from_args", return_value=object()),
         patch.object(module, "import_module", return_value=stock_spec) as import_spec,
         patch.object(module, "HybridModel", return_value=model) as build_stock,
@@ -54,4 +55,5 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
 
     import_spec.assert_called_once_with(args.spec)
     assert build_stock.call_args.kwargs["hybrid_stack_spec"] is stock_spec
+    assert build_stock.call_args.kwargs["vocab_size"] == 128
     build_modelopt.assert_not_called()
