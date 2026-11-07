@@ -93,8 +93,9 @@ def test_fault_tolerance_serialization_and_read_only_validation(run_config, tmp_
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("calc_timeouts", [False, True])
+@pytest.mark.parametrize("async_save", [False, True])
 def test_fault_tolerance_setup_uses_config(
-    monkeypatch, run_config, rank_monitor, tmp_path, enabled, calc_timeouts
+    monkeypatch, run_config, rank_monitor, tmp_path, enabled, calc_timeouts, async_save
 ):
     monkeypatch.setattr(ft_integration, "_GLOBAL_RANK_MONITOR_CLIENT", None)
     monkeypatch.setattr(ft_integration, "_ft_state_path", None)
@@ -112,7 +113,9 @@ def test_fault_tolerance_setup_uses_config(
         enable_ft_package=enabled, calc_ft_timeouts=calc_timeouts, ft_num_warmup_iters=2
     )
     run_config.checkpoint.save = str(tmp_path)
-    run_config.checkpoint.async_save = True
+    run_config.checkpoint.async_save = async_save
+    run_config.checkpoint.use_persistent_ckpt_worker = async_save
+    run_config.checkpoint.validate()
     saved_timeouts = {"section_timeouts": {"setup": 123, "step": 45}}
     (tmp_path / "ft_state.json").write_text(json.dumps(saved_timeouts))
 
@@ -126,7 +129,7 @@ def test_fault_tolerance_setup_uses_config(
     rank_monitor.load_state_dict.assert_called_once_with(saved_timeouts)
     rank_monitor.start_section.assert_called_once_with("setup")
     assert ft_integration._is_calculating_timeouts is calc_timeouts
-    assert ft_integration._is_async_chkpt_enabled
+    assert ft_integration._is_async_chkpt_enabled is async_save
     rank_monitor.reset_mock()
     for _ in range(3):
         ft_integration.on_training_step_start()
