@@ -1168,8 +1168,10 @@ class LLaVAModel(MegatronModule):
                 expanded_loss_mask = batch["expanded_loss_mask"]
 
         if self.sequence_parallel_lm and self.pre_process:
+            # The language model is built with scatter_embedding_sequence_parallel=False and runs
+            # its sequence-parallel collectives on pg_collection.tp, so shard over that same group.
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                combined_embeddings
+                combined_embeddings, group=self.pg_collection.tp
             )  # [S/(CP*TP),B,H]
 
         return combined_embeddings, expanded_labels, expanded_loss_mask, packed_seq_params

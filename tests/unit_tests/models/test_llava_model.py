@@ -16,6 +16,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -1016,6 +1017,68 @@ class TestLLaVAModelTokenParallel:
             # SBHD format
             assert combined_embeddings.shape[0] == self.combined_padded_seqlen / tp_size
             assert combined_embeddings.shape[1] == self.batch_size
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(Utils.world_size % 4 != 0, reason="Requires a world size divisible by 4")
+    def test_sequence_parallel_scatter_uses_pg_collection_tp(self):
+        """The sequence-parallel scatter must use pg_collection.tp, not the global TP group.
+
+        The language model is built with ``scatter_embedding_sequence_parallel=False`` and the
+        explicit ``pg_collection``, so its later sequence-parallel gathers run on
+        ``pg_collection.tp``. The scatter of the combined embeddings, and the all-gather of their
+        gradient in the backward pass, must use that group as well.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        # The global TP groups are [0, 1], [2, 3], ... Pair each rank with the rank that has the
+        # same global TP rank in the neighboring global TP group: [0, 2], [1, 3], [4, 6], ...
+        # Sharding by the global TP rank would give both members of a pair the same chunk.
+        tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            [
+                [base + offset, base + offset + 2]
+                for base in range(0, world_size, 4)
+                for offset in range(2)
+            ]
+        )
+        tp_ranks = torch.distributed.get_process_group_ranks(tp_group)
+        tp_size = len(tp_ranks)
+
+        model = SimpleNamespace(
+            pre_process=True,
+            post_process=False,
+            context_parallel_lm=1,
+            sequence_parallel_lm=True,
+            tensor_model_parallel_size_lm=tp_size,
+            tp_comm_overlap_lm=False,
+            pg_collection=ProcessGroupCollection(tp=tp_group),
+        )
+
+        # The full sequence is replicated within tp_group and differs between groups.
+        seq_len, batch_size, hidden_size = 4 * tp_size, 2, 8
+        positions = torch.arange(
+            seq_len, dtype=torch.float32, device=torch.cuda.current_device()
+        ).view(seq_len, 1, 1)
+        combined_embeddings = (
+            (positions + 100.0 * tp_ranks[0])
+            .expand(seq_len, batch_size, hidden_size)
+            .clone()
+            .requires_grad_()
+        )
+
+        local_embeddings, _, _, _ = LLaVAModel._process_embedding_token_parallel(
+            model, combined_embeddings, None, None, None
+        )
+        local_embeddings.backward(torch.full_like(local_embeddings, float(rank + 1)))
+
+        # Check only after every rank has run the collectives, so a mismatch cannot hang a rank.
+        expected_local = combined_embeddings.detach().chunk(tp_size, dim=0)[tp_group.rank()]
+        assert torch.equal(local_embeddings.detach(), expected_local)
+        expected_grad = torch.cat(
+            [torch.full_like(local_embeddings, float(tp_rank + 1)) for tp_rank in tp_ranks], dim=0
+        )
+        assert torch.equal(combined_embeddings.grad, expected_grad)
 
 
 def count_parameters(model):
