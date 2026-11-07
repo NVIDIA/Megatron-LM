@@ -223,7 +223,6 @@ class PairedLogitsSaver(LogitsSaverHooks):
             metadata = json.loads(meta_bytes)
             # Resume-only state is not part of the immutable file metadata.
             metadata.pop("published_through", None)
-            metadata.pop("range_end", None)
             storage = Storage(os.path.dirname(tar_path))
             name = parse_name(os.path.basename(tar_path))
             data, index = write_file([record["batch"] for record in writes.values()], metadata)

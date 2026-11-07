@@ -59,7 +59,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "writer_mbs": mbs,
         "attention_mode": "causal",
         "prefix_stable": True,
-        "tokenizer": {"sha256": "test", "size": 3, "special_ids": {}, "eod_id": 2},
+        "tokenizer": {"sha256": "test", "size": 3, "eod_id": 2},
         "logprob_vocab_size": 1 << 17,
     }
     noted = {
@@ -593,7 +593,7 @@ def test_tokenizer_fingerprint_is_canonical():
             return 3
 
     identity = codec.hf_tokenizer_identity(HF(), eod_id=2)
-    assert identity == {"sha256": first, "size": 3, "special_ids": special, "eod_id": 2}
+    assert identity == {"sha256": first, "size": 3, "eod_id": 2}
     assert codec.hf_tokenizer_identity(HF(), eod_id=0)["sha256"] == first  # EOD is not hashed.
 
 
@@ -2234,7 +2234,7 @@ def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runti
     args.logits_save_range_start = 4
     args.consumed_train_samples = 6 * 8
     metadata = runtime.initialize_dump_metadata(saver)
-    assert (metadata["published_through"], metadata["range_end"]) == (48, 64)
+    assert metadata["published_through"] == 48
     assert not storage_module.Storage(str(tmp_path)).list("dp*__48-64.*")
     assert len(storage_module.Storage(str(tmp_path)).list("dp*__32-48.*")) == 4
     args.consumed_train_samples = 8 * 8
@@ -2327,7 +2327,7 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
                 "end": end,
                 "batch": arrow.samples_batch(*record, vocab_size=1 << 17),
             }
-    meta = json.dumps({**metadata, "published_through": 0, "range_end": 64})
+    meta = json.dumps({**metadata, "published_through": 0})
     for rank in (0, 1):
         module.PairedLogitsSaver._write_batched_tar(
             str(tmp_path / storage_module.data_name(rank, 0, 16)), writes[rank], meta

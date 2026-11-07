@@ -180,7 +180,6 @@ def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[
     return {
         "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, size),
         "size": size,
-        "special_ids": special_ids,
         "eod_id": eod_id,
     }
 

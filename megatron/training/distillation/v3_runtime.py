@@ -182,7 +182,6 @@ def tokenizer_identity() -> dict[str, Any]:
     return {
         "sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab)),
         "size": len(vocab),
-        "special_ids": special_ids,
         "eod_id": eod,
     }
 
@@ -435,7 +434,6 @@ def initialize_dump_metadata(saver: Any) -> dict:
                     **expected,
                     "contract": {**expected["contract"], "first_sample": first_sample},
                     "published_through": published,
-                    "range_end": end,
                 },
                 "differing": differing,
             }

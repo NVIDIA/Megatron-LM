@@ -191,7 +191,6 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
         sources.append(
             {
                 "name": name,
-                "weight": weights[name],
                 "samples": targets[name],
                 "available": sum(b - a for _, _, a, b, _ in pieces),
                 "passes": passes,
@@ -246,8 +245,9 @@ def describe(manifest: dict[str, Any]) -> str:
         f"{manifest['lane_samples']} samples"
     ]
     for source in manifest["sources"]:
+        weight = manifest["config"]["sources"][source["name"]]
         lines.append(
-            f"  {source['name']}: weight {source['weight']}, {source['samples']} samples "
+            f"  {source['name']}: weight {weight}, {source['samples']} samples "
             f"({source['share']:.1%}; {source['supervised_share']:.1%} of supervised tokens) "
             f"from {source['available']} available, {source['passes']} pass(es)"
         )
