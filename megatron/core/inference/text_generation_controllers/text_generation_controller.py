@@ -38,6 +38,7 @@ from megatron.core.inference.utils import (
     detokenize_tokens,
     get_attention_mask,
     get_language_model,
+    get_moe_dp_replica_count,
     model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -418,6 +419,9 @@ class TextGenerationController(MTPControllerMixin):
         else:
             self._all_logits_cuda = None
         self._async_sched_forward = AsyncScheduleForwardState()
+        # Whether the last base forward a step launched processed only the bounded MoE rows; its
+        # MTP commit pass keeps that bound (see _dynamic_step_forward_logits).
+        self._base_forward_bounded_moe_rows = False
         # This buffer has a stable address across legacy, no-overlap, overlap,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -434,6 +438,8 @@ class TextGenerationController(MTPControllerMixin):
         self._async_sched_sample_cpu_ready_event = torch.cuda.Event()
         self._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
         self._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
+        # Marks the last dummy forward's launch; see dummy_forward().
+        self._dummy_forward_done_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
         self._async_sched_routing_copy_stream = None
         self._async_sched_routing_buffer_slots = []
@@ -824,6 +830,7 @@ class TextGenerationController(MTPControllerMixin):
         is_dummy_forward: bool = False,
         transfer_bookkeeping_to_gpu: bool = True,
         record_bookkeeping_done_event: bool = False,
+        construct_graph_bounded_moe_rows: Optional[bool] = None,
     ) -> Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]:
         """Initializes the inference context for dynamic batching.
 
@@ -835,6 +842,9 @@ class TextGenerationController(MTPControllerMixin):
                 CPU bookkeeping snapshot to GPU before returning.
             record_bookkeeping_done_event (bool): Whether to record an event
                 after the bookkeeping H2D transfer.
+            construct_graph_bounded_moe_rows (Optional[bool]): Whether the constructed
+                cuda graph bounds the FlashInfer MoE rows; see
+                DynamicInferenceContext.bounded_moe_row_graph_variants().
 
         Returns:
             Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]: The active input
@@ -851,6 +861,7 @@ class TextGenerationController(MTPControllerMixin):
         range_push("initialize_attention_state")
         bookkeeping_done_event = context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
+            construct_graph_bounded_moe_rows=construct_graph_bounded_moe_rows,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
             transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
             record_bookkeeping_done_event=record_bookkeeping_done_event,
@@ -938,17 +949,13 @@ class TextGenerationController(MTPControllerMixin):
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
-        decode_token_upper_bound = (
-            context.max_requests
-            * (self.num_speculative_tokens + 1)
-            * self.model_config.expert_model_parallel_size
-        )
-        InferenceMode.set_bounded_mxfp8_rows(
-            context.is_decode_only()
-            and token_capacity is not None
-            and decode_token_upper_bound <= token_capacity
-        )
+        InferenceMode.set_bounded_mxfp8_rows(context.use_bounded_mxfp8_rows)
+        if not context.is_creating_cuda_graphs:
+            # This forward's MTP commit pass runs after it, or at the next step's entry with async
+            # scheduling, and an idle peer's dummy step mirrors it with its own base forward's
+            # bound. A CUDA graph capture or an engine resume can change the flag above in
+            # between, so the commit passes keep this one.
+            self._base_forward_bounded_moe_rows = context.use_bounded_mxfp8_rows
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
@@ -1784,6 +1791,28 @@ class TextGenerationController(MTPControllerMixin):
     def dummy_forward(self) -> None:
         """Run the mode-specific dummy step used by idle expert-parallel ranks."""
         context = self.inference_wrapped_model.inference_context
+        context.agree_on_moe_decode_only(True)
+        self._run_dummy_step()
+
+    def _match_peers_without_forward(self) -> None:
+        """Issue a step's MoE collectives when the step launches no forward.
+
+        With more than one replica in the tp_ep group, every peer launches a forward or a
+        dummy step in each step, so a step with work but nothing to launch (nothing admitted,
+        or a kept chunk that cannot continue yet) runs a dummy step instead of returning; its
+        vote stands, and a dummy step is decode-only.
+        """
+        if get_moe_dp_replica_count(self.model_config) > 1:
+            self._run_dummy_step()
+
+    @torch.inference_mode()
+    def _run_dummy_step(self) -> None:
+        """Run the mode-specific dummy MTP and base forwards of one step, after its vote."""
+        context = self.inference_wrapped_model.inference_context
+        # The engine does not wait for dummy forwards, so stay at most one ahead of the GPU:
+        # the context init below restages the host buffers the previous one's copies read.
+        # Waiting after the vote lets the active peers launch their next forward meanwhile.
+        self._dummy_forward_done_event.synchronize()
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
 
         if context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
@@ -1794,9 +1823,10 @@ class TextGenerationController(MTPControllerMixin):
             raise AssertionError(
                 f"Unexpected async scheduling mode: {context.config.async_sched_mode}"
             )
+        self._dummy_forward_done_event.record()
 
         # Clear temporary dummy state while preserving reusable prefix state and counters.
-        context.reset(preserve_prefix_cache=True, preserve_counters=True)
+        context.end_expert_parallel_dummy_step()
 
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.
@@ -2850,12 +2880,16 @@ class TextGenerationController(MTPControllerMixin):
         )
 
     def _run_dummy_async_sched_base_step(self) -> None:
-        """Run the base-forward half of an async EP step after local work finishes."""
+        """Run the base-forward half of an async EP step after local work finishes.
+
+        The context may still hold paused requests or a chunked prefill hidden between chunks;
+        the dummy step sets them aside and gives them back.
+        """
         context = self.inference_wrapped_model.inference_context
 
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
         self._run_dummy_base_forward(input_ids, position_ids)
-        context.reset(preserve_prefix_cache=True, preserve_counters=True)
+        context.end_expert_parallel_dummy_step()
 
     def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Launch the initial forward when no valid logits state exists.
@@ -2872,7 +2906,7 @@ class TextGenerationController(MTPControllerMixin):
             input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
                 self._dynamic_step_context_init(record_bookkeeping_done_event=True)
             )
-            if self.num_speculative_tokens > 0 and self.model_config.expert_model_parallel_size > 1:
+            if self.num_speculative_tokens > 0 and get_moe_dp_replica_count(self.model_config) > 1:
                 self._run_dummy_serial_mtp_forward()
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -3209,7 +3243,7 @@ class TextGenerationController(MTPControllerMixin):
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     launched_decode_only = context.is_decode_only()
                     self._synchronize_async_sched_event(bookkeeping_done_event)
-            elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
+            elif had_pending_forward and get_moe_dp_replica_count(self.model_config) > 1:
                 self._run_dummy_async_sched_base_step()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
@@ -3217,6 +3251,7 @@ class TextGenerationController(MTPControllerMixin):
             if active_request_count == 0:
                 # An admission callback may resolve queued work without adding
                 # anything that requires a model forward.
+                self._match_peers_without_forward()
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
@@ -3448,6 +3483,7 @@ class TextGenerationController(MTPControllerMixin):
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
+            self._match_peers_without_forward()
             return DynamicBatchControllerStepResult(
                 decode_only=DecodeOnly(consumed=None, launched=None)
             )
@@ -3607,6 +3643,7 @@ class TextGenerationController(MTPControllerMixin):
         *,
         run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        admits_prefill: bool = True,
         finalize_requests: Optional[Callable[..., None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
@@ -3616,7 +3653,10 @@ class TextGenerationController(MTPControllerMixin):
                 on the legacy path.
             run_async_overlap (bool): Whether to run the overlap ordering.
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                used by the no-overlap path to admit eligible prefill requests.
+                used by the no-overlap path to admit eligible requests.
+            admits_prefill (bool): Whether `schedule_waiting_requests` may admit
+                prefill requests. When False it admits only decode-ready requests,
+                so the step knows at its entry whether its forward is decode-only.
             finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
@@ -3626,6 +3666,8 @@ class TextGenerationController(MTPControllerMixin):
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY:
+            # The engine admitted this step's requests before the call.
+            context.agree_on_moe_decode_only(context.num_prefill_requests == 0)
             return await self._run_legacy_step(
                 skip_bookkeeping, finalize_requests=finalize_requests
             )
@@ -3634,6 +3676,21 @@ class TextGenerationController(MTPControllerMixin):
 
         assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
         self._validate_async_sched_support_for_step(run_async_overlap)
+        # Agree on the phase of the forward this step launches before its MTP forwards, which an
+        # idle peer's dummy step joins only after its own agreement. Overlap steps launch
+        # decode-only forwards. A no-overlap step that admits no prefill launches decode-only
+        # work unless it primes a batch that is still prefilling: the update turns every
+        # request of a pending forward into a decode request, and a chunked prefill
+        # continues only by admission.
+        has_pending_forward = self._async_sched_forward.is_valid
+        if run_async_overlap and has_pending_forward:
+            launches_decode_only = True
+        else:
+            admits_prefill = admits_prefill and schedule_waiting_requests is not None
+            launches_decode_only = not admits_prefill and (
+                has_pending_forward or context.num_prefill_requests == 0
+            )
+        context.agree_on_moe_decode_only(launches_decode_only)
 
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0:
@@ -3642,6 +3699,7 @@ class TextGenerationController(MTPControllerMixin):
             # before the no-overlap path admits and primes the restored requests.
             self._async_sched_forward.clear()
             if run_async_overlap:
+                self._match_peers_without_forward()
                 return DynamicBatchControllerStepResult(
                     decode_only=DecodeOnly(consumed=None, launched=None)
                 )
