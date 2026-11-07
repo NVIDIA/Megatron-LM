@@ -519,6 +519,11 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
 
+    gated_delta_net_separate_grad_norm: bool = False
+    """If True, exclude GatedDeltaNet input-projection gradients from the global gradient norm
+    and clip them against their own norm. This prevents an oversized input-projection gradient
+    from shrinking every other parameter's update. Default is False."""
+
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes

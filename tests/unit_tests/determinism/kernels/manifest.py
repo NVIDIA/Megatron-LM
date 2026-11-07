@@ -566,6 +566,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
             R + 'test_ssm_replay.py',
+            K + "test_gdn_grad_norm.py",
         ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
@@ -607,6 +608,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_optimizer_kernels.py",
+            K + "test_gdn_grad_norm.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
         kind="external-lib",
@@ -773,6 +775,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
             R + 'test_ssm_replay.py',
+            K + "test_gdn_grad_norm.py",
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
