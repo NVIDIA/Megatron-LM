@@ -804,7 +804,7 @@ def test_callback_model_config_owns_shared_inputs(
     "section, name, value, error",
     [
         ("checkpoint", "ckpt_format", "torch", "requires torch_dist"),
-        ("dist", "use_torch_fsdp2", True, "not FSDP"),
+        ("ddp", "use_torch_fsdp2", True, "not FSDP"),
         ("ddp", "use_megatron_fsdp", True, "not FSDP"),
         ("dist", "use_tp_pp_dp_mapping", True, "TP-PP-DP mapping"),
     ],

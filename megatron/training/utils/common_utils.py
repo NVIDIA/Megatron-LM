@@ -104,7 +104,6 @@ def calc_params_l2_norm(
     args = get_args()
     cfg = get_run_config()
 
-    cfg = get_run_config()
     if cfg.ddp.use_megatron_fsdp:
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.

@@ -159,6 +159,7 @@ def test_optimizer_recipe_warning_only_for_conflicts(run_config, caplog, old_rec
 )
 def test_optimizer_validation_uses_model_precision(run_config, model_recipe, optimizer_recipe):
     run_config.train.micro_batch_size = 1
+    run_config.model.transformer.fp8 = "hybrid"
     run_config.model.transformer.fp8_recipe = model_recipe
     run_config.optimizer.fp8_recipe = optimizer_recipe
     run_config.optimizer.optimizer_cpu_offload = True
