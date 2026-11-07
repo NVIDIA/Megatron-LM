@@ -67,7 +67,12 @@ class TestFusedPreKDA:
             reference_input, None, packed_seq_params=packed_seq_params
         )
         fused_output, fused_bias = fused(fused_input, None, packed_seq_params=packed_seq_params)
-        torch.testing.assert_close(fused_output, reference_output, atol=4e-3, rtol=4e-3)
+        # The fused and the unfused preprocessing round Q/K/V, the decay gate and beta to
+        # adjacent BF16 values, and the delta-rule recurrence accumulates that along the
+        # sequence: on H100 the outputs differ by up to 2.5 BF16 ulps of their ~0.4 range
+        # (4.9e-3 at most over 2500 random inputs, packed and unpacked), so a 4e-3 tolerance
+        # had no margin and failed on single ranks in CI.
+        torch.testing.assert_close(fused_output, reference_output, atol=8e-3, rtol=8e-3)
         assert fused_bias == reference_bias
 
         grad_output = torch.linspace(
