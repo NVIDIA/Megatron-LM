@@ -37,7 +37,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/64/1/1</td>
       <td>1/2048/4096</td>
       <td>BSHD; MoK; MXFP8 indexer and batched projection; full CG; Muon</td>
-      <td>Pending refreshed measurement</td>
+      <td>722.9</td>
     </tr>
     <tr>
       <td><a href="deepseek_v4_flash/gb200/mxfp8_THD4K_128GPU_TP1PP2EP64.yaml">GB200 MXFP8 THD 4K</a></td>
@@ -53,7 +53,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/2/64/16/1</td>
       <td>1/128/65536</td>
       <td>THD packing; MoK; MXFP8 indexer and batched projection; attention CG; Muon</td>
-      <td>Pending refreshed measurement</td>
+      <td>592.5</td>
     </tr>
     <tr>
       <td rowspan="5">DeepSeek-V3</td>
@@ -212,8 +212,24 @@ Exclude compilation and graph capture from measurements; use the final 80 steps
 after at least 20 warmup steps, and verify that timing has stabilized.
 Periodic Python garbage collection is disabled during this bounded benchmark;
 startup collection remains enabled.
-Historical throughput values belong to the previous recipe revisions and are
-not measurements of the refreshed configuration.
+The refreshed BSHD 4K and THD 64K results were measured on November 6, 2026,
+with source revision `3d1504a0820ad2a7c415cf423b12db599eafa5e9` and the pinned
+recipe dependencies. Each configuration ran twice on 128 GB200 GPUs across
+32 nodes; each EP64 group stayed within one NVL72 domain. The index reports
+the median over the combined 160 measured iterations.
+
+| Recipe | TFLOP/s/GPU from mean step time, trials 1 / 2 | Mean step (s), trials 1 / 2 | Peak allocated memory (GiB/GPU) |
+| --- | --- | --- | --- |
+| BSHD 4K | 718.2 / 723.9 | 8.284 / 8.218 | 146.2 |
+| THD 64K | 591.9 / 588.7 | 12.126 / 12.191 | 102.3 |
+
+Throughput is calculated as model FLOPs divided by the average measured step time.
+Memory is the maximum PyTorch allocated high-water mark across all ranks and
+both trials, including initialization and graph capture; it is not total device
+memory usage. All four runs completed 100 iterations with finite logged losses
+and gradient norms, no skipped/NaN iterations, and all-rank completion records.
+Logged FLOPs agreed with fixed-length accounting. These results do not establish
+convergence or a controlled speedup over earlier recipes.
 
 The cuTile compilation cache is placed in node-local `/tmp` to avoid SQLite
 locking across ranks on a shared home directory. If the launcher overrides
