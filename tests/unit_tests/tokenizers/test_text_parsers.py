@@ -313,6 +313,21 @@ def test_qwen3_coder_tool_call_end_inside_value_does_not_terminate_the_call():
     assert call_args(body) == {"a": "see </tool_call> here"}
 
 
+def test_qwen3_coder_function_end_inside_value_does_not_terminate_the_function():
+    """A </function> written inside a parameter value belongs to the value.
+
+    Same rule as for </tool_call>: a complete <parameter>...</parameter> block is
+    consumed atomically, so the call is not cut at the first </function>.
+    """
+    body = (
+        "<tool_call>\n<function=f>\n"
+        "<parameter=a>see </function> here</parameter>\n"
+        "<parameter=b>7</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert call_args(body) == {"a": "see </function> here", "b": 7}
+
+
 @pytest.mark.parametrize(
     "text,expected_name",
     [

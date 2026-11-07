@@ -187,7 +187,8 @@ class _Qwen3CoderToolParser:
     _tool_call_end_re = re.compile(r"</tool_call>")
     _parameter_start_re = re.compile(r"<\s*parameter\s*=")
     _parameter_end_re = re.compile(r"<\s*/\s*parameter\s*>")
-    tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+    _function_start_re = re.compile(r"<function=")
+    _function_end_re = re.compile(r"</function>")
     # Mirrors vLLM's `_PARAM_RE` in `vllm/parser/qwen3.py`. Three properties are
     # load-bearing and each was previously wrong:
     #   * the tag tolerates whitespace -- `< parameter = a >`, `</ parameter >`
@@ -300,8 +301,13 @@ class _Qwen3CoderToolParser:
             ),
         )
 
-    def _find_tool_call_end(self, text: str, pos: int) -> int | None:
+    def _find_tool_call_end(
+        self, text: str, pos: int, end_re: re.Pattern | None = None
+    ) -> int | None:
         """Find the `</tool_call>` that closes the call body starting at `pos`.
+
+        `end_re` selects the closing tag to look for (default `</tool_call>`);
+        `</function>` uses the same parameter-aware scan.
 
         A `</tool_call>`-looking substring inside a parameter's value must not
         end the call early -- vLLM's engine is a state machine that knows it is
@@ -332,9 +338,10 @@ class _Qwen3CoderToolParser:
         Returns:
             The index of `</tool_call>`, or None if the call is not (yet) closed.
         """
+        end_re = end_re or self._tool_call_end_re
         while True:
             param_match = self._parameter_start_re.search(text, pos)
-            end_match = self._tool_call_end_re.search(text, pos)
+            end_match = end_re.search(text, pos)
             if end_match is None:
                 return None
             if param_match is None or end_match.start() < param_match.start():
@@ -361,7 +368,7 @@ class _Qwen3CoderToolParser:
             # wherever it gets abandoned, or end of string -- is the real
             # terminator.
             scan_limit = next_param_match.start() if next_param_match else len(text)
-            bounded_end_match = self._tool_call_end_re.search(text, param_match.start(), scan_limit)
+            bounded_end_match = end_re.search(text, param_match.start(), scan_limit)
             if bounded_end_match is not None:
                 return bounded_end_match.start()
             if next_param_match is not None:
@@ -392,11 +399,23 @@ class _Qwen3CoderToolParser:
         if len(raw_tool_calls) == 0:
             raw_tool_calls = [model_output]
 
-        raw_function_calls = []
+        function_calls = []
         for tool_call in raw_tool_calls:
-            raw_function_calls.extend(self.tool_call_function_regex.findall(tool_call))
-
-        function_calls = [match[0] if match[0] else match[1] for match in raw_function_calls]
+            pos = 0
+            while True:
+                start_match = self._function_start_re.search(tool_call, pos)
+                if start_match is None:
+                    break
+                body_start = start_match.end()
+                # Like `</tool_call>`, a `</function>` inside a complete
+                # <parameter>...</parameter> block is part of the value.
+                end_index = self._find_tool_call_end(tool_call, body_start, self._function_end_re)
+                if end_index is None:
+                    # Unclosed -- take the rest, as the old `<function=(.*)$` did.
+                    function_calls.append(tool_call[body_start:])
+                    break
+                function_calls.append(tool_call[body_start:end_index])
+                pos = end_index + len("</function>")
         return function_calls
 
     def extract_tool_calls(
