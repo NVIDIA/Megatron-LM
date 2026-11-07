@@ -13,6 +13,8 @@ from collections import OrderedDict
 import torch
 import argparse
 
+from megatron.core.safe_globals import register_safe_globals
+
 
 tp_split_dim = {
     'word_embeddings.weight': 0,
@@ -24,6 +26,7 @@ tp_split_dim = {
     'D': 0,
     'dt_bias': 0,
     'in_proj.weight': 0,
+    'in_proj.layer_norm_weight': -1,
     'conv1d.weight': 0,
     'conv1d.bias': 0,
     'x_proj.weight': 1,
@@ -72,8 +75,8 @@ def combine_tp_tensors(params, key, dim, tensors):
         for tensor in tensors:
             x, z, B, C, dt = torch.split(tensor, [params.mamba_d_inner // tp_size,
                                                   params.mamba_d_inner // tp_size,
-                                                  (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
-                                                  (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
+                                                  (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
+                                                  (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
                                                   params.mamba2_n_heads // tp_size], dim=dim)
             xs.append(x); zs.append(z); Bs.append(B); Cs.append(C); dts.append(dt)
 
@@ -221,6 +224,10 @@ def finalize_checkpoint(sample_model, model, params, verbose=False):
 
 def main(args):
     print("\n====RUNNING CHECKPOINT CONVERSION====\n")
+
+    # Megatron checkpoints pickle argparse.Namespace and other classes that
+    # torch.load(weights_only=True), the default since PyTorch 2.6, rejects.
+    register_safe_globals()
 
     args.mamba_d_inner = args.d_model * 2
     args.mamba2_n_heads = args.mamba_d_inner // args.mamba2_head_dim
