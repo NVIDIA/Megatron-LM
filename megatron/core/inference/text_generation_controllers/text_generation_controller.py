@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import gc
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -294,6 +295,10 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Inference consumes logits in fp32, so they are held and broadcast in fp32.
+    # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
+    _logits_dtype: torch.dtype = torch.float32
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -311,6 +316,9 @@ class TextGenerationController(MTPControllerMixin):
             self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
+
+        # Default False, unless overridden by gc_mode="freeze_overlap" in the engine.
+        self._overlap_gc = False
 
         # The language model holds the vocab, the MTP block and the embedding; a multimodal
         # wrapper keeps it under `language_model`.
@@ -397,7 +405,7 @@ class TextGenerationController(MTPControllerMixin):
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self._logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -997,10 +1005,7 @@ class TextGenerationController(MTPControllerMixin):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=self.model_config.params_dtype,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
         # Copy logits to contiguous buffer.
@@ -1008,6 +1013,17 @@ class TextGenerationController(MTPControllerMixin):
             self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
         else:
             self._all_logits_cuda = logits
+
+        # The forward is queued on the GPU. Collect now, while it runs, instead of letting
+        # automatic collection start right before the next launch.
+        if self._overlap_gc:
+            self._trigger_gc_now()
+
+    def _trigger_gc_now(self) -> None:
+        """Trigger GC now by CPython's thresholds."""
+        count, threshold = gc.get_count(), gc.get_threshold()
+        if threshold[0] and count[0] > threshold[0]:
+            gc.collect(next(gen for gen in (2, 1, 0) if count[gen] > threshold[gen]))
 
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -3943,7 +3959,7 @@ class TextGenerationController(MTPControllerMixin):
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self._logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
