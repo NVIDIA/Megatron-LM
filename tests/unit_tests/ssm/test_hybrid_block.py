@@ -2247,24 +2247,26 @@ class TestAttnResHybridBlock:
         _enable_te_cpu_offload_v1(monkeypatch)
         layer_type_list = validate_segment_layers(layer_pattern)
 
-        baseline_config = self._make_config(
-            len(layer_type_list),
+        # core_attn offloading rejects Q/K/V that are still views of one fused QKV
+        # buffer (the gathered copies would not match the packed layout fused attention
+        # retains for backward). The hybrid attention entries apply no rotary embedding
+        # here, so give them per-head Q/K norms, which hand core attention standalone
+        # tensors, as the GPT offloading tests do.
+        common_kwargs = dict(
             block_layers=2,
             attn_res_impl=attn_res_impl,
             recompute_granularity="selective" if recompute_layernorm else None,
             recompute_modules=["layernorm"] if recompute_layernorm else [],
+            qk_layernorm=True,
             **model_kwargs,
         )
+        baseline_config = self._make_config(len(layer_type_list), **common_kwargs)
         offload_config = self._make_config(
             len(layer_type_list),
-            block_layers=2,
-            attn_res_impl=attn_res_impl,
-            recompute_granularity="selective" if recompute_layernorm else None,
-            recompute_modules=["layernorm"] if recompute_layernorm else [],
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1,
-            **model_kwargs,
+            **common_kwargs,
         )
 
         model_parallel_cuda_manual_seed(123)
@@ -2332,6 +2334,26 @@ class TestAttnResHybridBlock:
             }
             return output.detach().float().cpu(), hidden_states.grad.detach().float().cpu(), grads
 
+        # Shape-level record of what the qkv_linear group offloads during warm-up, taken
+        # before bulk_offload_group replaces the group's tensors by CPU states.
+        from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+        qkv_linear_offloaded_shapes = set()
+        real_bulk_offload_group = off_module.ChunkOffloadHandler.bulk_offload_group
+
+        def spying_bulk_offload_group(handler, group_to_offload):
+            if handler.is_warmup and group_to_offload._name == "qkv_linear":
+                for tensor in group_to_offload._tensors.values():
+                    if isinstance(tensor, torch.Tensor) and handler.tensor_need_offloading_checker(
+                        tensor
+                    ):
+                        qkv_linear_offloaded_shapes.add(tuple(tensor.shape))
+            return real_bulk_offload_group(handler, group_to_offload)
+
+        monkeypatch.setattr(
+            off_module.ChunkOffloadHandler, "bulk_offload_group", spying_bulk_offload_group
+        )
+
         off_interface.reset_instance()
         try:
             # Warm up both paths, then finalize the offload manager's warmup bookkeeping.
@@ -2344,10 +2366,18 @@ class TestAttnResHybridBlock:
             # single "fused_group_mlp" group, so check the recorded group names.
             for module in _offload_summary_groups(offload_modules):
                 if module == "qkv_linear" and recompute_layernorm:
-                    # The QKV input is a CheckpointWithoutOutput tensor. The norm
-                    # checkpoint owns its storage and regenerates it in backward.
-                    assert manager.offload_summary_bytes.get(module, 0) == 0
-                    continue
+                    # The QKV input is a CheckpointWithoutOutput tensor: the norm checkpoint
+                    # owns its storage and regenerates it in backward, so its [s, b, h]
+                    # shape must not be among the group's offloads. The group still
+                    # offloads the Q/K norm inputs, so its byte count stays positive.
+                    assert (
+                        sequence_length,
+                        micro_batch_size,
+                        baseline_config.hidden_size,
+                    ) not in qkv_linear_offloaded_shapes, (
+                        f"qkv_linear offloaded the recompute-owned QKV input: "
+                        f"{sorted(qkv_linear_offloaded_shapes)}"
+                    )
                 assert manager.offload_summary_bytes.get(module, 0) > 0, (
                     f"Expected {module} to offload at least one activation, got "
                     f"{manager.offload_summary_bytes.get(module, 0)} bytes"
