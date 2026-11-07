@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.distributed.param_and_grad_buffer import _layerwise_gather_sources
 from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -621,3 +622,20 @@ class TestComputeBalancedLayout:
         for param in small_params + [oversized]:
             _assert_param_within_shard(layout, param, dp_size)
         assert oversized in layout.param_index_map
+
+
+def test_layerwise_gather_source_rejects_cpu_master():
+    """fp8 param-gather staging must fail loudly on a CPU-bound (offloaded) fp32 master.
+
+    Chunked optimizer-state offload rebinds selected masters to pinned CPU buffers whose
+    D2H copies may still be in flight; silently staging from them gathers stale weights.
+    """
+    param = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+    param.main_param = torch.zeros(4, 4, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="CPU-resident fp32 master"):
+        _layerwise_gather_sources([param], quantized=True)
+    if torch.cuda.is_available():
+        param.main_param = torch.ones(4, 4, dtype=torch.float32, device="cuda")
+        (staged,) = _layerwise_gather_sources([param], quantized=True)
+        assert staged.dtype == torch.bfloat16 and staged.is_cuda
+        assert torch.equal(staged, torch.ones_like(staged))

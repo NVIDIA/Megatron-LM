@@ -716,20 +716,42 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize(
+    "fused",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not moe_utils.fused_topk_with_score_function_supports_qb,
+                reason="requires the Transformer Engine QB fused-router API",
+            ),
+        ),
+    ],
+    ids=["unfused", "fused"],
+)
+@pytest.mark.parametrize("masked", [False, True], ids=["all-tokens", "padding-masked"])
 @pytest.mark.parametrize("det_algos", [True, False])
-def test_quantile_balancing_histogram_and_bias_replay(det_algos):
-    """Replay accumulated integer histograms, routing gradients, and the batch update."""
+def test_quantile_balancing_histogram_and_bias_replay(det_algos, masked, fused):
+    """Replay accumulated integer histograms, routing gradients, and the batch update.
+
+    ``masked`` passes a ``qb_valid_mask`` (padded packed-sequence slots are False) so only
+    the valid tokens contribute margin samples on the fused and the unfused path.
+    """
     seeded()
     num_tokens, num_experts, num_bins = 8192, 64, 128
     logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
     bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
     bounds = torch.tensor([-1.0, 1.0], device="cuda")
     histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    valid_mask = torch.rand(num_tokens, device="cuda") > 0.25 if masked else None
+    counted_tokens = int(valid_mask.sum()) if masked else num_tokens
 
     def fn(logits, histogram):
         # The harness clones the caller-owned histogram before every replay.
         outputs = []
-        for microbatch in logits.chunk(2):
+        masks = valid_mask.chunk(2) if masked else (None, None)
+        for microbatch, microbatch_mask in zip(logits.chunk(2), masks):
             outputs.append(
                 moe_utils.topk_routing_with_score_function(
                     microbatch,
@@ -738,6 +760,8 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
                     expert_bias=bias,
                     qb_histogram=histogram,
                     qb_bin_bounds=bounds,
+                    qb_valid_mask=microbatch_mask,
+                    fused=fused,
                 )
             )
         probs = torch.cat([output[0] for output in outputs])
@@ -758,7 +782,7 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
         )
     assert torch.equal(
         outputs["out[2]"].sum(dim=-1),
-        torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
+        torch.full((num_experts,), counted_tokens, device="cuda", dtype=torch.int64),
     )
     assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
     assert torch.isfinite(outputs["out[3]"]).all()
@@ -1302,6 +1326,46 @@ class TestMoEModules:
             what=f"global-batch TopKRouter[accumulate={accumulate}]",
         )
         assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
+        assert grads["in[0]"].abs().sum() > 0
+
+    def test_global_batch_quantile_router_padding_mask_replays(self):
+        """Padded tokens stay out of the global-batch histogram and the routing replays."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        router.train(True)
+        with torch.no_grad():
+            router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
+        logits = torch.randn(2048, 4, 64, device="cuda", requires_grad=True)
+        # [seq_length, bsz] padding mask of packed-sequence filler slots.
+        padding_mask = torch.rand(2048, 4, device="cuda") < 0.25
+        valid_tokens = int((~padding_mask).sum())
+
+        def fn(logits):
+            router.qb_histogram.zero_()
+            probs, routing_map = router.routing(logits, padding_mask=padding_mask)
+            return probs, routing_map, router.qb_histogram.clone()
+
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn(8192, 64, device="cuda")},
+            replays=3,
+            contention=True,
+            what="global-batch TopKRouter with padding mask",
+        )
+        assert torch.all(outputs["out[2]"].sum(dim=-1) == valid_tokens)
         assert grads["in[0]"].abs().sum() > 0
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")

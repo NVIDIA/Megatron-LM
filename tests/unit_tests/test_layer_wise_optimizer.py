@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from contextlib import nullcontext
@@ -211,6 +211,61 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children():
 
     with pytest.raises(AssertionError, match="at most one non-empty TensorParallelMuon child"):
         optimizer._enable_chunked_optimizer_state_offload(wrapped_optimizers)
+
+
+def test_layerwise_offload_rejects_padded_param_layout(monkeypatch):
+    """Chunked optimizer-state offload is wired for the compact LayerWise layout only.
+
+    ``OptimizerConfig.validate()`` already rejects the padded layout with Muon offload; the
+    optimizer rejects it explicitly as well so an unvalidated config cannot reach the offload
+    lifecycle with a layout that has no fp32-master staging point.
+    """
+
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self.fp32_from_float16_groups = [[]]
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    raw_optimizer = object.__new__(TensorParallelMuon)
+    raw_optimizer.param_groups = [{"params": [object()]}]
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
+        bf16=True,
+        chunked_optimizer_state_offload=True,
+        optimizer_state_offload_fraction=1.0,
+        overlap_param_gather=False,
+        second_order_optimizer_grad_collective="reduce-scatter",
+    )
+    # The layout follows the DDP wrapping: a chunk wrapped with the distributed optimizer and
+    # without compact LayerWise buffers is padded. Direct construction is always compact.
+    model_chunk = SimpleNamespace(
+        ddp_config=SimpleNamespace(
+            use_distributed_optimizer=True,
+            param_sync_via_bucket_group=True,
+            overlap_param_gather=False,
+            reuse_grad_buf_for_mxfp8_param_ag=False,
+        ),
+        full_param_layout=None,
+        config=SimpleNamespace(cuda_graph_impl="none"),
+    )
+
+    with pytest.raises(ValueError, match="requires the compact LayerWise layout"):
+        LayerWiseDistributedOptimizer([raw_optimizer], config, model_chunks=[model_chunk])
 
 
 def test_layerwise_param_sync_subset_excludes_distopt_buckets():

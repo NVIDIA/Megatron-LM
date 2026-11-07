@@ -499,8 +499,13 @@ class MegatronOptimizer(ABC):
         return indexer_params, non_indexer_params
 
     def prepare_model_params_for_param_sync(self) -> None:
-        """Stage optimizer-owned model params before an explicit DDP param sync."""
-        return
+        """Stage optimizer-owned model params before an explicit DDP param sync.
+
+        Non-DistOpt LayerWise children stage fp8 weights from their fp32 masters inside
+        the DDP all-gather, so any master offloaded to CPU must be resident before the
+        caller's ``start_param_sync(force_sync=True)``. No-op without an offloader.
+        """
+        self.ensure_master_weights_for_param_sync()
 
     def _stage_model_params_from_main_params(self) -> None:
         """Re-derive this optimizer's model params from its FP32 main params.

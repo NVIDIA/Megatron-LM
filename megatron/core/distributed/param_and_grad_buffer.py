@@ -243,10 +243,20 @@ def _layerwise_gather_sources(
     if not quantized:
         return params
     for param in params:
-        assert getattr(param, 'main_param', None) is not None, (
+        main_param = getattr(param, 'main_param', None)
+        assert main_param is not None, (
             "LayerWise quantized param gather needs the owner's FP32 main_param to stage the "
             "all-gather source."
         )
+        if not main_param.is_cuda:
+            # A CPU-bound master means chunked optimizer-state offload has already started (or
+            # not yet finished) moving it; its pinned buffer may be an in-flight D2H/H2D target,
+            # so staging from it would silently gather stale weights.
+            raise RuntimeError(
+                "fp8 param-gather staging found a CPU-resident fp32 master; restore the "
+                "optimizer masters (ensure_master_weights_for_param_sync) before dispatching "
+                "a LayerWise parameter all-gather under chunked optimizer-state offload"
+            )
     return [param.main_param.to(torch.bfloat16) for param in params]
 
 
@@ -393,6 +403,11 @@ class _ParamAndGradBucketGroup:
         # Other metadata to keep track of collectives.
         self.param_gather_handle = None
         self.param_gather_dispatched = False
+        # Set by LayerWiseDistributedOptimizer.start_param_sync_for_bucket_group_subset after the
+        # forced pre-forward gather that precedes the fp32 master offload: DDP.start_param_sync
+        # then leaves this bucket alone (the aligned VPP schedule revisits it) until the next
+        # dispatch-state reset or dispatch, because a re-gather would stage CPU-resident masters.
+        self.param_gather_pinned_before_master_offload = False
         self.grad_reduce_handle = None
         # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
         # bucket group early-drain its predecessor without the end-of-step finalize loop
@@ -563,6 +578,7 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
+                self.param_gather_pinned_before_master_offload = False
                 self.param_gather_dispatched = True
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
@@ -655,6 +671,7 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_handle = None
         if force_sync and self.ddp_config.overlap_param_gather:
             self._post_param_sync()
+        self.param_gather_pinned_before_master_offload = False
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -684,17 +701,22 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
-                if self.next_param_gather_bucket_group.param_gather_dispatched:
+                next_group = self.next_param_gather_bucket_group
+                if next_group.param_gather_dispatched:
+                    # A completed synchronous dispatch (force_sync, e.g. the LayerWise
+                    # pre-forward sync under chunked optimizer-state offload) leaves nothing to
+                    # overlap; only an in-flight async gather indicates an ordering mismatch.
                     # Registration order versus forward order is a property of the model,
                     # so every rank hits this together and one report is enough.
-                    warn_single_rank(
-                        "The next bucket's parameter all-gather operation has already been "
-                        "dispatched. This may be caused by a mismatch between the order of "
-                        "parameter registration and forward pass execution, which will "
-                        "hurt the communication-computation overlap performance."
-                    )
+                    if next_group.param_gather_handle is not None:
+                        warn_single_rank(
+                            "The next bucket's parameter all-gather operation has already been "
+                            "dispatched. This may be caused by a mismatch between the order of "
+                            "parameter registration and forward pass execution, which will "
+                            "hurt the communication-computation overlap performance."
+                        )
                 else:
-                    self.next_param_gather_bucket_group.start_param_sync()
+                    next_group.start_param_sync()
 
             self._post_param_sync()
 
@@ -903,6 +925,7 @@ class _ParamAndGradBucketGroup:
         because it has no predecessor draining.
         """
         self.param_gather_dispatched = False
+        self.param_gather_pinned_before_master_offload = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
