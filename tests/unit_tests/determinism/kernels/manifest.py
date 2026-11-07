@@ -111,6 +111,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
     ),
+    KernelEntry(
+        name="cross_layer_tensor_state",
+        sources=(
+            "megatron/core/transformer/state_boundary.py",
+            "megatron/core/transformer/stateful_module.py",
+            "megatron/core/context_parallel/shared_state.py",
+        ),
+        tests=(K + "test_shared_tensor_state.py",),
+        kind="dispatch",
+        notes="Eager/checkpoint/Torch and TE graph state replay, plus explicit CP layout/gather gradients.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
