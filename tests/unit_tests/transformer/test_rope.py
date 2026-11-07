@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -47,6 +49,90 @@ class TestMultimodalRotaryEmbedding:
         assert output.shape[3] == self.kv_channels
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
+
+
+class _FakeCPGroup:
+    """Minimal CP process-group stand-in for packed mRoPE gate checks."""
+
+    def __init__(self, rank: int, size: int):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+def _cpu_multimodal_rope(kv_channels: int = 64) -> MultimodalRotaryEmbedding:
+    """Build MultimodalRotaryEmbedding on CPU without touching CUDA init paths."""
+    emb = MultimodalRotaryEmbedding.__new__(MultimodalRotaryEmbedding)
+    torch.nn.Module.__init__(emb)
+    dim = kv_channels
+    emb.rotary_interleaved = False
+    emb.seq_len_interpolation_factor = None
+    emb.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    emb.cp_group = None
+    return emb
+
+
+class TestMultimodalRotaryEmbeddingPackedSeqCP:
+    """Packed THD mRoPE must keep full-sequence freqs under CP (issue #7679)."""
+
+    def test_packed_seq_cp2_matches_cp1_freqs(self):
+        """Same position IDs: packed_seq=True with CP=2 equals CP=1 (no early slice)."""
+        kv_channels = 64
+        seq_len = 8
+        mrope_section = [8, 12, 12]
+        # Distinct T/H/W positions so a wrong CP slice would change values, not only shape.
+        position_ids = (
+            torch.arange(seq_len, dtype=torch.float32).view(1, 1, seq_len).repeat(3, 1, 1)
+        )
+        position_ids[1] = position_ids[1] + 10
+        position_ids[2] = position_ids[2] + 20
+
+        rope = _cpu_multimodal_rope(kv_channels)
+        out_cp1 = rope(position_ids, mrope_section, packed_seq=True, cp_group=_FakeCPGroup(0, 1))
+        out_cp2 = rope(position_ids, mrope_section, packed_seq=True, cp_group=_FakeCPGroup(0, 2))
+
+        assert out_cp1.shape[0] == seq_len
+        assert out_cp2.shape[0] == seq_len
+        assert torch.equal(out_cp1, out_cp2)
+
+    def test_non_packed_cp_still_slices(self):
+        """Non-packed CP>1 must keep the intentional early slice (do not regress)."""
+        kv_channels = 64
+        seq_len = 8
+        mrope_section = [8, 12, 12]
+        position_ids = torch.zeros(3, 1, seq_len, dtype=torch.float32)
+        rope = _cpu_multimodal_rope(kv_channels)
+        sliced = torch.zeros(seq_len // 2, 1, 1, kv_channels)
+
+        with patch(
+            'megatron.core.models.common.embeddings.rotary_pos_embedding.get_pos_emb_on_this_cp_rank',
+            return_value=sliced,
+        ) as mock_slice:
+            out = rope(position_ids, mrope_section, packed_seq=False, cp_group=_FakeCPGroup(0, 2))
+
+        mock_slice.assert_called_once()
+        assert out.shape[0] == seq_len // 2
+
+    def test_packed_seq_skips_cp_slice_helper(self):
+        """packed_seq=True must not call get_pos_emb_on_this_cp_rank."""
+        kv_channels = 64
+        seq_len = 8
+        mrope_section = [8, 12, 12]
+        position_ids = torch.zeros(3, 1, seq_len, dtype=torch.float32)
+        rope = _cpu_multimodal_rope(kv_channels)
+
+        with patch(
+            'megatron.core.models.common.embeddings.rotary_pos_embedding.get_pos_emb_on_this_cp_rank'
+        ) as mock_slice:
+            out = rope(position_ids, mrope_section, packed_seq=True, cp_group=_FakeCPGroup(1, 2))
+
+        mock_slice.assert_not_called()
+        assert out.shape[0] == seq_len
 
 
 class TestRotaryEmbedding:
