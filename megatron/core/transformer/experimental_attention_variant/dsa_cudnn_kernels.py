@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import functools
+import inspect
+import re
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -65,6 +67,7 @@ class CudnnDsaInterface(Protocol):
         loss_coeff: float,
         grad_loss: Tensor,
         block_I: int,
+        topk_indices_global: bool = False,
     ) -> dict:
         """Backprop the sparse (top-k) indexer KL loss to the indexer q/k/weights."""
 
@@ -138,6 +141,30 @@ _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
 _CUDA_GRID_Y_MAX = 65535
 _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
+# First cuDNN frontend release whose dense DSA kernels default to a zero (top-left)
+# q_causal_offset instead of the legacy bottom-right alignment (NVIDIA/cudnn-frontend#316).
+_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 26)
+
+
+def _indexer_forward_bshd_bottom_right(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, *, ratio: int
+) -> Tensor:
+    """Dense BSHD indexer scores with the bottom-right causal alignment on any frontend."""
+    return _cudnn_dsa.indexer_forward_wrapper(
+        q_bshd,
+        k_bshd,
+        w_bsh,
+        ratio=ratio,
+        sm_scale=_INDEXER_SOFTMAX_SCALE,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.indexer_forward_wrapper,
+            batch=q_bshd.size(0),
+            seqlen_q=q_bshd.size(1),
+            seqlen_k=k_bshd.size(1),
+            ratio=ratio,
+            device=q_bshd.device,
+        ),
+    )["scores"]
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -612,13 +639,13 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio
+            )
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
-                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio
+            )
         else:
             if global_rows_k_bdk is None:
                 global_rows_k_bdk = (
@@ -748,6 +775,10 @@ def _indexer_topk_multi_packed_cp_thd(
         cu_seqlens_k=layout.segment_cu_k.to(dtype=torch.int32),
         max_seqlen_q=max_segment_q,
         max_seqlen_k=max_segment_k,
+        **_varlen_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.indexer_forward_wrapper,
+            (layout.segment_k_lengths - layout.segment_q_lengths) * _INDEXER_RATIO,
+        ),
     )["scores"]
 
     segment_topk = min(topk_k, max_segment_k)
@@ -937,6 +968,86 @@ def _ensure_dsa_namespace() -> None:
             "`pip install nvidia-cudnn-frontend[cutedsl]`."
         ) from e
     _cudnn_dsa = _ns
+
+
+def _wrapper_accepts_kwarg(wrapper, name: str) -> bool:
+    """Whether a cuDNN wrapper accepts keyword ``name`` (explicitly or via ``**kwargs``)."""
+    try:
+        parameters = inspect.signature(wrapper).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _cudnn_frontend_version() -> Optional[Tuple[int, int]]:
+    """Return the installed cuDNN frontend ``(major, minor)``, or None if unknown."""
+    try:
+        import cudnn
+    except ImportError:
+        return None
+    match = re.match(r"(\d+)\.(\d+)", str(getattr(cudnn, "__version__", "")))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _cudnn_frontend_at_least(version: Tuple[int, int]) -> bool:
+    """Whether the installed cuDNN frontend is known to be at least ``version``."""
+    installed = _cudnn_frontend_version()
+    return installed is not None and installed >= version
+
+
+def _varlen_bottom_right_q_offset_kwargs(wrapper, segment_offsets: Tensor) -> dict:
+    """Pin the bottom-right causal alignment of a cuDNN THD (varlen) indexer forward.
+
+    The packed context-parallel scorer gives each query segment a key prefix that is
+    longer than the segment (``segment_k * ratio - segment_q``), which frontend <= 1.25
+    handled by aligning each segment bottom-right. Frontend >= 1.26 aligns top-left
+    unless ``q_causal_offsets`` is given, so pass the per-segment offsets explicitly
+    there. Older frontends keep their exact call.
+    """
+    if not _cudnn_frontend_at_least(_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION):
+        return {}
+    if not _wrapper_accepts_kwarg(wrapper, "q_causal_offsets"):
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} aligns causal masks top-left by "
+            f"default, but {getattr(wrapper, '__name__', wrapper)!r} does not accept "
+            "q_causal_offsets to restore the bottom-right alignment MCore requires."
+        )
+    return {"q_causal_offsets": segment_offsets.to(dtype=torch.int32).contiguous()}
+
+
+def _bottom_right_q_offset_kwargs(
+    wrapper, *, batch: int, seqlen_q: int, seqlen_k: int, ratio: int, device: torch.device
+) -> dict:
+    """Pin the bottom-right causal alignment of a cuDNN BSHD dense DSA call.
+
+    The dense indexer forward, dense attention score recompute and dense indexer backward
+    kernels of cuDNN frontend <= 1.25 align the causal mask bottom-right, i.e. local query
+    row ``i`` sees keys ``[0, (seqlen_k * ratio - seqlen_q + i + 1) // ratio)``. Frontend
+    1.26 (NVIDIA/cudnn-frontend#316) added ``q_causal_offsets`` and, when it is not given,
+    uses a zero offset (top-left), so FE >= 1.26 masks differently by default. Every
+    MCore BSHD call site was written against the bottom-right contract -- the score-chunk
+    path crops the key prefix precisely so that bottom-right masking reproduces each row's
+    absolute length -- so pass the legacy offset explicitly whenever the default differs.
+
+    Returns no kwargs when the offset is zero (both conventions agree) or when the
+    installed frontend still has the legacy default, which keeps those calls, and their
+    kernel compile keys, exactly as before.
+    """
+    offset = seqlen_k * ratio - seqlen_q
+    if offset == 0 or not _cudnn_frontend_at_least(_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION):
+        return {}
+    if not _wrapper_accepts_kwarg(wrapper, "q_causal_offsets"):
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} aligns causal masks top-left by "
+            f"default, but {getattr(wrapper, '__name__', wrapper)!r} does not accept "
+            "q_causal_offsets to restore the bottom-right alignment MCore requires."
+        )
+    return {"q_causal_offsets": torch.full((batch,), offset, dtype=torch.int32, device=device)}
 
 
 def _local_to_global_flat(local_idxs: Tensor, batch_size: int) -> Tensor:
@@ -1148,11 +1259,8 @@ def _indexer_topk_bshd(
                 q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
             )
         else:
-            scores = _cudnn_dsa.indexer_forward_wrapper(
-                q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )[
-                "scores"
-            ]  # (b, sq, sk) fp32, -inf on masked positions
+            # (b, sq, sk) fp32, -inf on masked positions
+            scores = _indexer_forward_bshd_bottom_right(q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO)
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
         if not return_scores and use_local_indexer_varlen and single_packed_thd_sequence:
@@ -1513,6 +1621,38 @@ def _pad_sparse_backward_topk(
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
+def _call_sparse_indexer_backward(
+    q_idx_bshd: Tensor,
+    w_bsh: Tensor,
+    k_idx_bsd: Tensor,
+    attn_score: Tensor,
+    index_score: Tensor,
+    topk_indices: Tensor,
+    *,
+    loss_coeff: float,
+    grad_loss: Tensor,
+    block_i: int,
+) -> dict:
+    """Call either generation of the cuDNN wrapper with global flattened KV ids.
+
+    Historical wrappers accepted only global ids and therefore exposed no selector.
+    Newer wrappers default to local ids and expose ``topk_indices_global``.  MCore's
+    sparse-loss path has always materialized global ``B * S_k + local`` ids, so set
+    the selector whenever the installed wrapper supports it while preserving the
+    historical call signature.
+    """
+    wrapper = _cudnn_dsa.indexer_backward_wrapper
+    kwargs = {
+        "sm_scale": _INDEXER_SOFTMAX_SCALE,
+        "loss_coeff": loss_coeff,
+        "grad_loss": grad_loss,
+        "block_I": block_i,
+    }
+    if _wrapper_accepts_kwarg(wrapper, "topk_indices_global"):
+        kwargs["topk_indices_global"] = True
+    return wrapper(q_idx_bshd, w_bsh, k_idx_bsd, attn_score, index_score, topk_indices, **kwargs)
+
+
 def _run_sparse_indexer_backward(
     q_idx_bshd: Tensor,
     w_bsh: Tensor,
@@ -1528,17 +1668,16 @@ def _run_sparse_indexer_backward(
     """Run cuDNN sparse indexer backward within CUDA's grid-Y limit."""
     sq = q_idx_bshd.size(1)
     if sq <= _CUDA_GRID_Y_MAX:
-        result = _cudnn_dsa.indexer_backward_wrapper(
+        result = _call_sparse_indexer_backward(
             q_idx_bshd,
             w_bsh,
             k_idx_bsd,
             attn_score,
             index_score,
             topk_indices,
-            sm_scale=_INDEXER_SOFTMAX_SCALE,
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
-            block_I=block_i,
+            block_i=block_i,
         )
         return result["d_index_q"], result["d_weights"], result["d_index_k"]
 
@@ -1548,17 +1687,16 @@ def _run_sparse_indexer_backward(
     for row_start in range(0, sq, _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS):
         row_end = min(row_start + _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS, sq)
         chunk_rows = row_end - row_start
-        result = _cudnn_dsa.indexer_backward_wrapper(
+        result = _call_sparse_indexer_backward(
             q_idx_bshd[:, row_start:row_end].contiguous(),
             w_bsh[:, row_start:row_end].contiguous(),
             k_idx_bsd,
             attn_score[:, row_start:row_end].contiguous(),
             index_score[:, row_start:row_end].contiguous(),
             topk_indices[:, row_start:row_end].contiguous(),
-            sm_scale=_INDEXER_SOFTMAX_SCALE,
             loss_coeff=loss_coeff * chunk_rows / sq,
             grad_loss=grad_loss,
-            block_I=block_i,
+            block_i=block_i,
         )
         grad_q[:, row_start:row_end].copy_(result["d_index_q"])
         grad_w[:, row_start:row_end].copy_(result["d_weights"])
@@ -1706,6 +1844,14 @@ def _compute_dense_attn_score(
         softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
         ratio=_INDEXER_RATIO,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_attn_score_recompute_wrapper,
+            batch=q_attn_bshd.size(0),
+            seqlen_q=q_attn_bshd.size(1),
+            seqlen_k=k_attn_bshd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_attn_bshd.device,
+        ),
     )
     return result["out"], result["denom"]
 
@@ -1931,6 +2077,14 @@ def _compute_dense_indexer_loss_and_grads(
         grad_loss=unit_grad_loss,
         ratio=_INDEXER_RATIO,
         block_I=128,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_indexer_backward_wrapper,
+            batch=q_idx_bshd_for_bwd.size(0),
+            seqlen_q=q_idx_bshd_for_bwd.size(1),
+            seqlen_k=k_idx_bsd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_idx_bshd_for_bwd.device,
+        ),
     )
     # BSHD -> SBHD (match input layout).
     grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
