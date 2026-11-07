@@ -519,48 +519,44 @@ def _compute_indexer_scores_chunk_with_global_rows(
     indexer_ratio: int,
     sm_scale: float,
     seq_lens: Optional[Tensor] = None,
-    k_bdk: Optional[Tensor] = None,
-    key_positions: Optional[Tensor] = None,
 ) -> Tensor:
-    """Compute indexer scores for a query chunk using global causal row positions.
-
-    ``k_bdk`` (fp32 ``[b, idx_hd, sk]`` key) and ``key_positions`` (``arange(sk)``) are
-    loop-invariant across query chunks; callers that chunk may precompute and pass them to
-    avoid recomputing the key cast/transpose and arange on every chunk.
-    """
+    """Compute indexer scores for a query chunk using global causal row positions."""
     if indexer_ratio <= 0:
         raise RuntimeError(f"cuDNN DSA indexer ratio must be positive, got {indexer_ratio}.")
     if k_bshd.size(2) != 1:
         raise RuntimeError(f"cuDNN DSA indexer expects one key head, got {k_bshd.size(2)}.")
 
-    b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
+    b, sq = q_chunk_bshd.shape[:2]
     sk = k_bshd.size(1)
-    scores_chunk = torch.zeros((b, sq, sk), dtype=torch.float32, device=q_chunk_bshd.device)
-    if k_bdk is None:
-        k_bdk = k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
-
-    # Accumulate one head at a time to avoid materializing a [b, sq, idx_nh, sk] tensor.
-    for head_idx in range(idx_nh):
-        head_scores = torch.bmm(q_chunk_bshd[:, :, head_idx, :].to(dtype=torch.float32), k_bdk)
-        head_scores.relu_()
-        head_scores.mul_(w_chunk_bsh[:, :, head_idx].to(dtype=torch.float32).unsqueeze(-1))
-        scores_chunk.add_(head_scores)
-
-    if sm_scale != 1.0:
-        scores_chunk.mul_(sm_scale)
-
+    device = q_chunk_bshd.device
     if seq_lens is None:
-        query_positions = torch.arange(row_start, row_start + sq, device=q_chunk_bshd.device)
-        seq_lens = _causal_seq_lens(query_positions, indexer_ratio, sk)
+        q_causal_offsets = torch.full((b,), row_start, dtype=torch.int32, device=device)
     else:
         if seq_lens.ndim != 1 or seq_lens.numel() != sq:
             raise RuntimeError(f"cuDNN DSA score chunk seq_lens must have shape ({sq},).")
-        seq_lens = seq_lens.to(device=q_chunk_bshd.device, dtype=torch.int64).clamp(max=sk)
-    if key_positions is None:
-        key_positions = torch.arange(sk, device=q_chunk_bshd.device)
-    scores_chunk.masked_fill_(
-        key_positions.view(1, 1, sk) >= seq_lens.view(1, sq, 1), float("-inf")
-    )
+        seq_lens = seq_lens.to(device=device, dtype=torch.int64).clamp(max=sk)
+        # cuDNN FE >= 1.27 rejects seqlen_q > seqlen_k * ratio. Explicit seq_lens replace the
+        # kernel's causal mask (see masked_fill below), so any ratio that covers them is valid.
+        # Raise it before computing the offset, which is derived from the ratio the kernel uses.
+        indexer_ratio = max(indexer_ratio, -(-sq // sk))
+        # Row i keeps keys [0, (offset + i + 1) // indexer_ratio); cover seq_lens[i].
+        row_idx = torch.arange(sq, device=device, dtype=torch.int64)
+        offset = (seq_lens * indexer_ratio - row_idx - 1).max().clamp(min=0)
+        # repeat() rather than expand(): the kernel rejects the stride-0 view expand(1) gives.
+        q_causal_offsets = offset.to(torch.int32).reshape(1).repeat(b)
+    scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+        q_chunk_bshd,
+        k_bshd,
+        w_chunk_bsh,
+        ratio=indexer_ratio,
+        sm_scale=sm_scale,
+        q_causal_offsets=q_causal_offsets,
+    )["scores"]
+    if seq_lens is not None:
+        key_positions = torch.arange(sk, device=device)
+        scores_chunk.masked_fill_(
+            key_positions.view(1, 1, sk) >= seq_lens.view(1, sq, 1), float("-inf")
+        )
     return scores_chunk
 
 
@@ -593,9 +589,6 @@ def _indexer_topk_from_score_chunks(
     seq_lens_b = seq_lens.view(b, sq)
     indices_chunks = []
     values_chunks = [] if return_topk_scores else None
-    # Loop-invariant across chunks; computed lazily on first global-row chunk and reused.
-    global_rows_k_bdk = None
-    global_rows_key_positions = None
 
     for row_start in range(0, sq, chunk_rows):
         row_end = min(row_start + chunk_rows, sq)
@@ -620,11 +613,6 @@ def _indexer_topk_from_score_chunks(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         else:
-            if global_rows_k_bdk is None:
-                global_rows_k_bdk = (
-                    k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
-                )
-                global_rows_key_positions = torch.arange(sk, device=q_bshd.device)
             scores_chunk = _compute_indexer_scores_chunk_with_global_rows(
                 q_chunk,
                 k_bshd,
@@ -633,8 +621,6 @@ def _indexer_topk_from_score_chunks(
                 indexer_ratio=indexer_ratio,
                 sm_scale=_INDEXER_SOFTMAX_SCALE,
                 seq_lens=score_chunk_seq_lens,
-                k_bdk=global_rows_k_bdk,
-                key_positions=global_rows_key_positions,
             )
         if starts is not None:
             scores_chunk = dsa_masking.apply_starts_ends_mask_to_scores(
