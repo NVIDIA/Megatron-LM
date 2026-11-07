@@ -441,13 +441,17 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
                 own.copy_(routes[rank])
                 for replay in range(3):
                     graph.replay()
-                    dist.barrier(group=group)
-                    for label, value, expected in (
+                    torch.cuda.synchronize(device)
+                    observed = (
                         ("histogram", workspace.gathered_counts.cpu(), counts),
                         ("allocation", workspace.field("allocation").cpu(), allocation),
                         ("copies", captured.experts_to_copy.cpu(), copies),
                         ("routes", captured.virtual_experts.cpu(), mapped[rank]),
-                    ):
+                    )
+                    # The next replay republishes the symmetric histogram into every peer's
+                    # window; no rank may launch it until all ranks have read this one.
+                    dist.barrier(group=group, device_ids=[device.index])
+                    for label, value, expected in observed:
                         _check_equal(
                             value,
                             expected,
