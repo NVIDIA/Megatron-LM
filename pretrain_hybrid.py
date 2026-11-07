@@ -58,7 +58,10 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import set_run_config
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
+)
 from megatron.training.utils import is_first_or_last_pipeline_stage, prepare_packed_seq_params
 from model_provider import model_provider
 
@@ -218,6 +221,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
     # Non-validation TP receivers do not allocate this optional field.
     batch.setdefault("padding_mask", None)
+    if needs_padding_mask and (vp_stage is None or vp_stage == 0):
+        # Padded SBHD validation: feed the real per-sample lengths to the FLOPs
+        # accounting once per pipeline rank and micro-batch (first virtual stage),
+        # using the CP-unsliced [micro_batch_size, seq_length] mask, so the
+        # reported TFLOP/s count useful work only, like the packed THD path.
+        update_seqlen_stats_from_padding_mask(batch["padding_mask"])
 
     batch = flatten_batch_for_packed_sequences(batch)
 
