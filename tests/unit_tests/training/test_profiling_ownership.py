@@ -13,7 +13,7 @@ import pytest
 
 from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
-from megatron.training.config import ProfilingConfig
+from megatron.training.config import ProfilingConfig, StragglerDetectionConfig
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.state import TrainState
 from megatron.training.utils import start_memory_history_recording
@@ -113,6 +113,37 @@ def inline_profiler(monkeypatch, run_config):
     return start
 
 
+@pytest.mark.parametrize(
+    "enabled,start_disabled", [(None, False), (False, False), (True, False), (True, True)]
+)
+def test_straggler_setup_uses_native_config(
+    monkeypatch, run_config, inline_profiler, enabled, start_disabled
+):
+    args = training.get_args()
+    for config_field in fields(StragglerDetectionConfig):
+        delattr(args, config_field.name)
+    run_config.straggler = (
+        None
+        if enabled is None
+        else StragglerDetectionConfig(
+            log_straggler=enabled,
+            disable_straggler_on_startup=start_disabled,
+            straggler_minmax_count=3,
+            straggler_ctrlr_port=12345,
+        )
+    )
+    detector = MagicMock()
+    monkeypatch.setattr(training, "stimer", detector)
+    monkeypatch.setattr(training.torch.distributed, "get_world_size", lambda: 8)
+    inline_profiler(ProfilingConfig(), rank=2)
+    if enabled:
+        detector.configure.assert_called_once_with(
+            8, 2, mmcnt=3, enabled=not start_disabled, port=12345
+        )
+    else:
+        detector.configure.assert_not_called()
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_workload_inspector_uses_profiling_config(monkeypatch, inline_profiler, enabled):
     options = ["--run-workload-inspector-server"] if enabled else []
@@ -167,6 +198,9 @@ def validate_at_pretrain(monkeypatch, run_config):
     setup = Mock()
     monkeypatch.setattr(training, "initialize_megatron", initialize)
     monkeypatch.setattr(training.ft_integration, "setup", setup)
+    # pretrain() finalizes the container before fault-tolerance setup; that needs the
+    # registered args, which these validation-order checks stop short of.
+    monkeypatch.setattr(run_config, "finalize", Mock())
 
     def validate(config):
         run_config.profiling = config
@@ -229,7 +263,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
     args, _ = cli_config()
     model = object()
     build = Mock(return_value=model)
-    monkeypatch.setattr(argument_utils, "gpt_config_from_args", build)
+    monkeypatch.setattr(argument_utils, "model_config_from_args", build)
     kwargs = {"model_cfg": None} if explicit_none else {}
     config = argument_utils.inference_cfg_container_from_args(args, **kwargs)
     assert config.model is model

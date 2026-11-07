@@ -178,8 +178,22 @@ def parse_args_and_detect_vlm(
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    # Detection can update text-only and MIMO language backbones as well as VLMs.
+    # Keep the MIMO checkpoint provider's Hybrid configuration and prefix dispatch.
+    model_config_cls = (
+        LLaVAModelConfig
+        if is_vlm and getattr(args, "mimo_checkpoint_prefix_map", None) is None
+        else None
+    )
+    cfg.model = model_config_from_args(args, model_config_cls=model_config_cls)
     cfg.tokenizer = tokenizer_config_from_args(args)
     rebuild_tokenizer(cfg, args)
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+    resolve_tokenizer_vocab_size(cfg)
     # Tiling and dynamic_resolution are mutually exclusive at inference, so
     # use --use-tiling explicitly.
     if getattr(args, 'use_tiling', False):

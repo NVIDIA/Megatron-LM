@@ -1361,8 +1361,10 @@ class TestPipelineStagesShareOneCheckpointLayout:
                 }
             },
         }
-        args = SimpleNamespace(swiglu=False, num_experts=None)
-        return preprocess_fsdp_dtensor_state_dict(args, state_dict, model)
+        config = SimpleNamespace(
+            gated_linear_unit=False, activation_func=None, num_moe_experts=None
+        )
+        return preprocess_fsdp_dtensor_state_dict(config, state_dict, model)
 
     @pytest.mark.parametrize("section", ["model", "optimizer"])
     def test_stages_write_the_pp1_layout(self, no_expert_parallel, section):
