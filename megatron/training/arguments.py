@@ -1887,6 +1887,15 @@ def _add_transformer_engine_args(parser):
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
 
+    group.add_argument(
+        '--inference-shortcut-moe-overlap',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Overlap Shortcut MoE inference with its unsplit GDP or attention '
+        'predecessor. Requires dynamic inference_optimized language layers, '
+        'BF16 model parameters, TP=CP=1, and Triton NVLS.',
+    )
+
     group.add_argument('--inference-batch-times-seqlen-threshold',
                        type=int, default=-1,
                        help='If (batch-size * sequence-length) is smaller than this threshold'
