@@ -364,10 +364,17 @@ def add_moe_routing_to_choice(choice_data, result, prompt_len):
             choice_data["prompt_moe_topk_indices"] = result["routing_indices"][:prompt_len]
 
 
-def build_usage(prompt_tokens_counts, total_completion_tokens, cached_tokens_counts):
-    """Build the OpenAI usage block from per-choice prompt-token counts."""
-    prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-    cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
+def build_usage(
+    prompt_tokens_counts, total_completion_tokens, cached_tokens_counts, *, shared_prompt
+):
+    """Build the OpenAI usage block from per-choice prompt-token counts.
+
+    Chat choices share one prompt, so it is counted once; each completion choice has its own
+    prompt, so their prompt and cached counts are summed.
+    """
+    combine = max if shared_prompt else sum
+    prompt_token_count = combine(prompt_tokens_counts) if prompt_tokens_counts else 0
+    cached_token_count = combine(cached_tokens_counts) if cached_tokens_counts else 0
     return {
         "prompt_tokens": prompt_token_count,
         "completion_tokens": total_completion_tokens,
