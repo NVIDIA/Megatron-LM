@@ -1105,7 +1105,14 @@ def validate_args(args, defaults={}):
 
         if args.grad_reduce_in_bf16:
             args.accumulate_allreduce_grads_in_fp32 = False
-        elif not args.accumulate_allreduce_grads_in_fp32 and main_grads_is_fp32:
+        elif (
+            not args.use_megatron_fsdp
+            and not args.accumulate_allreduce_grads_in_fp32
+            and main_grads_is_fp32
+        ):
+            # MFSDP uses its explicit main-gradient and communication dtype policy,
+            # not the legacy optimizer main_grads_dtype default. Do not turn that
+            # unrelated default into an FP32 request that conflicts with MFSDP.
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
 

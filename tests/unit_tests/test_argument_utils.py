@@ -117,6 +117,85 @@ def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     assert ddp_config.megatron_fsdp_padded_shards is False
 
 
+@pytest.mark.parametrize("fsdp_version", [1, 2])
+@pytest.mark.parametrize("main_grads_dtype", ["auto", "bf16", "fp32"])
+def test_bf16_mfsdp_does_not_infer_legacy_fp32_reduction(
+    monkeypatch, fsdp_version, main_grads_dtype
+):
+    """The optimizer default must not override MFSDP's independent dtype policy."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.bf16 = True
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = fsdp_version
+    args.megatron_fsdp_main_grads_dtype = main_grads_dtype
+    args.ckpt_format = "fsdp_dtensor"
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+
+    args = validate_args(args)
+    config = get_megatron_ddp_config(args, use_torch_fsdp2=False)
+
+    assert args.accumulate_allreduce_grads_in_fp32 is False
+    assert config.grad_reduce_in_fp32 is False
+    assert (
+        config.megatron_fsdp_main_grads_dtype
+        == {"auto": None, "bf16": torch.bfloat16, "fp32": torch.float32}[main_grads_dtype]
+    )
+    assert config.megatron_fsdp_grad_comm_dtype is None
+
+
+@pytest.mark.parametrize("fsdp_version", [1, 2])
+@pytest.mark.parametrize(
+    "main_grads_dtype,comm_dtype,error",
+    [
+        ("auto", "auto", "main_grads_dtype=torch.float32"),
+        ("bf16", "auto", "main_grads_dtype=torch.float32"),
+        ("fp32", "bf16", "grad_comm_dtype=torch.float32 or None"),
+        ("fp32", "auto", None),
+        ("fp32", "fp32", None),
+    ],
+)
+def test_bf16_mfsdp_explicit_fp32_request_keeps_dtype_validation(
+    monkeypatch, fsdp_version, main_grads_dtype, comm_dtype, error
+):
+    """Explicit legacy requests still require compatible explicit MFSDP dtypes."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.bf16 = True
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = fsdp_version
+    args.megatron_fsdp_main_grads_dtype = main_grads_dtype
+    args.megatron_fsdp_grad_comm_dtype = comm_dtype
+    args.accumulate_allreduce_grads_in_fp32 = True
+    args.ckpt_format = "fsdp_dtensor"
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+
+    args = validate_args(args)
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = get_megatron_ddp_config(args, use_torch_fsdp2=False)
+        assert config.grad_reduce_in_fp32 is True
+        assert config.megatron_fsdp_main_grads_dtype == torch.float32
+
+
+def test_bf16_ddp_still_infers_fp32_reduction(monkeypatch):
+    """The legacy BF16 DDP default is unchanged."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.bf16 = True
+
+    args = validate_args(args)
+    config = get_megatron_ddp_config(args, use_torch_fsdp2=False)
+
+    assert args.accumulate_allreduce_grads_in_fp32 is True
+    assert config.grad_reduce_in_fp32 is True
+
+
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size
