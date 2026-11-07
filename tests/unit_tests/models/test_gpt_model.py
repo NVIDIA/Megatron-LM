@@ -5,6 +5,7 @@ import logging
 import os
 from contextlib import nullcontext
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -968,3 +969,81 @@ def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_out
         assert marked == share_embeddings_and_output_weights
 
     Utils.destroy_model_parallel()
+
+
+class _FakeProcessGroup:
+    """Process group stand-in exposing only the rank and size that a sequence split reads."""
+
+    def __init__(self, rank, size):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize("embedding_scatters", [True, False])
+def test_preprocess_splits_padding_mask_over_model_tp_group(monkeypatch, embedding_scatters):
+    """Under sequence parallelism the padding mask is split over ``pg_collection.tp``.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/7452 (finding 5): the
+    decoder input was split over the model's TP group but the MoE padding mask over the global
+    TP group, so a rank whose rank differs between the two groups masked tokens it does not hold.
+    """
+    sequence_length, batch_size, hidden_size = 8, 2, 4
+    model_tp_group = _FakeProcessGroup(rank=1, size=2)
+    # Stands in for the global TP group that an omitted ``group`` falls back to.
+    global_tp_group = _FakeProcessGroup(rank=0, size=2)
+    scatter_groups = []
+
+    def fake_scatter(tensor, group=None):
+        group = global_tp_group if group is None else group
+        scatter_groups.append(group)
+        chunk = tensor.shape[0] // group.size()
+        return tensor[group.rank() * chunk : (group.rank() + 1) * chunk]
+
+    monkeypatch.setattr(
+        "megatron.core.models.gpt.gpt_model.tensor_parallel.scatter_to_sequence_parallel_region",
+        fake_scatter,
+    )
+    # Each hidden state holds its token position, so the output shows which tokens a rank holds.
+    embeddings = (
+        torch.arange(sequence_length, dtype=torch.float32)
+        .view(sequence_length, 1, 1)
+        .expand(sequence_length, batch_size, hidden_size)
+    )
+    chunk = sequence_length // model_tp_group.size()
+    local_tokens = torch.arange(sequence_length)[
+        model_tp_group.rank() * chunk : (model_tp_group.rank() + 1) * chunk
+    ]
+    # The embedding either splits over its own tp_group (pg_collection.tp) or leaves it to GPTModel.
+    embedding = MagicMock(
+        return_value=embeddings[local_tokens] if embedding_scatters else embeddings
+    )
+    embedding.scatter_to_sequence_parallel = embedding_scatters
+    model = SimpleNamespace(
+        pre_process=True,
+        embedding=embedding,
+        config=SimpleNamespace(sequence_parallel=True, multi_latent_attention=False),
+        pg_collection=SimpleNamespace(tp=model_tp_group),
+        position_embedding_type="none",
+    )
+    padding_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool)
+    padding_mask[0, 3:] = True
+    padding_mask[1, 6:] = True
+
+    output = GPTModel._preprocess(
+        model,
+        input_ids=torch.zeros(batch_size, sequence_length, dtype=torch.long),
+        position_ids=torch.arange(sequence_length).repeat(batch_size, 1),
+        padding_mask=padding_mask,
+    )
+    decoder_input, local_padding_mask = output[0], output[5]
+
+    assert torch.equal(decoder_input[:, 0, 0].long(), local_tokens)
+    assert torch.equal(local_padding_mask, padding_mask[:, local_tokens])
+    # Every split, the padding mask included, uses the model's TP group.
+    assert all(group is model_tp_group for group in scatter_groups)
