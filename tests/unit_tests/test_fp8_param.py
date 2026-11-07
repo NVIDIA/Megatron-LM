@@ -319,7 +319,7 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if not inference and cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             requested_layout = {"reduce-scatter": "padded", "all-reduce": "compact"}[
-                cfg_container.optimizer.emerging_optimizer_grad_collective
+                cfg_container.optimizer.second_order_optimizer_grad_collective
             ]
             pending = [optimizer]
             layerwise = []
@@ -763,7 +763,7 @@ class TestFP8Param:
         kwargs = {
             "optimizer": "muon",
             "muon_tp_mode": "duplicated",
-            "emerging_optimizer_grad_collective": grad_collective,
+            "second_order_optimizer_grad_collective": grad_collective,
             "overlap_param_gather": dp_overlap[0],
             "overlap_grad_reduce": dp_overlap[1],
             "num_steps": 20,

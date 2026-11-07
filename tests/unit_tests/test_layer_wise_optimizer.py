@@ -338,7 +338,7 @@ def _create(
             transformer_config,
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective=grad_collective,
+            second_order_optimizer_grad_collective=grad_collective,
         )[0]
     else:
         model = DistributedDataParallel(transformer_config, ddp_config, model)
@@ -364,7 +364,7 @@ def _create(
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
             optimizer_state_offload_fraction=optimizer_state_offload_fraction,
-            emerging_optimizer_grad_collective=(
+            second_order_optimizer_grad_collective=(
                 grad_collective if use_layer_wise else 'reduce-scatter'
             ),
         ),

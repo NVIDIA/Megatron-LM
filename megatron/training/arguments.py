@@ -4271,12 +4271,12 @@ def _add_distributed_args(parser):
         help="Overlap outer-DP and inner-DP gradient reductions with Megatron-FSDP v2.",
     )
     group.add_argument(
-        '--emerging-optimizer-grad-collective',
+        '--second-order-optimizer-grad-collective',
         type=str,
         default='reduce-scatter',
         choices=['reduce-scatter', 'all-reduce'],
-        help='Data-parallel gradient collective for the parameters that an '
-        'emerging optimizer with --use-distributed-optimizer (e.g. Muon) '
+        help='Data-parallel gradient collective for the parameters that a '
+        'second-order optimizer with --use-distributed-optimizer (e.g. Muon) '
         'updates whole on one rank. reduce-scatter (default): those tensors '
         'stay whole inside padded, equal-size shards. all-reduce: no padding, '
         'twice the gradient traffic and an uneven all-gather of whole tensors; '

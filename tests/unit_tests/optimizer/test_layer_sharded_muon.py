@@ -749,7 +749,7 @@ def _layer_wise_muon(ns_batch_size, nesterov):
         TransformerConfig(num_attention_heads=1, num_layers=1),
         DistributedDataParallelConfig(),
         use_layer_wise_distributed_optimizer=True,
-        emerging_optimizer_grad_collective='all-reduce',
+        second_order_optimizer_grad_collective='all-reduce',
     )[0]
     config = OptimizerConfig(
         optimizer='muon',
@@ -757,7 +757,7 @@ def _layer_wise_muon(ns_batch_size, nesterov):
         bf16=True,
         use_distributed_optimizer=False,
         use_layer_wise_distributed_optimizer=True,
-        emerging_optimizer_grad_collective='all-reduce',
+        second_order_optimizer_grad_collective='all-reduce',
         muon_tp_mode='layer_sharded',
         muon_split_qkv=False,
         muon_ns_batch_size=ns_batch_size,

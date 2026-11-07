@@ -93,15 +93,15 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
     "flags, collective",
     [
         ([], "reduce-scatter"),
-        (["--emerging-optimizer-grad-collective", "reduce-scatter"], "reduce-scatter"),
-        (["--emerging-optimizer-grad-collective", "all-reduce"], "all-reduce"),
+        (["--second-order-optimizer-grad-collective", "reduce-scatter"], "reduce-scatter"),
+        (["--second-order-optimizer-grad-collective", "all-reduce"], "all-reduce"),
     ],
 )
-def test_emerging_optimizer_grad_collective_cli_defaults_to_reduce_scatter(flags, collective):
+def test_second_order_optimizer_grad_collective_cli_defaults_to_reduce_scatter(flags, collective):
     parser = add_megatron_arguments(ArgumentParser())
     args = parser.parse_args(flags)
     kwargs = _default_config_from_args(OptimizerConfig, args, return_instance=False)
-    assert kwargs["emerging_optimizer_grad_collective"] == collective
+    assert kwargs["second_order_optimizer_grad_collective"] == collective
 
 
 @pytest.mark.parametrize("count", [2, 3])

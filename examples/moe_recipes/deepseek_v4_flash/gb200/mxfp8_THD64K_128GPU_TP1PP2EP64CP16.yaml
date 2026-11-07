@@ -233,7 +233,7 @@ ARGS:
   muon_momentum: 0.95
   muon_coefficient_type: deepseekv4
   muon_num_ns_steps: 10
-  emerging_optimizer_grad_collective: all-reduce
+  second_order_optimizer_grad_collective: all-reduce
   bf16: true
   fp8_recipe: mxfp8
   fp8_format: e4m3

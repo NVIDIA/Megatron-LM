@@ -92,14 +92,14 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
-# LayerWise buffer layout behind each OptimizerConfig.emerging_optimizer_grad_collective.
+# LayerWise buffer layout behind each OptimizerConfig.second_order_optimizer_grad_collective.
 _PARAM_LAYOUTS = {"reduce-scatter": "padded", "all-reduce": "compact"}
 
 
 def _param_layout_for(grad_collective: str) -> str:
     if grad_collective not in _PARAM_LAYOUTS:
         raise ValueError(
-            "emerging_optimizer_grad_collective must be one of "
+            "second_order_optimizer_grad_collective must be one of "
             f"{list(_PARAM_LAYOUTS)}, got {grad_collective!r}."
         )
     return _PARAM_LAYOUTS[grad_collective]
@@ -110,7 +110,7 @@ def configure_ddp_for_layer_wise_optimizer(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer: bool,
-    emerging_optimizer_grad_collective: str = "reduce-scatter",
+    second_order_optimizer_grad_collective: str = "reduce-scatter",
 ) -> Optional[Callable]:
     """Prepare standard DDP wrapping for the selected optimizer; return its layout function.
 
@@ -120,7 +120,7 @@ def configure_ddp_for_layer_wise_optimizer(
 
     - Without the layer-wise distributed optimizer, a distributed-optimizer config gets
       :meth:`DistributedOptimizer.compute_full_param_layout` and other configs get no layout.
-    - With it, ``emerging_optimizer_grad_collective`` selects the LayerWise layout:
+    - With it, ``second_order_optimizer_grad_collective`` selects the LayerWise layout:
       ``"reduce-scatter"`` the padded and ``"all-reduce"`` the compact one. Both enable
       ``use_distributed_optimizer`` for the buffers of the sibling DistributedOptimizer, tag the
       params for buffer routing and get
@@ -131,7 +131,8 @@ def configure_ddp_for_layer_wise_optimizer(
         ddp_config: :class:`DistributedDataParallelConfig`, updated in place.
         use_layer_wise_distributed_optimizer: Whether the model is trained with
             :class:`LayerWiseDistributedOptimizer`.
-        emerging_optimizer_grad_collective: ``OptimizerConfig.emerging_optimizer_grad_collective``.
+        second_order_optimizer_grad_collective: See
+            ``OptimizerConfig.second_order_optimizer_grad_collective``.
 
     Returns:
         The ``compute_full_param_layout`` callable for DDP, or ``None``.
@@ -143,7 +144,7 @@ def configure_ddp_for_layer_wise_optimizer(
             return DistributedOptimizer.compute_full_param_layout
         return None
 
-    param_layout = _param_layout_for(emerging_optimizer_grad_collective)
+    param_layout = _param_layout_for(second_order_optimizer_grad_collective)
     if ddp_config.num_distributed_optimizer_instances != 1:
         raise ValueError(
             "LayerWiseDistributedOptimizer requires num_distributed_optimizer_instances == 1: "
@@ -925,7 +926,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.param_layout != 'compact':
             raise ValueError(
                 "Muon chunked optimizer-state offload requires the compact LayerWise layout "
-                f"(emerging_optimizer_grad_collective='all-reduce'); got {self.param_layout!r}."
+                f"(second_order_optimizer_grad_collective='all-reduce'); got {self.param_layout!r}."
             )
         offload_children = []
         for optimizer in optimizers:
@@ -1003,7 +1004,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """Return the LayerWise layout (``"padded"`` or ``"compact"``) of the wrapped model
         chunks.
 
-        It follows ``config.emerging_optimizer_grad_collective``, which must match the layouts
+        It follows ``config.second_order_optimizer_grad_collective``, which must match the layouts
         DDP was built with: LayerWise buffers with optimizer shards are padded, those without
         are compact. Without DDP-wrapped model chunks (direct construction), whole params are
         owned and gathered as in the compact layout.
@@ -1016,7 +1017,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "through configure_ddp_for_layer_wise_optimizer(), e.g. with "
                 "use_layer_wise_distributed_optimizer=True in wrap_model_chunks_with_ddp."
             )
-        declared = _param_layout_for(config.emerging_optimizer_grad_collective)
+        declared = _param_layout_for(config.second_order_optimizer_grad_collective)
         sharded = {
             layout.use_distributed_optimizer
             for full_layout in full_param_layouts or []
@@ -1031,8 +1032,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         built = ('padded' if sharded.pop() else 'compact') if sharded else declared
         if built != declared:
             raise ValueError(
-                "emerging_optimizer_grad_collective="
-                f"{config.emerging_optimizer_grad_collective!r} does not match the {built} "
+                "second_order_optimizer_grad_collective="
+                f"{config.second_order_optimizer_grad_collective!r} does not match the {built} "
                 "layout that DDP was built with. Pass the same value to "
                 "configure_ddp_for_layer_wise_optimizer() when wrapping the model."
             )
@@ -1056,7 +1057,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if is_mxfp8tensor(param) and reuse_grad_buf:
                         continue
                     hint = (
-                        "Use --emerging-optimizer-grad-collective all-reduce, which gathers "
+                        "Use --second-order-optimizer-grad-collective all-reduce, which gathers "
                         "BF16 values and requantizes them on every rank."
                         if is_mxfp8tensor(param) or is_blockwise_float8tensor(param)
                         else "Use the mxfp8 or blockwise recipe, or disable --fp8-param-gather."

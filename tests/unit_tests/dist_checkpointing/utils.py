@@ -258,7 +258,7 @@ def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise, 
         optimizer_cfg = get_run_config().optimizer
         optimizer_cfg.use_distributed_optimizer = use_distributed_optimizer
         optimizer_cfg.use_layer_wise_distributed_optimizer = use_layer_wise
-        optimizer_cfg.emerging_optimizer_grad_collective = grad_collective
+        optimizer_cfg.second_order_optimizer_grad_collective = grad_collective
 
 
 def setup_model_and_optimizer(
@@ -357,7 +357,7 @@ def setup_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
-        emerging_optimizer_grad_collective=grad_collective,
+        second_order_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
         chunked_optimizer_state_offload=chunked_optimizer_state_offload,
         optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
@@ -502,7 +502,7 @@ def setup_moe_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
-        emerging_optimizer_grad_collective=grad_collective,
+        second_order_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
     )
 

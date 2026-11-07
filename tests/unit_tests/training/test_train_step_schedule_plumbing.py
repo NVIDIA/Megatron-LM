@@ -598,7 +598,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         optimizer=SimpleNamespace(
             overlap_param_gather_with_optimizer_step=False,
             use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective="all-reduce",
+            second_order_optimizer_grad_collective="all-reduce",
         ),
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
         rng=SimpleNamespace(data_parallel_random_init=False),
@@ -641,7 +641,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         wrap_with_ddp=False,
         data_parallel_random_init=False,
         use_layer_wise_distributed_optimizer=True,
-        emerging_optimizer_grad_collective="all-reduce",
+        second_order_optimizer_grad_collective="all-reduce",
     )
 
 

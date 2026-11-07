@@ -62,11 +62,11 @@ The following figures show the sharding scheme and the main steps of the paramet
 
 ## Layer-Wise Distributed Optimizer
 
-Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
+Second-order optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
 
-`--emerging-optimizer-grad-collective` selects how the gradients of these matrices are reduced across data-parallel ranks, and with it how the matrices are laid out:
+`--second-order-optimizer-grad-collective` selects how the gradients of these matrices are reduced across data-parallel ranks, and with it how the matrices are laid out:
 
-| `--emerging-optimizer-grad-collective` | Parameter gather | Buffers |
+| `--second-order-optimizer-grad-collective` | Parameter gather | Buffers |
 | ------ | ------ | ------ |
 | `reduce-scatter` (default) | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
 | `all-reduce` | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. Twice the gradient traffic. |
@@ -77,9 +77,9 @@ With `--fp8-param-gather`, both collectives gather quantized parameters as BF16 
 
 ### Migrating from the boolean layout flags
 
-`--emerging-optimizer-grad-collective` replaces the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags:
+`--second-order-optimizer-grad-collective` replaces the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags:
 
-- Runs on the compact layout pass `--emerging-optimizer-grad-collective all-reduce`. It has been the default since July 2026, and `--no-use-layer-wise-param-layout` has selected it since October 2026.
+- Runs on the compact layout pass `--second-order-optimizer-grad-collective all-reduce`. It has been the default since July 2026, and `--no-use-layer-wise-param-layout` has selected it since October 2026.
 - Runs on the padded layout, the default in June 2026 and selected by `--use-layer-wise-param-layout` since July 2026, get it from the new default, `reduce-scatter`.
 
 The `torch_dist` checkpoints of both layouts load, optimizer state included.
