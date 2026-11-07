@@ -26,7 +26,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
-    l2norm,
+    torch_l2norm,
 )
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
@@ -284,6 +284,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             packed_seq_params,
         )
 
+        # The fused pre-GDR path already normalizes q/k. Only defer normalization
+        # to the GDR kernel when the unfused preprocessor is used.
+        use_qk_l2norm_in_kernel = (
+            self.use_qk_l2norm
+            and self.use_qk_l2norm_in_kernel
+            and not self.gdn_pre_gated_delta_rule_fusion
+        )
         if self.gdn_pre_gated_delta_rule_fusion:
             nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
             seq_idx = (
@@ -303,7 +310,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q
+                qkvzba,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                cu_seqlens_q,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
@@ -313,7 +326,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             **kernel_inputs,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
@@ -545,7 +558,16 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
 
-    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+    def pre_gated_delta_rule(
+        self,
+        qkvzba,
+        batch,
+        seq_len,
+        cp_size,
+        cp_group,
+        cu_seqlens_q=None,
+        use_qk_l2norm_in_kernel=False,
+    ):
         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
         # Transpose: s b x --> b s x
@@ -616,6 +638,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             seq_len,
             beta,
             alpha,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cp_size_headwise=cp_size,
         )
         gate = kernel_inputs.pop("gate")
@@ -723,8 +746,8 @@ def torch_chunk_gated_delta_rule(
     query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
+        query = torch_l2norm(query)
+        key = torch_l2norm(key)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
