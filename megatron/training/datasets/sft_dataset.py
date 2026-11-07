@@ -76,7 +76,9 @@ class SFTDataset(MegatronDataset):
         return SFTLowLevelDataset(dataset_path)
 
     def __len__(self) -> int:
-        return self.num_samples
+        # Unsized construction exposes one epoch, including during the builder's
+        # length checks before a corpus wrapper is attached.
+        return len(self.indices) if self.num_samples is None else self.num_samples
 
     def _split_conversations(self, merged_conversations):
         split_conversations = []
@@ -324,7 +326,7 @@ class MockSFTDataset(SFTDataset):
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:
-        return self.num_samples
+        return super().__len__()
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
