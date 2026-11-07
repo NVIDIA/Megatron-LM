@@ -18,10 +18,15 @@ Follow repository `AGENTS.md` and the user's requested scope throughout.
 - PRs with `autoMergeRequest` but no `mergeQueueEntry` are pending auto-merges,
   not actual queue entries. An `Approved` label alone does not imply either state.
   Report that distinction when counting or widening the candidate pool.
-- Honor supplied PRs and exclusions. If selecting a batch, inspect the diffs,
+- Honor supplied PRs, counts, and exclusions. If selecting a batch, inspect the diffs,
   review state, current CI, and dependencies. Prefer small fixes with regression
   coverage, limited default-behavior changes, and little file overlap. A small
   diff or complexity label is not sufficient evidence of low risk.
+- Recommend **5 PRs per batch**, normally **3–7**, weighing each PR's risk,
+  interactions, file overlap, and test coverage. Favor the lower end when risk
+  or uncertainty increases; approach 7 only for independent, well-covered changes.
+  Exceed 7 only for very trivial changes. If fewer than 3 suitable candidates are
+  available, report the shortage rather than adding risky PRs to reach a count.
 - Record each source PR number, full head SHA, author/coauthors, relevant labels,
   and changed files. Recheck that the PR is open and its head is unchanged before
   publishing the batch. Do not silently substitute a later revision.
