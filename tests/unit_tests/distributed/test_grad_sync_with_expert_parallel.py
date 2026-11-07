@@ -275,6 +275,80 @@ def test_expert_grad_sync_uses_expert_data_parallel_group(
         Utils.destroy_model_parallel()
 
 
+def test_replicated_expert_grad_sync_with_gtp_optimizer_instances():
+    """Expert DP reduction and EGTP completion cover each distinct-data rank once."""
+    if Utils.world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    class ToyModule(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.dense = torch.nn.Parameter(torch.ones(256, device="cuda", dtype=torch.bfloat16))
+            self.expert = torch.nn.Parameter(torch.ones(256, device="cuda", dtype=torch.bfloat16))
+            self.expert.allreduce = False
+
+    try:
+        Utils.initialize_model_parallel(
+            expert_model_parallel_size=2,
+            gtp_remat_size=2,
+            expert_gtp_remat_size=2,
+            num_distributed_optimizer_instances=2,
+        )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            num_moe_experts=2,
+            expert_model_parallel_size=2,
+            tensor_parallel_num_weight_shards=2,
+            expert_tensor_parallel_num_weight_shards=2,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=False,
+        )
+        ddp = DistributedDataParallel(
+            config,
+            ddp_config=DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                use_distributed_optimizer=True,
+                num_distributed_optimizer_instances=2,
+                overlap_grad_reduce=False,
+            ),
+            module=ToyModule(config),
+        )
+        ddp.zero_grad_buffer()
+        for param in ddp.parameters():
+            param.main_grad.fill_(float(torch.distributed.get_rank() + 1))
+        ddp.finish_grad_sync()
+
+        from megatron.core.distributed.finalize_model_grads import (
+            _allreduce_replicated_grads_over_gtp_remat_group,
+        )
+
+        _allreduce_replicated_grads_over_gtp_remat_group(
+            [ddp],
+            parallel_state.get_gtp_weight_remat_group(),
+            parallel_state.get_expert_gtp_weight_remat_group(),
+        )
+        expert_full_group = parallel_state.get_expert_data_parallel_group(with_gtp_remat=True)
+        expert_ranks = torch.distributed.get_process_group_ranks(expert_full_group)
+        dp_cp_size = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        ).size()
+        egtp_size = parallel_state.get_expert_gtp_weight_remat_group().size()
+        expected = sum(r + 1 for r in expert_ranks) / (dp_cp_size * egtp_size)
+        torch.testing.assert_close(
+            ddp.module.expert.main_grad,
+            torch.full_like(ddp.module.expert.main_grad, expected),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
