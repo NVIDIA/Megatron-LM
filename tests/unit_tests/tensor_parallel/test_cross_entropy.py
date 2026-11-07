@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.language_module import language_module as language_module_module
 from megatron.core.tensor_parallel import cross_entropy as cross_entropy_module
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -133,3 +135,40 @@ def test_vocab_parallel_cross_entropy():
     ).cuda()
     assert torch.equal(torch.round(expected_output), torch.round(output))
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+@pytest.mark.parametrize("logit_scale", [1.0, 1000.0])
+def test_vocab_parallel_cross_entropy_label_smoothing_uses_full_vocab(label_smoothing, logit_scale):
+    """At TP=2, smoothed loss and gradient match a float64 full-vocabulary reference.
+
+    A logit scale of 1000 makes most fp32 probabilities underflow to zero.
+    """
+    Utils.initialize_model_parallel(2, 1)
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        torch.manual_seed(7)
+        logits = torch.randn(6, 8, device="cuda") * logit_scale
+        target = torch.tensor([0, 7, 2, 4, 1, 6], device="cuda")
+        grad_output = torch.linspace(0.5, 1.5, 6, device="cuda")
+        local = logits.chunk(2, dim=-1)[tp_group.rank()].clone().requires_grad_()
+
+        # The kernel overwrites its input in place, so give it a copy of the shard.
+        loss = vocab_parallel_cross_entropy(local.clone(), target, label_smoothing, tp_group)
+        (loss * grad_output).sum().backward()
+
+        # Probability 1 - label_smoothing on the target, the rest spread over the other tokens.
+        dense = logits.double().requires_grad_()
+        log_probs = dense.log_softmax(dim=-1)
+        target_log_probs = log_probs.gather(-1, target[:, None]).squeeze(-1)
+        expected = -(1 - label_smoothing) * target_log_probs - label_smoothing * (
+            log_probs.sum(dim=-1) - target_log_probs
+        ) / (dense.size(-1) - 1)
+        (expected * grad_output.double()).sum().backward()
+
+        torch.testing.assert_close(loss.double(), expected.detach(), rtol=1e-5, atol=1e-4)
+        torch.testing.assert_close(
+            local.grad.double(), dense.grad.chunk(2, dim=-1)[tp_group.rank()], rtol=1e-5, atol=1e-6
+        )
+    finally:
+        Utils.destroy_model_parallel()

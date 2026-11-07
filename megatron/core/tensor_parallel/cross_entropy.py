@@ -174,6 +174,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
+        if label_smoothing > 0:
+            # Sum the shifted logits before calculate_predicted_logits exponentiates them in place.
+            shifted_logit_sum = (vocab_parallel_logits - logits_max.unsqueeze(dim=-1)).sum(dim=-1)
+
         target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
             VocabParallelCrossEntropy.calculate_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
@@ -185,15 +189,24 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
-        torch.distributed.all_reduce(
-            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        if label_smoothing > 0:
+            # Reduce the shifted-logit sum in the same collective as the exp sum.
+            reduced_sums = torch.stack((sum_exp_logits, shifted_logit_sum))
+            torch.distributed.all_reduce(
+                reduced_sums, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            sum_exp_logits, shifted_logit_sum = reduced_sums.unbind(dim=0)
+        else:
+            torch.distributed.all_reduce(
+                sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
             exp_logits, predicted_logits, sum_exp_logits
         )
 
-        vocab_size = exp_logits.size(-1)
+        # Smoothing is defined over the full vocabulary, not this rank's partition.
+        vocab_size = partition_vocab_size * world_size
         if label_smoothing > 0:
             r"""
             We'd like to assign 1 / (K - 1) probability mass to every index that is not the ground truth.
@@ -207,10 +220,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             assert 1.0 > label_smoothing > 0.0
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
 
-            # Exp logits at this point are normalized probabilities.
-            # So we can just take the log to get log-probs.
-            log_probs = torch.log(exp_logits)
-            mean_log_probs = log_probs.mean(dim=-1)
+            # mean(log_probs) = mean(logits - logits_max) - log(sum_exp_logits) over the full
+            # vocabulary. Unlike log(softmax), this stays finite when probabilities underflow.
+            mean_log_probs = shifted_logit_sum / vocab_size - torch.log(sum_exp_logits)
             loss = (1.0 - smoothing) * loss - smoothing * mean_log_probs
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
@@ -264,7 +276,8 @@ def vocab_parallel_cross_entropy(
         target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
 
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
-                         default is no smoothing (=0.0)
+                         default is no smoothing (=0.0). The smoothing mass is spread over
+                         the full vocabulary across all tensor parallel ranks.
 
         tp_group: the tensor parallel group over which to all reduce
     """
