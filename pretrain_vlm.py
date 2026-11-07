@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain vision language model."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -110,7 +110,7 @@ def model_provider(
     vision_model_type = "clip"
 
     assert (
-        args.ckpt_format == 'torch'
+        cfg.checkpoint.ckpt_format == 'torch'
     ), "Only ckpt-format torch is supported for VLM training currently."
     assert not (
         cfg.model.transformer.context_parallel_size > 1 and cfg.model.transformer.pipeline_model_parallel_size > 1

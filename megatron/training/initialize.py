@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron initialization."""
 import logging
@@ -122,7 +122,7 @@ def initialize_megatron(
     # set logging level
     setup_logging()
 
-    if training and args.async_save and args.use_persistent_ckpt_worker:
+    if training and cfg.checkpoint.async_save and cfg.checkpoint.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state

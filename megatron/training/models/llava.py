@@ -10,7 +10,8 @@ from megatron.core.transformer import TransformerConfig
 class LLaVAModelConfig:
     """LLaVA language-model inputs used by the multimodal provider callbacks.
 
-    Vision and projection architecture specialization remains in those applications.
+    Vision and projection specialization remains in those applications; this config
+    owns the model settings consumed by the shared training lifecycle.
     """
 
     transformer: TransformerConfig

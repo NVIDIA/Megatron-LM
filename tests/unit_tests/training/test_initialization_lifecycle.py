@@ -1047,6 +1047,7 @@ def test_llava_callback_consumes_its_model_config(
     args.params_dtype = torch.float32
     args.ckpt_format = "torch"
     cfg = run_config
+    cfg.checkpoint.ckpt_format = "torch"
     cfg.model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     cfg.model.rotary_base = 12345
     cfg.model.rope_scaling = True

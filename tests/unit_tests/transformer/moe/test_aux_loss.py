@@ -11,6 +11,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
@@ -604,6 +605,58 @@ class TestRouterAuxLoss:
         router.reset_global_aux_loss_tracker()
         assert router.ga_steps == 0
         assert torch.all(router.global_tokens_per_expert == 0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "aux_loss_fusion",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not HAVE_ROUTER_FUSION, reason="TE fused router ops not available"
+                ),
+            ),
+        ],
+    )
+    def test_global_aux_loss_with_float16_module(self, aux_loss_fusion):
+        """The global aux loss tracker must stay exact when Float16Module casts the router."""
+
+        def pop_global_aux_loss():
+            tracker = get_moe_layer_wise_logging_tracker()
+            loss = tracker["global_load_balancing_loss"]["values"][0].clone()
+            clear_aux_losses_tracker()
+            return loss
+
+        router = self.new_router(
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_aux_loss_fusion=aux_loss_fusion,
+        ).cuda()
+        router = Float16Module(router.config, router).module
+        assert router.global_tokens_per_expert.dtype == torch.int64
+        assert router.ga_steps.dtype == torch.int64
+
+        # Identical microbatches leave the running average, and so the loss, unchanged.
+        # bf16 can count microbatches only up to 256.
+        num_microbatches = 300
+        hidden_states = torch.randn((256, 2, router.config.hidden_size)).cuda().bfloat16()
+        clear_aux_losses_tracker()
+        router(hidden_states)
+        tokens_per_microbatch = router.global_tokens_per_expert.clone()
+        first_loss = pop_global_aux_loss()
+        for _ in range(num_microbatches - 2):
+            router(hidden_states)
+        clear_aux_losses_tracker()
+        router(hidden_states)
+        last_loss = pop_global_aux_loss()
+
+        assert router.ga_steps == num_microbatches
+        assert torch.equal(
+            router.global_tokens_per_expert, tokens_per_microbatch * num_microbatches
+        )
+        torch.testing.assert_close(last_loss, first_loss)
 
     # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
     @pytest.mark.flaky_in_dev
