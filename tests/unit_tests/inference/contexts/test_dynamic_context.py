@@ -65,7 +65,7 @@ def test_is_decode_only_uses_current_execution_snapshot(
     context.padded_batch_dimensions = mock.Mock(prefill_req_count=padded_prefill_requests)
     # Must be explicitly falsy: a bare Mock attribute is truthy, which would short-circuit
     # `is_decode_only` to False and make every case below pass for the wrong reason.
-    context.mtp_metadata = mock.Mock(is_varlen_forward=False)
+    context.mtp_metadata = mock.Mock(is_varlen_forward=False, is_graphed_commit_forward=False)
 
     assert context.is_decode_only() is expected
 
@@ -78,9 +78,22 @@ def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
     # Request counts that would otherwise classify this step as decode-only.
     context.num_prefill_requests = 0
     context.padded_batch_dimensions = mock.Mock(prefill_req_count=0)
-    context.mtp_metadata = mock.Mock(is_varlen_forward=True)
+    context.mtp_metadata = mock.Mock(is_varlen_forward=True, is_graphed_commit_forward=False)
 
     assert context.is_decode_only() is False
+
+
+@pytest.mark.parametrize("using_cuda_graph", [False, True])
+def test_is_decode_only_is_true_during_the_graphed_mtp_commit_pass(using_cuda_graph):
+    """The graphed commit pass is uniform per request, so it takes the decode kernel even when
+    the step's request counts include prefills."""
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context._using_cuda_graph_this_step = using_cuda_graph
+    context.num_prefill_requests = 1
+    context.padded_batch_dimensions = mock.Mock(prefill_req_count=1)
+    context.mtp_metadata = mock.Mock(is_varlen_forward=False, is_graphed_commit_forward=True)
+
+    assert context.is_decode_only() is True
 
 
 def _processed_rows_context(sampling_and_counts, num_sampled=None):
