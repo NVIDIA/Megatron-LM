@@ -30,7 +30,8 @@ from megatron.core.transformer.cuda_graphs import (
     _wrap_graph_for_vision,
     get_vision_cuda_graph_seq_length,
 )
-from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -55,15 +56,22 @@ class TestVisionLayerIsGraphable:
         layer = torch.nn.Linear(4, 4)
         assert _layer_is_graphable(layer, config) is False
 
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
-    def test_wrong_cuda_graph_impl_returns_false(self):
-        from megatron.core.transformer.transformer_layer import TransformerLayer
-
-        config = SimpleNamespace(cuda_graph_impl="local")
+    def test_layer_outside_cuda_graph_modules_returns_false(self):
+        # _layer_is_graphable does not look at cuda_graph_impl (callers gate on it); a
+        # TransformerLayer is rejected when cuda_graph_modules selects none of its submodules.
         layer = MagicMock(spec=TransformerLayer)
-        # isinstance check with MagicMock(spec=...) should pass
-        assert _layer_is_graphable(layer, config) is False
+        layer.mlp = MagicMock(spec=MLP)  # dense layer: MLP, not MoELayer
+        # isinstance checks with MagicMock(spec=...) should pass
+        for modules in ([CudaGraphModule.mamba], [CudaGraphModule.moe]):
+            config = SimpleNamespace(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+            )
+            assert _layer_is_graphable(layer, config) is False
+        # Control: the same layer is selected once its submodule is in scope.
+        config = SimpleNamespace(
+            cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.mlp]
+        )
+        assert _layer_is_graphable(layer, config) is True
 
     def test_correct_config_with_transformer_layer(self):
         """Real TransformerLayer + cuda_graph_impl='transformer_engine' -> True."""
