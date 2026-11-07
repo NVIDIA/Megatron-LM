@@ -81,7 +81,7 @@ def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypat
     bucket = "tests/unit_tests/**/*.py"
     assert bucket in buckets
     finder = sys.modules["find_test_cases"]
-    monkeypatch.setattr(finder, "get_test_cases", lambda _: buckets)
+    monkeypatch.setattr(finder, "get_test_cases", lambda _, tag="latest": buckets)
     monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "gb200"])
     finder.main()
     ignored = {line.removeprefix("--ignore=") for line in capsys.readouterr().out.splitlines()}
@@ -92,10 +92,10 @@ def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypat
         "dgx_gb200",
     )
     assert mandatory.mandatory_files(patterns, bucket, ignored) == [
-        "tests/unit_tests/distributed/mfsdp_v2/test_gradient_accumulation.py",
-        "tests/unit_tests/distributed/mfsdp_v2/test_mcore_dense.py",
-        "tests/unit_tests/distributed/mfsdp_v2/test_quantization.py",
-        "tests/unit_tests/distributed/mfsdp_v2/test_quantized_dbuffer.py",
+        "tests/unit_tests/core/distributed/mfsdp_v2/test_gradient_accumulation.py",
+        "tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_dense.py",
+        "tests/unit_tests/core/distributed/mfsdp_v2/test_quantization.py",
+        "tests/unit_tests/core/distributed/mfsdp_v2/test_quantized_dbuffer.py",
     ]
 
 

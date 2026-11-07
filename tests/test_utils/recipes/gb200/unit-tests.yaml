@@ -54,7 +54,7 @@ spec:
     fi
 
 
-    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
+    if [[ "$BUCKET" == "tests/unit_tests/core/inference/test_batch_invariant_fp8.py" ]]; then
         bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
           gb200 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
     else
@@ -84,16 +84,14 @@ spec:
 # Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
 # symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
 products:
-  # Run the same runtime-CP regressions on four ranks, outside the catch-all bucket.
-  - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
+  - test_case: [tests/unit_tests/core/context_parallel/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  # This file runs in isolated one-rank processes; other buckets exclude it.
-  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+  - test_case: [tests/unit_tests/core/inference/test_batch_invariant_fp8.py]
     products:
       - environment: [dev]
         tag: [latest]
@@ -107,28 +105,28 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
+  - test_case: [tests/unit_tests/core/resharding/test_nccl_m2n_copy_service.py]
     products:
       - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/inference/**/*.py]
+  - test_case: [tests/unit_tests/core/inference/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
+  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net.py]
     products:
       - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
+  - test_case: [tests/unit_tests/core/tensor_parallel/test_*gtp*.py]
     products:
       - environment: [dev]
         tag: [latest]

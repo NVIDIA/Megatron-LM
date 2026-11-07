@@ -11,7 +11,7 @@ import yaml
 from tests.unit_tests import find_test_cases
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_BUCKET = "tests/unit_tests/context_parallel/runtime/**/*.py"
+RUNTIME_BUCKET = "tests/unit_tests/core/context_parallel/**/*.py"
 
 
 @pytest.mark.parametrize("platform,gpus", [("h100", 8), ("gb200", 4)])
@@ -20,7 +20,7 @@ def test_runtime_cp_bucket_has_exclusive_ownership(monkeypatch, capsys, platform
     monkeypatch.chdir(REPO_ROOT)
     recipe_path = Path(f"tests/test_utils/recipes/{platform}/unit-tests.yaml")
     recipe = yaml.safe_load(recipe_path.read_text())
-    buckets = [name for product in recipe["products"] for name in product["test_case"]]
+    buckets = find_test_cases.get_test_cases(recipe_path, "latest")
     assert buckets.count(RUNTIME_BUCKET) == 1
     assert recipe["spec"]["gpus"] == gpus
     runtime = next(p for p in recipe["products"] if p["test_case"] == [RUNTIME_BUCKET])
@@ -28,11 +28,10 @@ def test_runtime_cp_bucket_has_exclusive_ownership(monkeypatch, capsys, platform
         "dev" in p["environment"] and "latest" in p["tag"] and "unit-tests" in p["scope"]
         for p in runtime["products"]
     )
-    # Keep the selector's actual recipe data while avoiding a yq binary dependency
-    # for this CPU infrastructure test. CI's yq expression reads this same list.
-    monkeypatch.setattr(find_test_cases, "get_test_cases", lambda path: buckets)
     expected = {
-        str(path) for path in Path("tests/unit_tests/context_parallel/runtime").glob("test_*.py")
+        str(path)
+        for path in Path("tests/unit_tests/core/context_parallel").glob("test_*.py")
+        if path.name not in {"test_layout.py", "test_batch_api_compat.py"}
     }
     assert expected
     owners = {path: [] for path in expected}

@@ -134,10 +134,24 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
+# Historical checkouts keep their own selector helper, which can ignore this
+# variable while newer helpers exclude buckets from the other suite version.
+export UNIT_TEST_TAG="$TAG"
 IGNORE_ARGS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
 done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
+
+# Testmon invokes pytest through an argument array, so expand file globs here
+# instead of relying on the shell expansion used by the full test command.
+TEST_TARGET=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+TEST_TARGETS=("$TEST_TARGET")
+if [[ "$TEST_TARGET" == *'*'* ]]; then
+    mapfile -t TEST_TARGETS < <(compgen -G "$TEST_TARGET" | LC_ALL=C sort)
+    if [[ "${#TEST_TARGETS[@]}" -eq 0 ]]; then
+        TEST_TARGETS=("$TEST_TARGET")
+    fi
+fi
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -246,16 +260,14 @@ run_testmon_phase() {
 
 run_baseline_tests() {
     local cache_root="${UNIT_TESTMON_CACHE_DIR:?}"
-    local target
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     rm -rf -- "$cache_root/prod" "$cache_root/experimental" "$cache_root/.testmon-work"
     rm -f -- "$cache_root/summary.md"
     mkdir -p "$cache_root"
 
     run_testmon_phase baseline prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
+        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
     run_testmon_phase baseline experimental \
-        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
+        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
     write_testmon_summary "baseline produced"
 }
 
@@ -335,8 +347,7 @@ run_selected_phase() {
 }
 
 run_enforced_tests() {
-    local target prod_count experimental_count mandatory_count
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    local prod_count experimental_count mandatory_count
     if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
         # Consume the CPU decision without running selection again on GPU.
         if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
@@ -349,11 +360,11 @@ run_enforced_tests() {
     else
         rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
         if ! run_testmon_phase select prod \
-            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}" \
             || ! merge_rank_selections prod \
             || ! apply_mandatory_tests prod \
             || ! run_testmon_phase select experimental \
-                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}" \
             || ! merge_rank_selections experimental \
             || ! apply_mandatory_tests experimental; then
             write_testmon_summary "full fallback: Testmon selection failed"

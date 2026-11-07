@@ -396,8 +396,8 @@ these barriers time out independently. This does not cover unrelated collectives
 GPU instructions.
 
 Training parity and supported offload/recompute cases are covered in
-`tests/unit_tests/transformer/moe/test_virtual_experts.py`. Planner correctness and CUDA graph
-replay are covered in `tests/unit_tests/determinism/kernels/test_moe_kernels.py`; checkpoint
+`tests/unit_tests/core/transformer/moe/test_virtual_experts.py`. Planner correctness and CUDA graph
+replay are covered in `tests/unit_tests/core/determinism/kernels/test_moe_kernels.py`; checkpoint
 loading and initialization parity are covered by
 `test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
 

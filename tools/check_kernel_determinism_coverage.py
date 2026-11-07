@@ -3,7 +3,7 @@
 """Require determinism tests for kernel-related changes.
 
 Run by the ``linting`` job in ``.github/workflows/cicd-main.yml`` on every PR push. It reads
-the kernel registry in ``tests/unit_tests/determinism/kernels/manifest.py`` and inspects the
+the kernel registry in ``tests/unit_tests/core/determinism/kernels/manifest.py`` and inspects the
 files the PR changes relative to its base:
 
 1. A changed file that bears a kernel -- it lives in one of ``KERNEL_DIRECTORIES``, matches
@@ -35,7 +35,7 @@ from types import ModuleType
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = REPO_ROOT / "tests/unit_tests/determinism/kernels/manifest.py"
+MANIFEST_PATH = REPO_ROOT / "tests/unit_tests/core/determinism/kernels/manifest.py"
 SOURCE_SUFFIXES = (".py", ".cu", ".cuh", ".cpp", ".h")
 
 

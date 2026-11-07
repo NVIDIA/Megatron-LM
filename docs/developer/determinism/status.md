@@ -23,16 +23,17 @@ environment values.
 
 ## Validation
 
-- **Kernel-level bit-exact suite** (`tests/unit_tests/determinism/kernels/`):
+- **Kernel-level bit-exact suite** (`tests/unit_tests/core/determinism/kernels/`):
   Replays every kernel Megatron dispatches (fused activations, Triton fusions,
   apex extensions, Transformer Engine wrappers, MoE, SSM, optimizer and
   inference kernels) on identical inputs and asserts byte-identical outputs and
   gradients. `manifest.py` registers each kernel with its test; the unit tests
   and the `linting` CI job fail when a kernel file is unregistered or a kernel
   change ships without a test change. Refer to [`testing.md`](./testing.md).
-- **Module-level bit-exact suite** (`tests/unit_tests/determinism/correctness/`): Runs a
+- **Module-level bit-exact suite** (`tests/unit_tests/core/determinism/correctness/`): Runs a
   model or block twice under restored RNG state and asserts bit-identical
-  outputs and gradients. Coverage includes:
+  outputs and gradients. Tests live in `correctness/`, alongside shared helpers
+  in the parent directory. Coverage includes:
 
   - GPTModel, TransformerBlock, and HybridModel
   - Tensor parallelism, expert parallelism, fully sharded data parallel, pipeline

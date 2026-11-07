@@ -96,8 +96,8 @@ jobs:
           BUILDS: ${{ needs.populate-build-cache.outputs.build-matrix }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
-          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/h100/unit-tests.yaml > h100.json
-          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200.json
+          yq -o json '.' tests/test_utils/recipes/h100/unit-tests.yaml | jq -c '[.products[] | select(any(.products[]; .tag | index("latest"))) | .test_case[]] | unique' > h100.json
+          yq -o json '.' tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c '[.products[] | select(any(.products[]; .tag | index("latest"))) | .test_case[]] | unique' > gb200.json
           # Testmon keys H100 data by recipe platform and bucket, not by cloud.
           # Publish one H100 baseline (AWS) to avoid concurrent writers for the
           # same cache key; the Singapore image build remains a separate matrix job.

@@ -1,9 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 
-import subprocess
+import os
 import sys
 from pathlib import Path
+
+import yaml
 
 # Platforms whose unit-test selection is driven by a pytest marker rather than
 # by the full recipe bucket. Only files carrying the marker are launched.
@@ -11,7 +13,7 @@ PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
 
 # This bucket is scheduled exclusively on GB200. Keep it out of H100 catch-all
 # buckets without changing the additive behavior of launch_on_gb200 elsewhere.
-PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/ssm/test_gated_delta_net.py"}}
+PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/core/ssm/test_gated_delta_net.py"}}
 
 
 def file_has_marker(filepath, marker):
@@ -30,14 +32,18 @@ def file_has_marker(filepath, marker):
         return False
 
 
-def get_test_cases(yaml_file):
-    result = subprocess.run(
-        ['yq', 'eval', '.products[].test_case[]', yaml_file],
-        capture_output=True,
-        text=True,
-        check=True,
+def get_test_cases(yaml_file: str, tag: str = "latest") -> list[str]:
+    """Return recipe buckets for one test-suite version, preserving their order."""
+    with open(yaml_file) as stream:
+        recipe = yaml.safe_load(stream)
+    return list(
+        dict.fromkeys(
+            test_case
+            for product in recipe["products"]
+            if any(tag in params.get("tag", []) for params in product["products"])
+            for test_case in product["test_case"]
+        )
     )
-    return [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
 
 
 def get_base_path(pattern):
@@ -77,7 +83,7 @@ def main():
     GPU_TYPE = sys.argv[2]
     YAML_FILE = f'tests/test_utils/recipes/{GPU_TYPE}/unit-tests.yaml'
 
-    all_test_cases = get_test_cases(YAML_FILE)
+    all_test_cases = get_test_cases(YAML_FILE, os.environ.get("UNIT_TEST_TAG", "latest"))
     bucket_files = set(expand_pattern(BUCKET))
 
     # Collect files from child test cases to ignore

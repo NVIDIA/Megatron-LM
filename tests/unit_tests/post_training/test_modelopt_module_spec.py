@@ -36,7 +36,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_te_version
-from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.core.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 

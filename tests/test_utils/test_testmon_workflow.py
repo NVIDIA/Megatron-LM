@@ -21,6 +21,17 @@ def _step(workflow: str, job: str, step_id: str) -> dict:
     return next(step for step in document["jobs"][job]["steps"] if step.get("id") == step_id)
 
 
+def _latest_buckets(recipe: dict) -> list[str]:
+    return sorted(
+        {
+            case
+            for product in recipe["products"]
+            if any("latest" in params["tag"] for params in product["products"])
+            for case in product["test_case"]
+        }
+    )
+
+
 def _run(
     script: str, directory: Path, environment: dict[str, str]
 ) -> tuple[subprocess.CompletedProcess, dict]:
@@ -59,16 +70,10 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
     yq.write_text(
         f"#!{sys.executable}\n"
         "import json, sys, yaml\n"
-        "assert sys.argv[1:3] == ['-o', 'json']\n"
-        "if len(sys.argv) == 5:\n"
-        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
-        "else:\n"
-        "    assert sys.argv[3] == "
-        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
-        "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
+        "assert sys.argv[1:4] == ['-o', 'json', '.']\n"
+        "with open(sys.argv[4]) as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
-        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
+        "print(json.dumps(recipe))\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
@@ -138,7 +143,7 @@ def test_producer_consumes_the_actual_build_matrix(
                 / "unit-tests.yaml"
             ).read_text()
         )
-        buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        buckets = _latest_buckets(recipe)
         assert [entry["bucket"] for entry in entries] == buckets
         assert all(
             entry["runner"] == runner and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
@@ -205,7 +210,7 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
         )
-        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        expected_buckets = _latest_buckets(recipe)
         entries = [entry for entry in matrix if entry["platform"] == platform]
         assert [entry["bucket"] for entry in entries] == expected_buckets
         assert all(
@@ -821,9 +826,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
         )
-        assert json.loads(parsed[output]) == [
-            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
-        ]
+        assert json.loads(parsed[output]) == [{"bucket": case} for case in _latest_buckets(recipe)]
     assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["type"] == "string"

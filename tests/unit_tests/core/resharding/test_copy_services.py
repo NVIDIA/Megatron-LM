@@ -1,0 +1,400 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+"""Unit tests for shared copy_services utilities.
+
+Covers:
+- ``match_local_ops_by_task_id``: pairing semantics and every error branch.
+- ``CopyService.close()`` default no-op contract.
+- Explicit opt-in for multiple runs per plan.
+- NCCL communicator initialization on ranks with no local operations.
+"""
+
+from unittest.mock import Mock
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from megatron.core.resharding.copy_services.base import (
+    CopyService,
+    RecvOp,
+    SendOp,
+    match_local_ops_by_task_id,
+)
+from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
+from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
+from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from tests.unit_tests.core.determinism.utils import get_cycles_per_ms
+from tests.unit_tests.test_utilities import Utils
+
+
+def _t():
+    return torch.zeros(4)
+
+
+class TestMatchLocalOps:
+    """match_local_ops_by_task_id pairs by task_id and rejects malformed inputs."""
+
+    def test_single_pair(self):
+        sends = [SendOp(task_id=1, tensor=_t(), dest_rank=0)]
+        recvs = [RecvOp(task_id=1, tensor=_t(), src_rank=0)]
+        pairs = match_local_ops_by_task_id(sends, recvs, "Test", rank=0)
+        assert len(pairs) == 1
+        send_op, recv_op = pairs[0]
+        assert send_op is sends[0]
+        assert recv_op is recvs[0]
+
+    def test_pairs_match_across_order(self):
+        """Order of sends vs recvs doesn't matter; pairing is by task_id."""
+        sends = [
+            SendOp(task_id=1, tensor=_t(), dest_rank=0),
+            SendOp(task_id=2, tensor=_t(), dest_rank=0),
+        ]
+        recvs = [
+            RecvOp(task_id=2, tensor=_t(), src_rank=0),
+            RecvOp(task_id=1, tensor=_t(), src_rank=0),
+        ]
+        pairs = match_local_ops_by_task_id(sends, recvs, "Test", rank=0)
+        pair_ids = {(s.task_id, r.task_id) for s, r in pairs}
+        assert pair_ids == {(1, 1), (2, 2)}
+
+    def test_empty_lists(self):
+        pairs = match_local_ops_by_task_id([], [], "Test", rank=0)
+        assert pairs == []
+
+    def test_none_send_task_id_raises(self):
+        sends = [SendOp(task_id=None, tensor=_t(), dest_rank=0)]
+        recvs = [RecvOp(task_id=1, tensor=_t(), src_rank=0)]
+        with pytest.raises(RuntimeError, match="requires a task_id"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=0)
+
+    def test_none_recv_task_id_raises(self):
+        sends = [SendOp(task_id=1, tensor=_t(), dest_rank=0)]
+        recvs = [RecvOp(task_id=None, tensor=_t(), src_rank=0)]
+        with pytest.raises(RuntimeError, match="requires a task_id"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=0)
+
+    def test_more_sends_than_recvs_raises(self):
+        sends = [
+            SendOp(task_id=1, tensor=_t(), dest_rank=0),
+            SendOp(task_id=2, tensor=_t(), dest_rank=0),
+        ]
+        recvs = [RecvOp(task_id=1, tensor=_t(), src_rank=0)]
+        with pytest.raises(RuntimeError, match="unmatched local ops"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=7)
+
+    def test_more_recvs_than_sends_raises(self):
+        sends = [SendOp(task_id=1, tensor=_t(), dest_rank=0)]
+        recvs = [
+            RecvOp(task_id=1, tensor=_t(), src_rank=0),
+            RecvOp(task_id=2, tensor=_t(), src_rank=0),
+        ]
+        with pytest.raises(RuntimeError, match="unmatched local ops"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=7)
+
+    def test_duplicate_send_task_ids_raises(self):
+        """Duplicate task_ids in sends collapse the dict — triggers count-mismatch raise."""
+        sends = [
+            SendOp(task_id=1, tensor=_t(), dest_rank=0),
+            SendOp(task_id=1, tensor=_t(), dest_rank=0),  # duplicate
+        ]
+        recvs = [
+            RecvOp(task_id=1, tensor=_t(), src_rank=0),
+            RecvOp(task_id=2, tensor=_t(), src_rank=0),
+        ]
+        with pytest.raises(RuntimeError, match="unmatched local ops"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=7)
+
+    def test_duplicate_recv_task_ids_raises(self):
+        sends = [
+            SendOp(task_id=1, tensor=_t(), dest_rank=0),
+            SendOp(task_id=2, tensor=_t(), dest_rank=0),
+        ]
+        recvs = [
+            RecvOp(task_id=1, tensor=_t(), src_rank=0),
+            RecvOp(task_id=1, tensor=_t(), src_rank=0),  # duplicate
+        ]
+        with pytest.raises(RuntimeError, match="unmatched local ops"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=7)
+
+    def test_mismatched_task_ids_raises(self):
+        """Equal counts but task_ids don't overlap — should raise missing-send."""
+        sends = [SendOp(task_id=1, tensor=_t(), dest_rank=0)]
+        recvs = [RecvOp(task_id=99, tensor=_t(), src_rank=0)]
+        with pytest.raises(RuntimeError, match="missing local send"):
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=0)
+
+    def test_error_message_includes_backend_and_rank(self):
+        sends = [SendOp(task_id=None, tensor=_t(), dest_rank=0)]
+        recvs = [RecvOp(task_id=1, tensor=_t(), src_rank=0)]
+        with pytest.raises(RuntimeError) as exc_info:
+            match_local_ops_by_task_id(sends, recvs, "TestBackend", rank=0)
+        assert "TestBackend" in str(exc_info.value)
+
+
+class TestCopyServiceClose:
+    """CopyService.close() default is a no-op; subclasses may override."""
+
+    def test_default_close_is_noop_and_returns_none(self):
+        class _Stub(CopyService):
+            def __init__(self):  # bypass dist requirement
+                pass
+
+            def submit_send(self, *args, **kwargs):
+                pass
+
+            def submit_recv(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                pass
+
+        svc = _Stub()
+        result = svc.close()
+        assert result is None
+
+    def test_subclass_can_override_close(self):
+        class _ClosingService(CopyService):
+            def __init__(self):
+                self.closed = False
+
+            def submit_send(self, *args, **kwargs):
+                pass
+
+            def submit_recv(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        svc = _ClosingService()
+        assert svc.closed is False
+        svc.close()
+        assert svc.closed is True
+
+
+def test_nixl_service_skips_redundant_process_group_barrier():
+    """NIXL's ready/data protocol provides its own peer completion."""
+    assert NixlCopyService.requires_process_group_barrier is False
+
+
+@pytest.mark.parametrize("service_cls", [NCCLCopyService, GlooCopyService])
+def test_local_copy_waits_for_current_stream(service_cls):
+    """A local copy must observe writes already queued on the caller's stream."""
+    Utils.initialize_distributed()
+    service = service_cls()
+    source = torch.zeros(1, device="cuda")
+    destination = torch.zeros_like(source)
+    torch.cuda.synchronize()
+
+    producer_gate = torch.cuda.Event()
+    release_stream = torch.cuda.Stream()
+    with torch.cuda.stream(release_stream):
+        torch.cuda._sleep(int(50 * get_cycles_per_ms()))
+        producer_gate.record()
+
+    torch.cuda.current_stream().wait_event(producer_gate)
+    source.fill_(1)
+
+    service.submit_send(source, dist.get_rank(), task_id=0)
+    service.submit_recv(destination, dist.get_rank(), task_id=0)
+    service.run()
+
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(destination, torch.ones_like(destination))
+
+
+@pytest.mark.parametrize(
+    ("service_cls", "run_method"),
+    [(NixlCopyService, "_do_local_copies"), (NVSHMEMCopyService, "run")],
+    ids=("nixl", "nvshmem"),
+)
+def test_optional_backend_local_copy_waits_for_current_stream(service_cls, run_method):
+    service = object.__new__(service_cls)
+    service.rank = 0
+    source = torch.zeros(1, device="cuda")
+    destination = torch.zeros_like(source)
+    torch.cuda.synchronize()
+
+    producer_gate = torch.cuda.Event()
+    release_stream = torch.cuda.Stream()
+    with torch.cuda.stream(release_stream):
+        torch.cuda._sleep(int(50 * get_cycles_per_ms()))
+        producer_gate.record()
+
+    torch.cuda.current_stream().wait_event(producer_gate)
+    source.fill_(1)
+
+    service.send_ops = [SendOp(task_id=0, tensor=source, dest_rank=0)]
+    service.recv_ops = [RecvOp(task_id=0, tensor=destination, src_rank=0)]
+    service._local_send_ops = {0: source}
+    service._local_recv_ops = {0: destination}
+    service._copy_stream = service._local_copy_stream = torch.cuda.Stream()
+    service._initialized = True
+    service._remote = Mock()
+
+    getattr(service, run_method)()
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(destination, torch.ones_like(destination))
+
+
+def test_multiple_runs_per_plan_require_explicit_backend_support():
+    """Third-party services stay model-wide unless they accept the stream contract."""
+    assert CopyService.supports_multiple_runs_per_plan is False
+    assert GlooCopyService.supports_multiple_runs_per_plan is True
+    assert NCCLCopyService.supports_multiple_runs_per_plan is True
+    assert NVSHMEMCopyService.supports_multiple_runs_per_plan is True
+    assert NixlCopyService.supports_multiple_runs_per_plan is False
+
+
+def test_nccl_service_eagerly_connects_before_first_run(monkeypatch):
+    """Idle ranks must join NCCL setup before active ranks issue their first P2P."""
+    device = torch.device("cuda", 1)
+
+    class Backend:
+        def __init__(self):
+            self.connected_devices = []
+
+        def eager_connect_single_device(self, connected_device):
+            self.connected_devices.append(connected_device)
+
+    class Group:
+        def __init__(self, backend):
+            self.backend = backend
+            self.requested_devices = []
+
+        def rank(self):
+            return 1
+
+        def size(self):
+            return 4
+
+        def _get_backend(self, requested_device):
+            self.requested_devices.append(requested_device)
+            return self.backend
+
+    class Stream:
+        def wait_stream(self, _stream):
+            pass
+
+    backend = Backend()
+    group = Group(backend)
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: device.index)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    service = NCCLCopyService(group=group)
+    service.run()
+    service.run()
+
+    assert group.requested_devices == [device]
+    assert backend.connected_devices == [device]
+
+
+def _windowing_fixture(monkeypatch, *, rank=0, world=2):
+    """NCCL service with fakes for the process group, streams, and batch_isend_irecv."""
+    device = torch.device("cuda", rank)
+
+    class Backend:
+        def eager_connect_single_device(self, _device):
+            pass
+
+    class Group:
+        def rank(self):
+            return rank
+
+        def size(self):
+            return world
+
+        def _get_backend(self, _device):
+            return Backend()
+
+    class Stream:
+        def wait_stream(self, _stream):
+            pass
+
+    class Work:
+        def wait(self):
+            pass
+
+    calls: list[int] = []
+
+    def fake_batch_isend_irecv(ops):
+        calls.append(len(ops))
+        return [Work()]
+
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: device.index)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "batch_isend_irecv", fake_batch_isend_irecv)
+    monkeypatch.setattr(dist, "P2POp", lambda op, tensor, peer, group=None: (op, peer))
+    return NCCLCopyService(group=Group()), calls
+
+
+class _Plan:
+    def __init__(self, total_tasks, num_batches=1):
+        self.total_tasks = total_tasks
+        self.num_batches = num_batches
+
+
+class TestNCCLTaskWindows:
+    """A huge single-batch submission is issued in global task-id windows."""
+
+    def test_large_single_batch_plan_is_windowed(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 256)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        # This rank owns only the odd task ids: windows are still keyed by the
+        # global id, so the peer (owning the even ids) lands in the same windows.
+        for task_id in range(1, 600, 2):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [128, 128, 44]
+        assert not service.send_ops and not service.recv_ops
+
+    def test_small_plan_uses_one_group(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 256)
+        service.set_plan(_Plan(total_tasks=200, num_batches=1))
+        for task_id in range(200):
+            service.submit_recv(_t(), src_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [200]
+
+    def test_planner_batches_are_trusted(self, monkeypatch):
+        """Multi-batch plans already bound each run(); no extra windowing."""
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 4)
+        service.set_plan(_Plan(total_tasks=600, num_batches=20))
+        for task_id in range(30):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [30]
+
+    def test_missing_task_ids_fall_back_to_one_group(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 4)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        for _ in range(10):
+            service.submit_send(_t(), dest_rank=1, task_id=None)
+        service.run()
+        assert calls == [10]
+
+    def test_windowing_can_be_disabled(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 0)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        for task_id in range(600):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [600]

@@ -589,7 +589,7 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
     """providers.is_dataset_built_on_rank, the predicate pretrain_gpt and pretrain_hybrid pass and the
     default of build_gpt_datasets, applies the rule to the registered arguments and the transformer
     config built from them, read at call time from global_vars and arguments (where tests patch
-    them; tests/unit_tests/data/test_get_batch.py does the same on eight GPUs)."""
+    them; tests/unit_tests/test_get_batch.py does the same on eight GPUs)."""
     rule_calls = []
     monkeypatch.setattr(
         global_vars, "_GLOBAL_ARGS", SimpleNamespace(sequence_packing_scheduler=None)
@@ -619,7 +619,7 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
 
 def test_rank_rule_gates_on_tensor_parallel_rank():
     """With one pipeline stage every branch of the rule reduces to "tensor-parallel rank 0
-    builds"; the stage logic runs on 8 GPUs in tests/unit_tests/data/test_get_batch.py."""
+    builds"; the stage logic runs on 8 GPUs in tests/unit_tests/test_get_batch.py."""
     from megatron.core import mpu
 
     Utils.initialize_model_parallel(2, 1)
