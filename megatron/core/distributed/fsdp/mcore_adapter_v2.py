@@ -31,6 +31,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -145,7 +146,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer and Mamba layers, shortcut MoE blocks, and
+                unspecified, transformer and Mamba layers, shortcut MoE blocks, mHC wrappers, and
                 TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
                 replaces these defaults. Expert containers use the expert-DP mesh;
                 custom lists must include them when expert and dense sharding settings
@@ -188,6 +189,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 TransformerLayer,
                 MambaLayer,
                 ShortcutMoEBlock,
+                HyperConnectionHybridLayer,
                 TEGroupedMLP,
                 SequentialMLP,
             ]
