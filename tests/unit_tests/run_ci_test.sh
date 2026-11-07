@@ -175,10 +175,16 @@ run_test_cmd() {
     return "$rc"
 }
 
-# Keep this path identical to exhaustive CI. The installed Testmon plugin is
-# inactive unless one of the selective paths below passes --testmon.
+# --experimental changes the runtime fixture, so production collects the same
+# items as the experimental phase. Testmon is inactive without --testmon.
 run_full_tests() {
+    local collection_report_dir
     for i in $(seq $UNIT_TEST_REPEAT); do
+        collection_report_dir=""
+        if [[ "$UNIT_TESTMON_MODE" == "full" && "$TAG" == "latest" ]]; then
+            # A failed report allocation keeps the existing experimental launch.
+            collection_report_dir=$(mktemp -d "$LOG_DIR/experimental-collection.XXXXXXXX") || collection_report_dir=""
+        fi
         echo "Running prod test suite."
         CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
             -m coverage run \
@@ -188,9 +194,15 @@ run_full_tests() {
             -vs \
             ${IGNORE_ARGS[@]} \
             -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-        run_test_cmd "$CMD"
+        UNIT_TEST_EXPERIMENTAL_REPORT_DIR="$collection_report_dir" run_test_cmd "$CMD"
 
         if [[ "$TAG" == "latest" ]]; then
+            if [[ -n "$collection_report_dir" ]] && uv run --no-sync python \
+                    tests/test_utils/python_scripts/experimental_collection.py \
+                    "$collection_report_dir" "$((NUM_NODES * GPUS_PER_NODE))"; then
+                echo "No experimental tests collected on any rank; skipping the experimental launch."
+                continue
+            fi
             CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
                 -vs \
                 --experimental \
