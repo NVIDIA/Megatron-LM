@@ -4792,6 +4792,80 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer log-probs need CUDA")
+def test_flashinfer_filtered_log_probs_match_torch_filters():
+    """Filtered rows keep the top-k set, then the top-p nucleus of it, renormalized.
+
+    The reference applies TorchSampling's top-k and top-p logit filters in that order. The
+    vocabulary (>= 2048) puts the top-p stage on FlashInfer's radix kernel.
+    """
+    pytest.importorskip("flashinfer")
+    vocab_size = 4096
+    logits = torch.randn(4, vocab_size, generator=torch.Generator().manual_seed(0)) * 3.0
+    temperature = torch.tensor([1.0, 0.8, 1.2, 1.0])
+    top_k = torch.tensor([20, 0, 50, 0], dtype=torch.int32)
+    top_p = torch.tensor([0.0, 0.7, 0.9, 0.0])
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=temperature.cuda(), top_k=top_k.cuda(), top_p=top_p.cuda()
+        ),
+        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        total_request_count=4,
+        paused_request_count=0,
+    )
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
+
+    backend = FlashInferSampling(vocab_size, torch.Generator(device="cuda"))
+    log_probs = backend.log_probs_kernel(logits.cuda(), context).cpu()
+
+    reference = logits / temperature.unsqueeze(1)
+    for row in range(4):
+        if top_k[row] > 0:
+            TorchSampling._modify_logits_for_top_k_filtering(
+                reference[row : row + 1], int(top_k[row])
+            )
+        if 0.0 < top_p[row] < 1.0:
+            TorchSampling._modify_logits_for_top_p_filtering(
+                reference[row : row + 1], float(top_p[row])
+            )
+    reference = torch.log_softmax(reference, dim=-1)
+    kept = torch.isfinite(reference)
+    assert kept.sum(dim=-1).tolist() == [20, 5, 38, vocab_size]
+    assert torch.equal(torch.isfinite(log_probs), kept)
+    torch.testing.assert_close(log_probs[kept], reference[kept], rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("has_switch", [True, False])
+def test_flashinfer_log_probs_request_deterministic_top_p(monkeypatch, has_switch):
+    """Top-p renorm gets `is_deterministic=True` exactly when FlashInfer's signature has it."""
+    seen = []
+
+    def renorm_with_switch(probs, top_p, is_deterministic=False):
+        seen.append(is_deterministic)
+        return probs
+
+    def renorm_without_switch(probs, top_p):
+        seen.append(None)
+        return probs
+
+    fake = mock.MagicMock()
+    fake.sampling.top_k_mask_logits.side_effect = lambda logits, top_k: logits
+    fake.sampling.top_p_renorm_probs = renorm_with_switch if has_switch else renorm_without_switch
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(2), top_k=torch.zeros(2, dtype=torch.int32), top_p=torch.ones(2)
+        ),
+        active_sampling_filter_flags=lambda count=None: (True, False),
+    )
+    backend = FlashInferSampling(16, torch.Generator())
+    backend.log_probs_kernel(torch.randn(2, 16), context)
+    assert seen == ([True] if has_switch else [None])
+
+
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [
