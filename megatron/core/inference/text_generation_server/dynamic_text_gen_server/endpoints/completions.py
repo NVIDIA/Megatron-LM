@@ -90,8 +90,8 @@ def parse_multi_modal_data(req):
 def _completions_logprobs(result, tokenizer, echo):
     """OpenAI text-completion ``logprobs`` block; with ``echo`` the prompt tokens lead.
 
-    Non-finite logprobs are clamped for JSON. The leading ``None`` matches the OpenAI format,
-    where the first token carries no logprob.
+    Non-finite logprobs are clamped for JSON. With ``echo`` the leading ``None`` is the first
+    prompt token, which carries no logprob; each generated token has its own entry.
     """
     generated_tokens = result["generated_tokens"] or []
     generated_log_probs = json_safe_logprobs(result.get("generated_log_probs") or [])
@@ -115,8 +115,8 @@ def _completions_logprobs(result, tokenizer, echo):
         )
     else:
         token_ids = generated_tokens
-        token_logprobs = [None] + generated_log_probs
-        top_logprobs = [None] + generated_top_n_logprobs if generated_top_n_logprobs else None
+        token_logprobs = generated_log_probs
+        top_logprobs = generated_top_n_logprobs if generated_top_n_logprobs else None
 
     tokens = [tokenizer.detokenize([tok]) for tok in token_ids]
     text_offset = []

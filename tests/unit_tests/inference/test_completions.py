@@ -318,8 +318,8 @@ async def test_completions_prompt_variants_are_tokenized_and_echoed(
 
 _LOGPROBS_WITHOUT_ECHO = {
     "tokens": ["<12>", "<13>"],
-    "token_logprobs": [None, -0.5, -9999.0],
-    "top_logprobs": [None, {"<12>": -0.5}, {"<13>": -9999.0}],
+    "token_logprobs": [-0.5, -9999.0],
+    "top_logprobs": [{"<12>": -0.5}, {"<13>": -9999.0}],
     "text_offset": [0, 4],
 }
 _LOGPROBS_WITH_ECHO = {
@@ -341,7 +341,7 @@ _LOGPROBS_WITH_ECHO_UNSCORED_PROMPT = {
     ("echo", "logprobs", "engine_top_n", "skip_prompt_log_probs", "expected_logprobs"),
     [
         pytest.param(False, None, True, False, None, id="plain"),
-        # Non-finite values are clamped for JSON; the leading None is the OpenAI first-token slot.
+        # Non-finite values are clamped for JSON; generated token scores stay one-to-one.
         pytest.param(False, 1, True, False, _LOGPROBS_WITHOUT_ECHO, id="logprobs"),
         pytest.param(True, 1, True, False, _LOGPROBS_WITH_ECHO, id="echo-with-logprobs"),
         # logprobs=0 asks for per-token log probs only, so the engine returns no top-N to format.
