@@ -405,12 +405,13 @@ class TestGPTModelConfigFinalize:
         assert not hasattr(config.transformer, "finalize")
         config.finalize()
 
-    def test_raises_when_cudagraph_without_te_rng_tracker(self):
+    def test_model_finalization_does_not_validate_runtime_rng_policy(self):
         config = _make_gpt_config()
         config.transformer.cuda_graph_impl = "local"
         config.transformer.use_te_rng_tracker = False
-        with pytest.raises(AssertionError, match="RNG tracker"):
-            config.finalize()
+        # The run container propagates RNGConfig before finalizing the model.
+        config.finalize()
+        assert not config.transformer.use_te_rng_tracker
 
     def test_no_error_when_cudagraph_with_te_rng_tracker(self):
         config = _make_gpt_config()
