@@ -655,7 +655,8 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
         torch.testing.assert_close(overlap_gradients[name], serial_gradients[name])
 
 
-def test_shortcut_norm_recompute_and_offload(monkeypatch):
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+def test_shortcut_norm_recompute_and_offload(monkeypatch, parallel):
     """The shortcut path wires pre-norm recompute and post-norm offload together."""
     from megatron.core.models.hybrid import shortcut_block as shortcut_block_module
 
@@ -694,7 +695,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         shortcut_block_module, "_get_offloading_interface", lambda: RecordingOffload
     )
 
-    config = _shortcut_config()
+    config = _shortcut_config(parallel=parallel)
     config.recompute_granularity = "selective"
     config.recompute_modules = ["shortcut_pre_mlp_layernorm"]
     config.fine_grained_activation_offloading = True
@@ -702,10 +703,13 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
 
     moe_layer = _FakeMoE(config)
     mlp = moe_layer.mlp
-    mlp.route = lambda hidden_states, padding_mask=None, packed_seq_params=None: (
-        torch.ones_like(hidden_states),
-        torch.ones_like(hidden_states, dtype=torch.bool),
-    )
+    moe_packed_seq_params = SimpleNamespace(tokens_per_sample=None, cp_group=object())
+
+    def route(hidden_states, padding_mask=None, *, packed_seq_params=None):
+        assert packed_seq_params is moe_packed_seq_params
+        return torch.ones_like(hidden_states), torch.ones_like(hidden_states, dtype=torch.bool)
+
+    mlp.route = route
     mlp.preprocess = (
         lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
             hidden_states,
@@ -726,7 +730,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         lambda output_with_bias, residual, mlp_state=(): output_with_bias[0] + residual
     )
 
-    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False).cuda()
+    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=parallel).cuda()
     hidden_states = torch.randn(
         2, 1, config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
     )
@@ -741,7 +745,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         inference_context=None,
         rotary_pos_emb=None,
         sequence_len_offset=None,
-        packed_seq_params=None,
+        packed_seq_params=moe_packed_seq_params,
         padding_mask=None,
         quant_context_factory=quant_context_factory,
     )
