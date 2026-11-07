@@ -103,8 +103,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
-        or args.dynamic_context_parallel
-        or args.sequence_packing_scheduler is not None
+        or cfg.model.transformer.dynamic_context_parallel
+        or cfg.model.transformer.sequence_packing_scheduler is not None
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:

@@ -18,12 +18,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import (
-    AsyncScheduleMode,
-    InferenceConfig,
-    KVCacheManagementMode,
-    PrefixCachingEvictionPolicy,
-)
+from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
@@ -44,7 +39,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
 )
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -56,13 +50,20 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.dsa_metadata import DSAMetadata
+from .attention_context.mamba_metadata import (
+    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+    MambaMetadata,
+    PrefixCachedMambaMetadata,
+)
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import MAX_CACHED_PROMPT_TOP_N_LOGPROBS, KVBlockAllocator
-from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
+from .mamba_slot_allocator import MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
+from .prefix_cache_block_state import PrefixCacheBlockState
+from .prefix_cache_registry import PrefixCacheRegistry
 from .routing_metadata import RoutingMetadata
 from .zero_padding_rows_kernel import zero_padding_rows
 
@@ -441,6 +442,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
+        # The simplified indexer always projects its own K, independent of main attention K.
+        self.cache_dsa_indexer_keys = (
+            getattr(model_config, "experimental_attention_variant", None) == "dsa"
+            and getattr(model_config, "dsa_indexer_mode", "standard") == "simplified"
+        )
+        self.dsa_indexer_head_dim = (
+            getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
+        )
+        self.dsa_metadata: Optional[DSAMetadata] = None
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -607,6 +617,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
+            )
+        if self.cache_dsa_indexer_keys:
+            self.block_size_bytes += (
+                kv_dtype_size_bytes
+                * self.num_attention_layers
+                * self.block_size_tokens
+                * self.dsa_indexer_head_dim
             )
         assert self.block_size_bytes > 0
 
@@ -788,14 +805,24 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "prefix_caching_mamba_gb unset for memory-only prefix caching."
                 )
 
+        # Prefix-cache state lives beside the allocator:
+        # the host hash registry is shared with the Mamba cache,
+        # and the per-block shadow state exists only when prefix caching is on.
+        kv_pool_size = (
+            block_count if self.unified_memory_level == 0 else block_count + paused_block_count
+        )
+        self.prefix_cache_registry = PrefixCacheRegistry()
+        pc_state: Optional[PrefixCacheBlockState] = None
+        if self.enable_prefix_caching:
+            pc_state = PrefixCacheBlockState(
+                pool_size=kv_pool_size, eviction_policy=self.prefix_caching_eviction_policy
+            )
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
-            pool_size=(
-                block_count if self.unified_memory_level == 0 else block_count + paused_block_count
-            ),
+            pool_size=kv_pool_size,
             paused_limit=paused_block_count,
-            enable_prefix_caching=self.enable_prefix_caching,
-            prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            pc_state=pc_state,
+            prefix_cache_registry=self.prefix_cache_registry if pc_state is not None else None,
         )
         self.dynamo_helper = DynamoHelper()
         self.kv_block_allocator.add_blocks_deregistered_observer(
@@ -842,6 +869,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+
+        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
+        # every non-final chunk on an SSM chunk boundary, so a step whose decode
+        # tokens leave less than `max_tokens` of room would round its prefill chunk
+        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
+        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
+        # step admits at least as many prefill tokens as without batch invariance.
+        self.max_prefill_tokens = self.max_tokens
+        if (
+            self.batch_invariant_mode
+            and self.is_hybrid_model
+            and inference_config.enable_chunked_prefill
+        ):
+            self.max_tokens += self.ssm_chunk_alignment
 
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
@@ -909,6 +950,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.transformer_impl == "transformer_engine"
         )
 
+        # The FlashInfer MXFP8 token bound (inference_flashinfer_mxfp8_token_capacity) covers
+        # the tokens of all EP ranks, so it is safe only when every EP rank is decoding. The
+        # NVLS dispatcher it requires does not sync that across EP, so sync it per step.
+        self._sync_ep_decode_only = (
+            model_config.inference_flashinfer_mxfp8_token_capacity is not None
+        )
+        self._ep_decode_only = False
+
         # We only allow non-decode cuda graphs for the nvls dispatcher
         force_disable_non_decode_cuda_graphs = (
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
@@ -925,10 +974,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # to never fall below that decode bound nor exceed `max_tokens`; setting
         # `cuda_graph_all_prefills` widens the range to the full `max_tokens`.
         decode_bound = self.max_requests * (self.num_speculative_tokens + 1)
+        # A ceiling that covers the whole prefill budget also covers the decode headroom
+        # added above (a no-op when max_prefill_tokens == max_tokens).
+        requested_cuda_graph_max_tokens = inference_config.cuda_graph_max_tokens
+        if requested_cuda_graph_max_tokens >= self.max_prefill_tokens:
+            requested_cuda_graph_max_tokens = self.max_tokens
         cuda_graph_max_tokens = (
             self.max_tokens
             if inference_config.cuda_graph_all_prefills
-            else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
+            else min(max(requested_cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
 
         # CUDA graph config list.
@@ -944,6 +998,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+                # Prefill-only steps fill at most the prefill budget: capture it exactly
+                # rather than padding those steps to the larger mixed-step capacity.
+                extra_prefill_token_counts=(
+                    (self.max_prefill_tokens,) if self.max_prefill_tokens < self.max_tokens else ()
+                ),
             )
         )
 
@@ -966,6 +1025,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 tp_ep_group=self.expert_tensor_and_model_parallel_group,
+                ep_invariant_combine=model_config.moe_ep_invariant_combine,
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -1001,7 +1061,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
             # A chunk plus its final token must fit in one step; otherwise a prompt
             # of that length can never advance without an invalid one-token tail.
-            assert self.max_tokens > self.ssm_chunk_alignment, (
+            assert self.max_prefill_tokens > self.ssm_chunk_alignment, (
                 "batch-invariant SSM chunked prefill requires max_tokens > "
                 f"ssm_chunk_alignment ({self.ssm_chunk_alignment})."
             )
@@ -1052,6 +1112,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             "DynamicInferenceContext: configuration summary",
             f"  max_requests:            {self.max_requests}",
             f"  max_tokens:              {self.max_tokens}",
+            f"  max_prefill_tokens:      {self.max_prefill_tokens}",
             f"  max_sequence_length:     {self.max_sequence_length}",
             f"  model_forward_seq_length: {self.max_sequence_length_for_model}",
             f"  block_size_tokens:       {self.block_size_tokens}",
@@ -1152,6 +1213,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+        if self.cache_dsa_indexer_keys:
+            self.dsa_memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.kv_block_allocator.pool_size,
+                    self.block_size_tokens,
+                    self.dsa_indexer_head_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -1161,6 +1233,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
             ).pin_memory()
+            if self.cache_dsa_indexer_keys:
+                self._offloadable_tensor_names.add("dsa_memory_buffer")
+                self._offloadable_cpu_backups["dsa_memory_buffer"] = torch.empty_like(
+                    self.dsa_memory_buffer, device="cpu"
+                ).pin_memory()
 
     def _initialize_mha_value_pages(self, block_ids: Sequence[int] | Tensor) -> None:
         """Zero newly acquired MHA value-cache pages before their first model write."""
@@ -1173,16 +1250,33 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests,
-                max_tokens=self.max_tokens,
-                max_intermediate_count=self.max_mamba_intermediate_states_per_step,
-                reserve_dummy_state_slot=self.reserve_recurrent_state_dummy_slot,
-                mamba_chunk_size=self.mamba_chunk_size,
-                d_conv=self.mamba_conv_states_shape[-1],
-                decode_indices_dtype=self._mamba_decode_indices_dtype,
-                gdp_num_householder=self.gdp_num_householder,
+            # The prefix-cached subclass carries the intermediate-state extraction machinery.
+            use_prefix_cached = (
+                self.config.enable_prefix_caching
+                and self.config.prefix_caching_mamba_gb is not None
+                and self.config.prefix_caching_mamba_gb > 0
             )
+            if use_prefix_cached:
+                self.mamba_metadata = PrefixCachedMambaMetadata(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_intermediate_count=self.max_mamba_intermediate_states_per_step,
+                    reserve_dummy_state_slot=self.reserve_recurrent_state_dummy_slot,
+                    mamba_chunk_size=self.mamba_chunk_size,
+                    d_conv=self.mamba_conv_states_shape[-1],
+                    decode_indices_dtype=self._mamba_decode_indices_dtype,
+                    gdp_num_householder=self.gdp_num_householder,
+                )
+            else:
+                self.mamba_metadata = MambaMetadata(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    reserve_dummy_state_slot=self.reserve_recurrent_state_dummy_slot,
+                    mamba_chunk_size=self.mamba_chunk_size,
+                    d_conv=self.mamba_conv_states_shape[-1],
+                    decode_indices_dtype=self._mamba_decode_indices_dtype,
+                    gdp_num_householder=self.gdp_num_householder,
+                )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
@@ -1673,6 +1767,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata = DSAMetadata(
+                max_requests=self.max_requests, max_tokens=self.max_tokens
+            )
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -1806,6 +1905,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
             return
 
+        # The early-return paths above preserve addresses and their captured graphs.
+        if self.dsa_metadata is not None:
+            self.dsa_metadata.topk_workspace = None
+
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
             for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
                 self._offloadable_storage_sizes[name] = tensor.storage().size()
@@ -1819,6 +1922,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     delattr(self, key)
             # The MTP scratch buffers hang off `self.mtp_metadata`, so the sweep above misses them.
             self.mtp_metadata.deallocate()
+            self.dsa_metadata = None
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1873,6 +1977,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
+
+    def is_ep_decode_only(self) -> bool:
+        """Return whether every expert-parallel rank runs a decode-only step."""
+        return self._ep_decode_only and self.is_decode_only()
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -2079,6 +2187,36 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
+    def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
+        """Append learned simplified-indexer keys to their paged cache."""
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        attention_layer_number = self.layer_map[layer_number - 1]
+        block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
+        local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
+            : self.padded_active_token_count
+        ]
+
+        if key.dim() == 4:
+            assert key.size(1) == 1 and key.size(2) == 1
+            key = key.squeeze(1).squeeze(1)
+        elif key.dim() == 3:
+            assert key.size(1) == 1
+            key = key.squeeze(1)
+
+        self.dsa_memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = key[
+            : self.padded_active_token_count
+        ]
+
+    def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Return a layer's learned indexer-key cache and active block table."""
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        attention_layer_number = self.layer_map[layer_number - 1]
+        assert self.active_attn_metadata is not None
+        return (
+            self.dsa_memory_buffer[attention_layer_number],
+            self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+        )
+
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
     ) -> Tuple[Tensor, Tensor]:
@@ -2112,11 +2250,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
 
-        # MambaSlotAllocator allocates two GPU buffer families with the same
-        # per-slot footprint, both of which must fit in this budget:
-        #   - "durable" cache:  self.ssm_states / self.conv_states, sized to
-        #                       `max_slots` slots (computed below).
-        #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
+        # Two GPU buffer families with the same per-slot footprint are charged to
+        # this budget, and both are allocated below only once the checks pass:
+        #   - "durable" cache:  MambaSlotAllocator.ssm_states / conv_states, sized
+        #                       to `max_slots` slots (computed below).
+        #   - "scratch" buffers: PrefixCachedMambaMetadata.intermediate_ssm_out /
+        #                       intermediate_conv_out,
         #                       fixed CUDA-graph-safe staging for intermediate-state
         #                       extraction, sized to the per-step token-budget cap
         #                       `scratch_slots` = max_mamba_intermediate_states_per_step.
@@ -2164,6 +2303,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 f"reduce max_tokens."
             )
 
+        self.mamba_metadata.allocate_scratch_buffers(
+            num_mamba_layers=self.num_mamba_layers,
+            conv_states_shape=self.mamba_conv_states_shape,
+            ssm_states_shape=self.mamba_ssm_states_shape,
+            conv_states_dtype=self.mamba_conv_states_dtype,
+            ssm_states_dtype=self.mamba_ssm_states_dtype,
+        )
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
             max_slots=max_slots,
@@ -2172,9 +2318,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ssm_states_shape=self.mamba_ssm_states_shape,
             conv_states_dtype=self.mamba_conv_states_dtype,
             ssm_states_dtype=self.mamba_ssm_states_dtype,
-        )
-        self.kv_block_allocator.on_blocks_deregistered = (
-            self.mamba_slot_allocator.on_kv_blocks_deregistered
+            prefix_cache_registry=self.prefix_cache_registry,
         )
 
         logging.info(
@@ -2264,15 +2408,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.gpu_view.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(
-            t=query[:n],
+        # Frequencies are already selected per token, including decode offsets.
+        # Passing cu_seqlens again would reindex them by request-local positions
+        # (and mis-handle padding). Use the token-aligned SBHD path for THD Q too.
+        query_tokens = query[:n]
+        packed_query = query_tokens.dim() == 3
+        rotated_query = apply_rotary_pos_emb(
+            t=query_tokens.unsqueeze(1) if packed_query else query_tokens,
             freqs=query_emb[:n],
             config=config,
-            cu_seqlens=cu_seqlens_q,
+            cu_seqlens=None,
             cp_group=cp_group,
             mscale=mscale,
             mla_rotary_interleaved=config.multi_latent_attention,
         )
+        query[:n] = rotated_query.squeeze(1) if packed_query else rotated_query
         return query
 
     def apply_rotary_emb_key(
@@ -2346,6 +2496,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         for attn_metadata in self.graph_attn_metadata.values():
             attn_metadata.reset()
         self.active_attn_metadata = None
+        dsa_metadata = getattr(self, "dsa_metadata", None)
+        if dsa_metadata is not None:
+            dsa_metadata.reset()
 
         if self.is_hybrid_model:
             self.mamba_metadata.reset_varlen_metadata()
@@ -2701,6 +2854,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
+        if self._sync_ep_decode_only:
+            self._ep_decode_only = (
+                InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+                    batch_dimensions,
+                    ep_group=self.expert_model_parallel_group,
+                    ep_zmq_communicator=self._ep_zmq_communicator,
+                )
+                is not None
+            )
+            # Decode graphs may have been captured with the token bound, so a decode-only
+            # rank must not replay one while another EP rank is prefilling.
+            if not self._ep_decode_only and best_graph is not None:
+                if best_graph.prefill_req_count == 0:
+                    best_graph = None
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
@@ -2878,6 +3045,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.update(
+                self._cpu_mha_query_lengths[:real_bs].tolist(),
+                self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
+                num_decode_requests=attn_dimensions.decode_req_count,
+                padded_tokens=self.padded_active_token_count,
+                padded_requests=padded_bs,
+                decode_only=self.is_decode_only(),
+            )
+
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
@@ -2885,9 +3062,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
-            if self.mamba_slot_allocator is not None:
+            if isinstance(self.mamba_metadata, PrefixCachedMambaMetadata):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_cpu_data()
+                    self.mamba_metadata.get_intermediate_cpu_data(self)
                 )
             active_mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
             if (
@@ -3053,6 +3230,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
+
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.transfer(
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+                non_blocking=record_done_event,
+            )
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
@@ -3343,18 +3526,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if start_block >= end_block:
             return 0
 
-        mamba_map = self.mamba_slot_allocator.hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
-
-        # Mark the blocks in range whose hash the allocator still holds state
-        # for; the farthest such block is the match count. Intersecting against
-        # the range's hashes first keeps this bounded by the range rather than
-        # the size of the whole cache.
-        block_hashes = torch.tensor(hashes, dtype=torch.int64)
-        cached = mamba_map.keys() & set(hashes)
-        cached_hashes = torch.tensor(list(cached), dtype=torch.int64)
-        is_cached = torch.isin(block_hashes, cached_hashes)
-        return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
+        return self.prefix_cache_registry.match_mamba_farthest(hashes)
 
     @staticmethod
     def _prompt_logprobs_top_n(req: DynamicInferenceRequest) -> Optional[int]:
@@ -3457,8 +3630,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
-                    backed_off_blocks = self._find_mamba_match_count(
-                        req=req, start_block=0, end_block=num_mamba_matched - 1
+                    backed_off_blocks = self.prefix_cache_registry.find_mamba_backoff(
+                        req.precomputed_block_hashes, num_mamba_matched - 1
                     )
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
                 else:
@@ -3535,7 +3708,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if matched_block_ids:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             potential_matched_count = int(
-                (self.kv_block_allocator.block_ref_counts[matched_tensor] == 0).sum()
+                (self.kv_block_allocator.pc_state.block_ref_counts[matched_tensor] == 0).sum()
             )
         kv_cache_available = self.kv_block_allocator.is_memory_available(
             num_blocks_from_pool, potential_matched_count=potential_matched_count
@@ -3548,7 +3721,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """Find cached blocks matching a range of the prompt using precomputed hashes.
 
         Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
-        the block allocator's hash-to-block mapping. Stops at the first non-match.
+        the prefix-cache registry. Stops at the first non-match.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
@@ -3575,19 +3748,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return [], 0
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
-
-        # Find longest KV prefix by iterating block hashes from end.
-        # Parent-chained hashes guarantee: if hash at position N exists,
-        # all hashes 0..N also exist. So first match from end = longest prefix.
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in kv_hash_to_block:
-                num_matched = i + 1
-                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
-                parent_hash = hashes[num_matched - 1]
-                return matched_blocks, parent_hash
-
-        return [], 0
+        return self.prefix_cache_registry.match_kv_prefix(hashes)
 
     def add_request(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
@@ -3649,9 +3810,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         matched_tensor = None
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
-            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.kv_block_allocator.update_timestamps(matched_tensor)
+            self.kv_block_allocator.pc_state.retain(matched_tensor, self.prefix_cache_lru_clock)
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
@@ -3660,7 +3819,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 # Roll back the pin so a failed add does not leak ref counts on
                 # the matched blocks (which would make them permanently unevictable).
                 if matched_tensor is not None:
-                    self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
+                    self.kv_block_allocator.pc_state.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
             self._initialize_mha_value_pages(new_block_ids)
 
@@ -3881,7 +4040,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                         if block_id not in newly_registered:
                             continue
                         next_token_idx = (start + offset + 1) * self.block_size_tokens
-                        self.kv_block_allocator.block_mtp_next_token[block_id] = (
+                        self.kv_block_allocator.pc_state.block_mtp_next_token[block_id] = (
                             int(req.prompt_tokens[next_token_idx])
                             if next_token_idx < total_tokens_after
                             else -1
@@ -3913,7 +4072,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 prev_block = int(
                     self.request_to_kv_block_ids[current_id][previously_complete - 1].item()
                 )
-                self.kv_block_allocator.block_mtp_next_token[prev_block] = int(
+                self.kv_block_allocator.pc_state.block_mtp_next_token[prev_block] = int(
                     req.prompt_tokens[req.finished_chunk_token_count]
                 )
 
@@ -3946,8 +4105,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
         # state is precisely what lets a later turn skip prefill on a hybrid model.
         # Mamba slot allocation / state restore above stays first-chunk-only.
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.compute_and_store_offsets(
+        if isinstance(self.mamba_metadata, PrefixCachedMambaMetadata):
+            self.mamba_metadata.compute_and_store_offsets(
+                self,
                 req,
                 current_id,
                 prefix_skip_tokens,
@@ -4093,12 +4253,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests (CPU writes).
-        if self.mamba_slot_allocator is not None:
-            sa = self.mamba_slot_allocator
-            sa._intermediate_counts_cpu[request_indexes] = 0
-            sa._intermediate_offsets_cpu[request_indexes] = 0
-            sa._intermediate_block_ids_cpu[request_indexes] = -1
-            sa._eos_cache_block_id_cpu[request_indexes] = -1
+        if isinstance(self.mamba_metadata, PrefixCachedMambaMetadata):
+            self.mamba_metadata.clear_request_entries(request_indexes)
 
     def _get_paused_request_count_within_block_budget(self) -> int:
         """Count the left-most paused requests whose blocks fit the paused budget."""
@@ -4152,7 +4308,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         unique_block_ids, inverse, selected_reference_counts = torch.unique(
             block_ids, return_inverse=True, return_counts=True
         )
-        current_reference_counts = self.kv_block_allocator.block_ref_counts[unique_block_ids]
+        current_reference_counts = self.kv_block_allocator.pc_state.block_ref_counts[
+            unique_block_ids
+        ]
         assert torch.all(
             selected_reference_counts <= current_reference_counts
         ), "selected more KV block references than the allocator owns"

@@ -18,7 +18,7 @@ from megatron.core.datasets.data_schedule import (
 )
 from megatron.core.datasets.data_schedule_utils import (
     create_data_iterator,
-    next_hdp_group_packing_aware,
+    next_dynamic_cp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -263,8 +263,8 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         )
 
 
-def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_can_expand_short_sequence_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
     )
 
@@ -274,8 +274,8 @@ def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
     assert exec_times[0] == exec_times[1]
 
 
-def test_next_hdp_group_packing_aware_fills_non_power_of_two_group():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_fills_non_power_of_two_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
     )
 
@@ -649,8 +649,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             assert (
                 sum(sequence_lengths) == args.seq_length
             ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
-            data_iterator = iter(
-                MockVariableLengthSequencePackingDataIterator(
+            # Like the scheduler, hand each PP stage only the fields it consumes.
+            unowned_keys = set()
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                unowned_keys.update(('tokens', 'position_ids'))
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                unowned_keys.update(('labels', 'loss_mask'))
+            data_iterator = (
+                {key: value for key, value in sample.items() if key not in unowned_keys}
+                for sample in MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
                     local_cp_size=local_cp_size,
@@ -668,6 +675,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             vp_stage=None,
             dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
+            config=SimpleNamespace(sequence_parallel=tp > 1),
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
@@ -795,6 +803,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         (2, 1, 4, None, "default_dynamic_cp"),
         (1, 2, 4, None, "default_dynamic_cp"),
         (1, 4, 2, 4, "default_dynamic_cp"),
+        (1, 1, 2, None, "default_dynamic_cp"),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
@@ -917,6 +926,14 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         assert (
             type(sequence_square_sum_this_global_batch) is float
             or type(sequence_square_sum_this_global_batch) is np.float32
+        )
+        # The statistics count every sample of the global batch once, independent of CP.
+        # These pre-packed samples carry no real length, so their padded length is used.
+        # TP ranks other than 0 receive the statistics as float32.
+        padded_lengths = [((num + 15) // 16) * 16 for num in nums]
+        assert num_total_tokens_this_global_batch == pytest.approx(sum(padded_lengths))
+        assert sequence_square_sum_this_global_batch == pytest.approx(
+            sum(length * length for length in padded_lengths)
         )
 
         def _check_batch(batch_all, batch_keys):

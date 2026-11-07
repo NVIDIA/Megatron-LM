@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import gc
 import os
 import random
 import string
@@ -251,6 +252,40 @@ class TextGenerationControllerTestBase:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
 
+    def _generate_dynamic(self, num_tokens_to_generate=8, prompt_seed=1234):
+        """Run `batch_size` seeded prompts through dynamic generation to completion;
+        returns the sampled tokens of every step."""
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        for request_id in range(self.batch_size):
+            generator = torch.Generator().manual_seed(prompt_seed + request_id)
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.randint(
+                        0, self.vocab_size - 1, (7 + request_id,), generator=generator
+                    ).to(torch.cuda.current_device()),
+                    sampling_params=SamplingParams(
+                        top_k=10, num_tokens_to_generate=num_tokens_to_generate
+                    ),
+                )
+            )
+        sampled_per_step = []
+        while context.has_unfinished_requests():
+            result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+            sampled_per_step.append(result["sample"].tolist())
+        return sampled_per_step
+
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
@@ -319,7 +354,10 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         max_tokens=32,
         request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
         kv_block_allocator=SimpleNamespace(
-            enable_handoff_pinning=False, block_routing={}, store_routing_per_block=mock.Mock()
+            enable_handoff_pinning=False,
+            routing_replay=SimpleNamespace(
+                has_data=mock.Mock(return_value=False), scatter_routing_to_blocks=mock.Mock()
+            ),
         ),
         block_size_tokens=2,
         request_kv_length_offsets=torch.full((metadata_len,), 2, dtype=torch.int32),
@@ -445,7 +483,9 @@ def test_legacy_step_reports_matching_decode_only_state(num_prefill_requests, ex
     context.config.async_sched_mode = AsyncScheduleMode.LEGACY
     context.num_prefill_requests = num_prefill_requests
     context.num_decode_requests = 1 - num_prefill_requests
-    context.kv_block_allocator = SimpleNamespace(store_routing_per_block=mock.Mock())
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(scatter_routing_to_blocks=mock.Mock())
+    )
     controller = _make_async_sched_controller(context)
     controller._dynamic_step_context_init = mock.Mock(
         return_value=(torch.tensor([1]), torch.tensor([0]), None)
@@ -795,6 +835,33 @@ def test_run_async_sched_publish_bookkeeping_skips_gpu_input_ids():
         skip_token_input_ids=True, record_done_event=True
     )
     assert done_event == "bookkeeping"
+
+
+@pytest.mark.parametrize(
+    "count, threshold, expected_generation",
+    [
+        ((700, 0, 0), (700, 10, 10), None),
+        ((701, 0, 0), (700, 10, 10), 0),
+        ((701, 11, 0), (700, 10, 10), 1),
+        ((701, 11, 11), (700, 10, 10), 2),
+        ((5000, 50, 50), (0, 10, 10), None),
+    ],
+)
+def test_trigger_gc_now_follows_cpython_thresholds(
+    monkeypatch, count, threshold, expected_generation
+):
+    """Collect the oldest due generation once the youngest is due; threshold 0 disables GC."""
+    collect = mock.Mock(return_value=0)
+    monkeypatch.setattr(gc, "get_count", lambda: count)
+    monkeypatch.setattr(gc, "get_threshold", lambda: threshold)
+    monkeypatch.setattr(gc, "collect", collect)
+
+    TextGenerationController.__new__(TextGenerationController)._trigger_gc_now()
+
+    if expected_generation is None:
+        collect.assert_not_called()
+    else:
+        collect.assert_called_once_with(expected_generation)
 
 
 @pytest.mark.parametrize(
@@ -1335,7 +1402,10 @@ def test_legacy_bookkeeping_keeps_partial_chunk_active():
     context.get_index_of_chunked_prefill_request = mock.Mock(return_value=0)
     context.get_active_sequence_lengths.return_value = torch.tensor([3])
     context.get_max_sequence_lengths.return_value = torch.tensor([4])
-    context.kv_block_allocator = SimpleNamespace(block_routing=False, enable_handoff_pinning=True)
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=False)),
+        enable_handoff_pinning=True,
+    )
     context.request_to_kv_block_ids = torch.tensor([[1, 2, -1]], dtype=torch.int32)
     controller = _make_async_sched_controller(context)
     controller._sampled_tokens_cuda[0] = 7
@@ -1351,7 +1421,9 @@ def test_async_bookkeeping_retains_finished_handoff_state():
     context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
     context.kv_block_allocator = SimpleNamespace(
-        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock(), block_routing={}
+        enable_handoff_pinning=True,
+        retain_memory_blocks=mock.Mock(),
+        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=False)),
     )
     context.request_to_kv_block_ids = torch.tensor(
         [[8, 9, -1], [10, 11, -1], [12, 13, -1]], dtype=torch.int32
@@ -1435,7 +1507,10 @@ def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
     drops `moe_topk_indices` from the response.
     """
     context = _make_async_sched_context(total_request_count=2)
-    context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=True)),
+        enable_handoff_pinning=False,
+    )
     context.request_to_kv_block_ids = torch.tensor(
         [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
         dtype=torch.int32,
@@ -1463,7 +1538,7 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     context = _make_async_sched_context(total_request_count=3)
     context.request_metadata["termination_id"] = torch.tensor(termination_ids)
     controller = _make_async_sched_controller(context)
-    context.kv_block_allocator.block_routing = {40: np.zeros((1, 1, 1))}
+    context.kv_block_allocator.routing_replay.has_data.return_value = True
     context.request_to_kv_block_ids = torch.tensor([[40], [41], [42]])
     controller._synchronize_async_sched_event = mock.Mock()
     controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
@@ -3710,8 +3785,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
-        ctx.kv_block_allocator.block_ref_counts[20] = 2
-        ctx.kv_block_allocator.block_ref_counts[10] = 1
+        ctx.kv_block_allocator.pc_state.block_ref_counts[20] = 2
+        ctx.kv_block_allocator.pc_state.block_ref_counts[10] = 1
 
         initial_avail = ctx.kv_block_allocator.pool_avail
 
@@ -3725,9 +3800,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Req 1 should have released block 20 (ref count decremented).
-        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[20].item() == 1
         # Block 10 should be untouched.
-        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[10].item() == 1
 
     @pytest.mark.internal
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
@@ -4251,52 +4326,41 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
-    def setup_model(
-        self,
-        dtype,
-        symmetric_ar_type=None,
-        fp8: bool = False,
-        tensor_model_parallel_size: int = 2,
-        pipeline_model_parallel_size: int = 1,
-        batch_size: int = 4,
-        static: bool = True,
-        use_training_random_init: bool = False,
-        materialize_only_last_token_logits: bool = False,
-        num_speculative_tokens: int = 0,
-        block_size_tokens: int = 256,
-        enable_prefix_caching: bool = False,
-        max_requests: int = None,
-        mtp_num_layers: int = 0,
-        sequence_parallel: bool = False,
-        expert_model_parallel_size: int = 1,
-        num_moe_experts: int = None,
-        hybrid_layer_pattern: str = None,
-    ):
+    def setup_model(self, dtype, **kwargs):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            expert_model_parallel_size=expert_model_parallel_size,
+            tensor_model_parallel_size=kwargs.get("tensor_model_parallel_size", 2),
+            pipeline_model_parallel_size=kwargs.get("pipeline_model_parallel_size", 1),
+            expert_model_parallel_size=kwargs.get("expert_model_parallel_size", 1),
         )
-        super().setup_model(
-            dtype,
-            symmetric_ar_type=symmetric_ar_type,
-            fp8=fp8,
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            batch_size=batch_size,
-            static=static,
-            use_training_random_init=use_training_random_init,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            num_speculative_tokens=num_speculative_tokens,
-            block_size_tokens=block_size_tokens,
-            enable_prefix_caching=enable_prefix_caching,
-            max_requests=max_requests,
-            mtp_num_layers=mtp_num_layers,
-            sequence_parallel=sequence_parallel,
-            expert_model_parallel_size=expert_model_parallel_size,
-            num_moe_experts=num_moe_experts,
-            hybrid_layer_pattern=hybrid_layer_pattern,
-        )
+        super().setup_model(dtype, **kwargs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
+    def test_logits_are_fp32(self, pp_size):
+        """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
+        the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
+        general_gemm is available and upcasts otherwise. Generation with and without the buffer
+        samples the same tokens (both run the same eager kernels here).
+        """
+        generated = {}
+        for cuda_graph_impl in ("none", "local"):
+            if generated:
+                self.teardown_method(None)
+            self.setup_model(
+                torch.bfloat16,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=pp_size,
+                static=False,
+                use_training_random_init=True,
+                cuda_graph_impl=cuda_graph_impl,
+            )
+            controller = self.text_generation_controller
+            generated[cuda_graph_impl] = self._generate_dynamic()
+            assert controller._all_logits_cuda.dtype is torch.float32
+        assert generated["none"] == generated["local"]
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])

@@ -257,18 +257,20 @@ class TopKRouter(Router):
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            # Keep the counters exact across micro-batches. Float16Module leaves integer
+            # buffers in their original dtype; in bf16, ga_steps would stop at 256.
             self.register_buffer(
                 'global_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 'ga_steps',
-                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                torch.tensor(0, dtype=torch.int64, device=torch.cuda.current_device()),
                 persistent=False,
             )
         else:
@@ -470,6 +472,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+                # The histogram is only supplied while accumulating, so every pass must
+                # use the reference router to stay bitwise identical across passes.
+                allow_batch_invariant_sigmoid_topk=False,
             )
 
         assert (
@@ -619,6 +624,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -682,6 +688,7 @@ class TopKRouter(Router):
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_aux_loss_fusion,
+                deterministic=self.config.deterministic_mode,
             )
             / bsz
         )
@@ -734,6 +741,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -1429,6 +1437,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        allow_batch_invariant_sigmoid_topk=True,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1443,6 +1452,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=allow_batch_invariant_sigmoid_topk,
         )
 
     def _uses_sigmoid_topk_kernel(
@@ -1453,7 +1463,9 @@ class InferenceTopKRouter(TopKRouter):
         It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
         scores with an expert bias, fp32 logits and supported shapes, without
         group-limited routing, router replay, precomputed indices or TE's fused
-        router; batch-invariant mode keeps its uncompiled reference path. forward()
+        router. Batch-invariant mode routes through topk_routing_with_score_function,
+        which runs this kernel with a batch-invariant launch in both training and
+        inference, so it does not take this path. forward()
         only reaches this path while InferenceMode is active, whether or not
         gradients are enabled, and the kernel's outputs carry no autograd graph.
         Expert selection matches the compiled path; for top-k of eight or more a
@@ -1524,6 +1536,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

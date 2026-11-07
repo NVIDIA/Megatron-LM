@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -799,6 +799,9 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    fp8_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP8 recipe."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -839,8 +842,9 @@ class TransformerConfig(ModelParallelConfig):
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
-    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+    """If set, enables the use of FP4 precision through Transformer Engine."""
+    fp4_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
@@ -905,6 +909,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_shortcut_post_norm: bool = False
     """Apply the configured normalization to the combined routed and shared expert output.
     Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_disable_mtp: bool = False
+    """Disable shortcut MoE connections in hybrid MTP stacks while keeping them in the decoder.
+    Each MTP depth runs its compute and MoE layers sequentially, using the ordinary MoE
+    normalization and routing path. Also applies to a shared, repeated MTP layer.
+    Only affects shortcut MoE; other MTP, recomputation, and offloading settings are preserved.
+    Changing this setting requires converting the MTP state when resuming a checkpoint.
+    Defaults to False to preserve existing MTP behavior."""
 
     moe_shortcut_parallel: bool = False
     """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
@@ -1505,6 +1517,16 @@ class TransformerConfig(ModelParallelConfig):
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
 
+    moe_ep_invariant_combine: bool = False
+    """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
+    reduction tree over the expert ids (moe/ep_invariant_combine.py) instead of per-EP-rank
+    partials added in rank order, so MoE outputs are bitwise identical at every power-of-two
+    expert-parallel size dividing num_moe_experts (e.g. training and inference with
+    different EP). Covers the training AllToAll combine and the inference NVLS combine of
+    the 'torch' and 'vllm' grouped-GEMM backends, which use the ordered fp32 combine
+    (whatever the batch-invariant collective). With expert tensor parallelism, inference
+    sums each expert row over expert TP before the combine, as training does."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
@@ -1575,8 +1597,10 @@ class TransformerConfig(ModelParallelConfig):
       bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
       outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
       below eight and to within the last fp32 bit otherwise. Other score functions,
-      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
-      use the 'torch' path. Default."""
+      group-limited routing, router replay and moe_router_fusion use the 'torch' path.
+      Default.
+    Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
+    routing with an expert bias in both training and inference."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
@@ -1636,6 +1660,15 @@ class TransformerConfig(ModelParallelConfig):
 
     gdp_num_householder: int = 3
     """The number of Householder reflections used in Gated Delta Product layers."""
+
+    gdp_g_clamp_value: Optional[float] = None
+    """Optional positive magnitude of the lower bound on GDP's per-token log decay.
+
+    For example, 50 clamps g to a minimum of -50 before the recurrent kernel in
+    training and inference. None leaves g unchanged. GDP gate metrics report raw g.
+    When loading checkpoint arguments, a saved value is restored if this is omitted;
+    an explicit CLI value takes precedence.
+    """
 
     mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
@@ -1929,6 +1962,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
             )
+
+        if self.gdp_g_clamp_value is not None and (
+            not math.isfinite(self.gdp_g_clamp_value) or self.gdp_g_clamp_value <= 0
+        ):
+            raise ValueError("gdp_g_clamp_value must be finite and positive when set.")
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
@@ -4818,6 +4856,23 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
+
+        if self.moe_ep_invariant_combine:
+            if not self.batch_invariant_mode:
+                raise ValueError("moe_ep_invariant_combine requires batch_invariant_mode=True.")
+            if self.num_moe_experts:
+                from megatron.core.transformer.moe.ep_invariant_combine import check_ep_size
+
+                check_ep_size(self.num_moe_experts, self.expert_model_parallel_size)
+            if self.transformer_impl == "inference_optimized" and (
+                self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+            ):
+                raise ValueError(
+                    "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
+                    "'torch' or 'vllm' for inference-optimized MoE: FlashInfer sums a "
+                    "token's routes inside its kernel."
+                )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (

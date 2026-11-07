@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.inference.utils import lm_head_can_emit
 from megatron.core.models.backends import (
     backend_slot,
     get_backend_from_config,
@@ -232,6 +233,8 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # The input table's post-update transforms must also reach its tied copies.
+            weight.is_word_embedding_parameter = True
             # Keep optimizer grouping consistent for tied embedding/output copies.
             if self.config.use_mup:
                 weight.is_embedding_parameter = True
@@ -337,6 +340,11 @@ class LanguageModule(MegatronModule):
             return self.output_layer.weight
         return None
 
+    @property
+    def lm_head_can_emit_fp32(self) -> bool:
+        """Whether the LM head can emit fp32 logits; reads the batch-invariant mode flag live."""
+        return lm_head_can_emit(self.output_layer, torch.float32)
+
     @torch.inference_mode()
     def compute_mtp_single_step(
         self,
@@ -383,8 +391,16 @@ class LanguageModule(MegatronModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
-        logits = self._scale_logits(logits)
+        # Speculative decoding is inference-only, and inference consumes logits in fp32: emit
+        # them so when the head can, upcast otherwise.
+        logits, _ = self.output_layer(
+            mtp_hidden,
+            weight=output_weight,
+            runtime_gather_output=True,
+            output_dtype=torch.float32 if self.lm_head_can_emit_fp32 else None,
+        )
+        # MuP scaling first: a bf16 head scales in bf16, as training does, then the upcast.
+        logits = self._scale_logits(logits).float()
 
         return mtp_hidden, logits
 

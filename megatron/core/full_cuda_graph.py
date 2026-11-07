@@ -344,7 +344,16 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            # Keep autograd nodes retained during warmup on the eventual capture stream.
+            # Leaves receiving None gradients can bypass PyTorch's stale-stream override.
+            caller_stream = torch.cuda.current_stream()
+            warmup_stream = get_shared_capture_stream()
+            warmup_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(warmup_stream):
+                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                    *args, **kwargs
+                )
+            caller_stream.wait_stream(warmup_stream)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)

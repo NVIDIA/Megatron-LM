@@ -304,6 +304,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if hasattr(source, "is_word_embedding_parameter"):
+        destination.is_word_embedding_parameter = source.is_word_embedding_parameter
 
 
 class MegatronOptimizer(ABC):
@@ -1038,6 +1040,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
+        if not self.is_stub_optimizer:
+            self._post_optimizer_step()
+
         # Update params from main params.
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -1062,6 +1067,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params').stop()
 
         return True
+
+    def _post_optimizer_step(self) -> None:
+        """Apply transforms to updated main parameters before staging model copies."""
+        pass
 
     @torch.no_grad()
     def step(self):
@@ -2151,7 +2160,12 @@ class ChainedOptimizer(MegatronOptimizer):
         return self._step()
 
     def grads_states_parallel_group_is_shared(self):
-        """Check if all optimizers share the same gradient statistics parallel group."""
+        """Whether all optimizers' gradient statistics can share one reduction."""
+        if any(
+            getattr(optimizer, 'requires_individual_grad_stats', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
@@ -2332,15 +2346,8 @@ class ChainedOptimizer(MegatronOptimizer):
             if len(parameters) == 0:
                 continue
 
-            use_fsdp_decoupled_grad = (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                optimizer.config.use_precision_aware_optimizer
-                and getattr(parameters[0], "__fsdp_param__", False)
-            )
-            use_decoupled_grad = (
-                optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                or use_fsdp_decoupled_grad
-            )
+            # All members share this config (asserted in __init__).
+            use_decoupled_grad = self._uses_decoupled_grad(parameters)
             if optimizer.config.dsa_indexer_clip_grad is not None:
                 indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
                 indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()

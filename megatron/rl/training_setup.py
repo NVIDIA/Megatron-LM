@@ -4,6 +4,7 @@ import copy
 from typing import Any, Optional
 
 from megatron.core import mpu
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.num_microbatches_calculator import (
@@ -33,8 +34,10 @@ def build_rl_inference_model(
     rl_config: Any, args: Any, config: Any, model_provider: Any, model_type: Any
 ) -> Optional[list]:
     """Build a separate inference model with custom parallelism, if requested."""
+    cfg_container = get_run_config()
     if not rl_config.uses_separate_inference_model(
-        context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
+        context_parallel_size=cfg_container.model.transformer.context_parallel_size,
+        inference_shards=args.inference_shards,
     ):
         if rl_config.rl_offload_inference_model_weights:
             raise ValueError(
@@ -43,7 +46,6 @@ def build_rl_inference_model(
                 "the training model."
             )
         return None
-    cfg_container = get_run_config()
     if spec_declares_disaggregation(args.inference_shards):
         # Disaggregated rollouts build this rank's prefill/decode model on
         # the shard process groups maintained by the per-pool refit path.
@@ -57,7 +59,7 @@ def build_rl_inference_model(
 
     # RL inference doesn't support CP; when training uses CP>1, always build a
     # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
-    force_cp1_inference_model = args.context_parallel_size > 1
+    force_cp1_inference_model = cfg_container.model.transformer.context_parallel_size > 1
     print_rank_0(
         "Building separate RL inference model with custom parallelism: "
         f"TP={rl_config.rl_inference_tensor_model_parallel_size}, "
@@ -67,7 +69,7 @@ def build_rl_inference_model(
         f"ExptTP={rl_config.rl_inference_expert_tensor_model_parallel_size}"
     )
     inference_pg_collection = build_inference_pg_collection(
-        args.world_size,
+        safe_get_world_size(),
         tp_size=rl_config.rl_inference_tensor_model_parallel_size,
         pp_size=rl_config.rl_inference_pipeline_model_parallel_size,
         cp_size=1 if force_cp1_inference_model else None,
@@ -119,29 +121,28 @@ def load_reference_state_dict(
         return {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
     print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-    load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-    args.no_load_optim = True
-
-    # Load pretrained checkpoint
-    args.load = None
-    args.finetune = True
+    skip_load_to_model_and_opt = (
+        HAVE_FSDP2 and cfg.dist.use_torch_fsdp2 and cfg.checkpoint.ckpt_format == "torch_dist"
+    )
+    # The reference weights come from --pretrained-checkpoint, weights-only: the load directory
+    # is cleared so the pretrained fallback applies, for this load only (the run's checkpoint
+    # policy and the arguments are not written).
     load_checkpoint(
         model,
         None,  # Don't load optimizer state
         None,  # Don't load scheduler state
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
-        skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
-        and args.ckpt_format == "torch_dist",
+        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+        load_dir=None,
+        finetune=True,
+        load_optim=False,
     )
     ref_state_dict = {
         k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
     }
 
-    # Reload RL training checkpoint weights
-    args.load = load
-    args.finetune = finetune
+    # Reload RL training checkpoint weights with the run's policy, without the optimizer.
     print_rank_0("> Reloading RL training checkpoint...")
     load_checkpoint(
         model,
@@ -149,13 +150,10 @@ def load_reference_state_dict(
         None,
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
-        skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
-        and args.ckpt_format == "torch_dist",
+        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+        load_optim=False,
     )
     update_num_microbatches(consumed_samples=get_train_state().consumed_train_samples, verbose=True)
-
-    args.no_load_optim = no_load_optim
     return ref_state_dict
 
 
