@@ -23,7 +23,10 @@ from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
     num_floating_point_operations,
+    reset_seqlen_stats_in_iteration,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
     update_vision_model_flops_stats,
     validate_vision_flops_metadata,
 )
@@ -1031,6 +1034,61 @@ class TestAccumulator:
         # returning ``(None, None)`` so ``num_floating_point_operations`` takes
         # the closed-form defaults.
         assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_update_from_padding_mask_counts_real_tokens_only(self):
+        # Two right-padded SBHD-validation samples of length 8 with 5 and 3
+        # real tokens: the padded tail must not be counted as useful work.
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 5 + 3
+        assert seqlen_squared_sum == 5**2 + 3**2
+
+    def test_update_from_padding_mask_matches_cu_seqlens(self):
+        padding_mask = torch.zeros((3, 16), dtype=torch.bool)
+        padding_mask[0, 10:] = True
+        padding_mask[1, 16:] = True  # full-length sample, no padding
+        padding_mask[2, 1:] = True
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        from_mask = consume_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 10, 26, 27], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == from_mask
+
+    def test_update_from_padding_mask_none_is_noop(self):
+        update_seqlen_stats_from_padding_mask(None)
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_discards_pending_updates(self):
+        # Statistics of a superseded train_step attempt or of evaluation forwards must not
+        # reach the next training consumer.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 5, 8], dtype=torch.int32))
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_then_update_counts_only_the_new_attempt(self):
+        # Evaluation (or a retried attempt) with real lengths [5, 3], then one training
+        # micro-batch with the same lengths: the consumer sees (8, 34), not (16, 68).
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        reset_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+
+    def test_two_microbatches_of_one_attempt_still_add_up(self):
+        cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == (16, 68)
+
+    def test_reset_clears_a_global_seed(self):
+        set_seqlen_stats_in_iteration(100, 10000)
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert training_module._seqlen_stats_are_global is False
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
