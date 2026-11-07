@@ -56,6 +56,8 @@ def test_attention_public_api_is_narrow():
     assert attention.__all__ == [
         "DSAIndexShareState",
         "DynamicSparseAttention",
+        "MSAIndexer",
+        "MSAttention",
         # MagiAttention is an optional core-attention backend added upstream in
         # NVIDIA/Megatron-LM#6478; both names are part of the primitive's public
         # surface, unlike the internal helpers asserted against below.

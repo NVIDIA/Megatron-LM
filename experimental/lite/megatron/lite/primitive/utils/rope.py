@@ -67,6 +67,15 @@ def _apply_rotary_pos_emb_bshd(
     return torch.cat((t, t_pass), dim=-1)
 
 
+def apply_rope_sbhd(t: Tensor, freqs: Tensor, fused: bool = False) -> Tensor:
+    """Non-interleaved RoPE on ``[S, B, H, D]``; ``fused`` uses TE's fused kernel (mcore apply_rope_fusion)."""
+    if not fused:
+        return _apply_rotary_pos_emb_bshd(t, freqs)
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
+
+    return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", interleaved=False, fused=True)
+
+
 def _get_thd_freqs_on_this_cp_rank(
     cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor, offset: int = 0
 ) -> Tensor:
