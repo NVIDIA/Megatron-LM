@@ -137,6 +137,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.config.freeze_base_model_for_mtp and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
         ):
