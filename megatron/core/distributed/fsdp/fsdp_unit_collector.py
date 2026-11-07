@@ -22,53 +22,72 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
-def _recomputed(module: nn.Module, wrapper: nn.Module | None) -> bool:
-    """Whether recomputation replays this module before the wrapper's pre_backward()."""
-    if not isinstance(wrapper, HyperConnectionHybridLayer):
-        return False
-    config = wrapper.config
-    if config.recompute_granularity != "selective" or "mhc" not in (config.recompute_modules or []):
-        return False
-    return module in (
-        getattr(wrapper.inner_layer, "input_layernorm", None),
-        getattr(wrapper.inner_layer, "pre_mlp_layernorm", None),
-    )
-
-
 class FsdpUnitCollector:
-    """Collect selected FSDP units in wrapping order, children before parents."""
+    """Collect FSDP units children before parents.
+
+    Known layers select their own inner units; other modules are traversed recursively.
+    """
 
     def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
         self._fsdp_unit_module_types = fsdp_unit_module_types
-        self._collected_units_in_preorder: dict[nn.Module, None] = {}
+        self._units: list[nn.Module] = []
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
-        """Return selected modules in reverse pre-order, including the root last."""
-        self._collected_units_in_preorder = {module: None}
-        self._visit(module, wrapper=None)
-        return list(reversed(self._collected_units_in_preorder))
-
-    def _visit(self, module: nn.Module, wrapper: nn.Module | None) -> None:
-        if self._should_shard(module, wrapper):
-            self._collected_units_in_preorder[module] = None
-
-        if isinstance(module, (ShortcutMoEBlock, HyperConnectionHybridLayer)):
-            wrapper = module
-        for child in module.children():
-            self._visit(child, wrapper)
-
-    def _should_shard(self, module: nn.Module, wrapper: nn.Module | None) -> bool:
-        """Whether this module should be an independent FSDP unit."""
-        # Replayed modules need their own hooks to gather parameters and reduce replay gradients.
-        if _recomputed(module, wrapper) and next(module.parameters(), None) is not None:
-            return True
-
+        """Return selected modules children before parents, including the root last."""
+        self._units = []
+        self._visit(module)
         if not isinstance(module, self._fsdp_unit_module_types):
-            return False
+            self._units.append(module)
+        return self._units
 
-        # ShortcutMoEBlock and mHC invoke inner-layer helpers that bypass __call__.
-        # Keep those parameters with the enclosing FSDP unit. Still visit children:
-        # routed experts run through experts(...), so they retain their own hooks.
-        if wrapper is not None and isinstance(module, (TransformerLayer, MambaLayer)):
-            return False
-        return True
+    def _visit(self, module: nn.Module) -> None:
+        if isinstance(module, HyperConnectionHybridLayer):
+            self._visit_mhc(module)
+        elif isinstance(module, ShortcutMoEBlock):
+            self._visit_shortcut(module)
+        elif isinstance(module, TransformerLayer):
+            self._visit_transformer(module)
+        elif isinstance(module, MambaLayer):
+            self._visit_mamba(module)
+        else:
+            self._visit_children(module)
+            self._collect(module)
+
+    def _collect(self, module: nn.Module) -> None:
+        if isinstance(module, self._fsdp_unit_module_types):
+            self._units.append(module)
+
+    def _visit_transformer(self, layer: TransformerLayer) -> None:
+        self._collect_routed_experts(layer)
+        self._collect(layer)
+
+    def _visit_mamba(self, layer: MambaLayer) -> None:
+        self._collect(layer)
+
+    def _visit_children(self, module: nn.Module) -> None:
+        for child in module.children():
+            self._visit(child)
+
+    def _visit_shortcut(self, block: ShortcutMoEBlock) -> None:
+        # Helpers bypass both inner layers' __call__, but experts run normally.
+        self._collect_routed_experts(block.moe_layer)
+        self._collect(block)
+
+    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> None:
+        inner_layer = mhc_layer.inner_layer
+        if isinstance(inner_layer, TransformerLayer):
+            config = mhc_layer.config
+            recompute_norms = config.recompute_granularity == "selective" and "mhc" in (
+                config.recompute_modules or []
+            )
+            if recompute_norms:
+                # Early replay requires parameterized norms to have their own hooks.
+                for norm in (inner_layer.input_layernorm, inner_layer.pre_mlp_layernorm):
+                    if next(norm.parameters(), None) is not None:
+                        self._units.append(norm)
+            self._collect_routed_experts(inner_layer)
+        self._collect(mhc_layer)
+
+    def _collect_routed_experts(self, layer: TransformerLayer) -> None:
+        if layer.is_moe_layer:
+            self._units.append(layer.mlp.experts)

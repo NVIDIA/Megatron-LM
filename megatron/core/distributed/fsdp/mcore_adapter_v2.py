@@ -146,11 +146,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer and Mamba layers, shortcut MoE blocks, mHC wrappers, and
-                TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
-                replaces these defaults. Expert containers use the expert-DP mesh;
-                custom lists must include them when expert and dense sharding settings
-                differ.
+                unspecified, transformer and Mamba layers, shortcut MoE blocks, and
+                mHC wrappers are used. An explicit list replaces these defaults.
+                Routed experts always receive independent units on the expert-DP mesh.
+                Parameterized mHC replay modules also receive independent units so
+                their hooks run during replay. Known layers own their remaining
+                submodules; configured types are matched during traversal of other
+                containers.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -190,8 +192,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 MambaLayer,
                 ShortcutMoEBlock,
                 HyperConnectionHybridLayer,
-                TEGroupedMLP,
-                SequentialMLP,
             ]
 
         log_single_rank(
