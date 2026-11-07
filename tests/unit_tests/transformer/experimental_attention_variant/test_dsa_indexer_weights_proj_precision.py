@@ -598,7 +598,7 @@ def test_weights_projection_gradient_accumulation_and_deferred_wgrad():
 
 
 @pytest.mark.internal
-def test_weights_projection_deferred_fused_wgrad_preserves_dummy_for_hook():
+def test_weights_projection_deferred_fused_wgrad_calls_hook_without_grad():
     _skip_if_precision_unsupported("bf16")
     config = _precision_config("bf16", delay_wgrad_compute=True, gradient_accumulation_fusion=True)
     object.__setattr__(config, "disable_parameter_transpose_cache", True)
@@ -611,9 +611,8 @@ def test_weights_projection_deferred_fused_wgrad_preserves_dummy_for_hook():
     hook_calls = []
 
     def overlap_grad_reduce_hook():
-        assert projection.weight.grad is not None
-        hook_calls.append(projection.weight.grad.clone())
-        projection.weight.grad = None
+        assert projection.weight.grad is None
+        hook_calls.append(projection.weight.grad_added_to_main_grad)
 
     projection.register_wgrad_accumulation_and_reduce_hooks(overlap_grad_reduce_hook)
     x = torch.randn(
@@ -626,7 +625,7 @@ def test_weights_projection_deferred_fused_wgrad_preserves_dummy_for_hook():
         projection.weight.main_grad, torch.zeros_like(projection.weight.main_grad)
     )
     assert not projection.weight.grad_added_to_main_grad
-    torch.testing.assert_close(projection.weight.grad, torch.zeros_like(projection.weight))
+    assert projection.weight.grad is None
     assert hook_calls == []
 
     projection.backward_dw()
@@ -637,12 +636,12 @@ def test_weights_projection_deferred_fused_wgrad_preserves_dummy_for_hook():
     torch.testing.assert_close(projection.weight.main_grad, expected_wgrad)
     assert projection.weight.grad_added_to_main_grad
     assert len(hook_calls) == 1
-    torch.testing.assert_close(hook_calls[0], torch.zeros_like(projection.weight))
+    assert hook_calls[0] is True
     assert projection.weight.grad is None
 
 
 @pytest.mark.internal
-def test_weights_projection_zeroes_dummy_wgrad_when_requested():
+def test_weights_projection_returns_none_wgrad_when_requested():
     _skip_if_precision_unsupported("bf16")
     config = _precision_config("bf16", gradient_accumulation_fusion=True)
     config = dataclasses.replace(config, disable_parameter_transpose_cache=True)
@@ -663,7 +662,7 @@ def test_weights_projection_zeroes_dummy_wgrad_when_requested():
     )
     torch.testing.assert_close(projection.weight.main_grad, expected_wgrad)
     assert projection.weight.grad_added_to_main_grad
-    torch.testing.assert_close(projection.weight.grad, torch.zeros_like(projection.weight))
+    assert projection.weight.grad is None
 
 
 @pytest.mark.internal
