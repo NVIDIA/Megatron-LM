@@ -5,6 +5,7 @@ import contextlib
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
@@ -235,6 +236,43 @@ def test_checkpoint():
     assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
 
     Utils.destroy_model_parallel()
+
+
+def test_checkpoint_distributes_saved_input_over_the_given_tp_group():
+    """``distribute_saved_activations`` splits and regathers the saved input over ``tp_group``,
+    not over the global tensor-parallel group."""
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("needs an even world size of at least 4")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        # The global TP groups are {0, 1}, {2, 3}, ...; the module's TP group is the
+        # data-parallel group {0, 2, ...} or {1, 3, ...}. The input is replicated over the
+        # module's group only, so a split and gather over the global group would restore a
+        # mix of two different inputs.
+        tp_group = parallel_state.get_data_parallel_group()
+        assert tp_group is not parallel_state.get_tensor_model_parallel_group()
+        group_id = min(torch.distributed.get_process_group_ranks(tp_group))
+        full = torch.arange(48.0, device="cuda").view(8, 6) + 100.0 * group_id
+        scale = torch.full((8, 6), 2.0, device="cuda")
+        recomputed_inputs = []
+
+        def forward(x, y):
+            if torch.is_grad_enabled():
+                # Only the recomputation in backward runs with grad enabled.
+                recomputed_inputs.append(x.detach().clone())
+            return x * x * y
+
+        x = full.clone().requires_grad_(True)
+        output = checkpoint(forward, True, x, scale, tp_group=tp_group)
+        assert x.data.numel() == full.numel() // tp_group.size()
+        output.sum().backward()
+
+        assert torch.equal(output, full * full * scale)
+        assert len(recomputed_inputs) == 1
+        assert torch.equal(recomputed_inputs[0], full)
+        assert torch.equal(x.grad, 2 * full * scale)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_checkpoint_without_output():
