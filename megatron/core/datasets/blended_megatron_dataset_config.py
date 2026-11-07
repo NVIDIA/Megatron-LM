@@ -49,7 +49,16 @@ class BlendedMegatronDatasetConfig:
     """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
-    """Whether to mmap the .bin files or use file pointers."""
+    """Whether to mmap the .bin files or use file pointers.
+
+       Set to False for object storage backends (e.g. S3), where mmap is not supported.
+       It can also mitigate mmap-related ``PermissionError: [Errno 1] Operation not
+       permitted`` (EPERM) during construction of large dataset blends. A WekaFS report
+       in NVIDIA-NeMo/Megatron-Bridge#3968 suspected a filesystem-client mmap limit;
+       that cause was not established. File-pointer reads remove the ``.bin`` mapping
+       per dataset; ``.idx`` remains mapped. Measure the throughput impact on your storage.
+       See ``--no-mmap-bin-files`` in docs/user-guide/data-loading.md.
+    """
 
     tokenizer: Optional[MegatronTokenizerBase] = None
     """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
