@@ -615,9 +615,9 @@ def test_the_cli_applies_the_msc_policy_it_parses(msc_installed, argv, enabled):
     assert not hasattr(checkpoint_config_from_args(args), "enable_msc")
 
 
-def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_installed):
+def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_installed, run_config):
     """A script that enables MSC itself (through the helper, before any path is read) keeps it on
-    through pretrain()'s fault-tolerance setup, which reads the registered arguments instead of
+    through pretrain()'s fault-tolerance setup, which reads the registered config instead of
     re-parsing the command line (that used to re-apply the parser's default and switch MSC off);
     the helper turns it off again for a run without MSC, silently."""
     from megatron.training import ft_integration

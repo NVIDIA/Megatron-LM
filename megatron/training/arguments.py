@@ -65,7 +65,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
-    parser = _add_autoresume_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
@@ -79,7 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_transformer_engine_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_inprocess_restart_args(parser)
-    parser = _add_ft_package_args(parser)
+    parser = _add_fault_tolerance_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -2531,19 +2530,12 @@ def _add_inprocess_restart_args(parser):
                        help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
 
-def _add_ft_package_args(parser):
-    group = parser.add_argument_group(title='ft_package')
-    group.add_argument('--enable-ft-package', action='store_true',
-                       help='If set, Fault Tolerance package is enabled. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--calc-ft-timeouts', action='store_true',
-                       help='If set, FT package will try to automatically compute the timeouts. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
-                       help='Number of warmup iterations before monitoring step section and '
-                       'out-of-section timeouts. The first N iterations are excluded from '
-                       'timeout monitoring as they can be significantly slower than steady-state. '
-                       'Default: 5. Note: This feature is for Nvidia internal use only.')
+def _add_fault_tolerance_args(parser):
+    from megatron.training.config import FaultToleranceConfig
+
+    ArgumentGroupFactory(FaultToleranceConfig, exclude=["fault_injector"]).build_group(
+        parser, "fault tolerance"
+    )
     return parser
 
 
@@ -3213,18 +3205,6 @@ def _add_data_args(parser):
                        help='FIM PAD token')
     group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
                        help='FIM EOD token')
-    return parser
-
-
-def _add_autoresume_args(parser):
-    group = parser.add_argument_group(title='autoresume')
-
-    group.add_argument('--adlr-autoresume', action='store_true',
-                       help='Enable autoresume on adlr cluster.')
-    group.add_argument('--adlr-autoresume-interval', type=int, default=1000,
-                       help='Intervals over which check for autoresume'
-                       'termination signal')
-
     return parser
 
 

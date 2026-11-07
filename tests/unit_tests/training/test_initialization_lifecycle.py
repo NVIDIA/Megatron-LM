@@ -396,7 +396,12 @@ def test_runtime_service_order_and_microbatch_inputs(
         "_set_telemetry",
     ):
 
-        if name == "_build_tokenizer":
+        if name == "_set_adlr_autoresume":
+
+            def record(service=name):
+                calls.append(service)
+
+        elif name == "_build_tokenizer":
 
             def record(_, received_args, service=name, **kwargs):
                 assert received_args is args

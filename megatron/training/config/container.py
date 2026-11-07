@@ -28,6 +28,7 @@ from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
+    FaultToleranceConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
@@ -338,6 +339,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -431,6 +433,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
         self._validate_checkpoint()
+        if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
+            raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
         self.optimizer.validate_run(
