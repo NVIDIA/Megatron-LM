@@ -1831,6 +1831,56 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def validate_flashinfer_mxfp8_expert_shapes(self) -> None:
+        """Check that each rank's expert weights suit the FlashInfer MXFP8 MoE kernels.
+
+        Both FlashInfer MXFP8 paths run each rank's [E, F / ETP, H] FC1 and [E, H, F / ETP] FC2
+        weights. The FFN F is sharded over the expert tensor-parallel ranks; the hidden (or
+        latent) dimension H is not. The CUTLASS path (ClampedRelu2 experts) packs the weights as
+        they are and needs both dimensions divisible by 128. The TRT-LLM routed path (unclamped
+        squared-ReLU experts) zero-pads both to multiples of 128, but FlashInfer 0.7.2's batched
+        GEMMs have no kernel config when H pads to 128 (the first forward fails with "No valid
+        config found for the given problem shape"). __post_init__ runs this check, and the
+        inference experts run it again when built, for a config whose parallel layout was
+        changed after construction (such as an RL inference model's).
+
+        Raises:
+            ValueError: If a FlashInfer MXFP8 path is configured and a rank's expert shard does
+                not suit its kernels.
+        """
+        if not (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            and self.fp8
+            and self.fp8_recipe == Fp8Recipe.mxfp8
+        ):
+            return
+        expert_hidden = (
+            self.moe_latent_size if self.moe_latent_size is not None else self.hidden_size
+        )
+        expert_ffn = (
+            self.moe_ffn_hidden_size
+            if self.moe_ffn_hidden_size is not None
+            else self.ffn_hidden_size
+        )
+        etp = self.expert_tensor_parallel_size
+        if self.activation_func_tanh_clamp_scale is not None:
+            if expert_hidden % 128 or expert_ffn % (128 * etp):
+                raise ValueError(
+                    "FlashInfer CUTLASS MXFP8 requires expert hidden and per-rank FFN dimensions "
+                    f"divisible by 128; got hidden {expert_hidden} and FFN {expert_ffn} split "
+                    f"over {etp} expert tensor-parallel ranks (the FFN is moe_ffn_hidden_size, "
+                    "or ffn_hidden_size when that is unset)."
+                )
+        elif expert_hidden <= 128:
+            # Seen on GB200 with FlashInfer 0.7.2.post1 (FFN 128 and 256);
+            # test_flashinfer_mxfp8.py fails once FlashInfer serves it.
+            raise ValueError(
+                "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel for an expert hidden size that "
+                f"pads to 128; got hidden {expert_hidden} (moe_latent_size, or hidden_size when "
+                "that is unset). Use an expert hidden size above 128, or "
+                "inference_grouped_gemm_backend 'torch' or 'vllm'."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2339,22 +2389,6 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 if not math.isfinite(self.activation_func_tanh_clamp_scale):
                     raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
-                if mxfp8_enabled:
-                    expert_hidden = (
-                        self.moe_latent_size
-                        if self.moe_latent_size is not None
-                        else self.hidden_size
-                    )
-                    expert_ffn = (
-                        self.moe_ffn_hidden_size
-                        if self.moe_ffn_hidden_size is not None
-                        else self.ffn_hidden_size
-                    )
-                    if expert_hidden % 128 or expert_ffn % 128:
-                        raise ValueError(
-                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
-                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
-                        )
                 if self.add_bias_linear:
                     raise ValueError(
                         "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
@@ -2376,6 +2410,7 @@ class TransformerConfig(ModelParallelConfig):
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
                     )
+                self.validate_flashinfer_mxfp8_expert_shapes()
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:

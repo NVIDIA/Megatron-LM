@@ -547,6 +547,13 @@ def flashinfer_routed_mxfp8_moe(
         raise ValueError("FC2 output size must match the model hidden size")
     if fc2_weight.logical_cols != fc1_weight.logical_rows:
         raise ValueError("FC2 K size must match the FC1 output size")
+    if fc1_weight.padded_cols == 128:
+        # FlashInfer 0.7.2's TRT-LLM batched GEMMs have no config for this hidden size;
+        # TransformerConfig.validate_flashinfer_mxfp8_expert_shapes rejects such models.
+        raise ValueError(
+            "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel for an expert hidden size that "
+            f"pads to 128; got hidden {fc1_weight.logical_cols}."
+        )
     if probabilities.dtype != torch.float32:
         raise TypeError(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
