@@ -11,6 +11,7 @@ from torch.distributed.tensor import DTensor, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     microbatch,
@@ -238,7 +239,8 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-def test_frozen_weights_without_input_gradients(distributed_setup):
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_frozen_weights_without_input_gradients(distributed_setup, caller_managed_grad_sync):
     """Keep frozen weights available until internal backward has consumed them."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -250,7 +252,12 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
     model = nn.Sequential(trainable_linear, frozen_linear).to(device)
     nn.init.ones_(frozen_linear.weight)
     frozen_weight = frozen_linear.weight
-    with fully_shard_context(FsdpContext(device=device)) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+        )
+    ) as context:
         fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
@@ -268,6 +275,9 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
             with microbatch(context, is_last=is_last):
                 model(torch.ones(2, 4, device=device)).sum().backward()
             assert frozen_weight.untyped_storage().nbytes() == 0
+    if caller_managed_grad_sync:
+        context.post_backward()
+        context.finish_grad_sync()
     torch.testing.assert_close(
         trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
     )

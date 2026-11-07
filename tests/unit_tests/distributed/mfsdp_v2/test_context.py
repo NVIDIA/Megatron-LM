@@ -30,6 +30,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
     ExecutionEvent,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 
 
 class NestedModel(nn.Module):
@@ -92,7 +93,8 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-def test_recorded_execution_order(distributed_setup):
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_recorded_execution_order(distributed_setup, caller_managed_grad_sync):
     """Recorded orders follow execution when submodules are registered in reverse."""
 
     class Model(nn.Module):
@@ -109,7 +111,13 @@ def test_recorded_execution_order(distributed_setup):
     model = Model().to(device)
     unsharded_weights = {layer: layer.weight for layer in model.children()}
     with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(
+                prefetch_order=PrefetchOrder.RECORDED,
+                caller_managed_grad_sync=caller_managed_grad_sync,
+            ),
+        )
     ) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
@@ -117,11 +125,25 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
+    context.finish_grad_sync()
+    assert context.is_recording_execution_order
     model(inputs).sum().backward()
+    if caller_managed_grad_sync:
+        assert context.is_recording_execution_order
+        context.post_backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
     ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
+
+    recorded_events = list(context.execution_order)
+    model.eval()
+    with torch.no_grad():
+        for _ in range(2):
+            model(inputs)
+    assert list(context.execution_order) == recorded_events
+    assert context.execution_order.position == 0
+    model.train()
 
     def check_prefetched(layer, _args):
         storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
@@ -131,8 +153,49 @@ def test_recorded_execution_order(distributed_setup):
         # Check before FSDP's own hooks, so on-demand unsharding cannot satisfy the assertion.
         layer.register_forward_pre_hook(check_prefetched, prepend=True)
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
-    model.zero_grad(set_to_none=True)
-    model(inputs).sum().backward()
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        output = model(inputs)
+        if caller_managed_grad_sync:
+            with pytest.raises(RuntimeError, match="before the recorded order was complete"):
+                context.post_backward()
+        output.sum().backward()
+        if caller_managed_grad_sync:
+            context.post_backward()
+        context.finish_grad_sync()
+        assert context.execution_order.position == 0
+
+
+def test_combined_hooks_record_repeated_owner_calls(distributed_setup):
+    """EP-overlap hooks record every owner demand and replay across child phases."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(
+                prefetch_order=PrefetchOrder.RECORDED, caller_managed_grad_sync=True
+            ),
+        )
+    ) as context:
+        fully_shard(
+            model, mesh, _default_placements(), schedule_policy=SchedulePolicy(register_hooks=False)
+        )
+    register_combined_1f1b_hooks(model)
+    expected = [
+        ExecutionEvent(model, phase)
+        for phase in (Phase.FORWARD, Phase.FORWARD, Phase.BACKWARD, Phase.BACKWARD)
+    ]
+    for iteration in range(3):
+        model.zero_grad(set_to_none=True)
+        model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+        assert context.is_recording_execution_order is (iteration == 0)
+        context.run_delayed_post_backward_callbacks()
+        context.post_backward()
+        context.finish_grad_sync()
+        assert list(context.execution_order) == expected
+        assert context.execution_order.position == 0
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):
@@ -289,6 +352,7 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
 
     if caller_managed_grad_sync:
         finish_grad_sync.assert_not_called()
+        context.post_backward()
         context.finish_grad_sync()
     finish_grad_sync.assert_called_once_with()
 

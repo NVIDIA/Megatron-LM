@@ -14,12 +14,20 @@
 
 """Shared runtime configuration for Megatron-FSDP contexts."""
 
+import enum
 from dataclasses import dataclass
+
+
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
 
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication and gradient synchronization for an FSDP context.
+    """Configure communication, prefetch, and gradient synchronization for an FSDP context.
 
     Attributes:
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
@@ -33,9 +41,16 @@ class RuntimePolicy:
             while retaining automatic weight cleanup. The caller must call
             finish_grad_sync() after all backward work, including delayed weight
             gradients, and before reading or modifying gradients.
+        prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
+            registration order. ``RECORDED`` gathers parameters on demand and records
+            module calls until ``post_backward()`` completes the schedule. Caller-managed
+            schedules call it once after all microbatch backwards. Subsequent schedules
+            must repeat the trace consistently across data-parallel ranks.
+            Discard the context if recording fails.
     """
 
     use_symmetric_memory: bool = False
     overlap_allgather_reduction: bool = True
     overlap_outer_communication: bool = False
     caller_managed_grad_sync: bool = False
+    prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION

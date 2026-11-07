@@ -2554,6 +2554,7 @@ def wrap_model_chunks_with_ddp(
         fully_shard_context(
             FsdpContext(
                 runtime_policy=RuntimePolicy(
+                    prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(config),
                     use_symmetric_memory=ddp_config.nccl_ub,
                     caller_managed_grad_sync=True,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
