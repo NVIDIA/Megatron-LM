@@ -363,11 +363,16 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
-    if dim != -1 and dim != input.ndim - 1:
+    # As in torch, a 0-dim input is one row of one element and its last dim is 0 (or -1).
+    if dim != -1 and dim != max(input.ndim, 1) - 1:
         raise ValueError("This implementation only supports log_softmax along the last dimension")
-    # Flatten all dimensions except the last one
     original_shape = input.shape
-    input_2d = input.reshape(-1, input.shape[-1])
+    if input.numel() == 0:
+        # No rows, or rows of no columns: nothing to normalize. Return the empty result torch
+        # returns; reshape(-1, 0) cannot infer the row count of an empty last dim.
+        return torch.empty_like(input, memory_format=torch.contiguous_format)
+    # Flatten all dimensions except the last one
+    input_2d = input.reshape(-1, input.shape[-1] if input.ndim > 0 else 1)
     input_2d = input_2d.contiguous()
 
     n_rows, n_cols = input_2d.shape
