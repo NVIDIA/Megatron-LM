@@ -337,6 +337,9 @@ def setup_model_and_optimizer(
         # get_model reads the layer-wise flag from the run config to tag params for DDP
         # buffer routing, so the run config must be in sync before the model is built.
         _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
+        ddp_config = get_megatron_ddp_config(mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2)
+        # Checkpoint loading must use the same DDP settings as the model wrapper.
+        get_run_config().ddp = ddp_config
         model = get_model(
             partial(
                 initialize_fn,
@@ -364,9 +367,7 @@ def setup_model_and_optimizer(
                 sequence_parallel=tp > 1 and ep > 1,
                 bf16=bf16,
             ),
-            ddp_config=get_megatron_ddp_config(
-                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
-            ),
+            ddp_config=ddp_config,
         )
 
     get_run_config().model.transformer = unwrap_model(model)[0].config
