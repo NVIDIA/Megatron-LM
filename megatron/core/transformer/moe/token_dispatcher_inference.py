@@ -338,7 +338,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
         """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
-        unpermute output directly into it, avoiding a copy before RSV."""
+        unpermute output directly into it, avoiding a copy before RSV.
+        """
         return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
 
     @classmethod

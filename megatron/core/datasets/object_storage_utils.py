@@ -22,7 +22,6 @@ class ObjectStorageConfig:
     """Config when the data (.bin) file and the index (.idx) file are in object storage
 
     Attributes:
-
         path_to_idx_cache (str): The local directory where we will store the index (.idx) file
 
         bin_chunk_nbytes (int): If the number of bytes is too small, then we send a request to S3

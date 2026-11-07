@@ -13,9 +13,7 @@ class BaseInferenceContext(abc.ABC):
     """
 
     def __init__(self, inference_config: InferenceConfig):
-        """
-        Args:
-        """
+        """Construct the base inference context."""
         self.config = inference_config
 
     @abc.abstractmethod

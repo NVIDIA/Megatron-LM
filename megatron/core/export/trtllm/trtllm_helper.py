@@ -562,7 +562,7 @@ class TRTLLMHelper:
         Args:
             engine_dir (str): The file path to save the engine
             trtllm_model_weights (dict): The TRTLLM converted model weights dict
-            trtllm_model_config : The TRTLLM Config
+            trtllm_model_config: The TRTLLM Config
             max_input_len (int, optional): Max input length. Defaults to 1024.
             max_output_len (int, optional): Max output length. Defaults to 1024.
             max_batch_size (int, optional): Max batch size. Defaults to 4.

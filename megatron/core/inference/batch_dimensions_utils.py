@@ -30,13 +30,12 @@ class InferenceBatchDimensions:
     """Batch dimensions for dynamic inference.
 
     Attributes:
-        token_count : number of total input tokens
-        prefill_req_count : number of prefill requests
-        decode_req_count : number of decode requests
+        token_count: Number of total input tokens.
+        prefill_req_count: Number of prefill requests.
+        decode_req_count: Number of decode requests.
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
-
     """
 
     token_count: int = 0
@@ -795,6 +794,7 @@ class CUDAGraphBatchDimensionBuilder:
                 all-reduce-max so all ranks select the same CUDA graph. Set to False when the
                 dispatcher handles per-rank token variation internally (e.g. AGV/RSV in the NVLS
                 path) and external EP sync is not needed.
+
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """

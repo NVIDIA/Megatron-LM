@@ -37,7 +37,7 @@ by copying the corresponding model param's metadata and prefixing its ``key``
 with ``optimizer.state.<state>.`` (see
 ``DistributedOptimizer.sharded_param_state_*``). Those entries therefore carry
 the same ``decoder.layers.<i>.`` keys and sharding as the model tensors, so
-:func:`retarget_sharded_state_dict_to_gpt_checkpoint` rewrites them onto the GPT
+{func}`retarget_sharded_state_dict_to_gpt_checkpoint` rewrites them onto the GPT
 checkpoint identically -- optimizer moments and fp32 master params for
 attention/MLP layers load from the GPT run, while fresh layers (e.g. Mamba)
 keep their freshly initialized optimizer state via ``LocalNonpersistentObject``.
@@ -223,7 +223,7 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
         sharded_state_dict: one model chunk's sharded state dict (as produced by
             ``model.sharded_state_dict()``) or the matching optimizer sharded
             state dict.
-        layer_maps: maps from :func:`gpt_compatible_layer_maps` derived from
+        layer_maps: maps from {func}`gpt_compatible_layer_maps` derived from
             the same pattern the model was built with.
     """
 

@@ -140,7 +140,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         the deprecated ``hybrid_context_parallel`` alias (warned about, an error together with
         ``dynamic_context_parallel``, not rewritten) and the SBHD / dynamic-CP exclusion.
         ``validate()`` runs them first; a caller that checks a config before its tokenizer exists
-        runs this alone."""
+        runs this alone.
+        """
         super().validate_without_tokenizer()
 
         assert self.reset_position_ids is not None, "reset_position_ids must be defined."
@@ -168,7 +169,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     @property
     def token_dtype_code(self) -> Optional[int]:
         """The dtype code for the token ids, 4 for int32 and 8 for uint16, from the tokenizer's
-        vocabulary size; None without a tokenizer or a vocabulary size."""
+        vocabulary size; None without a tokenizer or a vocabulary size.
+        """
         vocab_size = None if self.tokenizer is None else self.tokenizer.vocab_size
         if vocab_size is None:
             return None

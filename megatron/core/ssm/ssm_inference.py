@@ -134,7 +134,8 @@ def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMCh
 
 class SSMDynamicInferenceMixin:
     """Mixin providing the shared decode/prefill orchestration for the dynamic
-    inference engine. Concrete mixers implement the two `ssm_*` hooks below."""
+    inference engine. Concrete mixers implement the two `ssm_*` hooks below.
+    """
 
     # ------------------------------------------------------------------
     # Hooks implemented by concrete mixers.

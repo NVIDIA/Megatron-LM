@@ -176,7 +176,8 @@ class BlockOverflowError(ContextOverflowError):
 
 class ActiveRequestCountOverflowError(ContextOverflowError):
     '''Used when `initialize_attention_state()` is called with
-    `num_warmup_requests > max_requests.'''
+    `num_warmup_requests > max_requests.
+    '''
 
     def __init__(self, max_request_count, active_request_count):
         assert active_request_count > max_request_count
@@ -189,7 +190,8 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
 
 class TensorStateDeallocatedError(ContextOverflowError):
     """Context's tensor state is currently deallocated, such as when the engine
-    has been suspended."""
+    has been suspended.
+    """
 
     pass
 
@@ -2325,6 +2327,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     ) -> Tuple[Tensor, Tensor]:
         """
         Apply rotary embedding to query and key tensors using flashinfer's fused rope.
+
         Args:
             query (Tensor): Query tensor.
             key (Tensor): Key tensor.
@@ -5767,7 +5770,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         unsqueezed to [sum(seq_img_i), 1, hidden]. The downstream consumer
         does ``permute(1, 0, 2).reshape(-1, hidden)`` to yield the flat
         [total_image_tokens, hidden] array indexed by
-        :meth:`current_image_token_mask`.
+        {meth}`current_image_token_mask`.
 
         Returns tensor of shape [total_image_tokens, 1, hidden] or None.
         """

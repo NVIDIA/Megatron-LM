@@ -145,8 +145,9 @@ def distribute_shards_to_ranks(
         num_ranks (int): number of ranks in the parallelization group
         cross_parallelization_group_loads (Set[T]): Shards to load that are not in the main replica
 
-    Returns (Dict[T, int]): assignment of shard to rank (which rank should do the work
-        to achieve maximal uniformity)
+    Returns:
+        dict[T, int]: assignment of shard to rank (which rank should do the work to achieve maximal
+            uniformity)
     """
     shard_to_ranks = {k: tuple(v) for k, v in shard_to_ranks.items()}
     shard_to_saving_rank = {}
@@ -447,9 +448,9 @@ def determine_main_replica_uniform_distribution(
             (and ``pg_cache_path`` set), read the cache and skip the collective.
             Defaults to False.
 
-    Returns (ShardDistribution, optional): distribution that can be used to apply the
-        parallelization. Returns None if the process_group is trivial (1 rank)
-
+    Returns:
+        ShardDistribution | None: distribution that can be used to apply the parallelization.
+            Returns None if the process_group is trivial (1 rank)
     """
     from ..utils import get_pg_size
 
@@ -635,7 +636,6 @@ def exchange_loaded_tensors_gather_object(
         Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
             needed by this rank to load a given state dict. Includes
             previously loaded tensors (from `loaded_tensors` input)
-
     """
     all_loaded_tensors_list = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(
@@ -834,7 +834,8 @@ def exchange_loaded_tensors_broadcast_quantized(
     every rank ends up with the loading rank's encoding and no high-precision copy is created.
     Other tensors are exchanged as by `exchange_loaded_tensors_broadcast`.
 
-    Args: see `exchange_loaded_tensors_broadcast`.
+    Args:
+        See `exchange_loaded_tensors_broadcast`.
     """
     from ..fp8_utils import is_float8tensor  # Avoid circular import
 

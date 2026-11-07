@@ -245,7 +245,7 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
 
 
 def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
+    """List form of {func}`copy_tensor_to_quantized_param`, for a whole bucket of params.
 
     Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
     resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
@@ -1060,7 +1060,6 @@ if HAVE_TE:
 
         Returns:
             GPTModel: The same model with wrapped linear layers (modified in-place).
-
         """
         assert Fp8Padding and Fp8Unpadding, "TE version does not have FP8 padding functions"
         # Find and wrap all TE linear layers

@@ -115,7 +115,8 @@ def copy_gtp_attributes(destination, source):
     """Copy GTP metadata onto a param view/copy (e.g. an optimizer's master or shard param):
     dedup tags for ``param_is_not_gtp_duplicate``, the checkpoint replica group, and
     ``pad_length``/``group`` for ``gtp_local_pad_zero_count``. The latter two must both be
-    present or padding exclusion silently returns 0."""
+    present or padding exclusion silently returns 0.
+    """
     for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length", "group"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
@@ -267,7 +268,8 @@ def _initialize_affine_weight_cpu(
 
     Build the master weight on all processes and scatter
     the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
-    rank's GTP rows as well, so the initialization matches a run with GTP off."""
+    rank's GTP rows as well, so the initialization matches a run with GTP off.
+    """
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -553,7 +555,8 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     Conceptually this op is the same as torch.nn.functional.linear with
     weight.requires_grad==False, but in experiments they are not identical
-    mathematically."""
+    mathematically.
+    """
 
     @staticmethod
     @custom_fwd
@@ -647,40 +650,28 @@ def linear_with_frozen_weight(
     weight gradient allreduce.
 
     Args:
-
-    input (torch.Tensor required): input like torch.nn.functional.linear
-
-    weight (torch.Tensor required): weight like torch.nn.functional.linear
-
-    bias (torch.Tensor optional): bias like torch.nn.functional.linear
-
-    gradient_accumulation_fusion (bool required): dummy argument, used to
-    keep the API unified between all forward implementation functions.
-
-    allreduce_dgrad (bool, required): Do the allreduce of input gradients.
-        Here, async and sync allreduce are the same. If sequence_parallel is
-        True, this must be False, as no all reduce is performed.
-
-    sequence_parallel (bool required): Indicates that sequence
-        parallelism is used and thus in the forward pass the input is
-        all gathered, and the backward pass the input gradients are
-        reduce scattered.
-
-    tp_group (torch.distributed.ProcessGroup): The process group to use for tensor
-                                                       parallel operations.
-
-    grad_output_buffer (List[torch.Tensor] optional): dummy argument, used to
-    keep the API unified between all forward implementation functions.
-
-    wgrad_deferral_limit (int optional): dummy argument, used to
-    keep the API unified between all forward implementation functions.
-
-    gtp_remat_size (int): GTP shard count. When > 1 the weight is GTP-sharded and must be
-    all-gathered to its full shape before the matmul, mirroring the trainable path.
-    Defaults to 1 (no-op) for the common non-GTP / non-sharded case.
-
-    output_dtype (torch.dtype optional): Optional GEMM output dtype. A dtype different from
-        the input dtype requires Transformer Engine ``general_gemm``.
+        input (torch.Tensor): Required. Input like `torch.nn.functional.linear`.
+        weight (torch.Tensor): Required. Weight like `torch.nn.functional.linear`.
+        bias (torch.Tensor | None): Optional. Bias like `torch.nn.functional.linear`.
+        gradient_accumulation_fusion (bool): Required. Dummy argument, used to keep the API unified
+            between all forward implementation functions.
+        allreduce_dgrad (bool): Required. Do the allreduce of input gradients. Here, async and sync
+            allreduce are the same. If `sequence_parallel` is True, this must be False, as no all
+            reduce is performed.
+        sequence_parallel (bool): Required. Indicates that sequence parallelism is used and thus in
+            the forward pass the input is all gathered, and the backward pass the input gradients
+            are reduce scattered.
+        tp_group (torch.distributed.ProcessGroup | None): The process group to use for
+            tensor-parallel operations.
+        grad_output_buffer (list[torch.Tensor] | None): Optional. Dummy argument, used to keep the
+            API unified between all forward implementation functions.
+        wgrad_deferral_limit (None): Optional. Dummy argument, used to keep the API unified between
+            all forward implementation functions.
+        gtp_remat_size (int): GTP shard count. When > 1 the weight is GTP-sharded and must be
+            all-gathered to its full shape before the matmul, mirroring the trainable path. Defaults
+            to 1 (no-op) for the common non-GTP / non-sharded case.
+        output_dtype (torch.dtype | None): Optional. GEMM output dtype. A dtype different from the
+            input dtype requires Transformer Engine ``general_gemm``.
     """
 
     assert grad_output_buffer is None, (
@@ -1379,7 +1370,6 @@ class ColumnParallelLinear(torch.nn.Module):
         Returns:
             - output
             - bias
-
         """
         if weight is None:
             if self.weight is None:
@@ -1561,7 +1551,6 @@ class RowParallelLinear(torch.nn.Module):
             Communication buffer name. Not used in non-Transformer-Engine modules.
         config:
             ModelParallelConfig object
-
     """
 
     def __init__(

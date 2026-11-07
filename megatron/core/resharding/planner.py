@@ -940,7 +940,7 @@ def build_centralized_reshard_plan(
     dst_rank_offset: int = 0,
     execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
-    """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
+    """Deprecated compatibility wrapper for {func}`build_local_reshard_plan`."""
     warnings.warn(
         "build_centralized_reshard_plan is deprecated; use build_local_reshard_plan instead.",
         DeprecationWarning,

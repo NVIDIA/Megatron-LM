@@ -26,7 +26,6 @@ class TensorPointerExtractor:
             int: Memory address of the tensor data
 
         Examples:
-
             >>> import torch
 
             >>> t = torch.zeros(100, device='cuda')

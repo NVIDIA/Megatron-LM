@@ -10,7 +10,8 @@ from megatron.core.transformer import TransformerConfig
 @dataclass
 class AttentionConfig:
     """Configuration parameters for the self-attention part of a single transformer
-    block in a heterogeneous transformer."""
+    block in a heterogeneous transformer.
+    """
 
     no_op: bool = False
     """Whether this is a no-op operation."""
@@ -59,7 +60,8 @@ class AttentionConfig:
 @dataclass
 class MLPConfig:
     """Configuration parameters for the MLP part of a single transformer
-    block in a heterogeneous transformer."""
+    block in a heterogeneous transformer.
+    """
 
     no_op: bool = False
     """Whether this is a no-op operation."""

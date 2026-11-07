@@ -168,7 +168,8 @@ def tie_word_embeddings_state_dict(
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
-    Returns: None, acts in-place
+    Returns:
+        None: acts in-place
     """
     mtp_word_emb_replica_id = (
         1,  # copy of embedding in pre processing stage
@@ -203,7 +204,8 @@ def tie_output_layer_state_dict(
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
-    Returns: None, acts in-place
+    Returns:
+        None: acts in-place
     """
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage
@@ -298,6 +300,7 @@ def roll_tensor(
                               shifts=-1; "zigzag" retains the legacy rolling paths.
         fill_value: Value used outside the same real document in the contiguous path.
                     Other layouts require the default zero fill.
+
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """

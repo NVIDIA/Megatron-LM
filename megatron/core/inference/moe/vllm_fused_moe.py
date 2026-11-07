@@ -317,7 +317,8 @@ class VllmFusedMoeBuffers:
     @classmethod
     def get(cls, name: str, shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
         """Return a view of the persistent buffer, or torch.empty when not allocated
-        or the request does not fit (different dtype/device or larger than sized)."""
+        or the request does not fit (different dtype/device or larger than sized).
+        """
         if cls._buffers is not None:
             buf = cls._buffers.get(name)
             numel = 1

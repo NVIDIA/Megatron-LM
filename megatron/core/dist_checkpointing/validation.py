@@ -261,7 +261,6 @@ def _determine_missing_and_unexpected_keys(
         Tuple[Set[str], Set[str]]: missing and unexpected keys. Missing keys are equal
             on all ranks, unexpected keys might differ across ranks. If passed
             `global_metadata` is empty, returned missing keys are empty as well.
-
     """
     local_accessed_keys = set(sh_base.key for sh_base in local_metadata)
     ckpt_keys = set(sh_base.key for sh_base in ckpt_sharded_metadata.values())
@@ -497,8 +496,10 @@ def determine_global_metadata(
 
 def _compute_file_hash(file_path: str) -> str:
     """Return the SHA-256 hex digest of `file_path`, read in streaming chunks.
+
     Args:
         file_path: absolute path to the file to hash.
+
     Returns:
         Lowercase hex-encoded SHA-256 digest string.
     """
@@ -514,6 +515,7 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
     The manifest lists each filename (relative to `checkpoint_dir`)
     together with its SHA-256 digest. The manifest file itself is excluded
     from the listing.
+
     Args:
         checkpoint_dir: directory that contains the checkpoint files.
     """
@@ -538,8 +540,10 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     Reads ``integrity.json``, recomputes each file's hash, and raises
     `megatron.core.dist_checkpointing.core.CheckpointingException`
     on any mismatch or missing file.
+
     Args:
         checkpoint_dir: checkpoint directory to verify.
+
     Raises:
         CheckpointingException: if the manifest is absent, uses an unsupported
             algorithm, or any file's hash does not match.
@@ -589,8 +593,10 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
 
 def verify_integrity_manifest(checkpoint_dir: str) -> None:
     """Verify checkpoint files against their recorded SHA-256 hashes.
+
     Args:
         checkpoint_dir: checkpoint directory to verify.
+
     Raises:
         CheckpointingException: if ``integrity.json`` is absent or any file's
             hash no longer matches the stored value.

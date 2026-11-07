@@ -41,6 +41,7 @@ class SentencePieceTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerCha
                 will be restored, including the possibility to add special tokens inside wrapper.
             ignore_extra_whitespaces (bool): whether to ignore extra whitespaces in the
                 input text while encoding.
+
                 Note:
                     This is done for the current models tokenizers that don't handle extra
                     whitespaces as by default tokenizer learned to ignore it.

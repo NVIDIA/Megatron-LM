@@ -34,7 +34,7 @@ Shape: TypeAlias = torch.Size | Iterable[int]
 class GlobalLayout:
     """Global tensor layout in element coordinates.
 
-    Use :mod:`.layout_builder` to construct layouts for specific placements.
+    Use {mod}`.layout_builder` to construct layouts for specific placements.
 
     Attributes:
         tensor_shapes: Logical tensor shapes in tensor-id order.

@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
-    """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
+    """Whether a parameter is managed by {class}`LayerWiseDistributedOptimizer`.
 
     Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
     via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
@@ -58,7 +58,7 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
 def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: bool = True) -> bool:
     """Whether a DDP bucket belongs to a LayerWise-managed buffer.
 
-    Buckets are built from params that share a :class:`BufferKey`, so checking
+    Buckets are built from params that share a {class}`BufferKey`, so checking
     the first param's tag is sufficient. ``default_for_untagged`` controls the
     legacy (no-tagging) case: callers asking "is this mine?" from the LayerWise
     side pass ``True`` (legacy LayerWise owns everything); callers asking from
@@ -77,7 +77,7 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
     Run this once on the un-DDP-wrapped model chunks before
-    :class:`DistributedDataParallel` constructs its grad/param buffers — the
+    {class}`DistributedDataParallel` constructs its grad/param buffers — the
     grouping function ``group_params_for_buffers`` reads this attribute to
     decide which buffer each param lands in (LayerWise shard-aligned buffer vs
     DistOpt-style byte-level buffer).
@@ -114,9 +114,11 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     params (``is_gtp_param``) are offset-sharded and excluded -- each shard already has a
     distinct offset, hence a unique writer.
 
-    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
-    no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
-    collapsed) to match the optimizer-state checkpoint key suffix.
+    Returns:
+        dict[str, tuple[int, int]]: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when
+            GTP_remat is unavailable or no group spans >1 rank. Names are bare (all ``module.``
+            wrappers stripped, layer index collapsed) to match the optimizer-state checkpoint key
+            suffix.
     """
     gtp_fold: Dict[str, Tuple[int, int]] = {}
     try:
@@ -222,7 +224,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Guarantees that ``dp_size * shard_size`` satisfies bucket-end alignment
         and that every shard start is 64-element aligned (required by
-        :func:`pad_param_start`).
+        {func}`pad_param_start`).
         """
         dp_size = data_parallel_world_size
         bucket_divisor = bucket_end_divisor(dp_size, ddp_config.pad_buckets_for_high_nccl_busbw)
@@ -256,7 +258,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
            (GTP-sharded) matrices spread over the whole buffer instead of
            clustering inside each bucket.
         3. Pad each shard to ``max(shard_cursors)`` aligned to
-           :meth:`_shard_divisor`, then emit the bucket.
+           {meth}`_shard_divisor`, then emit the bucket.
 
         Each bucket therefore spans a contiguous backprop range so that
         ``overlap_grad_reduce`` can dispatch the bucket's reduce-scatter as
@@ -269,11 +271,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params: Parameters in model-definition (forward) order.
             bucket_size: Approximate elements per bucket (``None`` → single bucket).
             data_parallel_world_size: Size of the data-parallel group.
-            ddp_config: :class:`DistributedDataParallelConfig`.
+            ddp_config: {class}`DistributedDataParallelConfig`.
             param_indices: Optional per-param dtype indices (passed through).
 
         Returns:
-            :class:`PerBufferParamLayout` with shard-aligned buckets.
+            {class}`PerBufferParamLayout` with shard-aligned buckets.
         """
         dp_size = data_parallel_world_size
         shard_divisor = LayerWiseDistributedOptimizer._shard_divisor(dp_size, ddp_config)
@@ -428,7 +430,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         def _absorbs(numel: int) -> bool:
             """True if ``numel`` fits in the least-loaded shard without growing
             the bucket's padded size (``dp_size * padded_shard_size``), i.e.,
-            it fills existing shard padding instead of adding a new row."""
+            it fills existing shard padding instead of adding a new row.
+            """
             target = pad_to_divisor(max(shard_loads), shard_divisor)
             return pad_param_start(min(shard_loads)) + numel <= target
 
@@ -536,7 +539,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
-        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`
+        Groups parameters by {class}`BufferKey` via {func}`group_params_for_buffers`
         and produces a layerwise shard-aligned size-matching layout per buffer.
         Every parameter stays within a single shard so the local optimizer step
         (e.g. Newton-Schulz iteration for Muon) can run on whole tensors.
@@ -545,12 +548,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params: All parameters to lay out.
             bucket_size: Approximate elements per bucket (``None`` → single bucket).
             data_parallel_world_size: DP group size for dense parameters.
-            ddp_config: :class:`DistributedDataParallelConfig`.
+            ddp_config: {class}`DistributedDataParallelConfig`.
             expert_data_parallel_world_size: Expert DP group size (defaults to
                 ``data_parallel_world_size``).
 
         Returns:
-            :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
+            {class}`FullParamLayout` with a {class}`PerBufferParamLayout` per buffer group.
         """
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
         from .distrib_optimizer import DistributedOptimizer
@@ -827,7 +830,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:
         """The GTP layer records the group it sharded a weight over on the param
         (``p.group``); the gtp_remat axis picked for the domain must have the same ranks,
-        or the stage-1 exchange would concatenate shards from the wrong ranks."""
+        or the stage-1 exchange would concatenate shards from the wrong ranks.
+        """
         expected = None
         for p, spec in zip(params, specs):
             recorded = getattr(p, 'group', None)
@@ -847,7 +851,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def shard_params(self, optimizers, full_param_layouts=None):
         """Shard params across ranks according to the computed param layout.
 
-        Each param's shard assignment is derived from the :class:`FullParamLayout`
+        Each param's shard assignment is derived from the {class}`FullParamLayout`
         stored on the DDP model chunks.  Within each bucket the buffer is divided
         into ``dp_size`` equal shards; a param's shard index is determined by its
         position in the buffer.
@@ -858,7 +862,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Args:
             optimizers: Optimizers whose param groups will be narrowed to
                 the local rank's shard.
-            full_param_layouts: List of :class:`FullParamLayout` (one per model
+            full_param_layouts: List of {class}`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
         # Simplify when dp_cp group size is 1.
@@ -948,7 +952,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Legacy: this method is a fallback for when no ``full_param_layout``
         is provided.  Once all call sites supply a layout, this can be removed
-        in favor of :meth:`_shard_params_from_layout`.
+        in favor of {meth}`_shard_params_from_layout`.
 
         List of parameters are sorted by numel and assigned to ranks in ping-pong style.
         Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
@@ -1185,9 +1189,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Walks each model chunk's dense + expert-parallel bucket groups and
         skips any group not managed by LayerWise, so a sibling
-        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
+        {class}`DistributedOptimizer`'s own ``start_param_sync`` call does not
         double-sync the same buckets. Uses
-        :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
+        {meth}`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
         """
         for model_chunk in self.model_chunks:
@@ -1308,6 +1312,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def save_state_dict_to_file(self, filename: str) -> None:
         """Save the parameter state of the optimizer. For torch format only.
+
         Args:
             filename: The filename to save the parameter state.
         """

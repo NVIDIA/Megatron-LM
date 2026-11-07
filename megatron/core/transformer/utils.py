@@ -180,7 +180,6 @@ def make_sharded_tensors_for_checkpoint(
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
             with context parallel. If None, defaults to
             parallel_state.get_data_parallel_group(with_context_parallel=True)
-
     """
 
     if tensor_parallel_layers_axis_map is None:

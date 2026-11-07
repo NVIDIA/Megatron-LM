@@ -21,7 +21,7 @@ class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInfe
     """Dynamic engine with control-plane-neutral KV/state handoff behavior.
 
     External control planes can use this class directly and configure the
-    transfer role with :meth:`setup_kv_transfer`. It intentionally does not
+    transfer role with {meth}`setup_kv_transfer`. It intentionally does not
     install the coordinator-native registration protocol below.
     """
 
@@ -57,7 +57,7 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     """Dynamic inference engine with prefill/decode state hand-off support.
 
     This subclass adds the coordinator-native registration callbacks. External
-    control planes should use :class:`StateHandoffDynamicInferenceEngine`.
+    control planes should use {class}`StateHandoffDynamicInferenceEngine`.
     """
 
     def _record_and_serialize_finished_request(

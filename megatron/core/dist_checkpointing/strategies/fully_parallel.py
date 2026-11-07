@@ -124,7 +124,8 @@ class FullyParallelSaveStrategyWrapper:
         Args:
             sharded_state_dict (ShardedStateDict): state dict to distribute the saving
 
-        Returns: None
+        Returns:
+            None
         """
         start = time()
         if self.do_cache_distribution and self.cached_distribution is not None:
@@ -224,7 +225,8 @@ class FullyParallelLoadStrategyWrapper:
         `TorchDistLoadShardedStrategy`), so that `serialization.load` keeps the quantized
         destinations in the state dict. Only the `broadcast` exchange supports it: it replicates
         the raw quantized storage of the loading rank into the receivers' destinations (see
-        `exchange_loaded_tensors_broadcast_quantized`)."""
+        `exchange_loaded_tensors_broadcast_quantized`).
+        """
         return getattr(self.base_strategy, "stream_ckpt_dequant", False)
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
@@ -503,7 +505,8 @@ def distribute_main_replicas_with_precomputed_distribution(
         precomputed_distribution (ShardDistribution): distribution computed with
             `determine_main_replica_uniform_distribution`
 
-    Returns: None
+    Returns:
+        None
 
     Example replica ids of tensors A, B, C before distribution:
     rank0: A: (0, 0, 0), B: (0, 0, 0), C: (0, 0, 0)
@@ -555,11 +558,12 @@ def _defer_loading_sharded_items(
         item_type: The type of sharded item (ShardedObject or ShardedTensor)
         shard_id_func: Function to get the shard ID for the item type
 
-    Returns: a tuple of:
-        - ShardedStateDict: sub-state dict only with sharded items
-        - ShardedStateDict: sub-state dict with non-sharded items
-        - Dict[_ShardId, T]: mapping from shard id to items loaded by *this* rank
-        - Dict[_ShardId, T]: mapping from shard id to items loaded by *other* ranks
+    Returns:
+        a tuple of:
+            - ShardedStateDict: sub-state dict only with sharded items
+            - ShardedStateDict: sub-state dict with non-sharded items
+            - Dict[_ShardId, T]: mapping from shard id to items loaded by *this* rank
+            - Dict[_ShardId, T]: mapping from shard id to items loaded by *other* ranks
     """
     to_load_shards = {}
     unloaded_shards = {}

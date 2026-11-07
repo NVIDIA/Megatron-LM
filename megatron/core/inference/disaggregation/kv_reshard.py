@@ -70,7 +70,8 @@ class KVShardLayout:
 
     def kv_shard_key(self) -> Tuple[int, int]:
         """This rank's attention position: ``(tp_rank, pp_rank)``.
-        Ranks sharing a key are EP/ETP replicas holding identical KV."""
+        Ranks sharing a key are EP/ETP replicas holding identical KV.
+        """
         return (self.tp_rank, self.pp_rank)
 
     def kv_replicas(self) -> int:

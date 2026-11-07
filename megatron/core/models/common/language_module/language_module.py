@@ -476,7 +476,8 @@ class LanguageModule(MegatronModule):
             first_stage_word_emb_key (str): this must be the same as the
                 ShardedTensor.key of the first stage word embeddings.
 
-        Returns: None, acts in-place
+        Returns:
+            None: acts in-place
         """
         if not self.post_process:
             # No output layer

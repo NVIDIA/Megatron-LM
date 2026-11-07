@@ -178,7 +178,8 @@ class NixlPullHandle:
 
     def wait(self) -> None:
         """Block until the transfer completes; NIXL has no blocking wait, so
-        poll with a short sleep to avoid monopolizing a CPU core."""
+        poll with a short sleep to avoid monopolizing a CPU core.
+        """
         while not self.poll():
             time.sleep(_POLL_INTERVAL_S)
 

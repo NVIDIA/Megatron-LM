@@ -79,6 +79,7 @@ def get_num_layers_to_build(
 ) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
+
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
@@ -484,7 +485,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         stage comes from communication, not from the input, so the
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
-        forward_step_func"""
+        forward_step_func
+        """
         self.input_tensor = input_tensor
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

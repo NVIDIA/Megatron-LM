@@ -139,7 +139,7 @@ class ParamSharding(enum.Enum):
     """Which axes of a param group's (gtp_remat, tp) domain shard a 2-D weight.
 
     Derived from the model's sharding attributes and the domain sizes
-    (:meth:`ParamShardSpec.from_param`); the exchanges follow from it: stage 1 runs for a
+    ({meth}`ParamShardSpec.from_param`); the exchanges follow from it: stage 1 runs for a
     gtp_remat axis, stage 2 for a TP axis.
     """
 
@@ -180,11 +180,11 @@ class ParamShardSpec:
     """How the model sharded one parameter over a (gtp_remat, tp) domain.
 
     Holds only model-imposed facts, fixed by the forward/backward parallelism: the
-    optimizer reads them once (:meth:`from_param`) and never recomputes them in ``step()``.
+    optimizer reads them once ({meth}`from_param`) and never recomputes them in ``step()``.
     Everything the optimizer derives from them is a property.
 
     - ``tp_dim``: the dim TP splits (0 column-parallel, 1 row-parallel) or None
-      (:func:`tp_partition_dim`, ignored when the domain has no TP axis).
+      ({func}`tp_partition_dim`, ignored when the domain has no TP axis).
     - ``gtp_sharded``: dim 0 of the TP-local shard is split over gtp_remat
       (``is_gtp_param``) and the domain has a gtp_remat axis.
     - ``pad_length``: GTP alignment padding, trailing zero rows on the gtp-gathered
@@ -247,7 +247,8 @@ class ParamShardSpec:
     @property
     def ns_cost(self) -> int:
         """Newton-Schulz cost estimate on ``full_shape``, ~ max(M, N) * min(M, N)^2, the
-        weight NS-home balancing uses; non-2-D shapes count their elements."""
+        weight NS-home balancing uses; non-2-D shapes count their elements.
+        """
         if len(self.full_shape) != 2:
             return math.prod(self.full_shape)
         m, n = self.full_shape
@@ -258,7 +259,7 @@ class ParamShardSpec:
 class _GroupExchangePlan:
     """Everything ``step()`` needs for one param group that is constant across steps.
 
-    Built once per param identity tuple by :meth:`LayerShardedMuon._build_plan` and
+    Built once per param identity tuple by {meth}`LayerShardedMuon._build_plan` and
     invalidated by both setters; ``step()`` only consumes it. Index spaces: ``i`` indexes
     the group's grad-bearing params, ``n`` the routed sub-list, ``k`` the subset of the
     routed list that stage 1 delivers to this rank (``stage1_routed_indices``).
@@ -297,7 +298,7 @@ class LayerShardedMuon(TensorParallelMuon):
       restored before the reverse gtp_remat exchange.
 
     Each param's sharding is read once from these attributes
-    (:meth:`ParamShardSpec.from_param`), the per-group exchange plan (homes, routing
+    ({meth}`ParamShardSpec.from_param`), the per-group exchange plan (homes, routing
     tables) is cached, and ``step()`` only consumes it.
 
     ``step()`` runs, per param group:
@@ -345,7 +346,7 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
-        All other args: same as :class:`TensorParallelMuon`. In particular
+        All other args: same as {class}`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the path that delegates to the
             parent: the fallback taken before ``set_param_ns_homes`` is called,
@@ -537,9 +538,10 @@ class LayerShardedMuon(TensorParallelMuon):
     def _iter_ns(
         self, full_by_k: dict, load: Callable = lambda t: t
     ) -> Iterator[tuple[int, torch.Tensor]]:
-        """:meth:`_run_ns` one chunk at a time: yields ``(k, ns)`` as each chunk finishes,
+        """{meth}`_run_ns` one chunk at a time: yields ``(k, ns)`` as each chunk finishes,
         so a caller that consumes each result right away holds one chunk, not all.
-        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts."""
+        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts.
+        """
         by_shape: dict = {}
         for k, full in full_by_k.items():
             by_shape.setdefault(tuple(full.shape), []).append(k)
@@ -610,7 +612,8 @@ class LayerShardedMuon(TensorParallelMuon):
     def step(self, closure: Any = None) -> None:
         """Run one optimizer step: momentum update, shard exchange to the NS homes,
         full-matrix Newton-Schulz there, reverse exchange, weight update (see the
-        class docstring for the per-stage breakdown)."""
+        class docstring for the per-stage breakdown).
+        """
         if closure is not None:
             raise ValueError("closure is not supported")
 
@@ -757,7 +760,8 @@ class LayerShardedMuon(TensorParallelMuon):
 
             def ns_input(p):
                 """NS input of ``p``. With nesterov=False it aliases the momentum buffer
-                (``.float()`` is a no-op on fp32); everything below treats it as read-only."""
+                (``.float()`` is a no-op on fp32); everything below treats it as read-only.
+                """
                 buf = self.state[p]["momentum_buffer"]
                 return (p.grad.lerp(buf, beta) if self.nesterov else buf).float()
 

@@ -31,7 +31,8 @@ def get_micro_batch_size() -> int:
 
 def get_current_running_global_batch_size() -> int:
     """Get current running global batch size, taking into account number of DP replicas might be
-    incompatible with true global batch size if `decrease_batch_size_if_needed` is True."""
+    incompatible with true global batch size if `decrease_batch_size_if_needed` is True.
+    """
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_running_global_batch_size()
 
 
@@ -327,7 +328,8 @@ class NumMicroBatchesCalculator(ABC):
 
     def get_current_running_global_batch_size(self) -> int:
         """Get current running global batch size. If decrease_batch_size_if_needed is False,
-        this just equals global batch size."""
+        this just equals global batch size.
+        """
         assert self.current_running_global_batch_size is not None
         return self.current_running_global_batch_size
 
@@ -410,6 +412,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         rank (int): Rank for logging.
         schedule (str): Schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
             Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+
             Examples:
                 "0:768 250B:1536 500B:3072 750B:6144" (thresholds in tokens)
                 "0:768 61035156250:1536" (thresholds in samples)

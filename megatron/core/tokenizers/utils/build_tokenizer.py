@@ -133,7 +133,8 @@ def vocab_size_with_padding(
     logging_enabled=True,
 ):
     """Pad vocab size so it is divisible by model parallel size and
-    still having GPU friendly size."""
+    still having GPU friendly size.
+    """
 
     after = orig_vocab_size
     multiple = make_vocab_size_divisible_by * tensor_model_parallel_size

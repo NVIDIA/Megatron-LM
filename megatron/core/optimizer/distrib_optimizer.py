@@ -1118,7 +1118,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @property
     def optimizer_state_keys(self):
         """Return the optimizer's tensor state keys, e.g., ('exp_avg', 'exp_avg_sq') for Adam
-        or ('exp_avg',) for Lion."""
+        or ('exp_avg',) for Lion.
+        """
         _OPTIMIZER_STATE_KEYS = {"lion": ("exp_avg",)}
         optimizer_name = self.config.optimizer
         # When Muon is the top-level optimizer, the DistributedOptimizer wrapping
@@ -2490,7 +2491,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
         '''Reshard buckets (where each bucket is a tensor) to new target
-        numels, where the total numel remains the same.'''
+        numels, where the total numel remains the same.
+        '''
 
         old_total = sum([t.numel() for t in old_tensors])
         new_total = sum(new_numels)
@@ -3306,7 +3308,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This function is only used for MXFP8 params.
         Copy FP32 main params directly to param buffer for param all-gather since
         param buffer is not mapped to model params for MXFP8 case.
-
         """
         if self.ddp_config.use_megatron_fsdp:
             raise NotImplementedError(
@@ -3579,10 +3580,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Walks each model chunk's DDP bucket groups and skips those tagged
         ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
-        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
+        {class}`LayerWiseDistributedOptimizer` does not double-sync the same
         buckets). When no LayerWise tagging is present every bucket group is
         included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        behaviour. Uses {meth}`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
         # Deferred import: layer_wise_optimizer's compute_full_param_layout

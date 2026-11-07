@@ -972,6 +972,7 @@ class TransformerEncoder(nn.Module):
                 packing. When None and attn_impl=="te", the encoder builds its own
                 PackedSeqParams from `length` and runs the block stack on packed
                 features for efficiency.
+
         Returns:
             x (torch.Tensor): (B, D_model, T') with zero-padded positions when
                 ``return_packed`` is false, otherwise ``(Ttot, D_model)`` with

@@ -28,7 +28,7 @@ __all__ = ["fully_shard_optimizer", "init_optimizer_state"]
 def init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     """Allocate optimizer state so a DCP load has DTensors to fill.
 
-    :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes empty
+    {func}`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes empty
     optimizer state via torch's ``_init_optim_state``, but that assigns a parameter-dtype gradient.
     A Megatron-FSDP sharded parameter advertises the FSDP gradient dtype through ``grad_dtype``,
     which differs from the (main-weight) parameter dtype under mixed precision, and rejects a

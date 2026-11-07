@@ -176,7 +176,8 @@ def get_pp_last_rank(pp_group: torch.distributed.ProcessGroup):
 
 def get_pp_next_rank(pp_group: torch.distributed.ProcessGroup):
     """Return the global rank of the next rank in the pipeline parallel group, or None if last
-    stage."""
+    stage.
+    """
     if is_pp_last_stage(pp_group):
         return None
     current_rank_in_group = get_pg_rank(pp_group)
@@ -186,7 +187,8 @@ def get_pp_next_rank(pp_group: torch.distributed.ProcessGroup):
 
 def get_pp_prev_rank(pp_group: torch.distributed.ProcessGroup):
     """Return the global rank of the previous rank in the pipeline parallel group, or None if
-    first stage."""
+    first stage.
+    """
     if is_pp_first_stage(pp_group):
         return None
     current_rank_in_group = get_pg_rank(pp_group)
@@ -454,7 +456,8 @@ class ScheduleNode:
 
 class AbstractSchedulePlan(ABC):
     """To use combined 1f1b, model must implement build_schedule_plan while take the same
-    signature as model forward but return an instance of AbstractSchedulePlan"""
+    signature as model forward but return an instance of AbstractSchedulePlan
+    """
 
     @staticmethod
     @abstractmethod

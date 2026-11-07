@@ -306,7 +306,6 @@ class CudagraphBufferMetadata:
           can_skip_replay_copy and when args_to_clear_buffers fires.
       fwd_cudagraph_buffer / bwd_cudagraph_buffer — the shared strong-ref buffer other
           graphs alias for this input/grad.
-
     """
 
     is_cudagraph_input: bool = False
@@ -471,7 +470,8 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
 
 def make_weakref(ten, inplace=True):
     """Creates a weak reference to a tensor by creating a tensor that replaces storage with
-    raw-pointer wrappers that do not hold a storage reference"""
+    raw-pointer wrappers that do not hold a storage reference
+    """
 
     # Only graph mempool tensors in the graph mempool (e.g. a previous layer's
     # output reused as this graph's input) are safe to weak-ref since their memory is
@@ -586,7 +586,8 @@ def _preserve_parameter_grads_during_backward_capture(runner):
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
-    cudagraphs in execution order, which is required for cudagraphs sharing a mempool."""
+    cudagraphs in execution order, which is required for cudagraphs sharing a mempool.
+    """
 
     """A global flag that if true, all cudagraph runners
     fwd and bwd passes will be performed using their cudagraphed versions."""
@@ -671,7 +672,8 @@ class _CudagraphGlobalRecord:
     @classmethod
     def _create_cudagraphs(cls):
         """Iterate through 'cudagraph_record' creating graphs in the order in which
-        they were recorded."""
+        they were recorded.
+        """
         # Cudagraphs have already been created, check that no cudagraphed modules ran in eager mode
         if cls.cudagraph_created:
             assert len(cls.cudagraph_record) == 0, (
@@ -822,7 +824,8 @@ def create_cudagraphs():
     At the end for the first step, this function calls each runner's `create_fwd_graph` and
     `create_bwd_graph` in the order recorded in _CudagraphGlobalRecord, which allows cudagraphs
     to be created in execution order, which allows multiple cudagraphs to share a single
-    memory pool, minimizing cudagraph memory usage."""
+    memory pool, minimizing cudagraph memory usage.
+    """
 
     return _CudagraphGlobalRecord.create_cudagraphs()
 
@@ -921,7 +924,8 @@ class _GraphStatus(Enum):
 
 class _CudagraphRecordNode(torch.autograd.Function):
     """Inserts a noop node into the autograd graph, used to record when a bwd graph needs
-    to be created."""
+    to be created.
+    """
 
     @staticmethod
     def forward(ctx, runner, inputs):
@@ -937,7 +941,8 @@ class _CudagraphRecordNode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grads):
         """If this is the first bwd pass of this runner, record that a
-        bwd graph needs to be created."""
+        bwd graph needs to be created.
+        """
 
         runner = ctx.runner
         assert (
@@ -953,7 +958,8 @@ class _CudagraphRecordNode(torch.autograd.Function):
 
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
-    cudagraph io and fp8/fp4 if used."""
+    cudagraph io and fp8/fp4 if used.
+    """
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -1081,7 +1087,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
 class _CudaGraphRunner(torch.nn.Module):
     """Represents the execution of a cudagraphed module for a single microbatch.
     If there are multiple outstanding microbatches per module, such as for pipeline parallelism,
-    CudaGraphManager automatically creates multiple _CudaGraphRunners per module."""
+    CudaGraphManager automatically creates multiple _CudaGraphRunners per module.
+    """
 
     def __init__(
         self,
@@ -1094,7 +1101,8 @@ class _CudaGraphRunner(torch.nn.Module):
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
-        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called."""
+        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called.
+        """
 
         super().__init__()
 
@@ -1228,7 +1236,8 @@ class _CudaGraphRunner(torch.nn.Module):
     def get_connected_params(self, outputs):
         """Iterate through the autograd graph of 'outputs' and returns all parameters connected.
         In theory this should return all parameters that return a nonzero wgrad when computing
-        the backward pass of 'outputs'."""
+        the backward pass of 'outputs'.
+        """
         # Flatten outputs and start traversal from roots that require gradients
         args = (outputs,) if torch.is_tensor(outputs) else outputs
         stack = [
@@ -1309,7 +1318,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
-        'create_cudagraphs()'."""
+        'create_cudagraphs()'.
+        """
 
         global fwd_buffer_reuse_ref_count
 
@@ -1599,7 +1609,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
-        'create_cudagraphs()'."""
+        'create_cudagraphs()'.
+        """
 
         # unlike 'fwd_buffer_reuse_ref_count', 'bwd_buffer_reuse_ref_count' may not decrement
         # to 0 when activation checkpointing is used. See [interaction with recompute].
@@ -1783,7 +1794,8 @@ class _CudaGraphRunner(torch.nn.Module):
         """Records the data needed to create this runner's forward cudagraph.
         The first pass records a graph and appends the runner to _CudagraphGlobalRecord.
         The actual cudagraph will be created when 'create_cudagraphs()` is called. Subsequent
-        passes should replay the graph."""
+        passes should replay the graph.
+        """
 
         # Run the forward pass as normal in eager mode.
         out = self.func(*args, **kwargs)
@@ -2093,7 +2105,8 @@ class CudaGraphManager(torch.nn.Module):
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
-        param gather. Any other pre-forward hooks are not allowed."""
+        param gather. Any other pre-forward hooks are not allowed.
+        """
 
         from megatron.core.distributed import distributed_data_parallel
 
@@ -2112,7 +2125,8 @@ class CudaGraphManager(torch.nn.Module):
         We iterate through the list by 1 for each call, and the number of calls is equal to the
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
-        over different microbatches by tracking their respective fwd and bwd passes.'''
+        over different microbatches by tracking their respective fwd and bwd passes.
+        '''
 
         self._initialize_mempool()
         if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:

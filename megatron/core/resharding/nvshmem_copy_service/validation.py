@@ -5,7 +5,8 @@ Validation utilities for GPU-to-GPU communication.
 
 Provides deterministic data generation and validation for verifying
 
-correctness of communication operations."""
+correctness of communication operations.
+"""
 
 from dataclasses import dataclass
 from typing import List

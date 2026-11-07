@@ -55,7 +55,7 @@ class HyperCommGrid:
     Creating process groups for the same combination with different options is not supported.
 
     Methods default to the base factorization. Register additional factorizations of the same
-    rank span with :meth:`register_view` and target them via ``view="..."``.
+    rank span with {meth}`register_view` and target them via ``view="..."``.
 
     Note:
         ``create_pg()`` over specific dims must be explicitly called to create a process group.

@@ -135,9 +135,9 @@ class _EventLoopManager:
 class _CoordinatorRuntime:
     """Owns the dynamic-inference coordinator and ``InferenceClient`` lifecycle.
 
-    Async-native: :meth:`setup` and :meth:`teardown` are coroutines meant to
-    run on a background loop owned by :class:`_EventLoopManager`. The primary
-    rank additionally holds an :class:`InferenceClient` used by the high-level
+    Async-native: {meth}`setup` and {meth}`teardown` are coroutines meant to
+    run on a background loop owned by {class}`_EventLoopManager`. The primary
+    rank additionally holds an {class}`InferenceClient` used by the high-level
     API to submit requests and send control signals.
     """
 
@@ -197,10 +197,10 @@ class _CoordinatorRuntime:
     async def teardown(self) -> None:
         """Idempotent best-effort shutdown of the coordinator + client.
 
-        Safe to call from partial-setup state (e.g., when :meth:`setup` raised
+        Safe to call from partial-setup state (e.g., when {meth}`setup` raised
         after the coordinator subprocess spawned but before the client opened).
         Worker ranks are always no-op; their ``engine_loop_task`` is awaited by
-        :meth:`_MegatronLLMBase._shutdown_impl` after the primary has issued
+        {meth}`_MegatronLLMBase._shutdown_impl` after the primary has issued
         the STOP signal.
         """
         if not self._is_primary:
@@ -227,7 +227,7 @@ class _CoordinatorRuntime:
 
     @property
     def client(self) -> "Optional[InferenceClient]":
-        """The :class:`InferenceClient` on the primary rank; ``None`` on workers."""
+        """The {class}`InferenceClient` on the primary rank; ``None`` on workers."""
         return self._client
 
     @property
@@ -254,9 +254,9 @@ class _MegatronLLMBase:
     - **Direct mode** (``use_coordinator=False``): every rank is treated as
       primary and ``generate`` runs the engine synchronously (offloaded to a
       thread when called from an event loop). Lifecycle methods are invalid
-      and raise :class:`RuntimeError` via ``_assert_coordinator``.
+      and raise {class}`RuntimeError` via ``_assert_coordinator``.
     - **Coordinator mode** (``use_coordinator=True``): a background event loop
-      hosts the engine pipeline and an :class:`InferenceClient` (on global
+      hosts the engine pipeline and an {class}`InferenceClient` (on global
       rank 0). Only the primary rank may submit requests via ``generate``.
 
     ``model`` must be in eval mode before construction; this class does not
@@ -349,17 +349,17 @@ class _MegatronLLMBase:
 
     @property
     def engine(self) -> "DynamicInferenceEngine":
-        """The underlying :class:`DynamicInferenceEngine`."""
+        """The underlying {class}`DynamicInferenceEngine`."""
         return self._engine
 
     @property
     def context(self) -> "DynamicInferenceContext":
-        """The underlying :class:`DynamicInferenceContext`."""
+        """The underlying {class}`DynamicInferenceContext`."""
         return self._context
 
     @property
     def controller(self) -> "TextGenerationController":
-        """The underlying :class:`TextGenerationController`."""
+        """The underlying {class}`TextGenerationController`."""
         return self._controller
 
     # ---- sync bridge (public) ----
@@ -367,7 +367,7 @@ class _MegatronLLMBase:
     def submit(self, coro: Coroutine) -> "concurrent.futures.Future":
         """Schedule ``coro`` on the background runtime loop; return its future.
 
-        The returned :class:`concurrent.futures.Future` can be consumed from
+        The returned {class}`concurrent.futures.Future` can be consumed from
         any context: block with ``.result()`` from sync code, or wrap with
         ``asyncio.wrap_future(...)`` and ``await`` it from a coroutine.
         Callable from any thread, including threads whose own event loop is

@@ -41,10 +41,10 @@ def build_dynamic_inference_engine(
         model: Distributed Megatron model to serve.
         tokenizer: Tokenizer consumed by the text generation controller.
         inference_config: Runtime inference configuration. Defaults to
-            :class:`InferenceConfig`.
+            {class}`InferenceConfig`.
         inference_wrapper_cls: Model inference wrapper implementation.
         engine_cls: Optional engine implementation override. A disaggregated
-            config requires a subclass of :class:`DisaggDynamicInferenceEngine`.
+            config requires a subclass of {class}`DisaggDynamicInferenceEngine`.
 
     Returns:
         A fully configured dynamic inference engine.

@@ -970,8 +970,8 @@ def fused_apply_mla_rope_for_q(
 ) -> torch.Tensor:
     """Backward-compatible in-place MLA query RoPE API.
 
-    New callers should choose :func:`fused_mla_rope_inplace` or
-    :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
+    New callers should choose {func}`fused_mla_rope_inplace` or
+    {func}`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
     its original mutation behavior and does not add a clone to the hot path.
     """
     return fused_mla_rope_inplace(

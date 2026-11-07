@@ -310,6 +310,7 @@ def selective_state_update(
         dt_bias: (dim,) or (nheads, dim)
         intermediate_ssm_states: Optional buffer of shape (batch, seqlen, nheads, dim, dstate)
                                  or (batch, seqlen, dim, dstate)
+
     Return:
         out: shape matches x
     """

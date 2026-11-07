@@ -15,7 +15,6 @@ class EncoderDecoderTextGenerationController(TextGenerationController):
 
     This class inherits from TextGenerationController, adding features
     relating to encoder input encoder_prompt
-
     """
 
     def prep_inference_input(

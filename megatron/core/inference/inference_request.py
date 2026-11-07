@@ -261,7 +261,7 @@ def split_multimodal_data(
     raw image or video bytes, or serialized preprocessed tensors.
 
     Args:
-        serialized: The output of :func:`serialize_multimodal_data`, or None.
+        serialized: The output of {func}`serialize_multimodal_data`, or None.
 
     Returns:
         ``(media_meta, payload)``, both None for a text-only request.
@@ -281,8 +281,8 @@ def merge_multimodal_data(
 ) -> Optional[Dict[str, Any]]:
     """Rebuild serialized media from its descriptor and payload frames.
 
-    Inverse of :func:`split_multimodal_data`, returning the shape
-    :func:`resolve_multimodal_data_for_engine` consumes.
+    Inverse of {func}`split_multimodal_data`, returning the shape
+    {func}`resolve_multimodal_data_for_engine` consumes.
 
     Args:
         media_meta: The bounded descriptor from the metadata frame, or None.
@@ -551,7 +551,6 @@ class InferenceRequest:
     """Class for one inference request
 
     Containing relevant data for an inference request
-
     """
 
     request_id: int
@@ -781,7 +780,6 @@ class DynamicInferenceRequest(InferenceRequest):
     """Class for one inference request
 
     Containing relevant data for an dynamic inference request
-
     """
 
     request_id: int
@@ -1279,7 +1277,8 @@ class DynamicInferenceRequestRecord:
 
     def checkpoint(self) -> None:
         """Maintain reference to previous request, and then append a new request
-        that concatenates the previous prompt and generations."""
+        that concatenates the previous prompt and generations.
+        """
 
         old_request = self[-1]
 
@@ -1598,7 +1597,8 @@ class LiveRequestSnapshot:
     """Snapshot of a live request, allowing for its later resumption.
 
     A snapshot carries no media; resuming a multimodal request requires resubmitting the
-    same media so the expanded prompt the boundaries were counted on is reproduced."""
+    same media so the expanded prompt the boundaries were counted on is reproduced.
+    """
 
     uid: str
     request_id: int

@@ -111,11 +111,11 @@ def switch_load_balancing_loss_func(
         T is the total number of tokens in the global batch B
 
     Note:
-    To calculate the auxiliary loss at different levels (micro-batch or global batch):
-    - probs: Should always be from the local batch being processed
-    - tokens_per_expert: Should represent token counts at the desired level
-      (either micro-batch or global batch)
-    - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
+        To calculate the auxiliary loss at different levels (micro-batch or global batch):
+        - probs: Should always be from the local batch being processed
+        - tokens_per_expert: Should represent token counts at the desired level
+          (either micro-batch or global batch)
+        - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
 
     Args:
         probs (torch.Tensor): Softmax probabilities output by the router for each token.
@@ -1304,6 +1304,7 @@ def save_to_aux_losses_tracker(
     reduce_group_has_dp: bool = False,
 ) -> None:
     """Save the auxiliary loss for logging.
+
     Args:
         name (str): The name of the loss.
         loss (torch.Tensor): The loss tensor.
@@ -1503,6 +1504,7 @@ def maybe_move_tensor_to_cpu(
     tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
 ) -> torch.Tensor:
     """Move a tensor to CPU if it is on GPU.
+
     Args:
         tensor (torch.Tensor): The tensor to move to CPU.
         as_numpy (bool, optional): Whether to convert the tensor to a numpy array.

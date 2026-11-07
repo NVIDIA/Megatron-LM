@@ -21,7 +21,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
     """Async high-level inference API for Megatron.
 
     Asyncio-native wrapper over the shared engine + runtime managed by
-    :class:`_MegatronLLMBase` -- see that class for caller responsibilities
+    {class}`_MegatronLLMBase` -- see that class for caller responsibilities
     and the ``model.eval()`` contract. Requires ``use_coordinator=True``;
     direct mode is rejected at ``__init__`` (see Known Limitations in the
     package README).
@@ -31,8 +31,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
     - ``async generate`` accepting single or batched prompts.
     - ``async`` lifecycle controls: ``pause`` / ``unpause`` / ``suspend`` /
       ``resume`` / ``shutdown`` / ``wait_for_shutdown``.
-    - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
-    - ``async with`` context-manager protocol; exit calls :meth:`shutdown`.
+    - {meth}`serve` for OpenAI-compatible HTTP serving on the primary rank.
+    - ``async with`` context-manager protocol; exit calls {meth}`shutdown`.
     """
 
     def __init__(
@@ -190,11 +190,11 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         respect ``blocking`` (so all ranks return together).
 
         With ``blocking=True`` (default), this awaits the engine loop until
-        :meth:`shutdown` is called -- suitable for standalone serving scripts.
+        {meth}`shutdown` is called -- suitable for standalone serving scripts.
         With ``blocking=False``, this returns once every frontend replica is
         listening (primary) or immediately (workers); the engine loop continues
-        in the background runtime, and the user can call :meth:`generate` /
-        :meth:`shutdown` afterward. Waiting for the replicas blocks the loop this
+        in the background runtime, and the user can call {meth}`generate` /
+        {meth}`shutdown` afterward. Waiting for the replicas blocks the loop this
         coroutine runs on; nothing on that loop is needed for them to come up.
 
         Raises:

@@ -53,7 +53,7 @@ def fully_shard_context(context: FsdpContext) -> Iterator[FsdpContext]:
 def current_fully_shard_context() -> FsdpContext | None:
     """Return the innermost active ``fully_shard_context``, or ``None``.
 
-    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    Read-only counterpart of {func}`fully_shard_context`: it never creates, joins, or
     finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
     active. Callers that must share one context -- for example per-chunk wrappers built by
     a single wrap call -- use it to join the caller's ambient context instead of opening a

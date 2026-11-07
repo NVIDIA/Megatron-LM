@@ -87,7 +87,8 @@ class RecomputeSegment:
 
     def capture(self, layer: "TransformerLayerSchedulePlan", f_input: Tensor) -> None:
         """When the head layer starts its forward, snapshot what the replay needs:
-        input tensor, mutable chunk state, RNG."""
+        input tensor, mutable chunk state, RNG.
+        """
         if layer is not self.layers[0]:
             return
         from megatron.core.tensor_parallel.random import _get_all_rng_states
@@ -411,7 +412,8 @@ class TransformerLayerSchedulePlan:
 
     def reset_for_recompute(self):
         """Free the retained forward activations of this layer, keeping the nodes
-        reusable for a recompute forward. Also clears the per-layer shared state."""
+        reusable for a recompute forward. Also clears the per-layer shared state.
+        """
         for node in self._iter_recomputed_nodes():
             node.reset_for_recompute()
         if getattr(self, "layer_state", None) is not None:

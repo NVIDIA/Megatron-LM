@@ -10,7 +10,7 @@ if [[ $GIT_MAJOR -eq 2 && $GIT_MINOR -lt 31 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
@@ -40,6 +40,7 @@ if [[ -n "$CHANGED_FILES" ]]; then
     isort $ADDITIONAL_ARGS $CHANGED_FILES
     pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
     ruff check $ADDITIONAL_RUFF_ARGS $CHANGED_FILES
+    python3 "${SCRIPT_DIR}/check_docstring_style.py" $CHANGED_FILES
     mypy --explicit-package-bases --follow-imports=skip $CHANGED_FILES || true
 else
     echo Changeset is empty, all good.

@@ -859,7 +859,7 @@ if HAVE_HYBRIDEP:
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
 
-        args:
+        Args:
             x (torch.Tensor):
                 Input hidden states to combine
             handle (EventHandle):
@@ -961,7 +961,8 @@ if HAVE_TE_EP:
     def alloc_ep_symm_buffer(shape, dtype, ep_group):
         """Allocate one persistent NCCL symm-mem buffer (per-buffer collective rendezvous). mcore's
         zero-copy buffers are all persistent and non-pool; the symm mem-pool is used only by TE for
-        the per-call recv buffers it recycles."""
+        the per-call recv buffers it recycles.
+        """
         return te_ep.symm_mem_alloc(shape, dtype, ep_group)
 
     # Whether this TE build supports quantized EP dispatch/combine payloads.

@@ -20,7 +20,6 @@ class ModuleSpec:
             module class itself e.g. `ModuleClass` (which is already imported
             using `from module.location import ModuleClass`).
         params (dict): A dictionary of params that need to be passed while init.
-
     """
 
     module: Union[Tuple, type]

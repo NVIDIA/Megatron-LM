@@ -20,7 +20,7 @@ class ContextGPUView:
     Layout note: the bookkeeping fields are backed by a single contiguous
     ``uint8`` buffer (``self._buf``). Each field is a ``view(dtype)`` onto a
     slice of that buffer. This matches the pinned-CPU-buffer layout in
-    :class:`DynamicInferenceContext` so that the per-step H2D transfer is a
+    {class}`DynamicInferenceContext` so that the per-step H2D transfer is a
     single ``cudaMemcpyAsync`` instead of one per field.
     """
 

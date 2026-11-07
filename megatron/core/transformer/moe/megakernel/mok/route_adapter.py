@@ -171,10 +171,12 @@ def routing_map_to_mok_inputs(
     probs: torch.Tensor, routing_map: torch.Tensor, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compact an authoritative routing map into fixed-width MOK inputs.
+
     Args:
         probs: Dense router probabilities with shape [num_tokens, num_experts].
         routing_map: Dense boolean/integer route map with the same shape as probs.
         topk: Maximum number of valid routes emitted per token.
+
     Returns:
         A pair (probs_indices, indices) with shapes [num_tokens, topk].
         probs_indices is float32 and indices is int32 with -1 padding.

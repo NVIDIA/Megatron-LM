@@ -268,7 +268,7 @@ class InferenceClient:
             Decoded by the coordinator, consumed for routing, and not forwarded
             -- the engine computes its own KV hashes. One int per block rather
             than one per token, which is why it does not belong in frame 0.
-            None means this client did not hash; see :meth:`_block_hashes`.
+            None means this client did not hash; see {meth}`_block_hashes`.
         3 media
             Never decoded by the coordinator, forwarded to the engine verbatim.
             Same reasoning as the prompt but a larger payload: raw image or
@@ -393,7 +393,7 @@ class InferenceClient:
         """Submit a streaming request with remote KV metadata.
 
         Returns the same per-step partial/final iterator as
-        :meth:`add_request_streaming`.
+        {meth}`add_request_streaming`.
 
         Args:
             prompt: A string or list of token IDs.

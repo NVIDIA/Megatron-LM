@@ -342,6 +342,7 @@ def _get_param_groups(
             empty dictionary rather than the default value of None.
         process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
             aligned parameter groups. ``None`` preserves the WORLD-group behavior.
+
     Returns:
         List of parameter groups.
     """
@@ -836,7 +837,7 @@ def _get_megatron_emerging_optimizer(
     go through the exact same code path as the standard optimizer factory.
 
     When ``config.use_layer_wise_distributed_optimizer`` is True, the underlying optimizers
-    are wrapped with :class:`LayerWiseDistributedOptimizer`.
+    are wrapped with {class}`LayerWiseDistributedOptimizer`.
     """
     eopt_name = config.optimizer
     use_layer_wise = config.use_layer_wise_distributed_optimizer
@@ -1128,7 +1129,7 @@ def get_megatron_optimizer(
     Handles both standard optimizers (Adam, SGD) and emerging optimizers (e.g. Muon).
     We use separate optimizers for expert parameters and non-expert parameters.
     For emerging optimizers with ``config.use_layer_wise_distributed_optimizer=True``,
-    the optimizer is automatically wrapped with :class:`LayerWiseDistributedOptimizer`.
+    the optimizer is automatically wrapped with {class}`LayerWiseDistributedOptimizer`.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.

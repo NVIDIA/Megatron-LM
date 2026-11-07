@@ -39,7 +39,8 @@ class VocabParallelCrossEntropy:
         """Read-only part of the forward: target mask, local target ids and
         ``logits[target] - logits_max`` (zero for targets owned by other ranks).
 
-        Does not modify ``vocab_parallel_logits``."""
+        Does not modify ``vocab_parallel_logits``.
+        """
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -65,7 +66,8 @@ class VocabParallelCrossEntropy:
         """In place: ``vocab_parallel_logits <- exp(vocab_parallel_logits - logits_max)``.
 
         Pointwise only. Kept separate from any reduction over the result so that, when
-        compiled, Inductor can keep the mutation in place (see fused_cross_entropy.py)."""
+        compiled, Inductor can keep the mutation in place (see fused_cross_entropy.py).
+        """
 
         vocab_parallel_logits.sub_(logits_max.unsqueeze(dim=-1))
         vocab_parallel_logits.exp_()
@@ -79,7 +81,8 @@ class VocabParallelCrossEntropy:
         vocab_end_index: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculates predicted logits. ``vocab_parallel_logits`` is overwritten in place
-        with exp(logits - logits_max) and returned as ``exp_logits``."""
+        with exp(logits - logits_max) and returned as ``exp_logits``.
+        """
 
         target_mask, masked_target_1d, predicted_logits = (
             VocabParallelCrossEntropy.gather_predicted_logits(
@@ -130,7 +133,8 @@ class VocabParallelCrossEntropy:
         """In place: ``grad_input <- grad_input * grad_output``.
 
         Pointwise only. Kept separate from the target scatter so that, when compiled,
-        Inductor can keep the mutation in place (see fused_cross_entropy.py)."""
+        Inductor can keep the mutation in place (see fused_cross_entropy.py).
+        """
 
         grad_input.mul_(grad_output.unsqueeze(dim=-1))
 

@@ -20,20 +20,20 @@ from megatron.core.inference.sampling_params import SamplingParams
 class MegatronLLM(_MegatronLLMBase):
     """Sync high-level inference API for Megatron.
 
-    See :class:`_MegatronLLMBase` for execution modes (direct vs
+    See {class}`_MegatronLLMBase` for execution modes (direct vs
     coordinator), caller responsibilities, and the ``model.eval()`` contract.
 
     On top of the base, this class provides:
 
-    - :meth:`generate` accepting one prompt or a batch; **always returns a
+    - {meth}`generate` accepting one prompt or a batch; **always returns a
       ``list[DynamicInferenceRequest]``** (single-prompt input returns a
       one-element list -- deliberate asymmetry vs the async API).
-    - Sync lifecycle controls: :meth:`pause` / :meth:`unpause` /
-      :meth:`suspend` / :meth:`resume` / :meth:`shutdown` /
-      :meth:`wait_for_shutdown`.
-    - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
+    - Sync lifecycle controls: {meth}`pause` / {meth}`unpause` /
+      {meth}`suspend` / {meth}`resume` / {meth}`shutdown` /
+      {meth}`wait_for_shutdown`.
+    - {meth}`serve` for OpenAI-compatible HTTP serving on the primary rank.
     - Context-manager protocol: ``with MegatronLLM(...) as llm:``; exit
-      calls :meth:`shutdown`.
+      calls {meth}`shutdown`.
     """
 
     def __init__(
@@ -183,11 +183,11 @@ class MegatronLLM(_MegatronLLMBase):
         respect ``blocking`` (so all ranks return together).
 
         With ``blocking=True`` (default), this blocks the calling thread until
-        the engine loop terminates via :meth:`shutdown` -- suitable for
+        the engine loop terminates via {meth}`shutdown` -- suitable for
         standalone serving scripts. With ``blocking=False``, this returns once
         every frontend replica is listening (primary) or immediately (workers);
         the engine loop continues in the background runtime, and the user can
-        call :meth:`generate` / :meth:`shutdown` afterward.
+        call {meth}`generate` / {meth}`shutdown` afterward.
 
         Raises:
             ValueError: if ``use_coordinator=False`` (HTTP serving requires

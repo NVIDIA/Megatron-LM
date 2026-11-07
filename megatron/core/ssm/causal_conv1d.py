@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Causal convolution over contiguous context-parallel sequence shards, and the determinism
-guard the SSM mixers apply to the causal_conv1d backward."""
+guard the SSM mixers apply to the causal_conv1d backward.
+"""
 
 import os
 

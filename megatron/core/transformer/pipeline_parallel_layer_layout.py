@@ -207,6 +207,7 @@ class PipelineParallelLayerLayout:
 
     def pretty_repr(self):
         """Pretty representation of the custom layout, showing the layers held by each stage.
+
         Example:
                             VPP rank 0                 VPP rank 1
         PP rank 0           embedding,decoder*2        decoder*2
@@ -283,7 +284,8 @@ class PipelineParallelLayerLayout:
     def parse_str_to_list(layout_str: str):
         """Parse a layout string to a list of lists.
         Example: "Ettt|(tt|)*29,m|L" will be parsed to
-        [["E","t","t","t"]]+[["t","t"]]*29+[["m"],["L"]]"""
+        [["E","t","t","t"]]+[["t","t"]]*29+[["m"],["L"]]
+        """
 
         layout_str = layout_str.replace(",", "")  # remove purely cosmetic commas
 

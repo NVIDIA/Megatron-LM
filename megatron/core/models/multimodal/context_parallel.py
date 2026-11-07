@@ -291,8 +291,8 @@ def _split_num_frames(num_frames, lb, ub):
     """Return per-media frame counts clipped to the frame range ``[lb, ub)``.
 
     ``lb`` and ``ub`` are frame indices (the same coordinate system used by
-    :func:`_compute_tubelet_aware_split_points` and the per-frame ``seqlens``
-    array in :func:`split_to_context_parallel_ranks_dynamic_res`). The returned
+    {func}`_compute_tubelet_aware_split_points` and the per-frame ``seqlens``
+    array in {func}`split_to_context_parallel_ranks_dynamic_res`). The returned
     list has one entry per media that contributes at least one frame to the
     range, with the value being the number of frames of that media in the
     range.
@@ -448,7 +448,7 @@ def split_to_context_parallel_ranks_dynamic_res(
             2x2 patches for pixel shuffle or a native spatial merger.
         fp8_enabled: If True, pad each rank's local sequence to the FP8 multiple
             (16 by default; 32 for ``mxfp8``).
-        fp8_recipe: Forwarded to :func:`get_padding` so the FP8 padding multiple
+        fp8_recipe: Forwarded to {func}`get_padding` so the FP8 padding multiple
             matches the active recipe.
         num_frames: Per-media frame count, required when ``temporal_patch_size > 1``.
         temporal_patch_size: Tubelet size for temporal compression.

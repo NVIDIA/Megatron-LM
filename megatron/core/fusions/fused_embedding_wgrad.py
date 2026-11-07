@@ -73,7 +73,8 @@ def _sort_tokens_kernel(
     BLOCK: tl.constexpr,
 ):
     """Sort (token, position) pairs, then give every sorted slot the first and last slot of its
-    token's run and list the runs longer than NROWS (long_runs[0] is their count)."""
+    token's run and list the runs longer than NROWS (long_runs[0] is their count).
+    """
     offs = tl.arange(0, BLOCK)
     mask = offs < n
     ids = tl.load(ids_ptr + offs, mask=mask, other=0).to(tl.int32)

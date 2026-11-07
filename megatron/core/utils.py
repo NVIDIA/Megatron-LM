@@ -279,7 +279,6 @@ def experimental_cls(introduced_with_version: str):
                 parent classes will be provided to the metaclass. We add a
                 `__getattribute__` to the metaclass as to allow it to fetch it from the
                 callees class.
-
                 """
 
                 def __init__(self, *args, **kwargs):
@@ -603,7 +602,8 @@ def ensure_divisibility(numerator, denominator):
 
 def divide(numerator, denominator):
     """Ensure that numerator is divisible by the denominator and return
-    the division value."""
+    the division value.
+    """
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
 
@@ -709,7 +709,8 @@ def get_pg_src_rank(group=None):
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;
-    otherwise, return the attribute directly."""
+    otherwise, return the attribute directly.
+    """
     if isinstance(model, list):
         raise RuntimeError("_get_attr_wrapped_model given a list of models")
 
@@ -755,7 +756,8 @@ def get_model_config(model):
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name
-    are not used concurrently."""
+    are not used concurrently.
+    """
 
     def __init__(self):
         self.buffer = {}
@@ -859,7 +861,8 @@ def make_viewless_tensor(inp, requires_grad, keep_graph):
 
 def assert_viewless_tensor(tensor, extra_msg=None):
     """Assert that a tensor is not a view (i.e., its '._base' field is
-    not set)."""
+    not set).
+    """
     if isinstance(tensor, list):
         [assert_viewless_tensor(t) for t in tensor]
         return tensor
@@ -3348,7 +3351,7 @@ def ensure_params_ready(params: Iterable[Any]) -> None:
     A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
     asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
     consumer reading it earlier -- ahead of that module, or from another stream -- calls this
-    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    first. Backends mark their params with {data}`PARAM_READY_CALLBACK_ATTR`; unmarked params
     no-op, so neither side needs to know about the other.
 
     Callbacks are shared per communication bucket, so each fires once, not once per parameter.

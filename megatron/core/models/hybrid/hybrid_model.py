@@ -126,6 +126,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
             The main pattern may contain "|" to define pipeline stage boundaries.
+
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths

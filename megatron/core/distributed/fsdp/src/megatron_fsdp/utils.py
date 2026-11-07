@@ -232,7 +232,8 @@ def _get_cuda_rng_state(
         clone (bool): Whether to also clone the retrieved RNG state
         graph_safe (bool): Get the rng state in a graph safe manner.
 
-    This function is adapted from torch.cuda.random.get_rng_state()"""
+    This function is adapted from torch.cuda.random.get_rng_state()
+    """
 
     # if not using cuda graphs, just use the builtin pytorch function
     if not graph_safe:
@@ -322,7 +323,8 @@ def initialize_rng_tracker(
 
         class TECudaRNGStatesTracker(transformer_engine.pytorch.distributed.CudaRNGStatesTracker):
             """Wraps TransformerEngine's CudaRNGStatesTracker so that it is
-            interchangeable with Megatron's RNG tracker"""
+            interchangeable with Megatron's RNG tracker
+            """
 
             def __init__(self, is_inference_rng_tracker=False):
                 super().__init__()
@@ -392,7 +394,8 @@ def initialize_rng_tracker(
 
             def get_states(self):
                 """Get rng states. Copy the dictionary so we have direct
-                pointers to the states, not just a pointer to the dictionary."""
+                pointers to the states, not just a pointer to the dictionary.
+                """
                 states = {}
                 for name in self.states_:
                     states[name] = self.states_[name]
@@ -400,7 +403,8 @@ def initialize_rng_tracker(
 
             def set_states(self, states):
                 """Set the rng states. For efficiency purposes, we do not check
-                the size of seed for compatibility."""
+                the size of seed for compatibility.
+                """
                 self._is_initialized = True
                 self.states_ = states
 
@@ -432,7 +436,8 @@ def initialize_rng_tracker(
             @contextlib.contextmanager
             def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
                 """Fork the cuda rng state, perform operations, and exit with
-                the original state."""
+                the original state.
+                """
                 # Check if we have added the state
                 if name not in self.states_:
                     raise Exception("cuda rng state {} is not added".format(name))
@@ -632,7 +637,8 @@ class FSDPDistributedIndex:
 
         def register_submesh(device_mesh, submesh, is_expert_parallel):
             """Register a submesh with identifier: (*submesh, is_expert_parallel)
-            in the mesh library."""
+            in the mesh library.
+            """
             if contains_submesh(device_mesh, submesh):
                 submesh_identifier = tuple(list(submesh) + [is_expert_parallel])
                 self.mesh_library[submesh_identifier] = device_mesh[submesh]
@@ -807,7 +813,8 @@ class FSDPDistributedIndex:
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name
-    are not used concurrently."""
+    are not used concurrently.
+    """
 
     def __init__(self):
         self.buffer = {}

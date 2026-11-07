@@ -186,7 +186,8 @@ def _is_mxfp8_attention_active() -> bool:
     """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
     (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
     keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
-    dequantized values."""
+    dequantized values.
+    """
     if not FP8GlobalStateManager.is_fp8_enabled():
         return False
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:

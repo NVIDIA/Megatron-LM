@@ -63,7 +63,8 @@ class NcclTransferHandle:
 
     def poll(self) -> bool:
         """Return True if the transfer has settled, scattering received data
-        into the paged buffers on first completion."""
+        into the paged buffers on first completion.
+        """
         if self._done:
             return True
         if not all(w.is_completed() for w in self._works):
@@ -194,7 +195,8 @@ class NcclTransferBackend:
     # --- shared enumeration -------------------------------------------------
     def _kv_transfers(self, peer_records, mine_is_src: bool):
         """Yield (peer_meta, layers, heads) for this rank's part of the KV
-        reshard plan, in deterministic plan order."""
+        reshard plan, in deterministic plan order.
+        """
         sources: list = []
         peers_by_rank: dict = {}
         for meta, blocks in peer_records:
@@ -220,7 +222,8 @@ class NcclTransferBackend:
 
     def _ssm_transfers(self, peer_records, mine_is_src: bool):
         """Yield (peer_meta, lo, hi) band slices of this rank's SSM state,
-        in deterministic plan order."""
+        in deterministic plan order.
+        """
         for meta, _ in peer_records:
             raw_layout = meta.get("ssm_layout")
             if not isinstance(raw_layout, dict):
@@ -240,7 +243,8 @@ class NcclTransferBackend:
 
     def _kv_block_view(self, block_id: int, layers: slice, heads: slice) -> torch.Tensor:
         """One block's (kv, layer, token, head, dim) fragment in the
-        [2, L, B, T, H, d] paged buffer."""
+        [2, L, B, T, H, d] paged buffer.
+        """
         return self._memory_buffer[:, layers, block_id, :, heads, :]
 
     # --- decode side ---------------------------------------------------------
@@ -248,7 +252,8 @@ class NcclTransferBackend:
         self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
     ) -> NcclTransferHandle:
         """Post the receives matching the prefill's sends; the handle scatters
-        into the destination blocks (or SSM slots) on completion."""
+        into the destination blocks (or SSM slots) on completion.
+        """
         return self.start_prepared(
             [self.prepare_pull_blocks(peer_meta, src_block_ids, dst_block_ids)]
         )
@@ -298,7 +303,8 @@ class NcclTransferBackend:
         """Post the sends matching the decode's receives, straight out of the
         pinned source blocks (or SSM slots). `peer_meta` is the decode
         instance's per-rank metadata in the same nested shape as a hand-off's
-        kv_meta."""
+        kv_meta.
+        """
         return self.start_prepared([self.prepare_push_blocks(peer_meta, src_block_ids)])
 
     def prepare_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferPlan:

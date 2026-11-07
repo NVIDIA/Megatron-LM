@@ -10,11 +10,11 @@ class MHAMetadata(MetadataBase):
 
     GPU storage for the per-step fields (``query_lengths``,
     ``cu_query_seq_lengths``, ``kv_seq_lengths``, ``cu_kv_seq_lengths``,
-    ``block_table``) lives inside the context's :class:`ContextGPUView`
-    unified buffer. Both :class:`GraphedMHAMetadata` and
-    :class:`NonGraphedMHAMetadata` bind to the same GPU views (only one is
+    ``block_table``) lives inside the context's {class}`ContextGPUView`
+    unified buffer. Both {class}`GraphedMHAMetadata` and
+    {class}`NonGraphedMHAMetadata` bind to the same GPU views (only one is
     active per step), so the single coalesced H2D in
-    :meth:`DynamicInferenceContext.transfer_bookkeeping_to_gpu` covers the
+    {meth}`DynamicInferenceContext.transfer_bookkeeping_to_gpu` covers the
     MHA fields along with the rest of the bookkeeping state.
     """
 
@@ -36,7 +36,7 @@ class MHAMetadata(MetadataBase):
     def bind_gpu_buffers(self, gpu_view) -> None:
         """Attach shared GPU buffer views from the context's ContextGPUView.
 
-        Called by :class:`DynamicInferenceContext` after ``self.gpu_view`` is
+        Called by {class}`DynamicInferenceContext` after ``self.gpu_view`` is
         constructed. Both graphed and non-graphed MHA metadata bind to the
         same views; only one is active per step, so sharing storage is safe.
         """

@@ -188,7 +188,8 @@ _AUTO_TP_MODES = ("duplicated", "distributed")
 @dataclass(frozen=True)
 class HardwareProfile:
     """HW spec for different GPU. Use for cost model when selecting TP mode.
-    Bandwidths are UNIDIRECTIONAL."""
+    Bandwidths are UNIDIRECTIONAL.
+    """
 
     bf16_peak_tflops: float  # dense, fp32_matmul_prec = "medium" for now
     bw_intra_gbps: float  # collectives staying inside one NVLink domain
@@ -771,7 +772,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 
     Shared by ``adaptive_muon`` (which layers its own kwargs on top), so it never
     dispatches on ``muon_tp_mode='layer_sharded'``; that lives in
-    :func:`_muon_registry_config_to_kwargs`.
+    {func}`_muon_registry_config_to_kwargs`.
     """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
@@ -784,7 +785,7 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     """``config_to_kwargs`` for the ``muon`` registry entry.
 
     TensorParallelMuon kwargs, plus LayerShardedMuon's own when
-    :func:`_muon_config_to_cls` selects it (the same helper the entry's
+    {func}`_muon_config_to_cls` selects it (the same helper the entry's
     ``config_to_cls`` uses, so class and kwargs cannot disagree).
     """
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)

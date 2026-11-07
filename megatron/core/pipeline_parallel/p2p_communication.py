@@ -206,6 +206,7 @@ class P2PCommunicator:
                     previous rank.
             recv_next: boolean for whether tensor should be received from
                     next rank.
+
         Returns:
             (recv_prev_shape, recv_next_shape)
         """
@@ -302,7 +303,6 @@ class P2PCommunicator:
 
             - tensor_recv_prev: torch.Tensor if recv_prev is True, None otherwise.
             - tensor_recv_next: torch.Tensor if recv_next is True, None otherwise.
-
         """
 
         config = self.config

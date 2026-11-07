@@ -171,6 +171,5 @@ def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
 
         target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
         tp_group: the tensor parallel group over which to all reduce
-
     """
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)

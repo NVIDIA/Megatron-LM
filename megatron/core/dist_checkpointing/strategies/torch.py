@@ -116,8 +116,8 @@ def flatten_state_dict(
     Args:
         state_dict (ShardedStateDict): state dict to be flattened
 
-    Returns (tuple): flattened state dict and a mapping allowing to recreate the original one
-
+    Returns:
+        tuple: flattened state dict and a mapping allowing to recreate the original one
     """
     flattened = {}
     mappings = {}
@@ -166,8 +166,8 @@ def sharded_tensor_to_torch_sharded_tensor(
         load_legacy_1d_flatten_tensors (bool, optional): flag indicating if 1-D flattened tensors
             should be loaded in a legacy way. Defaults to False.
 
-    Returns (TorchShardedTensor): PyT ShardedTensor containing all passed shards.
-
+    Returns:
+        TorchShardedTensor: PyT ShardedTensor containing all passed shards.
     """
     if rank is None:
         rank = torch.distributed.get_rank()
@@ -258,9 +258,9 @@ def mcore_to_pyt_state_dict(
         init_device (torch.device, optional): device to initialize potentially missing tensors
             during loading. Defaults to 'cpu'.
 
-    Returns (Dict[str, Union[TorchShardedTensor, io.BytesIO]]): original dictionary with values
-        converted either into PyT ShardedTensors or io.BytesIO.
-
+    Returns:
+        dict[str, TorchShardedTensor | io.BytesIO]: original dictionary with values converted either
+            into PyT ShardedTensors or io.BytesIO.
     """
     rank = torch.distributed.get_rank()
     pyt_state_dict = {}
@@ -366,7 +366,8 @@ def _replace_state_dict_keys_with_sharded_keys(
     sharded_state_dict: ShardedStateDict, keep_only_main_replica: bool = False
 ) -> Tuple[Dict[str, List[ShardedBase]], FLATTEN_MAPPING, Dict[str, List[str]]]:
     """Group ShardedBase objects by keys and
-    return mappings required for recreating the original dict."""
+    return mappings required for recreating the original dict.
+    """
     flat_sd, flat_mapping = flatten_state_dict(sharded_state_dict)
     rename_mapping = defaultdict(list)
     new_flat_sd = defaultdict(list)
@@ -787,7 +788,8 @@ class TorchDistSaveShardedStrategy:
             sharded_state_dict (ShardedStateDict): sharded state dict to save
             checkpoint_dir (Path): checkpoint directory
 
-        Returns: None
+        Returns:
+            None
         """
         if HAVE_NVRX:
             # Import needed nvrx modules
@@ -949,7 +951,8 @@ class TorchDistLoadShardedStrategy:
                 information to instruct loading
             checkpoint_dir (Path): checkpoint directory
 
-        Returns: loaded state dict
+        Returns:
+            StateDict: loaded state dict
         """
         flexible_shape_sharded_tensors = [
             sh_ten

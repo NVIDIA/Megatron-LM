@@ -394,6 +394,7 @@ class QwenVL2DRotaryEmbedding(nn.Module):
         Args:
             row_ids: (N,) integer row indices of each patch, in [0, max_patches_per_side).
             col_ids: (N,) integer col indices of each patch, in [0, max_patches_per_side).
+
         Returns:
             freqs: (N, 1, 1, head_dim) — mcore rotary_pos_emb format (raw freqs, not cos/sin)
         """
@@ -486,6 +487,7 @@ class QwenPatchMerger(nn.Module):
         """
         Args:
             x: (B, h_patches * w_patches, hidden)
+
         Returns:
             (B, h_out * w_out, hidden * merge_size^2) before Qwen's merger MLP.
         """
@@ -636,6 +638,7 @@ class QwenVLViTModel(MegatronModule):
         """
         Args:
             pixel_values: (B, C, H, W)
+
         Returns:
             (B, h_out * w_out, hidden * spatial_merge_size^2)
         """
@@ -832,6 +835,7 @@ class KimiPatchMerger(nn.Module):
         """
         Args:
             x: (B, h_patches * w_patches, hidden)
+
         Returns:
             (B, h_out * w_out, 4 * hidden)
         """
@@ -940,6 +944,7 @@ class KimiViTModel(MegatronModule):
         """
         Args:
             pixel_values: (B, C, H, W)
+
         Returns:
             (B, h_out * w_out, 4 * hidden_size)
         """

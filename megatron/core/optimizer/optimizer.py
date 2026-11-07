@@ -372,7 +372,7 @@ class MegatronOptimizer(ABC):
 
         Does not zero any shared buffer and does not all-gather; both are the caller's
         responsibility so that optimizers sharing a DDP model chunk can be staged together.
-        See :meth:`quantize_and_sync_model_params_from_main_params`.
+        See {meth}`quantize_and_sync_model_params_from_main_params`.
         """
         return
 
@@ -386,7 +386,7 @@ class MegatronOptimizer(ABC):
 
         Not for use inside the training loop: the all-gather is forced synchronous and would
         defeat the overlapped param gather. The training loop reaches the same copy through
-        :meth:`step_with_ready_grads`.
+        {meth}`step_with_ready_grads`.
 
         Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
         scales, so loading them re-quantizes a value that has already been through one
@@ -755,7 +755,8 @@ class MegatronOptimizer(ABC):
                 used to save or load the optimizer state. Defaults to False.
             metadata (dict, optional): metadata controlling the sharded_state_dict logic.
 
-        Returns: optimizer sharded state dict
+        Returns:
+            ShardedStateDict: optimizer sharded state dict
         """
 
     @staticmethod
@@ -780,7 +781,8 @@ class MegatronOptimizer(ABC):
 
     def offload_to_cpu(self):
         """Function used for RL training.
-        Move optimizer state tensors to CPU to free GPU memory during inference."""
+        Move optimizer state tensors to CPU to free GPU memory during inference.
+        """
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
@@ -800,7 +802,8 @@ class MegatronOptimizer(ABC):
 
     def restore_from_cpu(self):
         """Function used for RL training.
-        Restore optimizer state tensors from CPU back to GPU for training."""
+        Restore optimizer state tensors from CPU back to GPU for training.
+        """
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
@@ -1333,7 +1336,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         float16_groups & fp32_from_fp32_groups. We additionally zero
         fp32_from_float16_groups as a memory optimization to reduce
         fragmentation; in the case of set_to_none==True, the space
-        used by this field can be safely deallocated at this point."""
+        used by this field can be safely deallocated at this point.
+        """
         if self.is_stub_optimizer:
             return
         for group in self.float16_groups:
@@ -1675,7 +1679,8 @@ class FP32Optimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """Clip gradients (if needed) and step the base optimizer.
-        Always return successful since there is no overflow."""
+        Always return successful since there is no overflow.
+        """
         timers = self.config.timers
         self.grad_norms_by_group = {}
 

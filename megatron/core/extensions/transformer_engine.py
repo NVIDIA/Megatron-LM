@@ -1242,7 +1242,6 @@ class TENorm:
        norm is followed by a residual connection)
 
     Fusion only happens when BOTH conditions are met.
-
     """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
@@ -1565,7 +1564,8 @@ class TELinear(te.pytorch.Linear):
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """Wrapper for the Transformer-Engine's `LayerNormLinear` layer
-    that combines layernorm and linear layers."""
+    that combines layernorm and linear layers.
+    """
 
     def __init__(
         self,
@@ -1835,7 +1835,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
 class TEColumnParallelLinear(TELinear):
     """Wrapper for the Transformer-Engine's `Linear` layer
-    but specialized similar to megatron's `ColumnParallelLinear` layer."""
+    but specialized similar to megatron's `ColumnParallelLinear` layer.
+    """
 
     def __init__(
         self,
@@ -2113,7 +2114,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
 
 class TERowParallelLinear(TELinear):
     """Wrapper for the Transformer-Engine's `Linear` layer
-    but specialized similar to megatron's `RowParallelLinear` layer."""
+    but specialized similar to megatron's `RowParallelLinear` layer.
+    """
 
     def __init__(
         self,
@@ -3745,7 +3747,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         role: te.pytorch.QuantizerRole,
                     ) -> te.pytorch.NVFP4Quantizer:
                         """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
-                        scale for activations."""
+                        scale for activations.
+                        """
                         tensor_type = role.tensor_type if role is not None else None
                         if not tensor_type:
                             tensor_type = "input"
@@ -3836,7 +3839,8 @@ class TEDelayedScaling(te.common.recipe.DelayedScaling):
 
 class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
     """Wraps TransformerEngine's CudaRNGStatesTracker so that it is
-    interchangeable with Megatron's RNG tracker"""
+    interchangeable with Megatron's RNG tracker
+    """
 
     def __init__(self, is_inference_rng_tracker=False):
         if not HAVE_TE:

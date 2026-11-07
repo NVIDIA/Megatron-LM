@@ -57,7 +57,6 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False, tp_group=None):
         new_buffer (bool): If True, returns a new Tensor.
                            If False, returns a view into the existing Tensor.
                            Default is False
-
     """
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     partition_size = torch.numel(tensor) // tp_group.size()
@@ -98,7 +97,6 @@ class VocabUtility:
     """Split the vocabulary into `world_size` chunks and return the first
     and last index of the vocabulary belonging to the `rank`
     partition: Note that indices in [fist, last)
-
     """
 
     @staticmethod

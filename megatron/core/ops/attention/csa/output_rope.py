@@ -254,7 +254,7 @@ class OutputRopeParams:
 
     The rotation is orthogonal only when the cos/sin were built with
     ``mscale=1.0`` (DSv4's "pure rotation" contract).  That is what makes
-    :meth:`undo` an inverse up to floating-point rounding, so backward can
+    {meth}`undo` an inverse up to floating-point rounding, so backward can
     recover the pre-RoPE output and gradient.
 
     ``sbhd_batch_size`` is required for the sbhd layout, where the flat

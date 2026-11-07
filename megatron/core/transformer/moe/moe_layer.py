@@ -727,7 +727,8 @@ class MoELayer(BaseMoELayer):
 
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
-        fc2_latent_proj, so the dimensions match the full hidden dim."""
+        fc2_latent_proj, so the dimensions match the full hidden dim.
+        """
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
@@ -783,6 +784,7 @@ class MoELayer(BaseMoELayer):
                 tokens, ``[seq_length * bsz, topk]``, replayed in place of the micro-batch's
                 (see ``ChunkedRouterReplay``). Being an argument, they are also what a
                 recompute of this call replays.
+
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """

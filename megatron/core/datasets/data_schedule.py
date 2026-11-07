@@ -630,6 +630,7 @@ def get_batch_on_this_rank_for_sequence_packing(
 ):
     """
     Get a batch of data for sequence packing.
+
     Args:
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
@@ -644,6 +645,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             sequence parallelism. Defaults to ``pg_collection.tp_cp``.
         pg_collection (ProcessGroupCollection): Caller-owned parallel grid. Runtime groups
             default to its ``dynamic_cp`` and ``dynamic_tp_cp`` maps; callbacks may override them.
+
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)

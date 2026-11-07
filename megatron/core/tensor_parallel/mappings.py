@@ -43,7 +43,8 @@ def _reduce(input_, group):
 
 def _split_along_last_dim(input_, group):
     """Split the tensor along its last dimension and keep the
-    corresponding slice."""
+    corresponding slice.
+    """
     assert group is not None, "group should not be None"
 
     world_size = group.size()
@@ -63,7 +64,8 @@ def _split_along_last_dim(input_, group):
 
 def _split_along_first_dim(input_, group):
     """Split the tensor along its first dimension and keep the
-    corresponding slice."""
+    corresponding slice.
+    """
     assert group is not None, "group should not be None"
 
     world_size = group.size()
@@ -584,7 +586,6 @@ def all_to_all_sp2hp(input_, group=None):
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens, H/TP].
-
     """
     group = get_tensor_model_parallel_group_if_none(group)
 
@@ -679,7 +680,7 @@ def async_gather_from_sequence_parallel_region(
 
     The caller must wait before the gathered tensor's first use. The returned
     tensor retains the same autograd contract as
-    :func:`gather_from_sequence_parallel_region`: its backward either
+    {func}`gather_from_sequence_parallel_region`: its backward either
     reduce-scatters or splits along the first dimension.
     """
     if group is None:

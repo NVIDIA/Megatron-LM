@@ -164,12 +164,12 @@ class MambaMetadata:
         ``bufs`` maps field names to 1D (or (1, max_tokens) for ``seq_idx``)
         pinned CPU views that compute_cpu_metadata writes into. The matching
         GPU views on the other side of the H2D are exposed via
-        :meth:`bind_gpu_buffers`.
+        {meth}`bind_gpu_buffers`.
         """
         self._cpu_bufs = bufs
 
     def bind_gpu_buffers(self, gpu_view) -> None:
-        """Attach shared GPU views from the context's :class:`ContextGPUView`."""
+        """Attach shared GPU views from the context's {class}`ContextGPUView`."""
         self._gpu_view = gpu_view
 
     def reset(self) -> None:
@@ -483,9 +483,9 @@ class MambaMetadata:
         pinned CPU views.
 
         The values written here are transferred to GPU by the single coalesced
-        H2D in :meth:`DynamicInferenceContext.transfer_bookkeeping_to_gpu`.
+        H2D in {meth}`DynamicInferenceContext.transfer_bookkeeping_to_gpu`.
         The returned dict contains only Python scalars. On `PrefixCachedMambaMetadata`
-        it also carries the intermediate GPU tensors, which :meth:`load_from_cpu`
+        it also carries the intermediate GPU tensors, which {meth}`load_from_cpu`
         consumes after the H2D.
 
         Args:
@@ -959,7 +959,7 @@ class PrefixCachedMambaMetadata(MambaMetadata):
                 region within the scratch buffers.
             cu_seqlens_gpu: GPU cu_seqlens tensor to read from. Defaults to
                 the legacy standalone ``_cu_seqlens_buffer`` used by
-                :meth:`update`; the coalesced production path passes the
+                {meth}`update`; the coalesced production path passes the
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
         chunk_size = self.mamba_chunk_size
@@ -1121,7 +1121,7 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         """Stage reusable recurrent states at interior offsets and/or an aligned chunk endpoint.
 
         Args:
-            ctx: The owning :class:`DynamicInferenceContext`.
+            ctx: The owning {class}`DynamicInferenceContext`.
             req: The inference request.
             current_id: Context request index.
             skip_tokens: Number of tokens being skipped (mamba match).

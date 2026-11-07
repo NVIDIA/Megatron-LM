@@ -862,8 +862,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """Return the per-head sink (off-by-one / learnable) softmax logit, or None.
 
         This mirrors how the static-inference path applies the off-by-one /
-        learnable softmax in :class:`DotProductAttention` and (for TE) in
-        :class:`TEDotProductAttention`. The dynamic-inference path bypasses
+        learnable softmax in {class}`DotProductAttention` and (for TE) in
+        {class}`TEDotProductAttention`. The dynamic-inference path bypasses
         ``self.core_attention`` and calls flash-attention kernels directly,
         so we plumb the offset back out here and apply the correction as a
         post-hoc rescale of the flash-attention output.
@@ -931,7 +931,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     ) -> Tensor:
         """Apply sink-softmax post-correction to a (B, S, H, D) flash-attn output.
 
-        See :meth:`_apply_sink_softmax_correction_varlen` for the math; this
+        See {meth}`_apply_sink_softmax_correction_varlen` for the math; this
         variant only differs in tensor layout.
 
         Args:
@@ -1106,6 +1106,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
                 the same denominator-with-sink formulation used by the
                 static-inference path (TE / DotProductAttention).
+
         Return:
             (Tensor) Attention output.
         """
@@ -1430,7 +1431,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         Return:
             Tensor consumed by the attention output projection.
-
         """
         assert (
             packed_sequence_cp_metadata is None
@@ -1942,7 +1942,8 @@ class SelfAttention(Attention):
 
         (TODO) In the future, more tensors should be checked across the training run and
         checked every X iterations. This is left for future work. Equality of tensors is probably
-        not required; transmitting hashes is sufficient."""
+        not required; transmitting hashes is sufficient.
+        """
 
         if not self.config.qk_layernorm:
             return

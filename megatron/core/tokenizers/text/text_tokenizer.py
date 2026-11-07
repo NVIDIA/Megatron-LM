@@ -153,6 +153,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         Args:
             paths (str | list[str]): path to the jsonl file(s).
             field (str): field name to extract text from jsonl file(s).
+
         Returns:
             ak.Array: an array of tokenized documents.
         """

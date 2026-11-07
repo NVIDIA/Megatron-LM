@@ -42,6 +42,7 @@ class MetadataBase:
         Copy the unpadded tensor to the tensor_buf,
         pad the tensor_buf with zero or the last value of the tensor,
         depending on whether the tensor is cumulative.
+
         Args:
             tensor_buf: The destination tensor, at least padded_batch_size long.
             unpadded_tensor: The tensor to copy, at least real_batch_size long.

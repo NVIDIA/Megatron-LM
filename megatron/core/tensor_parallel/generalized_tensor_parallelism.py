@@ -434,7 +434,8 @@ _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     """Padded send buffer from the registered recycling pool, pad tail zeroed (the RS
-    sends the whole buffer, and a recycled buffer may hold stale rows)."""
+    sends the whole buffer, and a recycled buffer may hold stale rows).
+    """
     buf = symmetric_wgrad_pool.alloc(weight._unsharded_shape_padded, dtype, device, weight.group)
     if weight.pad_length:
         buf[weight._unsharded_shape[0] :].zero_()
@@ -504,7 +505,8 @@ def _close_wgrad_accumulation_windows() -> None:
 
 def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
     """Return a pool-owned buffer for reuse (no-op for untagged buffers; see
-    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight."""
+    _wgrad_pool_get). Pass a recorded event if prior use may still be in flight.
+    """
     if not getattr(buf, "_from_gtp_wgrad_pool", False):
         return
     buf._gtp_wgrad_reuse_event = ready_event
@@ -789,8 +791,8 @@ def gtp_remat_slice_rows(unsharded, gtp_remat_group):
     """Take this rank's GTP_remat rows out of a tensor that is not yet GTP-sharded.
 
     Use this to fill a weight that was **already allocated pre-sharded**; padding matches
-    :func:`gtp_remat_shard_dim0`, so the rows line up with that shard. Unlike
-    :func:`_gtp_slice_one_param`, this returns a plain tensor and replaces nothing.
+    {func}`gtp_remat_shard_dim0`, so the rows line up with that shard. Unlike
+    {func}`_gtp_slice_one_param`, this returns a plain tensor and replaces nothing.
 
     Returns:
         This rank's rows, sized like one GTP shard (padding included).
@@ -858,7 +860,7 @@ def _gtp_attach_attrs(
 
     ``replica_group`` (the caller's gtp_remat-EXCLUDED DP x CP group) is stamped on the param so
     distributed checkpointing can elect a writer without reading the MPU globals; None leaves
-    the checkpoint path on its MPU fallback. See :func:`gtp_replica_rank`.
+    the checkpoint path on its MPU fallback. See {func}`gtp_replica_rank`.
     """
     # DistributedWeight requires implementers stay torch.Tensor subclasses; enforce at construction.
     assert isinstance(gtp_shard, torch.Tensor), (
@@ -880,10 +882,10 @@ def _gtp_attach_attrs(
 
 
 def _gtp_wrap_bf16_shard(module, name, param):
-    """Re-register a BF16 pre-sharded weight as a :class:`GTPShardedParam`.
+    """Re-register a BF16 pre-sharded weight as a {class}`GTPShardedParam`.
 
     The weight already IS this rank's shard (built pre-sharded), so — unlike the post-init path
-    :func:`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
+    {func}`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
     Returns the new param (also swapped into the module).
     """
     from megatron.core.tensor_parallel import (
@@ -933,7 +935,7 @@ def attach_gtp_to_presharded_module(
     """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring.
 
     ``replica_group``: the caller's gtp_remat-excluded DP x CP group
-    (see :func:`_gtp_attach_attrs`).
+    (see {func}`_gtp_attach_attrs`).
     """
     # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
     # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
@@ -1077,7 +1079,7 @@ def gtp_native_fp8_load_context(module):
 
     ``load_state_dict`` does ``param.copy_(bf16)`` -> TE ``convert_and_update_tensor``, whose
     ``IsMXFP8Tensor`` C++ check rejects our dynamic subclass (the load-side twin of
-    :func:`dequantize_gtp_native_fp8`). Presenting the base class lets TE re-quantize into the FP8
+    {func}`dequantize_gtp_native_fp8`). Presenting the base class lets TE re-quantize into the FP8
     storage; instance attrs live in ``__dict__`` and survive the swap, so the GTP surface persists.
     """
     from megatron.core.fp8_utils import is_float8tensor
@@ -1104,11 +1106,11 @@ def wrap_module_params_gtp(
 
     Called post-init for Megatron-style local modules (ColumnParallelLinear, etc.), which build
     the full weight and slice it here. TE modules do NOT use this path — they are constructed
-    already-shard-sized (GTP-agnostic init) and wired via :func:`attach_gtp_to_presharded_module`.
+    already-shard-sized (GTP-agnostic init) and wired via {func}`attach_gtp_to_presharded_module`.
     Params that are already GTP are skipped.
 
     ``replica_group``: the caller's gtp_remat-excluded DP x CP group
-    (see :func:`_gtp_attach_attrs`).
+    (see {func}`_gtp_attach_attrs`).
     """
     if gtp_remat_group.size() == 1:
         return
@@ -1179,8 +1181,8 @@ class GTPShardHandle:
 def _init_gtp_runtime_attrs(obj):
     """Initialize the full GTP runtime-state attribute surface on ``obj``.
 
-    Shared by :meth:`GTPShardedParam.__init__` (legacy BF16 slice path) and
-    :func:`attach_gtp_to_presharded_module` (native-FP8 reclass path), so both param-class
+    Shared by {meth}`GTPShardedParam.__init__` (legacy BF16 slice path) and
+    {func}`attach_gtp_to_presharded_module` (native-FP8 reclass path), so both param-class
     representations carry identical state. chain_id/group are set by the caller afterward.
     """
     # Canonical flag — also set on distopt's main_param copy so both kinds
@@ -2133,7 +2135,8 @@ class GTPShardedParam(torch.nn.Parameter):
         RS send buffer (dtype permitting): direct writes keep the RS send out of the
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
-        _prepare_wgrad_reduce_scatter_inputs."""
+        _prepare_wgrad_reduce_scatter_inputs.
+        """
         return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
@@ -2386,7 +2389,8 @@ class GTPShardedParam(torch.nn.Parameter):
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
         """Reduce-scatter one or more wgrads → (outputs, handle, release_bufs). Single
         tensor: plain RS; multiple: coalesced RS. ``release_bufs`` are the send buffers
-        to free once the collective has been waited on."""
+        to free once the collective has been waited on.
+        """
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
@@ -2692,7 +2696,7 @@ class GTPShardedParam(torch.nn.Parameter):
         return self._peek_gathered_weight(fwd=True)
 
     def peek_group_for_backward(self):
-        """Backward counterpart of :meth:`peek_group_for_forward`."""
+        """Backward counterpart of {meth}`peek_group_for_forward`."""
         return self._peek_gathered_weight(fwd=False)
 
     def finalize_group_grads(self, wgrads, nvtx_label=None):
@@ -3069,7 +3073,8 @@ def grouped_gather_along_first_dim(
     output_tensors: list = None,
 ):
     """All-gather multiple weights in one coalesced op; handles NVFP4 post-processing for both
-    sync and async paths."""
+    sync and async paths.
+    """
     # Determine device from first weight.
     inp = weights[0]
     if isinstance(inp, NVFP4TensorStorage):
@@ -3237,8 +3242,8 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     ``intra_dp_cp_group`` optionally overrides the replica group behind the replica_ids of the
     GTP-REPLICATED entries here (bias / extra_state); it must EXCLUDE the gtp_remat axis. Left
     None, the group is taken from the params themselves. GTP-sharded tensors elect their writer
-    inside :func:`make_tp_sharded_tensor_for_checkpoint`, always off their own stamped group.
-    See :func:`gtp_replica_rank`.
+    inside {func}`make_tp_sharded_tensor_for_checkpoint`, always off their own stamped group.
+    See {func}`gtp_replica_rank`.
     """
     from megatron.core.transformer.utils import (  # noqa: E402
         make_sharded_object_for_checkpoint,

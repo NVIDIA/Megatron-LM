@@ -2,7 +2,8 @@
 
 """Framework-agnostic primitives for heterogeneous inference sharding: build a
 ``ProcessGroupCollection`` per shard, each over a contiguous rank window at its
-own parallelism."""
+own parallelism.
+"""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union
@@ -50,9 +51,9 @@ def build_inference_pg_collection(
         ProcessGroupCollection configured for the inference model. On ranks
         outside the ``[rank_offset, rank_offset + world_size)`` window every
         process-group field is a non-member sentinel returned by
-        :func:`torch.distributed.new_subgroups_by_enumeration` — callers should
+        {func}`torch.distributed.new_subgroups_by_enumeration` — callers should
         not use that instance; see
-        :func:`build_inference_pg_collections_for_shards` for the right way to
+        {func}`build_inference_pg_collections_for_shards` for the right way to
         filter.
     """
     if tp_size is None:
@@ -175,7 +176,7 @@ class InferenceShard:
     window, and this rank's process groups for it.
 
     Attributes:
-        spec: This shard's :class:`~megatron.core.inference.shards_spec.InferenceShardSpec`
+        spec: This shard's {class}`~megatron.core.inference.shards_spec.InferenceShardSpec`
             (``tp``/``pp``/``ep``/``expt_tp``/``dp`` and optional
             ``role`` = ``prefill``/``decode``).
         rank_offset: First global rank belonging to this shard.
@@ -209,7 +210,7 @@ def build_inference_pg_collections_for_shards(
     ``[offset_i, offset_i + tp_i*pp_i*dp_i)``.
 
     Every rank must call this function so the collective ``dist.new_group``
-    calls inside :func:`build_inference_pg_collection` succeed for every shard.
+    calls inside {func}`build_inference_pg_collection` succeed for every shard.
     The returned ``pg_collection`` is populated only on ranks belonging to
     that shard; others see ``None``.
 
@@ -217,12 +218,12 @@ def build_inference_pg_collections_for_shards(
         total_world_size: Full world size across training + all inference
             shards.
         shards: Shard layout in any form ``normalize_shard_specs`` accepts -- a
-            spec string, a list of :class:`InferenceShardSpec`, or a list of
+            spec string, a list of {class}`InferenceShardSpec`, or a list of
             raw dicts. Normalized internally to validated specs.
         use_tp_pp_dp_mapping: Passed through to ``build_inference_pg_collection``.
 
     Returns:
-        List of :class:`InferenceShard`, one per input spec.
+        List of {class}`InferenceShard`, one per input spec.
     """
     specs = normalize_shard_specs(shards, total_world_size)
     rank = dist.get_rank()

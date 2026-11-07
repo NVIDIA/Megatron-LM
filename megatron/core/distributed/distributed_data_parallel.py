@@ -104,7 +104,6 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
             dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
             instead of computing a default one.
-
     """
 
     @staticmethod
@@ -655,7 +654,7 @@ class DistributedDataParallel(_BaseDataParallel):
         """Dispatch one bucket group's param all-gather + run the FP8 / MXFP8 / FP4
         post-all-gather work the synchronous path needs.
 
-        Factored out of :meth:`start_param_sync` so callers that own a subset
+        Factored out of {meth}`start_param_sync` so callers that own a subset
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.

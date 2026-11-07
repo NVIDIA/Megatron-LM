@@ -3793,6 +3793,7 @@ class ParamAndGradBuffer:
 
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3824,6 +3825,7 @@ class ParamAndGradBuffer:
 
     def reduce_scatter_gradients(self, async_op: bool = True):
         """Reduce scatter the gradients.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3865,6 +3867,7 @@ class ParamAndGradBuffer:
 
     def all_reduce_gradients(self, async_op: bool = False):
         """All reduce the gradients.
+
         Args:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
@@ -3928,8 +3931,7 @@ def _create_hfsdp_helper_buffer(
     inner_dp_group: torch.distributed.ProcessGroup,
     is_data_distributed: bool,
 ) -> DataParallelBuffer:
-    """
-    Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
+    """Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
 
     This helper buffer mirrors the metadata of the original fully
     `dp_buffer` (bucket config, params, allocator, etc.), but binds it to
@@ -3939,24 +3941,18 @@ def _create_hfsdp_helper_buffer(
     global bucket, while still sharing the same logical bucket indexing
     (`bucket_index`) with the fully DP buffer.
 
-    Parameters
-    ==========
-    dp_buffer : DataParallelBuffer
-        The existing fully data-parallel buffer whose configuration
-        and bucket layout should be mirrored.
-    inner_dp_group : torch.distributed.ProcessGroup
-        The process group representing the inner-DP (HFSDP) data-parallel
-        group for this helper buffer.
-    is_data_distributed : bool
-        Whether the underlying data in this helper buffer is sharded
-        across ranks in `inner_dp_group`.
+    Args:
+        dp_buffer (DataParallelBuffer): The existing fully data-parallel buffer whose configuration
+            and bucket layout should be mirrored.
+        inner_dp_group (torch.distributed.ProcessGroup): The process group representing the inner-DP
+            (HFSDP) data-parallel group for this helper buffer.
+        is_data_distributed (bool): Whether the underlying data in this helper buffer is sharded
+            across ranks in `inner_dp_group`.
 
-    Returns
-    =======
-    DataParallelBuffer
-        A new DataParallelBuffer configured as the HFSDP helper buffer
-        for the given `inner_dp_group`, sharing the same bucket index
-        as `dp_buffer` but with an inner-DP `shard_bucket_index`.
+    Returns:
+        DataParallelBuffer: A new DataParallelBuffer configured as the HFSDP helper buffer for the
+            given `inner_dp_group`, sharing the same bucket index as `dp_buffer` but with an
+            inner-DP `shard_bucket_index`.
     """
     helper_buffer = DataParallelBuffer(
         dp_buffer.ddp_config,
@@ -3996,8 +3992,7 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     mem_alloc: Callable[[torch.dtype, int], torch.Tensor],
     outer_dp_group: torch.distributed.ProcessGroup,
 ) -> None:
-    """
-    Initialize storage for the HFSDP helper buffer and its corresponding
+    """Initialize storage for the HFSDP helper buffer and its corresponding
     fully-DP DataParallelBuffer view.
 
     The helper buffer is allocated as a single contiguous tensor that
@@ -4006,21 +4001,16 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     through `dp_buffer`, so the fully-DP buffer becomes a view into the helper
     buffer rather than owning separate storage.
 
-    Parameters
-    ==========
-    hfsdp_helper_buffer : DataParallelBuffer
-        The HFSDP helper buffer that owns the full inner-/outer-DP bucket
-        storage.
-    dp_buffer : DataParallelBuffer
-        The fully-DP DataParallelBuffer that should view its local shard
-        from `hfsdp_helper_buffer`.
-    mem_alloc : Callable[[torch.dtype, int], torch.Tensor]
-        Allocation function used to create the backing tensor for the
-        helper buffer (dtype, numel).
-    outer_dp_group : torch.distributed.ProcessGroup
-        Process group for the outer data-parallel dimension. Its rank and
-        world size determine which slice of the helper buffer this rank
-        sees through `dp_buffer`.
+    Args:
+        hfsdp_helper_buffer (DataParallelBuffer): The HFSDP helper buffer that owns the full
+            inner-/outer-DP bucket storage.
+        dp_buffer (DataParallelBuffer): The fully-DP DataParallelBuffer that should view its local
+            shard from `hfsdp_helper_buffer`.
+        mem_alloc (Callable[[torch.dtype, int], torch.Tensor]): Allocation function used to create
+            the backing tensor for the helper buffer (dtype, numel).
+        outer_dp_group (torch.distributed.ProcessGroup): Process group for the outer data-parallel
+            dimension. Its rank and world size determine which slice of the helper buffer this rank
+            sees through `dp_buffer`.
     """
     # Allocate contiguous storage for all outer-DP shards in the helper buffer.
     hfsdp_helper_buffer.init_data(
@@ -4130,6 +4120,7 @@ class GradReducePipeline:
         outer_fsdp_group_grad_reduce: bool = False,
     ):
         """Reduce the gradients for the given parameters.
+
         Args:
             params (List[torch.Tensor]): The parameters.
             suggested_queue_capacity (int, optional): The suggested queue capacity.
@@ -4172,6 +4163,7 @@ class GradReducePipeline:
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
+
         Args:
             suggested_queue_size (int, optional): The recommended queue size in
                 buckets. Defaults to 1.
@@ -4266,11 +4258,13 @@ class GradReducePipeline:
     ) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
+
         Args:
             bucket_id (int): The bucket to be marked.
             bucket_group (List[int]): The bucket group to be reduced.
             async_op (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
+
         Returns:
             bool: True if the bucket is go for reduce-scatter/all-reduce.
         """
@@ -4721,7 +4715,8 @@ class AllGatherPipeline:
         """Extend a bucket list using the communication-size heuristic. Buckets that need
         neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
         stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
-        group added may exceed it."""
+        group added may exceed it.
+        """
         parameter_groups = self.buffer.parameter_groups
         allgathered_bucket_ids = set(bucket_ids)
 
@@ -4879,7 +4874,8 @@ class AllGatherPipeline:
     def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
         """Record the buckets whose row-wise weights a recomputed forward re-gathered.
         Buckets without a transpose buffer use the same weights in forward and backward.
-        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units.
+        """
         if self.buffer.ddp_config.fsdp_double_buffer:
             return
         parameter_groups = self.buffer.parameter_groups
@@ -4891,7 +4887,8 @@ class AllGatherPipeline:
 
     def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
         """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
-        not already gathered, so that their recomputed forward does not wait on them."""
+        not already gathered, so that their recomputed forward does not wait on them.
+        """
         pending = [
             bucket_id
             for bucket_id in bucket_ids
@@ -4920,7 +4917,8 @@ class AllGatherPipeline:
     ) -> List[int]:
         """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
         them, as described in `all_gather_params`. Return all of these bucket IDs, including
-        those that were already gathered."""
+        those that were already gathered.
+        """
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
@@ -5243,9 +5241,11 @@ def _check_nan_in_grad(grad: torch.Tensor):
 def check_gpu_memory(threshold=0.9):
     """
     Check if the GPU memory is over the threshold.
+
     Args:
         threshold (float, optional): The threshold to check if the GPU memory is over.
             Defaults to 0.9.
+
     Returns:
         bool: True if the GPU memory is over the threshold.
     """
@@ -5320,6 +5320,7 @@ class ResetParametersContext:
 def override_sharded_param_methods_with_safety_checks(params, all_gather_pipeline):
     """
     Override the methods of the parameters to prevent undefined behavior.
+
     Args:
         params (List[torch.Tensor]): The parameters to add hint on shard to functions.
         all_gather_pipeline (AllGatherPipeline): The all-gather pipeline.
@@ -5365,6 +5366,7 @@ def _dtype_size(dtype: torch.dtype) -> int:
 
     Args:
         dtype (torch.dtype): The dtype to get the size of.
+
     Returns:
         int: The size of the dtype.
     """
@@ -5391,8 +5393,10 @@ def _dtype_size(dtype: torch.dtype) -> int:
 def to_local_if_dtensor(tensor):
     """
     Convert a DTensor to a local tensor.
+
     Args:
         tensor (torch.Tensor): The tensor to convert.
+
     Returns:
         torch.Tensor: The local tensor.
     """

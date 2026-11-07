@@ -1392,7 +1392,7 @@ def _triton_pre_gated_delta_rule_backward(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Triton-backed backward for the pre-gated-delta-rule front-end.
 
-    Mirror of :func:`_triton_pre_gated_delta_rule_forward`. Takes upstream
+    Mirror of {func}`_triton_pre_gated_delta_rule_forward`. Takes upstream
     gradients (``dq``/``dk``/``dv``/``dgate``/``dbeta``/``dg``) plus the
     saved forward intermediates and returns input/parameter gradients
     ``(d_qkvzba, d_weight, d_A_log, d_dt_bias)``.
@@ -1529,11 +1529,11 @@ def _triton_pre_gated_delta_rule_backward(
 
 
 class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
-    """Thin :class:`torch.autograd.Function` wrapper around the fused path.
+    """Thin {class}`torch.autograd.Function` wrapper around the fused path.
 
     Stashes the forward inputs + the saved ``silu_qk_save`` intermediate
-    in ``ctx`` and dispatches to :func:`_triton_pre_gated_delta_rule_forward`
-    / :func:`_triton_pre_gated_delta_rule_backward`. The actual kernel
+    in ``ctx`` and dispatches to {func}`_triton_pre_gated_delta_rule_forward`
+    / {func}`_triton_pre_gated_delta_rule_backward`. The actual kernel
     logic lives in those two free functions so it's easy to read and
     reuse outside the autograd machinery.
     """
@@ -1646,7 +1646,7 @@ def fused_streamed_pre_gated_delta_rule(
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
-        :meth:`GatedDeltaNet.pre_gated_delta_rule` API.
+        {meth}`GatedDeltaNet.pre_gated_delta_rule` API.
     """
 
     if causal_conv1d_bwd_function is None:

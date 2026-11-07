@@ -68,7 +68,8 @@ except ImportError:
 
 class TrainingState(Enum):
     """States of a FSDP parameter group, which are coupled with
-    the sharding activity of parameters and gradients during training."""
+    the sharding activity of parameters and gradients during training.
+    """
 
     # From pre-forward before post-forward, where parameters should be unsharded
     FORWARD = auto()
@@ -188,7 +189,7 @@ class MegatronFSDP(torch.nn.Module):
         fine_grained_recurse_module_types (Optional[Tuple[Type[nn.Module], ...]]):
             Module classes for which fine-grained pre-forward / pre-backward unshard uses
             ``parameters(recurse=True)`` (container modules whose sharded weights live on
-            children). Checked with :func:`isinstance`. Defaults to empty (none).
+            children). Checked with {func}`isinstance`. Defaults to empty (none).
         report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
             Can significantly degrade performance. Defaults to False.
 

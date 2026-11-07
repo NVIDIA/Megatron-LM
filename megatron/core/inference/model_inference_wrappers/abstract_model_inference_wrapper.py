@@ -94,7 +94,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         The function gets called once before the auto regressive inference loop.
         It puts the model in eval mode.
-
         """
         self.model.eval()
 
@@ -213,7 +212,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         This function gets called iteratively in the inference loop.
         It can be used to extract relevant input from the prompt tokens, attention mask etc.
         required for each step in inference.
-
         """
         raise NotImplementedError()
 

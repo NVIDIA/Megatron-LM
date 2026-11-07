@@ -40,12 +40,14 @@ class MimoEncoderFloat16Module(Float16Module):
 class MimoModel(MegatronModule):
     """Multimodal In/Out Model supporting arbitrary combinations of modalities.
 
-    .. warning::
-        **EXPERIMENTAL**: This class is experimental, still under active development,
-        and the API is subject to change without notice. Use at your own risk.
+    ```{warning}
+    **EXPERIMENTAL**: This class is experimental, still under active development,
+    and the API is subject to change without notice. Use at your own risk.
+    ```
 
-    .. note::
-        This implementation is in development and may undergo API changes.
+    ```{note}
+    This implementation is in development and may undergo API changes.
+    ```
 
 
     This model processes multiple modalities (e.g., vision, audio) alongside text,
@@ -565,6 +567,7 @@ class MimoModel(MegatronModule):
         text_token_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Get embeddings for text tokens in the input.
+
         Args:
             input_ids: Input token IDs. Shape: (B, S)
                 Contains text tokens and potentially special tokens for other modalities.

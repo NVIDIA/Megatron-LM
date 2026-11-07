@@ -2,15 +2,16 @@
 
 """Model and data parallel groups.
 
-.. warning::
-    **This module is being deprecated.** It holds the process groups for a single, global
-    parallel grid. Megatron-Core is migrating to explicit process-group passing via
-    :class:`~megatron.core.process_groups_config.ProcessGroupCollection`.
+```{warning}
+**This module is being deprecated.** It holds the process groups for a single, global
+parallel grid. Megatron-Core is migrating to explicit process-group passing via
+{class}`~megatron.core.process_groups_config.ProcessGroupCollection`.
 
-    The group / rank / world-size accessors here read that global grid. A model using an
-    independent grid, such as an encoder with different parallelism from its language model,
-    can receive a group or rank from the wrong grid, or fail if the globals are uninitialized.
-    Passing the owning model's groups explicitly avoids that dependency.
+The group / rank / world-size accessors here read that global grid. A model using an
+independent grid, such as an encoder with different parallelism from its language model,
+can receive a group or rank from the wrong grid, or fail if the globals are uninitialized.
+Passing the owning model's groups explicitly avoids that dependency.
+```
 
     What this means for a change you are writing:
 
@@ -237,6 +238,7 @@ def update_pg_timeout(
 ):
     """Update the timeout for all process groups or a specific process group.
        Synchronize the process groups before updating the timeout.
+
     Args:
         timeout(datetime.timedelta): The timeout to set for the process group(s)
         pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
@@ -614,7 +616,8 @@ class RankGenerator(object):
 
 def default_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the word embeddings live.
-    For most models, these are the first and last pipeline stages."""
+    For most models, these are the first and last pipeline stages.
+    """
     if len(pp_ranks) == 1:
         return [pp_ranks[0]]
     else:
@@ -623,7 +626,8 @@ def default_embedding_ranks(pp_ranks):
 
 def default_position_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the position embeddings live.
-    For most models, this is only the first pipeline stage."""
+    For most models, this is only the first pipeline stage.
+    """
     return [pp_ranks[0]]
 
 
@@ -2137,7 +2141,7 @@ def get_dynamic_data_context_parallel_groups(
 def get_hybrid_data_context_parallel_groups(
     check_initialized: bool = True, group_size: Optional[int] = None
 ) -> torch.distributed.ProcessGroup:
-    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
+    """Deprecated alias for {func}`get_dynamic_data_context_parallel_groups`."""
     warnings.warn(
         "get_hybrid_data_context_parallel_groups is deprecated; use "
         "get_dynamic_data_context_parallel_groups instead.",
@@ -3023,7 +3027,8 @@ def destroy_global_memory_buffer():
 
 def get_all_ranks():
     """Get caller's rank in tensor-model-parallel, data-parallel, context-parallel,
-    pipeline-model-parallel and expert-model-parallel groups."""
+    pipeline-model-parallel and expert-model-parallel groups.
+    """
     ranks = [
         get_tensor_model_parallel_rank(),
         get_gtp_weight_remat_rank(),

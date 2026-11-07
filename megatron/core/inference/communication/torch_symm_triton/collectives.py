@@ -37,7 +37,6 @@ def _ag_phase(
 
     Each thread handles 128-bit (NUMEL_PER_THREAD elements) at a time.
     byte_offset locates the tensor within the multicast buffer.
-
     """
     pid = tl.program_id(axis=0)
     tid = get_flat_tid()

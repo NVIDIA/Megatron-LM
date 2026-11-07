@@ -2541,13 +2541,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     def grow_ep_recv_capacity(self, new_capacity: int) -> None:
         """Grow the backend's receive budget to ``new_capacity`` so an overflowed step can be
-        replayed without dropping. No-op unless the backend supports it."""
+        replayed without dropping. No-op unless the backend supports it.
+        """
         if hasattr(self._comm_manager, 'grow_recv_capacity'):
             self._comm_manager.grow_recv_capacity(new_capacity)
 
     def invalidate_ep_bootstrap(self) -> None:
         """Force the backend to re-bootstrap on its next dispatch. Call after changing the mode:
-        every manager must re-derive it, not just the one that happens to dispatch first."""
+        every manager must re-derive it, not just the one that happens to dispatch first.
+        """
         if hasattr(self._comm_manager, '_bootstrapped'):
             self._comm_manager._bootstrapped = False
 
