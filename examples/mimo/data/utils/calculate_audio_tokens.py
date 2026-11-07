@@ -63,3 +63,43 @@ def calculate_num_audio_tokens(audio_tensor, model_name):
         raise ValueError(f"Unsupported model type: {model_type}")
 
     return max(1, int(encoder_seq_length))
+
+
+def capped_whisper_lengths(audio_length, model_name="openai/whisper-base", feature_time=None):
+    """Mel frames and encoder tokens after the 30 s Whisper cap.
+
+    ``calculate_num_mel_frames`` is unchanged. Mel is then capped at
+    ``max_length_seconds * sample_rate // hop`` and at ``feature_time``.
+    """
+    if model_name not in AUDIO_MODEL_PARAMS:
+        raise ValueError(f"Unsupported model name: {model_name}")
+    model_params = SimpleNamespace(**AUDIO_MODEL_PARAMS[model_name])
+    hop = int(model_params.window_stride * model_params.sample_rate)
+    mel_cap = int(model_params.max_length_seconds * model_params.sample_rate) // hop
+    mel = calculate_num_mel_frames(
+        audio_length, model_params.sample_rate, model_params.window_stride
+    )
+    mel = min(int(mel), mel_cap)
+    if feature_time is not None:
+        mel = min(mel, int(feature_time))
+    tokens = max(1, math.ceil(mel / model_params.encoder_down_sampling))
+    return mel, tokens
+
+
+def expand_audio_placeholders(prompt: str, counts) -> str:
+    """Replace each ``<audio>`` once. Do not use ``str.replace`` on the token."""
+    parts = prompt.split("<audio>")
+    counts = list(counts)
+    if len(parts) != len(counts) + 1:
+        raise ValueError(
+            f"audio placeholder count {len(parts) - 1} != clip count {len(counts)}"
+        )
+    return parts[0] + "".join("<audio>" * n + parts[i + 1] for i, n in enumerate(counts))
+
+
+def stack_or_cat(values):
+    """Stack a shared clip shape. Concatenate a variable number of clips."""
+    first = values[0]
+    if first.ndim in (1, 3):
+        return torch.cat(values, dim=0)
+    return torch.stack(values, dim=0)
