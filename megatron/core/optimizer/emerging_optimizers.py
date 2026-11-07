@@ -151,6 +151,10 @@ def _is_nonlinear_or_embedding(param):
 
 def _is_muon_excluded(param):
     """True for parameters that should use the scalar optimizer instead of Muon."""
+    if getattr(param, 'muon_matrix_shape', None) is not None:
+        return not getattr(param, 'use_muon', True) or getattr(
+            param, 'is_embedding_or_output_parameter', False
+        )
     return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
 
 
@@ -891,6 +895,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+
+        matrix_shape = getattr(p, 'muon_matrix_shape', None)
+        if matrix_shape is not None:
+            # Grouped DSv4 projections are TP-replicated. Flattening only for NS
+            # preserves their original matrix update, while TE and checkpoints
+            # retain their respective 3D runtime and 2D checkpoint layouts.
+            if partition_dim is not None or getattr(p, 'is_gtp_weight_remat', False):
+                raise ValueError('muon_matrix_shape requires an unsharded parameter')
+            return self.scaled_orthogonalize_fn(
+                grad.reshape(matrix_shape), tp_group, None
+            ).reshape_as(grad)
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # Preserve dev's explicit split-QKV contract for every TP mode. GTP shards
