@@ -58,9 +58,16 @@ def _saved_indices(iteration: int, dp_rank: int, *, mbs: int, dp: int, gbs: int)
     return torch.tensor(sample_ids, dtype=torch.long).view(1, -1, 1)
 
 
-def _write_v2_cache(root: Path, *, mbs: int, dp: int, gbs: int, iterations: int) -> None:
+def _write_v2_cache(
+    root: Path, *, mbs: int, dp: int, gbs: int, iterations: int, format_version: int = 2
+) -> None:
     metadata = {
-        "saver": {"format_version": 2, "mbs_save": mbs, "dp_size_save": dp, "gbs_save": gbs}
+        "saver": {
+            "format_version": format_version,
+            "mbs_save": mbs,
+            "dp_size_save": dp,
+            "gbs_save": gbs,
+        }
     }
     for dp_rank in range(dp):
         members = {}
@@ -71,10 +78,12 @@ def _write_v2_cache(root: Path, *, mbs: int, dp: int, gbs: int, iterations: int)
                 f"{iteration * gbs}-{(iteration + 1) * gbs}" f"{LOGPROBS_TAR_MEMBER_SUFFIX}"
             ] = _torch_save_bytes(
                 {
-                    "values": torch.zeros_like(indices, dtype=torch.float32),
+                    "reference_values" if format_version >= 3 else "values": torch.zeros_like(
+                        indices, dtype=torch.float32
+                    ),
                     "indices_low": indices_low,
                     "bit_17": bit_17,
-                    "format_version": 2,
+                    "format_version": format_version,
                 }
             )
         _write_tar(root / f"dp{dp_rank}__0-{iterations * gbs}.tar", metadata, members)
@@ -136,7 +145,7 @@ def _assert_dataset_indices(
     ("dp_save", "dp_load", "gbs"),
     [(4, 4, 24), (4, 8, 24), (8, 4, 24), (4, 6, 24), (6, 4, 24), (3, 5, 30), (5, 3, 30)],
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3, 4])
 def test_dataset_dp_resharding_preserves_global_indices(
     tmp_path, monkeypatch, dp_save, dp_load, gbs, format_version
 ):
@@ -144,7 +153,14 @@ def test_dataset_dp_resharding_preserves_global_indices(
     if format_version == 1:
         _write_v1_cache(tmp_path, mbs=1, dp=dp_save, gbs=gbs, iterations=iterations)
     else:
-        _write_v2_cache(tmp_path, mbs=1, dp=dp_save, gbs=gbs, iterations=iterations)
+        _write_v2_cache(
+            tmp_path,
+            mbs=1,
+            dp=dp_save,
+            gbs=gbs,
+            iterations=iterations,
+            format_version=format_version,
+        )
     _assert_dataset_indices(
         tmp_path,
         monkeypatch,
@@ -296,6 +312,7 @@ def _bare_kd_loss(dataloader_items):
     loss._microbatch_counter = 0
     loss._current_values = None
     loss._current_indices = None
+    loss._cache_format_version = 2
     return loss
 
 
@@ -372,13 +389,13 @@ def test_init_dataloader_rejects_partial_global_batch(monkeypatch):
         loss._init_dataloader(12)
 
 
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3, 4])
 def test_dataset_yields_global_start_sample_when_resuming(tmp_path, monkeypatch, format_version):
     gbs = 8
     if format_version == 1:
         _write_v1_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3)
     else:
-        _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3)
+        _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3, format_version=format_version)
     args = SimpleNamespace(micro_batch_size=1, global_batch_size=gbs)
     monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
 
