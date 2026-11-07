@@ -456,22 +456,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         We call this kernel from within row parallel linear layers.
         But layer-norm needs the layer norm weights from the
         successive column parallel linear layer.
-        This function is used to pass those weights to the respective layers.
+        This function gives each row parallel linear layer that successive layer, whose
+        norm weights it reads on every forward.
         """
 
         for i in range(len(self.layers)):
             current_layer = self.layers[i]
 
-            # Get next layer's QKV norm weights (None for last layer)
+            # Get next layer's QKV linear, which applies its input norm (None for last layer)
             if i < len(self.layers) - 1:
-                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+                next_qkv_layer_norm_linear = self.layers[i + 1].get_qkv_layer_norm_linear()
             else:
-                next_qkv_norm_weights = None
+                next_qkv_layer_norm_linear = None
 
             # Configure all fused TP communication settings in one call
             current_layer.configure_fused_tp_inference(
                 skip_qkv_norm_and_all_gather=(i > 0),
-                fc2_next_layer_norm_weights=next_qkv_norm_weights,
+                fc2_next_layer_norm_linear=next_qkv_layer_norm_linear,
             )
 
     def _get_layer(self, layer_number: int):
