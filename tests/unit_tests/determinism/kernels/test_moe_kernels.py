@@ -76,6 +76,16 @@ from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
 
+class _InInferenceMode(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        with InferenceMode.active():
+            return self.module(*args, **kwargs)
+
+
 # --- virtual-expert planning ----------------------------------------------------------------
 
 
@@ -1257,21 +1267,11 @@ class TestMoEModules:
     def test_inference_nvfp4_moe_layer_replays(self, gated):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
         from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
-        from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
-
-        class _InInferenceMode(torch.nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-
-            def forward(self, hidden):
-                with InferenceMode.active():
-                    return self.module(hidden)
 
         self._init(ep=1)
         seeded()

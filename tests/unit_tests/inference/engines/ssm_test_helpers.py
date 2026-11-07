@@ -14,7 +14,9 @@ import torch
 
 from megatron.core.inference.config import MambaInferenceStateConfig
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_inference_stack_spec,
     gated_delta_product_stack_spec,
+    hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
@@ -59,9 +61,15 @@ def hybrid_mixer_kwargs(ssm_mixer):
     return dict(mamba_num_heads=16)
 
 
-def hybrid_stack_spec_for(ssm_mixer):
+def hybrid_stack_spec_for(ssm_mixer, inference_optimized=False):
     """The stack spec that builds the requested mixer."""
-    return gated_delta_product_stack_spec if ssm_mixer == "gdp" else hybrid_stack_spec
+    if ssm_mixer == "gdp":
+        return (
+            gated_delta_product_inference_stack_spec
+            if inference_optimized
+            else gated_delta_product_stack_spec
+        )
+    return hybrid_inference_stack_spec if inference_optimized else hybrid_stack_spec
 
 
 def ssm_state_config(model):
