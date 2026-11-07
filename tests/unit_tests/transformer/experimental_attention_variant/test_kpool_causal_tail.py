@@ -314,6 +314,25 @@ def test_kpool_chunked_topk_with_no_complete_pool():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("return_index_scores", [False, True])
+def test_kpool_empty_query_keeps_fixed_width(return_index_scores):
+    scores, indices = fused_qk_topk_kpool(
+        torch.empty(0, 1, 2, 128),
+        torch.empty(7, 1, 128),
+        torch.empty(0, 1, 2),
+        2048,
+        4,
+        torch.empty(7, 1, 128),
+        torch.empty(4, 128),
+        return_index_scores=return_index_scores,
+    )
+    assert indices.shape == (1, 0, 2051)
+    if return_index_scores:
+        assert scores.shape == (1, 0, 1)
+    else:
+        assert scores is None
+
+
 def test_compute_index_scores_preserves_autograd_graph():
     torch.manual_seed(460)
     q = torch.randn(3, 1, 2, 4, requires_grad=True)
