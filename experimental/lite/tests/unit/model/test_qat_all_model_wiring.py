@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 MODEL_ROOT = Path(__file__).parents[3] / "megatron" / "lite" / "model"
-MODEL_NAMES = ("qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2")
+MODEL_NAMES = ("qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2", "minimax_m3")
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)

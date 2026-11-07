@@ -55,6 +55,26 @@ def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
         )
 
 
+class _RouterGate(nn.Linear):
+    """Router weight ``[num_experts, hidden]`` whose GEMM runs in this module's own forward.
+
+    Calling the module (instead of a functional GEMM on ``gate.weight`` from the router) lets
+    module-forward hooks see the weight: Megatron-Core DDP's forward pre-hook, which waits for the
+    overlapped parameter all-gather of the distributed optimizer, only covers parameters of the
+    module being called. ``router_dtype`` selects the high-precision router GEMM.
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int):
+        super().__init__(hidden_size, num_experts, bias=False)
+
+    def forward(
+        self, x: torch.Tensor, router_dtype: torch.dtype | None = None, use_te_gemm: bool = True
+    ) -> torch.Tensor:
+        if router_dtype is None:
+            return super().forward(x)
+        return router_gating_linear(x, self.weight, None, router_dtype, use_te_gemm=use_te_gemm)
+
+
 class TopKRouter(nn.Module):
     """TopK gating with optional high-precision router logits/probabilities."""
 
@@ -85,7 +105,7 @@ class TopKRouter(nn.Module):
         self.router_dtype = router_dtype
         self.router_replay: RouterReplay | None = None
 
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.gate = _RouterGate(config.hidden_size, config.num_experts)
         self.register_buffer(
             "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
         )
@@ -93,8 +113,7 @@ class TopKRouter(nn.Module):
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        router_dtype = self.router_dtype or x.dtype
-        logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
+        logits = self.gate(x, self.router_dtype or x.dtype)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         if self.moe_router_fusion:
@@ -177,6 +196,8 @@ class SigmoidTopKRouter(nn.Module):
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
         expert_bias_persistent: bool = False,
+        router_te_gemm: bool = True,
+        gate_weight_fp32: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -199,9 +220,13 @@ class SigmoidTopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.router_te_gemm = router_te_gemm
+        # Keep the gate weight (and so its gradient and optimizer master) in fp32
+        # across model-wide dtype casts, as checkpoints store it.
+        self.gate_weight_fp32 = gate_weight_fp32
         self.router_replay: RouterReplay | None = None
 
-        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.gate = _RouterGate(config.hidden_size, config.n_routed_experts)
         self.register_buffer(
             "expert_bias",
             torch.zeros(config.n_routed_experts, dtype=torch.float32),
@@ -213,19 +238,12 @@ class SigmoidTopKRouter(nn.Module):
     def _apply(self, fn):
         super()._apply(fn)
         self.expert_bias.data = self.expert_bias.data.float()
+        if self.gate_weight_fp32:
+            self.gate.weight.data = self.gate.weight.data.float()
         return self
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = (
-            self.gate(x)
-            if self.router_dtype is None
-            else router_gating_linear(
-                x,
-                self.gate.weight,
-                None,
-                self.router_dtype,
-            )
-        )
+        logits = self.gate(x, self.router_dtype, self.router_te_gemm)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         routing_kwargs = {}

@@ -39,10 +39,19 @@ MODEL_PACKAGE_PREFIXES = (
     "megatron.lite.model.deepseek_v4",
     "megatron.lite.model.glm5",
     "megatron.lite.model.kimi_k2",
+    "megatron.lite.model.minimax_m3",
     "megatron.lite.model.qwen3_5",
     "megatron.lite.model.qwen3_moe",
 )
-MODEL_NAME_TERMS = {"deepseek_v4", "glm5", "kimi_k2", "qwen3", "qwen3_5", "qwen3_moe"}
+MODEL_NAME_TERMS = {
+    "deepseek_v4",
+    "glm5",
+    "kimi_k2",
+    "minimax_m3",
+    "qwen3",
+    "qwen3_5",
+    "qwen3_moe",
+}
 DENIED_IMPORT_PREFIXES = {
     "bench": ("examples.verl", "megatron.lite.model", "verl", "verl_mlite"),
     "runtime": ("examples", *MODEL_PACKAGE_PREFIXES, "verl", "verl_mlite"),
