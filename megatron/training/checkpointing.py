@@ -2620,6 +2620,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     if not hasattr(checkpoint_args, 'gdp_num_householder'):
         setattr(checkpoint_args, 'gdp_num_householder', 3)
     _set_arg('gdp_num_householder', force=True)
+    # Restore the saved numerical policy when using checkpoint args, but allow an
+    # explicit CLI value to enable or adjust it when resuming an older checkpoint.
+    _set_arg('gdp_g_clamp_value')
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')

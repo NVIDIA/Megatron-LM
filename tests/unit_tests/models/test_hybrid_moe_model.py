@@ -164,6 +164,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "gdn_kernel_backend": "fla",
     "gdp_cutedsl_kernel": False,
+    "gdp_g_clamp_value": None,
     "gdp_num_chunk_states_to_recompute": 2,
     "gdp_num_householder": 3,
     "gtp_remat_opt_in_modules": [],
