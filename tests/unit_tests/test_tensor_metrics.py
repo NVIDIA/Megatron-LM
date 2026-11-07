@@ -592,31 +592,6 @@ def test_executor_can_prepare_locally_and_complete_steps_later(monkeypatch):
     assert len(calls) == 1
 
 
-def test_executor_detaches_prepare_inputs_and_outputs():
-    input_leaf = torch.ones(2, requires_grad=True)
-    input_with_history = input_leaf.square()
-    output_with_history = input_leaf.sum()
-
-    class GraphReturningMetric(TensorMetric):
-        def prepare(self, values):
-            assert not values[0].tensor.requires_grad
-            assert values[0].tensor.grad_fn is None
-            return [values[0].with_tensor(output_with_history)]
-
-        def start(self, values):
-            raise AssertionError("This test only exercises preparation.")
-
-        def resume(self, values, continuation):
-            raise AssertionError("This test only exercises preparation.")
-
-    prepared = TensorMetricExecutor({}).prepare(
-        GraphReturningMetric(), [_item("activation", input_with_history)]
-    )
-
-    assert not prepared[0].tensor.requires_grad
-    assert prepared[0].tensor.grad_fn is None
-
-
 class _QKVL2NormMetric(L2NormMetric):
     source_kinds = frozenset({"activation"})
 

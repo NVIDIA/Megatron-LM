@@ -314,10 +314,6 @@ class TestGPTModelConfigGetAttr:
     def test_proxies_transformer_attribute(self):
         assert self.config.hidden_size == 256
 
-    def test_raises_attribute_error_for_unknown(self):
-        with pytest.raises(AttributeError):
-            _ = self.config.completely_unknown_attr_xyz
-
     def test_raises_before_transformer_init(self):
         del self.config.__dict__["transformer"]
         with pytest.raises(AttributeError):

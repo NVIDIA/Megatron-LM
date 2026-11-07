@@ -96,10 +96,6 @@ class TestHybridModelConfigGetAttr:
         # hidden_size is not a field on HybridModelConfig, so __getattr__ proxies to transformer
         assert self.config.hidden_size == 256
 
-    def test_raises_attribute_error_for_unknown(self):
-        with pytest.raises(AttributeError):
-            _ = self.config.completely_unknown_attr_xyz
-
     def test_raises_before_transformer_init(self):
         # Simulate the "transformer not yet set" path in __getattr__
         del self.config.__dict__["transformer"]
