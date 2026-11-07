@@ -4,11 +4,16 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.optimizer.clip_grads import count_zeros_fp32, get_grad_norm_fp32
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import CrossAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 """ 
@@ -132,3 +137,87 @@ class TestDotProductAttentionSoftcap:
         assert (without - wrong).abs().max() > 1e-3, "inputs do not separate the two caps"
 
         torch.testing.assert_close(with_scaling, without, rtol=1e-2, atol=1e-2)
+
+
+class TestLearnableSoftmaxOffsetTensorParallel:
+    """Every head's learnable attention sink must count once toward the gradient statistics.
+
+    softmax_offset holds one learnable logit per local attention head, so with TP>1 each TP
+    rank owns a different slice of the heads. Unless the parameter carries the TP attributes,
+    param_is_not_tensor_parallel_duplicate takes it for a replica and keeps it only on TP rank
+    0, so the norm used for gradient clipping and the zero count both drop the sink gradients
+    of the heads that live on the other TP ranks.
+    """
+
+    _TP = 2
+    _NUM_HEADS = 4
+    # Sink gradient of each global head. Every TP rank holds one zero and one non-zero entry,
+    # so both the norm and the zero count change if any rank's slice is dropped.
+    _FULL_SINK_GRAD = (0.0, 2.0, 0.0, 4.0)
+
+    def setup_method(self, method):
+        if Utils.world_size % self._TP != 0:
+            pytest.skip(f"requires a world size divisible by TP={self._TP}, got {Utils.world_size}")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=self._TP)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _config(self):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=self._NUM_HEADS,
+            tensor_model_parallel_size=self._TP,
+            softmax_type="learnable",
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+        )
+
+    def _assert_sink_counted_once_per_head(self, softmax_offset):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        heads_per_rank = self._NUM_HEADS // self._TP
+        assert softmax_offset.shape == (heads_per_rank,)
+        assert softmax_offset.tensor_model_parallel is True
+        assert softmax_offset.partition_dim == 0
+        assert softmax_offset.partition_stride == 1
+
+        full_grad = torch.tensor(self._FULL_SINK_GRAD, device="cuda")
+        first_head = tp_group.rank() * heads_per_rank
+        softmax_offset.grad = full_grad[first_head : first_head + heads_per_rank].clone()
+
+        # The duplicate filter that MegatronOptimizer._filter_grads_for_norm applies.
+        grads_for_norm = [
+            param.grad
+            for param in [softmax_offset]
+            if param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+        ]
+        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=tp_group)
+        assert float(grad_norm) == pytest.approx(full_grad.norm().item(), rel=1e-6)
+
+        num_zeros = count_zeros_fp32(
+            [softmax_offset], grad_stats_parallel_group=tp_group, tp_group=tp_group
+        )
+        assert num_zeros == (full_grad == 0).sum().item()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_dot_product_attention_sink_counted_on_every_tp_rank(self):
+        attention = DotProductAttention(
+            config=self._config(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+        )
+        self._assert_sink_counted_once_per_head(attention.softmax_offset)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="softmax_type requires TE >= 2.8.0")
+    def test_te_dot_product_attention_sink_counted_on_every_tp_rank(self):
+        attention = TEDotProductAttention(
+            config=self._config(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+        )
+        self._assert_sink_counted_once_per_head(attention.softmax_offset)
