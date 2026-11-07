@@ -1,5 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real EP4 NVLS invariance; each collective/backend needs a fresh interpreter."""
+"""Real NVLS batch invariance at EP = world size.
+
+The combine collectives valid on the device run in one process: "ordered" everywhere and
+"multimem" off Hopper. Each test enables and disables the mode around a freshly built layer. The
+ordered combine must equal the rank-order fp32 sum bit for bit; the multimem in-switch fp32 sum
+must stay within the fp32 summation bound of the exact sum. Under either, a target row keeps its
+fp32 bits across co-batches. MCORE_BI_TEST_BACKEND selects the GEMM backend (default te_native).
+In this layer the backend changes only the router's TE GEMM: the dispatch, the experts and the
+combine run the same Triton or DeepGEMM kernels under every backend.
+"""
 
 import os
 
@@ -10,7 +19,7 @@ from megatron.core.inference.moe import batch_invariant
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
-from megatron.core.parallel_state import get_expert_model_parallel_group
+from megatron.core.parallel_state import get_expert_tensor_and_model_parallel_group
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend
@@ -19,24 +28,33 @@ from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGath
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import _make_base_config
 from tests.unit_tests.test_utilities import Utils
 
-# A dedicated four-rank launch runs this manifest; other world sizes skip on every rank.
-pytestmark = pytest.mark.skipif(
-    Utils.world_size != 4, reason="this manifest requires four real NVLink EP ranks"
-)
+# Experts span every rank: EP 8 in the H100 bucket, EP 4 in the GB200 bucket.
+pytestmark = [
+    pytest.mark.launch_on_gb200,
+    pytest.mark.skipif(
+        Utils.world_size < 2 or Utils.world_size & (Utils.world_size - 1),
+        reason="NVLS Triton symmetric-memory barrier requires a power-of-two EP size > 1.",
+    ),
+]
+
+# A Hopper NVLS in-switch reduction is not batch-invariant on every system: it can depend on
+# multicast objects allocated earlier unless the driver and Fabric Manager carry the fix
+# (NVIDIA/nccl#2360). The multimem combine therefore runs only off Hopper; ordered runs everywhere.
+_IS_HOPPER = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+_COLLECTIVES = ["ordered"] if _IS_HOPPER else ["ordered", "multimem"]
 
 
 @pytest.fixture
-def nvls_runtime():
-    assert Utils.world_size == 4, "this manifest requires four real NVLink EP ranks"
+def nvls_runtime(request):
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "te_native")
-    collective = os.environ.get("MCORE_BI_TEST_COLLECTIVE", "ordered")
-    if backend == "te_native":
-        assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
+    collective = getattr(request, "param", "ordered")
     assert not bik.is_batch_invariant_mode_enabled(), "inherited a live BI backend"
     try:
-        # Explicit global selection precedes model construction and the first GEMM.
+        # Explicit global selection precedes model construction. The layer runs no aten GEMM
+        # (the router GEMM is TE's, the experts and combine are Triton or DeepGEMM), so
+        # te_native needs no CUBLASLT_WORKSPACE_SIZE pin from before the process's first GEMM.
         bik.enable_batch_invariant_mode(backend=backend, collective=collective)
-        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=4)
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         assert bik.get_batch_invariant_backend() == backend
         assert bik.get_batch_invariant_collective() == collective
         yield backend, collective
@@ -55,10 +73,14 @@ def nvls_runtime():
 
 def _build_nvls_layer(backend, collective, grouped_backend):
     """Build the shared native NVLS layer and target."""
+    # The CI images ship DeepGEMM; without it the torch cases fail here rather than skip.
+    assert (
+        grouped_backend != "torch" or bik.HAVE_DEEPGEMM_BF16
+    ), "The batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels."
     torch.manual_seed(321)
     model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
     config = _make_base_config(
-        expert_model_parallel_size=4,
+        expert_model_parallel_size=Utils.world_size,
         inference_grouped_gemm_backend=grouped_backend,
         inference_moe_token_dispatcher_type="nvls",
         batch_invariant_mode=True,
@@ -74,7 +96,7 @@ def _build_nvls_layer(backend, collective, grouped_backend):
         per_rank_worst_case_token_count=128,
         topk=config.moe_router_topk,
         hidden_size=config.hidden_size,
-        ep_group=get_expert_model_parallel_group(),
+        tp_ep_group=get_expert_tensor_and_model_parallel_group(),
     )
     layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
     dispatcher = layer._inference_token_dispatcher
@@ -102,7 +124,8 @@ def test_nvls_empty_router_width(nvls_runtime, monkeypatch):
 
     monkeypatch.setattr(moe_utils, "te_general_gemm", observe)
     rank = torch.distributed.get_rank()
-    counts = (64, 128, 64) if rank == 0 else (0, 32 * rank, 0)
+    # Peers gate 32, 64 or 96 tokens, within the 128-token per-rank buffers.
+    counts = (64, 128, 64) if rank == 0 else (0, 32 * (1 + (rank - 1) % 3), 0)
     reference = None
     for count in counts:
         inputs = target[:1].repeat(count, 1, 1)
@@ -121,6 +144,7 @@ def test_nvls_empty_router_width(nvls_runtime, monkeypatch):
     assert calls == [(count, config.hidden_size) for count in counts]
 
 
+@pytest.mark.parametrize("nvls_runtime", _COLLECTIVES, indirect=True)
 @pytest.mark.parametrize("grouped_backend", ["vllm", "torch"])
 @pytest.mark.parametrize("peers", ["idle", "uneven"])
 @torch.inference_mode()
@@ -180,7 +204,10 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         def reduce(*args, original=original, name=name, **kwargs):
             assert args[0].shape[0] == phase["counts"][rank]
             phase.setdefault("collectives", []).append(name)
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            # token_combine allocates this fp32 output per call and casts it to bf16 afterwards.
+            phase["combined"] = args[0]
+            return result
 
         monkeypatch.setattr(owner, name, reduce)
 
@@ -209,35 +236,53 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         # Independent oracle for the real target partials written by each rank's
         # experts into symmetric memory; NCCL here only gathers oracle inputs.
         partial = NVLSAllGatherVDispatcher._get_rsv_tensor()[target_row : target_row + 8].clone()
-        partials = [torch.empty_like(partial) for _ in range(4)]
+        partials = [torch.empty_like(partial) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(partials, partial)
         phase["partial_sums"] = [contribution.double().sum().item() for contribution in partials]
-        if collective == "multimem":
-            expected = torch.stack(partials).double().sum(dim=0).float()
-        else:
-            expected = torch.zeros_like(partial)
-            for contribution in partials:
-                expected = expected + contribution
         if rank == 0:
+            # Rank zero's AGV offset is 0, so its local rows are the global target rows.
+            combined = phase["combined"][target_row : target_row + 8].clone()
+            if collective == "ordered":
+                expected = torch.zeros_like(partial)
+                for contribution in partials:
+                    expected = expected + contribution
+                assert torch.equal(combined, expected), "ordered combine is not the rank-order sum"
+            else:
+                # The in-switch fp32 sum adds in an order the switch picks and need not be
+                # correctly rounded, so it is held to the recursive-summation bound for any order,
+                # gamma_(ws-1) * sum|x| with u = 2**-24 (Higham, eq. 4.4); its bits are pinned
+                # across co-batches below.
+                stacked = torch.stack(partials).double()
+                k, u = Utils.world_size - 1, 2.0**-24
+                bound = k * u / (1 - k * u) * stacked.abs().sum(dim=0)
+                error = (combined.double() - stacked.sum(dim=0)).abs()
+                assert torch.all(error <= bound), "multimem combine exceeds the fp32 sum bound"
             selected = output[target_row : target_row + 8, 0].clone()
             assert selected.abs().max() > 0
-            assert torch.equal(selected, expected.bfloat16()), "actual NVLS combine changed target"
+            assert torch.equal(selected, combined.bfloat16()), "actual NVLS combine changed target"
+            phase["combined"] = combined
             phase["output"] = selected
             phase["output_bits"] = selected.view(torch.int16).long().sum().item()
         evidence.append(dict(phase))
 
-    run([64, 0, 0, 0], 0)
-    wide = [128, 0, 0, 0] if peers == "idle" else [128, 32, 64, 96]
+    idle_peers = [0] * (Utils.world_size - 1)
+    run([64] + idle_peers, 0)
+    if peers == "idle":
+        wide = [128] + idle_peers
+    else:
+        # Peers bring 32, 64 or 96 tokens, within the 128-token per-rank buffers.
+        wide = [128] + [32 * (1 + peer % 3) for peer in range(Utils.world_size - 1)]
     run(wide, 120)
     run(wide, 0)
     # Return to the smaller shape with idle peers: stale expert/symmetric-buffer
     # data from the preceding wide execution must not affect the target.
-    run([64, 0, 0, 0], 0)
+    run([64] + idle_peers, 0)
     for actual in evidence[1:]:
         assert torch.equal(actual["target_probs"], evidence[0]["target_probs"])
         assert torch.equal(actual["target_experts"], evidence[0]["target_experts"])
         if rank == 0:
             assert torch.equal(actual["gate"], evidence[0]["gate"])
+            assert torch.equal(actual["combined"], evidence[0]["combined"])
             assert torch.equal(actual["output"], evidence[0]["output"])
     selected_experts = evidence[0]["target_experts"][0]
     assert torch.all(
