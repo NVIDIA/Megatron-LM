@@ -137,7 +137,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        emerging_optimizer_grad_collective: str = "reduce-scatter",
+        second_order_optimizer_grad_collective: str = "reduce-scatter",
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if use_megatron_fsdp or use_torch_fsdp2:
@@ -179,7 +179,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             ddp_config=ddp_config,
             data_parallel_random_init=data_parallel_random_init,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
+            second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
         )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg

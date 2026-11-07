@@ -162,7 +162,7 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
             lr=0.01,
             bf16=True,
             use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective='all-reduce',
+            second_order_optimizer_grad_collective='all-reduce',
             muon_split_qkv=False,
             clip_grad=0.0,
         )

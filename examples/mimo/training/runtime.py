@@ -98,7 +98,7 @@ def wrap_active_modules_with_ddp(
     ddp_config: DistributedDataParallelConfig,
     data_parallel_random_init: bool = False,
     use_layer_wise_distributed_optimizer: bool = False,
-    emerging_optimizer_grad_collective: str = "reduce-scatter",
+    second_order_optimizer_grad_collective: str = "reduce-scatter",
 ) -> None:
     """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     if mimo_model.language_model is not None:
@@ -121,7 +121,7 @@ def wrap_active_modules_with_ddp(
             data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=Float16Module,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
+            second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
         )[0]
 
     for name, submodule in mimo_model.modality_submodules.items():
@@ -141,6 +141,6 @@ def wrap_active_modules_with_ddp(
                 data_parallel_random_init=data_parallel_random_init,
                 mixed_precision_wrapper=MimoEncoderFloat16Module,
                 use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-                emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
+                second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
             )[0]
         )

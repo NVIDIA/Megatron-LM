@@ -55,18 +55,20 @@ def _model():
         ("muon", True, "reduce-scatter", None),
         ("muon", True, "all-reduce", None),
         ("muon", True, "ragged", "must be"),
-        # all-reduce only changes the parameters an emerging optimizer owns whole; anywhere
+        # all-reduce only changes the parameters a second-order optimizer owns whole; anywhere
         # else it would silently do nothing, so it is rejected.
-        ("adam", True, "all-reduce", "applies to emerging optimizers"),
-        ("muon", False, "all-reduce", "applies to emerging optimizers"),
+        ("adam", True, "all-reduce", "applies to second-order optimizers"),
+        ("muon", False, "all-reduce", "applies to second-order optimizers"),
     ],
 )
-def test_emerging_optimizer_grad_collective_validation(optimizer, use_distopt, collective, error):
+def test_second_order_optimizer_grad_collective_validation(
+    optimizer, use_distopt, collective, error
+):
     with nullcontext() if error is None else pytest.raises(ValueError, match=error):
         config = OptimizerConfig(
             optimizer=optimizer,
             use_distributed_optimizer=use_distopt,
-            emerging_optimizer_grad_collective=collective,
+            second_order_optimizer_grad_collective=collective,
         )
         # Depending on the branch, OptimizerConfig checks at construction or in validate().
         if hasattr(config, "validate"):
@@ -103,7 +105,7 @@ def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
     model = _model()
     # The container clears use_distributed_optimizer for the layer-wise optimizer.
     ddp_config = DistributedDataParallelConfig()
-    kwargs = {} if collective is None else {"emerging_optimizer_grad_collective": collective}
+    kwargs = {} if collective is None else {"second_order_optimizer_grad_collective": collective}
     fn = configure_ddp_for_layer_wise_optimizer(
         [model], ddp_config, use_layer_wise_distributed_optimizer=True, **kwargs
     )
@@ -120,7 +122,7 @@ def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
             [model],
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective="ragged",
+            second_order_optimizer_grad_collective="ragged",
         )
 
 
@@ -133,8 +135,8 @@ def _full_layout(sharded):
 def test_resolve_param_layout_follows_the_grad_collective():
     resolve = LayerWiseDistributedOptimizer._resolve_param_layout
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-    padded = SimpleNamespace(emerging_optimizer_grad_collective="reduce-scatter")
-    compact = SimpleNamespace(emerging_optimizer_grad_collective="all-reduce")
+    padded = SimpleNamespace(second_order_optimizer_grad_collective="reduce-scatter")
+    compact = SimpleNamespace(second_order_optimizer_grad_collective="all-reduce")
     assert resolve(padded, ddp_config, [_full_layout(True)]) == "padded"
     assert resolve(compact, ddp_config, [_full_layout(False)]) == "compact"
     # DDP buffers built for one collective cannot be driven with the other.

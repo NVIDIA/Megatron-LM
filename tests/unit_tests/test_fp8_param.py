@@ -319,7 +319,7 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            requested = cfg_container.optimizer.emerging_optimizer_grad_collective
+            requested = cfg_container.optimizer.second_order_optimizer_grad_collective
             assert has_param_layout, (
                 "LayerWise test did not enter the requested parameter-layout path: "
                 f"requested={requested}, actual={has_param_layout}"
@@ -656,7 +656,7 @@ class TestFP8Param:
         kwargs = {
             "optimizer": "muon",
             "muon_tp_mode": "duplicated",
-            "emerging_optimizer_grad_collective": grad_collective,
+            "second_order_optimizer_grad_collective": grad_collective,
             "overlap_param_gather": dp_overlap[0],
             "overlap_grad_reduce": dp_overlap[1],
             "num_steps": 20,

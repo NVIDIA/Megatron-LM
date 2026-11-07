@@ -189,7 +189,7 @@ def _create(
             transformer_config,
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective=grad_collective,
+            second_order_optimizer_grad_collective=grad_collective,
         )[0]
     else:
         model = DistributedDataParallel(transformer_config, ddp_config, model)
@@ -212,7 +212,7 @@ def _create(
             overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
-            emerging_optimizer_grad_collective=(
+            second_order_optimizer_grad_collective=(
                 grad_collective if use_layer_wise else 'reduce-scatter'
             ),
         ),

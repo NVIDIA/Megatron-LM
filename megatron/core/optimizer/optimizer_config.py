@@ -426,8 +426,8 @@ class OptimizerConfig:
     sets it and resets ``use_distributed_optimizer`` to False so that the standard
     distributed-optimizer path is not triggered."""
 
-    emerging_optimizer_grad_collective: str = "reduce-scatter"
-    """Data-parallel gradient collective for the parameters that an emerging optimizer with
+    second_order_optimizer_grad_collective: str = "reduce-scatter"
+    """Data-parallel gradient collective for the parameters that a second-order optimizer with
     ``use_distributed_optimizer`` (e.g. Muon) updates whole on one rank.
 
     - ``"reduce-scatter"``: each tensor stays whole inside one rank's shard of a padded buffer;
@@ -563,15 +563,15 @@ class OptimizerConfig:
         # value it will produce, not only the pre-finalize flag.
         will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
 
-        if self.emerging_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
+        if self.second_order_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
             raise ValueError(
-                "emerging_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
-                f"got {self.emerging_optimizer_grad_collective!r}."
+                "second_order_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
+                f"got {self.second_order_optimizer_grad_collective!r}."
             )
-        if self.emerging_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
+        if self.second_order_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
             raise ValueError(
-                "emerging_optimizer_grad_collective='all-reduce' applies to emerging optimizers "
-                "(e.g. Muon) with use_distributed_optimizer=True; got "
+                "second_order_optimizer_grad_collective='all-reduce' applies to second-order "
+                "optimizers (e.g. Muon) with use_distributed_optimizer=True; got "
                 f"optimizer={self.optimizer!r}, "
                 f"use_distributed_optimizer={self.use_distributed_optimizer}."
             )

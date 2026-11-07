@@ -66,6 +66,6 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
   --use-distributed-optimizer: true
-  --emerging-optimizer-grad-collective: all-reduce
+  --second-order-optimizer-grad-collective: all-reduce
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher

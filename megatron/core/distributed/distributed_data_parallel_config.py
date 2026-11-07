@@ -315,7 +315,7 @@ class DistributedDataParallelConfig:
 
         - No gather is needed because every DP rank runs the same optimizer update.
         - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens for the compact layout (``emerging_optimizer_grad_collective="all-reduce"``)
+          happens for the compact layout (``second_order_optimizer_grad_collective="all-reduce"``)
           when parameter-gather overlap and MXFP8 grad-buffer reuse are disabled. Each rank
           updates only its assigned parameters, then the optimizer calls ``allgather_params()``
           synchronously after the step.
