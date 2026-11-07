@@ -25,7 +25,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     grouped_gemm_batch_invariant_alignment,
     is_batch_invariant_mode_enabled,
 )
-from megatron.core.transformer.moe.ep_invariant_combine import tree_combine_forward
 from megatron.core.utils import null_decorator
 
 try:
@@ -313,23 +312,6 @@ def squared_relu_with_probs(
 
 
 @triton.jit
-def _peer_rows_tree(
-    buffer_ptrs, input_byte_offset, row_offsets, mask, START: tl.constexpr, N: tl.constexpr
-):
-    """Pairwise fp32 tree over the rows of peers [START, START + N), unrolled at compile time."""
-    if N == 1:
-        peer_base = tl.load(buffer_ptrs + START).to(tl.pointer_type(tl.uint8))
-        peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
-        acc = tl.load(peer_ptr + row_offsets, mask=mask, other=0.0)
-    else:
-        acc = _peer_rows_tree(buffer_ptrs, input_byte_offset, row_offsets, mask, START, N // 2)
-        acc = acc + _peer_rows_tree(
-            buffer_ptrs, input_byte_offset, row_offsets, mask, START + N // 2, N // 2
-        )
-    return acc
-
-
-@triton.jit
 def _squared_relu_with_probs_quantize_kernel(
     input_ptr,
     out_fp8_ptr,
@@ -467,10 +449,8 @@ def _ordered_reduce_scatter_v_kernel(
     BLOCK_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PAIRWISE_TREE: tl.constexpr,
 ):
-    """Reduce peer rows with an explicit rank-order FP32 sum (PAIRWISE_TREE: a pairwise
-    tree in rank order, (r0 + r1) + (r2 + r3), the top of the EP-invariant combine tree)."""
+    """Reduce peer rows with an explicit rank-order FP32 sum."""
     pid = tl.program_id(axis=0)
 
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
@@ -497,24 +477,15 @@ def _ordered_reduce_scatter_v_kernel(
         for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
             offsets = channel_offset + tid
             mask = offsets < HIDDEN_SIZE
-            if PAIRWISE_TREE:
-                acc = _peer_rows_tree(
-                    buffer_ptrs,
-                    input_byte_offset,
-                    global_token * HIDDEN_SIZE + offsets,
-                    mask,
-                    0,
-                    WORLD_SIZE,
+            acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+            for src_rank in tl.range(0, WORLD_SIZE):
+                peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
+                peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
+                values = tl.load(
+                    peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
                 )
-            else:
-                acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-                for src_rank in tl.range(0, WORLD_SIZE):
-                    peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
-                    peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
-                    values = tl.load(
-                        peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
-                    )
-                    acc += values
+                acc += values
 
             tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
 
@@ -527,14 +498,9 @@ def ordered_reduce_scatter_v(
     ep_max_tokens: torch.Tensor,
     per_rank_max_tokens: int,
     input_byte_offset: int = 0,
-    pairwise_tree: bool = False,
     **kwargs,
 ) -> torch.Tensor:
-    """Reduce-scatter variable token rows with a fixed FP32 rank order.
-
-    ``pairwise_tree`` adds the rank rows as a pairwise tree in rank order instead of a
-    chain (``moe_ep_invariant_combine``; needs a power-of-two world size).
-    """
+    """Reduce-scatter variable token rows with a fixed FP32 rank order."""
     assert HAVE_TRITON, "Triton is required for ordered_reduce_scatter_v."
     assert (
         output_tensor.ndim == 2 and input_tensor.ndim == 2
@@ -555,10 +521,6 @@ def ordered_reduce_scatter_v(
     assert (
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
-    world_size = symm_mem_hdl.world_size
-    assert (
-        not pairwise_tree or world_size & (world_size - 1) == 0
-    ), "pairwise_tree requires a power-of-two world size"
 
     # Do not autotune the number of blocks with Triton: every rank must launch the same grid
     # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
@@ -581,7 +543,6 @@ def ordered_reduce_scatter_v(
         BLOCK_SIZE=block_size,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
-        PAIRWISE_TREE=pairwise_tree,
         num_warps=num_warps,
     )
     return output_tensor
@@ -633,19 +594,8 @@ def unpermute_tokens_in_expert_order(
     inverse_map: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: Optional[torch.Tensor],
-    ep_invariant_leaves: Optional[int] = None,
 ) -> torch.Tensor:
-    """Reduce local expert contributions token-by-token in fixed expert order.
-
-    ``ep_invariant_leaves`` (``moe_ep_invariant_combine``): sum each token over this
-    rank's subtree of the EP-invariant combine tree, which has that many leaves over
-    the local experts (``ep_invariant_combine``), to an fp32 rank partial. At EP 1 that
-    is the final row; at larger EP the reduce-scatter finishes the tree.
-    """
-    if ep_invariant_leaves is not None:
-        return tree_combine_forward(
-            expert_output, inverse_map, ep_invariant_leaves, valid_tokens=valid_tokens, out=out
-        )
+    """Reduce local expert contributions token-by-token in fixed expert order."""
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
