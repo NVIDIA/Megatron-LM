@@ -21,11 +21,6 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
-    inputs:
-      autobot_hello:
-        description: "Exercise the Autobot GitHub event/result handshake on a pull-request/<number> ref"
-        type: boolean
-        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -46,13 +41,12 @@ permissions:
 #   H100_RUNNER_TRAFFIC_MODE: ${{ vars.H100_RUNNER_TRAFFIC_MODE || 'aws' }}
 
 jobs:
-  # Only the opt-in Autobot transport smoke test runs in this draft.
+  # Only the Autobot transport smoke test runs in this draft.
   request-autobot:
     name: Autobot CI request (hello)
     if: >-
       github.repository == 'NVIDIA/Megatron-LM' &&
-      startsWith(github.ref, 'refs/heads/pull-request/') &&
-      (vars.AUTOBOT_CI_HELLO == 'true' || inputs.autobot_hello == true)
+      startsWith(github.ref, 'refs/heads/pull-request/')
     runs-on: ubuntu-latest
     timeout-minutes: 1
     permissions: {}

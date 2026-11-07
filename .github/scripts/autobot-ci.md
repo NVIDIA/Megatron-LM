@@ -1,6 +1,6 @@
 # Autobot CI request/result smoke test
 
-The opt-in jobs in `cicd-main.yml` exercise an asynchronous request to Autobot
+The jobs in `cicd-main.yml` exercise an asynchronous request to Autobot
 through GitHub. The request job finishes; GitHub delivers its signed
 `workflow_job.completed` webhook; Autobot writes an `Autobot CI selection` check
 on that exact commit; the waiting job reads its JSON and uploads it as an
@@ -23,21 +23,18 @@ that publishes a check with the expected name.
 To exercise an unmerged draft PR, push its signed commit to the personal fork,
 open the PR against NVIDIA/Megatron-LM, and request the normal copy-pr-bot
 mirror with `/ok to test <full head SHA>`. Drafts are not automatically synced.
-Then manually dispatch the existing `cicd-main.yml` on that mirror ref with
-the Boolean `autobot_hello` input enabled:
+The mirror push automatically runs the hello integration. To repeat the test,
+manually dispatch the existing `cicd-main.yml` on that mirror ref:
 
 ```sh
 gh workflow run cicd-main.yml --repo NVIDIA/Megatron-LM \
-  --ref "pull-request/<PR-number>" -f autobot_hello=true
+  --ref "pull-request/<PR-number>"
 ```
 
 This draft runs only the request and waiter jobs. The real CI jobs, including
 Docker builds, linting, downstream/GPU tests, coverage and the final test gate,
 are temporarily commented out in `cicd-main.yml`. Restore them before using this
 workflow for production CI.
-
-For repeated mirror-push tests, set `AUTOBOT_CI_HELLO=true`; omit/unset that
-variable afterward to return to opt-in manual runs.
 
 ## Request and result identity
 
