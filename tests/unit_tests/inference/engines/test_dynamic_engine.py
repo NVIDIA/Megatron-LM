@@ -9,6 +9,7 @@ import random
 import threading
 import time
 import types
+import weakref
 from collections import OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -1449,6 +1450,8 @@ class DynamicEngineTestConfig:
     top_p: float = 0.0
     offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    # Tests leave process-wide GC alone unless they exercise a gc mode.
+    gc_mode: str = "default"
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -1629,6 +1632,7 @@ class DynamicInferenceEngineTestBase:
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
+                gc_mode=test_config.gc_mode,
             ),
         )
 
@@ -2401,6 +2405,58 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         request = engine.get_request(request_id)
         assert request.block_hash_salt is None
         assert request.precomputed_block_hashes == hashes(None)
+
+
+def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
+    """The coordinator loop idles before the first request; that idle is not the first drain."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.gc_mode = "freeze_overlap"
+    engine._in_custom_gc_mode = True
+    engine._gc_freeze_pending = True
+    engine._gc_mode_entry_step = 3
+    engine.context = types.SimpleNamespace(step_count=3)
+    engine.controller = types.SimpleNamespace(_overlap_gc=False, _trigger_gc_now=mock.Mock())
+    engine._freeze_gc_after_first_request_drain = mock.Mock()
+
+    engine._collect_gc_while_idle(drained=True)
+    engine._freeze_gc_after_first_request_drain.assert_not_called()
+
+    engine.context.step_count = 4
+    engine._collect_gc_while_idle(drained=False)
+    engine._freeze_gc_after_first_request_drain.assert_not_called()
+    engine._collect_gc_while_idle(drained=True)
+    engine._freeze_gc_after_first_request_drain.assert_called_once_with()
+
+    # Once the first-drain freeze has switched to overlap mode, idle time collects due garbage,
+    # paused or not.
+    engine._gc_freeze_pending = False
+    engine.controller._overlap_gc = True
+    engine._collect_gc_while_idle(drained=False)
+    engine._collect_gc_while_idle(drained=True)
+    assert engine.controller._trigger_gc_now.call_count == 2
+
+
+def test_shutdown_exits_custom_gc_mode_once():
+    """A stopped engine restores process-wide GC even if it was never suspended."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._staging_tasks = set()
+    engine.requests = {}
+    engine.zmq_context = types.SimpleNamespace(closed=True)
+    engine._state_events = {EngineState.STOPPED: asyncio.Event()}
+    engine.gc_mode = "freeze"
+    engine._in_custom_gc_mode = True
+    engine._gc_freeze_pending = True
+    engine.controller = types.SimpleNamespace(_overlap_gc=False)
+
+    with mock.patch.object(gc, "unfreeze") as unfreeze, mock.patch.object(gc, "collect"):
+        asyncio.run(engine.shutdown())
+        assert engine.state == EngineState.STOPPED
+        assert not engine._in_custom_gc_mode
+        assert not engine._gc_freeze_pending
+        unfreeze.assert_called_once_with()
+        # Suspend already exited the mode: shutdown must not unfreeze again.
+        engine._exit_custom_gc_mode()
+        unfreeze.assert_called_once_with()
 
 
 def test_add_request_defaults_sampling_params():
@@ -4279,12 +4335,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
             ]
 
+            # Request 4's 11th token is a near-tie of the exponential-race sampler under the
+            # fp32 head (on GB300: 73 at p/q 0.86136 against 35 at 0.86035, a relative margin
+            # of 1.2e-3; every other race of the run has a margin of 9e-3 or more), and the
+            # GPU classes land on different sides of it: Hopper (the dgx_h100 CI) samples 35,
+            # Blackwell 73. Keyed by the compute capability, as the repository keys its other
+            # platform-dependent expectations.
+            hybrid_near_tie_token = 73 if torch.cuda.get_device_capability()[0] >= 10 else 35
             mamba_expected_generated_tokens = [
                 [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
                 [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
                 [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
                 [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 73, 20, 49, 28, 34, 81],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, hybrid_near_tie_token, 20, 49, 28, 34, 81],
                 [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
                 [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
@@ -6754,6 +6817,78 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.add_request(env.requests[0])
             assert context.request_last_kv_block_id[0].item() == next_block_id
             assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
+    @torch.inference_mode()
+    def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
+        """Frozen cyclic garbage, including its CUDA memory, is released by suspend.
+
+        Scheduled collection starts only when the engine first drains after setup or resume.
+        """
+        was_enabled = gc.isenabled()
+        overlap = gc_mode == "freeze_overlap"
+        # Collections move immortal objects into the generation that gc.freeze() uses.
+        gc.unfreeze()
+        gc.collect()
+        immortal_count = gc.get_freeze_count()
+        try:
+            env = self._build_test_env(DynamicEngineTestConfig(gc_mode=gc_mode))
+            engine = env.engine
+            assert gc.get_freeze_count() > immortal_count
+            assert engine._gc_freeze_pending
+            assert not engine.controller._overlap_gc
+            assert gc.isenabled() is was_enabled
+
+            # A CUDA tensor in a reference cycle that is alive when the heap is frozen.
+            cycle = [torch.ones(1 << 20, device="cuda")]
+            cycle_bytes = cycle[0].untyped_storage().nbytes()
+            cycle_tensor = weakref.ref(cycle[0])
+            cycle.append(cycle)
+            engine._collect_and_freeze_gc()
+            del cycle
+            gc.collect()
+            assert cycle_tensor() is not None
+
+            half = len(env.requests) // 2
+            for request in env.requests[:half]:
+                engine._add_request(request)
+            while engine.has_unfinished_requests():
+                self._run_step(env)
+            assert not engine._gc_freeze_pending
+            assert engine.controller._overlap_gc is overlap
+            assert gc.isenabled() is (was_enabled and not overlap)
+
+            with mock.patch.object(
+                engine.controller, "_trigger_gc_now", wraps=engine.controller._trigger_gc_now
+            ) as trigger_gc_now:
+                for request in env.requests[half:]:
+                    engine._add_request(request)
+                while engine.has_unfinished_requests():
+                    self._run_step(env)
+            assert all(request.status == Status.COMPLETED for request in env.requests)
+            assert trigger_gc_now.called is overlap
+
+            gc.collect()
+            allocated = torch.cuda.memory_allocated()
+            engine.suspend()
+            # Earlier engines kept alive by pending event-loop callbacks may be released too.
+            assert cycle_tensor() is None
+            assert allocated - torch.cuda.memory_allocated() >= cycle_bytes
+            assert gc.get_freeze_count() == immortal_count
+            assert gc.isenabled() is was_enabled
+            assert not engine.controller._overlap_gc
+
+            engine.resume()
+            assert gc.get_freeze_count() > immortal_count
+            assert not engine.controller._overlap_gc
+            assert engine._gc_freeze_pending
+        finally:
+            gc.unfreeze()
+            (gc.enable if was_enabled else gc.disable)()
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
