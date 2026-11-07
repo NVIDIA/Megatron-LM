@@ -15,9 +15,11 @@ Follow repository `AGENTS.md` and the user's requested scope throughout.
 - Read the live `NVIDIA/Megatron-LM` main merge queue through GraphQL
   `repository.mergeQueue(branch: "main").entries`; paginate the connection.
   Keep `AWAITING_CHECKS`, `QUEUED`, and blocked entries distinct.
-- Select sources only from that connection, with a non-null `mergeQueueEntry`
-  in `AWAITING_CHECKS` or `QUEUED` state. Record the entry ID, state, and observed
-  source head. Do not select blocked entries or widen the pool when it is small.
+- Select sources only from that connection. Query each PR through GraphQL and
+  require `isInMergeQueue: true`, with a non-null `mergeQueueEntry` in
+  `AWAITING_CHECKS` or `QUEUED` state. Record the flag, entry ID, state, and
+  observed source head. A false or missing flag is not verified membership.
+  Do not select blocked entries or widen the pool when it is small.
 - PRs with `autoMergeRequest` but no `mergeQueueEntry` are pending auto-merges,
   not actual queue entries. An `Approved` label alone does not imply either state.
   Exclude them from batching, even if they are mergeable or have native approvals.
@@ -37,9 +39,29 @@ Follow repository `AGENTS.md` and the user's requested scope throughout.
   available, report the shortage rather than adding risky PRs to reach a count.
 - Record each source PR number, full head SHA, author/coauthors, relevant labels,
   changed files, queue-entry evidence, and exact-head approval-check results.
-  Before publishing, recheck that the PR is open, its head is unchanged, it is
-  still an actual eligible queue entry, and its approval checks still pass.
+  Before publishing, recheck that the PR is open, its head is unchanged,
+  GraphQL still reports `isInMergeQueue: true` with an eligible queue entry,
+  and its approval checks still pass.
   If any check fails, stop and report it; do not substitute pending auto-merges.
+
+Use this per-PR GraphQL query to verify membership and the source head during
+selection, before publishing, and before dequeueing for an authorized merge:
+
+```graphql
+query ($number: Int!) {
+  repository(owner: "NVIDIA", name: "Megatron-LM") {
+    pullRequest(number: $number) {
+      number
+      state
+      baseRefName
+      headRefOid
+      isInMergeQueue
+      reviewDecision
+      mergeQueueEntry { id state position }
+    }
+  }
+}
+```
 
 ## Assemble an attributed batch
 
@@ -112,10 +134,11 @@ permission to create and test a batch.
 When the user asks to land the sources:
 
 - Recheck each source's current head against the validated head and review/merge
-  requirements. Require its actual queue entry and successful exact-head source
-  approval checks again before dequeueing or merging. If membership or approval
-  is missing, stop and report it. Batch CI success and a generic instruction to
-  merge the batch do not waive source review requirements.
+  requirements. Require GraphQL `isInMergeQueue: true`, its actual queue entry,
+  and successful exact-head source approval checks again before dequeueing or
+  merging. If membership or approval is missing, stop and report it. Batch CI
+  success and a generic instruction to merge the batch do not waive source
+  review requirements.
   Inspect any upstream-main drift. Resolve dependencies before
   merging: open PRs based on `pull-request/<source PR>` must be retargeted to
   `main`, as required by repository guidance.
