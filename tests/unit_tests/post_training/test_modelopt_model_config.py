@@ -16,6 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.config import CheckpointConfig
 from megatron.training.models.base import ModelConfig
 from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
@@ -335,7 +336,7 @@ class TestModelOptModelConfigFromArgs:
         builder = builder_cls(config)
         for _ in range(2):
             builder.pre_wrap_hook(
-                Namespace(load="/ckpt/student", ckpt_format="torch_dist"), distillation
+                CheckpointConfig(load="/ckpt/student", ckpt_format="torch_dist"), distillation
             )([Mock()])
         expected = [
             "restore_modelopt_state_hook",
@@ -447,14 +448,16 @@ class TestModelOptCheckpointSelection:
     def test_hooks_follow_pretrained_checkpoint(
         self, monkeypatch, load, load_has_checkpoint, expected
     ):
-        from megatron.post_training import checkpointing
+        from megatron.training import checkpointing
         from megatron.training.config.training_config import CheckpointConfig
 
         restore = Mock(return_value=lambda models: models)
         monkeypatch.setattr(model_hooks, "restore_modelopt_state_hook", restore)
         monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
         monkeypatch.setattr(
-            checkpointing, "checkpoint_exists", lambda path: load_has_checkpoint and path == load
+            checkpointing,
+            "checkpoint_exists",
+            lambda path: path == "/pretrained" or (load_has_checkpoint and path == load),
         )
         config = mc.modelopt_model_config_from_args(make_modelopt_test_args())
         checkpoint = CheckpointConfig(

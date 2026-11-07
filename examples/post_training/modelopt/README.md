@@ -101,6 +101,9 @@ teacher weights from `distillation.teacher_load`, using `teacher_ckpt_format` wh
 (otherwise the student's format). The teacher load ignores the student's `ckpt_step`,
 `pretrained_checkpoint`, and `non_persistent_ckpt_type`, and does not change the student's
 checkpoint settings or restore the teacher's optimizer, RNG, or training progress.
+ModelOpt detection and state restoration share the weight loader's persistent checkpoint selection:
+the pretrained fallback when needed, `latest_train_state.pt` before the legacy text tracker,
+and the explicit `ckpt_step` override.
 
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion

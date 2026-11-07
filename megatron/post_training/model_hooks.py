@@ -28,9 +28,10 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.post_training.checkpointing import load_modelopt_state, resolve_checkpoint_load_dir
+from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
+from megatron.training.checkpointing import resolve_checkpoint_load_dir
 from megatron.training.models.base import compose_hooks
 
 PreWrapHook = Callable[[list[MegatronModule]], list[MegatronModule]]
@@ -289,9 +290,10 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
         hooks.append(on_model_init_device(hook, init_meta))
 
     if options is not None:
-        load_dir = resolve_checkpoint_load_dir(checkpoint)
-        if load_dir is not None:
-            register(restore_modelopt_state_hook(load_dir, checkpoint))
+        if checkpoint is not None:
+            load_dir, _ = resolve_checkpoint_load_dir(checkpoint)
+            if load_dir is not None:
+                register(restore_modelopt_state_hook(load_dir, checkpoint))
         if options.qad_train_target is not None:
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))

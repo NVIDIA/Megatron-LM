@@ -31,12 +31,14 @@ def should_use_modelopt_config(args, checkpoint=None) -> bool:
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
     from megatron.training.argument_utils import checkpoint_config_from_args
+    from megatron.training.checkpointing import resolve_checkpoint_load_dir
 
     if getattr(args, "modelopt_enabled", False):
         return True
     if checkpoint is None:
         checkpoint = checkpoint_config_from_args(args)
-    if checkpoint.load is not None and has_modelopt_state(checkpoint.load, checkpoint=checkpoint):
+    load_dir, _ = resolve_checkpoint_load_dir(checkpoint)
+    if load_dir is not None and has_modelopt_state(load_dir, checkpoint=checkpoint):
         print_rank_0("ModelOpt checkpoint detected")
         return True
     if getattr(args, "export_kd_teacher_load", None) is not None:

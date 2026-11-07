@@ -111,7 +111,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
         model_hooks, "restore_modelopt_state_hook", return_value=lambda x: x
     ) as restore:
         restored.model.get_builder_cls()(restored.model).pre_wrap_hook(restored.checkpoint)
-    restore.assert_called_once_with("/replacement", restored.checkpoint.ckpt_format)
+    restore.assert_called_once_with("/replacement", restored.checkpoint)
 
 
 def test_tokenizer_finalizes_same_model_used_for_build():

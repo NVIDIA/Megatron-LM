@@ -219,11 +219,32 @@ def _saved_checkpoint_policy(checkpoint_config: Optional[dict], ckpt_args) -> ty
     )
 
 
-def _resolve_load_iteration(load_dir: Optional[str]) -> tuple[int, bool, str]:
+def resolve_checkpoint_load_dir(
+    checkpoint: CheckpointConfig, *, load_dir=_UNSET
+) -> tuple[Optional[str], bool]:
+    """Choose the persistent load root and report whether the pretrained fallback was selected.
+
+    Explicit ``load_dir`` overrides the run's directory, including ``None``. Keep this decision
+    shared by weight loading and early ModelOpt restoration; neither writes the run's policy.
+    """
+    if load_dir is _UNSET:
+        load_dir = checkpoint.load
+    pretrained_dir = checkpoint.pretrained_checkpoint
+    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+        if not checkpoint_exists(pretrained_dir):
+            raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
+        return pretrained_dir, True
+    return load_dir, False
+
+
+def _resolve_load_iteration(
+    load_dir: Optional[str], *, ckpt_step: Optional[int] = None
+) -> tuple[int, bool, str]:
     """The iteration and release flag a load directory points at: ``latest_train_state.pt`` when
     present (the authoritative tracker since the train state owns the resume facts), the legacy
     ``latest_checkpointed_iteration.txt`` otherwise; ``(-1, False, ...)`` when neither exists. The
-    third item names the legacy tracker, for the message of a missing checkpoint."""
+    third item names the legacy tracker, for the message of a missing checkpoint. An explicit
+    ``ckpt_step`` overrides the tracked iteration."""
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
@@ -235,15 +256,16 @@ def _resolve_load_iteration(load_dir: Optional[str]) -> tuple[int, bool, str]:
             tracker_filename = get_checkpoint_tracker_filename(load_dir)
             if maybe_msc.os.path.isfile(tracker_filename):
                 iteration, release = read_metadata(tracker_filename)
+    if ckpt_step:
+        iteration = ckpt_step
     return iteration, release, tracker_filename
 
 
-def _get_load_checkpoint_path(load_dir: Optional[str], checkpoint: CheckpointConfig) -> str:
+def get_load_checkpoint_path(load_dir: str, checkpoint: CheckpointConfig) -> str:
     """The base directory a load reads: the tracked iteration of ``load_dir`` (the directory the
-    load resolved, after a pretrained-checkpoint fallback), or ``checkpoint.ckpt_step``."""
-    iteration, release, _ = _resolve_load_iteration(load_dir)
-    if checkpoint.ckpt_step:
-        iteration = checkpoint.ckpt_step
+    load resolved, after a pretrained-checkpoint fallback), or ``checkpoint.ckpt_step``.
+    Does not check whether that directory exists."""
+    iteration, release, _ = _resolve_load_iteration(load_dir, ckpt_step=checkpoint.ckpt_step)
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
 
@@ -469,10 +491,12 @@ def get_checkpoint_tracker_filename(checkpoints_path):
 
 
 def checkpoint_exists(checkpoints_path):
+    """Return whether a persistent root has a train-state or legacy text tracker."""
     if checkpoints_path is None:
         return False
-    path = get_checkpoint_tracker_filename(checkpoints_path)
-    return maybe_msc.os.path.isfile(path)
+    return file_exists(
+        get_checkpoint_train_state_filename(checkpoints_path, prefix="latest")
+    ) or maybe_msc.os.path.isfile(get_checkpoint_tracker_filename(checkpoints_path))
 
 
 def read_metadata(tracker_filename):
@@ -2287,11 +2311,9 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, checkpoint, checkpointing_context
     )
-    iteration, release, tracker_filename = _resolve_load_iteration(load_dir)
-
-    # Allow user to specify the loaded iteration.
-    if checkpoint.ckpt_step:
-        iteration = checkpoint.ckpt_step
+    iteration, release, tracker_filename = _resolve_load_iteration(
+        load_dir, ckpt_step=checkpoint.ckpt_step
+    )
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
@@ -2834,14 +2856,11 @@ def load_checkpoint(
     # The policy of this load: the keyword arguments where given, the run's section otherwise.
     # Two derivations below may turn the load into a weights-only one; they stay local to this
     # call, and the primary load records the outcome on the train state (``record_finetune``).
-    if load_dir is _UNSET:
-        load_dir = checkpoint.load
     finetune = checkpoint.finetune if finetune is None else finetune
     load_optim = checkpoint.load_optim if load_optim is None else load_optim
     load_rng = checkpoint.load_rng if load_rng is None else load_rng
     load_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
     override_ckpt_iteration = checkpoint.override_ckpt_iteration
-    loading_pretrained_checkpoint = False
 
     if checkpoint.stream_ckpt_dequant and optimizer is not None:
         raise ValueError(
@@ -2866,16 +2885,15 @@ def load_checkpoint(
                 override_ckpt_iteration = progress_iteration
 
     # Finetuning directories
-    pretrained_dir = checkpoint.pretrained_checkpoint
-    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+    requested_load_dir = checkpoint.load if load_dir is _UNSET else load_dir
+    load_dir, loading_pretrained_checkpoint = resolve_checkpoint_load_dir(
+        checkpoint, load_dir=requested_load_dir
+    )
+    if loading_pretrained_checkpoint:
         print_rank_0(
-            f'Checkpoint file not found in load directory {load_dir} attempting to finetune with checkpoint in {pretrained_dir}'
+            f'Checkpoint file not found in load directory {requested_load_dir} attempting to finetune with checkpoint in {load_dir}'
         )
-        load_dir = pretrained_dir
-        if not checkpoint_exists(load_dir):
-            raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
         finetune = True
-        loading_pretrained_checkpoint = True
 
     if record_finetune:
         # The classification of this run's primary load, for the readers that decide on it after
@@ -3234,7 +3252,7 @@ def load_checkpoint(
             sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
-        reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
+        reader = FileSystemReader(get_load_checkpoint_path(load_dir, checkpoint))
         try:
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
@@ -3538,7 +3556,9 @@ def load_checkpoint(
                 # legacy text tracker otherwise).
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
-                iteration, release, _ = _resolve_load_iteration(load_dir)
+                iteration, release, _ = _resolve_load_iteration(
+                    load_dir, ckpt_step=checkpoint.ckpt_step
+                )
                 model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
                 optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
                     model_checkpoint_name
