@@ -303,6 +303,15 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     return None
 
 
+def _get_loss_cp_group(
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Resolve the global CP group only for legacy callers that omit their group."""
+    if cp_group is None and torch.distributed.is_initialized():
+        cp_group = parallel_state.get_context_parallel_group()
+    return cp_group
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -314,8 +323,9 @@ def forward_step_calc_loss(
     forward_data_store,
     cp_group_size=None,
     is_last_stage=None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Calculate the loss and number of tokens for forward_step()"""
+    """Calculate loss from CP-local sums/counts and return the local token count."""
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -324,8 +334,10 @@ def forward_step_calc_loss(
         ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
 
     if cp_group_size is None and is_last_stage is None:
-        # fallback to parallel state
-        cp_group_size = parallel_state.get_context_parallel_world_size()
+        # Combined 1F1B supplies its CP group but still uses the legacy stage lookup.
+        # With no distributed runtime the legacy CP world size is zero.
+        cp_group = _get_loss_cp_group(cp_group)
+        cp_group_size = cp_group.size() if cp_group is not None else 0
         is_last_stage = parallel_state.is_pipeline_last_stage(
             ignore_virtual=False, vp_stage=vp_stage
         )
@@ -343,9 +355,17 @@ def forward_step_calc_loss(
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
-                    # Protect against division by zero when all tokens are masked
-                    #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
+                    num_tokens_for_loss = num_tokens
+                    if cp_group_size > 1:
+                        # Keep the returned count and reporting metrics local. CP shards of one
+                        # sample must share a denominator, including shards with no valid tokens.
+                        num_tokens_for_loss = num_tokens.clone()
+                        torch.distributed.all_reduce(
+                            num_tokens_for_loss, group=_get_loss_cp_group(cp_group)
+                        )
+                        # DDP averages over DP x CP; compensate for its CP factor.
+                        output_tensor *= cp_group_size
+                    output_tensor /= torch.clamp(num_tokens_for_loss, min=1)
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
@@ -416,6 +436,7 @@ def forward_step(
     current_microbatch=None,
     vp_stage=None,
     is_last_stage=True,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Forward step for passed-in model.
 
@@ -484,6 +505,8 @@ def forward_step(
             Whether it is the last stage. Defaults to True.
             Also considering virtual stages.
             In case of PP/VPP, is_last_stage/is_vp_last_stage.
+        cp_group (ProcessGroup, optional):
+            Context parallel group for the loss denominator reduction.
 
     Returns:
         Tensor or list[Tensor]: The output object(s) from the forward step.
@@ -540,6 +563,7 @@ def forward_step(
         forward_data_store,
         cp_group_size,
         is_last_stage,
+        cp_group=cp_group,
     )
 
     if unwrap_output_tensor:
@@ -803,6 +827,7 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
+            cp_group=pg_collection.cp,
         )
     else:
         with no_sync_func():
@@ -819,6 +844,7 @@ def forward_backward_no_pipelining(
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                     current_microbatch=i,
+                    cp_group=pg_collection.cp,
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
@@ -846,6 +872,7 @@ def forward_backward_no_pipelining(
                 first_val_step, forward_only, num_microbatches == 1
             ),
             current_microbatch=num_microbatches - 1,
+            cp_group=pg_collection.cp,
         )
 
         total_num_tokens += num_tokens
@@ -1394,6 +1421,7 @@ def forward_backward_pipelining_with_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
@@ -1499,6 +1527,7 @@ def forward_backward_pipelining_with_interleaving(
                 pre_backward=pre_backward,
                 post_forward=post_forward,
                 post_backward=post_backward,
+                cp_group=cp_group,
             )
         else:  # Conventional interleaved 1F1B path
             forward_output_tensor = None
@@ -2226,13 +2255,14 @@ def forward_backward_pipelining_without_interleaving(
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
 
         if is_multimodule:
-            # Multi-module: use language model's CP size for loss scaling
+            # The language model owns the CP group used to normalize its loss.
             if not config.variable_seq_lengths:
                 raise ValueError(
                     "config.variable_seq_lengths=True required for multi-module pipelines"
                 )
             if pg_collection.has_language_model():
-                cp_size = pg_collection.get_language_model_cp_size()
+                cp_group = pg_collection.get_language_model_collection().cp
+                cp_size = cp_group.size()
             else:
                 # Encoder-only ranks should not use CP loss scaling.
                 cp_size = None
@@ -2380,6 +2410,7 @@ def forward_backward_pipelining_without_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
@@ -2426,6 +2457,7 @@ def forward_backward_pipelining_without_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
