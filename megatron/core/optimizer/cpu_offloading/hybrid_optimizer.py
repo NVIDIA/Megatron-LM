@@ -324,6 +324,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
 
+        # FusedAdam advances a group-level step. Publish it back to HDO so a
+        # restored counter is not copied over the newer value on every step.
+        # CPU Adam keeps its counters in per-parameter state instead.
+        if self.gpu_optimizer is not None:
+            steps = {
+                self.inner_param_to_orig_param[group["params"][0]]: group["step"]
+                for group in self.gpu_optimizer.param_groups
+                if "step" in group
+            }
+            for group in self.param_groups:
+                for param in group["params"]:
+                    if param in steps:
+                        group["step"] = steps[param]
+                        break
+
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
             new_state = defaultdict(dict)
