@@ -1,6 +1,6 @@
 ---
 name: batch-and-test-mergequeue-prs
-description: Select queued or pending Megatron-LM PRs, combine their changes into an attributed squash batch, and validate it with functional CI. Also covers landing the original PRs and stopping obsolete CI when requested.
+description: Select queued or pending Megatron-LM PRs, combine their changes into an attributed squash batch, and validate it with the Run Merge-Queue jobs label using the actual merge-queue configuration. Also covers landing the original PRs and stopping obsolete CI when requested.
 license: Apache-2.0
 ---
 
@@ -54,30 +54,25 @@ conflict adjustments, and concrete validation commands/results. Keep internal
 hosts out of public descriptions, comments, and commit messages. Update the
 description after pushes; pass bodies through files or structured API payloads.
 
-Use these scope labels according to the requested validation:
-
-| Label | Functional scope | Repetitions | Mode |
-| --- | --- | --- | --- |
-| `Run functional tests once` | Full L1 | 1 | Normal steps and golden comparisons |
-| `Run functional tests` | Full L1 | 5 | Normal steps and golden comparisons |
-| `Run tests` | L1 | 1 | Lightweight, four steps without golden comparisons |
-
-For ordinary batch validation, prefer `Run functional tests once` unless the
-user requests repetition. It takes precedence when another scope label is also
-present. Add downstream labels only for the requested coverage or relevant
-integration; LTS remains opt-in. See [mcore-cicd](../mcore-cicd/SKILL.md) for scope,
-image, and downstream controls.
+Use only `Run Merge-Queue jobs` as the batch's test-scope label. It selects the
+same configuration branch as an actual merge-group event: L1 functional tests
+with one repetition, normal training steps and golden comparisons, merge-group
+cadence filtering, full unit buckets, dev images, AWS H100 routing, MBridge L1,
+and no NeMo RL downstream run. Do not inherit source PR scope, image, or
+downstream labels. Platform eligibility and PR approval controls still apply.
+See [mcore-cicd](../mcore-cicd/SKILL.md) for the shared configuration reference.
 
 Apply labels before CI starts. Labels alone do not trigger the workflow. After
 pushing, use `/ok to test` when required by the contribution workflow; draft
 auto-sync may be disabled. Verify that a `CICD Megatron-LM` run appears on
 `pull-request/<batch PR>` for the pushed head.
 
-- Inspect the configure job's actual outputs: expect `scope=L1`,
-  `lightweight=false`, the requested `n_repeat`, `run_functional=true`,
-  `run_h100_functional=true`, `cadence_bypass=true`, and
-  `unit_testmon_eligible=false` for a full batch run. `run_functional` controls
-  GB200 functional selection; platform eligibility still applies.
+- Inspect the configure job's actual outputs: expect `merge_queue_jobs=true`,
+  `scope=L1`, `lightweight=false`, `n_repeat=1`, `cadence=mergegroup`,
+  `cadence_bypass=false`, `unit_testmon_eligible=false`, `lts=false`,
+  `run_functional=true`, `run_h100_functional=true`, `run_mbridge=true`,
+  `mbridge_suite=L1`, and `run_nemo_rl=false`. `run_functional` controls GB200
+  functional selection; platform and downstream feature gates still apply.
 - CI may test a synthetic merge SHA rather than the source head. Record it and
   compare its tree with the expected source patches on its actual upstream base.
   Do not call a different or stale revision validated.

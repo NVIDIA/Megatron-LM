@@ -510,33 +510,8 @@ def _run_configure(
             id="existing-lightweight-precedence",
         ),
         pytest.param(["Run functional tests"], {}, "5", "false", "true", "true", id="five-runs"),
-        pytest.param(["Run functional tests once"], {}, "1", "false", "true", "true", id="one-run"),
         pytest.param(
-            ["Run functional tests", "Run functional tests once"],
-            {},
-            "1",
-            "false",
-            "true",
-            "true",
-            id="once-overrides-five",
-        ),
-        pytest.param(
-            ["Run tests", "Run functional tests once"],
-            {},
-            "1",
-            "false",
-            "true",
-            "true",
-            id="once-overrides-lightweight",
-        ),
-        pytest.param(
-            ["Run functional tests once", "container::lts"],
-            {},
-            "1",
-            "false",
-            "true",
-            "true",
-            id="once-with-explicit-lts",
+            ["Run Merge-Queue jobs"], {}, "1", "false", "true", "false", id="merge-queue-label"
         ),
         pytest.param(
             [],
@@ -583,6 +558,102 @@ def test_functional_scope_and_repetitions(
     assert outputs["lts"] == str("container::lts" in labels).lower()
     if cadence_bypass == "true":
         assert outputs["cadence"] == ""
+
+
+@pytest.mark.parametrize("traffic_mode", ["aws", "gcp", "50-50"])
+@pytest.mark.parametrize(
+    "other_labels",
+    [
+        [],
+        ["Run tests"],
+        ["Run functional tests"],
+        ["container::lts"],
+        ["Run NeMoRL tests", "Run MBridge tests"],
+        [
+            "Run tests",
+            "Run functional tests",
+            "container::lts",
+            "Run NeMoRL tests",
+            "Run MBridge tests",
+            "Run selective unit tests",
+        ],
+    ],
+)
+def test_merge_queue_label_matches_merge_group_configuration(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    traffic_mode: str,
+    other_labels: list[str],
+) -> None:
+    """Compare every output from labeled PR and actual merge-group configuration."""
+    environment = {
+        **configure_environment,
+        "H100_TRAFFIC_MODE": traffic_mode,
+        "ENABLE_SELECTIVE_UNIT_TESTS": "true",
+    }
+    result, baseline = _run_configure(
+        tmp_path,
+        {
+            **environment,
+            "IS_MERGE_GROUP": "true",
+            "EVENT_NAME": "merge_group",
+            "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+        },
+        [],
+    )
+    assert result.returncode == 0, result.stderr
+    result, outputs = _run_configure(tmp_path, environment, ["Run Merge-Queue jobs", *other_labels])
+    assert result.returncode == 0, result.stderr
+    assert outputs == baseline
+    for name, expected in {
+        "merge_queue_jobs": "true",
+        "scope": "L1",
+        "n_repeat": "1",
+        "lightweight": "false",
+        "lts": "false",
+        "dev": "true",
+        "run_functional": "true",
+        "run_h100_functional": "true",
+        "cadence": "mergegroup",
+        "cadence_bypass": "false",
+        "unit_testmon_eligible": "false",
+        "run_mbridge": "true",
+        "mbridge_suite": "L1",
+        "run_nemo_rl": "false",
+        "h100_cloud": "aws-h100",
+        "h100_build_runner": "nvidia-ci-aws-cpu",
+        "h100_use_gcp": "false",
+    }.items():
+        assert outputs[name] == expected
+
+
+@pytest.mark.parametrize("is_member", ["false", "true"])
+@pytest.mark.parametrize("is_maintainer", ["false", "true"])
+def test_merge_queue_label_preserves_ephemeral_runner_boundaries(
+    tmp_path: Path, configure_environment: dict[str, str], is_member: str, is_maintainer: str
+) -> None:
+    """Keep untrusted PRs on ephemeral runners despite selecting the queue profile."""
+    runner = "ephe-v2-example-a2"
+    result, outputs = _run_configure(
+        tmp_path,
+        {
+            **configure_environment,
+            "PREFLIGHT_IS_MEMBER": is_member,
+            "IS_MAINTAINER": is_maintainer,
+            "EPHEMERAL_RUNNER": "ephe-v2-example",
+            "RUN_ATTEMPT": "2",
+            "H100_TRAFFIC_MODE": "gcp",
+        },
+        ["Run Merge-Queue jobs"],
+    )
+    assert result.returncode == 0, result.stderr
+    if is_member == "false" or is_maintainer == "false":
+        assert outputs["h100_build_runner"] == runner
+        assert json.loads(outputs["h100_gpu_runs_on"]) == runner
+    else:
+        assert outputs["h100_build_runner"] == "nvidia-ci-aws-cpu"
+    assert outputs["h100_cloud"] == "aws-h100"
+    assert outputs["h100_use_gcp"] == "false"
 
 
 @pytest.mark.parametrize(
@@ -814,7 +885,7 @@ def test_selective_variable_and_label_precedence(
     [
         pytest.param(["Run tests"], {}, id="run-tests-label"),
         pytest.param(["Run functional tests"], {}, id="run-functional-tests-label"),
-        pytest.param(["Run functional tests once"], {}, id="run-functional-tests-once-label"),
+        pytest.param(["Run Merge-Queue jobs"], {}, id="run-merge-queue-jobs-label"),
         pytest.param(["force-run-all"], {}, id="force-run-all-label"),
         pytest.param(["container::lts"], {}, id="lts-label"),
         pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),

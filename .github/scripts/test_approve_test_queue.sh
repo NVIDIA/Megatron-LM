@@ -244,7 +244,7 @@ assert len(state.requests) == 1
 assert state.ns["get_pr_base_branch"](run_2)[0] == "dev"
 assert len(state.requests) == 2
 
-for label in ("Run functional tests", "Run functional tests once"):
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
     state = load([pr(1, labels=(label,))])
     assert state.ns["has_functional_test_label"](run_1)
     assert label in state.ns["RUN_ALL_TESTS_LABELS"]
@@ -342,10 +342,10 @@ release_prs = {n: (author, "release/a" if base == "main" else "release/b")
 assert approvals(release_prs, running=[1, 2], waiting=[3, 4, 5], branch="others") == [4, 5]
 # The existing queue-wide limit still applies.
 assert approvals(prs, waiting=[1, 2, 4], limit=2) == [1, 2]
-for label in ("Run functional tests", "Run functional tests once"):
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
     assert approvals(prs, waiting=[1, 4], labels={1: [label], 4: [label]}) == [1]
     assert approvals(prs, waiting=[1, 4], labels={1: [label]}, allow_full=False) == [4]
-    for other_label in ("Run functional tests", "Run functional tests once"):
+    for other_label in ("Run functional tests", "Run Merge-Queue jobs"):
         labels = {5: [label], 4: [other_label]}
         assert approvals(prs, queued=[5], waiting=[4], labels=labels) == []
         assert approvals(prs, running=[5], waiting=[4], labels=labels) == []
