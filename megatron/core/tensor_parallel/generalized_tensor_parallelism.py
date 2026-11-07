@@ -51,7 +51,9 @@ from megatron.core.tensor_parallel.gtp_eager_wgrad import (
     clear_eager_wgrad_rings,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
+    register_external_pool,
     symmetric_wgrad_pool,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
@@ -744,7 +746,8 @@ def classify_gtp_remat_chains(
     model, *, cuda_graph_modules=None, moe_shared_expert_overlap=False, cuda_graph_impl="none"
 ):
     """
-    Register default prefetch chains and finalize their captured/eager boundaries.
+    Pool the all-gather inputs nothing else placed, then register default prefetch chains
+    and finalize their captured/eager boundaries.
 
     Explicit registrations take precedence. All other eligible weights use the same
     registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
@@ -762,6 +765,10 @@ def classify_gtp_remat_chains(
     # Clear stale process-global chain state so a rebuilt model starts fresh.
     reset_gtp_state()
     models = model if isinstance(model, list) else [model]
+    for model_module in models:
+        for _, param in model_module.named_parameters():
+            if getattr(param, "needs_nccl_mem", False):
+                _move_weight_to_symm_pool(param, param.group)
     _register_default_prefetch_chains(models)
     for model_module in models:
         tag_gtp_params_with_names(model_module)
@@ -873,6 +880,9 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    # Opts the all-gather input into symmetric backing: DDP's pool via register_ub_pool, else
+    # the GTP pool after wrapping (classify_gtp_remat_chains).
+    gtp_shard.needs_nccl_mem = is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -927,6 +937,48 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
+def _move_weight_to_symm_pool(param, gtp_remat_group):
+    """Swap a weight's storage into the group's registered pool, unless it is already in a
+    symmetric pool, still on CPU, or the group has no "ag" registration.
+
+    Quantized weights are re-homed whole (data + scale tensors) with the same
+    make_empty/copy_from_storage/data-setter sequence TE uses to re-home grouped
+    weights; plain BF16 weights get an empty_like + copy_. The old storage is freed.
+    """
+    if (
+        getattr(param, "is_in_symm_pool", False)
+        or not param.is_cuda
+        or not is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
+    ):
+        return
+    quantizer = getattr(param, "_quantizer", None)
+    with torch.no_grad():
+        if quantizer is not None:
+            # Allocate the full quantized layout (data + scales) in the pool. Match the
+            # source tensor's populated buffers so copy_from_storage copies all of them;
+            # restore the quantizer's usage afterwards (the optimizer's quantize_
+            # updates rely on it).
+            saved_usage = (quantizer.rowwise_usage, quantizer.columnwise_usage)
+            quantizer.set_usage(
+                rowwise=param._rowwise_data is not None,
+                columnwise=param._columnwise_data is not None,
+            )
+            with gtp_symm_pool_ctx(gtp_remat_group):
+                pooled = quantizer.make_empty(param.shape, dtype=param.dtype, device=param.device)
+            quantizer.set_usage(rowwise=saved_usage[0], columnwise=saved_usage[1])
+            pooled.copy_from_storage(param)
+        else:
+            with gtp_symm_pool_ctx(gtp_remat_group):
+                pooled = torch.empty_like(param)
+            pooled.copy_(param)
+        old = param.data
+        param.data = pooled
+        if hasattr(old, "clear"):
+            # Quantized storage: release the non-pooled buffers immediately.
+            old.clear()
+    param.is_in_symm_pool = True
+
+
 def attach_gtp_to_presharded_module(
     module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None
 ):
@@ -954,6 +1006,9 @@ def attach_gtp_to_presharded_module(
         if param is None or is_gtp_param(param):
             continue
         if isinstance(param, QuantizedTensor):
+            # Pooled whole now, before an outside owner can take part of its storage; plain
+            # weights are placed after wrapping (classify_gtp_remat_chains).
+            _move_weight_to_symm_pool(param, gtp_remat_group)
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:
             gtp_param = _gtp_wrap_bf16_shard(module, name, param)
@@ -2134,7 +2189,9 @@ class GTPShardedParam(torch.nn.Parameter):
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
         _prepare_wgrad_reduce_scatter_inputs."""
-        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
+        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(
+            self.group, mode="rs"
+        )
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
         """Return writable logical-shape scratch; ``persistent`` keeps eager pointers fixed.
@@ -2163,7 +2220,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return ring_slot.tensor[: self._unsharded_shape[0]]
 
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
-        if is_gtp_symm_pool_registered(self.group):
+        if is_gtp_symm_pool_registered(self.group, mode="rs"):
             # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
@@ -2197,6 +2254,11 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+
+    def register_ub_pool(self, pool: torch.cuda.MemPool) -> None:
+        """Register the external pool backing this param's all-gather input on its group."""
+        register_external_pool(pool, self.group)
+        self.is_in_symm_pool = True
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
@@ -2406,7 +2468,7 @@ class GTPShardedParam(torch.nn.Parameter):
         fp32_accumulation = (
             GTP_CONFIG.reduce_scatter_with_fp32_accumulation
             and self.group.size() > 2
-            and not is_gtp_symm_pool_registered(self.group)
+            and not is_gtp_symm_pool_registered(self.group, mode="rs")
         )
 
         if async_op:
@@ -2514,7 +2576,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
                 # With symmetric memory registration, send the padded parent tensor of the
                 # logical view that get_wgrad_tensor handed the GEMM.
-                if is_gtp_symm_pool_registered(weight.group):
+                if is_gtp_symm_pool_registered(weight.group, mode="rs"):
                     symm_slot = weight._wgrad_symm_slot
                     weight._wgrad_symm_slot = None
                     if symm_slot is None:
@@ -2843,7 +2905,15 @@ class GTPWeightCache:
             out_shape = param._unsharded_shape_padded
 
         chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
-        with cuda_graph_pool_allocation(_chain_is_graphed(chain_id)):
+        # All-gather outputs go into the group's registered pool so the gather runs on
+        # symmetric kernels; otherwise (reduce-scatter outputs, or no registration) keep
+        # the CUDA-graph pool routing. Tickets are persistent and first allocated during
+        # eager warmup, so a graphed chain replays stable pool addresses either way.
+        if not reduce_scatter and is_gtp_symm_pool_registered(param.group, mode="ag"):
+            alloc_ctx = gtp_symm_pool_ctx(param.group)
+        else:
+            alloc_ctx = cuda_graph_pool_allocation(_chain_is_graphed(chain_id))
+        with alloc_ctx:
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage
                 # would corrupt the optimizer's quantize_ update direction (frozen weights).

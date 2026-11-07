@@ -11,11 +11,12 @@ ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
 those buffers.
 
-Two parts:
+Three parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
+  - ``register_external_pool``: registers a pool owned elsewhere on a GTP group.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ import torch
 import torch.distributed as dist
 
 import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
-import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,12 @@ _pools: typing.Dict[str, torch.cuda.MemPool] = {}
 # teardown needs the group object to deregister.
 _registered: typing.Dict[str, typing.Any] = {}
 
+# Group name -> the sides ({"ag", "rs"}) that route their buffers into its pool.
+_registered_modes: typing.Dict[str, frozenset] = {}
+
+# Pools owned elsewhere, registered on a GTP group: (pool, group name) -> group.
+_registered_ext_pools: typing.Dict[typing.Tuple[torch.cuda.MemPool, str], typing.Any] = {}
+
 # ---------------------------------------------------------------------------
 # Pool lifecycle: create -> warm -> register -> allocate-into -> query -> deregister
 # ---------------------------------------------------------------------------
@@ -58,56 +64,73 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
-        try:
-            vmm_symm_allocator.init()
-            pool = vmm_symm_allocator.create_vmm_mem_pool()
-        except RuntimeError as e:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"[MCORE][GTP] {e}\n"
-                "[MCORE][GTP] FALLING BACK to ncclMemAlloc-backed symmetric pools. "
-                "ncclMemAlloc maps every allocation on all P2P-visible peer GPUs, "
-                "which slows CPU-side kernel launching at scale.",
-            )
-            nccl_allocator.init()
-            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+        pool = vmm_symm_allocator.create_symm_mem_pool()
         _pools[name] = pool
     return pool
 
 
-def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPool | None:
+def _register_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup, label: str) -> None:
+    """Window-register ``pool`` on ``group``, after creating the group's lazily-initialized
+    NCCL communicator (registration needs it)."""
+    warmup = torch.zeros(1, device=torch.cuda.current_device())
+    dist.all_reduce(warmup, group=group)
+    try:
+        vmm_symm_allocator.register_mem_pool(pool, group)
+    except RuntimeError:
+        # ProcessGroupNCCL records the pool before registering its segments; undo the record.
+        try:
+            vmm_symm_allocator.deregister_mem_pool(pool, group)
+        except RuntimeError:
+            pass
+        raise
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[MCORE][GTP] Registered {label} pool on group {group.group_name} "
+        f"(size={group.size()})",
+    )
+
+
+def register_gtp_symm_pool(
+    group: dist.ProcessGroup | None, modes: typing.Iterable[str] = ("ag", "rs")
+) -> torch.cuda.MemPool | None:
     """Create (if needed) and register the group's pool. Safe to call more than once;
     does nothing for ``None`` or single-rank groups.
+
+    ``modes``: non-empty subset of ``{"ag", "rs"}``; re-registering adds modes, no collective.
 
     Issues a collective, so call it during model construction — before the first
     forward or any CUDA-graph capture. New segments register automatically afterwards.
     """
+    modes = frozenset(modes)
+    if not modes or not modes <= {"ag", "rs"}:
+        raise ValueError(f"[GTP] modes must be a non-empty subset of {{'ag', 'rs'}}, got {modes}")
     if group is None or group.size() <= 1:
         return None
     if not is_torch_min_version("2.9.0a0"):
         raise RuntimeError(
             "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
             "versions cannot create a symmetric memory pool (create_vmm_mem_pool would "
-            "silently fall back to a non-symmetric one, so the reduce-scatter would not "
+            "silently fall back to a non-symmetric one, so the collectives would not "
             "be symmetric)."
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
+        _registered_modes[group.group_name] |= modes
         return pool
-    # NCCL creates communicators lazily on the first collective; run one tiny all-reduce
-    # so the registration below sees an initialized communicator.
-    warmup = torch.zeros(1, device=torch.cuda.current_device())
-    dist.all_reduce(warmup, group=group)
-    vmm_symm_allocator.register_mem_pool(pool, group)
+    _register_pool(pool, group, "GTP cache")
     _registered[group.group_name] = group
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[MCORE][GTP] Registered GTP cache pool on group {group.group_name} "
-        f"(size={group.size()})",
-    )
+    _registered_modes[group.group_name] = modes
     return pool
+
+
+def register_external_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup) -> None:
+    """Register a pool owned elsewhere on ``group``, once per (pool, group)."""
+    key = (pool, group.group_name)
+    if key in _registered_ext_pools:
+        return
+    _register_pool(pool, group, "external")
+    _registered_ext_pools[key] = group
 
 
 def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
@@ -116,10 +139,14 @@ def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
-def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
+def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None, mode: str | None = None) -> bool:
     """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
-    ``None`` and single-rank groups, which are never registered."""
-    return group is not None and group.size() > 1 and group.group_name in _registered
+    ``None`` and single-rank groups, which are never registered.
+
+    ``mode``: ``None`` asks "registered at all"; ``"ag"``/``"rs"`` asks if that side uses it."""
+    if group is None or group.size() <= 1 or group.group_name not in _registered:
+        return False
+    return mode is None or mode in _registered_modes[group.group_name]
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +220,7 @@ class RegisteredLIFOPool:
                     f"(group={group.group_name}, numel={numel}, dtype={dtype}): {hint}."
                 )
             # Allocate from the group's registered pool when it has one; else plain memory.
-            if is_gtp_symm_pool_registered(group):
+            if is_gtp_symm_pool_registered(group, mode="rs"):
                 with gtp_symm_pool_ctx(group):
                     flat = torch.empty(numel, dtype=dtype, device=device)
             else:
@@ -273,8 +300,12 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
         vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
+    for (pool, _), group in _registered_ext_pools.items():
+        vmm_symm_allocator.deregister_mem_pool(pool, group)
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()
+    _registered_ext_pools.clear()
     _registered.clear()
+    _registered_modes.clear()
     _pools.clear()

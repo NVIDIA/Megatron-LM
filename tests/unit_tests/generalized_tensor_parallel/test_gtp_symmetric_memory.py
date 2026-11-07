@@ -12,24 +12,33 @@ Test groups
                               covers foreign wgrads
 - TestSymmBackwardNumerics  - symm-flagged backward produces the same main_grad as plain GTP
 - TestRealPoolRegistration  - register_gtp_symm_pool + gtp_symm_pool_ctx + a
-                              collective on pool memory; skips where NCCL window
+                              collective on pool memory, incl. mode scoping and
+                              union-on-rereg; skips where NCCL window
                               registration is unsupported. Proves ncclCommWindowRegister
                               accepts the VMM allocator's current-device-only memory
 - TestVmmAllocatorModule / TestSymmPoolBackend
                             - the VMM allocator extension (build caching, pool
                               alloc/recycle, granularity) and pool-backend wiring
+- TestRegisterModes / TestNeedsNcclMemStamp
+                            - mode validation and the registration fact GTP derives its
+                              AG routing from (single process)
+- TestMoveWeightToSymmPool / TestTeWeightPoolMove / TestConvertedQuantizedWeightMove /
+  TestRegisterExternalPool / TestExternalPoolRoundTrip / TestAgAllocRouting
+                            - the AG side: weight placement into the group pool, external
+                              (DDP) pool registration, and weight-cache buffer routing
 
 The buffer-routing tests monkeypatch ``is_gtp_symm_pool_registered`` in BOTH consuming
 namespaces
 (the gtp module's binding for routing decisions AND gtp_symmetric_memory's own for the LIFO's
 branch), so LIFO allocations genuinely flow through ``gtp_symm_pool_ctx`` into the group's
-ncclMemAlloc pool — just without the (collective, environment-dependent) window registration,
+pool — just without the (collective, environment-dependent) window registration,
 which TestRealPoolRegistration covers for real.
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != 4.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,6 +64,7 @@ from megatron.core.tensor_parallel.gtp_symmetric_memory import (
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _requires_multi_gpu,
+    _requires_mxfp8,
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -75,6 +85,15 @@ class _StubGroup:
 
     def rank(self):
         return self._rank
+
+
+def _in_pool(t, group):
+    """Whether ``t``'s storage lies in ``group``'s GTP pool."""
+    pool = gtp_symm._pools.get(group.group_name)
+    return pool is not None and any(
+        seg["address"] <= t.data_ptr() < seg["address"] + seg["total_size"]
+        for seg in pool.snapshot()
+    )
 
 
 _CONFIG_FIELDS = (
@@ -116,6 +135,7 @@ class TestTeardownContract:
 
         # Own state is gone: registries empty, free lists dropped.
         assert not gtp_symm._pools and not gtp_symm._registered
+        assert not gtp_symm._registered_modes
         assert not symmetric_wgrad_pool._free
         # Foreign allocations survive teardown untouched.
         torch.cuda.synchronize()
@@ -195,10 +215,11 @@ class TestSymmPoolBackend:
         def _boom():
             raise RuntimeError("extension failed to build")
 
+        nccl_allocator = gtp_symm.vmm_symm_allocator.nccl_allocator
         monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
-        monkeypatch.setattr(gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init"))
+        monkeypatch.setattr(nccl_allocator, "init", lambda: calls.append("nccl_init"))
         monkeypatch.setattr(
-            gtp_symm.nccl_allocator,
+            nccl_allocator,
             "create_nccl_mem_pool",
             lambda symmetric: calls.append("nccl_pool") or object(),
         )
@@ -240,6 +261,158 @@ def test_wgrad_pool_fences_cross_stream_reuse(monkeypatch, symmetric):
     torch.cuda.synchronize()
     torch.testing.assert_close(observed, torch.ones_like(observed))
     torch.testing.assert_close(reused, torch.full_like(reused, 17))
+
+
+class TestRegisterModes:
+    def test_rejects_empty_and_unknown_modes(self):
+        with pytest.raises(ValueError, match="non-empty subset"):
+            gtp_symm.register_gtp_symm_pool(_StubGroup(size=2), modes=())
+        with pytest.raises(ValueError, match="non-empty subset"):
+            gtp_symm.register_gtp_symm_pool(_StubGroup(size=2), modes=("foo",))
+
+    def test_mode_query_reflects_registration(self):
+        group = _StubGroup(name="mode_query_group")
+        # Fake a live rs-only registration; the query must scope by mode.
+        gtp_symm._registered[group.group_name] = group
+        gtp_symm._registered_modes[group.group_name] = frozenset({"rs"})
+        try:
+            assert gtp_symm.is_gtp_symm_pool_registered(group)
+            assert gtp_symm.is_gtp_symm_pool_registered(group, mode="rs")
+            assert not gtp_symm.is_gtp_symm_pool_registered(group, mode="ag")
+        finally:
+            del gtp_symm._registered[group.group_name]
+            del gtp_symm._registered_modes[group.group_name]
+
+
+class TestNeedsNcclMemStamp:
+    @pytest.mark.parametrize("ag_registered", [False, True])
+    def test_stamp_follows_ag_registration(self, ag_registered):
+        group = _StubGroup(name="stamp_group")
+        saved = gtp_module.is_gtp_symm_pool_registered
+        gtp_module.is_gtp_symm_pool_registered = (
+            lambda g, mode=None: ag_registered and g is group and mode == "ag"
+        )
+        shard = GTPShardedParam(torch.zeros(4, 4))
+        try:
+            gtp_module._gtp_attach_attrs(shard, group)
+            assert shard.needs_nccl_mem is ag_registered
+        finally:
+            gtp_module.is_gtp_symm_pool_registered = saved
+            # Remove by identity: list.remove would run tensor == against other params.
+            gtp_module._GTP_PARAMS[:] = [p for p in gtp_module._GTP_PARAMS if p is not shard]
+
+
+class TestMoveWeightToSymmPool:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
+    def test_moves_only_unplaced_cuda_weights_of_ag_groups(self, monkeypatch):
+        ag_group, rs_group = _StubGroup(name="move_ag_group"), _StubGroup(name="move_rs_group")
+        monkeypatch.setattr(
+            gtp_module,
+            "is_gtp_symm_pool_registered",
+            lambda g, mode=None: g is ag_group and mode == "ag",
+        )
+        move = gtp_module._move_weight_to_symm_pool
+        try:
+            # Unplaced CUDA weight of an ag group: moved with values intact, then flagged.
+            w = GTPShardedParam(torch.randn(8, 4, device="cuda", dtype=torch.bfloat16))
+            before = w.detach().clone()
+            move(w, ag_group)
+            assert _in_pool(w, ag_group) and w.is_in_symm_pool
+            assert torch.equal(w.detach(), before)
+            # Already placed (by this move, or by an external owner's pool): left alone.
+            ptr = w.data_ptr()
+            move(w, ag_group)
+            assert w.data_ptr() == ptr
+            placed = GTPShardedParam(torch.randn(8, 4, device="cuda"))
+            placed.is_in_symm_pool = True
+            ptr = placed.data_ptr()
+            move(placed, ag_group)
+            assert placed.data_ptr() == ptr
+            # No ag registration, or still on CPU: left alone and unflagged.
+            rs_only = GTPShardedParam(torch.randn(8, 4, device="cuda"))
+            move(rs_only, rs_group)
+            assert rs_group.group_name not in gtp_symm._pools
+            cpu = GTPShardedParam(torch.randn(8, 4))
+            move(cpu, ag_group)
+            assert not cpu.is_cuda
+            assert not getattr(rs_only, "is_in_symm_pool", False)
+            assert not getattr(cpu, "is_in_symm_pool", False)
+            del w, before, placed, rs_only
+            torch.cuda.synchronize()
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+
+
+class TestRegisterExternalPool:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="warmup tensor needs CUDA")
+    def test_registers_once_per_pool_and_group(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gtp_symm.dist, "all_reduce", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "register_mem_pool",
+            lambda pool, group: calls.append(("reg", pool, group.group_name)),
+        )
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "deregister_mem_pool",
+            lambda pool, group: calls.append(("dereg", pool, group.group_name)),
+        )
+        pool_a, pool_b = object(), object()
+        g = _StubGroup(name="g")
+        try:
+            gtp_symm.register_external_pool(pool_a, g)
+            gtp_symm.register_external_pool(pool_a, g)
+            gtp_symm.register_external_pool(pool_b, g)
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+        assert calls == [
+            ("reg", pool_a, "g"),
+            ("reg", pool_b, "g"),
+            ("dereg", pool_a, "g"),
+            ("dereg", pool_b, "g"),
+        ]
+        assert not gtp_symm._registered_ext_pools
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="warmup tensor needs CUDA")
+    def test_failed_registration_is_rolled_back(self, monkeypatch):
+        calls = []
+
+        def register(pool, group):
+            calls.append(("reg", pool, group.group_name))
+            if group.group_name == "b":
+                raise RuntimeError("window registration failed")
+
+        monkeypatch.setattr(gtp_symm.dist, "all_reduce", lambda *args, **kwargs: None)
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "register_mem_pool", register)
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "deregister_mem_pool",
+            lambda pool, group: calls.append(("dereg", pool, group.group_name)),
+        )
+        pool, group_a, group_b = object(), _StubGroup(name="a"), _StubGroup(name="b")
+        try:
+            gtp_symm.register_external_pool(pool, group_a)
+            with pytest.raises(RuntimeError, match="window registration failed"):
+                gtp_symm.register_external_pool(pool, group_b)
+            # Only the failed pair is undone and left unrecorded; the good pair stays registered.
+            assert calls == [("reg", pool, "a"), ("reg", pool, "b"), ("dereg", pool, "b")]
+            assert list(gtp_symm._registered_ext_pools) == [(pool, "a")]
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+        assert calls[-1] == ("dereg", pool, "a")
+        assert not gtp_symm._registered_ext_pools
+
+    def test_param_hook_registers_on_its_group(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            gtp_module, "register_external_pool", lambda pool, group: seen.append((pool, group))
+        )
+        pool, g = object(), _StubGroup()
+        param = SimpleNamespace(group=g)
+        GTPShardedParam.register_ub_pool(param, pool)
+        assert seen == [(pool, g)]
+        assert param.is_in_symm_pool
 
 
 class TestRegisteredLIFOPool:
@@ -381,8 +554,8 @@ def _worker_wgrad_split(rank, world_size, port):
     # Patch BOTH consuming namespaces: gtp_module's binding drives the routing decisions;
     # gtp_symm's own drives RegisteredLIFOPool.alloc's pool-vs-plain branch, so LIFO
     # allocations genuinely land in the group's ncclMemAlloc pool.
-    gtp_module.is_gtp_symm_pool_registered = lambda g: g is group
-    gtp_symm.is_gtp_symm_pool_registered = lambda g: g is group
+    gtp_module.is_gtp_symm_pool_registered = lambda g, mode=None: g is group
+    gtp_symm.is_gtp_symm_pool_registered = lambda g, mode=None: g is group
     try:
         # Unpadded symm weight: the GEMM scratch is a view of a registered LIFO parent.
         assert group.group_name not in gtp_symm._pools
@@ -507,7 +680,7 @@ def _worker_symm_backward_numerics(rank, world_size, port):
             layer = _make_gtp_linear(64, 128, group, dtype)
             w = layer.weight
             w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
-            pred = (lambda g: g is group) if symm else saved_pred
+            pred = (lambda g, mode=None: g is group) if symm else saved_pred
             gtp_module.is_gtp_symm_pool_registered = pred
             gtp_symm.is_gtp_symm_pool_registered = pred if symm else saved_symm_pred
             x = inp.clone().requires_grad_(True)
@@ -545,6 +718,17 @@ def _worker_real_pool_registration(rank, world_size, port):
         assert is_gtp_symm_pool_registered(group)
         # Idempotent re-register must not raise or re-issue the warmup.
         register_gtp_symm_pool(group)
+        # Default registration covers both modes.
+        assert is_gtp_symm_pool_registered(group, mode="ag")
+        assert is_gtp_symm_pool_registered(group, mode="rs")
+        # Partial registration scopes by mode; re-registering unions the modes.
+        group2 = dist.new_group(list(range(world_size)))
+        register_gtp_symm_pool(group2, modes=("rs",))
+        assert is_gtp_symm_pool_registered(group2, mode="rs")
+        assert not is_gtp_symm_pool_registered(group2, mode="ag")
+        register_gtp_symm_pool(group2, modes=("ag",))
+        assert is_gtp_symm_pool_registered(group2, mode="ag")
+        assert is_gtp_symm_pool_registered(group2, mode="rs")
         with gtp_symm_pool_ctx(group):
             src = torch.full((4,), float(rank), device="cuda")
             out = torch.empty(4 * world_size, device="cuda")
@@ -717,3 +901,271 @@ def _worker_full_iteration_registered_scratch(rank, world_size, port):
         wrapper.reset_cuda_graph()
         deregister_and_clear_gtp_symm_pools()
         dist.destroy_process_group(group)
+
+
+# ---------------------------------------------------------------------------
+# External (DDP param-buffer) pool registration round trip (world 4)
+# ---------------------------------------------------------------------------
+
+
+def _worker_external_pool_round_trip(rank, world_size, port):
+    group = dist.new_group(list(range(world_size)))
+    pool = _vmm_pool_or_skip()
+    with torch.cuda.use_mem_pool(pool):
+        param_data = torch.zeros(4 * world_size, device="cuda")
+    try:
+        gtp_symm.register_external_pool(pool, group)
+    except RuntimeError as e:  # NCCL window registration unsupported in this environment
+        pytest.skip(f"NCCL symmetric registration unavailable: {e}")
+    try:
+        gtp_symm.register_external_pool(pool, group)
+        assert len(gtp_symm._registered_ext_pools) == 1
+        # A collective whose input lives in the registered pool must round-trip.
+        src = param_data[:4]
+        src.fill_(float(rank))
+        out = torch.empty(4 * world_size, device="cuda")
+        dist.all_gather_into_tensor(out, src, group=group)
+        expected = torch.repeat_interleave(
+            torch.arange(world_size, device="cuda", dtype=torch.float32), 4
+        )
+        assert torch.equal(out, expected)
+    finally:
+        # Mandatory: leftover windows abort the ProcessGroupNCCL destructor at teardown.
+        deregister_and_clear_gtp_symm_pools()
+    assert not gtp_symm._registered_ext_pools
+
+
+class TestExternalPoolRoundTrip:
+    def test_register_collective_deregister(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_external_pool_round_trip, 4)
+
+
+# ---------------------------------------------------------------------------
+# AG allocation routing: slice-path storage + weight-cache buffers (world 4)
+# ---------------------------------------------------------------------------
+
+
+def _worker_ag_alloc_routing(rank, world_size, port):
+    dtype = torch.bfloat16
+    group = dist.new_group(list(range(world_size)))
+    saved_pred = gtp_module.is_gtp_symm_pool_registered
+    saved_symm_pred = gtp_symm.is_gtp_symm_pool_registered
+    # ag-only registration: AG buffers route into the pool, RS consumers stay plain.
+    pred = lambda g, mode=None: g is group and mode in (None, "ag")
+    gtp_module.is_gtp_symm_pool_registered = pred
+    gtp_symm.is_gtp_symm_pool_registered = pred
+    try:
+        gtp_module.reset_gtp_state()
+        torch.manual_seed(0)
+        layer = _make_gtp_linear(64, 128, group, dtype)
+        w = layer.weight
+        # Construction leaves the BF16 shard in plain memory; the post-wrap step pools it.
+        assert group.group_name not in gtp_symm._pools
+        gtp_module.classify_gtp_remat_chains(layer)
+        assert w.is_in_symm_pool
+        w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
+        w._debug_name = "ag_routing_weight"
+
+        # The shard (the all-gather input) lives in the pool; the cache routes AG outputs
+        # into it and RS outputs out of it.
+        assert _in_pool(w, group)
+        cache = gtp_module.get_global_GTP_cache()
+        ag_buf = cache._allocate_buffer(w, dtype, reduce_scatter=False, fwd=True)
+        rs_buf = cache._allocate_buffer(w, dtype, reduce_scatter=True, fwd=False)
+        assert _in_pool(ag_buf, group)
+        assert not _in_pool(rs_buf, group)
+
+        # RS consumers see no "rs" registration: wgrad scratch stays on the plain pool.
+        t = w.get_wgrad_tensor()
+        assert getattr(t, "_from_gtp_wgrad_pool", False)
+        assert w._wgrad_symm_slot is None
+        gtp_module._wgrad_pool_put(t)
+
+        del ag_buf, rs_buf
+        torch.cuda.synchronize()
+    finally:
+        gtp_module.is_gtp_symm_pool_registered = saved_pred
+        gtp_symm.is_gtp_symm_pool_registered = saved_symm_pred
+        deregister_and_clear_gtp_symm_pools()
+
+
+class TestTeWeightPoolMove:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
+    def test_weight_moves_to_pool_bias_stays_out(self, monkeypatch):
+        group = _StubGroup(name="te_weight_move_group")
+        monkeypatch.setattr(
+            gtp_module, "is_gtp_symm_pool_registered", lambda g, mode=None: g is group
+        )
+        weight = torch.nn.Parameter(torch.randn(8, 4, device="cuda", dtype=torch.bfloat16))
+        bias = torch.nn.Parameter(torch.zeros(8, device="cuda", dtype=torch.bfloat16))
+        before = weight.detach().clone()
+        try:
+            gtp_module._move_weight_to_symm_pool(weight, group)
+            # The weight's storage moved into the pool with values intact; bias did not.
+            assert _in_pool(weight, group)
+            assert not _in_pool(bias, group)
+            assert torch.equal(weight.detach(), before)
+            del weight, before
+            torch.cuda.synchronize()
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+
+
+class TestConvertedQuantizedWeightMove:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
+    def test_converted_mxfp8_weight_moves_whole(self, monkeypatch):
+        """The post-wrap move also handles a weight already converted to a GTP FP8 param."""
+        _requires_mxfp8()
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        group = _StubGroup(name="converted_fp8_move_group")
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            layer = te.Linear(64, 64, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        # Not registered at attach time, so the weight is converted but not pooled.
+        gtp_module.attach_gtp_to_presharded_module(layer, group, 0)
+        w = layer.weight
+        assert not getattr(w, "is_in_symm_pool", False)
+        before = gtp_module.dequantize_gtp_native_fp8(w).clone()
+        monkeypatch.setattr(
+            gtp_module, "is_gtp_symm_pool_registered", lambda g, mode=None: g is group
+        )
+        try:
+            gtp_module._move_weight_to_symm_pool(w, group)
+            assert w.is_in_symm_pool
+            for t in (w._rowwise_data, w._rowwise_scale_inv, w._columnwise_data):
+                assert t is None or _in_pool(t, group)
+            assert torch.equal(gtp_module.dequantize_gtp_native_fp8(w), before)
+            del w, layer, before
+            torch.cuda.synchronize()
+        finally:
+            gtp_module._GTP_PARAMS[:] = [
+                p for p in gtp_module._GTP_PARAMS if getattr(p, "group", None) is not group
+            ]
+            deregister_and_clear_gtp_symm_pools()
+
+
+class TestAgAllocRouting:
+    def test_slice_storage_and_cache_routing(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_ag_alloc_routing, 4)
+
+
+# ---------------------------------------------------------------------------
+# AG-input placement lifecycle: CPU init and frozen weights under real DDP (world 4)
+# ---------------------------------------------------------------------------
+
+
+def _gtp_remat_world(modes):
+    """Re-init model parallel with GTP_remat=2 and fake ``modes`` registration on its group."""
+    from megatron.core import parallel_state as ps
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    group = ps.get_gtp_weight_remat_group()
+    pred = lambda g, mode=None: g is group and (mode is None or mode in modes)
+    saved = (gtp_module.is_gtp_symm_pool_registered, gtp_symm.is_gtp_symm_pool_registered)
+    gtp_module.is_gtp_symm_pool_registered = pred
+    gtp_symm.is_gtp_symm_pool_registered = pred
+    gtp_module.reset_gtp_state()
+    GTP_CONFIG.pad_for_alignment = 0
+    return group, saved
+
+
+def _restore_world(saved):
+    from megatron.core import parallel_state as ps
+
+    gtp_module.is_gtp_symm_pool_registered, gtp_symm.is_gtp_symm_pool_registered = saved
+    torch.cuda.synchronize()
+    deregister_and_clear_gtp_symm_pools()
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+
+def _worker_cpu_init_placement(rank, world_size, port, modes):
+    import transformer_engine.pytorch as te
+
+    group, saved = _gtp_remat_world(modes)
+    try:
+        model = torch.nn.Module()
+        # CPU-initialized slice-path and pre-sharded BF16 weights, built with the modes set.
+        model.sliced = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cpu")
+        gtp_module.wrap_module_params_gtp(model.sliced, ["weight"], group)
+        model.presharded = te.Linear(16, 16, bias=False, params_dtype=torch.bfloat16, device="cpu")
+        gtp_module.attach_gtp_to_presharded_module(model.presharded, group, 0)
+        weights = (model.sliced.weight, model.presharded.weight)
+        values = [w.detach().clone() for w in weights]
+        assert not any(getattr(w, "is_in_symm_pool", False) for w in weights)
+
+        model.cuda()
+        pointers = [w.data_ptr() for w in weights]
+        gtp_module.classify_gtp_remat_chains(model)
+        for w, value, ptr in zip(weights, values, pointers):
+            assert torch.equal(w.detach().cpu(), value)
+            if "ag" in modes:
+                assert w.is_in_symm_pool and _in_pool(w, group)
+            else:
+                # RS-only control: the all-gather input is never moved.
+                assert w.data_ptr() == ptr and not getattr(w, "is_in_symm_pool", False)
+        del model, weights
+    finally:
+        _restore_world(saved)
+
+
+def _worker_frozen_placement_under_ddp(rank, world_size, port):
+    import transformer_engine.pytorch as te
+
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    group, saved = _gtp_remat_world(("ag",))
+    saved_register = gtp_module.register_external_pool
+    hooks = []
+    gtp_module.register_external_pool = lambda pool, g: hooks.append((pool, g))
+    try:
+        model = torch.nn.Module()
+        model.trainable = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        model.frozen = te.Linear(16, 32, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        for layer in (model.trainable, model.frozen):
+            gtp_module.wrap_module_params_gtp(layer, ["weight"], group)
+        trainable, frozen = model.trainable.weight, model.frozen.weight
+        frozen.requires_grad_(False)
+        frozen_value = frozen.detach().clone()
+
+        ddp = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1, hidden_size=4),
+            DistributedDataParallelConfig(use_distributed_optimizer=True, bucket_size=None),
+            model,
+        )
+        buffers = ddp.buffers + ddp.expert_parallel_buffers
+        (buffer,) = [b for b in buffers if any(p is trainable for p in b.params)]
+        assert not any(p is frozen for b in buffers for p in b.params)
+        # DDP re-homed the trainable weight into param_data and handed it the pool.
+        start = buffer.param_data.data_ptr()
+        end = start + buffer.param_data.numel() * buffer.param_data.element_size()
+        assert start <= trainable.data_ptr() < end
+        assert hooks == [(buffer.param_nccl_mem_pool, group)] and trainable.is_in_symm_pool
+
+        ptr = trainable.data_ptr()
+        gtp_module.classify_gtp_remat_chains(ddp)
+        assert trainable.data_ptr() == ptr
+        assert frozen.is_in_symm_pool and _in_pool(frozen, group)
+        assert torch.equal(frozen.detach(), frozen_value)
+        del ddp, model, trainable, frozen, buffers, buffer
+    finally:
+        gtp_module.register_external_pool = saved_register
+        _restore_world(saved)
+
+
+class TestAgInputPlacementLifecycle:
+    @pytest.mark.parametrize("modes", [("ag",), ("rs",)])
+    def test_cpu_initialized_weights_pooled_after_cuda(self, modes):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_cpu_init_placement, 4, modes)
+
+    def test_frozen_weight_pooled_trainable_left_in_ddp(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_frozen_placement_under_ddp, 4)

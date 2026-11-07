@@ -1413,14 +1413,22 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        # A bare flag ([]) means both modes; after this, each value is None (off) or non-empty.
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            modes = getattr(args, attr, None)
+            if modes is not None:
+                setattr(args, attr, sorted(set(modes)) or ["ag", "rs"])
+
+        gtp_ub_modes = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_modes:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_modes and args.gtp_remat_reduce_scatter_with_fp32_accumulation:
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -3005,11 +3013,15 @@ def _add_distributed_args(parser):
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
                        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.')
-    group.add_argument('--gtp-remat-nccl-ub', action='store_true', dest='gtp_remat_nccl_ub',
-                       default=False, help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
-                       'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).')
-    group.add_argument('--gtp-expert-remat-nccl-ub', action='store_true', dest='gtp_expert_remat_nccl_ub',
-                       default=False, help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.')
+    group.add_argument("--gtp-remat-nccl-ub", nargs="*", choices=["ag", "rs"],
+                       dest="gtp_remat_nccl_ub", default=None,
+                       help="Use NCCL symmetric memory for GTP communication on the GTP group, "
+                       "independent of --use-nccl-ub (which covers the DP group). Takes a subset "
+                       "of {ag, rs}: 'ag' registers the weight all-gather buffers, 'rs' registers "
+                       "the wgrad reduce-scatter send buffers. Bare flag enables both.")
+    group.add_argument("--gtp-expert-remat-nccl-ub", nargs="*", choices=["ag", "rs"],
+                       dest="gtp_expert_remat_nccl_ub", default=None,
+                       help="Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.")
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
