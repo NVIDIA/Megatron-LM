@@ -87,6 +87,10 @@ class WeightedMultiTask(
             self._rollout_env_ids.append(env_id)
             self._rollout_weights.append(config.weight / total_weight)
             self._rollout_config_indices.append(idx)
+            # Curriculum-cursor agents scale restart seeds by their roster share
+            # (see responses_env_agent.next_curriculum_index).
+            # Pre-allocation default; rollout_allocations re-stamps the share actually consumed.
+            object.__setattr__(agent, '_prompt_share', config.weight / total_weight)
         duplicates = {
             env_id for env_id in self._rollout_env_ids if self._rollout_env_ids.count(env_id) > 1
         }
@@ -223,6 +227,10 @@ class WeightedMultiTask(
                 raise TypeError(f"Agent of type {type(agent)} does not support grouped rollouts")
 
         counts = self._quantized_counts(num_groups)
+        for agent, count in zip(self._rollout_agents, counts):
+            # Curriculum restart seeds must mirror ACTUAL consumption: the quantized
+            # count, not the fractional weight (rounding + min-one bump drift).
+            object.__setattr__(agent, '_prompt_share', count / num_groups)
         env_ids = self._env_ids() if self._restored_groups is not None else self._rollout_env_ids
         exact = [weight * num_groups for weight in self._rollout_weights]
         if any(abs(count - target) > 1e-9 for count, target in zip(counts, exact)):
