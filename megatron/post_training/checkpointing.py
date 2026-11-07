@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from pathlib import Path
@@ -26,18 +26,22 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
+from megatron.training.config import CheckpointConfig
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.distillation import DistillationConfig
 from megatron.training.utils import print_rank_0
 
 
-def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
+def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) -> bool:
     """Check if modelopt_state folder exists inside the checkpoint and contains nontrivial state.
 
     NOTE: Ignores distillation (KD) state, which is deprecated and unused.
 
     Args:
         checkpoint_path: Path to the checkpoint directory
-        ckpt_format: Checkpoint format used to load the state.
+        checkpoint: The checkpoint policy to inspect with (its format selects the reader): the
+            registered section at run time, or, at startup before any run config exists, the
+            section built from the arguments.
 
     Returns:
         True if modelopt_state exists and contains nontrivial state, False otherwise
@@ -52,9 +56,11 @@ def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
         return len(modes) > 0
 
     try:
-        if ckpt_format == "torch":
-            # Non-sharded
-            state_dict, _, _, _ = _load_base_checkpoint(checkpoint_path, get_args(), rank0=False)
+        if checkpoint.ckpt_format == "torch":
+            # Non-sharded; the legacy reader is the one path that needs the arguments.
+            state_dict, _, _, _ = _load_base_checkpoint(
+                checkpoint_path, get_args(), rank0=False, checkpoint=checkpoint
+            )
             if state_dict is None:
                 return False
             modelopt_state = state_dict.get("modelopt_state")
@@ -69,9 +75,7 @@ def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
             modelopt_checkpoint_name = load_dir / "modelopt_state"
             if not modelopt_checkpoint_name.is_dir():
                 return False
-            modelopt_state = dist_checkpointing.load_common_state_dict(
-                str(modelopt_checkpoint_name)
-            )
+            modelopt_state = dist_checkpointing.load_common_state_dict(str(modelopt_checkpoint_name))
             return _has_nontrivial_modelopt_state(modelopt_state)
     except Exception as e:
         print_rank_0(f"Failed to inspect checkpoint in {checkpoint_path}: {e}")
@@ -94,7 +98,7 @@ def get_sharded_load_dir(load_dir: str) -> Optional[Path]:
 
 
 def load_modelopt_state(
-    model: nn.Module, load_dir: Optional[str] = None, *, ckpt_format: str | None = None
+    model: nn.Module, load_dir: Optional[str] = None, *, checkpoint: CheckpointConfig | None = None
 ) -> None:
     """Loading modelopt_state without loading the model.
 
@@ -105,17 +109,18 @@ def load_modelopt_state(
     Args:
         model: the model to load the modelopt_state into
         load_dir: optionally provide a different loading path
-        ckpt_format: explicit checkpoint format; defaults to the runtime format
+        checkpoint: checkpoint policy; defaults to the registered run section
     """
-    args = get_args()
-    load_dir = load_dir or args.load
-    ckpt_format = ckpt_format or args.ckpt_format
+    checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
+    load_dir = load_dir or checkpoint.load
 
-    if ckpt_format == "torch":
+    if checkpoint.ckpt_format == "torch":
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _, _ = _load_base_checkpoint(load_dir, args, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(
+                load_dir, get_args(), rank0=False, checkpoint=checkpoint
+            )
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -161,37 +166,24 @@ def load_kd_teacher_checkpoint(
             f"No teacher checkpoint found at {distillation.teacher_load} (expected "
             f"{get_checkpoint_tracker_filename(distillation.teacher_load)})."
         )
-    args = get_args()
-
+    checkpoint = get_run_config().checkpoint if student_checkpoint is None else student_checkpoint
     teacher = unwrap_model(model[0]).teacher_model
-    ckpt_format = distillation.teacher_ckpt_format or (
-        student_checkpoint.ckpt_format if student_checkpoint is not None else args.ckpt_format
-    )
     print_rank_0(
         f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ..."
     )
-    # load_checkpoint still uses runtime args. Adapt only for the duration of this call,
-    # restoring even absent fields and failed loads so the student's state is unchanged.
-    # Also clear the student's resume/finetune selectors, which would otherwise redirect the
-    # teacher load to another iteration or directory.
-    overrides = {
-        "finetune": True,
-        "export_kd_teacher_load": distillation.teacher_load,
-        "ckpt_format": ckpt_format,
-        "pretrained_checkpoint": None,
-        "ckpt_step": None,
-        "non_persistent_ckpt_type": None,
-    }
-    missing = object()
-    original = {key: getattr(args, key, missing) for key in overrides}
-    try:
-        for key, value in overrides.items():
-            setattr(args, key, value)
-        load_checkpoint([teacher], None, None, load_arg="export_kd_teacher_load")
-    finally:
-        for key, value in original.items():
-            if value is missing:
-                delattr(args, key)
-            else:
-                setattr(args, key, value)
+    # The teacher's weights come from its own tracker, regardless of the student's resume
+    # selectors. Per-call overrides leave both the arguments and the registered section alone.
+    load_checkpoint(
+        [teacher],
+        None,
+        None,
+        load_dir=distillation.teacher_load,
+        finetune=True,
+        load_optim=False,
+        load_rng=False,
+        ckpt_format=distillation.teacher_ckpt_format or checkpoint.ckpt_format,
+        ckpt_step=None,
+        pretrained_checkpoint=None,
+        non_persistent_ckpt_type=None,
+    )
     print_rank_0("... teacher loaded successfully.")

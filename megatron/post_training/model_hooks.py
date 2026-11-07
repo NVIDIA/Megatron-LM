@@ -54,7 +54,7 @@ def on_model_init_device(hook: PreWrapHook, init_model_with_meta_device: bool) -
     return wrapped
 
 
-def restore_modelopt_state_hook(load_dir: str, ckpt_format: str | None = None) -> PreWrapHook:
+def restore_modelopt_state_hook(load_dir: str, checkpoint=None) -> PreWrapHook:
     """Restore ``modelopt_state`` from ``load_dir`` into each model stage.
 
     [IMPORTANT] This must happen before the model is returned to the caller.
@@ -68,7 +68,7 @@ def restore_modelopt_state_hook(load_dir: str, ckpt_format: str | None = None) -
 
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         for model in models:
-            load_modelopt_state(model=model, load_dir=load_dir, ckpt_format=ckpt_format)
+            load_modelopt_state(model=model, load_dir=load_dir, checkpoint=checkpoint)
         return models
 
     return hook
@@ -291,7 +291,7 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
     if options is not None:
         load_dir = resolve_checkpoint_load_dir(checkpoint)
         if load_dir is not None:
-            register(restore_modelopt_state_hook(load_dir, checkpoint.ckpt_format))
+            register(restore_modelopt_state_hook(load_dir, checkpoint))
         if options.qad_train_target is not None:
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))

@@ -60,7 +60,10 @@ def test_should_use_modelopt_config(
         result = modelopt_utils.should_use_modelopt_config(args)
     assert result is expected
     if checkpoint_has_state:
-        has_state.assert_called_once_with(load, args.ckpt_format)
+        has_state.assert_called_once()
+        assert has_state.call_args.args == (load,)
+        checkpoint = has_state.call_args.kwargs["checkpoint"]
+        assert checkpoint.load == load and checkpoint.ckpt_format == args.ckpt_format
     if assert_args_unchanged:
         assert vars(args) == original_args
 

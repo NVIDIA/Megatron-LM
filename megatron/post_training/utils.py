@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import os
@@ -21,18 +21,22 @@ def is_distillation_model(model) -> bool:
     return isinstance(unwrapped, DistillationModel)
 
 
-def should_use_modelopt_config(args) -> bool:
+def should_use_modelopt_config(args, checkpoint=None) -> bool:
     """Return whether CLI inputs require the ModelOpt-aware model configuration.
 
     ModelOpt is used when ``--modelopt-enabled`` is set, for a checkpoint with ModelOpt
-    state, or for distillation.
+    state, or for distillation. ``checkpoint`` is the registered section at runtime; before
+    registration it is translated from the CLI arguments.
     """
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
+    from megatron.training.argument_utils import checkpoint_config_from_args
 
     if getattr(args, "modelopt_enabled", False):
         return True
-    if args.load is not None and has_modelopt_state(args.load, args.ckpt_format):
+    if checkpoint is None:
+        checkpoint = checkpoint_config_from_args(args)
+    if checkpoint.load is not None and has_modelopt_state(checkpoint.load, checkpoint=checkpoint):
         print_rank_0("ModelOpt checkpoint detected")
         return True
     if getattr(args, "export_kd_teacher_load", None) is not None:

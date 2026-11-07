@@ -96,6 +96,12 @@ change the model's subsequent save behavior. `--export-te-mcore-model` is deprec
 ignored; `--export-default-te-spec` selects full Transformer Engine modules instead of
 ModelOpt's local modules.
 
+Checkpoint settings come from the run container's `checkpoint` section. Distillation loads the
+teacher weights from `distillation.teacher_load`, using `teacher_ckpt_format` when provided
+(otherwise the student's format). The teacher load ignores the student's `ckpt_step`,
+`pretrained_checkpoint`, and `non_persistent_ckpt_type`, and does not change the student's
+checkpoint settings or restore the teacher's optimizer, RNG, or training progress.
+
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
 CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)

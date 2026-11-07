@@ -461,7 +461,7 @@ class TestModelOptCheckpointSelection:
             load=load, pretrained_checkpoint="/pretrained", ckpt_format="torch_dist"
         )
         config.get_builder_cls()(config).pre_wrap_hook(checkpoint)([Mock()])
-        restore.assert_called_once_with(expected, "torch_dist")
+        restore.assert_called_once_with(expected, checkpoint)
 
 
 class TestLoadTeacherModelConfig:
@@ -669,24 +669,41 @@ class TestTeacherCheckpointConfig:
         load_checkpoint.assert_not_called()
 
     @pytest.mark.parametrize("fail", [False, True])
-    def test_uses_config_and_restores_runtime_args(self, fail):
+    @pytest.mark.parametrize("non_persistent_ckpt_type", ["global", "local"])
+    def test_teacher_load_is_isolated_from_student_policy(self, fail, non_persistent_ckpt_type):
         from megatron.post_training import checkpointing
+        from megatron.training.config import CheckpointConfig
 
         args = Namespace(
             finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale", ckpt_step=5
         )
+        checkpoint = CheckpointConfig(
+            load="/student",
+            ckpt_format="torch",
+            ckpt_step=10,
+            pretrained_checkpoint="/student-fallback",
+            non_persistent_ckpt_type=non_persistent_ckpt_type,
+        )
+        original = vars(checkpoint).copy()
         teacher = Mock()
         student = Mock(teacher_model=teacher)
         config = DistillationConfig(teacher_load="/configured", teacher_ckpt_format="torch_dist")
 
         def load(models, optimizer, scheduler, **kwargs):
             assert models == [teacher]
-            assert args.export_kd_teacher_load == "/configured"
-            assert args.ckpt_format == "torch_dist"
-            assert args.finetune is True
-            assert args.ckpt_step is None
-            assert args.pretrained_checkpoint is None
-            assert args.non_persistent_ckpt_type is None
+            assert optimizer is None and scheduler is None
+            assert kwargs == dict(
+                load_dir="/configured",
+                finetune=True,
+                load_optim=False,
+                load_rng=False,
+                ckpt_format="torch_dist",
+                ckpt_step=None,
+                pretrained_checkpoint=None,
+                non_persistent_ckpt_type=None,
+            )
+            assert vars(checkpoint) == original
+            assert args.ckpt_step == 5 and args.export_kd_teacher_load == "/stale"
             if fail:
                 raise RuntimeError("load failed")
 
@@ -697,74 +714,115 @@ class TestTeacherCheckpointConfig:
         ):
             if fail:
                 with pytest.raises(RuntimeError, match="load failed"):
-                    checkpointing.load_kd_teacher_checkpoint([student], config)
+                    checkpointing.load_kd_teacher_checkpoint(
+                        [student], config, student_checkpoint=checkpoint
+                    )
             else:
-                checkpointing.load_kd_teacher_checkpoint([student], config)
+                checkpointing.load_kd_teacher_checkpoint(
+                    [student], config, student_checkpoint=checkpoint
+                )
         load_checkpoint.assert_called_once()
+        assert vars(checkpoint) == original
         assert vars(args) == dict(
             finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale", ckpt_step=5
         )
 
+    @pytest.mark.parametrize("non_persistent_type", ["global", "local"])
+    @pytest.mark.parametrize("tracker", ["7", "release"])
+    def test_teacher_reads_its_own_tracker(
+        self, monkeypatch, tmp_path, run_config, non_persistent_type, tracker
+    ):
+        """Exercise load_checkpoint and its base reader up to the tensor-storage boundary."""
+        from megatron.post_training import checkpointing
+        from megatron.training import checkpointing as training_checkpointing
+
+        teacher_dir = tmp_path / "teacher"
+        teacher_dir.mkdir()
+        (teacher_dir / "latest_checkpointed_iteration.txt").write_text(tracker)
+        non_persistent_dir = tmp_path / "student-non-persistent"
+        non_persistent_dir.mkdir()
+        (non_persistent_dir / "latest_checkpointed_iteration.txt").write_text("1000")
+        checkpoint = run_config.checkpoint
+        checkpoint.load = "/student"
+        checkpoint.ckpt_format = "torch_dist"
+        checkpoint.ckpt_step = 50
+        checkpoint.pretrained_checkpoint = "/student-fallback"
+        checkpoint.non_persistent_ckpt_type = non_persistent_type
+        checkpoint.non_persistent_global_ckpt_dir = str(non_persistent_dir)
+        original = vars(checkpoint).copy()
+        args = Namespace()
+        reads = []
+
+        def read(directory, args, rank0, state_dict, iteration, release, **kwargs):
+            reads.append((directory, rank0, iteration, release))
+            return None, "", False, None
+
+        monkeypatch.setattr(training_checkpointing, "get_args", lambda: args)
+        monkeypatch.setattr(training_checkpointing, "unwrap_model", lambda models: models)
+        monkeypatch.setattr(
+            training_checkpointing, "_get_checkpoint_format", lambda *a: "torch_dist"
+        )
+        monkeypatch.setattr(training_checkpointing, "_load_global_dist_base_checkpoint", read)
+        teacher = Mock()
+        monkeypatch.setattr(checkpointing, "unwrap_model", lambda model: model)
+        checkpointing.load_kd_teacher_checkpoint(
+            [Mock(teacher_model=teacher)],
+            DistillationConfig(teacher_load=str(teacher_dir)),
+            student_checkpoint=checkpoint,
+        )
+        iteration, release = (7, False) if tracker == "7" else (0, True)
+        assert reads == [
+            (str(teacher_dir), True, iteration, release),
+            (str(teacher_dir), False, iteration, release),
+        ]
+        assert vars(checkpoint) == original and vars(args) == {}
+
     def test_no_distillation_ignores_legacy_teacher_flag(self):
         from megatron.post_training import checkpointing
 
-        args = Namespace(export_kd_teacher_load="/teacher")
         with (
-            patch.object(checkpointing, "get_args", return_value=args),
+            patch.object(checkpointing, "get_run_config", side_effect=AssertionError("no run")),
+            patch.object(checkpointing, "get_args", side_effect=AssertionError("no args")),
             patch.object(checkpointing, "load_checkpoint") as load_checkpoint,
         ):
             checkpointing.load_kd_teacher_checkpoint([Mock()], None)
         load_checkpoint.assert_not_called()
 
-    def test_student_checkpoint_format_when_teacher_format_unset(self):
+    @pytest.mark.parametrize("registered", [False, True])
+    def test_student_checkpoint_format_when_teacher_format_unset(self, registered):
         from megatron.post_training import checkpointing
-        from megatron.training.config.training_config import CheckpointConfig
+        from megatron.training.config import CheckpointConfig
 
-        args = Namespace(ckpt_format="torch", finetune=False)
-        observed = []
-
-        def load(*_args, **_kwargs):
-            observed.append(args.ckpt_format)
-
+        checkpoint = CheckpointConfig(ckpt_format="torch_dist")
         with (
-            patch.object(checkpointing, "get_args", return_value=args),
+            patch.object(
+                checkpointing, "get_run_config", return_value=Namespace(checkpoint=checkpoint)
+            ),
             patch.object(checkpointing, "unwrap_model"),
-            patch.object(checkpointing, "load_checkpoint", side_effect=load),
+            patch.object(checkpointing, "load_checkpoint") as load,
         ):
             checkpointing.load_kd_teacher_checkpoint(
                 [Mock()],
                 DistillationConfig(teacher_load="/teacher"),
-                student_checkpoint=CheckpointConfig(ckpt_format="torch_dist"),
+                student_checkpoint=None if registered else checkpoint,
             )
-        assert observed == ["torch_dist"]
-        assert vars(args) == {"ckpt_format": "torch", "finetune": False}
+        assert load.call_args.kwargs["ckpt_format"] == "torch_dist"
 
-    def test_absent_legacy_teacher_path_is_not_left_on_args(self):
+    def test_modelopt_state_uses_explicit_checkpoint_policy(self):
         from megatron.post_training import checkpointing
-
-        args = Namespace(finetune=False, ckpt_format="torch")
-        with (
-            patch.object(checkpointing, "get_args", return_value=args),
-            patch.object(checkpointing, "unwrap_model"),
-            patch.object(checkpointing, "load_checkpoint"),
-        ):
-            checkpointing.load_kd_teacher_checkpoint(
-                [Mock()], DistillationConfig(teacher_load="/teacher")
-            )
-        assert not hasattr(args, "export_kd_teacher_load")
-
-    def test_modelopt_state_uses_explicit_path_and_format(self):
-        from megatron.post_training import checkpointing
+        from megatron.training.config import CheckpointConfig
 
         args = Namespace(load="/student", ckpt_format="torch_dist")
+        checkpoint = CheckpointConfig(load="/configured", ckpt_format="torch", ckpt_step=10)
         with (
             patch.object(checkpointing, "get_args", return_value=args),
+            patch.object(checkpointing, "get_run_config", side_effect=AssertionError("no run")),
             patch.object(
                 checkpointing, "_load_base_checkpoint", return_value=({}, None, None, None)
             ) as load,
         ):
-            checkpointing.load_modelopt_state(Mock(), "/explicit", ckpt_format="torch")
-        load.assert_called_once_with("/explicit", args, rank0=False)
+            checkpointing.load_modelopt_state(Mock(), "/explicit", checkpoint=checkpoint)
+        load.assert_called_once_with("/explicit", args, rank0=False, checkpoint=checkpoint)
 
 
 class TestConfigurationDrivenKDLoss:
