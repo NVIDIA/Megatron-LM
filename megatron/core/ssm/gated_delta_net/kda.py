@@ -237,11 +237,14 @@ class KimiDeltaAttention(_GDNBase):
         beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
         return raw_g, {"beta": beta.contiguous()}
 
-    @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
+        """Apply per-head RMSNorm followed by KDA's sigmoid output gate.
 
-        x_dtype = x.dtype
+        Two-stage gates call FLA's fused gated norm outside torch.compile. Traced into a compiled
+        graph, its autotuned Triton kernel would be timed by Inductor, out of reach of the
+        autotune policy that pins FLA's kernels in deterministic mode.
+        """
+
         x = x.reshape(-1, self.value_head_dim)
         gate = gate.reshape(-1, self.value_head_dim)
         if self.two_stage_gates:
@@ -252,6 +255,12 @@ class KimiDeltaAttention(_GDNBase):
             return rms_norm_gated(
                 x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
             )
+        return self._apply_gated_norm_unfused(x, gate)
+
+    @jit_fuser
+    def _apply_gated_norm_unfused(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply ``out_norm`` and the sigmoid gate, rounding once at the end."""
+        x_dtype = x.dtype
         x = self.out_norm(x)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 

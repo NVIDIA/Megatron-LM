@@ -73,6 +73,36 @@ def test_falls_back_to_cheapest_when_untuned(restore_state, caplog):
     assert "mamba_ssm.ops.triton.fake._fake_kernel" in caplog.text
 
 
+def test_cheapest_counts_fla_tile_sizes():
+    """FLA names its tiles ``B`` plus the tiled dimension; they count like ``BLOCK_*`` ones, so
+    the smallest tile is the cheapest (the likeliest to fit in shared memory) whatever the
+    candidate order. Non-tile arguments, such as a swizzle group or a precision, do not count."""
+    configs = [
+        _Config({"BK": 128, "BV": 64}, num_stages=2),
+        _Config({"BK": 64, "BV": 32}, num_stages=2),
+        _Config({"BK": 64, "BV": 32}, num_stages=3),
+    ]
+    assert selection.cheapest(configs) is configs[1]
+    assert selection.cheapest([_Config({"B": 1024}), _Config({"B": 256})]).kwargs == {"B": 256}
+    configs = [_Config({"BM": 64, "G": 1}), _Config({"BM": 32, "G": 8, "DOT_PRECISION": "tf32"})]
+    assert selection.cheapest(configs) is configs[1]
+
+
+def test_cheapest_prefers_one_warpgroup_on_equal_tiles():
+    """Among equal tile costs, 4 warps (one warpgroup) win, then the nearest larger count, then
+    the nearest smaller one; fewer warps would rule out warpgroup tensor-core instructions."""
+
+    def warps_chosen(counts):
+        return selection.cheapest([_Config({"BT": 64}, num_warps=n) for n in counts]).num_warps
+
+    assert warps_chosen([1, 2, 4, 8, 16, 32]) == 4
+    assert warps_chosen([2, 8, 16]) == 8
+    assert warps_chosen([1, 2]) == 2
+    # The tile still comes first: a smaller tile at 1 warp beats a larger one at 4.
+    configs = [_Config({"BT": 64}, num_warps=4), _Config({"BT": 32}, num_warps=1)]
+    assert selection.cheapest(configs) is configs[1]
+
+
 def test_prefers_tuned_config_and_preserves_identity(restore_state):
     """A table hit returns the ORIGINAL Config object, keeping pre_hook intact."""
     table = _table(
