@@ -100,6 +100,16 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_moe_backend_arguments():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    assert args.moe_token_dispatcher_type == "alltoall"
+    assert args.moe_grouped_gemm is True
+    assert parser.parse_args(["--moe-grouped-gemm"]).moe_grouped_gemm is True
+    assert parser.parse_args(["--no-moe-grouped-gemm"]).moe_grouped_gemm is False
+
+
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
     from megatron.training.training import get_megatron_ddp_config
