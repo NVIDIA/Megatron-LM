@@ -79,6 +79,9 @@ def test_kpool_preserves_each_query_causal_tail(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+# Without fast_hadamard_transform the autouse fixture above replaces the transform with a scale,
+# which this test would then compare against a real Hadamard matrix.
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform is not installed")
 @pytest.mark.parametrize("input_scale", [0.0, 1e-5, 1.0, 1000.0])
 def test_kpool_fp8_input_matches_hadamard_matrix_reference(input_scale):
     torch.manual_seed(456)
