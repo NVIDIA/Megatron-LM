@@ -412,8 +412,13 @@ def flashinfer_cutlass_mxfp8_moe(
     activation_type,
     out: torch.Tensor | None = None,
     activation_clamp_limit: torch.Tensor | None = None,
+    use_fused_finalize: bool = True,
 ) -> torch.Tensor:
-    """Run full-row MXFP8 MoE through FlashInfer's CUTLASS backend."""
+    """Run full-row MXFP8 MoE through FlashInfer's CUTLASS backend.
+
+    use_fused_finalize=False rules out GEMM2 tactics that sum each token's top-k routes with
+    atomics, so the result does not depend on their order.
+    """
     require_flashinfer_cutlass_mxfp8()
     if hidden_states.dtype != torch.bfloat16:
         raise TypeError(
@@ -457,6 +462,7 @@ def flashinfer_cutlass_mxfp8_moe(
             use_mxfp8_act_scaling=True,
             activation_type=activation_type,
             swizzled_input_sf=True,
+            use_fused_finalize=use_fused_finalize,
         )
     )
 

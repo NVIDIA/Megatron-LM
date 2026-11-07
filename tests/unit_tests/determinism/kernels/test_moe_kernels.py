@@ -9,9 +9,13 @@ the router gating GEMM, and virtual-expert planning against a CPU oracle in eage
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
-``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
+``fused_a2a.py`` when the dependency and the GPUs are available), the inference
+``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell, and the inference BF16
+experts on FlashInfer's CUTLASS fused MoE under every GEMM2 tactic its autotuner can select.
 """
+
+import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,6 +41,7 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
+    InferenceGroupedMLP,
     SequentialMLP,
     TEGroupedMLP,
     _te_supports_scaled_tanh_srelu,
@@ -912,6 +917,86 @@ class _InQuantizationContext(torch.nn.Module):
             return self.module(*args)
 
 
+_FLASHINFER_MOE_GEMM1 = "trtllm::fused_moe::gemm1"
+_FLASHINFER_MOE_GEMM2 = "trtllm::fused_moe::gemm2"
+
+
+def _pin_flashinfer_gemm2_tactic(monkeypatch):
+    """Stand-in for a tuned FlashInfer autotuner cache that holds a fused-MoE GEMM2 tactic.
+
+    Set ``.tactic`` to an index into the runner's GEMM2 tactics, or ``None`` for FlashInfer's
+    untuned default. ``.count`` is the number of GEMM2 tactics the runner offers and
+    ``.fused_finalize`` whether it offers fused-finalize ones. ``.valid`` lists the GEMM2
+    tactics FlashInfer's autotuner may select (its runner's ``get_valid_tactics``: the
+    CUTLASS dispatch accepts them on this GPU); it never offers the others. GEMM1 keeps its
+    default.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    choose_one = AutoTuner.choose_one
+    pin = SimpleNamespace(tactic=None, count=None, fused_finalize=None, valid=None)
+
+    def pinned_choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        if custom_op not in (_FLASHINFER_MOE_GEMM1, _FLASHINFER_MOE_GEMM2):
+            return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+        moe_runner = runners[0].fused_moe_runner
+        # GEMM2 tactic ids follow the GEMM1 ones.
+        gemm1_count = moe_runner.get_gemm1_tactic_count()
+        pin.count = moe_runner.get_gemm2_tactic_count()
+        pin.fused_finalize = runners[0].use_fused_finalize
+        if custom_op == _FLASHINFER_MOE_GEMM2:
+            # The runner is set to GEMM2 here, as for FlashInfer's own tuning; the profile
+            # only matters for W4 group scaling.
+            pin.valid = sorted(
+                tactic - gemm1_count
+                for tactic in runners[0].get_valid_tactics(inputs, None)
+                if tactic >= gemm1_count
+            )
+        if custom_op == _FLASHINFER_MOE_GEMM1 or pin.tactic is None:
+            return runners[0], -1
+        return runners[0], gemm1_count + pin.tactic
+
+    monkeypatch.setattr(AutoTuner, "choose_one", pinned_choose_one)
+    return pin
+
+
+@pytest.fixture
+def flashinfer_gemm2_tactic(monkeypatch):
+    """_pin_flashinfer_gemm2_tactic for the BF16 experts, where FlashInfer's CUTLASS fused-MoE
+    module is already built (its first use JIT-compiles every dtype combination: about 38
+    minutes on an H100 node, longer than the determinism bucket)."""
+    fused_moe = pytest.importorskip("flashinfer.fused_moe")
+    if "use_fused_finalize" not in inspect.signature(fused_moe.cutlass_fused_moe).parameters:
+        pytest.skip("cutlass_fused_moe has no use_fused_finalize before FlashInfer 0.6.15")
+    from flashinfer.jit import fused_moe as fused_moe_jit
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = 10 * major + minor
+    gen_module = getattr(fused_moe_jit, f"gen_cutlass_fused_moe_sm{sm}_module", None)
+    if sm not in (90, 100, 103) or gen_module is None:
+        pytest.skip(f"FlashInfer has fused-finalize BF16 MoE tactics on SM90/100/103, not SM{sm}")
+    if not gen_module().is_compiled:
+        pytest.skip(
+            "FlashInfer's CUTLASS fused-MoE module is not built. Install flashinfer-jit-cache or "
+            f"build it once with flashinfer.fused_moe.core.get_cutlass_fused_moe_module('{sm}')."
+        )
+    return _pin_flashinfer_gemm2_tactic(monkeypatch)
+
+
+_PROBE_ROW = 73
+
+
+def _routed_tokens(num_tokens, num_experts, topk, hidden_size):
+    """``(hidden, routing_map, probs)`` for a batch, and for its token ``_PROBE_ROW`` alone."""
+    batch = (
+        torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16),
+        torch.rand(num_tokens, num_experts, device="cuda").argsort(dim=-1)[:, :topk],
+        torch.softmax(torch.randn(num_tokens, topk, device="cuda"), dim=-1),
+    )
+    alone = tuple(t[_PROBE_ROW : _PROBE_ROW + 1].clone() for t in batch)
+    return batch, alone
+
+
 class TestMoEModules:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -1311,6 +1396,211 @@ class TestMoEModules:
                 what="MoELayer[inference, flashinfer per-token NVFP4]",
             )
         assert layer.experts._nvfp4_weights is not None
+
+    def _flashinfer_bf16_experts_forward(self):
+        """Inference BF16 experts (16, top-8, squared ReLU) on FlashInfer's CUTLASS fused MoE."""
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+
+        if not HAVE_TE:
+            pytest.skip("InferenceGroupedMLP needs Transformer Engine")
+        self._init()
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=16,
+            moe_ffn_hidden_size=512,
+            moe_router_topk=8,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=squared_relu,
+            gated_linear_unit=False,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nccl",
+        )
+        experts = get_submodules(get_inference_optimized_moe_spec()).experts(
+            num_local_experts=16,
+            config=config,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        experts = experts.cuda().eval()
+
+        def forward(hidden, routing_map, probs):
+            with InferenceMode.active():
+                return experts(hidden, None, probs, routing_map)[0]
+
+        return forward
+
+    @pytest.mark.parametrize("mode", ["deterministic", "batch_invariant"])
+    def test_inference_flashinfer_bf16_experts_replay_for_every_gemm2_tactic(
+        self, mode, flashinfer_gemm2_tactic
+    ):
+        """BF16 FlashInfer experts replay bit-exactly and are batch invariant whichever GEMM2
+        tactic FlashInfer's autotuner holds. GEMM2 tactics with a fused finalize sum the top-k
+        routes with BF16 atomics, so they must not be selectable in these modes."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        forward = self._flashinfer_bf16_experts_forward()
+        batch, alone = _routed_tokens(1024, 16, 8, 1024)
+        runnable = []
+        with (
+            torch.no_grad(),
+            deterministic_algorithms(mode == "deterministic"),
+            set_batch_invariant_mode(mode == "batch_invariant"),
+        ):
+            forward(*alone)
+            assert (
+                flashinfer_gemm2_tactic.fused_finalize is False
+            ), f"FlashInfer offers fused-finalize GEMM2 tactics to BF16 experts in {mode} mode"
+            tactics = [None, *range(flashinfer_gemm2_tactic.count)]
+            for tactic in tactics:
+                flashinfer_gemm2_tactic.tactic = tactic
+                what = f"FlashInfer BF16 experts[{mode}, GEMM2 tactic {tactic}]"
+                try:
+                    probe = forward(*alone)[0]
+                    forward(*batch)
+                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
+                    continue
+                runnable.append(tactic)
+                outputs, _ = assert_replays_bit_exact(
+                    forward, batch, replays=3, backward=False, what=what
+                )
+                assert bytes_equal(
+                    outputs["out"][_PROBE_ROW], probe
+                ), f"{what}: a token's output changed with its batch"
+        assert None in runnable and 2 * len(runnable) >= len(
+            tactics
+        ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"
+
+    @pytest.mark.launch_on_gb200
+    def test_inference_flashinfer_cutlass_mxfp8_experts_replay_for_every_gemm2_tactic(
+        self, monkeypatch
+    ):
+        """CUTLASS MXFP8 ClampedRelu2 experts (top-4) replay bit-exactly under deterministic
+        algorithms whichever GEMM2 tactic FlashInfer's autotuner holds. Their call goes through
+        cutlass_fused_moe too, whose fused-finalize GEMM2 tactics sum the top-k routes with
+        atomics, so those must not be selectable.
+
+        Blackwell is this test's hardware, so there it does not skip: a FlashInfer without
+        ClampedRelu2 or use_fused_finalize fails it, and without flashinfer-jit-cache FlashInfer
+        builds its CUTLASS fused-MoE module on first use (about 8 minutes on GB200).
+        """
+        if torch.cuda.get_device_capability()[0] != 10:
+            pytest.skip("FlashInfer ClampedRelu2 needs SM10x")
+        from flashinfer import fused_moe
+        from flashinfer.fused_moe import ActivationType
+
+        parameters = inspect.signature(fused_moe.cutlass_fused_moe).parameters
+        assert hasattr(ActivationType, "ClampedRelu2"), "FlashInfer has no ClampedRelu2"
+        for name in ("clamped_relu2_limit", "use_fused_finalize"):
+            assert name in parameters, f"FlashInfer's cutlass_fused_moe has no {name}"
+        flashinfer_gemm2_tactic = _pin_flashinfer_gemm2_tactic(monkeypatch)
+        from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_cutlass_mxfp8_weights
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        seeded()
+        num_experts, hidden_size, ffn_hidden_size, topk = 8, 512, 512, 4
+
+        def cutlass_mxfp8_weight(rows, cols):
+            weights = torch.randn(num_experts, rows, cols, device="cuda") / cols**0.5
+            parts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in weights.bfloat16()]
+            return prepare_cutlass_mxfp8_weights(
+                MXFP8Tensor(
+                    data=torch.stack([p.data for p in parts]),
+                    scale=torch.stack([p.scale for p in parts]),
+                    backend="triton",
+                    dtype=torch.bfloat16,
+                )
+            )
+
+        experts = SimpleNamespace(  # the attributes InferenceGroupedMLP._flashinfer_forward reads
+            _uses_mxfp8_weights=True,
+            _fc1_weight=cutlass_mxfp8_weight(ffn_hidden_size, hidden_size),
+            _fc2_weight=cutlass_mxfp8_weight(hidden_size, ffn_hidden_size),
+            _flashinfer_activation_type=ActivationType.ClampedRelu2,
+            _activation_clamp_scale=0.5,
+            _flashinfer_clamp_limit=torch.full((1,), 0.5, device="cuda", dtype=torch.float32),
+            _nvls_dispatcher=False,
+            ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+            # Torch deterministic algorithms alone must rule out the fused finalize.
+            config=SimpleNamespace(deterministic_mode=False, batch_invariant_mode=False),
+        )
+
+        def forward(hidden, routing_map, probs):
+            return InferenceGroupedMLP._flashinfer_forward(experts, hidden, routing_map, probs)[0]
+
+        batch, _ = _routed_tokens(4096, num_experts, topk, hidden_size)
+        failed = {}
+        with torch.no_grad(), deterministic_algorithms(True):
+            forward(*batch)
+            assert (
+                flashinfer_gemm2_tactic.fused_finalize is False
+            ), "FlashInfer offers fused-finalize GEMM2 tactics to CUTLASS MXFP8 experts"
+            # The runner lists more GEMM2 tactics than its CUTLASS dispatch can launch with
+            # MXFP8 on this GPU; FlashInfer reports those as invalid (zero occupancy) and its
+            # autotuner never selects them. Every tactic it reports valid must run and replay.
+            valid = flashinfer_gemm2_tactic.valid
+            invalid = flashinfer_gemm2_tactic.count - len(valid)
+            assert valid, f"FlashInfer reports none of {flashinfer_gemm2_tactic.count} valid"
+            for tactic in [None, *valid]:
+                flashinfer_gemm2_tactic.tactic = tactic
+                try:
+                    forward(*batch)
+                except RuntimeError as error:
+                    failed[tactic] = str(error).strip().splitlines()[0][:300]
+                    continue
+                assert_replays_bit_exact(
+                    forward,
+                    batch,
+                    replays=3,
+                    backward=False,
+                    what=f"FlashInfer CUTLASS MXFP8 experts[GEMM2 tactic {tactic}]",
+                )
+        assert not failed, (
+            f"{len(failed)} of the {len(valid)} GEMM2 tactics FlashInfer reports valid (or the "
+            f"default, None) failed to run ({invalid} of {flashinfer_gemm2_tactic.count} are "
+            f"invalid): {failed}"
+        )
+
+    @pytest.mark.xfail(
+        strict=False,
+        raises=AssertionError,
+        reason="Negative control. Whether the fused-finalize atomics race visibly is hardware "
+        "dependent; recorded, not gated.",
+    )
+    def test_inference_flashinfer_bf16_fused_finalize_is_the_racy_path(
+        self, flashinfer_gemm2_tactic
+    ):
+        """Negative control: by default FlashInfer also offers GEMM2 tactics that fuse the
+        finalize. When their atomic top-k sum races visibly, the sweep above is known to
+        reach such tactics if they are offered."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        forward = self._flashinfer_bf16_experts_forward()
+        batch, _ = _routed_tokens(1024, 16, 8, 1024)
+        differing = 0
+        with torch.no_grad(), deterministic_algorithms(False), set_batch_invariant_mode(False):
+            forward(*batch)
+            for tactic in range(flashinfer_gemm2_tactic.count):
+                flashinfer_gemm2_tactic.tactic = tactic
+                try:
+                    forward(*batch)
+                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
+                    continue
+                differing += count_differing_replays(forward, batch, replays=3, backward=False)
+        assert differing > 0, "no GEMM2 tactic of the default runner varied across replays"
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
