@@ -394,9 +394,11 @@ def loss_func(loss_mask, output_tensor, samples_seen):
     loss_mask = loss_mask.contiguous().view(-1).float()
     loss = torch.sum(losses * loss_mask)
 
-    if args.no_calculate_per_token_loss:
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int).clamp(min=1)
-    elif args.use_loss_scaling and args.context_parallel_size > 1:
+    if (
+        not args.no_calculate_per_token_loss
+        and args.use_loss_scaling
+        and args.context_parallel_size > 1
+    ):
         # The precomputed mask already normalizes the loss; account for the loss
         # reduction's division by the number of CP ranks.
         num_tokens = torch.tensor(1, dtype=torch.int, device=losses.device)
