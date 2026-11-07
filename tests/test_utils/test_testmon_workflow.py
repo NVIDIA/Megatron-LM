@@ -496,6 +496,96 @@ def _run_configure(
 
 
 @pytest.mark.parametrize(
+    ("labels", "overrides", "repeat", "lightweight", "functional", "cadence_bypass"),
+    [
+        pytest.param([], {}, "2", "false", "false", "false", id="default"),
+        pytest.param(["Run tests"], {}, "1", "true", "true", "true", id="lightweight"),
+        pytest.param(
+            ["Run tests", "Run functional tests"],
+            {},
+            "1",
+            "true",
+            "true",
+            "true",
+            id="existing-lightweight-precedence",
+        ),
+        pytest.param(["Run functional tests"], {}, "5", "false", "true", "true", id="five-runs"),
+        pytest.param(["Run functional tests once"], {}, "1", "false", "true", "true", id="one-run"),
+        pytest.param(
+            ["Run functional tests", "Run functional tests once"],
+            {},
+            "1",
+            "false",
+            "true",
+            "true",
+            id="once-overrides-five",
+        ),
+        pytest.param(
+            ["Run tests", "Run functional tests once"],
+            {},
+            "1",
+            "false",
+            "true",
+            "true",
+            id="once-overrides-lightweight",
+        ),
+        pytest.param(
+            ["Run functional tests once", "container::lts"],
+            {},
+            "1",
+            "false",
+            "true",
+            "true",
+            id="once-with-explicit-lts",
+        ),
+        pytest.param(
+            [],
+            {"IS_MERGE_GROUP": "true", "EVENT_NAME": "merge_group"},
+            "1",
+            "false",
+            "true",
+            "false",
+            id="merge-group",
+        ),
+        pytest.param(
+            [],
+            {"IS_CI_WORKLOAD": "true", "EVENT_NAME": "schedule"},
+            "5",
+            "false",
+            "true",
+            "false",
+            id="schedule",
+        ),
+        pytest.param(
+            [], {"EVENT_NAME": "workflow_dispatch"}, "5", "false", "true", "false", id="dispatch"
+        ),
+    ],
+)
+def test_functional_scope_and_repetitions(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    labels: list[str],
+    overrides: dict[str, str],
+    repeat: str,
+    lightweight: str,
+    functional: str,
+    cadence_bypass: str,
+) -> None:
+    """Exercise the actual configure shell across labels and non-PR triggers."""
+    result, outputs = _run_configure(tmp_path, {**configure_environment, **overrides}, labels)
+    assert result.returncode == 0, result.stderr
+    assert outputs["scope"] == ("L1" if functional == "true" else "L0")
+    assert outputs["n_repeat"] == repeat
+    assert outputs["lightweight"] == lightweight
+    assert outputs["run_functional"] == functional
+    assert outputs["run_h100_functional"] == "true"
+    assert outputs["cadence_bypass"] == cadence_bypass
+    assert outputs["lts"] == str("container::lts" in labels).lower()
+    if cadence_bypass == "true":
+        assert outputs["cadence"] == ""
+
+
+@pytest.mark.parametrize(
     ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
     [
         pytest.param(
@@ -724,6 +814,7 @@ def test_selective_variable_and_label_precedence(
     [
         pytest.param(["Run tests"], {}, id="run-tests-label"),
         pytest.param(["Run functional tests"], {}, id="run-functional-tests-label"),
+        pytest.param(["Run functional tests once"], {}, id="run-functional-tests-once-label"),
         pytest.param(["force-run-all"], {}, id="force-run-all-label"),
         pytest.param(["container::lts"], {}, id="lts-label"),
         pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),

@@ -14,7 +14,11 @@ metadata:
 
 For PR-label or trigger questions, lead with the exact values:
 
-- No label: `scope=mr-github-slim`, `n_repeat=2`, `lightweight=false`.
+- `Run functional tests once`: `scope=L1`, `n_repeat=1`, `lightweight=false`.
+  Runs normal training steps and golden-value comparisons; also requests full unit buckets.
+- `Run functional tests`: `scope=L1`, `n_repeat=5`, `lightweight=false`.
+- `Run tests`: `scope=L1`, `n_repeat=1`, `lightweight=true` (four steps, no golden comparison).
+- No scope label: `scope=L0`, `n_repeat=2`, `lightweight=false`.
 - `container::lts` only switches the container image path to LTS and combines
   with any scope label. **Opt-in only — attach it solely when the user
   explicitly asks for LTS validation; never add it on your own initiative, even
@@ -65,8 +69,16 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 | Condition | `scope` | `n_repeat` | `lightweight` | Notes |
 |-----------|---------|-----------|---------------|-------|
-| Merge group | `mr-github` | 1 | false | Automatic, no label needed |
-| _(no label)_ | `mr-github-slim` | 2 | false | Slim subset only |
+| Merge group | `L1` | 1 | false | Automatic, no label needed |
+| `Run functional tests once` | `L1` | 1 | false | Full functional run; wins over both other scope labels |
+| `Run tests` | `L1` | 1 | true | Lightweight run without golden comparisons |
+| `Run functional tests` | `L1` | 5 | false | Five full repetitions |
+| Schedule / manual dispatch | `L1` | 5 | false | CI workload default |
+| _(no scope label)_ | `L0` | 2 | false | PR default |
+
+Both full-functional labels bypass cadence filtering and disable selective unit tests.
+They share the approval queue's global functional-test slot and are held when
+`ALLOW_PR_RUN_ALL_TESTS=false`.
 
 **Orthogonal image label:**
 
@@ -78,6 +90,9 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.
+
+For combining queued changes into one validation PR, use
+[batch-and-test-mergequeue-prs](../batch-and-test-mergequeue-prs/SKILL.md).
 
 ### Which label to attach when opening a PR
 

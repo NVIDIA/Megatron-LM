@@ -195,7 +195,10 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 3. Add a YAML recipe under `tests/test_utils/recipes/h100/` (and `gb200/` if
    needed). Required fields: `scope`, `environment`, `platform`, `n_repeat`,
    `time_limit`.
-4. Push the PR, add the label **"Run functional tests"** to trigger a full run.
+4. Request **"Run functional tests once"** for a full run with one repetition,
+   or **"Run functional tests"** for five repetitions. Both keep normal training
+   steps and golden comparisons. Apply the label before the synthetic PR push
+   or rerun the workflow after changing labels; labels alone do not start CI.
 5. After a successful run, download golden values:
 
    ```bash
