@@ -1013,16 +1013,17 @@ def group_params_for_buffers(
 
 
 def _compute_default_per_buffer_param_layout(
-    params: List[torch.nn.Parameter], bucket_size: Optional[int]
+    params: List[torch.nn.Parameter], bucket_size: Optional[int], alignment: int = 1
 ) -> 'PerBufferParamLayout':
     """Compute parameter layout for the non-distributed-optimizer case.
 
-    No padding is applied. Parameters are iterated in reverse order (backprop order)
-    and grouped into buckets of approximately `bucket_size` elements.
+    Parameters are iterated in reverse order (backprop order) and grouped into
+    buckets of approximately `bucket_size` elements.
 
     Args:
         params: List of parameters to lay out.
         bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+        alignment: Alignment of parameter and bucket starts in elements.
 
     Returns:
         PerBufferParamLayout with the computed mapping.
@@ -1037,8 +1038,8 @@ def _compute_default_per_buffer_param_layout(
     bucket_start_index = 0
     bucket_params = set()
     bucket_id = 0
-
     for param in params[::-1]:
+        param_start_index = (param_start_index + alignment - 1) // alignment * alignment
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)
@@ -1046,6 +1047,7 @@ def _compute_default_per_buffer_param_layout(
 
         if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            param_end_index = (param_end_index + alignment - 1) // alignment * alignment
             bucket_indices.append((bucket_start_index, param_end_index))
             bucket_start_index = param_end_index
             bucket_params = set()
@@ -1054,6 +1056,7 @@ def _compute_default_per_buffer_param_layout(
 
     if len(bucket_params) > 0:
         per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+        param_end_index = (param_end_index + alignment - 1) // alignment * alignment
         bucket_indices.append((bucket_start_index, param_end_index))
 
     return PerBufferParamLayout(
@@ -1099,6 +1102,7 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
+        align_fp4_wgrad: bool = False,
     ):
 
         if pg_collection is None:
@@ -1148,9 +1152,15 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
 
-        # Use the provided layout if given, otherwise compute the default (no-padding) layout.
+        # FP4 GEMM writes fused weight gradients directly into this buffer and requires
+        # 16-byte-aligned output pointers. Distributed optimizer layouts already align them.
         if param_layout is None:
-            param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
+            alignment = (
+                16 // torch.empty((), dtype=grad_dtype).element_size() if align_fp4_wgrad else 1
+            )
+            param_layout = _compute_default_per_buffer_param_layout(
+                self.params, bucket_size, alignment
+            )
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
         self.num_optimizer_shards = param_layout.num_optimizer_shards
@@ -1200,7 +1210,7 @@ class _ParamAndGradBuffer:
             assert self.numel % self.data_parallel_world_size == 0
             if self.has_nvfp4_params:
                 assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
-        else:
+        elif not align_fp4_wgrad:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
