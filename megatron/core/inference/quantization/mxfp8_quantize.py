@@ -39,6 +39,33 @@ def _ceil_div(a, b):
 
 
 @triton.jit
+def _mxfp8_quantize_groups(x, BLOCK_GROUPS: tl.constexpr):
+    """Quantize one row of BLOCK_GROUPS * 32 fp32 values to e4m3 with per-32 e8m0 scales.
+
+    Returns the e4m3 values ([BLOCK_GROUPS * 32]) and the scale exponents ([BLOCK_GROUPS] uint8).
+    The scale rounds up to the next power of two (Mishra et al., https://arxiv.org/pdf/2506.08027).
+    """
+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+    max_vals = tl.max(tl.abs(x_grouped), axis=1)
+
+    # 448 is the max representable value in FP8 e4m3.
+    # dequant_scale = min scale s.t. max_val / scale <= 448.
+    dequant_scale = max_vals / 448.0
+    # Round up to next power of 2 via integer bit manipulation:
+    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
+    # (exponent-only mask) bumps the exponent if any mantissa bits are set.
+    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+    quantized = tl.reshape(x_grouped * quant_scale[:, None], [BLOCK_GROUPS * 32])
+    return quantized.to(tl.float8e4nv), (dequant_exp >> 23).to(tl.uint8)
+
+
+@triton.jit
 def _mxfp8_quant_swizzle_row(
     row,
     out_ptr,
@@ -59,35 +86,12 @@ def _mxfp8_quant_swizzle_row(
 
     # Load full row
     x = tl.load(src_row + offs, mask=mask, other=0.0).to(tl.float32)
-
-    # Per-group-of-32 max
-    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
-    abs_grouped = tl.abs(x_grouped)
-    max_vals = tl.max(abs_grouped, axis=1)
-
-    # 448 is the max representable value in FP8 e4m3.
-    # dequant_scale = min scale s.t. max_val / scale <= 448.
-    dequant_scale = max_vals / 448.0
-    # Round up to next power of 2 via integer bit manipulation:
-    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
-    # (exponent-only mask) bumps the exponent if any mantissa bits are set.
-    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
-    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
-
-    # Quantize
-    quantized = x_grouped * quant_scale[:, None]
-    quantized_flat = tl.reshape(quantized, [BLOCK_K])
-    out_fp8 = quantized_flat.to(tl.float8e4nv)
+    out_fp8, scale_exp = _mxfp8_quantize_groups(x, BLOCK_GROUPS)
 
     # Store FP8 data
     tl.store(out_row + offs, out_fp8, mask=mask)
 
     # Store swizzled scales
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
@@ -296,6 +300,81 @@ def mxfp8_quantize_rows(
         NUM_PROGRAMS=num_programs,
     )
     return out_data, out_scale.view(torch.float8_e8m0fnu)
+
+
+# Persistent grid for the routed-layout quantizer; each CTA strides over the live rows, so idle
+# CTAs cost nothing at decode. GB300, 65,536 live rows: 2048 CTAs x 8 warps 94 us (512 x 4: 196 us).
+_ROUTED_ROWS_CTAS = 2048
+
+
+@triton.jit
+def _mxfp8_quant_routed_rows_kernel(
+    src_ptr,  # [rows, K] bf16/fp16/fp32 input
+    out_ptr,  # [rows, padded_K] e4m3 output; columns >= K are zeroed
+    scale_ptr,  # [rows, padded_K // 32] e8m0 scales in linear layout; groups >= K // 32 are zeroed
+    n_rows_ptr,  # scalar int32 CUDA tensor: only rows [0, n_rows) are written
+    K,  # logical hidden size (multiple of 32)
+    padded_K,  # row stride of out_ptr (multiple of 128)
+    BLOCK_K: tl.constexpr,  # next_power_of_2(padded_K)
+    BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32
+    NUM_PROGRAMS: tl.constexpr,  # persistent grid size
+):
+    """Quantize the live rows to MXFP8 in the row-major layout the TRT-LLM routed MoE reads."""
+    pid = tl.program_id(0)
+    n_rows = tl.load(n_rows_ptr)
+    padded_groups = padded_K // 32
+    offs = tl.arange(0, BLOCK_K)
+    load_mask = offs < K
+    store_mask = offs < padded_K
+    group_offs = tl.arange(0, BLOCK_GROUPS)
+    group_mask = group_offs < padded_groups
+    for row in tl.range(pid, n_rows, NUM_PROGRAMS):
+        row64 = tl.cast(row, tl.int64)
+        # Padding columns load as 0, so they quantize to 0 with a 0 scale exponent.
+        x = tl.load(src_ptr + row64 * K + offs, mask=load_mask, other=0.0).to(tl.float32)
+        out_fp8, scale_exp = _mxfp8_quantize_groups(x, BLOCK_GROUPS)
+        tl.store(out_ptr + row64 * padded_K + offs, out_fp8, mask=store_mask)
+        tl.store(scale_ptr + row64 * padded_groups + group_offs, scale_exp, mask=group_mask)
+
+
+def quantize_routed_mxfp8_input(
+    hidden_states: torch.Tensor, padded_hidden_size: int, valid_tokens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows [0, valid_tokens) of `hidden_states` for the TRT-LLM routed MXFP8 MoE.
+
+    Returns row-major e4m3 data of shape [rows, padded_hidden_size] and uint8 e8m0 scales of
+    shape [rows, padded_hidden_size // 32] in the kernel's linear layout. Padding columns of the
+    live rows are zero; rows at or beyond valid_tokens are left uninitialized. Quantized values
+    are bitwise identical to `mxfp8_quantize`.
+    """
+    if not HAVE_TRITON:
+        raise RuntimeError("quantize_routed_mxfp8_input requires triton.")
+    rows, hidden_size = hidden_states.shape
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0, f"hidden size {hidden_size} must be divisible by 32"
+    assert (
+        padded_hidden_size >= hidden_size and padded_hidden_size % 128 == 0
+    ), f"padded hidden size {padded_hidden_size} must be a multiple of 128, at least {hidden_size}"
+    assert hidden_states.is_contiguous() and valid_tokens.is_cuda and valid_tokens.numel() == 1
+    device = hidden_states.device
+    data = torch.empty(rows, padded_hidden_size, dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.empty(
+        rows, padded_hidden_size // MXFP8_BLOCK_SIZE, dtype=torch.uint8, device=device
+    )
+    BLOCK_K = triton.next_power_of_2(padded_hidden_size)
+    num_programs = max(1, min(rows, _ROUTED_ROWS_CTAS))
+    _mxfp8_quant_routed_rows_kernel[(num_programs,)](
+        hidden_states,
+        data,
+        scale,
+        valid_tokens,
+        hidden_size,
+        padded_hidden_size,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
+        NUM_PROGRAMS=num_programs,
+        num_warps=8,
+    )
+    return data, scale
 
 
 def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
