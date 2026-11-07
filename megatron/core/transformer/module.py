@@ -152,6 +152,9 @@ class MegatronModule(torch.nn.Module):
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
         A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
+        Call this after updating parameters in place outside of a training step (e.g. a weight
+        refit into an inference model) so the cached quantized weights are refreshed on the next
+        forward, in eager mode and in CUDA graph replays.
         """
         if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
