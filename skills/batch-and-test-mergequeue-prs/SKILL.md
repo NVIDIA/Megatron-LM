@@ -76,8 +76,9 @@ auto-sync may be disabled. Verify that a `CICD Megatron-LM` run appears on
   `scope=L1`, `lightweight=false`, `n_repeat=1`, `cadence=mergegroup`,
   `cadence_bypass=false`, `unit_testmon_eligible=false`, `lts=false`,
   `run_functional=true`, `run_h100_functional=true`, `run_mbridge=true`,
-  `mbridge_suite=L1`, and `run_nemo_rl=false`. `run_functional` controls GB200
-  functional selection; platform and downstream feature gates still apply.
+  `mbridge_suite=L1`, and `run_nemo_rl=false`. GB200 functional jobs retain their
+  existing approval, unit-test, maintainer, and feature gates; downstream feature
+  gates still apply.
 - CI may test a synthetic merge SHA rather than the source head. Record it and
   compare its tree with the expected source patches on its actual upstream base.
   Do not call a different or stale revision validated.
