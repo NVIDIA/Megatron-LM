@@ -1,11 +1,24 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import torch
+
 from megatron.core import mpu
 from megatron.core.inference.communication_utils import broadcast_float_list
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.tokenization import tokenize_prompts
 from megatron.core.utils import accepts_parameter
+
+
+def _as_list(values):
+    """Return a request's token or log-prob field as a plain Python list.
+
+    Engines disagree on whether these fields hold a tensor or a list, so
+    normalize before concatenating prompt and generated parts.
+    """
+    if isinstance(values, torch.Tensor):
+        return values.tolist()
+    return list(values)
 
 
 def run_mcore_engine(
@@ -86,10 +99,12 @@ def run_mcore_engine(
         response_dict = {
             # Send original prompts, not x.prompt, to circumvent tokenization artifacts
             "text": [p + x.generated_text for p, x in zip(prompts, result)],
-            "tokens": [x.prompt_tokens + x.generated_tokens.tolist() for x in result],
+            "tokens": [_as_list(x.prompt_tokens) + _as_list(x.generated_tokens) for x in result],
         }
         if sampling_params.return_log_probs:
-            response_logprobs = [x.prompt_log_probs + x.generated_log_probs for x in result]
+            response_logprobs = [
+                _as_list(x.prompt_log_probs) + _as_list(x.generated_log_probs) for x in result
+            ]
             response_dict["logprobs"] = response_logprobs
         if sampling_params.return_segments:
             response_dict["segments"] = [x.segments for x in result]
