@@ -1218,6 +1218,23 @@ class _ParamAndGradBuffer:
                 "parameter and gradient data share storage."
             )
 
+        if ddp_config.ddp_cpu_staging and ddp_config.use_distributed_optimizer:
+            staged_bytes = 0
+            for param in self.params:
+                if (
+                    param.is_cuda
+                    and param.dtype == torch.bfloat16
+                    and not is_grouped_tensor(param)
+                    and not _param_uses_quantized_storage(param)
+                ):
+                    assert param.data._base is None, "DDP CPU staging requires viewless parameters"
+                    staged_bytes += param.numel() * param.element_size()
+                    param.data = param.detach().to("cpu")
+            if staged_bytes:
+                torch.cuda.empty_cache()
+                if self.is_buffer_log_rank:
+                    logger.info("DDP initialization staged %s BF16 bytes on CPU", staged_bytes)
+
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()

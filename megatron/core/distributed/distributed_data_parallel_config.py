@@ -35,6 +35,14 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
+    ddp_cpu_staging: bool = False
+    """Temporarily move plain BF16 CUDA parameters to CPU before allocating DDP buffers.
+
+    Requires ``use_distributed_optimizer``. Trades host memory and synchronous copies
+    for a lower initialization GPU memory peak. FP32, quantized and grouped parameters
+    retain their existing initialization path. Has no effect after initialization.
+    """
+
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
