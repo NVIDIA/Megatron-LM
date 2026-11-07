@@ -82,6 +82,7 @@ class _Keys(str, Enum):
     CALL = "_call_"
     ARGS = "_args_"
     NAME = "_name_"
+    BUILDER = "_builder_"
 
 
 _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (

@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.training.models.transforms import ModelTransformConfig
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,11 @@ class TestModelConfigDefaults:
         assert cfg.extra_checkpoint_metadata is None
         assert cfg.pre_wrap_hooks == []
         assert cfg.post_wrap_hooks == []
+
+    def test_invalid_real_quant_config_is_rejected(self):
+        cfg = DummyModelConfig(transformations=ModelTransformConfig(real_quant_cfg="unsupported"))
+        with pytest.raises(ValueError, match="Unsupported real_quant_cfg"):
+            cfg.validate()
 
     def test_custom_fields_stored(self):
         hook1 = Mock()
@@ -239,10 +245,10 @@ class TestModelConfigFromDict:
         assert cfg.value == 55
         assert cfg.name == "reconstructed"
 
-    def test_builder_restored(self):
+    def test_serialized_builder_ignored(self):
         d = self._dummy_dict(_builder_="fake.builder.string")
         cfg = ModelConfig.from_dict(d)
-        assert cfg.builder == "fake.builder.string"
+        assert cfg.builder == DummyModelConfig.builder
 
     def test_ignores_unknown_fields(self):
         d = self._dummy_dict(unknown_field="should_be_ignored", another_unknown=123)

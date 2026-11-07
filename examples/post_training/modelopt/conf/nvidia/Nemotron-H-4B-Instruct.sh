@@ -38,5 +38,4 @@ MODEL_ARGS=" \
     --make-vocab-size-divisible-by 1 \
     --use-mcore-models \
     --rotary-base 10000 \
-    --export-model-type HybridModel \
 "

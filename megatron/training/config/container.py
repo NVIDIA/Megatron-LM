@@ -43,6 +43,7 @@ from megatron.training.config.training_config import (
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
+from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -338,6 +339,8 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -431,6 +434,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
         self._validate_checkpoint()
+        self._validate_distillation()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
         self.optimizer.validate_run(
@@ -453,6 +457,18 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
+
+    def _validate_distillation(self) -> None:
+        """Check distillation against the student model and training settings.
+
+        Runs after ``super().validate()``, so the teacher config is known to be resolved.
+        """
+        if self.distillation is None:
+            return
+        if self.model is not None:
+            validate_distillation_student(self.distillation, self.model)
+        if self.train.manual_gc:
+            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the

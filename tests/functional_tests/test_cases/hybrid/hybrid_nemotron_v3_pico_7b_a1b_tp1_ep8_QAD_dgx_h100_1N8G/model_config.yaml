@@ -50,7 +50,6 @@ BEFORE_SCRIPT: |
     --init-method-std 0.0256 \
     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
     --mamba-num-heads 64 \
-    --export-model-type MambaModel \
     --num-experts 128 \
     --moe-router-topk 6 \
     --moe-aux-loss-coeff 1e-4 \
@@ -77,13 +76,11 @@ BEFORE_SCRIPT: |
     --calib-dataset-path-or-name cnn_dailymail \
     --calib-size 256 \
     --calib-batch-size 8 \
-    --skip-generate \
-    --export-te-mcore-model
+    --skip-generate
   #--export-default-te-spec         # TODO(aanoosheh): undo once TE fix is released
   echo -e "\n=== Stage 1 complete ===\n"
 MODEL_ARGS:
   # KD teacher/config
-  --export-te-mcore-model: true
   #--export-default-te-spec: true   # TODO(aanoosheh): undo once TE fix is released
   --export-kd-teacher-load: ${MODEL_BF16_CKPT}
   --auto-detect-ckpt-format: true
@@ -105,7 +102,6 @@ MODEL_ARGS:
   --init-method-std: 0.0256
   --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
   --mamba-num-heads: 64
-  --export-model-type: MambaModel
   # MoE
   --num-experts: 128
   --moe-router-topk: 6

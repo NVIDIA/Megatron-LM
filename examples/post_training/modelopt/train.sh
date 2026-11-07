@@ -14,7 +14,6 @@ MLM_DEFAULT_ARGS=" \
     --modelopt-enabled \
     --distributed-timeout-minutes 60 \
     --auto-detect-ckpt-format \
-    --export-te-mcore-model \
 "
 
 
@@ -69,7 +68,8 @@ fi
 
 export HF_TOKEN=${HF_TOKEN}
 
-if [[ ${MODEL_ARGS} == *"HybridModel"* ]] || [[ ${MODEL_ARGS} == *"MambaModel"* ]]; then
+if [[ ${MODEL_ARGS} == *"--hybrid-layer-pattern"* ]] || [[ ${MODEL_ARGS} == *"--hybrid-override-pattern"* ]] \
+    || [[ ${MODEL_ARGS} == *"HybridModel"* ]] || [[ ${MODEL_ARGS} == *"MambaModel"* ]]; then
     PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_hybrid.py
 else
     PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_gpt.py

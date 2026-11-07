@@ -1774,6 +1774,50 @@ def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
 
 
+@pytest.mark.parametrize("non_persistent_type", ["global", "local"])
+@pytest.mark.parametrize("selection", ["inherited", "cleared", "explicit"])
+def test_per_load_selectors_reach_both_checkpoint_reads(
+    monkeypatch, run_config, non_persistent_type, selection
+):
+    """Teacher selectors override both reads without changing the student's run section."""
+    checkpoint = run_config.checkpoint
+    checkpoint.load = "/student"
+    checkpoint.ckpt_format = "torch_dist"
+    checkpoint.ckpt_step = 50
+    checkpoint.pretrained_checkpoint = "/student-fallback"
+    checkpoint.non_persistent_ckpt_type = non_persistent_type
+    original = vars(checkpoint).copy()
+    overrides = {
+        "inherited": {},
+        "cleared": dict(ckpt_step=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None),
+        "explicit": dict(
+            ckpt_step=7, pretrained_checkpoint="/teacher-fallback", non_persistent_ckpt_type=None
+        ),
+    }[selection]
+    args = _loader_args()
+    reads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/teacher",), [])
+
+    def base_load(directory, run_args, *, rank0, checkpoint, finetune, **kwargs):
+        reads.append((directory, rank0, checkpoint))
+        assert finetune is True
+        for name in ("ckpt_step", "pretrained_checkpoint", "non_persistent_ckpt_type"):
+            assert getattr(checkpoint, name) == overrides.get(name, original[name])
+        return None, "", False, None
+
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint(
+        [object()], None, None, load_dir="/teacher", finetune=True, **overrides
+    ) == (0, 0)
+    assert [(directory, rank0) for directory, rank0, _ in reads] == [
+        ("/teacher", True),
+        ("/teacher", False),
+    ]
+    assert reads[0][2] is reads[1][2]
+    assert vars(checkpoint) == original
+    assert vars(args) == vars(_loader_args())
+
+
 def test_only_the_primary_load_records_the_finetune_classification(
     init_model_parallel, monkeypatch, run_config
 ):

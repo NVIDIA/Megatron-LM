@@ -11,12 +11,6 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.training import get_args, print_rank_0
 from megatron.training.global_vars import get_run_config
 
-try:
-    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-    has_nvidia_modelopt = True
-except ImportError:
-    has_nvidia_modelopt = False
-
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
@@ -55,10 +49,6 @@ def model_provider(
             torch.cuda.memory._dump_snapshot(filename)
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):
-        # [ModelOpt]: Use custom builder + spec when modelopt is enabled
-        model_builder = modelopt_gpt_hybrid_builder
 
     return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 

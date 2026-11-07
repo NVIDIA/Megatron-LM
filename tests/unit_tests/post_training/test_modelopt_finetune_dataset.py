@@ -3,8 +3,9 @@
 """Unit tests for ModelOpt Hugging Face finetuning dataset helpers."""
 
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ transformers = pytest.importorskip("transformers")
 _MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "post_training" / "modelopt"
 sys.path.insert(0, str(_MODEL_OPT_EXAMPLE_DIR))
 
+import finetune
 from finetune import SFTDataset
 from utils import get_eos_token_id
 
@@ -155,3 +157,16 @@ def test_get_eos_token_id_rejects_out_of_vocab_fallback():
 
     with pytest.raises(ValueError, match="outside the tokenizer vocabulary"):
         get_eos_token_id(tokenizer)
+
+
+@pytest.mark.parametrize("original_num_layers, expected", [(None, False), (32, True)])
+def test_offline_mode_follows_the_model_config(original_num_layers, expected):
+    from megatron.training.models.transforms import ModelTransformConfig
+
+    cfg = Namespace(
+        model=Namespace(
+            transformations=ModelTransformConfig(original_num_layers=original_num_layers)
+        )
+    )
+    with patch.object(finetune, "get_run_config", return_value=cfg):
+        assert finetune._is_offline_model() is expected

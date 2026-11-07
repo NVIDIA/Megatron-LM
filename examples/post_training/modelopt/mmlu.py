@@ -8,7 +8,6 @@ instead of autoregressively generating tokens.
 """
 
 import argparse
-import functools
 import logging
 import os
 import sys
@@ -24,15 +23,16 @@ from utils import get_hf_tokenizer
 
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -85,7 +85,8 @@ if __name__ == "__main__":
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    cfg = modelopt_inference_config_from_args(args)
+    set_run_config(cfg)
     initialize_megatron(training=False)
 
     args = get_args()
@@ -94,9 +95,7 @@ if __name__ == "__main__":
     # Meta device initialization is used such that models can be materialized in low-precision
     # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
     # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
-    if args.init_model_with_meta_device:
-        args.use_cpu_initialization = True
-    else:
+    if not args.init_model_with_meta_device:
         warnings.warn(
             "--init-model-with-meta-device is not set. If you would like to resume the "
             "model in low-bit directly (low-memory initialization and skipping 16-bit), "
@@ -104,21 +103,15 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
-        wrap_with_ddp=False,
-    )
+    model = build_inference_models(cfg)
     report_current_memory_info()
 
-    # Materialize the model from meta device to gpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
-    unwrapped_model.to_empty(device="cuda")
-    report_current_memory_info()
 
     tokenizer = get_hf_tokenizer()
 
-    if args.load is not None:
+    if cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 

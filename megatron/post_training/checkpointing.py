@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -22,16 +21,15 @@ from megatron.training import get_args
 from megatron.training.checkpointing import (
     _load_base_checkpoint,
     checkpoint_exists,
-    get_checkpoint_name,
     get_checkpoint_tracker_filename,
+    get_load_checkpoint_path,
     load_checkpoint,
-    read_metadata,
+    resolve_checkpoint_load_dir,
 )
 from megatron.training.config import CheckpointConfig
 from megatron.training.global_vars import get_run_config
+from megatron.training.models.distillation import DistillationConfig
 from megatron.training.utils import print_rank_0
-
-logger = logging.getLogger(__name__)
 
 
 def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) -> bool:
@@ -71,9 +69,9 @@ def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) ->
             return _has_nontrivial_modelopt_state(modelopt_state)
         else:
             # Sharded
-            load_dir = get_sharded_load_dir(checkpoint_path)
-            if load_dir is None:
+            if checkpoint_path is None:
                 return False
+            load_dir = Path(get_load_checkpoint_path(checkpoint_path, checkpoint))
             modelopt_checkpoint_name = load_dir / "modelopt_state"
             if not modelopt_checkpoint_name.is_dir():
                 return False
@@ -84,22 +82,9 @@ def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) ->
         return False
 
 
-def get_sharded_load_dir(load_dir: str) -> Optional[Path]:
-    """Helper to retrieve the sharded load directory from a MLM checkpoint tracker file."""
-    if not checkpoint_exists(load_dir):
-        return None
-
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
-    iteration, release = read_metadata(tracker_filename)
-    sharded_load_dir = Path(get_checkpoint_name(load_dir, iteration, release, return_base_dir=True))
-
-    if not sharded_load_dir.exists():
-        return None
-
-    return sharded_load_dir
-
-
-def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> None:
+def load_modelopt_state(
+    model: nn.Module, load_dir: Optional[str] = None, *, checkpoint: CheckpointConfig | None = None
+) -> None:
     """Loading modelopt_state without loading the model.
 
     If distributed checkpointing in use, we try to load from the sharded modelopt_state. This will not
@@ -109,15 +94,19 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
     Args:
         model: the model to load the modelopt_state into
         load_dir: optionally provide a different loading path
+        checkpoint: checkpoint policy; defaults to the registered run section
     """
-    checkpoint = get_run_config().checkpoint
-    load_dir = load_dir or checkpoint.load
+    checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
+    if load_dir is None:
+        load_dir, _ = resolve_checkpoint_load_dir(checkpoint)
 
     if checkpoint.ckpt_format == "torch":
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _, _ = _load_base_checkpoint(load_dir, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(
+                load_dir, get_args(), rank0=False, checkpoint=checkpoint
+            )
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -129,29 +118,46 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
             mto.restore_from_modelopt_state(model, modelopt_state)
     else:
         # Sharded
-        sharded_load_dir = get_sharded_load_dir(load_dir)
-        if sharded_load_dir is None:
+        sharded_load_dir = (
+            Path(get_load_checkpoint_path(load_dir, checkpoint)) if load_dir is not None else None
+        )
+        if sharded_load_dir is None or not sharded_load_dir.is_dir():
             print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
             return
         restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
-def load_kd_teacher_checkpoint(model) -> None:
-    """Load the teacher checkpoint for ModelOpt distillation if the model has one."""
-    args = get_args()
-    if not getattr(args, "export_kd_teacher_load", None):
+def load_kd_teacher_checkpoint(
+    model, distillation: DistillationConfig | None = None, *, student_checkpoint=None
+) -> None:
+    """Load the teacher's weights after wrapping. No-op when the run has no distillation."""
+    if distillation is None:
         return
-
+    # load_checkpoint only warns about a missing checkpoint, which would leave the teacher
+    # randomly initialized.
+    if not checkpoint_exists(distillation.teacher_load):
+        raise FileNotFoundError(
+            f"No teacher checkpoint found at {distillation.teacher_load} (expected "
+            f"{get_checkpoint_tracker_filename(distillation.teacher_load)})."
+        )
+    checkpoint = get_run_config().checkpoint if student_checkpoint is None else student_checkpoint
     teacher = unwrap_model(model[0]).teacher_model
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # The teacher is loaded weights-only (finetune-style) from its own directory and, when given,
-    # its own format; the run's checkpoint policy is unchanged.
+    print_rank_0(
+        f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ..."
+    )
+    # The teacher's weights come from its own tracker, regardless of the student's resume
+    # selectors. Per-call overrides leave both the arguments and the registered section alone.
     load_checkpoint(
         [teacher],
         None,
         None,
-        load_dir=args.export_kd_teacher_load,
+        load_dir=distillation.teacher_load,
         finetune=True,
-        ckpt_format=args.export_kd_teacher_ckpt_format or None,
+        load_optim=False,
+        load_rng=False,
+        ckpt_format=distillation.teacher_ckpt_format or checkpoint.ckpt_format,
+        ckpt_step=None,
+        pretrained_checkpoint=None,
+        non_persistent_ckpt_type=None,
     )
     print_rank_0("... teacher loaded successfully.")

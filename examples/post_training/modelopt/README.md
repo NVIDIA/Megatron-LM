@@ -88,6 +88,23 @@ pip install -e /workspace/Model-Optimizer
 
 ### Megatron-Core Checkpoint Prerequisite
 
+ModelOpt's local modules use canonical Transformer Engine keys when saving distributed
+checkpoints. Older ModelOpt checkpoints with separate layernorm names are accepted during
+loading: canonical keys are preferred, with legacy names used only when the requested key
+is absent. This applies to model weights and model-keyed optimizer tensors and does not
+change the model's subsequent save behavior. `--export-te-mcore-model` is deprecated and
+ignored; `--export-default-te-spec` selects full Transformer Engine modules instead of
+ModelOpt's local modules.
+
+Checkpoint settings come from the run container's `checkpoint` section. Distillation loads the
+teacher weights from `distillation.teacher_load`, using `teacher_ckpt_format` when provided
+(otherwise the student's format). The teacher load ignores the student's `ckpt_step`,
+`pretrained_checkpoint`, and `non_persistent_ckpt_type`, and does not change the student's
+checkpoint settings or restore the teacher's optimizer, RNG, or training progress.
+ModelOpt detection and state restoration share the weight loader's persistent checkpoint selection:
+the pretrained fallback when needed, `latest_train_state.pt` before the legacy text tracker,
+and the explicit `ckpt_step` override.
+
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
 CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)
