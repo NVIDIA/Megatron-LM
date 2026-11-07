@@ -13,18 +13,11 @@ import torch.distributed as dist
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 
+from .format.arrow import samples_batch, write_file
 from .logits_saver import LogitsSaverHooks
-from .v3_format import (
-    MAX_VOCAB_SIZE,
-    capture_batch,
-    encode,
-    finalize_record,
-    join_inputs,
-    pack_targets,
-    tail_logprob,
-)
+from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inputs, tail_logprob
 from .v3_replay import layout_options, token_map
-from .v3_storage import KINDS, Storage, member_name, parse_tar_name, tar_name, write_tar
+from .v3_storage import Storage, data_name, parse_name, publish
 
 
 class PairedLogitsSaver(LogitsSaverHooks):
@@ -160,16 +153,14 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 torch.cat(all_tails),
                 isolated=contract["attention_mode"] == "isolated_segments",
             )
-            targets = pack_targets(
-                values, indices, vocab_size=contract["logprob_vocab_size"], tail=tail
-            )
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
             self._iteration_records = {
                 "start": start,
                 "end": end,
-                "inputs": encode(inputs),
-                "targets": encode(targets),
+                "batch": samples_batch(
+                    inputs, values, indices, tail, vocab_size=contract["logprob_vocab_size"]
+                ),
             }
         self._captured.clear()
 
@@ -202,8 +193,7 @@ class PairedLogitsSaver(LogitsSaverHooks):
         name = ""
         if writes:
             start, end = min(a for a, _ in writes), max(b for _, b in writes)
-            # The inputs tar name; the paired targets tar shares its rank and range.
-            name = os.path.join(self.save_dir, tar_name(self.dp_rank, start, end, "inputs"))
+            name = os.path.join(self.save_dir, data_name(self.dp_rank, start, end))
         return (
             name,
             writes,
@@ -231,27 +221,13 @@ class PairedLogitsSaver(LogitsSaverHooks):
 
                 MultiStorageClientFeature.enable()
             metadata = json.loads(meta_bytes)
-            # Resume-only state is not part of the immutable tar metadata.
+            # Resume-only state is not part of the immutable file metadata.
             metadata.pop("published_through", None)
             metadata.pop("range_end", None)
             storage = Storage(os.path.dirname(tar_path))
-            parsed = parse_tar_name(os.path.basename(tar_path))
-            records = list(writes.values())
-            # Inputs first: a range is only readable once both tars exist.
-            for kind in KINDS:
-                meta = {
-                    **metadata,
-                    "kind": kind,
-                    "dp_rank": parsed.dp_rank,
-                    "range": [parsed.start, parsed.end],
-                }
-                members = [
-                    (member_name(record["start"], record["end"], kind), record[kind])
-                    for record in records
-                ]
-                write_tar(
-                    storage, tar_name(parsed.dp_rank, parsed.start, parsed.end, kind), meta, members
-                )
+            name = parse_name(os.path.basename(tar_path))
+            data, index = write_file([record["batch"] for record in writes.values()], metadata)
+            publish(storage, name, data, index)
         except Exception:
             if failure_event is not None:
                 failure_event.set()

@@ -3,7 +3,6 @@
 """Small integration hooks for paired dumping, replay, and checkpoint resume."""
 
 import json
-import uuid
 from typing import Any, Callable
 
 import torch
@@ -24,8 +23,8 @@ from .v3_storage import (
     complete_ranges,
     contiguous_end,
     discard_unpublished,
-    list_tars,
-    parse_tar_name,
+    has_legacy_tars,
+    list_published,
     read_meta,
 )
 
@@ -201,7 +200,7 @@ def dump_range(args: Any) -> tuple[int | None, int]:
 
 
 def _published_end(storage: Storage, dp_size: int, start: int, end: int) -> int:
-    return contiguous_end(complete_ranges(list_tars(storage), dp_size), start, end)
+    return contiguous_end(complete_ranges(list_published(storage), dp_size), start, end)
 
 
 def frozen_resume_iteration(args: Any) -> int:
@@ -287,7 +286,6 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             "prefix_stable": True,
             "writers": saver.dp_size,
             "writer_mbs": args.micro_batch_size,
-            "writer_gbs": args.global_batch_size,
         },
         "recorded": {
             "teacher": _teacher_identity(args),
@@ -314,7 +312,7 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             "save_interval": args.save_interval,
         },
     }
-    # Compare exactly what a JSON round trip through a tar's _meta.json preserves.
+    # Compare exactly what a JSON round trip through the files' schema metadata preserves.
     return json.loads(json.dumps(settings))
 
 
@@ -342,13 +340,13 @@ def initialize_dump_metadata(saver: Any) -> dict:
     def create():
         try:
             storage = Storage(saver.save_dir)
-            if any(parse_tar_name(name) is None for name in storage.list("*.tar")):
+            if has_legacy_tars(storage):
                 raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
-            tars = list_tars(storage)
+            files = list_published(storage)
             first_sample = 0 if frozen else args.consumed_train_samples
             differing = []
-            if tars:
-                existing = read_meta(storage, tars[0].name)
+            if files:
+                existing = read_meta(storage, files[0])
                 validate_metadata(existing)
                 first_sample = existing["contract"]["first_sample"]
                 required, differing = mismatched_settings(
@@ -360,7 +358,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
                 )
                 if required:
                     raise ValueError(
-                        f"Teacher settings differ from existing v3 tars ({', '.join(required)}); "
+                        f"Teacher settings differ from existing v3 files ({', '.join(required)}); "
                         "use a new save directory"
                     )
             start_iteration, end_iteration = dump_range(args)
@@ -378,7 +376,6 @@ def initialize_dump_metadata(saver: Any) -> dict:
                 "metadata": {
                     **expected,
                     "contract": {**expected["contract"], "first_sample": first_sample},
-                    "generation": uuid.uuid4().hex,
                     "published_through": published,
                     "range_end": end,
                 },
@@ -390,7 +387,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
     result = _broadcast_without_pp(create)
     if "error" in result:
         raise RuntimeError(result["error"])
-    _report_recorded_differences(result["differing"], "dump job and existing v3 tars")
+    _report_recorded_differences(result["differing"], "dump job and existing v3 files")
     return result["metadata"]
 
 
@@ -431,12 +428,12 @@ def initialize_replay(args: Any) -> None:
     if rank == 0:
         try:
             storage = Storage(args.logits_load_dir)
-            if any(parse_tar_name(name) is None for name in storage.list("*.tar")):
+            if has_legacy_tars(storage):
                 raise ValueError("Input replay requires a v3 dump; found legacy tars")
-            tars = list_tars(storage)
-            if not tars:
-                raise FileNotFoundError("No v3 tars found; input replay requires a v3 dump")
-            metadata = read_meta(storage, tars[0].name)
+            files = list_published(storage)
+            if not files:
+                raise FileNotFoundError("No v3 files found; input replay requires a v3 dump")
+            metadata = read_meta(storage, files[0])
             _check_student_compatibility(args, metadata)
             groups, hole = discover_groups(storage, metadata)
             replay_end = getattr(args, "logits_load_replay_end", None)
@@ -660,7 +657,6 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             passes=_PLAN["passes"],
             decode_threads=args.logits_load_decode_threads,
             prefetch_depth=args.logits_load_msc_prefetch_depth,
-            chunk_bytes=args.logits_load_read_chunk_mb << 20,
             student_vocab_size=args.padded_vocab_size,
         )
         _PLAN["readers"].append(reader)

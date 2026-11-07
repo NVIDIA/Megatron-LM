@@ -1,19 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Lossless, token-aligned records for self-contained offline KD caches.
+"""Teacher-side capture of Megatron batches into lossless, token-aligned records.
 
-This module deliberately has no training/runtime dependencies so the format can
-also be inspected, written, and tested on CPU without initializing Megatron, and
-reused by non-Megatron producers and consumers.
+The producer-neutral parts of the format (target encodings, metadata, the Arrow file
+layout) live in :mod:`.format`; this module re-exports the contract helpers for V3
+callers. It has no training/runtime dependencies, so it is tested on CPU without
+initializing Megatron.
 """
 
 import itertools
 from typing import Any
 
 import torch
-import zstandard
-from safetensors.torch import load as load_tensors
-from safetensors.torch import save as save_tensors
 
 from .format.contract import (  # noqa: F401  (re-exported for V3 callers)
     ATTENTION_MODES,
@@ -24,20 +22,20 @@ from .format.contract import (  # noqa: F401  (re-exported for V3 callers)
     RECORDED_KEYS,
     REPLAY_KEYS,
     REQUIRED_KEYS,
+    check_targets,
     digest,
     hf_tokenizer_identity,
     index_encoding_for_vocab,
+    join_indices,
     mismatched_settings,
-    pack_targets,
+    split_indices,
     tail_logprob,
     tokenizer_fingerprint,
-    unpack_targets,
     validate_metadata,
 )
 
-# Token-aligned input fields. Only ``tokens`` is required; the rest have defaults.
+# Token-aligned input fields, all stored for every sample.
 TOKEN_FIELDS = ("tokens", "labels", "position_ids", "loss_mask")
-OPTIONAL_TOKEN_FIELDS = ("labels", "position_ids", "loss_mask")
 
 
 def attention_mode_for_layout(
@@ -59,24 +57,6 @@ def segment_padding_divisor(*, context_parallel_size: int, sequence_parallel_tp:
     """Megatron SFT's per-segment padding divisor (``SFTDataset._calculate_padding_divisor``)."""
     cp_pad = 2 * context_parallel_size if context_parallel_size > 1 else 1
     return cp_pad * max(1, sequence_parallel_tp)
-
-
-def encode(payload: dict[str, torch.Tensor]) -> bytes:
-    """Serialize a flat dict of tensors as safetensors inside one checksummed zstd frame."""
-    tensors = {key: value.detach().cpu().contiguous() for key, value in payload.items()}
-    return zstandard.ZstdCompressor(level=3, write_checksum=True).compress(save_tensors(tensors))
-
-
-def decode(data: bytes) -> dict[str, torch.Tensor]:
-    """Verify the frame checksum while decompressing, then load the safetensors payload."""
-    try:
-        raw = zstandard.ZstdDecompressor().decompress(data)
-    except zstandard.ZstdError as error:
-        raise ValueError(f"Offline KD v3 member checksum or framing error: {error}") from None
-    try:
-        return load_tensors(raw)
-    except Exception as error:
-        raise ValueError(f"Offline KD v3 member is not a safetensors payload: {error}") from None
 
 
 def int32(tensor: torch.Tensor) -> torch.Tensor:
@@ -151,35 +131,6 @@ def join_inputs(batches: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def default_inputs(
-    tokens: torch.Tensor, segment_lengths: torch.Tensor, final_labels: torch.Tensor | None = None
-) -> dict[str, torch.Tensor]:
-    """Defaults for omitted optional fields, per segment.
-
-    ``position_ids`` count from 0 within each segment; ``labels`` are the next token
-    within the segment, and ``final_labels`` (one per segment) at each segment's last
-    position; ``loss_mask`` is all ones. Stored segments never end on an unscored
-    position (trailing zero-weight positions are stripped), so the last position has a
-    real next-token label that the stored tokens cannot provide.
-    """
-    total = tokens.numel()
-    starts = torch.zeros(total, dtype=torch.int64)
-    labels = torch.zeros(total, dtype=torch.int32)
-    if total > 1:
-        labels[:-1] = tokens[1:].to(torch.int32)
-    if segment_lengths.numel():
-        offsets = torch.cumsum(segment_lengths, 0)
-        segment_of = torch.repeat_interleave(torch.arange(segment_lengths.numel()), segment_lengths)
-        starts = (offsets - segment_lengths)[segment_of]
-        labels[offsets - 1] = 0 if final_labels is None else final_labels.to(torch.int32)
-    positions = torch.arange(total, dtype=torch.int64) - starts
-    return {
-        "position_ids": positions.to(torch.int32),
-        "labels": labels,
-        "loss_mask": torch.ones(total, dtype=torch.bool),
-    }
-
-
 def finalize_record(
     inputs: dict[str, Any],
     values: torch.Tensor,
@@ -195,8 +146,7 @@ def finalize_record(
     attention no kept position attends to them and they are never scored, so this is
     lossless; it removes dataset padding and trailing masked turns alike. Targets are
     kept only for the remaining positions with nonzero loss weight: context-only
-    positions such as prompts need tokens but no target rows. Optional fields equal to
-    their defaults are omitted.
+    positions such as prompts need tokens but no target rows.
     """
     offsets = inputs["sample_offsets"].tolist()
     weights = inputs["loss_mask"].float()
@@ -219,89 +169,9 @@ def finalize_record(
     sample_ends = [segment_ends[c - 1] if c else 0 for c in itertools.accumulate(segment_counts)]
     record = {
         "sample_offsets": torch.tensor([0, *sample_ends], dtype=torch.int64),
-        "tokens": inputs["tokens"][keep],
+        **{key: inputs[key][keep] for key in TOKEN_FIELDS},
         "segment_lengths": lengths.to(torch.int32),
         "segment_counts": torch.tensor(segment_counts, dtype=torch.int32),
     }
-    ends = torch.cumsum(lengths, 0) - 1
-    final_labels = inputs["labels"][keep][ends].to(torch.int32)
-    defaults = default_inputs(record["tokens"], lengths, final_labels)
-    for key in OPTIONAL_TOKEN_FIELDS:
-        kept = inputs[key][keep]
-        default = defaults[key]
-        if kept.dtype == torch.bool or default.dtype == torch.bool:
-            same = kept.dtype == default.dtype and torch.equal(kept, default)
-        else:
-            same = torch.equal(kept.to(default.dtype), default)
-        if not same:
-            record[key] = kept
-    if "labels" not in record:
-        record["segment_final_labels"] = final_labels
     rows = keep & (weights != 0)
     return record, values[rows], indices[rows], tail[rows]
-
-
-def validate_inputs(payload: dict[str, Any]) -> None:
-    """Reject malformed stored inputs (sample offsets, segments, token-aligned fields)."""
-    offsets = payload["sample_offsets"]
-    if (
-        offsets.ndim != 1
-        or offsets.numel() < 2
-        or offsets[0] != 0
-        or (offsets[1:] < offsets[:-1]).any()
-    ):
-        raise ValueError("Malformed offline KD sample offsets")
-    total = int(offsets[-1])
-    for key in TOKEN_FIELDS:
-        tensor = payload.get(key)
-        if tensor is None and key != "tokens":
-            continue
-        if tensor is None or tensor.ndim != 1 or tensor.numel() != total:
-            raise ValueError(f"Malformed offline KD {key} tensor")
-    lengths, counts = payload.get("segment_lengths"), payload.get("segment_counts")
-    if payload.get("labels") is None:
-        final = payload.get("segment_final_labels")
-        segments = (
-            lengths.numel() if lengths is not None else int((offsets[1:] > offsets[:-1]).sum())
-        )
-        if final is None or final.ndim != 1 or final.numel() != segments:
-            raise ValueError("Offline KD records without labels need one final label per segment")
-    if (lengths is None) != (counts is None):
-        raise ValueError("Offline KD segment_lengths and segment_counts must appear together")
-    if lengths is None:
-        return
-    if (
-        counts.numel() != offsets.numel() - 1
-        or int(counts.sum()) != lengths.numel()
-        or (lengths <= 0).any()
-        or (counts < 0).any()
-    ):
-        raise ValueError("Malformed offline KD segments")
-    per_sample = torch.zeros(counts.numel(), dtype=torch.int64)
-    if lengths.numel():
-        owner = torch.repeat_interleave(torch.arange(counts.numel()), counts.long())
-        per_sample.index_add_(0, owner, lengths.long())
-    if not torch.equal(per_sample, offsets[1:] - offsets[:-1]):
-        raise ValueError("Offline KD segments disagree with sample lengths")
-
-
-def fill_input_defaults(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return inputs with every optional field present (stored values or defaults).
-
-    Inputs without segments treat each non-empty sample as one segment.
-    """
-    offsets = payload["sample_offsets"]
-    sample_lengths = (offsets[1:] - offsets[:-1]).to(torch.int64)
-    if payload.get("segment_lengths") is None:
-        lengths = sample_lengths[sample_lengths > 0]
-        counts = (sample_lengths > 0).to(torch.int32)
-    else:
-        lengths = payload["segment_lengths"].to(torch.int64)
-        counts = payload["segment_counts"]
-    result = dict(payload)
-    result["segment_lengths"], result["segment_counts"] = lengths, counts
-    defaults = default_inputs(payload["tokens"], lengths, payload.get("segment_final_labels"))
-    for key in OPTIONAL_TOKEN_FIELDS:
-        if result.get(key) is None:
-            result[key] = defaults[key]
-    return result

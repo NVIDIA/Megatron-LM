@@ -23,7 +23,7 @@ Add these flags to a normal `pretrain_gpt.py` or `pretrain_hybrid.py` teacher la
 The teacher still uses its original dataset flags. `--freeze-all-layers` is optional;
 omit it only when intentionally collecting targets while training the teacher.
 `--save` and `--save-interval` are required: the save interval is the flush interval,
-and each flush writes one inputs tar and one targets tar per teacher DP rank.
+and each flush writes one data file and its index per teacher DP rank.
 Teacher batch-size ramp-up, `--iterations-to-skip` (including iterations added from
 `--result-rejected-tracker-filename`), and `--allow-ambiguous-pad-tokens` are rejected.
 A frozen teacher must score deterministically: it still runs in train mode, so set
@@ -61,9 +61,9 @@ exits before running a step. Without `--override-ckpt-iteration`, a job is the c
 single sequential writer and `--exit-interval` keeps its usual periodic meaning (for
 example, to requeue every N iterations).
 
-Every tar records the cache settings (see [Metadata](#metadata)). A teacher checks them
-against an existing tar at startup, and students check every tar before using its data:
-a tar whose required settings differ is rejected, and differences in recorded settings
+Every file records the cache settings (see [Metadata](#metadata)). A teacher checks them
+against an existing file at startup, and students check every file before using its data:
+a file whose required settings differ is rejected, and differences in recorded settings
 (teacher, data, split, seed, sample budget, ...) are reported by name but don't block.
 
 ## Loading
@@ -105,7 +105,7 @@ Enable deterministic shard-group reordering with:
 
 Omitting this option keeps sequential loading; `--logits-load-shuffle-shards 0` enables
 shuffling with seed zero. The shuffle seed is independent of the teacher dataset seed.
-One reorder unit is one flush range (all teacher DP tars for it). Samples inside a group
+One reorder unit is one flush range (all teacher DP files for it). Samples inside a group
 retain their global saved order. A smaller student budget consumes a prefix of the
 selected order, and may stop within a group at a student iteration boundary. It does not
 require the teacher's global batch size.
@@ -126,7 +126,7 @@ When the next student iteration would cross the known published prefix, world ra
 lists the cache once and shares any newly published groups with every rank. If there are
 still too few samples, all ranks raise the same exhaustion error; replay does not sleep
 or poll. Start the student after the teacher has published enough data to stay ahead of
-consumption. A flush range is published once its inputs and targets tars exist for every
+consumption. A flush range is published once its index exists for every
 teacher DP rank. Replay never crosses a hole in the published prefix; when later ranges
 are already published (for example, parallel dump jobs that are still writing), it logs
 a warning naming the gap, and only fails if the student actually needs those samples.
@@ -135,11 +135,11 @@ a warning naming the gap, and only fails if the student actually needs those sam
 
 Students may change DP, microbatch size, global batch size, and use batch-size ramp-up.
 Replay derives the next iteration's consumption from Megatron's current microbatch
-calculator. Each student rank streams the teacher DP tars it needs, decoding a bounded
-window of teacher iterations ahead.
+calculator. Each student rank streams the teacher DP files it needs, decoding a bounded
+window of blocks ahead.
 
 When the student DP size does not divide the teacher's, or the student microbatch is
-smaller than the teacher's, several student ranks read the same teacher tar, so the
+smaller than the teacher's, several student ranks read the same teacher block, so the
 bytes read exceed the dump size by that factor (as in V2).
 
 Dumps store no padding (see [Stored records](#stored-records)); the student lays each
@@ -166,51 +166,61 @@ also requires a compatible model checkpoint and Megatron configuration.
 ## Storage
 
 Local paths and configured `msc://` storage are supported; remote paths require
-`--enable-msc`. A cache is a flat directory with one inputs tar and one targets tar per
-teacher DP rank and flush range (global sample range):
+`--enable-msc`. A cache is a flat directory with one data file and one index per teacher
+DP rank (writer) and flush range (global sample range):
 
 ```text
-dp0__0-51200.inputs.tar
-dp0__0-51200.targets.tar
-dp1__0-51200.inputs.tar
-dp1__0-51200.targets.tar
+dp0__0-51200.arrow
+dp0__0-51200.index.json
+dp1__0-51200.arrow
+dp1__0-51200.index.json
 ...
 ```
 
-Discovery only lists tar names. A tar is published once its object exists: local writes
-are staged and renamed, and remote objects become visible only when their upload
-completes. Published tars are immutable. Keeping one tar per teacher DP rank means a
-missing or corrupt shard points directly at the rank (and node) that wrote it. Ranks that
-only need inputs (the first pipeline stage, and middle stages for packed data) never
-download targets.
+A data file is an [Arrow IPC file](https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format)
+with zstd-compressed buffers: one row per sample, the input columns first and then the
+target columns, grouped into record batches ("blocks") of at most 16 MiB uncompressed
+(a larger sample gets a block of its own). Any Arrow reader (pyarrow, DuckDB, Hugging
+Face `datasets`) can open it; the cache settings are in its schema metadata under
+`offline_kd`.
 
-Each tar begins with `_meta.json`, followed by one member per teacher iteration
-(`START-END.inputs.safetensors.zst` or `START-END.targets.safetensors.zst`). Each data
-member is one zstd frame, with its built-in content checksum verified on read, holding a
-[safetensors](https://github.com/huggingface/safetensors) file: a flat map of named
-tensors and nothing else (no pickle). Any safetensors reader can load a decompressed
-member. Members carry no metadata of their own: the tar's `_meta.json` and the member
-name identify the record, and an inputs tar and its targets tar must share `generation`.
+The index is written after its data file is complete, so its existence publishes the
+range for that writer: local writes are staged and renamed, and remote objects become
+visible only when their upload completes. Discovery only lists index names. A published
+range is never replaced; a data file without an index (an interrupted attempt) is
+ignored and overwritten by a retry. The index records:
+
+| Index key | Meaning |
+| --- | --- |
+| `index_version` | `1` |
+| `size` | The data file's size in bytes; a reader rejects a data file of another size, since the index then belongs to another version of it |
+| `footer` | Base64 copy of the data file's IPC footer (and trailing magic), so readers never fetch it from the data file |
+| `blocks` | Per block: `first_row`, `rows`, the byte range of the block (`offset`, `length`), the length of its input columns alone (`input_length`, a prefix of the block), and `supervised` (target rows) |
+
+A reader fetches each block with one ranged read, or only its input columns (the first
+pipeline stage, and middle stages for packed data, never download targets). Keeping one
+file per writer means a missing or corrupt file points directly at the rank (and node)
+that wrote it.
 
 The rest of this section is the producer-neutral specification. Megatron is one producer;
 other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
 Face loader) implement the same rules. `v3_format.py` has no Megatron dependencies and
-can be reused directly. Golden dumps under `tests/offline_kd_cpu/fixtures/` must decode
+can be reused directly, as can `format/contract.py` and `format/arrow.py`, which import
+nothing from Megatron. Golden dumps under `tests/offline_kd_cpu/fixtures/` must decode
 identically in every implementation.
 
 ### Metadata
 
 ```json
 {"format_version": 3,
- "kind": "inputs", "dp_rank": 0, "range": [0, 51200], "generation": "<job id>",
  "contract": {...},
  "recorded": {...},
  "provenance": {...}}
 ```
 
-Every tar stores its inputs next to its targets, so a tar is self-consistent on its own.
-Only settings that change how a reader interprets a tar are required (`contract`); they
-must be identical across every tar of a cache, whichever producer wrote it, and a
+Every file stores its inputs next to its targets, so a file is self-consistent on its
+own. Only settings that change how a reader interprets a file are required (`contract`);
+they must be identical across every file of a cache, whichever producer wrote it, and a
 mismatch is an error:
 
 | Required key | Meaning |
@@ -219,14 +229,14 @@ mismatch is an error:
 | `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it, and it fixes the index encoding (`u16` up to 65536, else `u16+u8`) |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)); must match the student's |
 | `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten samples only when it is true |
-| `writers`, `writer_mbs`, `writer_gbs` | Writer layout: sample `x` of an iteration starting at `s` lives in writer `((x-s)//mbs) % writers`, row `((x-s)//(mbs·writers))·mbs + (x-s)%mbs`; one record per iteration of `writer_gbs` samples |
+| `writers`, `writer_mbs` | Writer layout: sample `x` of a flush range starting at `s` lives in writer `((x-s)//mbs) % writers`, at row `((x-s)//(mbs·writers))·mbs + (x-s)%mbs` of that writer's file |
 | `first_sample` | Global sample index where replay starts |
 
 `format_version` 3 implies T=1 log probabilities and stripped padding (see
 [Stored records](#stored-records)).
 
 `recorded` settings describe how the data was produced. They are optional for other
-producers, and differences between tars or dump jobs are reported by name, never fatal:
+producers, and differences between files or dump jobs are reported by name, never fatal:
 
 | Recorded key | Megatron writes |
 | --- | --- |
@@ -252,25 +262,24 @@ scored, so this is lossless; it removes dataset padding (per-document and pack t
 trailing masked turns alike. Leading or inner zero-weight positions (prompts) are kept as
 context. Consequently every stored segment ends on a scored position.
 
-Targets are stored only for positions with nonzero loss weight: target row `i` belongs
-to the `i`-th such position, in token order, and the row count must equal the number of
-nonzero weights (after filling the `loss_mask` default). Context-only positions such as
-prompts and earlier conversation turns carry tokens but no target rows, so a long
-conversation supervised only on its final answer stores rows for the answer alone.
+Targets are stored only for positions with nonzero loss weight: target row `i` of a
+sample belongs to its `i`-th such position, in token order, and the row count must equal
+the number of nonzero weights. Context-only positions such as prompts and earlier
+conversation turns carry tokens but no target rows, so a long conversation supervised
+only on its final answer stores rows for the answer alone.
 
-| Inputs field | Required | Encoding / default |
-| --- | --- | --- |
-| `sample_offsets` | yes | int64 `[samples + 1]` offsets into the flat token tensors (empty samples allowed) |
-| `tokens` | yes | int32 flat token IDs |
-| `segment_lengths`, `segment_counts` | for `isolated_segments` | int32 positive lengths of each sample's segments, and segments per sample; otherwise each non-empty sample is one segment |
-| `position_ids` | no | int32; default counts from 0 within each segment |
-| `labels` | no | int32; default is the next token within the segment, and `segment_final_labels[i]` at segment `i`'s last position |
-| `segment_final_labels` | when `labels` is omitted | int32, one per segment |
-| `loss_mask` | no | bool, or float32 for fractional weights; default all ones |
+Every column is a `large_list` with one entry per sample; all input columns are always
+present:
 
-Writers may omit an optional field only when it equals its default; Megatron does so
-automatically (RoPE models never read `position_ids`, so most Megatron dumps omit them).
-Readers fill defaults before use. A target row with no valid entry (all sentinel)
+| Input column | Encoding |
+| --- | --- |
+| `tokens` | int32 token IDs (an empty sample is allowed) |
+| `labels` | int32, the next-token label of each position |
+| `position_ids` | int32 |
+| `loss_mask` | bool, or float32 for fractional weights (one type per file) |
+| `segments` | int32 positive lengths of the sample's attention segments, summing to its token count; one segment for a non-packed sample |
+
+A target row with no valid entry (all sentinel)
 contributes zero KD loss; its stored loss weight still controls CE supervision.
 Student-inserted padding has zero loss weight for both losses. The student places target
 rows back at their positions; positions without a row get sentinel targets.
@@ -287,7 +296,7 @@ rows back at their positions; positions without a row get sentinel targets.
 - Every row has exactly K entries. A logprob of `-1000` marks a masked or unavailable
   entry; its decoded index must be ignored. Rows with fewer than K available entries are
   filled with it.
-- `tail_logprobs` (optional, but always written by Megatron) is the log of the
+- `tail` (optional, but always written by Megatron) is the log of the
   probability mass outside each row's retained entries, including entries masked by
   top-P: `log(1 - sum(exp(retained)))`. Writers compute it from full-precision log
   probabilities **before** casting values to `save_dtype` (`v3_format.tail_logprob`);
@@ -300,17 +309,17 @@ rows back at their positions; positions without a row get sentinel targets.
   the same entries. Entries a student cannot represent (indices beyond its vocabulary)
   are moved into the tail.
 
-| Targets field | Encoding |
+| Target column | Encoding (per sample, one entry per target row) |
 | --- | --- |
-| `values` | `[rows, K]`, float16 or float32 |
-| `indices_low` | `[rows, K]`, uint16 lower 16 bits |
-| `indices_high` | `[rows, K]`, uint8 bits 16–23; present exactly when the index encoding is `"u16+u8"` |
-| `tail_logprobs` | `[rows]`, float32, optional |
+| `values` | `fixed_size_list<float16 or float32, K>` |
+| `indices_low` | `fixed_size_list<uint16, K>`, lower 16 bits |
+| `indices_high` | `fixed_size_list<uint8, K>`, bits 16–23; present exactly when the index encoding is `"u16+u8"` |
+| `tail` | float32, optional |
 
 `index_encoding` is `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to
 `2**24`).
 
-The `-1` selection sentinel encodes as all ones. Readers validate dtypes, shapes, the
+The `-1` selection sentinel encodes as all ones. Readers validate the row counts, the
 encoding against `logprob_vocab_size`, and that valid entries index below it. TP gathering
 in the Megatron saver uses FP32 transport, exact for every supported index. V1/V2 keep
 their 17-bit encoding.
@@ -347,7 +356,7 @@ excluded because inputs are stored as IDs. Megatron's EOD is recorded as `eod_id
 
 ### Writing V3 from vLLM
 
-A non-Megatron teacher writes the same tars, filling the required settings and whatever
+A non-Megatron teacher writes the same files, filling the required settings and whatever
 recorded settings and provenance (including `producer` and `teacher_precision`, e.g.
 vLLM's `dtype` and `quantization`) it can. The writer owns tokenization and packing; vLLM
 only scores token IDs.
@@ -361,15 +370,15 @@ only scores token IDs.
    at least one generated token; discard it.
 2. Row `t` takes `prompt_logprobs[t + 1]`, so the last content token's row is the
    distribution over EOS. Keep exactly the top K entries (vLLM may add the prompt token's
-   own logprob); fill missing entries with `-1000`. Compute `tail_logprobs` from these
+   own logprob); fill missing entries with `-1000`. Compute `tail` from these
    float32 values before casting them to `save_dtype`, and keep only the rows of
    positions with nonzero loss weight.
 3. Give the EOS position zero loss weight (it has no next token); the stripping rule
-   removes it. Omit `labels` and store `segment_final_labels` = EOS: the stored segment
-   then matches what a Megatron SFT dataset produces.
-4. Store `loss_mask` only when some tokens are not trained on, e.g. from
+   removes it. Labels are the next tokens, with EOS as the last kept position's label:
+   the stored segment then matches what a Megatron SFT dataset produces.
+4. Set `loss_mask` to zero on tokens that are not trained on, e.g. from
    `apply_chat_template(..., return_assistant_tokens_mask=True)` for assistant-only loss.
-   Omit `position_ids`.
+   Positions count from 0 within each segment.
 
 **Teacher-generated responses.** To distill on responses the teacher writes (sequence-level
 KD), make each segment prompt plus completion: completion rows come from the generated
@@ -385,8 +394,10 @@ row, but its final label is then the sampled token rather than a data label.
 
 **Layout.**
 
-- Pack segments into samples in an `isolated_segments` cache, one writer per `dp_rank`,
-  `writer_mbs=1`, `writer_gbs` samples per record; store no padding.
+- Pack segments into samples in an `isolated_segments` cache with `writers=1` and
+  `writer_mbs=1` (or one file per writer, following the writer layout); store no padding.
+  `format/arrow.py` (`samples_batch`, `write_file`) and `v3_storage.publish` write the
+  files and index.
 - A student checks each pack against its own length after re-padding every segment to
   its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
   students you expect; record the headroom you used as `padding_divisor`.
@@ -398,20 +409,19 @@ row, but its final label is then the sampled token rather than a data label.
 
 ### Size
 
-Inputs cost about 4 bytes per token for `tokens` plus whichever optional fields differ
-from their defaults (labels 4, positions 4, loss mask 1 or 4). FP16/BF16 targets take
-about `4·K + 4` bytes per scored token with `u16` indices, or `5·K + 4` with `u16+u8`,
-before zstd; the high byte compresses to a small fraction of a byte per entry for typical
+Inputs cost about 12 bytes per token (tokens, labels and positions) plus the loss mask
+(1 bit or 4 bytes), before zstd. FP16 targets take about `4·K + 4` bytes per scored token
+with `u16` indices, or `5·K + 4` with `u16+u8`, before zstd; the high byte compresses to a small fraction of a byte per entry for typical
 token IDs. Unscored context costs only its input bytes: a 60K-token conversation trained
 on a 1K-token answer stores 1K target rows.
 
 ### Object storage
 
-Remote tars are streamed sequentially with large ranged reads, one request per
-`--logits-load-read-chunk-mb` (default 64) chunk, independent of the MSC cache
-configuration. `--logits-load-msc-prefetch-depth` sets how many decoded teacher
-iterations each teacher-DP-rank stream keeps ahead, and `--logits-load-decode-threads`
-how many decode concurrently. Only one rank per pipeline stage lists the cache, and only
+Each block is one ranged read (`StorageClient.read` with a byte range), independent of
+the MSC cache configuration; a file's index is one small read. Reading starts at the
+block a resume needs, without fetching earlier ones. `--logits-load-msc-prefetch-depth`
+sets how many blocks each writer stream reads and decodes ahead, and
+`--logits-load-decode-threads` how many decode concurrently. Only one rank per pipeline stage lists the cache, and only
 when the student reaches the known frontier.
 
 ## Checkpoint resume
@@ -440,15 +450,15 @@ rejected. Top-P filtering retains uniform K and its value sentinels, and the acc
 teacher attempt reports `avg-logprobs-kept` just as V2 does.
 
 The CPU suite exercises the producer-neutral format (index encodings, padding stripping and
-re-padding, input defaults, metadata contract, tokenizer fingerprint, golden fixtures),
-codec integrity, exact input/target pairing, reshuffling and its
-checkpointed extent, DP/MBS changes, ramp-up, prefix shortening, CP token maps and
-per-CP-rank target shards, publication and holes from parallel jobs, the collective
-replay frontier, chunked remote reads, frozen-teacher range resume and cleanup,
+re-padding, the Arrow file and index layout, metadata contract, tokenizer fingerprint,
+golden fixtures), exact input/target pairing, reshuffling and its checkpointed extent,
+DP/MBS changes, ramp-up, prefix shortening, CP token maps and per-CP-rank target shards,
+publication and holes from parallel jobs, the collective replay frontier, one ranged read
+per block (and input-only prefixes), frozen-teacher range resume and cleanup,
 mismatched-settings detection, and differentiable sparse KL:
 
 ```sh
-uv run --no-project --with torch --with numpy --with zstandard --with safetensors --with pytest \
+uv run --no-project --with torch --with numpy --with pyarrow --with pytest \
   python -m pytest -q -o addopts='' tests/offline_kd_cpu
 ```
 
@@ -462,8 +472,9 @@ boundaries.
 
 The new modules in `megatron/training/distillation/` isolate the format, publication,
 replay and token mappings, saver, runtime hooks, and paired loss (`v3_*.py`). The
-producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation)
-live in `format/contract.py`, which imports nothing from Megatron.
+producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation, and
+the Arrow file and index layout) live in `format/contract.py` and `format/arrow.py`, which
+import nothing from Megatron.
 Small hooks in `arguments.py`, `training.py`, `checkpointing.py`, `pretrain_gpt.py`, and
 `pretrain_hybrid.py` select the V3 path. V3 reuses existing sparse top-K extraction,
 student output capture, the shared LM/sparse-KD loss and reporting, and the persistent

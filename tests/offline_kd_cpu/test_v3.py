@@ -2,7 +2,7 @@
 
 """CPU tests of the v3 codec and replay, without Megatron/CUDA initialization.
 
-Run with ``uv run --no-project --with torch --with numpy --with zstandard
+Run with ``uv run --no-project --with torch --with numpy --with pyarrow
 --with pytest python -m pytest tests/offline_kd_cpu``. Load the deliberately
 runtime-independent modules under a private namespace to avoid importing the
 Megatron package's GPU initialization code.
@@ -18,16 +18,17 @@ import types
 import typing
 from pathlib import Path
 
+import numpy as np
+import pyarrow as pa
 import pytest
-import safetensors.torch
 import torch
-import zstandard
 
 _namespace = "offline_kd_cpu"
 _package = types.ModuleType(_namespace)
 _package.__path__ = [str(Path(__file__).resolve().parents[2] / "megatron/training/distillation")]
 sys.modules[_namespace] = _package
 codec = importlib.import_module(f"{_namespace}.v3_format")
+arrow = importlib.import_module(f"{_namespace}.format.arrow")
 storage_module = importlib.import_module(f"{_namespace}.v3_storage")
 replay = importlib.import_module(f"{_namespace}.v3_replay")
 Storage = storage_module.Storage
@@ -48,7 +49,7 @@ def inputs(ids, length=8, packed=False):
 
 
 def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=None):
-    """Cache metadata shared by every tar: required settings, recorded settings, provenance.
+    """Cache metadata shared by every file: required settings, recorded settings, provenance.
 
     Overrides of recorded keys may also be passed through ``contract`` for brevity.
     """
@@ -56,7 +57,6 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "first_sample": 0,
         "writers": dp,
         "writer_mbs": mbs,
-        "writer_gbs": gbs,
         "attention_mode": "causal",
         "prefix_stable": True,
         "tokenizer": {"sha256": "test", "size": 3, "special_ids": {}, "eod_id": 2},
@@ -91,8 +91,9 @@ def scored(tokens, loss_mask):
 def make_record(captured, contract, logprobs=False):
     """Finalize captured inputs and targets exactly as the saver does.
 
-    Targets are identity rows (value = index = token ID) by default; with ``logprobs``
-    they are genuine log probabilities with a stored fp32 tail.
+    Targets are identity rows (value = index = token ID) by default, with no stored
+    tail; with ``logprobs`` they are genuine log probabilities with a stored fp32 tail.
+    Returns ``(record, values, indices, tail)``.
     """
     target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
     values = target_ids.float()
@@ -105,10 +106,11 @@ def make_record(captured, contract, logprobs=False):
         codec.tail_logprob(values),
         isolated=contract["attention_mode"] == "isolated_segments",
     )
-    targets = codec.pack_targets(
-        values, indices, vocab_size=contract["logprob_vocab_size"], tail=tail if logprobs else None
-    )
-    return record, targets
+    return record, values, indices, tail if logprobs else None
+
+
+# Small blocks so every file has several and block boundaries are exercised.
+TEST_BLOCK_BYTES = 256
 
 
 def write_flush(
@@ -118,38 +120,33 @@ def write_flush(
     begin,
     finish,
     *,
+    gbs=8,
     packed=False,
-    generation="gen",
     source=None,
     logprobs=False,
+    block_bytes=TEST_BLOCK_BYTES,
 ):
-    """Write one teacher DP rank's flush exactly as the saver does."""
+    """Write one writer's flush exactly as the saver does."""
     contract = metadata["contract"]
-    dp, mbs, gbs = contract["writers"], contract["writer_mbs"], contract["writer_gbs"]
-    members = {"inputs": [], "targets": []}
+    dp, mbs = contract["writers"], contract["writer_mbs"]
+    batches = []
     for iteration in range(begin, finish):
-        start, end = iteration * gbs, (iteration + 1) * gbs
+        start = iteration * gbs
         ids = [
             start + (mb * dp + rank) * mbs + j
             for mb in range(gbs // (dp * mbs))
             for j in range(mbs)
         ]
         batch = (source or inputs)(ids, packed=packed)
-        record, targets = make_record(codec.capture_batch(batch), contract, logprobs)
-        for kind, payload in (("inputs", record), ("targets", targets)):
-            members[kind].append(
-                (storage_module.member_name(start, end, kind), codec.encode(payload))
+        batches.append(
+            arrow.samples_batch(
+                *make_record(codec.capture_batch(batch), contract, logprobs),
+                vocab_size=contract["logprob_vocab_size"],
             )
-    for kind in storage_module.KINDS:
-        meta = {
-            **metadata,
-            "generation": generation,
-            "kind": kind,
-            "dp_rank": rank,
-            "range": [begin * gbs, finish * gbs],
-        }
-        name = storage_module.tar_name(rank, begin * gbs, finish * gbs, kind)
-        storage_module.write_tar(storage, name, meta, members[kind])
+        )
+    data, index = arrow.write_file(batches, metadata, block_bytes=block_bytes)
+    name = storage_module.FileName(rank, begin * gbs, finish * gbs)
+    storage_module.publish(storage, name, data, index)
 
 
 def write_cache(
@@ -164,7 +161,6 @@ def write_cache(
     provenance=None,
     metadata=None,
     start=0,
-    generation="gen",
     source=None,
     logprobs=False,
 ):
@@ -177,16 +173,16 @@ def write_cache(
     for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
         for rank in range(dp):
-            name = storage_module.tar_name(rank, begin * gbs, finish * gbs, "inputs")
-            if not storage.exists(name):
+            name = storage_module.FileName(rank, begin * gbs, finish * gbs)
+            if not storage.exists(name.index):
                 write_flush(
                     storage,
                     metadata,
                     rank,
                     begin,
                     finish,
+                    gbs=gbs,
                     packed=packed,
-                    generation=generation,
                     source=source,
                     logprobs=logprobs,
                 )
@@ -229,28 +225,135 @@ def test_fractional_mask_and_integer_overflow():
         codec.capture_batch(source)
 
 
-def test_zstd_checksum_detects_corruption():
-    raw = codec.encode(
-        codec.pack_targets(torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.long), vocab_size=3)
-    )
-    with pytest.raises(ValueError, match="checksum"):
-        codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]))
+def roundtrip(record, values, indices, tail, *, vocab_size=1 << 17, block_bytes=1 << 20):
+    """Write one file of these samples and decode every block back."""
+    batch = arrow.samples_batch(record, values, indices, tail, vocab_size=vocab_size)
+    data, index = arrow.write_file([batch], settings(), block_bytes=block_bytes)
+    decoded = []
+    for block in range(len(index["blocks"])):
+        offset, size = arrow.block_range(index, block, inputs_only=False)
+        decoded.append(
+            arrow.decode_block(
+                arrow.read_block(index, block, data[offset : offset + size]), vocab_size=vocab_size
+            )
+        )
+    return data, index, decoded
 
 
-def test_members_are_plain_safetensors_inside_zstd():
-    payload = {
-        "values": torch.tensor([[-0.5, -1000.0]], dtype=torch.float16),
-        "indices_low": torch.tensor([[7, 0xFFFF]], dtype=torch.uint16),
-        "loss_mask": torch.tensor([True, False]),
-        "empty": torch.zeros(0, dtype=torch.int32),
+def target_roundtrip(values, indices, tail=None, *, vocab_size):
+    """Store target rows (one token each) in a file and decode them back."""
+    rows = values.shape[0]
+    record = {
+        "sample_offsets": torch.tensor([0, rows]),
+        **{key: torch.zeros(rows, dtype=torch.int32) for key in ("tokens", "labels")},
+        "position_ids": torch.arange(rows),
+        "loss_mask": torch.ones(rows, dtype=torch.bool),
+        "segment_lengths": torch.tensor([rows] if rows else []),
+        "segment_counts": torch.tensor([1 if rows else 0]),
     }
-    raw = zstandard.ZstdDecompressor().decompress(codec.encode(payload))
-    restored = safetensors.torch.load(raw)
-    assert restored.keys() == payload.keys()
-    assert all(torch.equal(restored[key], payload[key]) for key in payload)
-    assert all(restored[key].dtype == payload[key].dtype for key in payload)
-    with pytest.raises(ValueError, match="safetensors"):
-        codec.decode(zstandard.ZstdCompressor().compress(b"not safetensors"))
+    _, _, [(_, targets)] = roundtrip(record, values, indices, tail, vocab_size=vocab_size)
+    return targets
+
+
+def batch_targets(batch):
+    """Raw ``(values, indices, tail)`` columns of a sample batch, without validation."""
+    values = arrow._flat(batch.column("values"))[1]
+    high = (
+        arrow._flat(batch.column("indices_high"))[1]
+        if "indices_high" in batch.schema.names
+        else None
+    )
+    indices = codec.join_indices(arrow._flat(batch.column("indices_low"))[1], high)
+    tail = arrow._flat(batch.column("tail"))[1] if "tail" in batch.schema.names else None
+    return arrow._tensor(values), arrow._tensor(indices), tail
+
+
+def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
+    name = storage_module.FileName(1, 0, 16)
+    table = pa.ipc.open_file(storage.path(name.data)).read_all()
+    assert table.schema.names == [
+        "tokens",
+        "labels",
+        "position_ids",
+        "loss_mask",
+        "segments",
+        "values",
+        "indices_low",
+        "indices_high",
+        "tail",
+    ]
+    assert json.loads(table.schema.metadata[arrow.META_KEY]) == metadata
+    assert table.num_rows == 8 and table.column("tokens")[0].as_py() == list(range(200, 208))
+    index = storage_module.read_index(storage, name)
+    assert index["size"] == storage.size(name.data) and len(index["blocks"]) > 1
+    assert sum(block["rows"] for block in index["blocks"]) == 8
+    assert storage_module.read_meta(storage, name) == metadata
+
+
+def test_input_only_reads_fetch_one_prefix_range(tmp_path):
+    storage, _ = write_cache(tmp_path, iterations=2, logprobs=True)
+    name = storage_module.FileName(0, 0, 16)
+    index = storage_module.read_index(storage, name)
+    data = (tmp_path / name.data).read_bytes()
+    for block, entry in enumerate(index["blocks"]):
+        assert entry["input_length"] < entry["length"]
+        offset, size = arrow.block_range(index, block, inputs_only=True)
+        batch = arrow.read_block(index, block, data[offset : offset + size], inputs_only=True)
+        assert batch.schema.names == list(arrow.INPUT_COLUMNS)
+        inputs_, targets = arrow.decode_block(batch)
+        assert targets is None and inputs_["sample_offsets"].numel() == entry["rows"] + 1
+        # The prefix alone cannot serve the targets: no other bytes are ever fetched.
+        with pytest.raises(OSError, match="did not fetch"):
+            arrow.read_block(index, block, data[offset : offset + size])
+
+
+def test_index_is_bound_to_its_data_file(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2)
+    name = storage_module.FileName(0, 0, 16)
+    index = storage_module.read_index(storage, name)
+    arrow.check_index(index, storage.size(name.data))
+    with pytest.raises(ValueError, match="another version of the file"):
+        arrow.check_index(index, storage.size(name.data) + 1)
+    with pytest.raises(ValueError, match="index version"):
+        arrow.check_index({**index, "index_version": 99})
+
+
+def test_binary_and_fractional_loss_masks_share_one_file():
+    batches = []
+    for weight in (1.0, 0.25):
+        source = inputs([0])
+        source["loss_mask"][0, 2] = weight
+        record = codec.finalize_record(
+            codec.capture_batch(source),
+            torch.zeros(8, 1),
+            torch.zeros(8, 1, dtype=torch.long),
+            torch.zeros(8),
+            isolated=False,
+        )
+        batches.append(arrow.samples_batch(*record[:3], None, vocab_size=8))
+    assert batches[0].schema.field("loss_mask").type == pa.large_list(pa.bool_())
+    data, index = arrow.write_file(batches, settings())
+    table = pa.ipc.open_file(pa.py_buffer(data)).read_all()
+    assert table.schema.field("loss_mask").type == pa.large_list(pa.float32())
+    assert table.column("loss_mask").to_pylist() == [
+        [0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 1, 0.25, 1, 1, 1, 1, 1],
+    ]
+
+
+def test_oversized_sample_gets_its_own_block():
+    record = codec.finalize_record(
+        codec.capture_batch(inputs([0, 1, 2])),
+        torch.zeros(24, 1),
+        torch.zeros(24, 1, dtype=torch.long),
+        torch.zeros(24),
+        isolated=False,
+    )
+    _, index, decoded = roundtrip(*record[:3], None, block_bytes=1)
+    assert [block["rows"] for block in index["blocks"]] == [1, 1, 1]
+    assert [block["supervised"] for block in index["blocks"]] == [7, 7, 7]
+    assert [inputs_["tokens"].tolist() for inputs_, _ in decoded][1] == list(range(100, 108))
 
 
 def test_tail_is_the_full_precision_mass_outside_retained_entries():
@@ -275,19 +378,19 @@ def test_tail_is_the_full_precision_mass_outside_retained_entries():
 @pytest.mark.parametrize("case", ["mass", "nan", "dtype", "shape"])
 def test_malformed_tail_rejected(case):
     values = torch.tensor([[0.6, 0.3]]).log()
+    indices = torch.tensor([[0, 1]])
     tail = torch.tensor([0.1]).log()
-    payload = codec.pack_targets(values, torch.tensor([[0, 1]]), vocab_size=4, tail=tail)
-    codec.unpack_targets(payload)
+    codec.check_targets(values, indices, tail, vocab_size=4)
     if case == "mass":
-        payload["tail_logprobs"] = torch.tensor([0.5]).log()
+        tail = torch.tensor([0.5]).log()
     elif case == "nan":
-        payload["tail_logprobs"] = torch.tensor([float("nan")])
+        tail = torch.tensor([float("nan")])
     elif case == "dtype":
-        payload["tail_logprobs"] = payload["tail_logprobs"].double()
+        tail = tail.double()
     else:
-        payload["tail_logprobs"] = torch.zeros(2)
+        tail = torch.zeros(2)
     with pytest.raises(ValueError, match="tail"):
-        codec.unpack_targets(payload)
+        codec.check_targets(values, indices, tail, vocab_size=4)
 
 
 def test_targets_are_stored_only_where_loss_is_applied():
@@ -303,21 +406,10 @@ def test_targets_are_stored_only_where_loss_is_applied():
     )
     assert record["tokens"].tolist() == [0, 1, 2, 3, 4, 5, 6]  # Only the padding is stripped.
     assert kept_ids.reshape(-1).tolist() == [2, 3, 6]  # Context tokens carry no targets.
-    payload = codec.pack_targets(kept, kept_ids, vocab_size=1 << 17, tail=kept_tail)
-    metadata = settings()
-    live = replay.ReplayReader(Storage("."), metadata, [])
-    try:
-        sample_record = {**record, "sample_offsets": torch.tensor([0, 7])}
-        live.dp = 1
-        inputs_, targets = live.decode_record(
-            0, 0, 1, codec.encode(sample_record), codec.encode(payload)
-        )
-        with pytest.raises(ValueError, match="nonzero loss weights"):
-            short = {key: value[:2] for key, value in payload.items()}
-            live.decode_record(0, 0, 1, codec.encode(sample_record), codec.encode(short))
-    finally:
-        live.close()
-    assert inputs_["target_offsets"].tolist() == [0, 0, 0, 1, 2, 2, 2, 3]
+    _, _, [(inputs_, targets)] = roundtrip(record, kept, kept_ids, kept_tail)
+    with pytest.raises(ValueError, match="one row per nonzero loss weight"):
+        arrow.samples_batch(record, kept[:2], kept_ids[:2], kept_tail[:2], vocab_size=1 << 17)
+    assert torch.equal(targets[1].reshape(-1), kept_ids.reshape(-1))
     sample = {field: inputs_[field] for field in codec.TOKEN_FIELDS}
     sample.update(
         segments=inputs_["segment_lengths"],
@@ -361,14 +453,21 @@ def test_entries_beyond_the_student_vocabulary_join_the_tail(tmp_path):
 def test_index_encoding_roundtrip(vocab_size, encoding):
     indices = torch.tensor([[0, vocab_size - 1, -1, 0, vocab_size - 1]])
     values = torch.tensor([[-1.0, -2.0, -1000.0, -3.0, -4.0]])
-    payload = codec.pack_targets(values, indices, vocab_size=vocab_size)
-    assert payload["indices_low"].dtype == torch.uint16
-    assert ("indices_high" in payload) == (encoding == "u16+u8")
-    if "indices_high" in payload:
-        assert payload["indices_high"].dtype == torch.uint8
-        assert payload["indices_high"].shape == indices.shape
-    restored, ids, _ = codec.unpack_targets(
-        codec.decode(codec.encode(payload)), vocab_size=vocab_size
+    low, high = codec.split_indices(indices.numpy(), values.numpy(), vocab_size=vocab_size)
+    assert low.dtype == np.uint16 and (high is None) == (encoding == "u16")
+    if high is not None:
+        assert high.dtype == np.uint8 and high.shape == indices.shape
+    record = {
+        "sample_offsets": torch.tensor([0, 1]),
+        "tokens": torch.tensor([0]),
+        "labels": torch.tensor([0]),
+        "position_ids": torch.tensor([0]),
+        "loss_mask": torch.tensor([True]),
+        "segment_lengths": torch.tensor([1]),
+        "segment_counts": torch.tensor([1]),
+    }
+    _, _, [(_, (restored, ids, _))] = roundtrip(
+        record, values, indices, None, vocab_size=vocab_size
     )
     assert torch.equal(restored, values)
     keep = values != -1000.0
@@ -383,37 +482,27 @@ def test_index_encoding_rejects_invalid_vocab_size(vocab_size):
         codec.index_encoding_for_vocab(vocab_size)
 
 
-@pytest.mark.parametrize(
-    "case", ["missing_low", "mismatch", "missing_high", "extra_high", "dtype", "bounds"]
-)
-def test_malformed_target_encoding_rejected(case):
-    payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=65537)
-    kwargs = {}
-    if case == "missing_low":
-        del payload["indices_low"]
-    elif case == "mismatch":
-        kwargs["vocab_size"] = 65536
-    elif case == "missing_high":
-        del payload["indices_high"]
-        kwargs["vocab_size"] = 65537
-    elif case == "extra_high":
-        payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=3)
-        payload["indices_high"] = torch.zeros(1, 2, dtype=torch.uint8)
-        kwargs["vocab_size"] = 3
-    elif case == "dtype":
-        payload["indices_low"] = payload["indices_low"].long()
+@pytest.mark.parametrize("case", ["bounds", "shape", "high_shape", "integer_values"])
+def test_malformed_targets_rejected(case):
+    values, indices = torch.zeros(1, 2), torch.tensor([[0, 65538]])
+    if case == "bounds":  # ID 65538 exceeds the declared vocabulary.
+        with pytest.raises(ValueError, match="out of range"):
+            codec.check_targets(values, indices, None, vocab_size=65537)
+    elif case == "shape":
+        with pytest.raises(ValueError, match="Malformed"):
+            codec.check_targets(values[:, :1], indices, None, vocab_size=None)
+    elif case == "high_shape":
+        with pytest.raises(ValueError, match="Malformed"):
+            codec.join_indices(np.zeros((1, 2), np.uint16), np.zeros((1, 1), np.uint8))
     else:
-        payload["indices_low"][0, 1] = 2
-        payload["indices_high"][0, 1] = 1  # ID 65538 exceeds the declared vocabulary.
-        kwargs["vocab_size"] = 65537
-    with pytest.raises(ValueError):
-        codec.unpack_targets(payload, **kwargs)
+        with pytest.raises(ValueError, match="Malformed"):
+            codec.check_targets(indices, indices, None, vocab_size=None)
 
 
 @pytest.mark.parametrize("index,value", [(-2, -1000.0), (-1, -1.0), (65537, -1.0)])
 def test_target_encoder_rejects_invalid_ids(index, value):
     with pytest.raises(ValueError, match="vocabulary index"):
-        codec.pack_targets(torch.tensor([[value]]), torch.tensor([[index]]), vocab_size=65537)
+        codec.split_indices(np.array([[index]]), np.array([[value]]), vocab_size=65537)
 
 
 @pytest.mark.parametrize(
@@ -533,13 +622,10 @@ def test_finalize_strips_only_trailing_zero_weight_positions():
     assert indices.reshape(-1).tolist() == [1, 2, 5]
     assert torch.equal(values, indices.float())
     assert kept_tail.tolist() == [-1, -2, -5]
-    # Positions and labels equal their defaults (with per-segment final labels).
-    assert "position_ids" not in record and "labels" not in record
-    assert record["segment_final_labels"].tolist() == [303, 306]
-    restored = codec.fill_input_defaults(record)
-    assert restored["position_ids"].tolist() == [0, 1, 2, 0, 1]
-    assert restored["loss_mask"].float().tolist() == [0, 1, 1, 0, 1]
-    assert restored["labels"].tolist() == captured["labels"][[0, 1, 2, 4, 5]].tolist()
+    # Every token-aligned field is kept for the kept positions.
+    assert record["position_ids"].tolist() == [0, 1, 2, 0, 1]
+    assert record["loss_mask"].float().tolist() == [0, 1, 1, 0, 1]
+    assert record["labels"].tolist() == captured["labels"][[0, 1, 2, 4, 5]].tolist()
 
 
 def test_finalize_drops_fully_masked_segments_and_samples():
@@ -553,7 +639,8 @@ def test_finalize_drops_fully_masked_segments_and_samples():
     assert record["sample_offsets"].tolist() == [0, 0]
     assert record["segment_counts"].tolist() == [0]
     assert values.shape == (0, 1)
-    codec.validate_inputs(record)
+    _, _, [(restored, (stored, *_))] = roundtrip(record, values, values.long(), None)
+    assert restored["sample_offsets"].tolist() == [0, 0] and stored.shape == (0, 1)
 
 
 def test_unpacked_samples_are_one_segment():
@@ -568,60 +655,45 @@ def test_unpacked_samples_are_one_segment():
     assert record["segment_lengths"].tolist() == [8, 6]
 
 
-def test_input_defaults_are_per_segment():
-    tokens = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
-    defaults = codec.default_inputs(tokens, torch.tensor([3, 2]), torch.tensor([10, 11]))
-    assert defaults["position_ids"].tolist() == [0, 1, 2, 0, 1]
-    assert defaults["labels"].tolist() == [6, 7, 10, 9, 11]
-    assert defaults["loss_mask"].all()
-    minimal = {
-        "sample_offsets": torch.tensor([0, 5]),
-        "tokens": tokens,
-        "segment_lengths": torch.tensor([3, 2], dtype=torch.int32),
-        "segment_counts": torch.tensor([2], dtype=torch.int32),
-    }
-    with pytest.raises(ValueError, match="final label"):
-        codec.validate_inputs(minimal)
-    minimal["segment_final_labels"] = torch.tensor([10, 11], dtype=torch.int32)
-    codec.validate_inputs(minimal)
-    filled = codec.fill_input_defaults(minimal)
-    assert filled["labels"].tolist() == [6, 7, 10, 9, 11]
-
-
-@pytest.mark.parametrize("case", ["counts", "length", "zero", "sum"])
-def test_malformed_segments_rejected(case):
-    record = {
-        "sample_offsets": torch.tensor([0, 5]),
-        "tokens": torch.zeros(5, dtype=torch.int32),
-        "labels": torch.zeros(5, dtype=torch.int32),
-        "segment_lengths": torch.tensor([3, 2], dtype=torch.int32),
-        "segment_counts": torch.tensor([2], dtype=torch.int32),
-    }
-    if case == "counts":
-        record["segment_counts"] = torch.tensor([1], dtype=torch.int32)
-    elif case == "length":
-        del record["segment_counts"]
-    elif case == "zero":
-        record["segment_lengths"] = torch.tensor([5, 0], dtype=torch.int32)
+@pytest.mark.parametrize("case", ["zero", "sum", "misaligned"])
+def test_malformed_blocks_rejected(case):
+    record = codec.finalize_record(
+        packed_capture([0, 1, 1, 0, 0, 1, 0, 0]),
+        torch.zeros(8, 1),
+        torch.zeros(8, 1, dtype=torch.long),
+        torch.zeros(8),
+        isolated=True,
+    )
+    batch = arrow.samples_batch(*record[:3], None, vocab_size=8)
+    if case == "misaligned":
+        name, values = "labels", [[1, 2, 3]]
     else:
-        record["segment_lengths"] = torch.tensor([3, 3], dtype=torch.int32)
-    with pytest.raises(ValueError):
-        codec.validate_inputs(record)
+        name, values = "segments", [[5, 0]] if case == "zero" else [[3, 3]]
+    column = pa.array(values, pa.large_list(pa.int32()))
+    batch = batch.set_column(batch.schema.get_field_index(name), name, column)
+    with pytest.raises(ValueError, match="segments|aligned"):
+        arrow.decode_block(batch)
 
 
-def test_tars_are_self_describing_and_immutable(tmp_path):
+def test_files_are_self_describing_and_immutable(tmp_path):
     storage, metadata = write_cache(tmp_path)
     assert storage.list("*") == sorted(
-        storage_module.tar_name(rank, a, b, kind)
+        name
         for rank in range(2)
         for a, b in ((0, 16), (16, 32))
-        for kind in ("inputs", "targets")
+        for name in (storage_module.data_name(rank, a, b), storage_module.index_name(rank, a, b))
     )
-    meta = storage_module.read_meta(storage, "dp1__16-32.targets.tar")
+    name = storage_module.FileName(1, 16, 32)
+    meta = storage_module.read_meta(storage, name)
     assert codec.mismatched_settings(meta, metadata) == ([], [])
-    assert (meta["kind"], meta["dp_rank"], meta["range"]) == ("targets", 1, [16, 32])
     with pytest.raises(RuntimeError, match="replace published"):
-        storage_module.write_tar(storage, "dp1__16-32.targets.tar", meta, [])
+        storage_module.publish(storage, name, b"", {})
+    # A data file without an index (an interrupted attempt) is invisible and replaceable.
+    orphan = storage_module.FileName(0, 32, 48)
+    storage.write(orphan.data, b"partial")
+    assert orphan not in storage_module.list_published(storage)
+    storage_module.publish(storage, orphan, b"data", {"index_version": 1})
+    assert storage.read(orphan.data) == b"data"
 
 
 @pytest.mark.parametrize(
@@ -748,8 +820,8 @@ def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
         iterator.close()
 
 
-@pytest.mark.parametrize("missing", ["dp1__0-16.targets.tar", "dp0__0-16.inputs.tar"])
-def test_range_is_published_only_when_every_rank_and_kind_exists(tmp_path, missing):
+@pytest.mark.parametrize("missing", ["dp1__0-16.index.json", "dp0__0-16.index.json"])
+def test_range_is_published_only_when_every_writer_published(tmp_path, missing):
     storage, metadata = write_cache(tmp_path)
     (tmp_path / missing).unlink()
     found, hole = replay.discover_groups(storage, metadata)
@@ -761,11 +833,11 @@ def test_range_is_published_only_when_every_rank_and_kind_exists(tmp_path, missi
 
 def test_hole_from_parallel_jobs_is_a_warning_until_filled(tmp_path):
     # The job owning iterations 2-4 finishes before the one owning 0-2.
-    storage, metadata = write_cache(tmp_path, start=2, generation="job-b")
+    storage, metadata = write_cache(tmp_path, start=2)
     found, hole = replay.discover_groups(storage, metadata)
     assert found == [] and hole == (0, 16, 1)
     assert "parallel dump job may still be writing" in replay.describe_hole(hole)
-    write_cache(tmp_path, iterations=2, generation="job-a")
+    write_cache(tmp_path, iterations=2)
     found, hole = replay.discover_groups(storage, metadata)
     assert found == [(0, 16), (16, 32)] and hole is None
     sequential_root = tmp_path / "sequential"
@@ -815,28 +887,44 @@ def test_shuffled_reader_never_extends(tmp_path):
     shuffled.close()
 
 
-def test_input_only_readers_never_open_targets(tmp_path, monkeypatch):
-    storage, metadata = write_cache(tmp_path)
-    opened = []
-    original = storage_module.iter_tar
+class _CountingStorage(Storage):
+    """Local storage that records every ranged read."""
 
-    def recording(storage, name, chunk_bytes=storage_module.DEFAULT_CHUNK_BYTES):
-        opened.append(name)
-        return original(storage, name, chunk_bytes)
+    def __init__(self, root):
+        super().__init__(str(root))
+        self.reads = []
 
-    monkeypatch.setattr(replay, "iter_tar", recording)
-    live = reader(storage, metadata, targets=False)
+    def read_range(self, name, offset, size):
+        self.reads.append((name, offset, size))
+        return super().read_range(name, offset, size)
+
+
+@pytest.mark.parametrize("targets", [True, False])
+def test_each_block_is_one_ranged_read(tmp_path, targets):
+    write_cache(tmp_path, logprobs=True)
+    storage = _CountingStorage(tmp_path)
+    metadata = storage_module.read_meta(storage, storage_module.FileName(0, 0, 16))
+    live = reader(storage, metadata, targets=targets)
     samples = live.samples(list(range(32)), 32)
     live.close()
     assert ids_of(samples) == list(range(32))
-    assert "teacher_values" not in samples[0]
-    assert opened and all(name.endswith(".inputs.tar") for name in opened)
+    assert ("teacher_values" in samples[0]) == targets
+    expected = []
+    for start, end in ((0, 16), (16, 32)):
+        for rank in range(2):
+            name = storage_module.FileName(rank, start, end)
+            index = storage_module.read_index(storage, name)
+            expected += [
+                (name.data, *arrow.block_range(index, block, inputs_only=not targets))
+                for block in range(len(index["blocks"]))
+            ]
+    assert sorted(storage.reads) == sorted(expected)
 
 
-def test_tars_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp_path, capsys):
+def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp_path, capsys):
     storage, metadata = write_cache(tmp_path, iterations=2)
     write_cache(tmp_path, iterations=4, contract={"seq_length": 16, "teacher": "other"})
-    write_cache(tmp_path, iterations=6, contract={"prefix_stable": False}, generation="bad")
+    write_cache(tmp_path, iterations=6, contract={"prefix_stable": False})
     live = reader(storage, metadata)
     try:
         assert ids_of(live.samples(list(range(32)), 32)) == list(range(32))
@@ -849,12 +937,12 @@ def test_tars_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp_
         live.close()
 
 
-def test_inputs_and_targets_from_different_jobs_are_rejected(tmp_path):
+def test_index_of_another_file_version_is_rejected(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    other, _ = write_cache(tmp_path / "other", iterations=2, generation="other")
-    (tmp_path / "other" / "dp0__0-16.targets.tar").replace(tmp_path / "dp0__0-16.targets.tar")
+    # A retry rewrote the data file, but its index is still the earlier one.
+    (tmp_path / "dp0__0-16.arrow").write_bytes((tmp_path / "dp0__0-16.arrow").read_bytes() + b"x")
     live = reader(storage, metadata)
-    with pytest.raises(ValueError, match="different dump jobs"):
+    with pytest.raises(ValueError, match="another version of the file"):
         live.samples([0], 1)
     live.close()
 
@@ -1018,80 +1106,20 @@ def test_token_maps_match_megatron_cpu_partitioning(packed, layout, monkeypatch)
         assert torch.equal(mapping, actual)
 
 
-def test_corrupt_sample_offsets_are_rejected():
-    captured = codec.capture_batch(inputs([0]))
-    captured["sample_offsets"][-1] = 100
-    with pytest.raises(ValueError, match="tensor"):
-        codec.validate_inputs(captured)
-
-
-class _CountingRemote:
-    """A remote-like storage view over local files that counts ranged reads."""
-
-    remote = True
-
-    def __init__(self, root):
-        self.local = Storage(str(root))
-        self.reads = []
-
-    def size(self, name):
-        return self.local.size(name)
-
-    def read_range(self, name, offset, size):
-        self.reads.append((name, offset, size))
-        return self.local.read_range(name, offset, size)
-
-
-@pytest.mark.parametrize("chunk", [1 << 10, 4 << 10, 1 << 20])
-def test_chunked_remote_reads_issue_one_request_per_chunk(tmp_path, chunk):
-    storage, _ = write_cache(tmp_path, iterations=2)
-    name = "dp0__0-16.targets.tar"
-    remote = _CountingRemote(tmp_path)
-    streamed = list(storage_module.iter_tar(remote, name, chunk))
-    assert streamed == list(storage_module.iter_tar(storage, name))
-    size = storage.size(name)
-    # Sequential, non-overlapping chunk-sized requests; trailing tar padding may go unread.
-    assert [offset for _, offset, _ in remote.reads] == [
-        index * chunk for index in range(len(remote.reads))
-    ]
-    assert all(length == min(chunk, size - offset) for _, offset, length in remote.reads)
-    assert len(remote.reads) <= -(-size // chunk)
-    remote.reads.clear()
-    assert storage_module.read_meta(remote, name)["kind"] == "targets"
-    assert len(remote.reads) == 1
-
-
-def test_chunked_reader_serves_small_reads_without_rebuilding_its_chunk(tmp_path):
-    storage, _ = write_cache(tmp_path)
-    name = "dp0__0-16.targets.tar"
-    expected = (tmp_path / name).read_bytes()
-    chunk = len(expected) // 3 + 1
-    reader = storage_module.ChunkedReader(_CountingRemote(tmp_path), name, chunk)
-    pieces, chunks = [], []
-    while piece := reader.read(512):  # tarfile-sized reads.
-        assert len(piece) <= 512
-        pieces.append(piece)
-        if not chunks or chunks[-1] is not reader.chunk:
-            chunks.append(reader.chunk)
-    assert b"".join(pieces) == expected
-    # One chunk object per fetch: reads advance an offset instead of re-slicing it.
-    assert len(chunks) == -(-len(expected) // chunk)
-    assert reader.read() == b""
-
-
 def test_discard_unpublished_only_touches_its_own_range(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=6)
-    (tmp_path / "dp1__16-32.targets.tar").unlink()
-    (tmp_path / "dp0__16-32.inputs.tar.0123456789abcdef0123456789abcdef.tmp").write_bytes(b"x")
+    (tmp_path / "dp1__16-32.index.json").unlink()
+    (tmp_path / "dp0__16-32.arrow.0123456789abcdef0123456789abcdef.tmp").write_bytes(b"x")
     removed = storage_module.discard_unpublished(storage, 16, 32)
-    assert sorted(removed) == [
-        "dp0__16-32.inputs.tar",
-        "dp0__16-32.inputs.tar.0123456789abcdef0123456789abcdef.tmp",
-        "dp0__16-32.targets.tar",
-        "dp1__16-32.inputs.tar",
+    # Indexes go first, so an interrupted cleanup leaves only unpublished data files.
+    assert removed == [
+        "dp0__16-32.index.json",
+        "dp0__16-32.arrow",
+        "dp0__16-32.arrow.0123456789abcdef0123456789abcdef.tmp",
+        "dp1__16-32.arrow",
     ]
     # Another job's range (32-48) is untouched.
-    assert len(storage.list("dp*__32-48.*.tar")) == 4
+    assert len(storage.list("dp*__32-48.*")) == 4
 
 
 @pytest.fixture
@@ -1105,7 +1133,6 @@ def runtime_environment(monkeypatch):
         logits_load_shuffle_shards=7,
         logits_load_decode_threads=2,
         logits_load_msc_prefetch_depth=2,
-        logits_load_read_chunk_mb=1,
         logits_load_replay_end=None,
         seq_length=8,
         context_parallel_size=1,
@@ -1191,7 +1218,6 @@ def test_single_shuffle_argument_parses_enablement_and_seed(seed):
     argv = [] if seed is None else ["--logits-load-shuffle-shards", str(seed)]
     args = parser.parse_args(argv)
     assert args.logits_load_shuffle_shards == seed
-    assert args.logits_load_read_chunk_mb == 64
     with pytest.raises(SystemExit):
         parser.parse_args(["--logits-load-shuffle-shards"])
 
@@ -1273,7 +1299,6 @@ def test_teacher_identity_and_precision_are_recorded(
 
 
 def test_format_contract_imports_without_megatron():
-    import importlib.util
     import subprocess
 
     path = Path(_package.__path__[0]) / "format" / "contract.py"
@@ -1287,12 +1312,10 @@ def test_format_contract_imports_without_megatron():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def replay_cache(tmp_path, args, runtime, *, iterations=4, generation="gen"):
+def replay_cache(tmp_path, args, runtime, *, iterations=4):
     """Create a runtime-compatible cache."""
     contract = {"tokenizer": runtime.tokenizer_identity()}
-    storage, metadata = write_cache(
-        tmp_path, iterations=iterations, contract=contract, generation=generation
-    )
+    storage, metadata = write_cache(tmp_path, iterations=iterations, contract=contract)
     args.logits_load_dir = str(tmp_path)
     return storage, metadata
 
@@ -1449,7 +1472,7 @@ def test_resume_can_switch_to_identically_dumped_replacement(
     expected = ids_of(original_reader.samples([8, 9], 10))
     original_reader.close()
     args.consumed_train_samples = 8
-    replay_cache(tmp_path / "replacement", args, runtime, generation="replacement")
+    replay_cache(tmp_path / "replacement", args, runtime)
     runtime._PLAN = None
     runtime.initialize_replay(args)
     iterator = build_loader_iterator(runtime, args, args.consumed_train_samples)
@@ -1554,7 +1577,7 @@ def test_frontier_rejects_changed_published_prefix(tmp_path, runtime_environment
     args.logits_load_shuffle_shards = None
     replay_cache(tmp_path, args, runtime, iterations=2)
     runtime.initialize_replay(args)
-    (tmp_path / "dp1__0-16.inputs.tar").unlink()
+    (tmp_path / "dp1__0-16.index.json").unlink()
     args.consumed_train_samples = 16
     with pytest.raises(RuntimeError, match="Previously published"):
         runtime.ensure_replay_frontier(args)
@@ -1583,14 +1606,14 @@ def test_context_parallel_replay_scatters_shards_and_errors(runtime_environment,
     assert next(receiver)["_kd_indices"] == "i1"
 
     def broken():
-        raise ValueError("corrupt tar")
+        raise ValueError("corrupt file")
         yield
 
     rank[0] = 0
-    with pytest.raises(RuntimeError, match="corrupt tar"):
+    with pytest.raises(RuntimeError, match="corrupt file"):
         next(runtime._ContextParallelReplay(broken, 0, 2))
     rank[0] = 1
-    with pytest.raises(RuntimeError, match="corrupt tar"):
+    with pytest.raises(RuntimeError, match="corrupt file"):
         next(receiver)
 
 
@@ -1684,58 +1707,21 @@ def test_prefix_shortening_is_checked_per_sample(tmp_path, seq_length, prefix_st
             replay.collate_samples(samples, seq_length, prefix_stable=prefix_stable)
 
 
-def test_isolated_records_require_segments(tmp_path):
-    # Another producer's record that omits segments; isolated attention needs them.
-    metadata = settings(contract={"attention_mode": "isolated_segments"})
-    live = replay.ReplayReader(Storage(str(tmp_path)), metadata, [])
-    record = {
-        "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
-        "tokens": torch.zeros(8, dtype=torch.int32),
-        "labels": torch.zeros(8, dtype=torch.int32),
-    }
-    try:
-        with pytest.raises(ValueError, match="requires saved segments"):
-            live.decode_record(0, 0, 8, codec.encode(record))
-    finally:
-        live.close()
-
-
-def test_unsegmented_causal_records_use_defaults(tmp_path):
-    live = replay.ReplayReader(Storage(str(tmp_path)), settings(), [])
-    record = {
-        "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
-        "tokens": torch.arange(8, dtype=torch.int32),
-        "segment_final_labels": torch.tensor([2, 4, 6, 8], dtype=torch.int32),
-    }
-    inputs_, _ = live.decode_record(0, 0, 8, codec.encode(record))
-    live.close()
-    assert inputs_["segment_lengths"].tolist() == [2, 2, 2, 2]
-    assert inputs_["labels"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert inputs_["loss_mask"].all()
-    assert inputs_["position_ids"].tolist() == [0, 1] * 4
-
-
-def test_reader_checks_target_width_against_tar_metadata(tmp_path):
-    storage, metadata = write_cache(tmp_path)
-    live = reader(storage, metadata)
-    input_stream = iter(
-        storage_module.iter_tar(storage, storage_module.tar_name(0, 0, 16, "inputs"))
+@pytest.mark.parametrize("column", [*arrow.INPUT_COLUMNS, "indices_high"])
+def test_blocks_need_every_input_column_and_the_vocabulary_index_width(column):
+    record = codec.finalize_record(
+        codec.capture_batch(inputs([0])),
+        torch.zeros(8, 1),
+        torch.zeros(8, 1, dtype=torch.long),
+        torch.zeros(8),
+        isolated=False,
     )
-    target_stream = iter(
-        storage_module.iter_tar(storage, storage_module.tar_name(0, 0, 16, "targets"))
-    )
-    try:
-        next(input_stream)
-        next(target_stream)
-        raw_inputs = next(input_stream)[1]
-        payload = codec.decode(next(target_stream)[1])
-        del payload["indices_high"]  # u16 encoding, but the cache vocabulary needs u16+u8.
-        with pytest.raises(ValueError, match="index encoding"):
-            live.decode_record(0, 0, 8, raw_inputs, codec.encode(payload))
-    finally:
-        input_stream.close()
-        target_stream.close()
-        live.close()
+    batch = arrow.samples_batch(*record[:3], None, vocab_size=1 << 17)
+    arrow.decode_block(batch, vocab_size=1 << 17)
+    batch = batch.drop_columns([column])
+    message = "index encoding" if column == "indices_high" else "missing columns"
+    with pytest.raises(ValueError, match=message):
+        arrow.decode_block(batch, vocab_size=1 << 17)
 
 
 def test_targets_beyond_the_student_vocabulary_are_masked(tmp_path, capsys):
@@ -1881,13 +1867,13 @@ def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runti
     metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
     assert (metadata["published_through"], metadata["contract"]["first_sample"]) == (0, 0)
     teacher_cache(tmp_path, runtime, args, start=4, iterations=8)
-    (tmp_path / "dp1__48-64.targets.tar").unlink()  # Job B's interrupted tail.
+    (tmp_path / "dp1__48-64.index.json").unlink()  # Job B's interrupted tail.
     args.logits_save_range_start = 4
     args.consumed_train_samples = 6 * 8
     metadata = runtime.initialize_dump_metadata(saver)
     assert (metadata["published_through"], metadata["range_end"]) == (48, 64)
-    assert not storage_module.Storage(str(tmp_path)).list("dp*__48-64.*.tar")
-    assert len(storage_module.Storage(str(tmp_path)).list("dp*__32-48.*.tar")) == 4
+    assert not storage_module.Storage(str(tmp_path)).list("dp*__48-64.*")
+    assert len(storage_module.Storage(str(tmp_path)).list("dp*__32-48.*")) == 4
     args.consumed_train_samples = 8 * 8
     with pytest.raises(RuntimeError, match="outside this job's published range"):
         runtime.initialize_dump_metadata(saver)
@@ -1924,7 +1910,6 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     saver.cp_size = saver.dp_size = 1
     saver._initialized = True
     saver.metadata_dict = {
-        "generation": "gen",
         "published_through": 0,
         "contract": {"attention_mode": "causal", "logprob_vocab_size": 1 << 17},
     }
@@ -1952,22 +1937,19 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     forward([6, 7])
     saver.commit_attempt()
     record = saver._pending_writes[(0, 4)]
-    restored = codec.decode(record["inputs"])
-    # Identity targets are not log probabilities, so inspect the payload directly.
-    payload = codec.decode(record["targets"])
-    values = payload["values"]
-    indices = payload["indices_low"].long() | payload["indices_high"].long() << 16
-    assert "sample_ids" not in record and "sample_ids" not in restored
-    assert all(isinstance(value, torch.Tensor) for value in restored.values())
+    batch = record["batch"]
+    assert "sample_ids" not in record and "sample_id" not in batch.schema.names
+    restored, _ = arrow.decode_block(batch.select(list(arrow.INPUT_COLUMNS)))
     assert restored["tokens"][0] == 400
-    weights = codec.fill_input_defaults(restored)["loss_mask"]
+    # Identity targets are not log probabilities, so inspect the columns directly.
+    values, indices, tail = batch_targets(batch)
+    weights = restored["loss_mask"]
     assert torch.equal(restored["tokens"].long()[weights != 0], indices.squeeze(-1))
     assert torch.equal(values.long(), indices)
-    assert payload["tail_logprobs"].dtype == torch.float32
-    assert payload["tail_logprobs"].shape == values.shape[:1]
+    assert tail.dtype == np.float32 and tail.shape == values.shape[:1]
 
 
-def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environment, monkeypatch):
+def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, monkeypatch):
     args, runtime, _ = runtime_environment
     module = importlib.import_module(f"{_namespace}.v3_saver")
     metadata = settings()
@@ -1976,20 +1958,20 @@ def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environme
         start, end = iteration * 8, (iteration + 1) * 8
         for rank in (0, 1):
             ids = [start + (mb * 2 + rank) * 2 + j for mb in range(2) for j in range(2)]
-            captured, targets = make_record(codec.capture_batch(inputs(ids)), metadata["contract"])
+            record = make_record(codec.capture_batch(inputs(ids)), metadata["contract"])
             writes.setdefault(rank, {})[(start, end)] = {
                 "start": start,
                 "end": end,
-                "inputs": codec.encode(captured),
-                "targets": codec.encode(targets),
+                "batch": arrow.samples_batch(*record, vocab_size=1 << 17),
             }
-    meta = json.dumps({**metadata, "generation": "gen", "published_through": 0, "range_end": 64})
+    meta = json.dumps({**metadata, "published_through": 0, "range_end": 64})
     for rank in (0, 1):
         module.PairedLogitsSaver._write_batched_tar(
-            str(tmp_path / storage_module.tar_name(rank, 0, 16, "inputs")), writes[rank], meta
+            str(tmp_path / storage_module.data_name(rank, 0, 16)), writes[rank], meta
         )
     storage = Storage(str(tmp_path))
-    assert "published_through" not in storage_module.read_meta(storage, "dp0__0-16.inputs.tar")
+    meta = storage_module.read_meta(storage, storage_module.FileName(0, 0, 16))
+    assert meta == metadata  # Resume-only state is not stored.
     live = reader(storage, metadata)
     assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
     live.close()
@@ -2174,11 +2156,9 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     saver._max_vocab_size = module.PairedLogitsSaver._max_vocab_size
     values, indices = method(saver, logits)
     assert indices.tolist() == [[[1 << 17, (1 << 17) - 1]]]
-    payload = codec.pack_targets(
+    restored, ids, _ = target_roundtrip(
         values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
     )
-    assert payload["indices_high"].dtype == torch.uint8
-    restored, ids, _ = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
     assert torch.equal(ids, indices.reshape(1, 2))
     assert torch.equal(restored, values.reshape(1, 2))
 
@@ -2259,11 +2239,8 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     assert torch.allclose(values, torch.where(keep, expected, -1e3).to(dtype), atol=1e-6)
     kept_mass = (full.softmax(-1).topk(4, dim=-1).values * keep).sum(-1)
     assert torch.allclose(tail, (1 - kept_mass).log(), atol=1e-6)
-    encoded = codec.pack_targets(
-        values.reshape(-1, 4), indices.reshape(-1, 4), vocab_size=6, tail=tail.reshape(-1)
-    )
-    restored, restored_ids, restored_tail = codec.unpack_targets(
-        codec.decode(codec.encode(encoded))
+    restored, restored_ids, restored_tail = target_roundtrip(
+        values.reshape(-1, 4), indices.reshape(-1, 4), tail.reshape(-1), vocab_size=6
     )
     assert torch.equal(restored_tail, tail.reshape(-1))
     assert torch.equal(restored, values.reshape(-1, 4))
@@ -2319,25 +2296,20 @@ def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeyp
     with pytest.raises(RuntimeError, match="enable-msc"):
         Storage("msc://test/dump")
     calls = []
-    backend.glob = lambda pattern: calls.append(pattern) or [
-        "msc://test/dump/dp0__0-8.inputs.tar",
-        "msc://test/dump/dp0__0-8.targets.tar",
-    ]
+    backend.glob = lambda pattern: calls.append(pattern) or ["msc://test/dump/dp0__0-8.index.json"]
     module = importlib.import_module(f"{_namespace}.v3_saver")
-    monkeypatch.setattr(module, "write_tar", lambda *a: None)
+    monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
+    monkeypatch.setattr(module, "publish", lambda *a: None)
     module.PairedLogitsSaver._write_batched_tar(
-        "msc://test/dump/dp0__0-8.inputs.tar",
-        {0: {"start": 0, "end": 8, "inputs": b"", "targets": b""}},
+        "msc://test/dump/dp0__0-8.arrow",
+        {0: {"start": 0, "end": 8, "batch": None}},
         "{}",
         msc_enabled=True,
     )
     assert state["enabled"]
     storage = Storage("msc://test/dump")
-    assert [tar.name for tar in storage_module.list_tars(storage)] == [
-        "dp0__0-8.inputs.tar",
-        "dp0__0-8.targets.tar",
-    ]
-    storage_module.list_tars(storage)
+    assert storage_module.list_published(storage) == [storage_module.FileName(0, 0, 8)]
+    storage_module.list_published(storage)
     assert len(calls) == 2  # Refreshes never reuse a stale application-level listing.
 
 
@@ -2379,16 +2351,15 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     saver.cp_group = object()
     saver._cp_dst_rank_global = 9
     saver.metadata_dict = {
-        "generation": "test",
         "contract": {
             "attention_mode": "isolated_segments" if packed else "causal",
             "logprob_vocab_size": 1 << 17,
-        },
+        }
     }
     saver._captured = [(captured, maps[0], *mapped[0])]
     saver._serialize_attempt()
-    raw = saver._iteration_records["targets"]
-    values, indices, tail = codec.unpack_targets(codec.decode(raw))
+    values, indices, tail = batch_targets(saver._iteration_records["batch"])
+    tail = arrow._tensor(tail)
     assert len(calls) == 4
     rows = captured["loss_mask"] != 0  # No trailing padding here, so only weights drop rows.
     assert torch.equal(values, full_values[rows])
@@ -2505,12 +2476,10 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     # With a u16 encoding, -1 decodes as 65535, a real vocabulary ID at the limit.
-    values, indices, tail = codec.unpack_targets(
-        codec.pack_targets(
-            torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
-            torch.tensor([[0, -1]]),
-            vocab_size=1 << 16,
-        )
+    values, indices, tail = target_roundtrip(
+        torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
+        torch.tensor([[0, -1]]),
+        vocab_size=1 << 16,
     )
     assert torch.allclose(tail, torch.tensor([0.3]).log())
     assert indices[0, 1] == 65535
@@ -2546,12 +2515,13 @@ def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypat
     def broken(*args):
         raise OSError("failed publication")
 
-    monkeypatch.setattr(module, "write_tar", broken)
+    monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
+    monkeypatch.setattr(module, "publish", broken)
     event = types.SimpleNamespace(set=lambda: failures.append(True))
     with pytest.raises(OSError, match="failed publication"):
         module.PairedLogitsSaver._write_batched_tar(
-            str(tmp_path / "dp0__0-8.inputs.tar"),
-            {0: {"start": 0, "end": 8, "inputs": b"", "targets": b""}},
+            str(tmp_path / "dp0__0-8.arrow"),
+            {0: {"start": 0, "end": 8, "batch": None}},
             "{}",
             failure_event=event,
         )
@@ -2633,23 +2603,12 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-def minimal_inputs(ids, packed=False):
-    """A producer that only knows tokens: optional fields take their defaults."""
-    batch = inputs(ids, packed=packed)
-    tokens = batch["tokens"]
-    batch["labels"] = torch.cat((tokens[:, 1:], torch.zeros_like(tokens[:, :1])), 1)
-    batch["loss_mask"] = torch.ones_like(tokens, dtype=torch.float32)
-    batch["loss_mask"][:, -1] = 0
-    return batch
-
-
 FIXTURE_VARIANTS = {
     # name: (write_cache kwargs)
-    "u16_causal": dict(contract={"logprob_vocab_size": 4096}),  # Labels/mask stored.
+    "u16_causal": dict(contract={"logprob_vocab_size": 4096}),  # No stored tail.
     "u16u8_packed_stripped": dict(
         packed=True, contract={"padding_divisor": 2}, source=tail_masked, gbs=4, mbs=1
     ),
-    "u16_minimal_fields": dict(contract={"logprob_vocab_size": 4096}, source=minimal_inputs),
     "u16_logprobs_with_tail": dict(contract={"logprob_vocab_size": 4096}, logprobs=True),
 }
 
@@ -2673,7 +2632,7 @@ def test_golden_fixtures_decode(tmp_path, name):
         build_fixture(golden, name)
     expected_storage, expected_meta = build_fixture(tmp_path, name)
     storage = Storage(str(golden))
-    meta = storage_module.read_meta(storage, storage_module.list_tars(storage)[0].name)
+    meta = storage_module.read_meta(storage, storage_module.list_published(storage)[0])
     codec.validate_metadata(meta)
     assert codec.mismatched_settings(meta, expected_meta) == ([], [])
     count = groups(storage, meta)[-1][1]
@@ -2693,13 +2652,10 @@ def test_golden_fixtures_decode(tmp_path, name):
             "teacher_tail",
         ):
             assert torch.equal(a[key], b[key]), (name, key)
-    if name == "u16_minimal_fields":
-        members = dict(storage_module.iter_tar(storage, "dp0__0-16.inputs.tar"))
-        record = codec.decode(members["0-8.inputs.safetensors.zst"])
-        assert not set(codec.OPTIONAL_TOKEN_FIELDS) & set(record)  # All defaults: omitted.
+    first = storage_module.list_published(storage)[0]
+    schema = pa.ipc.open_file(storage.path(first.data)).schema
+    assert ("tail" in schema.names) == (name == "u16_logprobs_with_tail")
     if name == "u16_logprobs_with_tail":
-        members = dict(storage_module.iter_tar(storage, "dp0__0-16.targets.tar"))
-        payload = codec.decode(members["0-8.targets.safetensors.zst"])
-        assert payload["tail_logprobs"].dtype == torch.float32
+        assert schema.field("tail").type == pa.large_list(pa.float32())
         tail = got[0]["teacher_tail"]
         assert torch.allclose(got[0]["teacher_values"].exp().sum(-1) + tail.exp(), torch.ones(1))

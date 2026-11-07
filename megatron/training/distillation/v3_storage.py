@@ -1,67 +1,66 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Publication and streaming tar reads for offline KD v3.
+"""Publication and listing of offline KD v3 files.
 
-A cache is a flat directory of per-teacher-DP-rank tars, one inputs tar and one
-targets tar per flush (save-interval) range::
+A cache is a flat directory of per-writer files, one data file and one index per
+writer and flush (save-interval) range::
 
-    dp{rank}__{start}-{end}.inputs.tar
-    dp{rank}__{start}-{end}.targets.tar
+    dp{rank}__{start}-{end}.arrow        # samples and their targets (see format.arrow)
+    dp{rank}__{start}-{end}.index.json   # block byte ranges and a footer copy
 
-Each tar begins with a ``_meta.json`` member describing the cache settings, the
-writing job, and the tar itself, followed by one member per teacher iteration.
-A tar is published once its object exists: local writes are staged and renamed,
-and remote objects only become visible once their upload completes.
+The index is written after its data file is complete, so its existence publishes the
+range for that writer: local writes are staged and renamed, and remote objects only
+become visible once their upload completes. Data files without an index are ignored
+and replaced by a retry.
 """
 
 import glob
 import importlib
-import io
 import json
 import os
 import re
-import tarfile
 import uuid
-from typing import Any, Iterator, NamedTuple
+from typing import Any, NamedTuple
 
-META_MEMBER = "_meta.json"
-KINDS = ("inputs", "targets")
-DEFAULT_CHUNK_BYTES = 64 << 20
-_TAR_NAME = re.compile(r"^dp(\d+)__(\d+)-(\d+)\.(inputs|targets)\.tar$")
-_STAGED_NAME = re.compile(r"^(.+\.tar)\.[0-9a-f]{32}\.tmp$")
+_FILE_NAME = re.compile(r"^dp(\d+)__(\d+)-(\d+)\.(arrow|index\.json)$")
+_STAGED_NAME = re.compile(r"^(.+)\.[0-9a-f]{32}\.tmp$")
 
 
-class TarName(NamedTuple):
-    """A parsed v3 tar name."""
+class FileName(NamedTuple):
+    """A parsed v3 file name."""
 
     dp_rank: int
     start: int
     end: int
-    kind: str
 
     @property
-    def name(self) -> str:
-        """Return the object name."""
-        return tar_name(self.dp_rank, self.start, self.end, self.kind)
+    def data(self) -> str:
+        """The data file's name."""
+        return data_name(self.dp_rank, self.start, self.end)
+
+    @property
+    def index(self) -> str:
+        """The index's name."""
+        return index_name(self.dp_rank, self.start, self.end)
 
 
-def tar_name(dp_rank: int, start: int, end: int, kind: str) -> str:
-    """Name the tar holding one teacher DP rank's flush range of one kind."""
-    return f"dp{dp_rank}__{start}-{end}.{kind}.tar"
+def data_name(dp_rank: int, start: int, end: int) -> str:
+    """Name the data file holding one writer's flush range."""
+    return f"dp{dp_rank}__{start}-{end}.arrow"
 
 
-def member_name(start: int, end: int, kind: str) -> str:
-    """Name the member holding one teacher iteration."""
-    return f"{start}-{end}.{kind}.safetensors.zst"
+def index_name(dp_rank: int, start: int, end: int) -> str:
+    """Name the index published after that data file."""
+    return f"dp{dp_rank}__{start}-{end}.index.json"
 
 
-def parse_tar_name(name: str) -> TarName | None:
-    """Parse a v3 tar name, or return None for other objects."""
-    match = _TAR_NAME.match(name)
+def parse_name(name: str) -> FileName | None:
+    """Parse a v3 data file or index name, or return None for other objects."""
+    match = _FILE_NAME.match(name)
     if match is None:
         return None
-    dp_rank, start, end, kind = match.groups()
-    return TarName(int(dp_rank), int(start), int(end), kind)
+    dp_rank, start, end, _ = match.groups()
+    return FileName(int(dp_rank), int(start), int(end))
 
 
 class Storage:
@@ -117,132 +116,87 @@ class Storage:
         client, path = self._client(name)
         return int(client.info(path).content_length)
 
+    def read(self, name: str) -> bytes:
+        """Read a whole (small) object with one request."""
+        with self.open(name) as stream:
+            return stream.read()
+
     def read_range(self, name: str, offset: int, size: int) -> bytes:
         """Read ``size`` bytes at ``offset`` with exactly one request."""
         if not self.remote:
             with open(self.path(name), "rb") as stream:
                 stream.seek(offset)
-                return stream.read(size)
-        client, path = self._client(name)
-        byte_range = importlib.import_module("multistorageclient.types").Range(
-            offset=offset, size=size
-        )
-        data = client.read(path, byte_range=byte_range)
-        return data.to_bytes() if hasattr(data, "to_bytes") else bytes(data)
-
-
-class ChunkedReader:
-    """Sequential file-like view of a remote object, fetched in large ranged reads.
-
-    ``tarfile`` reads in small records; serving them from large chunks keeps the
-    number of storage requests at ``ceil(size / chunk_bytes)`` per object, with
-    no multipart fan-out.
-    """
-
-    def __init__(self, storage: Storage, name: str, chunk_bytes: int = DEFAULT_CHUNK_BYTES):
-        self.storage = storage
-        self.name = name
-        self.chunk_bytes = max(1, chunk_bytes)
-        self.size = storage.size(name)
-        self.position = 0  # Object offset of the next chunk to fetch.
-        self.chunk = b""
-        self.offset = 0  # Read offset within the current chunk.
-
-    def read(self, size: int = -1) -> bytes:
-        """Return up to ``size`` bytes, fetching the next chunk when the current one is spent.
-
-        The chunk is never rebuilt: each read copies only the bytes it returns.
-        """
-        if self.offset == len(self.chunk) and self.position < self.size:
-            length = min(self.chunk_bytes, self.size - self.position)
-            self.chunk = self.storage.read_range(self.name, self.position, length)
-            if len(self.chunk) != length:
-                raise IOError(f"Short ranged read from offline KD v3 object {self.name}")
-            self.position += length
-            self.offset = 0
-        end = len(self.chunk)
-        if size is not None and size >= 0:
-            end = min(self.offset + size, end)
-        data = self.chunk[self.offset : end]
-        self.offset = end
+                data = stream.read(size)
+        else:
+            client, path = self._client(name)
+            byte_range = importlib.import_module("multistorageclient.types").Range(
+                offset=offset, size=size
+            )
+            data = client.read(path, byte_range=byte_range)
+            data = data.to_bytes() if hasattr(data, "to_bytes") else bytes(data)
+        if len(data) != size:
+            raise IOError(f"Short ranged read from offline KD object {name}")
         return data
 
-    def close(self) -> None:
-        """Release the buffered chunk."""
-        self.chunk = b""
-        self.offset = 0
+    def write(self, name: str, data: bytes) -> None:
+        """Write an object; local writes are staged and renamed into place."""
+        if self.remote:
+            with self.open(name, "wb") as stream:
+                stream.write(data)
+            return
+        os.makedirs(self.root, exist_ok=True)
+        staged = f"{name}.{uuid.uuid4().hex}.tmp"
+        with self.open(staged, "wb") as stream:
+            stream.write(data)
+        os.replace(self.path(staged), self.path(name))
 
 
-def _open_stream(storage: Storage, name: str, chunk_bytes: int) -> Any:
-    return ChunkedReader(storage, name, chunk_bytes) if storage.remote else storage.open(name)
+def publish(storage: Storage, name: FileName, data: bytes, index: dict[str, Any]) -> None:
+    """Publish an immutable range: the data file first, then its index.
 
-
-def iter_tar(
-    storage: Storage, name: str, chunk_bytes: int = DEFAULT_CHUNK_BYTES
-) -> Iterator[tuple[str, bytes]]:
-    """Stream ``(member name, bytes)`` pairs in order, without random access."""
-    stream = _open_stream(storage, name, chunk_bytes)
-    try:
-        with tarfile.open(fileobj=stream, mode="r|") as archive:
-            for info in archive:
-                member = archive.extractfile(info)
-                if member is None:
-                    raise ValueError(f"Unexpected non-file member {info.name} in {name}")
-                yield info.name, member.read()
-    finally:
-        stream.close()
-
-
-def read_meta(storage: Storage, name: str, chunk_bytes: int = 1 << 16) -> dict[str, Any]:
-    """Read a tar's leading ``_meta.json`` with one small request."""
-    members = iter_tar(storage, name, chunk_bytes)
-    try:
-        member, data = next(members, (None, None))
-    finally:
-        members.close()
-    if member != META_MEMBER:
-        raise ValueError(f"Offline KD v3 tar {name} does not begin with {META_MEMBER}")
-    return json.loads(data)
-
-
-def write_tar(
-    storage: Storage, name: str, meta: dict[str, Any], members: list[tuple[str, bytes]]
-) -> None:
-    """Publish an immutable tar: ``_meta.json`` first, then the given members.
-
-    Local writes are staged under a unique temporary name and renamed into place.
-    Remote objects only become visible once their upload completes.
+    A published range is never replaced. A data file without an index (an interrupted
+    earlier attempt) is overwritten.
     """
-    if storage.exists(name):
-        raise RuntimeError(f"Refusing to replace published offline KD v3 tar {name}")
-    staged = name if storage.remote else f"{name}.{uuid.uuid4().hex}.tmp"
-    if not storage.remote:
-        os.makedirs(storage.root, exist_ok=True)
-    meta_bytes = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode()
-    with storage.open(staged, "wb") as stream:
-        with tarfile.open(fileobj=stream, mode="w") as archive:
-            for member, raw in [(META_MEMBER, meta_bytes), *members]:
-                info = tarfile.TarInfo(member)
-                info.size = len(raw)
-                archive.addfile(info, io.BytesIO(raw))
-    if not storage.remote:
-        os.replace(storage.path(staged), storage.path(name))
+    if storage.exists(name.index):
+        raise RuntimeError(f"Refusing to replace published offline KD v3 file {name.data}")
+    storage.write(name.data, data)
+    storage.write(name.index, json.dumps(index, separators=(",", ":")).encode())
 
 
-def list_tars(storage: Storage) -> list[TarName]:
-    """List published v3 tars, ignoring staged and unrelated objects."""
+def read_index(storage: Storage, name: FileName) -> dict[str, Any]:
+    """Read a published range's index."""
+    return json.loads(storage.read(name.index))
+
+
+def read_meta(storage: Storage, name: FileName) -> dict[str, Any]:
+    """Read a published file's settings from its index (one small request)."""
+    from .format.arrow import check_index, file_meta
+
+    index = read_index(storage, name)
+    check_index(index)
+    return file_meta(index)
+
+
+def has_legacy_tars(storage: Storage) -> bool:
+    """Whether the directory holds V1/V2 tar dumps, which V3 never mixes with."""
+    return bool(storage.list("*.tar"))
+
+
+def list_published(storage: Storage) -> list[FileName]:
+    """List published ranges (those with an index), ignoring staged and other objects."""
     return sorted(
-        parsed for parsed in map(parse_tar_name, storage.list("dp*__*.tar")) if parsed is not None
+        parsed
+        for parsed in map(parse_name, storage.list("dp*__*.index.json"))
+        if parsed is not None
     )
 
 
-def complete_ranges(tars: list[TarName], dp_size: int) -> list[tuple[int, int]]:
-    """Return flush ranges whose inputs and targets tars exist for every teacher DP rank."""
-    present: dict[tuple[int, int], set[tuple[int, str]]] = {}
-    for tar in tars:
-        present.setdefault((tar.start, tar.end), set()).add((tar.dp_rank, tar.kind))
-    required = {(rank, kind) for rank in range(dp_size) for kind in KINDS}
-    return sorted(span for span, found in present.items() if required <= found)
+def complete_ranges(published: list[FileName], writers: int) -> list[tuple[int, int]]:
+    """Return flush ranges published by every writer."""
+    present: dict[tuple[int, int], set[int]] = {}
+    for name in published:
+        present.setdefault((name.start, name.end), set()).add(name.dp_rank)
+    return sorted(span for span, found in present.items() if set(range(writers)) <= found)
 
 
 def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = None) -> int:
@@ -261,15 +215,12 @@ def discard_unpublished(storage: Storage, published_through: int, end: int) -> l
     Readers cannot have consumed these objects: they lie beyond a hole.
     """
     removed = []
-    for tar in list_tars(storage):
-        if published_through <= tar.start < end:
-            storage.remove(tar.name)
-            removed.append(tar.name)
-    if not storage.remote:
-        for staged in storage.list("dp*__*.tar.*.tmp"):
-            match = _STAGED_NAME.match(staged)
-            target = parse_tar_name(match.group(1)) if match else None
-            if target is not None and published_through <= target.start < end:
-                storage.remove(staged)
-                removed.append(staged)
+    # Indexes first: an interrupted cleanup then leaves only unpublished data files.
+    for name in sorted(storage.list("dp*__*"), key=lambda name: ".index.json" not in name):
+        match = _STAGED_NAME.match(name)
+        parsed = parse_name(match.group(1) if match else name)
+        if parsed is not None and published_through <= parsed.start < end:
+            if match is None or not storage.remote:
+                storage.remove(name)
+                removed.append(name)
     return removed

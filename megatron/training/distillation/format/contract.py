@@ -12,6 +12,7 @@ import hashlib
 import json
 from typing import Any
 
+import numpy as np
 import torch
 
 FORMAT_VERSION = 3
@@ -25,7 +26,7 @@ ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 # attention the inputs assume, and whether a prefix of a sample keeps its targets.
 REQUIRED_KEYS = ("tokenizer", "logprob_vocab_size", "attention_mode", "prefix_stable")
 # Replay dumps also need the writer layout that maps a global sample to its file and row.
-REPLAY_KEYS = ("writers", "writer_mbs", "writer_gbs", "first_sample")
+REPLAY_KEYS = ("writers", "writer_mbs", "first_sample")
 # Recorded only: where the data came from and how it was produced.
 RECORDED_KEYS = (
     "teacher",
@@ -72,7 +73,7 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True) -> None:
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
     if replay:
-        for key in ("writers", "writer_mbs", "writer_gbs"):
+        for key in ("writers", "writer_mbs"):
             if type(contract[key]) is not int or contract[key] < 1:
                 raise ValueError(f"Offline KD metadata {key} must be a positive integer")
         if type(contract["first_sample"]) is not int or contract["first_sample"] < 0:
@@ -152,73 +153,53 @@ def tail_logprob(values: torch.Tensor) -> torch.Tensor:
     return tail.clamp(min=LOGPROB_SENTINEL)
 
 
-def pack_targets(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    vocab_size: int,
-    tail: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Encode [rows, K] targets: indices as uint16 low words plus, above 2**16, a uint8
-    high byte, and the optional float32 ``[rows]`` tail log probability (see
-    :func:`tail_logprob`)."""
+def split_indices(
+    indices: np.ndarray, values: np.ndarray, *, vocab_size: int
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Encode ``[rows, K]`` vocabulary indices as uint16 low words plus, above 2**16, a
+    uint8 high byte. Index -1 is allowed only on sentinel entries."""
     encoding = index_encoding_for_vocab(vocab_size)
-    if values.shape != indices.shape or values.ndim != 2:
-        raise ValueError("Offline KD targets must have matching [tokens, K] shapes")
-    if not values.is_floating_point() or indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Offline KD targets require floating values and int32/int64 indices")
-    values = values.detach().cpu().contiguous()
-    indices = indices.detach().to(device="cpu", dtype=torch.int64)
-    if indices.numel() and (
+    if indices.size and (
         (indices < -1).any()
         or (indices >= vocab_size).any()
         or ((indices == -1) & (values != LOGPROB_SENTINEL)).any()
     ):
         raise ValueError("Offline KD vocabulary index is out of range or has an unmasked sentinel")
-    payload = {"values": values, "indices_low": (indices & 0xFFFF).to(torch.uint16)}
-    if encoding == "u16+u8":
-        payload["indices_high"] = ((indices >> 16) & 0xFF).to(torch.uint8)
-    if tail is not None:
-        if tail.shape != values.shape[:1]:
-            raise ValueError("Offline KD tail log probabilities must have one value per row")
-        payload["tail_logprobs"] = tail.detach().to(device="cpu", dtype=torch.float32)
-    return payload
+    low = (indices & 0xFFFF).astype(np.uint16)
+    high = ((indices >> 16) & 0xFF).astype(np.uint8) if encoding == "u16+u8" else None
+    return low, high
 
 
-def unpack_targets(
-    payload: dict[str, torch.Tensor], *, vocab_size: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(values, indices, tail)`` target rows.
-
-    The index encoding is implied by ``indices_high``'s presence; with ``vocab_size`` it
-    must also be the one :func:`index_encoding_for_vocab` prescribes. Without a stored
-    ``tail_logprobs`` the tail is derived from the stored values.
-    """
-    values, low = payload.get("values"), payload.get("indices_low")
-    high = payload.get("indices_high")
-    if values is None or low is None:
-        raise ValueError("Malformed offline KD target tensors")
-    encoding = "u16" if high is None else "u16+u8"
-    if vocab_size is not None and encoding != index_encoding_for_vocab(vocab_size):
-        raise ValueError("Offline KD target index encoding disagrees with logprob_vocab_size")
-    if (
-        values.shape != low.shape
-        or values.ndim != 2
-        or not values.is_floating_point()
-        or low.dtype != torch.uint16
-        or (high is not None and (high.dtype != torch.uint8 or high.shape != low.shape))
-    ):
-        raise ValueError("Malformed offline KD target tensors")
-    indices = low.to(torch.int64)
+def join_indices(low: np.ndarray, high: np.ndarray | None) -> np.ndarray:
+    """Invert :func:`split_indices` (sentinel entries come back as arbitrary indices)."""
+    indices = low.astype(np.int64)
     if high is not None:
-        indices |= high.to(torch.int64) << 16
+        if high.shape != low.shape:
+            raise ValueError("Malformed offline KD target indices")
+        indices |= high.astype(np.int64) << 16
+    return indices
+
+
+def check_targets(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    tail: torch.Tensor | None,
+    *,
+    vocab_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate decoded target rows and return them with the tail clamped to [-1000, 0].
+
+    A stored tail plus the retained probabilities must sum to 1 within
+    :data:`MASS_TOLERANCE`; without one, the tail is derived from the values.
+    """
+    if values.ndim != 2 or values.shape != indices.shape or not values.is_floating_point():
+        raise ValueError("Malformed offline KD target values")
     if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
         raise ValueError("Offline KD target vocabulary index is out of range")
-    tail = payload.get("tail_logprobs")
     if tail is None:
         return values, indices, tail_logprob(values)
     if tail.dtype != torch.float32 or tail.shape != values.shape[:1] or tail.isnan().any():
-        raise ValueError("Malformed offline KD tail_logprobs")
+        raise ValueError("Malformed offline KD tail log probabilities")
     tail = tail.clamp(min=LOGPROB_SENTINEL, max=0.0)
     retained = values.float().masked_fill(values == LOGPROB_SENTINEL, -torch.inf).exp().sum(-1)
     if values.numel() and ((retained + tail.exp() - 1).abs() > MASS_TOLERANCE).any():
