@@ -12,7 +12,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -28,7 +28,7 @@ from .mapping import (
     StateDict,
     apply_factory_merges,
 )
-from .state_dict_utils import load_preprocess, save_preprocess
+from .state_dict_utils import elect_checkpoint_replicas, load_preprocess, save_preprocess
 from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import (
     TorchDistLoadShardedStrategy,
@@ -59,6 +59,16 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _validate_checkpoint_parallelization_group(checkpoint_group, parallelization_group):
+    """Keep fully parallel exchanges inside the checkpoint's rank domain."""
+    if checkpoint_group is None:
+        return
+    checkpoint_ranks = set(torch.distributed.get_process_group_ranks(checkpoint_group))
+    parallelization_ranks = set(torch.distributed.get_process_group_ranks(parallelization_group))
+    if not parallelization_ranks.issubset(checkpoint_ranks):
+        raise ValueError('Fully parallel group must be contained in the checkpoint process group')
+
+
 def get_default_load_sharded_strategy(checkpoint_dir: str | Path | None = None):
     """Create the default torch distributed load strategy."""
     return TorchDistLoadShardedStrategy(checkpoint_name=checkpoint_dir)
@@ -83,6 +93,7 @@ def load(
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    preferred_reader_ranks: Optional[Sequence[int]] = None,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -120,15 +131,38 @@ def load(
             `verify_integrity=True`.
         process_group (ProcessGroup, optional): ranks that collectively describe
             one complete sharded state dict. Defaults to the global process group.
+        preferred_reader_ranks (Sequence[int], optional): global ranks preferred
+            for each shard's main replica within the checkpoint group. If none
+            holds a shard, another rank in the group reads it. When omitted,
+            the state dict's existing replica IDs are used. A fully parallel
+            load wrapper may rebalance tensor reads within its own group.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
             the loaded state dict is returned. If `strict` flag was set to
     """
 
+    from .strategies.fully_parallel import FullyParallelLoadStrategyWrapper
+
+    if isinstance(sharded_strategy, FullyParallelLoadStrategyWrapper):
+        configured_group = sharded_strategy.checkpoint_process_group
+        if (
+            process_group is not None
+            and configured_group is not None
+            and configured_group is not process_group
+        ):
+            raise ValueError("Load strategy uses a different checkpoint process group")
+        if process_group is None:
+            process_group = configured_group
+        else:
+            sharded_strategy.checkpoint_process_group = process_group
+        _validate_checkpoint_parallelization_group(
+            process_group, sharded_strategy.parallelization_group
+        )
+
     verify_checkpoint(checkpoint_dir)
     if verify_integrity:
-        verify_integrity_manifest(checkpoint_dir)
+        verify_integrity_manifest(checkpoint_dir, process_group=process_group)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
 
@@ -170,6 +204,14 @@ def load(
     ckpt_sharded_metadata = None
     local_metadata, global_metadata = None, None
     strict = parse_strict_flag(strict)
+    if preferred_reader_ranks is not None:
+        _, global_metadata = determine_global_metadata(
+            sharded_state_dict, process_group=process_group
+        )
+        elect_checkpoint_replicas(
+            sharded_state_dict, global_metadata, process_group, preferred_reader_ranks
+        )
+        local_metadata = global_metadata[torch.distributed.get_rank(group=process_group)]
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
         # common_state is an internal format key loaded separately by load_common_state_dict();
@@ -177,7 +219,9 @@ def load(
         ckpt_sharded_metadata = {
             k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
         }
-    if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
+    if global_metadata is None and (
+        validate_access_integrity or StrictHandling.requires_global_app_metadata(strict)
+    ):
         local_metadata, global_metadata = determine_global_metadata(
             sharded_state_dict, process_group=process_group
         )
@@ -189,6 +233,7 @@ def load(
         local_metadata,
         global_metadata,
         ckpt_sharded_metadata,
+        process_group=process_group,
     )
 
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
@@ -363,6 +408,8 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     verify_integrity: bool = False,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+    preferred_writer_ranks: Optional[Sequence[int]] = None,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -399,7 +446,8 @@ def save(
         async_sharded_save (bool, optional): if True, for the sharded state dict part
             an async save implementation will be called, with the AsyncRequest
             being returned to the caller. Note that it is the caller responsibility to
-            actually schedule the async save. Defaults to False.
+            actually schedule the async save. Subgroup saves are not supported
+            because NVRx finalization uses WORLD collectives. Defaults to False.
         preprocess_common_before_consistancy_check (Callable[[CommonStateDict], StateDict], None):
             A callable function that will preprocess the common state dict (i.e can be used  to
             remove keys that we expect to be different in the state dict). The function must not
@@ -411,6 +459,13 @@ def save(
             later be verified on load with `load(..., verify_integrity=True)`.
             Adds I/O overhead proportional to the total checkpoint size (one extra
             read pass over all files on rank 0).
+        process_group (ProcessGroup, optional): ranks that collectively write one
+            complete checkpoint. Defaults to the global process group.
+        preferred_writer_ranks (Sequence[int], optional): global ranks preferred
+            for each shard's writer within the checkpoint group. If none holds
+            a shard, another rank in the group writes it. When omitted, the
+            state dict's existing replica IDs select writers. A fully parallel
+            save wrapper may rebalance tensor writes within its own group.
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -419,26 +474,60 @@ def save(
     """
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
-    if torch.distributed.get_rank() == 0:
-        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
-
-        if next(checkpoint_dir_path.iterdir(), None) is not None:
-            # Don't throw exception here since this could cause a cascade of failures
-            # without human intervention in cases where multiple jobs are queued up.
-            if torch.distributed.get_rank() == 0:
-                logger.warning("Overwriting old incomplete / corrupted checkpoint...")
-
     if not (
         isinstance(sharded_strategy, TorchDistSaveShardedStrategy)
         or isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
     ):
         sharded_strategy = TorchDistSaveShardedStrategy()
 
+    base_strategy = (
+        sharded_strategy.base_strategy
+        if isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
+        else sharded_strategy
+    )
+    if process_group is not None:
+        if (
+            base_strategy.process_group is not None
+            and base_strategy.process_group is not process_group
+        ):
+            raise ValueError("Save strategy uses a different checkpoint process group")
+        base_strategy.process_group = process_group
+    else:
+        process_group = base_strategy.process_group
+    if isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper):
+        _validate_checkpoint_parallelization_group(
+            process_group, sharded_strategy.parallelization_group
+        )
+    # NVRx passes the subgroup through planning, but AsyncRequest finalization
+    # still synchronizes on WORLD. Avoid a hang when checkpoint domains advance
+    # independently until NVRx supports subgroup-scoped async requests.
+    if (
+        async_sharded_save
+        and process_group is not None
+        and torch.distributed.get_world_size(group=process_group)
+        != torch.distributed.get_world_size()
+    ):
+        raise NotImplementedError(
+            'Asynchronous torch_dist checkpointing with a subgroup is unsupported: '
+            'NVRx AsyncRequest finalization uses WORLD collectives.'
+        )
+
+    if torch.distributed.get_rank(group=process_group) == 0:
+        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
+        if next(checkpoint_dir_path.iterdir(), None) is not None:
+            # Don't throw exception here since this could cause a cascade of failures
+            # without human intervention in cases where multiple jobs are queued up.
+            logger.warning("Overwriting old incomplete / corrupted checkpoint...")
+
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
     sharded_state_dict, state_dict = save_preprocess(
-        sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
+        sharded_state_dict,
+        validate_access_integrity,
+        preprocess_common_before_consistancy_check,
+        process_group=process_group,
+        preferred_writer_ranks=preferred_writer_ranks,
     )
 
     sharded_state_dict["common_state"] = ShardedObject(
@@ -446,21 +535,21 @@ def save(
         data=state_dict,
         global_shape=(1,),
         global_offset=(0,),
-        replica_id=torch.distributed.get_rank(),
+        replica_id=torch.distributed.get_rank(group=process_group),
     )
 
     def metadata_finalize_fn():
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank(group=process_group) == 0:
             save_config(
                 CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                 checkpoint_dir,
             )
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
 
     def integrity_finalize_fn():
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank(group=process_group) == 0:
             save_integrity_manifest(checkpoint_dir)
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
 
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)

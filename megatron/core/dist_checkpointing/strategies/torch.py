@@ -698,6 +698,7 @@ class TorchDistSaveShardedStrategy:
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
         cpu_shm_mode: bool = False,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -743,6 +744,7 @@ class TorchDistSaveShardedStrategy:
 
         self.separation_hint = separation_hint
         self.cpu_shm_mode = cpu_shm_mode
+        self.process_group = process_group
 
         self.validated_loaded_metadata_reuse = False
 
@@ -771,6 +773,7 @@ class TorchDistSaveShardedStrategy:
         checkpoint.save(
             pyt_state_dict,
             storage_writer=writer,
+            process_group=self.process_group,
             planner=MCoreSavePlanner(
                 dedup_replicated_tensors=not self.keep_only_main_replica,
                 flatten_state_dict=False,
@@ -850,7 +853,7 @@ class TorchDistSaveShardedStrategy:
             save_state_dict_ret = save_state_dict_async_plan(
                 pyt_state_dict,
                 writer,
-                None,
+                self.process_group,
                 coordinator,
                 # flatten_sharded_tensors=False: MCore doesn't use nested ShardedTensors (FSDP 2D),
                 # so skip the expensive traverse_state_dict copy in _flatten_sharded_tensors
