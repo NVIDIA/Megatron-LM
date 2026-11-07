@@ -252,15 +252,17 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
         raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
 
-def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise):
+def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise, grad_collective):
     """Make the run config describe the optimizer the test is about to build.
 
-    Checkpoint saving derives the optimizer sharding metadata from the run config, not from args.
+    Checkpoint saving derives the optimizer sharding metadata from the run config, not from args,
+    and get_model() wraps DDP for the run config's grad collective.
     """
     if is_run_config_initialized():
         optimizer_cfg = get_run_config().optimizer
         optimizer_cfg.use_distributed_optimizer = use_distributed_optimizer
         optimizer_cfg.use_layer_wise_distributed_optimizer = use_layer_wise
+        optimizer_cfg.emerging_optimizer_grad_collective = grad_collective
 
 
 def setup_model_and_optimizer(
@@ -271,7 +273,7 @@ def setup_model_and_optimizer(
     bf16=True,
     dist_opt=True,
     optimizer='adam',
-    use_param_layout=False,
+    grad_collective='reduce-scatter',
     muon_scalar_optimizer='adam',
     cp=1,
     ep=1,
@@ -292,13 +294,8 @@ def setup_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # When use_layer_wise is True and use_param_layout is False, route DDP
-    # construction through the legacy path (no precomputed param layout, no
-    # ``use_distributed_optimizer=True`` flip). LayerWiseDistributedOptimizer
-    # then syncs via its legacy ``allgather_params()`` codepath rather than
-    # ``start_param_sync``.
-    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
-    ddp_use_layer_wise = use_layer_wise and use_param_layout
+    ddp_use_dist_opt = dist_opt
+    ddp_use_layer_wise = use_layer_wise
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -335,7 +332,7 @@ def setup_model_and_optimizer(
             mock_args.optimizer = optimizer
         # get_model reads the layer-wise flag from the run config to tag params for DDP
         # buffer routing, so the run config must be in sync before the model is built.
-        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise, grad_collective)
         model = get_model(
             partial(
                 initialize_fn,
@@ -358,6 +355,7 @@ def setup_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        emerging_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
         muon_scalar_optimizer=muon_scalar_optimizer,
     )
@@ -454,7 +452,7 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
     optimizer='adam',
-    use_param_layout=False,
+    grad_collective='reduce-scatter',
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -464,9 +462,8 @@ def setup_moe_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # See setup_model_and_optimizer for the use_param_layout semantics.
-    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
-    ddp_use_layer_wise = use_layer_wise and use_param_layout
+    ddp_use_dist_opt = dist_opt
+    ddp_use_layer_wise = use_layer_wise
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -477,7 +474,7 @@ def setup_moe_model_and_optimizer(
             mock_args.optimizer = optimizer
         # get_model reads the layer-wise flag from the run config to tag params for DDP
         # buffer routing, so the run config must be in sync before the model is built.
-        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise, grad_collective)
         model = get_model(
             partial(
                 initialize_fn,
@@ -502,6 +499,7 @@ def setup_moe_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        emerging_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
     )
 
@@ -514,11 +512,17 @@ def setup_moe_model_and_optimizer(
     model_parallel_cuda_manual_seed(seed + 1)
 
     if optimizer_type in ('muon', 'dist_muon'):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+
+        def _init_states(opt):
+            # The padded and compact layouts nest LayerWise next to a DistOpt sibling, which
+            # seeds its state elsewhere.
+            if isinstance(opt, ChainedOptimizer):
+                for child_optimizer in opt.chained_optimizers:
+                    _init_states(child_optimizer)
+            elif hasattr(opt, 'init_state_fn'):
+                opt.init_state_fn(opt.optimizer if hasattr(opt, 'optimizer') else opt)
+
+        _init_states(optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:

@@ -282,3 +282,132 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     unchanged[num_rows:] = True
     flat_unchanged = unchanged.repeat_interleave(row_width)[start:end]
     assert bytes_equal(projected[flat_unchanged], shard[flat_unchanged])
+
+
+@pytest.mark.parametrize(
+    "head_split_shapes", [(64,) * 6, (96, 32)], ids=["uniform-heads", "unequal-components"]
+)
+def test_muon_per_head_orthogonalize_replays(head_split_shapes):
+    """Per-head split-QKV Muon: batched Newton-Schulz per head width, replayed under contention."""
+    from megatron.core.optimizer import emerging_optimizers
+
+    if not emerging_optimizers.HAVE_EMERGING_OPTIMIZERS:
+        pytest.skip("requires emerging-optimizers")
+    seeded()
+    muon = emerging_optimizers.TensorParallelMuon(
+        [torch.nn.Parameter(torch.zeros(1, device="cuda"))],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: True,
+    )
+    num_groups, cols = 8, 1024
+    momentum = torch.randn(num_groups * sum(head_split_shapes), cols, device="cuda")
+    param = torch.nn.Parameter(torch.empty_like(momentum))
+    param.qkv_split_shapes = list(head_split_shapes)
+
+    assert_replays_bit_exact(
+        lambda grad: muon.orthogonalize(param, grad),
+        (momentum,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what=f"per-head Muon {head_split_shapes}",
+    )
+
+
+_FP8_BUFFERS = ("_rowwise_data", "_rowwise_scale_inv", "_columnwise_data", "_columnwise_scale_inv")
+
+
+def _fp8_buffers(param):
+    return [
+        getattr(param.data, n) for n in _FP8_BUFFERS if getattr(param.data, n, None) is not None
+    ]
+
+
+def _fp8_param_factory(recipe):
+    """Return a builder of empty FP8 params of ``recipe``; skips where the recipe is unsupported."""
+    from megatron.training.utils import get_device_arch_version
+
+    try:
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+    except ImportError:
+        pytest.skip("requires Transformer Engine quantized tensors")
+    arch = get_device_arch_version()
+    if recipe == "blockwise" and arch != 9:
+        pytest.skip("blockwise FP8 params are supported on Hopper")
+    if recipe == "mxfp8" and arch < 10:
+        pytest.skip("MXFP8 params need Blackwell")
+    quantizer_cls = Float8BlockQuantizer if recipe == "blockwise" else MXFP8Quantizer
+
+    def fp8_param(shape):
+        quantizer = quantizer_cls(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        empty = quantizer.make_empty(shape, dtype=torch.bfloat16, device="cuda")
+        param = torch.nn.Parameter(empty, requires_grad=False)
+        # make_empty leaves the padding of the scale-inverse tensors unset and the quantize
+        # kernels do not write it; zero it so that only quantized values are compared.
+        for buffer in _fp8_buffers(param):
+            buffer.zero_()
+        return param
+
+    return fp8_param
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+def test_whole_param_requantize_replays(recipe):
+    """LayerWise whole-param gathers requantize BF16 into FP8 params on every rank."""
+    from megatron.core.fp8_utils import requantize_whole_params_from_high_precision
+
+    fp8_param = _fp8_param_factory(recipe)
+    seeded()
+    shapes = [(1024, 512), (2048, 256), (384, 1024)]
+    values = tuple(torch.randn(*shape, device="cuda", dtype=torch.bfloat16) for shape in shapes)
+
+    def requantize(*srcs):
+        params = [fp8_param(src.shape) for src in srcs]
+        requantize_whole_params_from_high_precision(params, list(srcs))
+        return [buffer for param in params for buffer in _fp8_buffers(param)]
+
+    assert_replays_bit_exact(
+        requantize,
+        values,
+        replays=4,
+        backward=False,
+        contention=True,
+        what=f"{recipe} whole-param requantize",
+    )
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+def test_bf16_master_copy_replays(recipe):
+    """LayerWise children on the compact layout write FP8 params that no gather
+    publishes as Q(bf16(master)); other params take the multi-tensor copy."""
+    from megatron.core.fp8_utils import requantize_whole_params_from_high_precision
+    from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+
+    fp8_param = _fp8_param_factory(recipe)
+    seeded()
+    shapes = [(1024, 512), (384, 1024), (2048, 256)]
+    masters = tuple(torch.randn(*shape, device="cuda") for shape in shapes)
+
+    def copy(quantized_master, gathered_master, plain_master):
+        quantized, gathered = fp8_param(quantized_master.shape), fp8_param(gathered_master.shape)
+        # The whole-param gather publishes this one; the copy leaves it alone.
+        gathered.requantized_by_layer_wise_gather = True
+        plain = torch.nn.Parameter(torch.empty_like(plain_master, dtype=torch.bfloat16))
+        optimizer = Float16OptimizerWithFloat16Params.__new__(Float16OptimizerWithFloat16Params)
+        optimizer.float16_groups = [[quantized, gathered, plain]]
+        optimizer.fp32_from_float16_groups = [[quantized_master, gathered_master, plain_master]]
+        optimizer._dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device="cuda")
+        optimizer._copy_main_params_to_model_params_via_bf16()
+        return _fp8_buffers(quantized) + [plain.data]
+
+    got = copy(*masters)
+    reference = fp8_param(shapes[0])
+    requantize_whole_params_from_high_precision([reference], [masters[0].to(torch.bfloat16)])
+    for a, b in zip(got, _fp8_buffers(reference) + [masters[2].to(torch.bfloat16)]):
+        assert bytes_equal(a, b), "the copy must write Q(bf16(master))"
+    assert_replays_bit_exact(
+        copy, masters, replays=4, backward=False, contention=True, what=f"{recipe} master copy"
+    )

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 import math
 import weakref
@@ -119,8 +120,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
             if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 raise ValueError(
-                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
-                    "(--reuse-grad-buf-for-mxfp8-param-ag)."
+                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True, which "
+                    "the training CLI sets for --fp8-recipe mxfp8 with --fp8-param-gather."
                 )
 
     def __init__(
@@ -361,9 +362,24 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            buffer_ddp_config = self.ddp_config
+            if (
+                self.ddp_config.use_distributed_optimizer
+                and param_layout is not None
+                and not param_layout.use_distributed_optimizer
+            ):
+                # The layout keeps this buffer replicated while the distributed optimizer shards
+                # the other buffers of this chunk (the compact LayerWise layout). Its buckets
+                # all-reduce gradients and keep parameters in their own storage. The bucket
+                # size was resolved above, so drop num_buckets to avoid revalidating it.
+                # TODO(deyuf): Stop copying ddp_config here: let the buffer read whether it is
+                # sharded from its layout once DDP executes the optimizer's per-buffer plan.
+                buffer_ddp_config = dataclasses.replace(
+                    self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
@@ -659,7 +675,13 @@ class DistributedDataParallel(_BaseDataParallel):
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.
+
+        Bucket groups whose config does not dispatch parameter sync through DDP are skipped:
+        their parameters are published by the owning optimizer (the compact LayerWise layout
+        without overlap or grad-buffer reuse gathers in ``allgather_params()``).
         """
+        if not bucket_group.ddp_config.param_sync_via_bucket_group:
+            return
         bucket_group.start_param_sync(force_sync=force_sync)
 
         if self.ddp_config.overlap_param_gather:

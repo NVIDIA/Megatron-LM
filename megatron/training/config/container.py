@@ -438,6 +438,19 @@ class PretrainConfigContainer(ConfigContainerBase):
             use_torch_fsdp2=self.dist.use_torch_fsdp2,
             ckpt_format=self.checkpoint.ckpt_format,
         )
+        # A conversion run saves its optimizer under --ckpt-convert-format, which the check above
+        # does not see. A skip_train run builds no optimizer, and --no-save-optim skips its state.
+        if (
+            self.checkpoint.ckpt_convert_format == "torch"
+            and self.checkpoint.save_optim
+            and not self.validation.skip_train
+            and self.optimizer.uses_layer_wise_distributed_optimizer()
+        ):
+            raise ValueError(
+                "--ckpt-convert-format torch does not save the state of the DistributedOptimizer "
+                "that the LayerWise layouts chain next to the layer-wise optimizer. Use "
+                "--ckpt-convert-format torch_dist, or --no-save-optim to convert the model only."
+            )
         # Legacy providers have no model config; their model inputs are checked by the adapter.
         if self.model is not None:
             self.optimizer.validate_model(
@@ -477,7 +490,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         ):
             # Legacy checkpointing uses Gloo process groups to collect the full distributed
             # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
-            # the layer-wise path at finalize and save their state separately on each rank.
+            # the layer-wise path at finalize, which rejects the legacy torch format itself
+            # (OptimizerConfig.validate_run).
             assert checkpoint.use_dist_ckpt, (
                 '--use-distributed-optimizer without Gloo process groups requires a distributed '
                 'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '

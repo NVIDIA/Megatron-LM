@@ -271,8 +271,8 @@ class RLConfig:
             ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
         ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "Gradient-buffer offload is incompatible with the MXFP8 parameter all-gather "
+                "(--fp8-param-gather with mxfp8): "
                 "parameters share the gradient-buffer storage that offload releases."
             )
 

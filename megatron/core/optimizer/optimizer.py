@@ -46,6 +46,11 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..fp8_utils import (
+    is_blockwise_float8tensor,
+    is_mxfp8tensor,
+    requantize_whole_params_from_high_precision,
+)
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -395,6 +400,15 @@ class MegatronOptimizer(ABC):
         reproduces the saved weights exactly.
         """
         self._stage_model_params_from_main_params()
+
+    def _sync_unbuffered_model_params(self) -> None:
+        """Gather the model params that this optimizer publishes without DDP bucket groups.
+
+        Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
+        after every member has staged its params. DDP skips the bucket groups of such params
+        (see ``DistributedDataParallelConfig.param_sync_via_bucket_group``).
+        """
+        return
 
     def _filter_grads_for_norm(
         self,
@@ -1240,6 +1254,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
     """
 
+    # Set by LayerWiseDistributedOptimizer for its children on the compact layout (see
+    # _copy_main_params_to_model_params_via_bf16).
+    quantize_from_bf16_master = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -1393,11 +1411,39 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        if self.quantize_from_bf16_master:
+            self._copy_main_params_to_model_params_via_bf16()
+            return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
+
+    def _copy_main_params_to_model_params_via_bf16(self):
+        """Master-to-model copy of a LayerWise child on the compact layout.
+
+        That layout publishes plain MXFP8 / blockwise FP8 params by requantizing the gathered
+        BF16 values on every rank, owner included. The gathered params are skipped here (the
+        gather overwrites them); a param no rank gathers (a single-rank data-parallel group) gets
+        the same Q(bf16(master)) here. Other params are copied as usual.
+        """
+        model_data, main_data, quantized_params, values = [], [], [], []
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if is_mxfp8tensor(model_param) or is_blockwise_float8tensor(model_param):
+                    if not getattr(model_param, 'requantized_by_layer_wise_gather', False):
+                        quantized_params.append(model_param)
+                        values.append(main_param.detach().to(torch.bfloat16))
+                    continue
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        if model_data:
+            _multi_tensor_copy_this_to_that(
+                this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
+            )
+        if quantized_params:
+            requantize_whole_params_from_high_precision(quantized_params, values)
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
@@ -1943,12 +1989,20 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
+        # Optimizer-owned gathers (e.g. compact LayerWise without overlap) run after every
+        # member has staged its params; DDP below skips their bucket groups.
+        self._sync_unbuffered_model_params()
         # self.model_chunks, not a walk over the members: __init__ collects chunks only from
         # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
         # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
         # super().__init__(), and recomputing here would discard that and gather nothing.
         for model_chunk in self.model_chunks:
             model_chunk.start_param_sync(force_sync=True)
+
+    @override
+    def _sync_unbuffered_model_params(self) -> None:
+        for optimizer in self.chained_optimizers:
+            optimizer._sync_unbuffered_model_params()
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:
@@ -2107,9 +2161,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 ):
                     if not bucket_group.buckets:
                         continue
-                    if _bucket_is_managed_by_layer_wise_optimizer(
-                        bucket_group.buckets[0], default_for_untagged=False
-                    ):
+                    if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
                         continue
 
                     bucket_group_id = id(bucket_group)
@@ -2186,11 +2238,19 @@ class ChainedOptimizer(MegatronOptimizer):
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
         else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+            grad_norms = [
+                _grad_norm
+                for _grad_norm in (opt.get_grad_norm() for opt in self.chained_optimizers)
+                if _grad_norm is not None
+            ]
+            if any(isinstance(x, torch.Tensor) for x in grad_norms):
+                # Same arithmetic as ``math.sqrt(float(sum(x**2)))``, but on the device, so an
+                # optimizer-step CUDA graph capture needs no host synchronization.
+                # clip_grad_by_total_norm_fp32 forms the clip coefficient in float64 and rounds it
+                # once to fp32 for the scale kernel, as the Python-float path does.
+                grad_norm = torch.sqrt(sum(x**2 for x in grad_norms).to(torch.float64))
+            else:
+                grad_norm = math.sqrt(sum(x**2 for x in grad_norms))
         return grad_norm
 
     @override

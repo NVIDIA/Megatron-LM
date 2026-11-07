@@ -1616,7 +1616,6 @@ class TestDistributedOptimizer:
                 dist_opt=True,
                 optimizer='muon',
                 muon_scalar_optimizer='lion',
-                use_param_layout=True,
             )
 
             lion_distopt_A = _get_lion_distopt(optimizer_A)
@@ -1639,7 +1638,6 @@ class TestDistributedOptimizer:
                 dist_opt=True,
                 optimizer='muon',
                 muon_scalar_optimizer='lion',
-                use_param_layout=True,
             )
 
             lion_distopt_B = _get_lion_distopt(optimizer_B)

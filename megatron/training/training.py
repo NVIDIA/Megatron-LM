@@ -85,10 +85,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.layer_wise_optimizer import (
-    LayerWiseDistributedOptimizer,
-    tag_params_for_buffer_routing,
-)
+from megatron.core.optimizer.layer_wise_optimizer import configure_ddp_for_layer_wise_optimizer
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -2428,7 +2425,7 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
-    use_layer_wise_param_layout=True,
+    emerging_optimizer_grad_collective="reduce-scatter",
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -2439,18 +2436,16 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
-    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
-    for reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
-    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
-    to its legacy ``allgather_params`` sync path.
+    For standard DDP, :func:`configure_ddp_for_layer_wise_optimizer` decides the layout
+    (mutating ``ddp_config`` in place):
 
-    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
-    computes per-chunk byte-level layouts via
-    :meth:`DistributedOptimizer.compute_full_param_layout`.
-
-    Otherwise: no layouts are computed.
+    - ``use_layer_wise_distributed_optimizer=True`` forces
+      ``ddp_config.use_distributed_optimizer=True`` and computes per-chunk layouts via
+      :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout` for
+      ``emerging_optimizer_grad_collective``.
+    - Non-layerwise with ``ddp_config.use_distributed_optimizer=True`` computes per-chunk
+      byte-level layouts via :meth:`DistributedOptimizer.compute_full_param_layout`.
+    - Otherwise no layouts are computed.
 
     Layouts are only computed when ``DP is DDP`` (i.e. the standard
     ``DistributedDataParallel``); FSDP variants don't accept
@@ -2460,11 +2455,9 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+            ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout
-            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+        emerging_optimizer_grad_collective: ``OptimizerConfig.emerging_optimizer_grad_collective``.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -2487,18 +2480,12 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
-            ddp_config.use_distributed_optimizer = True
-            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
-            tag_params_for_buffer_routing(model_chunks)
-        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
-            compute_layout = DistributedOptimizer.compute_full_param_layout
-        else:
-            compute_layout = None
+        compute_layout = configure_ddp_for_layer_wise_optimizer(
+            model_chunks,
+            ddp_config,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
+        )
         if compute_layout is not None:
             layout_pgs = (
                 pg_collection
@@ -2837,9 +2824,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 config,
                 ddp_config,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=getattr(
-                    args, 'use_layer_wise_param_layout', True
-                ),
+                emerging_optimizer_grad_collective=cfg.optimizer.emerging_optimizer_grad_collective,
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -3000,7 +2985,7 @@ def setup_model_and_optimizer(
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                emerging_optimizer_grad_collective=cfg.optimizer.emerging_optimizer_grad_collective,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
