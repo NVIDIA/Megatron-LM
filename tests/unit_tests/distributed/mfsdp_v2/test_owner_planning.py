@@ -154,16 +154,19 @@ def test_assign_owner_work_tie_breaks_by_tensor_index(distributed_setup):
 
 
 @pytest.mark.parametrize("other_ranks", [[0], [0, 2]])
-def test_assign_owner_work_rejects_mixed_meshes(other_ranks, distributed_setup):
-    """Reject both different mesh sizes and different rank sets of the same size."""
+def test_assign_owner_work_plans_each_mesh_independently(other_ranks, distributed_setup):
+    """Buffers on other meshes, of any size or rank set, do not change a mesh's owners."""
     if distributed_setup.world_size <= max(1, *other_ranks):
         pytest.skip(f"Test meshes require at least {max(1, *other_ranks) + 1} ranks.")
     meshes = [DeviceMesh(distributed_setup.device.type, ranks) for ranks in [[0, 1], other_ranks]]
     if any(mesh.get_coordinate() is None for mesh in meshes):
         pytest.skip("Rank is outside one of the test meshes.")
+    first, second = meshes
     buffers = [
         DBuffer.empty(mesh, [RowAtomic()], [(8, 8)], torch.float32, distributed_setup.device)
-        for mesh in meshes
+        for mesh in (first, second, first)
     ]
-    with pytest.raises(ValueError, match="same DP mesh"):
-        assign_owner_work(buffers)
+    first_alone = assign_owner_work([buffers[0], buffers[2]])
+    second_alone = assign_owner_work([buffers[1]])
+    # Results keep the input order even though the meshes interleave.
+    assert assign_owner_work(buffers) == [first_alone[0], second_alone[0], first_alone[1]]
