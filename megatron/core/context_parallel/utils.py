@@ -116,7 +116,6 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
     if cp_size == 1:
         return batch
 
-    sequence_tensor = None
     sequence_keys = (
         "tokens",
         "labels",
@@ -126,32 +125,27 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         "mtp_input_mask",
         "padding_mask",
     )
-    for key in sequence_keys:
-        sequence_tensor = batch.get(key)
-        if sequence_tensor is not None:
-            break
     cu_seqlens = batch['cu_seqlens'].squeeze(0)
     cu_seqlens_padded = batch.get('cu_seqlens_padded')
     if cu_seqlens_padded is not None:
         cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
     physical_cu_seqlens = cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded
-    if sequence_tensor is not None:
-        source_positions = torch.arange(
-            sequence_tensor.size(1), dtype=physical_cu_seqlens.dtype, device=sequence_tensor.device
-        )
-        sequence_ids = torch.searchsorted(physical_cu_seqlens[1:], source_positions, right=True)
-        valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
-        source_valid = source_positions < valid_ends.index_select(0, sequence_ids)
-        index = rank_order_indices.view(cp_size, -1)[cp_rank]
-        valid_index = index.clamp_min(0)
-        padding = (index < 0) | ~source_valid.index_select(0, valid_index)
-        for key in sequence_keys:
-            tensor = batch.get(key)
-            if tensor is not None:
-                local_tensor = tensor.index_select(1, valid_index)
-                padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
-                fill_value = True if key == "padding_mask" else 0
-                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
+    # Check only this rank's source indices. This also works on metadata-only PP
+    # stages, without reading a GPU sequence length to allocate a full-source mask.
+    index = rank_order_indices.view(cp_size, -1)[cp_rank]
+    valid_index = index.clamp_min(0)
+    sequence_ids = torch.searchsorted(physical_cu_seqlens[1:], valid_index, right=True)
+    valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
+    padding = (index < 0) | (valid_index >= valid_ends.index_select(0, sequence_ids))
+    for key in sequence_keys:
+        tensor = batch.get(key)
+        if tensor is not None:
+            local_tensor = tensor.index_select(1, valid_index)
+            padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
+            fill_value = True if key == "padding_mask" else 0
+            batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
+    if batch.get('padding_mask') is None:
+        batch['padding_mask'] = padding.unsqueeze(0)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()
@@ -184,6 +178,25 @@ def _build_packed_seq_params(
         else physical_cu_seqlens
     )
 
+    moe_sample_lengths = None
+    if use_logical_qkv_seqlens and tokens_per_sample is not None:
+        # Each original fixed-length sample ends on a document boundary. Map those
+        # boundaries into the padded stream before converting to CP-local lengths.
+        sample_ends = torch.arange(
+            0, cu_seqlens[-1], tokens_per_sample, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        )[1:]
+        document_ends = torch.searchsorted(cu_seqlens, sample_ends)
+        if not torch.equal(cu_seqlens.index_select(0, document_ends), sample_ends):
+            raise ValueError("A packed sample boundary must also be a document boundary")
+        physical_sample_ends = torch.cat(
+            (
+                physical_cu_seqlens[:1],
+                physical_cu_seqlens.index_select(0, document_ends),
+                physical_cu_seqlens[-1:],
+            )
+        )
+        moe_sample_lengths = tuple((physical_sample_ends.diff() // cp_size).tolist())
+
     max_seqlen = int(batch['max_seqlen'].item())
     local_cp_size = batch.get('local_cp_size')
     return PackedSeqParams(
@@ -199,6 +212,7 @@ def _build_packed_seq_params(
         tp_cp_group=tp_cp_group,
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
+        moe_sample_lengths=moe_sample_lengths,
         pad_between_seqs=pad_between_seqs,
     )
 
