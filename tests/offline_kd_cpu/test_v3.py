@@ -1392,6 +1392,183 @@ def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
     ]
 
 
+blend = importlib.import_module(f"{_namespace}.format.blend")
+
+
+def corpus_source(root, name, *, samples, iterations, base=0, contract=None):
+    """Write a corpus source whose sample ``i`` has tokens (base + i) * 100 + position."""
+    metadata = settings(contract=contract)
+    metadata["recorded"].pop("num_samples")
+    metadata["contract"]["num_samples"] = samples  # Required for corpus sources.
+    write_cache(
+        root / name / "train",
+        iterations=iterations,
+        metadata=metadata,
+        source=lambda ids, packed=False: inputs([base + i for i in ids], packed=packed),
+    )
+    return metadata
+
+
+def blend_config(root, **overrides):
+    return {"corpus": str(root), "split": "train", "seed": 1, "lanes": 4, "allow_partial": []} | {
+        "sources": {"web": 3, "math": 1},
+        **overrides,
+    }
+
+
+def two_sources(root, **contract):
+    corpus_source(root, "web", samples=32, iterations=4, contract=contract)
+    corpus_source(root, "math", samples=16, iterations=2, base=500, contract=contract)
+
+
+def test_blend_plan_is_deterministic_and_follows_the_weights(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=38)
+    assert (manifest["lanes"], manifest["lane_samples"]) == (4, 10)  # Whole lanes >= budget.
+    assert {s["name"]: s["samples"] for s in manifest["sources"]} == {"web": 30, "math": 10}
+    assert all(s["passes"] == 1 for s in manifest["sources"])
+    segments = manifest["segments"]
+    lengths = np.bincount(segments[:, 0], weights=segments[:, 4] - segments[:, 3])
+    assert lengths.tolist() == [10, 10, 10, 10]
+    assert blend.plan(blend_config(tmp_path), budget=38)["hash"] == manifest["hash"]
+    assert blend.plan(blend_config(tmp_path, seed=2), budget=38)["hash"] != manifest["hash"]
+    assert "web: weight 3, 30 samples (75.0%" in blend.describe(manifest)
+
+
+def test_blend_upsamples_with_whole_passes(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path, sources={"web": 1, "math": 1}), budget=64)
+    math = next(s for s in manifest["sources"] if s["name"] == "math")
+    assert (math["samples"], math["available"], math["passes"]) == (32, 16, 2)
+
+
+def test_blend_excludes_filler_and_refuses_incomplete_sources(tmp_path):
+    corpus_source(tmp_path, "web", samples=13, iterations=2)  # 16 positions, 3 filler.
+    corpus_source(tmp_path, "math", samples=32, iterations=2, base=500)  # Half dumped.
+    with pytest.raises(ValueError, match="math covers samples 0-16 of 32"):
+        blend.plan(blend_config(tmp_path), budget=8)
+    manifest = blend.plan(blend_config(tmp_path, allow_partial=["math"]), budget=8)
+    available = {s["name"]: s["available"] for s in manifest["sources"]}
+    assert available == {"web": 13, "math": 16}
+
+
+def test_blend_sources_must_agree_on_required_settings(tmp_path):
+    corpus_source(tmp_path, "web", samples=32, iterations=4)
+    corpus_source(tmp_path, "math", samples=16, iterations=2, contract={"prefix_stable": False})
+    with pytest.raises(ValueError, match="differs on prefix_stable"):
+        blend.plan(blend_config(tmp_path), budget=8)
+
+
+def test_corpus_reader_serves_the_planned_samples(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    live = replay.CorpusReader(str(tmp_path), manifest)
+    try:
+        samples = live.samples(list(range(40)), 40)
+        with pytest.raises(RuntimeError, match="holds 40 samples"):
+            live.samples([40], 41)
+    finally:
+        live.close()
+    origin = [int(sample["tokens"][0]) // 100 for sample in samples]
+    web = [o for o in origin if o < 500]
+    math = [o - 500 for o in origin if o >= 500]
+    assert len(web) == 30 and len(set(web)) == 30 and max(web) < 32
+    assert len(math) == 10 and len(set(math)) == 10 and max(math) < 16
+    for sample in samples:  # Identity targets: each scored token's target is the token.
+        assert torch.equal(
+            sample["teacher_indices"].reshape(-1), sample["tokens"][sample["loss_mask"] != 0].long()
+        )
+    # Sources are spread along the stream, so every lane mixes them.
+    lane_origins = [{origin[p] >= 500 for p in range(lane, 40, 4)} for lane in range(4)]
+    assert sum(len(found) == 2 for found in lane_origins) >= 2
+
+
+def test_corpus_reader_only_opens_the_lanes_of_its_rank(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    live = replay.CorpusReader(str(tmp_path), manifest, targets=False)
+    try:
+        # DP rank 1 of 2 with MBS 2 reads positions 2, 3, 6, 7, ...: lanes 2 and 3 only.
+        positions = [p for p in range(40) if (p % 4) // 2 == 1]
+        assert len(live.samples(positions, 40)) == 20
+        assert sorted(live.lanes) == [2, 3]
+    finally:
+        live.close()
+
+
+def test_corpus_reader_rejects_files_changed_since_planning(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    manifest["files"][0]["size"] += 1
+    live = replay.CorpusReader(str(tmp_path), manifest)
+    file_lanes = {int(lane) for lane, file_id, *_ in manifest["segments"] if file_id == 0}
+    lane = min(file_lanes)
+    try:
+        with pytest.raises(ValueError, match="changed since the blend was planned"):
+            live.samples(list(range(lane, 40, 4)), 40)
+    finally:
+        live.close()
+
+
+def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
+    tmp_path, runtime_environment
+):
+    args, runtime, _ = runtime_environment
+    two_sources(tmp_path, tokenizer=runtime.tokenizer_identity())
+    config = tmp_path / "blend.json"
+    config.write_text(json.dumps(blend_config(tmp_path)))
+    args.logits_load_inputs, args.logits_load_dir, args.logits_load_shuffle_shards = (
+        False,
+        None,
+        None,
+    )
+    args.kd_corpus_blend = str(config)
+    args.sequence_packing_scheduler = args.hybrid_context_parallel = args.use_varlen_dataset = False
+    args.mtp_num_layers, args.dataloader_type, args.train_iters = None, "single", 5
+    runtime.validate_options(args)
+    assert args.logits_load_inputs and args.logits_load_dir == str(tmp_path)
+    runtime.initialize_replay(args)
+    assert runtime._PLAN["corpus"] and runtime._PLAN["available"] == 40
+    planned = args.kd_corpus_manifest_hash
+    iterator = build_loader_iterator(runtime, args, 0)
+    try:
+        batch = next(iterator)
+        assert batch["tokens"].shape == (2, 8) and batch["_kd_sample_ids"] == [0, 1]
+    finally:
+        iterator.close()
+    runtime.ensure_replay_frontier(args)  # 0 + 8 <= 40, no listing.
+    args.consumed_train_samples = 40
+    with pytest.raises(RuntimeError, match="exhausted at 40"):
+        runtime.ensure_replay_frontier(args)
+    # A resume plans the same schedule; a changed config is refused.
+    runtime._PLAN, args.consumed_train_samples = None, 8
+    runtime.initialize_replay(args)
+    assert args.kd_corpus_manifest_hash == planned
+    runtime._PLAN = None
+    config.write_text(json.dumps(blend_config(tmp_path, seed=9)))
+    with pytest.raises(RuntimeError, match="no longer plans the schedule"):
+        runtime.initialize_replay(args)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"logits_load_shuffle_shards": 3}, "ordered by its plan"),
+        ({"logits_save_inputs": True}, "both dump and load"),
+    ],
+)
+def test_corpus_blend_validation(tmp_path, runtime_environment, change, message):
+    args, runtime, _ = runtime_environment
+    config = tmp_path / "blend.json"
+    config.write_text(json.dumps(blend_config(tmp_path)))
+    args.kd_corpus_blend = str(config)
+    args.logits_load_shuffle_shards = None
+    for key, value in change.items():
+        setattr(args, key, value)
+    with pytest.raises(ValueError, match=message):
+        runtime.validate_options(args)
+
+
 def test_unfrozen_teacher_may_use_dropout(runtime_environment):
     # An unfrozen teacher's dump is a record of its training run, dropout included.
     args, runtime, _ = runtime_environment

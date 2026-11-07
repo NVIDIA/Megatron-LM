@@ -64,6 +64,22 @@ def validate_corpus_dump(args: Any) -> None:
     args.logits_save_inputs = True
 
 
+def validate_corpus_blend(args: Any) -> None:
+    """Check and apply ``--kd-corpus-blend``: corpus loading reuses the replay path."""
+    path = getattr(args, "kd_corpus_blend", None)
+    if not path:
+        return
+    from .format.blend import load_config
+
+    if getattr(args, "logits_save_inputs", False) or getattr(args, "kd_corpus_dump", None):
+        raise ValueError("A run cannot both dump and load offline KD v3 data")
+    if getattr(args, "logits_load_shuffle_shards", None) is not None:
+        raise ValueError("A corpus blend is ordered by its plan; omit --logits-load-shuffle-shards")
+    config = load_config(path)
+    args.logits_load_inputs = True
+    args.logits_load_dir = args.logits_load_dir or config["corpus"]
+
+
 def epoch_length(dataset: Any) -> int:
     """Samples in one epoch of a Megatron dataset built with ``num_samples=None``.
 

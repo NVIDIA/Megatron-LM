@@ -18,7 +18,14 @@ from .v3_format import (
     tokenizer_fingerprint,
     validate_metadata,
 )
-from .v3_replay import ReplayIterator, ReplayReader, describe_hole, discover_groups, layout_options
+from .v3_replay import (
+    CorpusReader,
+    ReplayIterator,
+    ReplayReader,
+    describe_hole,
+    discover_groups,
+    layout_options,
+)
 from .v3_storage import (
     Storage,
     complete_ranges,
@@ -39,9 +46,10 @@ _STAGED_TARGETS = None
 
 def validate_options(args: Any) -> None:
     """Validate only opted-in v3 behavior; legacy flags keep their semantics."""
-    from .corpus_runtime import validate_corpus_dump
+    from .corpus_runtime import validate_corpus_blend, validate_corpus_dump
 
     validate_corpus_dump(args)
+    validate_corpus_blend(args)
     saving = getattr(args, "logits_save_inputs", False)
     loading = getattr(args, "logits_load_inputs", False)
     if saving and not args.logits_save_dir:
@@ -426,8 +434,8 @@ def initialize_dump_metadata(saver: Any) -> dict:
     return result["metadata"]
 
 
-def _check_student_compatibility(args: Any, metadata: dict) -> None:
-    validate_metadata(metadata)
+def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = True) -> None:
+    validate_metadata(metadata, replay=replay)
     contract = metadata["contract"]
     if contract["tokenizer"]["sha256"] != tokenizer_identity()["sha256"]:
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
@@ -456,6 +464,9 @@ def initialize_replay(args: Any) -> None:
     """Establish a common replay plan on all ranks before building datasets."""
     global _PLAN
     if not getattr(args, "logits_load_inputs", False) or _PLAN is not None:
+        return
+    if getattr(args, "kd_corpus_blend", None):
+        _PLAN = _initialize_corpus(args)
         return
     shuffle = args.logits_load_shuffle_shards is not None
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -532,6 +543,52 @@ def initialize_replay(args: Any) -> None:
         )
 
 
+def _initialize_corpus(args: Any) -> dict:
+    """Plan the corpus blend on world rank 0 and share it (collective)."""
+    from .format.blend import describe, load_config, plan
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    result = [None]
+    if rank == 0:
+        try:
+            config = load_config(args.kd_corpus_blend)
+            budget = args.train_samples or args.train_iters * args.global_batch_size
+            manifest = plan(config, budget=budget)
+            metadata = {"format_version": FORMAT_VERSION, "contract": manifest["contract"]}
+            _check_student_compatibility(args, metadata, replay=False)
+            expected = getattr(args, "kd_corpus_manifest_hash", None)
+            if expected is not None and expected != manifest["hash"]:
+                raise ValueError(
+                    "The corpus blend no longer plans the schedule this checkpoint was trained "
+                    "on (its config, budget or files changed); start a new run to change it"
+                )
+            if args.consumed_train_samples > manifest["lanes"] * manifest["lane_samples"]:
+                raise ValueError(
+                    f"Checkpoint sample cursor {args.consumed_train_samples} exceeds the corpus "
+                    "blend"
+                )
+            result[0] = {"metadata": metadata, "manifest": manifest}
+            print(describe(manifest), flush=True)
+        except Exception as error:
+            result[0] = {"error": f"{type(error).__name__}: {error}"}
+    if dist.is_initialized():
+        dist.broadcast_object_list(result, src=0)
+    if "error" in result[0]:
+        raise RuntimeError(result[0]["error"])
+    manifest = result[0]["manifest"]
+    # Saved with the checkpoint's args so a resume must replay the same schedule.
+    args.kd_corpus_manifest_hash = manifest["hash"]
+    return {
+        **result[0],
+        "corpus": True,
+        "available": manifest["lanes"] * manifest["lane_samples"],
+        "groups": [],
+        "hole": None,
+        "passes": 1,
+        "readers": [],
+    }
+
+
 def ensure_replay_frontier(args: Any) -> None:
     """Agree on all ranks that the next iteration's samples are published.
 
@@ -544,7 +601,8 @@ def ensure_replay_frontier(args: Any) -> None:
     need = args.consumed_train_samples + get_current_global_batch_size()
     if need <= _PLAN["available"]:
         return
-    if args.logits_load_shuffle_shards is None:  # Only a sequential plan grows.
+    if args.logits_load_shuffle_shards is None and not _PLAN.get("corpus"):
+        # Only a sequential replay plan grows.
         rank = dist.get_rank() if dist.is_initialized() else 0
         result = [None]
         if rank == 0:
@@ -682,18 +740,25 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
     cp_size = args.context_parallel_size
 
     def source_factory() -> ReplayIterator:
-        reader = ReplayReader(
-            Storage(args.logits_load_dir),
-            _PLAN["metadata"],
-            _PLAN["groups"],
+        options = dict(
             targets=mpu.is_pipeline_last_stage(),
-            shuffle=args.logits_load_shuffle_shards is not None,
-            seed=args.logits_load_shuffle_shards or 0,
-            passes=_PLAN["passes"],
             decode_threads=args.logits_load_decode_threads,
             prefetch_depth=args.logits_load_msc_prefetch_depth,
             student_vocab_size=args.padded_vocab_size,
         )
+        if _PLAN.get("corpus"):
+            manifest = _PLAN["manifest"]
+            reader = CorpusReader(manifest["config"]["corpus"], manifest, **options)
+        else:
+            reader = ReplayReader(
+                Storage(args.logits_load_dir),
+                _PLAN["metadata"],
+                _PLAN["groups"],
+                shuffle=args.logits_load_shuffle_shards is not None,
+                seed=args.logits_load_shuffle_shards or 0,
+                passes=_PLAN["passes"],
+                **options,
+            )
         _PLAN["readers"].append(reader)
         return ReplayIterator(
             reader,

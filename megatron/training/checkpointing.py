@@ -3512,6 +3512,7 @@ def load_checkpoint(
 
     if getattr(args, "logits_load_inputs", False) and "args" in state_dict and not finetune:
         args.logits_load_replay_end = getattr(checkpoint_args, "logits_load_replay_end", None)
+        args.kd_corpus_manifest_hash = getattr(checkpoint_args, "kd_corpus_manifest_hash", None)
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The

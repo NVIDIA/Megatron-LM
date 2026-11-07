@@ -5,11 +5,13 @@
 import bisect
 import concurrent.futures
 import itertools
+import os
 import queue
 import random
 import threading
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from .format.arrow import block_range, check_index, decode_block, file_meta, read_block
@@ -171,24 +173,20 @@ def describe_hole(hole: tuple[int, int, int] | None) -> str:
 
 
 class _Lane:
-    """Read one writer's files in replay order, decoding a bounded window of blocks ahead.
+    """Read one ordered stream of blocks, decoding a bounded window ahead.
 
-    Blocks are consumed in non-decreasing ``(group, block)`` order. Each block is one
-    ranged read (of its input columns only, when targets are not needed); a resume
-    starts at its block without reading earlier ones.
+    ``items(stopped)`` yields ``(key, (storage, data file, index, block, label))`` with
+    increasing keys; consumers request keys in non-decreasing order. Each block is one
+    ranged read (of its input columns only, when targets are not needed).
     """
 
-    def __init__(self, reader: "ReplayReader", dp_rank: int, group_index: int, block: int):
+    def __init__(self, reader: Any, name: str, items: Callable):
         self.reader = reader
-        self.dp_rank = dp_rank
         self.queue: queue.Queue = queue.Queue(maxsize=reader.prefetch_depth)
         self.current = None
         self.stopped = threading.Event()
         self.thread = threading.Thread(
-            target=self._run,
-            args=(group_index, block),
-            name=f"offline-kd-v3-dp{dp_rank}",
-            daemon=True,
+            target=self._run, args=(items,), name=f"offline-kd-v3-{name}", daemon=True
         )
         self.thread.start()
 
@@ -201,39 +199,28 @@ class _Lane:
                 continue
         return False
 
-    def _run(self, group_index: int, first_block: int) -> None:
+    def _run(self, items: Callable) -> None:
         reader = self.reader
         try:
-            index = group_index
-            while not self.stopped.is_set():
-                span = reader.wait_for_group(index, self.stopped)
-                if span is None:
+            for key, (storage, data, index, block, label) in items(self.stopped):
+                offset, size = block_range(index, block, inputs_only=not reader.targets)
+                raw = storage.read_range(data, offset, size)
+                future = reader.pool.submit(reader.decode_rows, index, block, raw, label)
+                if not self._put((key, future)):
                     return
-                name = FileName(self.dp_rank, *span)
-                file_index = reader.index(self.dp_rank, span)
-                for block in range(
-                    first_block if index == group_index else 0, len(file_index["blocks"])
-                ):
-                    offset, size = block_range(file_index, block, inputs_only=not reader.targets)
-                    raw = reader.storage.read_range(name.data, offset, size)
-                    future = reader.pool.submit(reader.decode, self.dp_rank, span, block, raw)
-                    if not self._put((index, block, future)):
-                        return
-                index += 1
         except BaseException as error:  # Surface any failure to the consumer.
-            self._put((None, None, error))
+            self._put((None, error))
 
-    def block(self, group_index: int, block: int) -> tuple[dict, tuple | None]:
-        """Return a decoded block, advancing the stream as needed."""
-        wanted = (group_index, block)
-        while self.current is None or self.current[:2] < wanted:
+    def block(self, key: tuple) -> tuple[dict, tuple | None]:
+        """Return the decoded block for ``key``, advancing the stream as needed."""
+        while self.current is None or self.current[0] < key:
             item = self.queue.get()
             if item[0] is None:
-                raise item[2]
+                raise item[1]
             self.current = item
-        if self.current[:2] != wanted:
-            raise RuntimeError(f"Offline KD v3 replay requested {wanted} after {self.current[:2]}")
-        return self.current[2].result()
+        if self.current[0] != key:
+            raise RuntimeError(f"Offline KD v3 replay requested {key} after {self.current[0]}")
+        return self.current[1].result()
 
     def close(self) -> None:
         """Stop streaming and release buffered blocks."""
@@ -246,7 +233,103 @@ class _Lane:
         self.current = None
 
 
-class ReplayReader:
+class _BlockReader:
+    """Decoding, vocabulary masking and sample slicing shared by replay and corpus readers."""
+
+    def __init__(
+        self,
+        contract: dict,
+        *,
+        targets: bool,
+        decode_threads: int,
+        prefetch_depth: int,
+        student_vocab_size: int | None,
+    ):
+        self.contract = contract
+        self.prefix_stable = contract["prefix_stable"]
+        self.isolated = contract["attention_mode"] == "isolated_segments"
+        self.targets = targets
+        self.student_vocab_size = student_vocab_size
+        # Entries whose index the student vocabulary lacks are masked into the ghost bucket.
+        self.masked_entries = 0
+        self.target_entries = 0
+        self._masking_warned = False
+        self.prefetch_depth = max(1, prefetch_depth)
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, decode_threads), thread_name_prefix="offline-kd-v3-decode"
+        )
+        self.lanes: dict[Any, _Lane] = {}
+
+    def decode_rows(
+        self, index: dict, block: int, raw: bytes, label: str
+    ) -> tuple[dict, tuple | None]:
+        """Decode and validate one block."""
+        batch = read_block(index, block, raw, inputs_only=not self.targets)
+        inputs, targets = decode_block(batch, vocab_size=self.contract["logprob_vocab_size"])
+        if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
+            raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
+        inputs["segment_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
+        )
+        # Target rows exist only at positions with nonzero loss weight, in token order.
+        scored = inputs["loss_mask"] != 0
+        inputs["target_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(scored.long(), 0))
+        )
+        if targets is not None:
+            targets = self._mask_unknown_indices(*targets)
+        return inputs, targets
+
+    def _mask_unknown_indices(
+        self, values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid = values != LOGPROB_SENTINEL
+        self.target_entries += int(valid.sum())
+        if self.student_vocab_size is None:
+            return values, indices, tail
+        unknown = valid & (indices >= self.student_vocab_size)
+        count = int(unknown.sum())
+        if count:
+            self.masked_entries += count
+            # Entries the student cannot represent join the tail bucket.
+            masked = values.float().masked_fill(~unknown, -torch.inf).logsumexp(-1)
+            tail = torch.logaddexp(tail, masked)
+            values = values.masked_fill(unknown, LOGPROB_SENTINEL)
+            indices = indices.masked_fill(unknown, 0)
+            fraction = self.masked_entries / max(1, self.target_entries)
+            if fraction > 1e-4 and not self._masking_warned:
+                self._masking_warned = True
+                print(
+                    f"WARNING: offline KD v3 masked {self.masked_entries} teacher target entries "
+                    f"({fraction:.2%}) with indices beyond the student vocabulary "
+                    f"({self.student_vocab_size}); check the teacher/student vocabularies",
+                    flush=True,
+                )
+        return values, indices, tail
+
+    @staticmethod
+    def slice_sample(inputs: dict, targets: tuple | None, row: int, sample_id: int) -> dict:
+        """Cut one sample (and its target rows) out of a decoded block."""
+        a, b = inputs["sample_offsets"][row : row + 2].tolist()
+        sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
+        sample["sample_id"] = sample_id
+        s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
+        sample["segments"] = inputs["segment_lengths"][s0:s1]
+        if targets is not None:
+            ta, tb = inputs["target_offsets"][[a, b]].tolist()
+            sample["teacher_values"], sample["teacher_indices"], sample["teacher_tail"] = (
+                tensor[ta:tb] for tensor in targets
+            )
+        return sample
+
+    def close(self) -> None:
+        """Stop all lanes and the decode pool."""
+        for lane in self.lanes.values():
+            lane.close()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+class ReplayReader(_BlockReader):
     """Read samples by logical replay position, streaming each writer's files."""
 
     def __init__(
@@ -264,20 +347,19 @@ class ReplayReader:
         student_vocab_size: int | None = None,
     ):
         validate_metadata(metadata)
+        super().__init__(
+            metadata["contract"],
+            targets=targets,
+            decode_threads=decode_threads,
+            prefetch_depth=prefetch_depth,
+            student_vocab_size=student_vocab_size,
+        )
         self.storage = storage
         self.metadata = metadata
-        self.contract = metadata["contract"]
         self.mbs = self.contract["writer_mbs"]
         self.dp = self.contract["writers"]
-        self.prefix_stable = self.contract["prefix_stable"]
         # Recorded settings that differ between files are reported once each, never fatal.
         self.reported_differences: set[str] = set()
-        self.isolated = self.contract["attention_mode"] == "isolated_segments"
-        self.student_vocab_size = student_vocab_size
-        # Entries whose index the student vocabulary lacks are masked into the ghost bucket.
-        self.masked_entries = 0
-        self.target_entries = 0
-        self._masking_warned = False
         # Each pass replays every group once; shuffled passes draw successive orders from one
         # seeded generator, so the first pass matches a single-pass shuffle.
         rng = random.Random(seed)
@@ -287,14 +369,8 @@ class ReplayReader:
             if shuffle:
                 rng.shuffle(order)
             self.groups.extend(order)
-        self.targets = targets
         # A shuffled or repeated replay covers a fixed extent; only a sequential one grows.
         self.fixed = shuffle or passes > 1
-        self.prefetch_depth = max(1, prefetch_depth)
-        self.pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, decode_threads), thread_name_prefix="offline-kd-v3-decode"
-        )
-        self.lanes: dict[int, _Lane] = {}
         self.indexes: dict[tuple[int, int, int], dict] = {}
         self.index_lock = threading.Lock()
         self.closed = False
@@ -380,58 +456,25 @@ class ReplayReader:
                 flush=True,
             )
 
-    def decode(
-        self, dp_rank: int, span: tuple[int, int], block: int, raw: bytes
-    ) -> tuple[dict, tuple | None]:
-        """Decode and validate one block of a writer's file."""
-        index = self.index(dp_rank, span)
-        batch = read_block(index, block, raw, inputs_only=not self.targets)
-        inputs, targets = decode_block(batch, vocab_size=self.contract["logprob_vocab_size"])
-        if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
-            raise ValueError(f"Offline KD v3 block {block} of dp{dp_rank} {span} has wrong rows")
-        inputs["segment_offsets"] = torch.cat(
-            (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
-        )
-        # Target rows exist only at positions with nonzero loss weight, in token order.
-        scored = inputs["loss_mask"] != 0
-        inputs["target_offsets"] = torch.cat(
-            (torch.zeros(1, dtype=torch.int64), torch.cumsum(scored.long(), 0))
-        )
-        if targets is not None:
-            targets = self._mask_unknown_indices(*targets)
-        return inputs, targets
-
-    def _mask_unknown_indices(
-        self, values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        valid = values != LOGPROB_SENTINEL
-        self.target_entries += int(valid.sum())
-        if self.student_vocab_size is None:
-            return values, indices, tail
-        unknown = valid & (indices >= self.student_vocab_size)
-        count = int(unknown.sum())
-        if count:
-            self.masked_entries += count
-            # Entries the student cannot represent join the tail bucket.
-            masked = values.float().masked_fill(~unknown, -torch.inf).logsumexp(-1)
-            tail = torch.logaddexp(tail, masked)
-            values = values.masked_fill(unknown, LOGPROB_SENTINEL)
-            indices = indices.masked_fill(unknown, 0)
-            fraction = self.masked_entries / max(1, self.target_entries)
-            if fraction > 1e-4 and not self._masking_warned:
-                self._masking_warned = True
-                print(
-                    f"WARNING: offline KD v3 masked {self.masked_entries} teacher target entries "
-                    f"({fraction:.2%}) with indices beyond the student vocabulary "
-                    f"({self.student_vocab_size}); check the teacher/student vocabularies",
-                    flush=True,
-                )
-        return values, indices, tail
-
-    def _lane(self, dp_rank: int, group_index: int, block: int) -> _Lane:
+    def _lane(self, dp_rank: int, group_index: int, first_block: int) -> _Lane:
         lane = self.lanes.get(dp_rank)
         if lane is None:
-            lane = self.lanes[dp_rank] = _Lane(self, dp_rank, group_index, block)
+
+            def items(stopped: threading.Event) -> Any:
+                group = group_index
+                while not stopped.is_set():
+                    span = self.wait_for_group(group, stopped)
+                    if span is None:
+                        return
+                    name, index = FileName(dp_rank, *span), self.index(dp_rank, span)
+                    label = f"dp{dp_rank} {span[0]}-{span[1]}"
+                    for block in range(
+                        first_block if group == group_index else 0, len(index["blocks"])
+                    ):
+                        yield (group, block), (self.storage, name.data, index, block, label)
+                    group += 1
+
+            lane = self.lanes[dp_rank] = _Lane(self, f"dp{dp_rank}", items)
         return lane
 
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
@@ -448,19 +491,8 @@ class ReplayReader:
             row = (offset // (self.mbs * self.dp)) * self.mbs + offset % self.mbs
             first_rows = self.index(dp_rank, (start, end))["first_rows"]
             block = bisect.bisect_right(first_rows, row) - 1
-            inputs, targets = self._lane(dp_rank, group_index, block).block(group_index, block)
-            row -= first_rows[block]
-            a, b = inputs["sample_offsets"][row : row + 2].tolist()
-            sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
-            sample["sample_id"] = sid
-            s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
-            sample["segments"] = inputs["segment_lengths"][s0:s1]
-            if targets is not None:
-                ta, tb = inputs["target_offsets"][[a, b]].tolist()
-                sample["teacher_values"], sample["teacher_indices"], sample["teacher_tail"] = (
-                    tensor[ta:tb] for tensor in targets
-                )
-            samples.append(sample)
+            inputs, targets = self._lane(dp_rank, group_index, block).block((group_index, block))
+            samples.append(self.slice_sample(inputs, targets, row - first_rows[block], sid))
         return samples
 
     def close(self) -> None:
@@ -468,9 +500,109 @@ class ReplayReader:
         with self.condition:
             self.closed = True
             self.condition.notify_all()
-        for lane in self.lanes.values():
-            lane.close()
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        super().close()
+
+
+class CorpusReader(_BlockReader):
+    """Read a planned corpus blend (see :mod:`.format.blend`) by global sample position.
+
+    Global sample ``p`` is row ``p // L`` of lane ``p % L``. Each lane streams its
+    pieces' blocks in order; a rank only creates the lanes its positions fall in.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        manifest: dict,
+        *,
+        targets: bool = True,
+        decode_threads: int = 4,
+        prefetch_depth: int = 2,
+        student_vocab_size: int | None = None,
+    ):
+        super().__init__(
+            manifest["contract"],
+            targets=targets,
+            decode_threads=decode_threads,
+            prefetch_depth=prefetch_depth,
+            student_vocab_size=student_vocab_size,
+        )
+        self.root = root
+        self.manifest = manifest
+        self.lanes_count = manifest["lanes"]
+        self.total_samples = manifest["lanes"] * manifest["lane_samples"]
+        segments = manifest["segments"]
+        self.pieces = [segments[segments[:, 0] == lane] for lane in range(self.lanes_count)]
+        self.starts = [
+            np.concatenate(([0], np.cumsum(pieces[:, 4] - pieces[:, 3])))[:-1].tolist()
+            for pieces in self.pieces
+        ]
+        self.storages: dict[str, Storage] = {}
+        self.indexes: dict[int, dict] = {}
+        self.index_lock = threading.Lock()
+
+    def _file(self, file_id: int) -> tuple[Storage, FileName, dict]:
+        entry = self.manifest["files"][file_id]
+        storage = self.storages.setdefault(
+            entry["folder"], Storage(os.path.join(self.root, entry["folder"]))
+        )
+        return storage, FileName(entry["dp_rank"], entry["start"], entry["end"]), entry
+
+    def index(self, file_id: int) -> dict:
+        """Load (once) and check a planned file's index against the manifest."""
+        with self.index_lock:
+            cached = self.indexes.get(file_id)
+        if cached is not None:
+            return cached
+        storage, name, entry = self._file(file_id)
+        index = read_index(storage, name)
+        if index.get("size") != entry["size"]:
+            raise ValueError(
+                f"Offline KD corpus file {entry['folder']}/{name.data} changed since the blend "
+                "was planned"
+            )
+        check_index(index, storage.size(name.data))
+        contract = file_meta(index)["contract"]
+        differing = [key for key in self.contract if contract.get(key) != self.contract[key]]
+        if differing:
+            raise ValueError(
+                f"Offline KD corpus file {entry['folder']}/{name.data} differs from the blend on "
+                f"{', '.join(differing)}"
+            )
+        with self.index_lock:
+            return self.indexes.setdefault(file_id, index)
+
+    def _lane(self, lane: int, first_piece: int) -> _Lane:
+        stream = self.lanes.get(lane)
+        if stream is None:
+
+            def items(stopped: threading.Event) -> Any:
+                for piece in range(first_piece, len(self.pieces[lane])):
+                    if stopped.is_set():
+                        return
+                    file_id, block = (int(v) for v in self.pieces[lane][piece][1:3])
+                    storage, name, entry = self._file(file_id)
+                    label = f"{entry['folder']}/{name.data}"
+                    yield (piece,), (storage, name.data, self.index(file_id), block, label)
+
+            stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
+        return stream
+
+    def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
+        """Fetch samples at global positions (non-decreasing per lane across calls)."""
+        if available_end > self.total_samples:
+            raise RuntimeError(
+                f"Offline KD corpus blend holds {self.total_samples} samples; requested "
+                f"{available_end}"
+            )
+        samples = []
+        for position in positions:
+            lane, offset = position % self.lanes_count, position // self.lanes_count
+            piece = bisect.bisect_right(self.starts[lane], offset) - 1
+            inputs, targets = self._lane(lane, piece).block((piece,))
+            row = int(self.pieces[lane][piece][3]) + offset - self.starts[lane][piece]
+            samples.append(self.slice_sample(inputs, targets, row, position))
+        return samples
 
 
 def _layout_sample(

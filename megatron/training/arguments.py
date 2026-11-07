@@ -1661,7 +1661,7 @@ def validate_args(args, defaults={}):
         )
 
     if (args.logits_save_inputs or args.logits_load_inputs or args.kd_corpus_dump
-            or args.logits_load_shuffle_shards is not None):
+            or args.kd_corpus_blend or args.logits_load_shuffle_shards is not None):
         from megatron.training.distillation.v3_runtime import validate_options
 
         validate_options(args)
@@ -3683,6 +3683,11 @@ def _add_logits_distillation_args(parser):
                             'itself to the epoch; --train-iters is ignored.')
     group.add_argument('--kd-corpus-split', type=str, default='train', choices=['train', 'valid'],
                        help='Which --split part a corpus dump scores.')
+    group.add_argument('--kd-corpus-blend', type=str, default=None, metavar='CONFIG',
+                       help='Train on a blend of v3 corpus sources described by a JSON config '
+                            '(corpus directory, source weights in samples, split, seed, lanes). '
+                            'The schedule is planned at startup for the training budget and '
+                            'fixed by the checkpoint.')
     group.add_argument('--logits-load-shuffle-shards', type=int, default=None, metavar='SEED',
                        help='Shuffle v3 teacher flush-range groups using this seed. The '
                             'shuffled extent is fixed at the first launch and restored on '

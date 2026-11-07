@@ -125,6 +125,40 @@ The teacher's dataset settings are recorded rather than checked against the stud
 `--logits-load-ignore-hash` is unnecessary for V3. Member checksums and pairing identities
 are always checked; `--logits-load-ignore-errors` is rejected.
 
+### Training on a corpus blend
+
+A student trains on a blend of corpus sources (see [Corpus dumps](#corpus-dumps)) with
+`--kd-corpus-blend blend.json` instead of `--logits-load-inputs`:
+
+```json
+{"corpus": "/data/corpus", "sources": {"web_crawl": 0.7, "math_sft": 0.3},
+ "split": "train", "seed": 1234, "lanes": 64, "allow_partial": []}
+```
+
+Weights are in samples, as in Megatron's `BlendedDataset`. At startup, world rank 0
+plans the schedule for the training budget (`--train-samples`, or `--train-iters` times
+the global batch size) and logs each source's realized share of samples and of supervised
+tokens:
+
+- Each source contributes whole seeded passes over its blocks, then a seeded subset, so a
+  weight above one epoch repeats the source and one below it subsamples it. Filler
+  samples and, unless the source is listed in `allow_partial`, incomplete sources are
+  refused.
+- Every source is spread evenly along one stream, and the stream is cut into `lanes`
+  equal lanes. Global sample `p` is position `p // lanes` of lane `p % lanes`, so the
+  schedule does not depend on the student's DP size, and every global batch draws from
+  up to `lanes` places in the stream.
+- When `lanes` is a multiple of DP × microbatch size, each lane is read by exactly one
+  student rank, one ranged read per block. Otherwise ranks share lanes and read the same
+  blocks. Each rank keeps about `lanes / DP × --logits-load-msc-prefetch-depth` blocks
+  (16 MiB uncompressed each) in flight.
+
+The sources must share the required settings; a different teacher is reported. The plan
+is fixed by the checkpoint: a resume re-plans and refuses a different schedule (a changed
+config, budget or set of files). Changing DP or microbatch size on resume is fine.
+Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
+LM loss only.
+
 ### Reordering, subsets, and growing dumps
 
 Enable deterministic shard-group reordering with:
@@ -503,9 +537,10 @@ boundaries.
 
 The new modules in `megatron/training/distillation/` isolate the format, publication,
 replay and token mappings, saver, runtime hooks, and paired loss (`v3_*.py`). The
-producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation, and
-the Arrow file and index layout) live in `format/contract.py` and `format/arrow.py`, which
-import nothing from Megatron.
+producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation,
+the Arrow file and index layout, and the corpus blend planner) live in `format/`, which
+imports nothing from Megatron. Corpus dumps and blends add `corpus_runtime.py` and
+`CorpusReader` in `v3_replay.py`.
 Small hooks in `arguments.py`, `training.py`, `checkpointing.py`, `pretrain_gpt.py`, and
 `pretrain_hybrid.py` select the V3 path. V3 reuses existing sparse top-K extraction,
 student output capture, the shared LM/sparse-KD loss and reporting, and the persistent
