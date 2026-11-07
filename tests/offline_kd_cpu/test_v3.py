@@ -1569,6 +1569,66 @@ def test_corpus_blend_validation(tmp_path, runtime_environment, change, message)
         runtime.validate_options(args)
 
 
+hf = importlib.import_module(f"{_namespace}.format.hf")
+
+
+def test_hf_stream_yields_a_ranks_samples_in_megatron_order(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    stream = hf.CorpusStream(str(tmp_path), manifest, rank=1, world_size=2, micro_batch_size=2)
+    ids = [sample["sample_id"] for sample in stream]
+    assert ids == [p for p in range(40) if (p % 4) // 2 == 1]
+    resumed = hf.CorpusStream(
+        str(tmp_path), manifest, rank=1, world_size=2, micro_batch_size=2, start=20
+    )
+    assert [sample["sample_id"] for sample in resumed] == [p for p in ids if p >= 20]
+
+
+def test_hf_collate_aligns_labels_and_targets(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    samples = list(hf.CorpusStream(str(tmp_path), manifest, micro_batch_size=2))[:3]
+    short = dict(samples[1])  # A shorter sample: its first 5 tokens and their target rows.
+    rows = int((short["loss_mask"][:5] != 0).sum())
+    for key in codec.TOKEN_FIELDS:
+        short[key] = short[key][:5]
+    for key in ("teacher_values", "teacher_indices", "teacher_tail"):
+        short[key] = short[key][:rows]
+    short["segments"] = torch.tensor([5])
+    samples[1] = short
+    batch = hf.collate(samples, pad_token_id=7)
+    assert batch["input_ids"].shape == (3, 8) and batch["input_ids"][1, 5:].tolist() == [7] * 3
+    assert batch["attention_mask"][1].tolist() == [1] * 5 + [0] * 3
+    scored = batch["loss_weights"] != 0
+    assert (batch["labels"][~scored] == -100).all()
+    # Identity targets: the scored rows' teacher index is the token at that position.
+    assert torch.equal(batch["teacher_indices"][..., 0][scored], batch["input_ids"][scored])
+    assert (batch["teacher_values"][~scored] == codec.LOGPROB_SENTINEL).all()
+
+
+def test_hf_topk_kl_matches_megatron(monkeypatch):
+    cached = _loss_namespace(monkeypatch)
+    torch.manual_seed(0)
+    batch, length, vocab, k = 2, 5, 11, 3
+    logits = torch.randn(batch, length, vocab)
+    teacher = torch.randn(batch, length, vocab).log_softmax(-1)
+    values, indices = teacher.topk(k, dim=-1)
+    values[0, 1, 2] = codec.LOGPROB_SENTINEL  # A top-P masked entry.
+    tail = codec.tail_logprob(values.reshape(-1, k)).reshape(batch, length)
+    weights = torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.5], [1.0, 0.0, 1.0, 1.0, 1.0]])
+    reference = cached.topk_kl_div(
+        logits.transpose(0, 1).clone(),
+        values.transpose(0, 1),
+        indices.transpose(0, 1),
+        1,
+        0,
+        None,
+        teacher_tail_logprobs=tail.transpose(0, 1),
+    )
+    expected = (reference * weights).sum() / weights.sum()
+    assert torch.allclose(hf.topk_kl(logits, values, indices, tail, weights), expected, atol=1e-6)
+
+
 def test_unfrozen_teacher_may_use_dropout(runtime_environment):
     # An unfrozen teacher's dump is a record of its training run, dropout included.
     args, runtime, _ = runtime_environment

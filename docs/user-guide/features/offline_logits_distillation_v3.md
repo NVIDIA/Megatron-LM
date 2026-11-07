@@ -159,6 +159,13 @@ config, budget or set of files). Changing DP or microbatch size on resume is fin
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
 LM loss only.
 
+Outside Megatron, `format/blend.py` plans the same schedule and `format/hf.py` is a
+torch-only reference consumer: `CorpusStream` yields one rank's samples in Megatron's
+order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `labels`
+and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
+bucket as Megatron. Stored labels are already shifted to line up with the logits at the
+same position.
+
 ### Reordering, subsets, and growing dumps
 
 Enable deterministic shard-group reordering with:
