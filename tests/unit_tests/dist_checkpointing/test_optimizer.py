@@ -52,7 +52,10 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
     setup_moe_model_and_optimizer,
 )
-from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_model
+from tests.unit_tests.dist_checkpointing.utils import (
+    initialize_moe_model,
+    initialize_quantized_gpt_model,
+)
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
@@ -1005,6 +1008,49 @@ class TestDistributedOptimizer:
                 # Test both param state dicts are equal
                 diffs = diff(optim_param_state_A, optim_param_state_B)
                 assert not any(map(bool, diffs)), (rank, diffs)
+
+        Utils.destroy_model_parallel()
+
+    def test_stub_dense_optimizer_checkpoint_round_trip(self, tmp_path_dist_ckpt):
+        """Freezing every non-expert parameter leaves the dense DistributedOptimizer without an
+        inner optimizer (a stub); saving and loading a checkpoint must still work."""
+        ep = 2
+
+        def initialize_experts_only_model(*args, **kwargs):
+            model = initialize_moe_model(*args, **kwargs)
+            for name, param in model.named_parameters():
+                param.requires_grad_('.experts.' in name)
+            return model
+
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_stub_dense_optimizer', sync=True) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.use_distributed_optimizer = True
+            mock_args.save_tokenizer_assets = False
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                model, optimizer_A = setup_moe_model_and_optimizer(
+                    seed=2, tp=1, pp=1, ep=ep, initialize_fn=initialize_experts_only_model
+                )
+                stubs = [
+                    opt
+                    for opt in optimizer_A.chained_optimizers
+                    if isinstance(opt, DistributedOptimizer) and opt.is_stub_optimizer
+                ]
+                assert len(stubs) == 1, "expected exactly one stub (dense) DistributedOptimizer"
+
+                init_checkpointing_mock_args(mock_args, ckpt_dir)
+                sync_checkpoint_config(mock_args)
+                save_checkpoint(10, model, optimizer_A, None, 0)
+                optim_state_A = optimizer_A.state_dict()
+
+                model, optimizer_B = setup_moe_model_and_optimizer(
+                    seed=3, tp=1, pp=1, ep=ep, initialize_fn=initialize_experts_only_model
+                )
+                sync_checkpoint_config(mock_args)
+                load_checkpoint_no_arg_checks(model, optimizer_B, None)
+                diffs = diff(optim_state_A, optimizer_B.state_dict())
+                assert not any(map(bool, diffs)), diffs
 
         Utils.destroy_model_parallel()
 

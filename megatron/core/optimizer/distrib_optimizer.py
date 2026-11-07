@@ -1144,6 +1144,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
+        # A stub optimizer (all parameters frozen) has no state to save.
+        if self.is_stub_optimizer:
+            return {}
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -1227,6 +1230,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if self.is_stub_optimizer:
+            return
         if self.ddp_config.use_megatron_fsdp:
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
@@ -1727,6 +1732,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             filename (str): path to save parameter state to.
         """
+        if self.is_stub_optimizer:
+            return
 
         state_dict = self.get_parameter_state_dp_zero()
         if self.data_parallel_group.rank() == 0:
@@ -1810,6 +1817,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
+        if self.is_stub_optimizer:
+            return {}
         if sharding_type is not None:
             log_single_rank(
                 logger,
