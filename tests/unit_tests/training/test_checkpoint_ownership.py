@@ -330,6 +330,40 @@ def test_legacy_checkpoint_gloo_requirement_follows_optimizer_kind(run_config, o
         assert run_config.optimizer.use_layer_wise_distributed_optimizer is False
 
 
+@pytest.mark.parametrize(
+    "optimizer, convert_format, save_optim, skip_train, rejected",
+    [
+        ("muon", "torch", True, False, True),
+        ("dist_muon", "torch", True, False, True),
+        # The sharded format saves the layer-wise state.
+        ("muon", "torch_dist", True, False, False),
+        # A model-only conversion, or one that builds no optimizer, saves no optimizer state.
+        ("muon", "torch", False, False, False),
+        ("muon", "torch", True, True, False),
+        # The standard DistributedOptimizer keeps its legacy parameter-state save.
+        ("adam", "torch", True, False, False),
+    ],
+)
+def test_torch_conversion_rejects_saving_layer_wise_optimizer_state(
+    run_config, optimizer, convert_format, save_optim, skip_train, rejected
+):
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.checkpoint = CheckpointConfig(
+        load="/ckpt",
+        ckpt_convert_format=convert_format,
+        ckpt_convert_save="/converted",
+        save_optim=save_optim,
+    )
+    run_config.validation.skip_train = skip_train
+
+    if rejected:
+        with pytest.raises(ValueError, match="--ckpt-convert-format torch does not save"):
+            run_config.validate()
+    else:
+        run_config.validate()
+
+
 def test_inference_container_checks_the_format_against_dist_only():
     cfg = _inference_container(ckpt_format="torch")
     cfg.dist.use_torch_fsdp2 = True
