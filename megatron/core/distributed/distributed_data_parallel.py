@@ -700,11 +700,35 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # LayerWise buckets force-synced right before their fp32 masters were offloaded
+            # (LayerWiseDistributedOptimizer.start_param_sync_for_bucket_group_subset under
+            # chunked optimizer-state offload) stay pinned until the next dispatch-state reset:
+            # the aligned VPP schedule revisits them through this entry, and re-gathering would
+            # stage stale weights from CPU-resident masters. Any other completed gather, e.g. a
+            # manual force_sync while the forward hooks are disabled, is re-dispatched as before.
+            if (
+                not force_sync
+                and not force_dispatch
+                and bucket_group.param_gather_pinned_before_master_offload
+                and bucket_group.param_gather_dispatched
+                and bucket_group.param_gather_handle is None
+            ):
+                continue
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-    def reset_param_sync_dispatch_state(self):
-        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+    def reset_param_sync_dispatch_state(self, bucket_groups=None):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook.
+
+        Args:
+            bucket_groups (list, optional): the bucket groups to reset; all bucket groups of
+                this model chunk by default. An optimizer that re-stages its own param buffers
+                passes only the bucket groups it owns, so a sibling optimizer's completed
+                gathers (e.g. LayerWise groups force-synced before their fp32 masters were
+                offloaded to CPU) keep their state.
+        """
+        if bucket_groups is None:
+            bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        for bucket_group in bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
@@ -714,6 +738,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 "parameter all-gather is still in flight."
             )
             bucket_group.param_gather_dispatched = False
+            bucket_group.param_gather_pinned_before_master_offload = False
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):
