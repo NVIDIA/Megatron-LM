@@ -176,6 +176,9 @@ class SharedExpertMLP(MLP):
                     linear.ub_overlap_ag_dgrad = False
                     linear.ub_overlap_ag_fprop = False
                     linear.ub_overlap_rs_dgrad = False
+                    # Batch-invariant mode: post_forward_comm reduces fc2's partials with
+                    # the ordered reduction, so TELinear must not reduce them as well.
+                    linear.bi_tp_reduce_by_caller = True
                 else:
                     # MCore legacy Linear
                     linear.explicit_expert_comm = True
