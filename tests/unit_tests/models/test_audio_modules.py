@@ -53,11 +53,32 @@ class TestAudioProjection:
         projector.input_size = 3
         projector.stack_factor = 2
 
-        with pytest.raises(NotImplementedError, match="stack_factor == 1"):
+        with pytest.raises(NotImplementedError, match="stack_factor == 1") as exc_info:
             AudioProjection.forward_packed(
                 projector,
                 PackedAudioEmbeddings(
                     embeddings=torch.zeros(1, 3), lengths=torch.tensor([1], dtype=torch.int32)
+                ),
+            )
+        message = str(exc_info.value)
+        assert "per-audio stacking of PackedAudioEmbeddings" in message
+        assert "NemoTransformerAudioModel" not in message
+
+    def test_forward_packed_rejects_length_sum_before_projector(self):
+        class BoomProjector:
+            def __call__(self, hidden_states):
+                raise AssertionError(f"projector ran on shape {tuple(hidden_states.shape)}")
+
+        projector = object.__new__(AudioProjection)
+        projector.input_size = 3
+        projector.stack_factor = 1
+        projector.projector = BoomProjector()
+
+        with pytest.raises(ValueError, match="sum\\(lengths\\)"):
+            AudioProjection.forward_packed(
+                projector,
+                PackedAudioEmbeddings(
+                    embeddings=torch.zeros(4, 3), lengths=torch.tensor([1, 1], dtype=torch.int32)
                 ),
             )
 
@@ -74,6 +95,17 @@ class TestAudioProjection:
         torch.testing.assert_close(padded.embeddings[:2], packed.embeddings[:2])
         torch.testing.assert_close(padded.embeddings[2:4], torch.zeros(2, 3))
         torch.testing.assert_close(padded.embeddings[4:], packed.embeddings[2:])
+
+
+def test_audio_decode_error_names_self_decoders():
+    from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
+
+    module = AudioModalitySubmodules()
+    with pytest.raises(NotImplementedError) as exc_info:
+        module.decode(torch.zeros(1, 2), {})
+    message = str(exc_info.value)
+    assert "self.decoders" in message
+    assert "stack_factor" not in message
 
 
 class TestAudioProjectionWithModelParallel:
