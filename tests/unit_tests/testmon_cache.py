@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Versioned, read-only validation of main's unit Testmon cache generations."""
+"""Versioned, read-only validation of trusted unit Testmon baseline generations."""
 
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ PLATFORMS = {
     "dgx_h100": {"cloud": "aws-h100", "recipe": "tests/test_utils/recipes/h100/unit-tests.yaml"},
     "dgx_gb200": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb200/unit-tests.yaml"},
 }
+# PR target branch -> how its trusted producer publishes baselines. PR pushes can
+# read Actions caches only from their own branch and the default branch, so main
+# saves caches while each push to dev uploads artifacts from its producer run.
+BASELINE_BRANCHES = {"main": "cache", "dev": "artifact"}
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
@@ -115,11 +119,17 @@ def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
 
 
 def cache_identity(
-    root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
+    root: Path,
+    bucket: str,
+    recipe_platform: str,
+    image_id: str = "unknown",
+    target_branch: str = "main",
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
     if recipe_platform not in PLATFORMS:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
+    if target_branch not in BASELINE_BRANCHES:
+        raise ValueError(f"unsupported Testmon baseline branch: {target_branch!r}")
     if (
         not any(bucket.startswith(test_root + "/") for test_root in UNIT_TEST_ROOTS)
         or ".." in Path(bucket).parts
@@ -142,11 +152,21 @@ def cache_identity(
         "inputs": inputs,
     }
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
+    # The branch-specific prefix and manifest source keep each branch's
+    # generations apart even when their compatibility contracts match.
     return {
         "compatibility": contract,
         "image_id": image_id,
-        "cache_prefix": f"unit-testmon-v{SCHEMA}-main-{recipe_platform}-{bucket_hash}-",
+        "target_branch": target_branch,
+        "cache_prefix": f"unit-testmon-v{SCHEMA}-{target_branch}-{recipe_platform}-{bucket_hash}-",
     }
+
+
+def _source_ref(identity: dict) -> str:
+    target_branch = identity.get("target_branch")
+    if target_branch not in BASELINE_BRANCHES:
+        raise ValueError(f"unsupported Testmon baseline branch: {target_branch!r}")
+    return f"refs/heads/{target_branch}"
 
 
 def _database(cache_dir: Path, phase: str) -> Path:
@@ -231,11 +251,12 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
         r"[0-9]+-[0-9]+", generation
     ):
         raise ValueError("invalid baseline source or generation")
+    source_ref = _source_ref(identity)
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
     manifest = {
         "schema": SCHEMA,
-        "source_ref": "refs/heads/main",
+        "source_ref": source_ref,
         "source_sha": source_sha,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "generation": generation,
@@ -246,8 +267,14 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
     return manifest
 
 
-def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
-    """Require a compatible completed main generation, including a prefix cache match."""
+def validate_cache(
+    cache_dir: Path, identity: dict, matched_key: str, source_sha: str | None = None
+) -> dict:
+    """Require a compatible completed generation of the identity's branch and lookup key.
+
+    Artifact consumers also pass the producer run's commit as ``source_sha``.
+    """
+    source_ref = _source_ref(identity)
     manifest = _read_json(cache_dir / "manifest.json")
     generation = manifest.get("generation", "")
     if not isinstance(generation, str) or not re.fullmatch(r"[0-9]+-[0-9]+", generation):
@@ -256,10 +283,12 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
         raise ValueError("restored Testmon key does not match its generation")
     if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity["compatibility"]:
         raise ValueError("Testmon cache compatibility changed")
-    if manifest.get("source_ref") != "refs/heads/main" or not re.fullmatch(
+    if manifest.get("source_ref") != source_ref or not re.fullmatch(
         r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))
     ):
         raise ValueError("invalid Testmon baseline source")
+    if source_sha is not None and manifest["source_sha"] != source_sha:
+        raise ValueError("Testmon baseline does not come from the expected producer commit")
     if not isinstance(manifest.get("created_at"), str):
         raise ValueError("missing Testmon baseline creation time")
     created_at = datetime.fromisoformat(manifest["created_at"])
@@ -280,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     identity_parser.add_argument("--bucket", required=True)
     identity_parser.add_argument("--platform", required=True)
     identity_parser.add_argument("--image-id", default="unknown")
+    identity_parser.add_argument("--target-branch", default="main")
     identity_parser.add_argument("--output", type=Path, required=True)
     for command in ("validate", "finalize"):
         child = subparsers.add_parser(command)
@@ -287,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--identity", type=Path, required=True)
         if command == "validate":
             child.add_argument("--matched-key", required=True)
+            child.add_argument("--source-sha")
         else:
             child.add_argument("--source-sha", required=True)
             child.add_argument("--generation", required=True)
@@ -295,18 +326,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "platforms":
             print(json.dumps(PLATFORMS))
         elif args.command == "identity":
-            identity = cache_identity(args.root, args.bucket, args.platform, args.image_id)
+            identity = cache_identity(
+                args.root, args.bucket, args.platform, args.image_id, args.target_branch
+            )
             _write_json(args.output, identity)
             print(f"cache_prefix={identity['cache_prefix']}")
+            print(f"baseline_transport={BASELINE_BRANCHES[args.target_branch]}")
         elif args.command == "finalize":
             finalize(args.cache_dir, _read_json(args.identity), args.source_sha, args.generation)
         else:
             identity = _read_json(args.identity)
-            manifest = validate_cache(args.cache_dir, identity, args.matched_key)
+            manifest = validate_cache(args.cache_dir, identity, args.matched_key, args.source_sha)
             created_at = datetime.fromisoformat(manifest["created_at"])
             age_hours = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
             print(
-                f"Baseline source: {manifest['source_sha']} "
+                f"Baseline source: {manifest['source_sha']} on {manifest['source_ref']} "
                 f"(created {manifest['created_at']}; age {age_hours:.1f} hours)"
             )
             print(

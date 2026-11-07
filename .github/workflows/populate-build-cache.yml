@@ -13,31 +13,20 @@
 # limitations under the License.
 
 name: Populate CI build caches
-run-name: Populate CI build and Testmon caches from main
+run-name: Populate CI build and Testmon caches from ${{ github.ref_name }}
 
+# Each baseline branch runs its own copy of this workflow. Main's copy refreshes
+# Testmon on its schedule and publishes Actions caches. Schedules run only on
+# the default branch, and dev-target PR pushes cannot read dev-branch caches, so
+# dev's copy records dev pushes and publishes the baselines as run artifacts.
 on:
   push:
     branches:
-      - main
-    paths:
-      - ".github/workflows/_build_ci_container.yml"
-      - ".github/workflows/populate-build-cache.yml"
-      - ".github/actions/action.yml"
-      - "docker/**"
-      - "megatron/core/__init__.py"
-      - "megatron/core/package_info.py"
-      - "pyproject.toml"
-      - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
-      - "uv.lock"
-      - "tests/unit_tests/testmon*.py"
-      - "tests/unit_tests/run_ci_test.sh"
-      - "tests/test_utils/recipes/*/unit-tests.yaml"
-  schedule:
-    - cron: "17 */6 * * *"
+      - dev
   workflow_dispatch:
 
 concurrency:
-  group: populate-ci-caches-main
+  group: populate-ci-caches-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -50,13 +39,13 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     steps:
-      - name: Require main
+      - name: Require a baseline branch
         shell: bash
         env:
           SOURCE_REF: ${{ github.ref }}
         run: |
-          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
-            echo "::error::Dispatch this workflow from the main branch."
+          if [ "$SOURCE_REF" != "refs/heads/main" ] && [ "$SOURCE_REF" != "refs/heads/dev" ]; then
+            echo "::error::Dispatch this workflow from the main or dev branch."
             exit 1
           fi
 
@@ -81,7 +70,9 @@ jobs:
   parse-unit-tests:
     name: Select Testmon cache buckets
     needs: populate-build-cache
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Main records on its schedule. Dev has no schedule and records each push
+    # while selective unit tests are enabled; a dispatch on dev always records.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/dev' && vars.ENABLE_SELECTIVE_UNIT_TESTS == 'true')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -137,4 +128,4 @@ jobs:
           tag: latest
           is_unit_test: "true"
           unit_testmon_mode: baseline
-          unit_testmon_target_branch: main
+          unit_testmon_target_branch: ${{ github.ref_name }}
