@@ -2,12 +2,13 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal, Sequence, override
 
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -23,6 +24,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
@@ -41,7 +43,8 @@ class HybridModelConfig(ModelConfig):
     on the embedded ``transformer`` config are accessible directly on this object
     via ``__getattr__``/``__setattr__`` proxying.
 
-    Supports hybrid architectures via ``hybrid_layer_pattern``
+    Supports hybrid architectures via either ``hybrid_layer_pattern`` or a
+    first-class ``hybrid_layer_config_list``.
 
     Note:
         ``vocab_size`` must be set before passing this config to ``HybridModelBuilder``.
@@ -59,6 +62,12 @@ class HybridModelConfig(ModelConfig):
     hybrid_mlp_ratio: float = 0.0
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
+    hybrid_layer_config_list: Sequence[HybridLayerEntry] | None = None
+    """Python-defined layers and split markers, mutually exclusive with a pattern.
+
+    Forwarded unchanged to Core and recorded in run-config metadata. Model construction
+    still uses the supplied Python definition when resuming from a checkpoint.
+    """
     seq_length: int = 8192
     """Position-embedding capacity, passed to the model as max_sequence_length; the launcher
     fills it from --max-position-embeddings. The training sequence length that core modules
@@ -178,9 +187,37 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             The constructed model
 
-        Note:
-            Virtual pipeline model parallelism is not supported for Hybrid models.
+        A config-list architecture may use ``PipelineSplit`` markers with a
+        matching preconfigured virtual-pipeline topology.
         """
+        hybrid_layer_config_list = self._model_config.hybrid_layer_config_list
+        try:
+            args = get_args()
+        except AssertionError:
+            args = None
+        args_mtp_num_layers = getattr(args, "mtp_num_layers", None) if args is not None else None
+        if hybrid_layer_config_list is not None:
+            # This CLI-only option is not part of TransformerConfig. Core validates the
+            # supplied PP/VPP topology against the list's PipelineSplit markers.
+            if (
+                args is not None
+                and getattr(args, "num_layers_per_virtual_pipeline_stage", None) is not None
+            ):
+                raise ValueError(
+                    "Python-defined HybridModel config lists must configure VPP explicitly with "
+                    "--num-virtual-stages-per-pipeline-rank; "
+                    "--num-layers-per-virtual-pipeline-stage would infer VPP from a layer count."
+                )
+            has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
+                self._model_config.hybrid_mlp_ratio != 0.0
+            )
+            if self._model_config.hybrid_override_pattern is not None or has_deprecated_ratio:
+                raise ValueError(
+                    "hybrid_layer_config_list is mutually exclusive with "
+                    "hybrid_override_pattern, "
+                    "hybrid_attention_ratio, and hybrid_mlp_ratio"
+                )
+
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
@@ -201,12 +238,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         post_process = (
             post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
         )
-        return HybridModel(
+        model = HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
+            hybrid_layer_config_list=hybrid_layer_config_list,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
             logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
@@ -220,6 +258,21 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        if hybrid_layer_config_list is not None:
+            # Core owns config cloning and MTP inference; retain its resolved root config.
+            self._model_config.transformer = model.config
+            if args is not None:
+                if args_mtp_num_layers is not None and args_mtp_num_layers != model.mtp_num_depths:
+                    raise ValueError(
+                        "hybrid_layer_config_list defines "
+                        f"{model.mtp_num_depths} MTP depths, but runtime "
+                        f"mtp_num_layers is {args_mtp_num_layers}"
+                    )
+                if model.mtp_num_depths > 0:
+                    args.mtp_num_layers = model.mtp_num_depths
+        if args is not None:
+            args.is_hybrid_model = True
+        return model
 
     def build_distributed_models(
         self,
