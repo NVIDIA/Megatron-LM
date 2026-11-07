@@ -1,7 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import builtins
 import threading
+from pathlib import Path
 from unittest.mock import Mock
+
+import pytest
 
 from tests.test_utils.python_scripts import launch_nemo_run_workload
 
@@ -66,3 +70,108 @@ def test_stopped_monitor_does_not_cancel_attempt():
 
     assert not failure_detected_event.is_set()
     experiment.cancel.assert_not_called()
+
+
+def test_failure_signature_split_at_file_chunk_boundary(tmp_path, monkeypatch):
+    chunk_size = 128
+    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", chunk_size)
+    signature = "Connection reset by peer"
+    log_path = tmp_path / "task" / "attempt_0" / "rank0" / "stdout.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("x" * (chunk_size - 5) + signature + " trailing text")
+
+    assert launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+
+
+def test_failure_signature_at_end_of_file_is_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", 128)
+    signature = "The following metrics failed"
+    log_path = tmp_path / "task.log"
+    log_path.write_text("x" * 7 + signature)
+
+    assert launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+
+
+def test_nested_rank_and_harness_logs_are_scanned(tmp_path):
+    rank_log = tmp_path / "task" / "attempt_0" / "rank0" / "stdout.log"
+    rank_log.parent.mkdir(parents=True)
+    rank_log.write_text("training output without retry markers")
+    task_log = tmp_path / "task" / "nemo-run.log"
+    task_log.write_text("The following metrics failed: loss")
+
+    assert launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+
+
+def test_resolved_paths_from_overlapping_globs_are_read_once(tmp_path, monkeypatch):
+    rank_log = tmp_path / "task" / "attempt_0" / "rank0" / "stdout.log"
+    rank_log.parent.mkdir(parents=True)
+    rank_log.write_text("ordinary output")
+    alias_log = tmp_path / "task" / "alias.log"
+    alias_log.symlink_to(rank_log)
+    original_open = builtins.open
+    opened_paths = []
+
+    def counting_open(path, *args, **kwargs):
+        if Path(path).resolve() == rank_log.resolve():
+            opened_paths.append(Path(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    assert not launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+    assert len(opened_paths) == 1
+
+
+def test_malformed_utf8_is_replaced_and_scanned(tmp_path):
+    log_path = tmp_path / "rank.log"
+    log_path.write_bytes(b"\xff\xfe" + b"illegal memory access")
+
+    assert launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+
+
+def test_unreadable_log_is_ignored(tmp_path, monkeypatch, caplog):
+    log_path = tmp_path / "rank.log"
+    log_path.write_text("ordinary output")
+    original_open = builtins.open
+
+    def failing_open(path, *args, **kwargs):
+        if Path(path) == log_path:
+            raise OSError("simulated read failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+
+    assert not launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+    assert "simulated read failure" in caplog.text
+
+
+def test_all_nonflaky_logs_return_false(tmp_path):
+    log_path = tmp_path / "task" / "attempt_0" / "rank0" / "stdout.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("normal training output\nfinished without known transient errors")
+
+    assert not launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("monitor_hit", "tee_signature"),
+    [(True, ""), (False, "The server socket has failed to listen on any local network address.")],
+)
+def test_existing_failure_evidence_short_circuits_log_scan(
+    tmp_path, monkeypatch, monitor_hit, tee_signature
+):
+    log_buffer = launch_nemo_run_workload._ThreadSafeBuffer()
+    failure_detected_event = threading.Event()
+    if monitor_hit:
+        failure_detected_event.set()
+    else:
+        log_buffer.write(tee_signature)
+
+    def unexpected_scan(_workdir):
+        pytest.fail("archived logs should not be scanned after streamed failure evidence")
+
+    monkeypatch.setattr(launch_nemo_run_workload, "_has_flaky_failure_in_logs", unexpected_scan)
+
+    assert launch_nemo_run_workload._should_retry_failed_attempt(
+        tmp_path, log_buffer, failure_detected_event
+    )

@@ -16,6 +16,10 @@ from tests.test_utils.python_scripts import recipe_parser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_FAILURE_LOG_SCAN_CHUNK_SIZE = 1024 * 1024
+# Current retry signatures are under 100 characters, so a 4 KiB overlap covers boundary splits.
+_FAILURE_LOG_SCAN_OVERLAP = 4 * 1024
+
 
 def is_flaky_failure(concat_allranks_logs: str) -> bool:
     """Assumes that certain keywords hint towards intermittent failures"""
@@ -100,8 +104,8 @@ def _cancel_on_flaky_failure(
             return
 
 
-def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
-    """Reads every log file that may carry a flaky-failure signature.
+def _has_flaky_failure_in_logs(workdir: pathlib.Path) -> bool:
+    """Search candidate logs in fixed-size chunks for a flaky-failure signature.
 
     The per-rank ``attempt_0/*/std*.log`` files only contain torchrun training
     output. The golden-value comparison runs in ``run_ci_test.sh`` and emits its
@@ -113,11 +117,10 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
         workdir: Working directory under which nemo-run writes all log files.
 
     Returns:
-        The concatenated lines of every discovered log file, deduplicated by
-        resolved path to avoid double-counting overlapping globs.
+        Whether any discovered log contains a flaky-failure signature. Files
+        are deduplicated by resolved path to avoid rescanning overlapping globs.
     """
     seen_paths = set()
-    collected_lines: list[str] = []
     for pattern in ("**/attempt_0/*/std*.log", "**/*.log"):
         for log_file_path in workdir.glob(pattern):
             resolved = log_file_path.resolve()
@@ -126,10 +129,26 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
             seen_paths.add(resolved)
             try:
                 with open(log_file_path, "r", errors="replace") as f:
-                    collected_lines.extend(f.readlines())
+                    previous_chunk = ""
+                    while chunk := f.read(_FAILURE_LOG_SCAN_CHUNK_SIZE):
+                        candidate = previous_chunk + chunk
+                        if is_flaky_failure(candidate):
+                            return True
+                        previous_chunk = chunk[-_FAILURE_LOG_SCAN_OVERLAP:]
             except OSError as error:
                 logger.warning("Could not read log file %s: %s", log_file_path, error)
-    return collected_lines
+    return False
+
+
+def _should_retry_failed_attempt(
+    workdir: pathlib.Path, log_buffer: _ThreadSafeBuffer, failure_detected_event: threading.Event
+) -> bool:
+    """Use streamed evidence before scanning archived task and rank logs."""
+    return (
+        failure_detected_event.is_set()
+        or is_flaky_failure(log_buffer.getvalue())
+        or _has_flaky_failure_in_logs(workdir)
+    )
 
 
 @click.command()
@@ -326,10 +345,9 @@ def main(
             sys.exit(0)
 
         logger.error(f"Job failed with status: {job_dict['status']}")
-        all_ranks_all_logs = [tee_buffer.getvalue()]
-        all_ranks_all_logs.extend(_collect_failure_logs(pathlib.Path(os.getcwd())))
-        all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
-        if flaky_failure_detected_event.is_set() or is_flaky_failure(all_ranks_all_logs_string):
+        if _should_retry_failed_attempt(
+            pathlib.Path(os.getcwd()), tee_buffer, flaky_failure_detected_event
+        ):
             logger.warning("Detected flaky failure, attempt restart.")
             n_attempts += 1
             continue
