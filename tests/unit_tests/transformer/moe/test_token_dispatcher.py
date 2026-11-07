@@ -26,7 +26,12 @@ from megatron.core.transformer.moe.fused_a2a import (
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
+from megatron.core.transformer.moe.moe_utils import (
+    get_capacity,
+    pad_routing_map,
+    permute,
+    unpermute,
+)
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
@@ -657,6 +662,35 @@ if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_permute_unpermute_empty_assignment(permute_fusion, with_probs):
+    """No token routed to this rank's experts: zero rows out, zeros back, gradients still flow."""
+    tokens = torch.randn(16, 8, device="cuda", requires_grad=True)
+    routing_map = torch.zeros(16, 4, dtype=torch.bool, device="cuda")
+    probs = torch.rand(16, 4, device="cuda", requires_grad=True) if with_probs else None
+
+    permuted, permuted_probs, sorted_indices, _, _ = permute(
+        tokens, routing_map, probs=probs, num_out_tokens=0, fused=permute_fusion
+    )
+    assert permuted.shape == (0, 8)
+    if with_probs:
+        assert permuted_probs.shape == (0,)
+        permuted = permuted * permuted_probs.unsqueeze(-1)
+    restored = unpermute(
+        permuted, sorted_indices, tokens.shape, routing_map=routing_map, fused=permute_fusion
+    )
+
+    torch.testing.assert_close(restored, torch.zeros_like(tokens), rtol=0, atol=0)
+    # The output must stay in the autograd graph: a rank that skipped it would also skip the
+    # backward collectives behind its inputs while the other ranks run them.
+    restored.sum().backward()
+    torch.testing.assert_close(tokens.grad, torch.zeros_like(tokens), rtol=0, atol=0)
+    if with_probs:
+        torch.testing.assert_close(probs.grad, torch.zeros_like(probs), rtol=0, atol=0)
+
+
 class TestAllgatherDispatcher:
     def setup_method(self, method):
         pass
@@ -704,6 +738,54 @@ class TestAllgatherDispatcher:
         )
 
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    def test_expert_ranks_without_tokens(self, permute_fusion):
+        """Every token picks experts 0 and 1, which live on expert-parallel rank 0, so every
+        other rank's local assignment is empty (legal in dropless top-k routing)."""
+        ep_size = Utils.world_size
+        if ep_size < 2:
+            pytest.skip("Needs at least two expert-parallel ranks.")
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=2 * ep_size,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            moe_permute_fusion=permute_fusion,
+        )
+        moe_layer = container.moe_layer
+        hidden_states = torch.randn((8, 4, moe_layer.config.hidden_size), device="cuda")
+        hidden_states.requires_grad = True
+        routing_map = torch.zeros(
+            32, moe_layer.config.num_moe_experts, dtype=torch.bool, device="cuda"
+        )
+        routing_map[:, :2] = True
+        probs = (routing_map.float() / 2).requires_grad_()
+
+        permuted, tokens_per_expert, permuted_probs = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, routing_map
+        )
+        has_tokens = parallel_state.get_expert_model_parallel_rank() == 0
+        assert (tokens_per_expert.sum().item() > 0) == has_tokens
+        restored, _ = token_unpermutation(
+            moe_layer.token_dispatcher, permuted * permuted_probs.unsqueeze(-1)
+        )
+        torch.testing.assert_close(restored, hidden_states)
+        torch.autograd.backward(restored, hidden_states)
+        torch.testing.assert_close(hidden_states.grad, hidden_states)
+
+        # The whole layer, with the router replaced by the same assignment.
+        hidden_states.grad = None
+        moe_layer.router.forward = lambda *args, **kwargs: (probs, routing_map)
+        output, _ = moe_layer(hidden_states)
+        output.sum().backward()
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
 
 
 def is_deep_ep_available():
