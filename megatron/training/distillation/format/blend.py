@@ -27,13 +27,18 @@ import numpy as np
 from ..v3_storage import (
     FileName,
     Storage,
-    complete_ranges,
     contiguous_end,
     list_published,
     read_index,
+    validate_published_ranges,
 )
 from .arrow import check_index, file_meta
-from .contract import REQUIRED_KEYS, mismatched_settings, validate_metadata
+from .contract import (
+    blend_contract,
+    mismatched_corpus_order,
+    mismatched_settings,
+    validate_metadata,
+)
 
 MANIFEST_VERSION = 1
 DEFAULTS = {"seed": 1234, "lanes": 64}
@@ -66,20 +71,38 @@ def _source_rows(storage: Storage, name: str) -> tuple[dict, list, list, list]:
         validate_metadata(file_settings, corpus=True)
         if meta is None:
             meta = file_settings
-        elif mismatched_settings(file_settings, meta)[0]:
-            raise ValueError(f"Corpus source {name} mixes files written with different settings")
+        else:
+            differing = mismatched_settings(file_settings, meta)[0] + mismatched_corpus_order(
+                file_settings, meta
+            )
+            if differing:
+                raise ValueError(
+                    f"Corpus source {name} mixes files written with different settings ({', '.join(differing)})"
+                )
         indexes.append(index)
     contract = meta["contract"]
     writers, mbs, total = contract["writers"], contract["writer_mbs"], contract["num_samples"]
-    covered = contiguous_end(complete_ranges(files, writers), 0)
+    if contract["first_sample"] != 0:
+        raise ValueError(f"Corpus source {name} must start at sample zero")
+    ranges = validate_published_ranges(files, writers, mbs)
+    covered = contiguous_end(ranges, 0)
     if covered < total:
         raise ValueError(
             f"Corpus source {name} covers samples 0-{covered} of {total}; finish its dump first"
         )
     limit = total
+    complete = set(ranges)
     pieces = []  # (file id, block, first row, end row, supervised rows)
     for file_id, (file, index) in enumerate(zip(files, indexes)):
-        if file.start >= limit:
+        expected_rows = (file.end - file.start) // writers
+        cursor = 0
+        for entry in index["blocks"]:
+            if entry["first_row"] != cursor or entry["rows"] <= 0:
+                raise ValueError(f"Corpus source {name} file {file.index} has invalid block rows")
+            cursor += entry["rows"]
+        if cursor != expected_rows:
+            raise ValueError(f"Corpus source {name} file {file.index} has wrong rows for its range")
+        if file.start >= limit or (file.start, file.end) not in complete:
             continue
         for block, entry in enumerate(index["blocks"]):
             rows = np.arange(entry["first_row"], entry["first_row"] + entry["rows"])
@@ -139,16 +162,22 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
         folder = name
         storage = Storage(os.path.join(root, folder))
         meta, source_files, sizes, pieces = _source_rows(storage, name)
+        shared = blend_contract(meta["contract"])
         if reference is None:
-            reference = meta
-        differing = [
-            key for key in REQUIRED_KEYS if meta["contract"][key] != reference["contract"][key]
-        ]
+            reference = shared
+        differing = [key for key in shared if shared[key] != reference[key]]
         if differing:
             raise ValueError(f"Corpus source {name} differs on {', '.join(differing)}")
         offset = len(files)
         files += [
-            {"folder": folder, "dp_rank": f.dp_rank, "start": f.start, "end": f.end, "size": size}
+            {
+                "folder": folder,
+                "dp_rank": f.dp_rank,
+                "start": f.start,
+                "end": f.end,
+                "size": size,
+                "logprob_vocab_size": meta["contract"]["logprob_vocab_size"],
+            }
             for f, size in zip(source_files, sizes)
         ]
         chosen, passes = _select(pieces, targets[name], seed, name)
@@ -192,7 +221,7 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
         "budget": budget,
         "lanes": lanes,
         "lane_samples": per_lane,
-        "contract": {key: reference["contract"][key] for key in REQUIRED_KEYS},
+        "contract": reference,
         "files": files,
         "sources": sources,
         "segments": np.asarray(segments, dtype=np.int64).reshape(-1, 5),

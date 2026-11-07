@@ -3,9 +3,9 @@
 """Target encodings and file metadata shared by every offline KD producer and consumer.
 
 Every file stores its inputs next to its targets, so a file is self-consistent on its
-own. Only settings that change how a reader interprets a file are required, and only
-those make files incompatible; the remaining settings are recorded for reference and
-differences between files are reported, never fatal.
+own. File decoding settings may differ between corpus sources; a blend shares token
+and attention semantics. Within one corpus source, sample construction and ordering
+must also remain fixed so resumed and parallel jobs cover one epoch exactly once.
 """
 
 import hashlib
@@ -25,11 +25,16 @@ ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 # Required by every reader: what token IDs mean, how target indices decode, which
 # attention the inputs assume, and whether a prefix of a sample keeps its targets.
 REQUIRED_KEYS = ("tokenizer", "logprob_vocab_size", "attention_mode", "prefix_stable")
+# Corpus sources may use different normalization domains and index encodings.
+BLEND_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
 # Replay dumps also need the writer layout that maps a global sample to its file and row.
 REPLAY_KEYS = ("writers", "writer_mbs", "first_sample")
 # A corpus source also needs its epoch size, which defines when it is complete.
 CORPUS_KEYS = ("num_samples",)
-# Recorded only: where the data came from and how it was produced.
+# These recorded fields become invariants within a single corpus source, but may
+# differ freely between sources in a blend.
+CORPUS_ORDER_KEYS = ("data", "seed", "builder", "seq_length", "padding_divisor")
+# Provenance fields; CORPUS_ORDER_KEYS are enforced within one corpus source.
 RECORDED_KEYS = (
     "teacher",
     "seq_length",
@@ -49,17 +54,23 @@ def index_encoding_for_vocab(vocab_size: int) -> str:
     return "u16" if vocab_size <= 1 << 16 else "u16+u8"
 
 
-def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool = False) -> None:
+def validate_metadata(
+    meta: dict[str, Any], *, replay: bool = True, corpus: bool = False, blend: bool = False
+) -> None:
     """Reject metadata a reader cannot interpret.
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
-    optional ``recorded`` and ``provenance`` dictionaries, which are never validated
-    beyond their type.
+    optional ``recorded`` and ``provenance`` dictionaries. A blend manifest carries
+    shared semantics only (``blend=True, replay=False``), not file decoding settings.
     """
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")
     contract = meta.get("contract")
-    keys = REQUIRED_KEYS + (REPLAY_KEYS if replay else ()) + (CORPUS_KEYS if corpus else ())
+    keys = (
+        (BLEND_KEYS if blend else REQUIRED_KEYS)
+        + (REPLAY_KEYS if replay else ())
+        + (CORPUS_KEYS if corpus else ())
+    )
     missing = [key for key in keys if not isinstance(contract, dict) or key not in contract]
     if missing:
         raise ValueError(f"Offline KD metadata is missing required settings: {', '.join(missing)}")
@@ -69,9 +80,15 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
     tokenizer = contract["tokenizer"]
     if not isinstance(tokenizer, dict) or not isinstance(tokenizer.get("sha256"), str):
         raise ValueError("Offline KD metadata tokenizer must carry a sha256 fingerprint")
-    index_encoding_for_vocab(contract["logprob_vocab_size"])
+    if not blend:
+        index_encoding_for_vocab(contract["logprob_vocab_size"])
     if contract["attention_mode"] not in ATTENTION_MODES:
         raise ValueError(f"Unsupported offline KD attention_mode {contract['attention_mode']!r}")
+    if (
+        contract["attention_mode"] == "causal_eod_reset"
+        and type(tokenizer.get("eod_id")) is not int
+    ):
+        raise ValueError("Offline KD causal_eod_reset requires an integer tokenizer eod_id")
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
     if replay:
@@ -87,7 +104,8 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
 def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> tuple[list, list]:
     """Return ``(required, recorded)`` setting names whose values differ.
 
-    Required differences make two files incompatible; recorded ones are only reported.
+    Required differences make two files incompatible. Corpus callers additionally
+    enforce :func:`mismatched_corpus_order` on the recorded sample construction fields.
     """
     required = sorted(
         key
@@ -100,6 +118,30 @@ def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> tuple
         if meta.get("recorded", {}).get(key) != expected.get("recorded", {}).get(key)
     )
     return required, recorded
+
+
+def blend_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return the shared semantics of corpus sources, excluding per-file decoding.
+
+    EOD identity matters only when it defines attention boundaries. It is deliberately
+    outside the tokenizer fingerprint, and other producers may leave it unspecified.
+    """
+    shared = {key: contract[key] for key in BLEND_KEYS}
+    shared["tokenizer"] = {
+        key: value
+        for key, value in contract["tokenizer"].items()
+        if key != "eod_id" or contract["attention_mode"] == "causal_eod_reset"
+    }
+    return shared
+
+
+def mismatched_corpus_order(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
+    """Find changes that would splice different epochs into one corpus source."""
+    return [
+        key
+        for key in CORPUS_ORDER_KEYS
+        if meta.get("recorded", {}).get(key) != expected.get("recorded", {}).get(key)
+    ]
 
 
 def digest(data: bytes) -> str:

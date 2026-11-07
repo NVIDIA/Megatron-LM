@@ -13,8 +13,9 @@
 Labels are stored already shifted: ``labels[t]`` is the token that ``logits[t]`` should
 predict, and the teacher row at ``t`` comes from the teacher's logits at ``t``. Compare
 both with the student's logits at the same position; a model's built-in loss, which
-shifts labels again, does not apply. Packed samples carry positions that restart at
-every segment, as variable-length attention kernels expect.
+shifts labels again, does not apply. Packed and EOD-reset samples use an explicit 4D
+additive attention mask: select a model/backend that honors it (eager or SDPA standard
+attention). FlashAttention and recurrent/linear attention need their own boundary adapter.
 """
 
 from typing import Any, Iterator
@@ -37,7 +38,11 @@ def rank_positions(
 
 
 class CorpusStream(torch.utils.data.IterableDataset):
-    """One rank's samples of a planned blend, in order (resumable from a global position)."""
+    """One rank's samples, resumable from a global position; at most one loader worker.
+
+    This stream already assigns DP ranks. Do not apply another distributed dataset
+    sharder (for example Trainer/Accelerate's automatic sharding) on top of it.
+    """
 
     def __init__(
         self,
@@ -56,6 +61,12 @@ class CorpusStream(torch.utils.data.IterableDataset):
         self.reader_options = reader_options
 
     def __iter__(self) -> Iterator[dict]:
+        worker = torch.utils.data.get_worker_info()
+        if worker is not None and worker.num_workers > 1:
+            raise ValueError(
+                "CorpusStream requires DataLoader num_workers=0 or 1 to preserve replay order; "
+                "multiple workers would duplicate samples"
+            )
         reader = CorpusReader(self.root, self.manifest, **self.reader_options)
         total = self.manifest["lanes"] * self.manifest["lane_samples"]
         try:
@@ -71,19 +82,98 @@ class CorpusStream(torch.utils.data.IterableDataset):
             reader.close()
 
 
-def collate(samples: list[dict], *, pad_token_id: int = 0) -> dict[str, torch.Tensor]:
-    """Right-pad samples to the longest one; padding has zero loss weight and no targets."""
+def _attention_mask(
+    samples: list[dict], length: int, modes: list[str], eod_ids: list[int | None]
+) -> torch.Tensor:
+    """Preserve real-token attention independently of the scoring mask."""
+    if all(mode == "causal" for mode in modes):
+        mask = torch.zeros(len(samples), length, dtype=torch.long)
+        for row, sample in enumerate(samples):
+            mask[row, : sample["tokens"].numel()] = 1
+        return mask
+    mask = torch.full((len(samples), 1, length, length), torch.finfo(torch.float32).min)
+    for row, (sample, mode, eod_id) in enumerate(zip(samples, modes, eod_ids)):
+        n = sample["tokens"].numel()
+        if mode == "isolated_segments":
+            if "segments" not in sample:
+                raise ValueError("HF offline KD isolated_segments requires segment lengths")
+            segments = sample["segments"].long()
+            if (segments <= 0).any() or int(segments.sum()) != n:
+                raise ValueError("HF offline KD segments must cover the stored tokens exactly")
+            segment_ids = torch.repeat_interleave(torch.arange(segments.numel()), segments)
+        elif mode == "causal_eod_reset":
+            if type(eod_id) is not int:
+                raise ValueError("HF offline KD causal_eod_reset requires an eod_id")
+            # EOD belongs to the preceding context; the following token starts a new one.
+            segment_ids = torch.zeros(n, dtype=torch.long)
+            segment_ids[1:] = (sample["tokens"][:-1] == eod_id).long().cumsum(0)
+        else:
+            segment_ids = torch.zeros(n, dtype=torch.long)
+        positions = torch.arange(n)
+        allowed = (positions[:, None] >= positions[None, :]) & (
+            segment_ids[:, None] == segment_ids[None, :]
+        )
+        mask[row, 0, :n, :n].masked_fill_(allowed, 0.0)
+    return mask
+
+
+def collate(
+    samples: list[dict],
+    *,
+    pad_token_id: int = 0,
+    attention_mode: str | None = None,
+    eod_id: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Right-pad samples and preserve their contexts; pad top-K widths with sentinels.
+
+    Readers attach attention metadata to each sample. Hand-built samples can supply
+    it through the keyword arguments. Non-causal modes return a 4D additive mask for
+    eager/SDPA attention; plain causal samples use the usual 2D padding mask.
+    """
+    if not samples:
+        raise ValueError("Cannot collate an empty offline KD microbatch")
     length = max(sample["tokens"].numel() for sample in samples)
-    k = samples[0]["teacher_values"].shape[-1] if "teacher_values" in samples[0] else 0
+    if length == 0:
+        raise ValueError("Cannot collate an offline KD microbatch with no input tokens")
+    modes, eod_ids = [], []
+    for sample in samples:
+        mode = sample.get("attention_mode", attention_mode or "causal")
+        if mode not in ("causal", "causal_eod_reset", "isolated_segments"):
+            raise ValueError(f"Unsupported HF offline KD attention mode {mode!r}")
+        if attention_mode is not None and mode != attention_mode:
+            raise ValueError("HF collator attention_mode differs from the stored sample")
+        if (
+            "attention_mode" not in sample
+            and attention_mode is None
+            and "segments" in sample
+            and sample["segments"].numel() > 1
+        ):
+            raise ValueError("HF collator needs an explicit attention_mode for multiple segments")
+        stored_eod = sample.get("eod_id")
+        if (
+            mode == "causal_eod_reset"
+            and eod_id is not None
+            and stored_eod is not None
+            and stored_eod != eod_id
+        ):
+            raise ValueError("HF collator eod_id differs from the stored sample")
+        modes.append(mode)
+        eod_ids.append(stored_eod if stored_eod is not None else eod_id)
+    with_targets = "teacher_values" in samples[0]
+    if any(("teacher_values" in sample) != with_targets for sample in samples):
+        raise ValueError("Cannot mix offline KD samples with and without targets")
+    k = max(sample["teacher_values"].shape[-1] for sample in samples) if with_targets else 0
     batch = {
         "input_ids": torch.full((len(samples), length), pad_token_id, dtype=torch.long),
-        "attention_mask": torch.zeros(len(samples), length, dtype=torch.long),
+        "attention_mask": _attention_mask(samples, length, modes, eod_ids),
         "position_ids": torch.zeros(len(samples), length, dtype=torch.long),
         "labels": torch.full((len(samples), length), -100, dtype=torch.long),
         "loss_weights": torch.zeros(len(samples), length),
     }
     if k:
         dtype = samples[0]["teacher_values"].dtype
+        for sample in samples[1:]:
+            dtype = torch.promote_types(dtype, sample["teacher_values"].dtype)
         batch["teacher_values"] = torch.full(
             (len(samples), length, k), LOGPROB_SENTINEL, dtype=dtype
         )
@@ -93,14 +183,14 @@ def collate(samples: list[dict], *, pad_token_id: int = 0) -> dict[str, torch.Te
         n = sample["tokens"].numel()
         weights = sample["loss_mask"].float()
         batch["input_ids"][row, :n] = sample["tokens"].long()
-        batch["attention_mask"][row, :n] = 1
         batch["position_ids"][row, :n] = sample["position_ids"].long()
         batch["loss_weights"][row, :n] = weights
         batch["labels"][row, :n] = torch.where(weights != 0, sample["labels"].long(), -100)
         if k:
             scored = torch.nonzero(weights != 0).reshape(-1)
-            batch["teacher_values"][row, scored] = sample["teacher_values"]
-            batch["teacher_indices"][row, scored] = sample["teacher_indices"].long()
+            sample_k = sample["teacher_values"].shape[-1]
+            batch["teacher_values"][row, scored, :sample_k] = sample["teacher_values"].to(dtype)
+            batch["teacher_indices"][row, scored, :sample_k] = sample["teacher_indices"].long()
             batch["teacher_tail"][row, scored] = sample["teacher_tail"].float()
     return batch
 
@@ -115,12 +205,20 @@ def topk_kl(
     """Forward KL(teacher ‖ student) over the retained entries plus the residual bucket.
 
     Shapes: logits ``[B, T, V]``, targets ``[B, T, K]``, tail and weights ``[B, T]``.
-    Sentinel entries are skipped; the result is averaged over the total loss weight.
+    Sentinel entries are skipped; target IDs outside the student's output vocabulary
+    join the residual bucket. The result is averaged over the total loss weight.
     """
     logprobs = student_logits.float().log_softmax(-1)
     valid = teacher_values != LOGPROB_SENTINEL
     teacher = teacher_values.float()
-    student = logprobs.gather(-1, teacher_indices.clamp(0, logprobs.shape[-1] - 1))
+    if (valid & (teacher_indices < 0)).any():
+        raise ValueError("HF offline KD has an unmasked negative target index")
+    unknown = valid & (teacher_indices >= logprobs.shape[-1])
+    dropped = teacher.masked_fill(~unknown, -torch.inf).logsumexp(-1)
+    teacher_tail = torch.logaddexp(teacher_tail.float(), dropped)
+    valid = valid & ~unknown
+    teacher = teacher.masked_fill(~valid, LOGPROB_SENTINEL)
+    student = logprobs.gather(-1, teacher_indices.masked_fill(~valid, 0))
     student_tail = torch.log((1.0 - (student.exp() * valid).sum(-1)).clamp(min=1e-8))
     kl = (valid * teacher.exp() * (teacher - student)).sum(-1)
     kl = kl + teacher_tail.exp() * (teacher_tail - student_tail)

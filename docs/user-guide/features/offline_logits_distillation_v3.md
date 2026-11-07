@@ -65,6 +65,7 @@ Every file records the cache settings (see [Metadata](#metadata)). A teacher che
 against an existing file at startup, and students check every file before using its data:
 a file whose required settings differ is rejected, and differences in recorded settings
 (teacher, data, split, seed, sample budget, ...) are reported by name but don't block.
+Corpus sources additionally enforce the sample-order invariants described below.
 
 ### Corpus dumps
 
@@ -154,7 +155,10 @@ tokens:
   blocks. Each rank keeps about `lanes / DP × --logits-load-msc-prefetch-depth` blocks
   (16 MiB uncompressed each) in flight.
 
-The sources must share the required settings; a different teacher is reported. The plan
+The sources must share tokenizer identity, attention mode and prefix stability. Their
+normalization vocabulary sizes, index encodings and top-K widths may differ: decoding
+uses each file's vocabulary size, and collation pads K to the batch maximum with masked
+entries. EOD IDs must agree only for EOD-reset attention. A different teacher is reported. The plan
 is fixed by the checkpoint: a resume re-plans and refuses a different schedule (a changed
 config, budget or set of files). Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
@@ -166,6 +170,20 @@ order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `
 and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
 bucket as Megatron. Stored labels are already shifted to line up with the logits at the
 same position.
+
+`CorpusStream` already assigns samples to DP ranks; do not wrap it in another distributed
+dataset sharder (including automatic Trainer/Accelerate sharding). Use a DataLoader with
+`num_workers=0` or `1`; more workers are rejected rather than duplicating the stream.
+The reader attaches attention mode and EOD identity to each sample. For isolated segments
+and EOD-reset attention, the collator constructs a 4D additive block-causal mask, independent
+of loss weights. Use a standard-attention HF model/backend that honors custom masks
+(`eager` or `sdpa`); FlashAttention and recurrent/linear attention require a dedicated
+boundary adapter. The reference mask uses quadratic memory. Plain causal samples retain
+the usual 2D padding mask. Hand-built samples must supply equivalent attention metadata
+or pass `attention_mode` and, when needed, `eod_id` to `collate`.
+
+The HF loss uses the actual student logit width to move unsupported teacher target IDs
+into the residual bucket, even if `student_vocab_size` was not supplied to the reader.
 
 ### Reordering, subsets, and growing dumps
 
@@ -291,14 +309,16 @@ identically in every implementation.
 ```
 
 Every file stores its inputs next to its targets, so a file is self-consistent on its
-own. Only settings that change how a reader interprets a file are required (`contract`);
-they must be identical across every file of a cache, whichever producer wrote it, and a
-mismatch is an error:
+own. Settings needed to interpret a file are required (`contract`). Files in one replay
+cache or corpus source must agree on them. Across sources in a corpus blend, only token
+identity, attention mode and prefix stability must agree; normalization domain and writer
+layout remain per source/file. The blend manifest records its shared contract separately
+and pins each file's normalization size:
 
 | Required key | Meaning |
 | --- | --- |
 | `tokenizer` | `{"sha256", "size", "special_ids", "eod_id"}` (see [Tokenizer fingerprint](#tokenizer-fingerprint)); must match the student's |
-| `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it, and it fixes the index encoding (`u16` up to 65536, else `u16+u8`) |
+| `logprob_vocab_size` | Per-file size of the vocabulary the teacher normalized over; every valid index is below it, and it fixes the index encoding (`u16` up to 65536, else `u16+u8`). Sources in a blend may differ |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)); must match the student's |
 | `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten samples only when it is true |
 | `writers`, `writer_mbs` | Writer layout: sample `x` of a flush range starting at `s` lives in writer `((x-s)//mbs) % writers`, at row `((x-s)//(mbs·writers))·mbs + (x-s)%mbs` of that writer's file |
@@ -309,14 +329,18 @@ mismatch is an error:
 [Stored records](#stored-records)).
 
 `recorded` settings describe how the data was produced. They are optional for other
-producers, and differences between files or dump jobs are reported by name, never fatal:
+producers. Replay reports differences by name. Within one corpus source, `data`, `seed`,
+`builder`, `seq_length` and `padding_divisor` must remain identical across files and resumed
+or parallel dump jobs: splicing different sample streams would break one-epoch coverage.
+These fields may differ freely between separate sources. Changing source contents in
+place is not detected; use a new source directory for a revised dataset.
 
 | Recorded key | Megatron writes |
 | --- | --- |
 | `teacher` | `--load` plus the checkpoint iteration, e.g. `/ckpts/teacher@2000` |
 | `seq_length` | `--seq-length` |
 | `padding_divisor` | Per-segment padding granularity the writer used (1 when segments were not padded) |
-| `data` | `--data-path` as `[[weight, file basename], ...]` |
+| `data` | Replay: path-agnostic blend description; corpus: the full source path (canonical local path, or unchanged storage URI), or mock-data identity |
 | `split` | `--split` |
 | `seed` | `--seed` |
 | `num_samples` | The training sample budget (required, in `contract`, for corpus dumps) |
@@ -368,7 +392,9 @@ rows back at their positions; positions without a row get sentinel targets.
   temperature belongs in the student loss.
 - Every row has exactly K entries. A logprob of `-1000` marks a masked or unavailable
   entry; its decoded index must be ignored. Rows with fewer than K available entries are
-  filled with it.
+  filled with it. K is fixed within an Arrow file; files from different sources may use
+  different K. Readers pad narrower rows with masked entries when constructing a batch,
+  without changing their stored tail.
 - `tail` (optional, but always written by Megatron) is the log of the
   probability mass outside each row's retained entries, including entries masked by
   top-P: `log(1 - sum(exp(retained)))`. Writers compute it from full-precision log
@@ -451,6 +477,8 @@ only scores token IDs.
    the stored segment then matches what a Megatron SFT dataset produces.
 4. Set `loss_mask` to zero on tokens that are not trained on, e.g. from
    `apply_chat_template(..., return_assistant_tokens_mask=True)` for assistant-only loss.
+   Shift this token mask with the labels: weight at input position `t` describes whether
+   its label (token `t + 1`) is supervised, not whether input token `t` is an assistant token.
    Positions count from 0 within each segment.
 
 **Teacher-generated responses.** To distill on responses the teacher writes (sequence-level
@@ -474,8 +502,12 @@ row, but its final label is then the sampled token rather than a data label.
 - A student checks each pack against its own length after re-padding every segment to
   its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
   students you expect; record the headroom you used as `padding_divisor`.
-- Set `logprob_vocab_size` to the model's `config.vocab_size` and fingerprint the
-  tokenizer with `hf_tokenizer_identity`.
+- Set `logprob_vocab_size` to the actual number of vocabulary entries included in the
+  raw log-softmax (normally `config.vocab_size`, not a rounded embedding allocation),
+  and fingerprint the tokenizer with `hf_tokenizer_identity`. A Megatron source may
+  normalize over additional padding entries; this does not prevent blending the sources
+  when their true tokenizer identities match. Unsupported retained IDs join the student's
+  residual bucket rather than being reassigned to real tokens.
 - Set `prefix_stable` to false when the model's `rope_scaling` depends on the sequence
   length (`"dynamic"`, or `"longrope"` when sequences may exceed
   `original_max_position_embeddings`), true otherwise.

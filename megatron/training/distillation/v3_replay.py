@@ -15,8 +15,9 @@ import numpy as np
 import torch
 
 from .format.arrow import block_range, check_index, decode_block, file_meta, read_block
+from .format.contract import blend_contract
 from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
-from .v3_storage import FileName, Storage, complete_ranges, list_published, read_index
+from .v3_storage import FileName, Storage, list_published, read_index, validate_published_ranges
 
 
 def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
@@ -141,15 +142,9 @@ def discover_groups(
     """
     validate_metadata(metadata)
     contract = metadata["contract"]
-    ranges = complete_ranges(list_published(storage), contract["writers"])
-    unit = contract["writer_mbs"] * contract["writers"]
-    previous = None
-    for start, end in ranges:
-        if end <= start or (end - start) % unit:
-            raise ValueError(f"Offline KD v3 range {start}-{end} is not whole writer microbatches")
-        if previous is not None and start < previous[1]:
-            raise ValueError(f"Overlapping offline KD v3 ranges {previous} and {(start, end)}")
-        previous = (start, end)
+    ranges = validate_published_ranges(
+        list_published(storage), contract["writers"], contract["writer_mbs"]
+    )
     by_start = dict(ranges)
     groups = []
     cursor = contract["first_sample"]
@@ -265,7 +260,10 @@ class _BlockReader:
     ) -> tuple[dict, tuple | None]:
         """Decode and validate one block."""
         batch = read_block(index, block, raw, inputs_only=not self.targets)
-        inputs, targets = decode_block(batch, vocab_size=self.contract["logprob_vocab_size"])
+        # Normalization domain and index encoding belong to this file, not the blend.
+        inputs, targets = decode_block(
+            batch, vocab_size=file_meta(index)["contract"]["logprob_vocab_size"]
+        )
         if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
             raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
         inputs["segment_offsets"] = torch.cat(
@@ -307,12 +305,13 @@ class _BlockReader:
                 )
         return values, indices, tail
 
-    @staticmethod
-    def slice_sample(inputs: dict, targets: tuple | None, row: int, sample_id: int) -> dict:
+    def slice_sample(self, inputs: dict, targets: tuple | None, row: int, sample_id: int) -> dict:
         """Cut one sample (and its target rows) out of a decoded block."""
         a, b = inputs["sample_offsets"][row : row + 2].tolist()
         sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
         sample["sample_id"] = sample_id
+        sample["attention_mode"] = self.contract["attention_mode"]
+        sample["eod_id"] = self.contract["tokenizer"].get("eod_id")
         s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
         sample["segments"] = inputs["segment_lengths"][s0:s1]
         if targets is not None:
@@ -562,8 +561,13 @@ class CorpusReader(_BlockReader):
                 "was planned"
             )
         check_index(index, storage.size(name.data))
-        contract = file_meta(index)["contract"]
-        differing = [key for key in self.contract if contract.get(key) != self.contract[key]]
+        metadata = file_meta(index)
+        validate_metadata(metadata, corpus=True)
+        contract = metadata["contract"]
+        shared = blend_contract(contract)
+        differing = [key for key in self.contract if shared.get(key) != self.contract[key]]
+        if contract["logprob_vocab_size"] != entry["logprob_vocab_size"]:
+            differing.append("logprob_vocab_size")
         if differing:
             raise ValueError(
                 f"Offline KD corpus file {entry['folder']}/{name.data} differs from the blend on "
@@ -677,6 +681,9 @@ def collate_samples(
     fields = {field: [] for field in TOKEN_FIELDS}
     boundary_rows, values, indices, tails = [], [], [], []
     with_targets = "teacher_values" in samples[0]
+    if any(("teacher_values" in sample) != with_targets for sample in samples):
+        raise ValueError("Cannot mix offline KD samples with and without targets")
+    k = max(sample["teacher_values"].shape[-1] for sample in samples) if with_targets else 0
     for sample in samples:
         source, positions, boundaries = _layout_sample(
             sample, seq_length, packed=packed, divisor=divisor, prefix_stable=prefix_stable
@@ -701,14 +708,14 @@ def collate_samples(
             has_row = real.clone()
             has_row[real] = scored[source[real]]
             rows = row_of[source[has_row]]
-            k = sample["teacher_values"].shape[-1]
+            sample_k = sample["teacher_values"].shape[-1]
             row_values = torch.full(
                 (seq_length, k), LOGPROB_SENTINEL, dtype=sample["teacher_values"].dtype
             )
             row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
             row_tail = torch.zeros(seq_length, dtype=torch.float32)
-            row_values[has_row] = sample["teacher_values"][rows]
-            row_indices[has_row] = sample["teacher_indices"][rows]
+            row_values[has_row, :sample_k] = sample["teacher_values"][rows]
+            row_indices[has_row, :sample_k] = sample["teacher_indices"][rows]
             row_tail[has_row] = sample["teacher_tail"][rows]
             values.append(row_values)
             indices.append(row_indices)

@@ -9,6 +9,7 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
+from .format.contract import blend_contract, mismatched_corpus_order
 from .v3_format import (
     FORMAT_VERSION,
     attention_mode_for_layout,
@@ -330,6 +331,15 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         settings["recorded"].pop("num_samples")
         settings["contract"]["num_samples"] = args.kd_corpus_samples
         settings["recorded"].pop("split")  # A corpus source is never split.
+        # A basename is useful provenance for replay, but insufficient to identify a
+        # corpus source when appending another job's part of the same epoch.
+        paths = getattr(args, "data_path", None) or []
+        if paths and not getattr(args, "mock_data", False):
+            path = str(paths[0])
+            settings["recorded"]["data"] = {
+                "kind": "corpus",
+                "path": path if "://" in path else os.path.realpath(path),
+            }
     # Compare exactly what a JSON round trip through the files' schema metadata preserves.
     return json.loads(json.dumps(settings))
 
@@ -358,7 +368,10 @@ def _check_corpus_sources(root: str, own: str, expected: dict) -> list[str]:
             continue
         seen.add(folder)
         meta = read_meta(Storage(os.path.join(root, folder)), parse_name(os.path.basename(name)))
-        if meta["contract"]["tokenizer"] != expected["contract"]["tokenizer"]:
+        if (
+            blend_contract(meta["contract"])["tokenizer"]
+            != blend_contract(expected["contract"])["tokenizer"]
+        ):
             raise ValueError(f"Corpus source {folder} uses a different tokenizer")
         differing.update(mismatched_settings(meta, expected)[1])
     return sorted(differing & {"teacher"})
@@ -398,6 +411,8 @@ def initialize_dump_metadata(saver: Any) -> dict:
                         "contract": {**expected["contract"], "first_sample": first_sample},
                     },
                 )
+                if root is not None:
+                    required += mismatched_corpus_order(existing, expected)
                 if required:
                     raise ValueError(
                         f"Teacher settings differ from existing v3 files ({', '.join(required)}); "
@@ -435,10 +450,15 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
 
 def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = True) -> None:
-    validate_metadata(metadata, replay=replay)
+    validate_metadata(metadata, replay=replay, blend=not replay)
     contract = metadata["contract"]
-    if contract["tokenizer"]["sha256"] != tokenizer_identity()["sha256"]:
+    student_tokenizer = tokenizer_identity()
+    if contract["tokenizer"]["sha256"] != student_tokenizer["sha256"]:
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
+    if contract["attention_mode"] == "causal_eod_reset" and contract["tokenizer"][
+        "eod_id"
+    ] != student_tokenizer.get("eod_id"):
+        raise ValueError("Offline KD v3 EOD attention-boundary token mismatch")
     if args.padded_vocab_size < contract["tokenizer"]["size"]:
         raise ValueError(
             f"Student vocabulary ({args.padded_vocab_size}) is smaller than the tokenizer "
@@ -875,7 +895,9 @@ def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
     if args.create_attention_mask_in_dataloader:
         from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 
-        eod = _PLAN["metadata"]["contract"]["tokenizer"]["eod_id"]
+        # A causal corpus need not assign an EOD boundary token. It is unused when
+        # attention resets are disabled; stored positions and loss weights are retained.
+        eod = _PLAN["metadata"]["contract"]["tokenizer"].get("eod_id", -1)
         result["attention_mask"] = torch.stack(
             [
                 _get_ltor_masks_and_position_ids(

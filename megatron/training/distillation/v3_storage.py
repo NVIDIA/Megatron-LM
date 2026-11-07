@@ -207,6 +207,28 @@ def complete_ranges(published: list[FileName], writers: int) -> list[tuple[int, 
     return sorted(span for span, found in present.items() if set(range(writers)) <= found)
 
 
+def validate_published_ranges(
+    published: list[FileName], writers: int, writer_mbs: int
+) -> list[tuple[int, int]]:
+    """Validate writer IDs and disjoint microbatch ranges; return complete ranges.
+
+    Partial groups participate in overlap validation too: they must never contribute
+    duplicate rows alongside a complete group with another range.
+    """
+    unit = writers * writer_mbs
+    for name in published:
+        if not 0 <= name.dp_rank < writers:
+            raise ValueError(f"Offline KD v3 file {name.index} has an invalid writer rank")
+    previous = None
+    for start, end in sorted({(name.start, name.end) for name in published}):
+        if start < 0 or end <= start or (end - start) % unit:
+            raise ValueError(f"Offline KD v3 range {start}-{end} is not whole writer microbatches")
+        if previous is not None and start < previous[1]:
+            raise ValueError(f"Overlapping offline KD v3 ranges {previous} and {(start, end)}")
+        previous = (start, end)
+    return complete_ranges(published, writers)
+
+
 def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = None) -> int:
     """Return the end of the contiguous run of ``ranges`` beginning at ``start``."""
     by_start = dict(ranges)
