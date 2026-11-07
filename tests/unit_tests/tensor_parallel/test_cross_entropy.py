@@ -5,9 +5,11 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.language_module import language_module as language_module_module
 from megatron.core.tensor_parallel import cross_entropy as cross_entropy_module
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -104,6 +106,45 @@ def test_language_module_loss_returns_argmax_of_the_cross_entropy():
             module, labels=labels, logits=logits
         )
         assert loss.shape == labels.shape
+
+
+def test_language_module_loss_on_gathered_logits_matches_full_vocab_cross_entropy():
+    """Gathered logits give the loss and gradients of the full vocabulary (#7452, finding 2).
+
+    With `parallel_output=False` or `runtime_gather_output=True`, every TP rank holds all the
+    logits. Passed to the vocab-parallel cross entropy as they are, the loss is log(tp_size) too
+    high and the gradients lose the target term; this rank's shard of them gives the exact loss.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=4)
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    tp_size, tp_rank = tp_group.size(), tp_group.rank()
+    language_module = language_module_module.LanguageModule
+    module = SimpleNamespace(
+        tp_group=tp_group, vocab_parallel_cross_entropy=cross_entropy_module.unfused_cross_entropy
+    )
+    seq_length, batch_size, vocab_size = 5, 3, 16
+    generator = torch.Generator().manual_seed(1234)
+    logits = torch.randn(seq_length, batch_size, vocab_size, generator=generator).cuda()
+    labels = torch.randint(0, vocab_size, (batch_size, seq_length), generator=generator).cuda()
+
+    full_logits = logits.clone().requires_grad_()
+    expected_loss = torch.nn.functional.cross_entropy(
+        full_logits.reshape(-1, vocab_size), labels.transpose(0, 1).reshape(-1), reduction="none"
+    )
+    expected_loss = expected_loss.view(seq_length, batch_size).transpose(0, 1)
+    expected_loss.sum().backward()
+
+    shard = logits.chunk(tp_size, dim=-1)[tp_rank].clone().requires_grad_()
+    assert language_module._vocab_parallel_logits(module, shard, False) is shard
+    gathered = gather_from_tensor_model_parallel_region(shard, group=tp_group)
+    loss = language_module.compute_language_model_loss(
+        module, labels, language_module._vocab_parallel_logits(module, gathered, True)
+    )
+    loss.sum().backward()
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(shard.grad, full_logits.grad.chunk(tp_size, dim=-1)[tp_rank])
+    Utils.destroy_model_parallel()
 
 
 def test_vocab_parallel_cross_entropy():
