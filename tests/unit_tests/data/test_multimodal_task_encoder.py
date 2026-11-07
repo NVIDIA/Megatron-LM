@@ -2,6 +2,7 @@
 
 import importlib
 import io
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,9 @@ from examples.multimodal.data_loading.task_encoder import (
 
 @pytest.mark.parametrize("consumer", ["tiling", "task_encoder", "legacy_task_encoder"])
 def test_preprocessing_rejects_non_vision_model(monkeypatch, run_config, consumer):
+    # The legacy example imports sibling modules by name. Set its script path
+    # explicitly instead of relying on another test module to modify sys.path.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "examples/multimodal"))
     from examples.multimodal import dataset_helpers
     from examples.multimodal.data_loading.image_processing import create_image_tiling_strategy
 
