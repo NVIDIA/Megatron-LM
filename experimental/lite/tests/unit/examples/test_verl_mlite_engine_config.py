@@ -86,6 +86,57 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
+def test_runtime_batches_move_to_device_lazily(monkeypatch) -> None:
+    engine = _engine(engine_config=_engine_config(router_replay_mode="disabled"))
+    moved = []
+
+    class MicroBatch(dict):
+        def to(self, device):
+            moved.append((self["id"], device))
+            return self
+
+    micro_batches = [MicroBatch(id=0), MicroBatch(id=1)]
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.tu.get_non_tensor_data",
+        lambda **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.tu.assign_non_tensor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_id", lambda: "cuda:0")
+    engine.get_data_parallel_size = lambda: 1
+    engine.is_mp_src_rank_with_outputs = lambda: False
+    engine._make_runtime_batch = lambda batch: SimpleNamespace(
+        id=batch["id"], routed_experts=None
+    )
+    engine._make_runtime_loss_context = lambda batch, **_kwargs: LossContext(
+        source_batch=batch
+    )
+    engine.handle = object()
+
+    class Runtime:
+        @staticmethod
+        def forward_backward(_handle, data, **_kwargs):
+            assert moved == []
+            first_batch, _ = next(data)
+            assert first_batch.id == 0
+            assert moved == [(0, "cuda:0")]
+            second_batch, _ = next(data)
+            assert second_batch.id == 1
+            assert moved == [(0, "cuda:0"), (1, "cuda:0")]
+            return SimpleNamespace(metrics={}, model_output=SimpleNamespace(loss=None))
+
+    engine.runtime = Runtime()
+    engine._forward_backward_batch_with_runtime(
+        data=object(),
+        micro_batches=micro_batches,
+        indices=None,
+        loss_function=None,
+        forward_only=False,
+    )
+
+
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),

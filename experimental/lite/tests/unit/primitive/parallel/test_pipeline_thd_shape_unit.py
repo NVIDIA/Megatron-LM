@@ -52,6 +52,8 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
     model = _MockModel(hidden)
     recorded_fwd, recorded_bwd = [], []
     fwd_q, bwd_q = list(fwd_shapes), list(fwd_shapes)  # both arrive in mb order
+    consumed_batches = 0
+    forward_calls = 0
 
     def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape,
                  *, fwd_recv_buf=None, bwd_recv_buf=None, batch_p2p=True,
@@ -68,6 +70,9 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         return fwd_out, bwd_out
 
     def forward_step_fn(m, batch):
+        nonlocal forward_calls
+        forward_calls += 1
+        assert consumed_batches == forward_calls, "1F1B prefetched batches before forward"
         s = int(batch["S"])
         if ps.pp_is_first:
             base = torch.ones(s, 1, hidden, requires_grad=True)
@@ -84,10 +89,17 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         return out
 
     batches = [{"S": s} for s in seq_lens]
+
+    def batch_iter():
+        nonlocal consumed_batches
+        for batch in batches:
+            consumed_batches += 1
+            yield batch, None
+
     orig_srp, pl._send_recv_pipeline = pl._send_recv_pipeline, fake_srp
     try:
         pl._1f1b_schedule(
-            forward_step_fn, model, iter([(b, None) for b in batches]),
+            forward_step_fn, model, iter(batch_iter()),
             num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
     finally:
         pl._send_recv_pipeline = orig_srp
