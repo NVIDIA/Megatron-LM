@@ -1268,6 +1268,130 @@ def test_dump_validation_rejects_unsafe_options(runtime_environment, change, mes
         runtime.validate_options(args)
 
 
+corpus = importlib.import_module(f"{_namespace}.corpus_runtime")
+
+
+def corpus_args(args, tmp_path, name="web"):
+    dump_args(args)
+    args.logits_save_dir = str(tmp_path)
+    args.kd_corpus_dump, args.kd_corpus_split = name, "train"
+    args.data_path, args.mock_data, args.eval_iters, args.train_samples = (
+        ["web_text"],
+        False,
+        0,
+        None,
+    )
+    return args
+
+
+def test_corpus_dump_validation_sets_its_folder_and_one_epoch_budget(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    corpus_args(args, tmp_path)
+    runtime.validate_options(args)
+    assert args.logits_save_inputs and args.kd_corpus_root == str(tmp_path)
+    assert args.logits_save_dir == str(tmp_path / "web" / "train")
+    assert args.train_iters * args.global_batch_size >= 1 << 39  # Until the epoch is known.
+    runtime.validate_options(args)  # Idempotent.
+    assert args.logits_save_dir == str(tmp_path / "web" / "train")
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"freeze_all_layers": False}, "frozen teacher"),
+        ({"data_path": ["0.5", "a", "0.5", "b"]}, "exactly one unweighted"),
+        ({"eval_iters": 10}, "--eval-iters 0"),
+        ({"train_samples": 100}, "omit --train-samples"),
+        ({"kd_corpus_dump": "a/b"}, "plain directory name"),
+        ({"valid_data_path": ["v"]}, "valid-data-path"),
+    ],
+)
+def test_corpus_dump_validation_rejects_other_setups(
+    tmp_path, runtime_environment, change, message
+):
+    args, runtime, _ = runtime_environment
+    corpus_args(args, tmp_path)
+    for key, value in change.items():
+        setattr(args, key, value)
+    with pytest.raises(ValueError, match=message):
+        runtime.validate_options(args)
+
+
+def test_corpus_epoch_is_one_seeded_permutation_padded_to_whole_batches():
+    class Rows:
+        """An SFT-like dataset: built with num_samples=None, its length is its rows."""
+
+        num_samples = None
+        indices = np.arange(10)
+
+        def __len__(self):
+            return self.num_samples
+
+        def __getitem__(self, index):
+            return {"row": index}
+
+    epoch = corpus.CorpusEpoch(Rows(), seed=3, global_batch_size=4)
+    assert (epoch.num_samples, len(epoch)) == (10, 12)
+    rows = [epoch[i]["row"] for i in range(12)]
+    assert sorted(rows[:10]) == list(range(10)) and rows[10:] == rows[:2]  # Filler repeats.
+    again = corpus.CorpusEpoch(Rows(), seed=3, global_batch_size=4)
+    assert [again[i]["row"] for i in range(10)] == rows[:10]
+    other = corpus.CorpusEpoch(Rows(), seed=4, global_batch_size=4)
+    assert [other[i]["row"] for i in range(10)] != rows[:10]
+
+
+def test_corpus_epoch_length_sizes_the_run(runtime_environment):
+    args, _, _ = runtime_environment
+    args.kd_corpus_dump, args.kd_corpus_split, args.kd_corpus_samples = "web", "train", 17
+    corpus.agree_corpus_epoch(args)
+    assert args.train_iters == 3  # 17 samples in global batches of 8.
+
+
+def test_corpus_metadata_requires_the_epoch_size(tmp_path, runtime_environment):
+    args, runtime, _ = runtime_environment
+    corpus_args(args, tmp_path)
+    runtime.validate_options(args)
+    args.kd_corpus_samples = 20
+    metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
+    assert metadata["contract"]["num_samples"] == 20 and "num_samples" not in metadata["recorded"]
+    assert metadata["recorded"]["split"] == "99,1,0:train"
+    metadata["contract"]["first_sample"] = 0
+    codec.validate_metadata(metadata, corpus=True)
+    del metadata["contract"]["num_samples"]
+    with pytest.raises(ValueError, match="num_samples"):
+        codec.validate_metadata(metadata, corpus=True)
+
+
+def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, capsys):
+    args, runtime, _ = runtime_environment
+    corpus_args(args, tmp_path, name="code")
+    runtime.validate_options(args)
+    args.kd_corpus_samples = 32
+    metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
+    metadata["contract"]["first_sample"] = 0
+    other = json.loads(json.dumps(metadata))
+    other["contract"]["num_samples"] = 64  # Sources differ in size and data, but share a teacher.
+    other["recorded"]["teacher"] = "/other@1"
+    write_cache(tmp_path / "web" / "train", metadata=other, iterations=2)
+    saver = teacher_saver(runtime, tmp_path / "code" / "train")
+    runtime.initialize_dump_metadata(saver)
+    assert "recorded settings (teacher)" in capsys.readouterr().out
+    other["contract"]["tokenizer"] = {**other["contract"]["tokenizer"], "sha256": "different"}
+    write_cache(tmp_path / "math" / "train", metadata=other, iterations=2)
+    with pytest.raises(RuntimeError, match="math/train uses a different tokenizer"):
+        runtime.initialize_dump_metadata(saver)
+
+
+def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
+    write_cache(tmp_path / "web" / "train", iterations=2)
+    assert Storage(str(tmp_path)).list("*/*/dp0__*.index.json") == [
+        "web/train/dp0__0-16.index.json"
+    ]
+    assert Storage(str(tmp_path / "web" / "train")).list("dp0__*.index.json") == [
+        "dp0__0-16.index.json"
+    ]
+
+
 def test_unfrozen_teacher_may_use_dropout(runtime_environment):
     # An unfrozen teacher's dump is a record of its training run, dropout included.
     args, runtime, _ = runtime_environment

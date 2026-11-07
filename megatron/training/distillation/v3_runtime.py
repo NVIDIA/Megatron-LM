@@ -3,6 +3,7 @@
 """Small integration hooks for paired dumping, replay, and checkpoint resume."""
 
 import json
+import os
 from typing import Any, Callable
 
 import torch
@@ -25,6 +26,7 @@ from .v3_storage import (
     discard_unpublished,
     has_legacy_tars,
     list_published,
+    parse_name,
     read_meta,
 )
 
@@ -37,6 +39,9 @@ _STAGED_TARGETS = None
 
 def validate_options(args: Any) -> None:
     """Validate only opted-in v3 behavior; legacy flags keep their semantics."""
+    from .corpus_runtime import validate_corpus_dump
+
+    validate_corpus_dump(args)
     saving = getattr(args, "logits_save_inputs", False)
     loading = getattr(args, "logits_load_inputs", False)
     if saving and not args.logits_save_dir:
@@ -312,6 +317,11 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             "save_interval": args.save_interval,
         },
     }
+    if getattr(args, "kd_corpus_dump", None):
+        # A corpus source's extent is part of its contract: it defines completeness.
+        settings["recorded"].pop("num_samples")
+        settings["contract"]["num_samples"] = args.kd_corpus_samples
+        settings["recorded"]["split"] = f"{settings['recorded']['split']}:{args.kd_corpus_split}"
     # Compare exactly what a JSON round trip through the files' schema metadata preserves.
     return json.loads(json.dumps(settings))
 
@@ -324,6 +334,26 @@ def _report_recorded_differences(differing: list[str], where: str) -> None:
             "files remain usable, but check this was intended",
             flush=True,
         )
+
+
+def _check_corpus_sources(root: str, own: str, expected: dict) -> list[str]:
+    """Compare this source with one published file of every other source in the corpus.
+
+    All sources of a corpus must share a tokenizer; other differences (for example the
+    teacher) are returned for reporting.
+    """
+    storage = Storage(root)
+    seen, differing = set(), set()
+    for name in storage.list("*/*/dp*__*.index.json"):
+        folder = os.path.dirname(name)
+        if folder == own or folder in seen:
+            continue
+        seen.add(folder)
+        meta = read_meta(Storage(os.path.join(root, folder)), parse_name(os.path.basename(name)))
+        if meta["contract"]["tokenizer"] != expected["contract"]["tokenizer"]:
+            raise ValueError(f"Corpus source {folder} uses a different tokenizer")
+        differing.update(mismatched_settings(meta, expected)[1])
+    return sorted(differing & {"teacher"})
 
 
 def initialize_dump_metadata(saver: Any) -> dict:
@@ -345,11 +375,15 @@ def initialize_dump_metadata(saver: Any) -> dict:
             files = list_published(storage)
             first_sample = 0 if frozen else args.consumed_train_samples
             differing = []
+            root = getattr(args, "kd_corpus_root", None)
+            if root is not None:
+                own = os.path.relpath(saver.save_dir, root)
+                differing += _check_corpus_sources(root, own, expected)
             if files:
                 existing = read_meta(storage, files[0])
-                validate_metadata(existing)
+                validate_metadata(existing, corpus=root is not None)
                 first_sample = existing["contract"]["first_sample"]
-                required, differing = mismatched_settings(
+                required, recorded = mismatched_settings(
                     existing,
                     {
                         **expected,
@@ -361,6 +395,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
                         f"Teacher settings differ from existing v3 files ({', '.join(required)}); "
                         "use a new save directory"
                     )
+                differing += recorded
             start_iteration, end_iteration = dump_range(args)
             start = first_sample if start_iteration is None else start_iteration * gbs
             end = end_iteration * gbs

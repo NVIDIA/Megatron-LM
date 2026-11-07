@@ -93,11 +93,19 @@ class Storage:
         )
 
     def list(self, pattern: str) -> list[str]:
-        """List fresh object names; never cache a growing-cache listing."""
+        """List fresh object names relative to the root; never cache a growing listing."""
         paths = (
             self.backend.glob(self.path(pattern)) if self.remote else glob.glob(self.path(pattern))
         )
-        return sorted(os.path.basename(str(path)) for path in paths)
+        prefix = self.path("")
+        return sorted(
+            (
+                str(path)[len(prefix) :]
+                if str(path).startswith(prefix)
+                else os.path.basename(str(path))
+            )
+            for path in paths
+        )
 
     def remove(self, name: str) -> None:
         """Delete an object."""

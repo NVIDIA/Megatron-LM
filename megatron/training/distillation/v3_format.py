@@ -15,6 +15,7 @@ import torch
 
 from .format.contract import (  # noqa: F401  (re-exported for V3 callers)
     ATTENTION_MODES,
+    CORPUS_KEYS,
     FORMAT_VERSION,
     LOGPROB_SENTINEL,
     MASS_TOLERANCE,

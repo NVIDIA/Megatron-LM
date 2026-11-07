@@ -27,6 +27,8 @@ ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 REQUIRED_KEYS = ("tokenizer", "logprob_vocab_size", "attention_mode", "prefix_stable")
 # Replay dumps also need the writer layout that maps a global sample to its file and row.
 REPLAY_KEYS = ("writers", "writer_mbs", "first_sample")
+# A corpus source also needs its epoch size, which defines when it is complete.
+CORPUS_KEYS = ("num_samples",)
 # Recorded only: where the data came from and how it was produced.
 RECORDED_KEYS = (
     "teacher",
@@ -47,7 +49,7 @@ def index_encoding_for_vocab(vocab_size: int) -> str:
     return "u16" if vocab_size <= 1 << 16 else "u16+u8"
 
 
-def validate_metadata(meta: dict[str, Any], *, replay: bool = True) -> None:
+def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool = False) -> None:
     """Reject metadata a reader cannot interpret.
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
@@ -57,7 +59,7 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True) -> None:
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")
     contract = meta.get("contract")
-    keys = REQUIRED_KEYS + (REPLAY_KEYS if replay else ())
+    keys = REQUIRED_KEYS + (REPLAY_KEYS if replay else ()) + (CORPUS_KEYS if corpus else ())
     missing = [key for key in keys if not isinstance(contract, dict) or key not in contract]
     if missing:
         raise ValueError(f"Offline KD metadata is missing required settings: {', '.join(missing)}")
@@ -78,6 +80,8 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True) -> None:
                 raise ValueError(f"Offline KD metadata {key} must be a positive integer")
         if type(contract["first_sample"]) is not int or contract["first_sample"] < 0:
             raise ValueError("Offline KD metadata first_sample must be a nonnegative integer")
+    if corpus and (type(contract["num_samples"]) is not int or contract["num_samples"] < 1):
+        raise ValueError("Offline KD corpus metadata num_samples must be a positive integer")
 
 
 def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> tuple[list, list]:

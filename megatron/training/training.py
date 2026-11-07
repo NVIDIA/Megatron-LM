@@ -6251,7 +6251,16 @@ def build_train_valid_test_data_loaders(
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+        if getattr(args, "kd_corpus_dump", None):
+            from megatron.training.distillation.corpus_runtime import build_corpus_dump_datasets
+
+            train_ds, valid_ds, test_ds = build_corpus_dump_datasets(
+                args, build_train_valid_test_datasets_provider
+            )
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider
+            )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
         if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
@@ -6285,6 +6294,11 @@ def build_train_valid_test_data_loaders(
         do_test = test_dataloader is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
     else:
         do_train, do_valid, do_test = False, False, False
+
+    if getattr(args, "kd_corpus_dump", None):
+        from megatron.training.distillation.corpus_runtime import agree_corpus_epoch
+
+        agree_corpus_epoch(args)  # Every rank sizes the run to the source's epoch.
 
     broadcast_data_flags(do_train=do_train, do_valid=do_valid, do_test=do_test)
     return train_dataloader, valid_dataloaders, test_dataloader

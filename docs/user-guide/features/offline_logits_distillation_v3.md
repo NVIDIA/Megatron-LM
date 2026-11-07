@@ -66,6 +66,36 @@ against an existing file at startup, and students check every file before using 
 a file whose required settings differ is rejected, and differences in recorded settings
 (teacher, data, split, seed, sample budget, ...) are reported by name but don't block.
 
+### Corpus dumps
+
+A corpus dump scores one source dataset into its own folder, so that dumps of several
+sources can later be blended like ordinary dataset files instead of replayed as one run.
+It is a frozen-teacher dump with three restrictions: one unweighted `--data-path` prefix
+(or SFT file), exactly one epoch of it as Megatron builds it (GPT windows or SFT rows, at
+the teacher's `--seq-length`), and a seeded permutation of that epoch (`--seed`), so
+every block is a random sample of the source:
+
+```sh
+for source in web_crawl math_sft code; do
+  torchrun ... pretrain_gpt.py <frozen teacher args> --eval-iters 0 \
+    --data-path "$DATA/$source" --kd-corpus-dump "$source" \
+    --logits-save-dir "$CORPUS" --logits-save-top-k 128 \
+    --save "$PROGRESS/$source" --save-interval 100
+done
+```
+
+Each job writes `<corpus>/<source>/<split>/` (`--kd-corpus-split train` or `valid` picks
+the `--split` part) and sizes itself to the epoch, ignoring `--train-iters`. Jobs for
+different sources can run in parallel, and each source can itself be split into parallel
+range jobs as above. Sources of one corpus must share a tokenizer (a job refuses to start
+otherwise); a different teacher is reported, not refused.
+
+The epoch is padded to a whole number of global batches by repeating its first samples;
+the source's epoch size is recorded as the required `num_samples` setting, and samples at
+or beyond it are filler that corpus readers ignore. A source is complete when its files
+cover `[0, num_samples)` padded to whole batches. Megatron's own dataset builder decides
+the samples, so SFT truncation and pretraining windows are exactly as in training.
+
 ## Loading
 
 Add these flags to a student launch, with ordinary student model/checkpoint arguments:
@@ -231,6 +261,7 @@ mismatch is an error:
 | `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten samples only when it is true |
 | `writers`, `writer_mbs` | Writer layout: sample `x` of a flush range starting at `s` lives in writer `((x-s)//mbs) % writers`, at row `((x-s)//(mbs·writers))·mbs + (x-s)%mbs` of that writer's file |
 | `first_sample` | Global sample index where replay starts |
+| `num_samples` | Corpus dumps only: the source's epoch size; positions at or beyond it are filler |
 
 `format_version` 3 implies T=1 log probabilities and stripped padding (see
 [Stored records](#stored-records)).
@@ -246,7 +277,7 @@ producers, and differences between files or dump jobs are reported by name, neve
 | `data` | `--data-path` as `[[weight, file basename], ...]` |
 | `split` | `--split` |
 | `seed` | `--seed` |
-| `num_samples` | The training sample budget |
+| `num_samples` | The training sample budget (required, in `contract`, for corpus dumps) |
 | `builder` | The dataset class, e.g. `GPTDataset` or `SFTDataset` |
 
 `provenance` is free-form and never compared. Megatron records `producer`,
