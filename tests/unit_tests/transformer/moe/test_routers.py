@@ -2054,3 +2054,46 @@ def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
     parent = TransformerConfig(moe_router_fusion=False, **kwargs)
     child = dataclasses.replace(parent, moe_router_fusion=True)
     assert child.moe_router_aux_loss_fusion is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_router_gating_linear_fp32_contract():
+    """FP32 routers must get true-FP32 GEMM numerics, not TF32-grade.
+
+    TE's general_gemm computes TF32 even with FP32 operands, in both the forward and the grad
+    paths, missing the tolerances below by ~2 orders of magnitude (measured rel errors vs an
+    FP64 reference on the TE path: fwd 4.4e-6, grad_input 2.1e-4, grad_weight 2.1e-4; through
+    torch.mm: 0.0 / 3.1e-7 / 8.1e-7). See #8126.
+    """
+    torch.manual_seed(1234)
+    seq_len, hidden, num_experts = 2048, 4096, 288
+    inp = torch.randn(seq_len, hidden, device="cuda")
+    weight = torch.randn(num_experts, hidden, device="cuda") * 0.02
+
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        # Forward: bf16 operands with an fp32 router dtype (the common router setup). The
+        # fixed path is bitwise the fp32 mm over the upcast operands.
+        inp_bf16, weight_bf16 = inp.to(torch.bfloat16), weight.to(torch.bfloat16)
+        logits = router_gating_linear(inp_bf16, weight_bf16, None, torch.float32)
+        ref_fwd = torch.mm(inp_bf16.float(), weight_bf16.float().t())
+        rel_fwd = ((logits - ref_fwd).norm() / ref_fwd.norm()).item()
+        assert rel_fwd < 1e-6, f"forward rel={rel_fwd:.2e} (TF32-grade? expect 0.0 via torch.mm)"
+
+        # Backward: fp32 operands (fp32 router parameters, the #8126 setup) so the gradients
+        # themselves are fp32 and the comparison is not limited by bf16 rounding.
+        inp_g = inp.clone().requires_grad_(True)
+        weight_g = weight.clone().requires_grad_(True)
+        grad_out = torch.randn(seq_len, num_experts, device="cuda")
+        router_gating_linear(inp_g, weight_g, None, torch.float32).backward(grad_out)
+
+        ref_gi = torch.mm(grad_out.double(), weight.double())
+        ref_gw = torch.mm(grad_out.double().t(), inp.double())
+        rel_gi = ((inp_g.grad.double() - ref_gi).norm() / ref_gi.norm()).item()
+        rel_gw = ((weight_g.grad.double() - ref_gw).norm() / ref_gw.norm()).item()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+    assert rel_gi < 1e-5, f"grad_input rel={rel_gi:.2e} (TF32-grade? expect ~3e-7 via torch.mm)"
+    assert rel_gw < 1e-5, f"grad_weight rel={rel_gw:.2e} (TF32-grade? expect ~8e-7 via torch.mm)"
