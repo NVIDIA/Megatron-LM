@@ -2001,6 +2001,24 @@ requires_mamba_ssm = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def disable_tf32():
+    """Run a test with true fp32 GEMMs.
+
+    NGC containers enable TF32 by default (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE), which quantizes
+    GEMM inputs to 10 mantissa bits: two fp32 implementations that agree to one ulp then differ
+    by ~1e-3 wherever a TF32 rounding flips, more than an fp32 parity tolerance can absorb.
+    Restored by hand: the backend flags are properties, which monkeypatch cannot undo.
+    """
+    saved = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = saved
+
+
 @pytest.mark.internal
 class TestAttnResHybridBlock:
     """Attention residuals in hybrid stacks (AttnResHybridLayer + HybridStack).
@@ -2455,7 +2473,7 @@ class TestAttnResHybridBlock:
         ],
     )
     def test_norm_fusion_and_recompute_match_unfused(
-        self, layer_pattern, model_kwargs, fused_tolerance, standalone_mlp_norm
+        self, layer_pattern, model_kwargs, fused_tolerance, standalone_mlp_norm, disable_tf32
     ):
         """attn_res_norm_fusion and 'attn_res' recompute against the unfused stack.
 
