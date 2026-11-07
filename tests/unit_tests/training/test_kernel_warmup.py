@@ -104,11 +104,9 @@ def test_warmup_preserves_rng_and_live_storage(
         label_layouts.append((labels.shape, labels.stride()))
         return calculate_predicted_logits(logits, labels, *args)
 
-    def observe_gradient(softmax, grad_output, target_mask, masked_target_1d, logits_dtype):
+    def observe_gradient(softmax, grad_output, *args):
         layouts.append((grad_output.shape, grad_output.stride()))
-        return calculate_gradients(
-            softmax, grad_output, target_mask, masked_target_1d, logits_dtype
-        )
+        return calculate_gradients(softmax, grad_output, *args)
 
     monkeypatch.setattr(fused_cross_entropy, "calculate_gradients", observe_gradient)
     monkeypatch.setattr(fused_cross_entropy, "calculate_predicted_logits", observe_labels)

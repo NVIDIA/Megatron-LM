@@ -93,13 +93,52 @@ class VocabParallelCrossEntropy:
         return target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits
 
     @staticmethod
-    def calculate_cross_entropy_loss(
-        exp_logits: torch.Tensor, predicted_logits: torch.Tensor, sum_exp_logits: torch.Tensor
+    def sum_exp_logits_excluding_target(
+        exp_logits: torch.Tensor, target_mask: torch.Tensor, masked_target_1d: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Calculates cross entropy loss."""
+        """Row sums of ``exp_logits`` with and without the target entry, from one reduction.
 
-        # Loss = log(sum(exp(logits))) - predicted-logit.
-        loss = torch.log(sum_exp_logits) - predicted_logits
+        Once the target leads the other logits by more than ~16.6 in fp32 (~5.5 in bf16), its
+        ``exp(0) = 1`` swamps them: ``1 + others`` rounds to 1, so ``log(sum_exp_logits) -
+        predicted_logits`` and ``softmax[target] - 1`` both round to exactly 0 while the other
+        classes keep their gradients, and the row gradient no longer sums to zero
+        (https://arxiv.org/abs/2610.31642). Summing the others alone keeps them.
+
+        The target entries are zeroed for the reduction and restored afterwards (``x - x`` and
+        ``0 + x`` are exact), so no logits-sized temporary is allocated. Rows whose target is
+        owned by another rank are left untouched. Returns ``(sum_exp_logits, sum_exp_others)``,
+        where ``sum_exp_logits`` adds the target back as a scalar."""
+
+        partition_vocab_size = exp_logits.size()[-1]
+        exp_2d = exp_logits.view(-1, partition_vocab_size)
+        arange_1d = torch.arange(start=0, end=exp_2d.size()[0], device=exp_2d.device)
+        target_exp = exp_2d[arange_1d, masked_target_1d].masked_fill(target_mask.view(-1), 0.0)
+        exp_2d[arange_1d, masked_target_1d] -= target_exp
+        sum_exp_others = exp_2d.sum(dim=-1)
+        exp_2d[arange_1d, masked_target_1d] += target_exp
+        sum_exp_logits = sum_exp_others + target_exp
+
+        shape = exp_logits.size()[:-1]
+        return sum_exp_logits.view(shape), sum_exp_others.view(shape)
+
+    @staticmethod
+    def calculate_cross_entropy_loss(
+        exp_logits: torch.Tensor,
+        predicted_logits: torch.Tensor,
+        sum_exp_logits: torch.Tensor,
+        sum_exp_others: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calculates cross entropy loss.
+
+        With ``sum_exp_others`` (see ``sum_exp_logits_excluding_target``) the loss stays
+        accurate when the target dominates instead of rounding to 0."""
+
+        if sum_exp_others is None:
+            # Loss = log(sum(exp(logits))) - predicted-logit.
+            loss = torch.log(sum_exp_logits) - predicted_logits
+        else:
+            # Same value, log(1 + others / exp(predicted-logit)), without forming 1 + others.
+            loss = torch.nn.functional.softplus(torch.log(sum_exp_others) - predicted_logits)
 
         # Normalize and optionally smooth logits
         exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
@@ -135,6 +174,25 @@ class VocabParallelCrossEntropy:
         grad_input.mul_(grad_output.unsqueeze(dim=-1))
 
     @staticmethod
+    def set_target_gradients(
+        grad_2d: torch.Tensor,
+        arange_1d: torch.Tensor,
+        masked_target_1d: torch.Tensor,
+        softmax_update: torch.Tensor,
+        target_grad: torch.Tensor,
+    ) -> None:
+        """In place: the target entries become ``target_grad`` on the rank that owns the target.
+
+        ``target_grad`` is ``softmax[target] - 1`` computed as ``-sum_exp_others /
+        sum_exp_logits``, which keeps its value where ``softmax[target] - 1`` would round to 0.
+        Rows whose target is owned by another rank (``softmax_update == 0``) keep the softmax."""
+
+        current = grad_2d[arange_1d, masked_target_1d]
+        grad_2d[arange_1d, masked_target_1d] = torch.where(
+            softmax_update.bool(), target_grad, current
+        )
+
+    @staticmethod
     def calculate_gradients(
         grad_2d: torch.Tensor,
         arange_1d: torch.Tensor,
@@ -142,11 +200,17 @@ class VocabParallelCrossEntropy:
         softmax_update: torch.Tensor,
         grad_input: torch.Tensor,
         grad_output: torch.Tensor,
+        target_grad: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Calculates gradients in place in ``grad_input`` (``grad_2d`` is a view of it)."""
 
         # Scatter over the [s * b] target entries.
-        grad_2d[arange_1d, masked_target_1d] -= softmax_update
+        if target_grad is None:
+            grad_2d[arange_1d, masked_target_1d] -= softmax_update
+        else:
+            VocabParallelCrossEntropy.set_target_gradients(
+                grad_2d, arange_1d, masked_target_1d, softmax_update, target_grad
+            )
 
         # Finally elementwise multiplication with the output gradients.
         VocabParallelCrossEntropy.scale_gradients_inplace(grad_input, grad_output)
@@ -174,10 +238,15 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
-        target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
-            VocabParallelCrossEntropy.calculate_predicted_logits(
+        target_mask, masked_target_1d, predicted_logits = (
+            VocabParallelCrossEntropy.gather_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
             )
+        )
+        VocabParallelCrossEntropy.exp_logits_inplace(vocab_parallel_logits, logits_max)
+        exp_logits = vocab_parallel_logits
+        sum_exp_logits, sum_exp_others = VocabParallelCrossEntropy.sum_exp_logits_excluding_target(
+            exp_logits, target_mask, masked_target_1d
         )
 
         # All reduce is needed to get the chunks from other GPUs.
@@ -185,13 +254,14 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
-        torch.distributed.all_reduce(
-            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        sum_exp = torch.stack((sum_exp_logits, sum_exp_others))
+        torch.distributed.all_reduce(sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        sum_exp_logits, sum_exp_others = sum_exp.unbind(0)
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
-            exp_logits, predicted_logits, sum_exp_logits
+            exp_logits, predicted_logits, sum_exp_logits, sum_exp_others
         )
+        target_grad = -(sum_exp_others / sum_exp_logits).view(-1)
 
         vocab_size = exp_logits.size(-1)
         if label_smoothing > 0:
@@ -215,8 +285,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
 
-        # Store softmax, target-mask and masked-target for backward pass.
-        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
+        # Store softmax, target-mask, masked-target and target gradient for backward pass.
+        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d, target_grad)
 
         return loss
 
@@ -225,7 +295,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """Vocab parallel cross entropy backward function."""
 
         # Retreive tensors from the forward path.
-        softmax, target_mask, masked_target_1d = ctx.saved_tensors
+        softmax, target_mask, masked_target_1d, target_grad = ctx.saved_tensors
         label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
 
         grad_2d, arange_1d, softmax_update, grad_input = (
@@ -234,7 +304,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         if label_smoothing > 0:
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
-            grad_2d[arange_1d, masked_target_1d] -= (1.0 - smoothing) * softmax_update
+            # softmax[target] - (1 - smoothing) = target_grad + smoothing.
+            VocabParallelCrossEntropy.set_target_gradients(
+                grad_2d, arange_1d, masked_target_1d, softmax_update, target_grad + smoothing
+            )
             average_grad = 1 / vocab_size
             grad_2d[arange_1d, :] -= smoothing * average_grad
 
@@ -242,7 +315,13 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             grad_input.mul_(grad_output.unsqueeze(dim=-1))
         else:
             grad_input = VocabParallelCrossEntropy.calculate_gradients(
-                grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+                grad_2d,
+                arange_1d,
+                masked_target_1d,
+                softmax_update,
+                grad_input,
+                grad_output,
+                target_grad,
             )
 
         return grad_input, None, None, None

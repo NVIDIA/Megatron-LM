@@ -42,6 +42,7 @@ from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     deterministic_algorithms,
     seeded,
 )
@@ -199,6 +200,51 @@ class TestTensorParallelLayers:
         grad_2d[arange_1d, masked_target_1d] -= softmax_update
         VocabParallelCrossEntropy.scale_gradients_inplace(grad_input, grad_output)
         assert torch.equal(composite_grad, grad_input), "staged backward differs from composite"
+
+    @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+    def test_vocab_parallel_cross_entropy_confident_targets_replay(self, label_smoothing):
+        """Rows whose target leads the other logits by tens: the loss takes the target-free sum
+        and the target gradient is written by set_target_gradients; both must replay."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        vocab = 32768
+        logits = torch.randn(4096, vocab, device="cuda", dtype=torch.float32)
+        target = torch.randint(0, vocab * tp_group.size(), (4096,), device="cuda")
+        start = tp_group.rank() * vocab
+        rows = torch.nonzero((target >= start) & (target < start + vocab)).squeeze(-1)
+        boost = torch.linspace(20.0, 95.0, rows.numel(), device="cuda")
+        logits[rows, target[rows] - start] += boost
+        assert_replays_bit_exact(
+            lambda l, t: vocab_parallel_cross_entropy(l, t, label_smoothing, tp_group),
+            (logits.requires_grad_(True), target),
+            replays=3,
+            what="vocab_parallel_cross_entropy (confident targets)",
+        )
+
+    def test_sum_exp_logits_excluding_target_restores_exp_logits(self):
+        """The target-free row sum zeroes the target entries in place and restores them:
+        exp_logits must come back byte-identical, and both sums must equal their direct
+        forms. Half the rows have their target on another rank and are left untouched."""
+        seeded()
+        vocab = 32768
+        exp_logits = torch.rand(4096, vocab, device="cuda")
+        target = torch.randint(0, 2 * vocab, (4096,), device="cuda")
+        target_mask = target >= vocab
+        masked_target_1d = torch.where(target_mask, torch.zeros_like(target), target)
+        before = exp_logits.clone()
+
+        sum_exp, sum_others = VocabParallelCrossEntropy.sum_exp_logits_excluding_target(
+            exp_logits, target_mask, masked_target_1d
+        )
+
+        assert bytes_equal(exp_logits, before), "exp_logits was not restored"
+        rows = torch.arange(4096, device="cuda")
+        others = before.clone()
+        owned = rows[~target_mask]
+        others[owned, masked_target_1d[owned]] = 0.0
+        assert bytes_equal(sum_others, others.sum(dim=-1))
+        target_exp = before[rows, masked_target_1d].masked_fill(target_mask, 0.0)
+        assert bytes_equal(sum_exp, sum_others + target_exp)
 
     @pytest.mark.parametrize(
         "grad_accum_fusion",

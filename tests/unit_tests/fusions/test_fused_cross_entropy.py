@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
+
 import pytest
 import torch
 
@@ -83,3 +85,39 @@ def test_fused_cross_entropy_matches_torch_reference(single_rank_all_reduce, log
     )
     torch.testing.assert_close(loss.float(), ref_loss, **tols)
     torch.testing.assert_close(logits.grad.float(), ref_logits.grad, **tols)
+
+
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_fused_cross_entropy_confident_target(single_rank_all_reduce, logits_dtype):
+    """Once the target leads by more than ~16.6 (fp32 math), log(sum_exp) - x and softmax - 1
+    used to round to exactly 0 while the other classes kept their gradients
+    (https://arxiv.org/abs/2610.31642). Both must match an fp64 reference instead."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    margins = [5.0, 10.0, 17.0, 20.0, 40.0]
+    vocab_size = 512
+    target = torch.tensor([3, 100, 511, 0, 256], device=device)
+    # bf16 can hold these margins exactly only near integers: round the logits first.
+    logits64 = torch.zeros(len(margins), vocab_size, dtype=torch.float64, device=device)
+    for row, (margin, t) in enumerate(zip(margins, target.tolist())):
+        logits64[row, t] = round(margin + math.log(vocab_size - 1))
+    logits64 = logits64.to(logits_dtype).double()
+
+    z = logits64.clone().requires_grad_(True)
+    target_logit = z.gather(-1, target.unsqueeze(-1))
+    others = (z - target_logit).masked_fill(
+        torch.nn.functional.one_hot(target, vocab_size).bool(), float("-inf")
+    )
+    ref_loss = torch.nn.functional.softplus(torch.logsumexp(others, dim=-1))
+    ref_loss.sum().backward()
+
+    logits = logits64.to(logits_dtype).view(len(margins), 1, vocab_size).requires_grad_(True)
+    loss = fused_vocab_parallel_cross_entropy(logits.clone(), target.view(-1, 1), _FakeTPGroup())
+    torch.testing.assert_close(loss.double().view(-1), ref_loss.detach(), rtol=1e-5, atol=0)
+
+    fused_vocab_parallel_cross_entropy(logits, target.view(-1, 1), _FakeTPGroup()).sum().backward()
+    rows = torch.arange(len(margins), device=device)
+    grad = logits.grad.double().view(len(margins), vocab_size)
+    tol = (
+        1e-5 if logits_dtype == torch.float32 else 1e-2
+    )  # the gradient is emitted in the logits dtype
+    torch.testing.assert_close(grad[rows, target], z.grad[rows, target], rtol=tol, atol=0)
