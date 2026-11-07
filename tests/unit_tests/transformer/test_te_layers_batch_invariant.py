@@ -1,6 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import importlib
 import os
+import subprocess
+import sys
+import warnings
 
 import pytest
 import torch
@@ -801,6 +804,141 @@ def test_te_native_device_metadata_workspace(monkeypatch, supported):
 
     assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
     assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
+
+
+# How PyTorch's warning starts when cuBLASLt fails a GEMM and PyTorch reruns it on cuBLAS.
+_CUBLASLT_FALLBACK = (
+    "bgemm_internal_cublaslt error: CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmul"
+)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "te_native",
+        "triton",
+        pytest.param(
+            "deepgemm",
+            marks=pytest.mark.skipif(
+                not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable"
+            ),
+        ),
+    ],
+)
+def test_batch_invariant_prefers_cublaslt_and_restores_it(backend):
+    """Every backend runs the aten GEMMs it leaves native (all of them under te_native,
+    aten::bmm under deepgemm and triton) on cuBLASLt with a zero workspace, and makes
+    PyTorch's fallback to cuBLAS an error. Leaving the mode restores all of it."""
+    has_workspace_api = hasattr(torch.backends.cuda, "cublaslt_workspace_size")
+    if has_workspace_api:
+        workspace_before = torch.backends.cuda.cublaslt_workspace_size()
+    blas_before = torch.backends.cuda.preferred_blas_library()
+    env_before = os.environ.get("CUBLASLT_WORKSPACE_SIZE")
+    with set_batch_invariant_mode(True, backend=backend):
+        assert torch.backends.cuda.preferred_blas_library() == torch._C._BlasBackend.Cublaslt
+        assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
+        if has_workspace_api:
+            assert torch.backends.cuda.cublaslt_workspace_size() == 0
+        with pytest.raises(UserWarning, match=_CUBLASLT_FALLBACK):
+            warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
+    assert torch.backends.cuda.preferred_blas_library() == blas_before
+    assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before
+    if has_workspace_api:
+        assert torch.backends.cuda.cublaslt_workspace_size() == workspace_before
+    # Outside the mode the fallback is a warning again, not an error.
+    with warnings.catch_warnings(record=True):
+        warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
+
+
+# Runs in a fresh process. With "first", it enables the mode before its first GEMM and only then
+# picks its device, as initialize_megatron does. Before PyTorch 2.14 that order is required:
+# cuBLASLt reads CUBLASLT_WORKSPACE_SIZE once, at its first GEMM. With "late", a GEMM on
+# cuBLASLt with PyTorch's default 1 MiB workspace runs first. Large K with small N and few rows
+# is where cuBLASLt with a workspace splits K. To check that these shapes do split K on a GPU,
+# set MCORE_BI_TEST_CUBLASLT_WORKSPACE_KIB: cuBLASLt then gets that workspace instead of the
+# starved one, and the script should fail.
+_ATEN_GEMMS_ROW_INVARIANT = """
+import os
+import sys
+
+import torch
+
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+
+
+def linear(x, weight):
+    # A bias-free linear layer (aten::mm), such as the GPT output layer.
+    return torch.matmul(x, weight[0].t())
+
+
+def per_head(x, weight):
+    # A per-head projection (aten::bmm), such as absorbed MLA's einsums.
+    return torch.einsum("shk,hnk->shn", x, weight)
+
+
+backend, enable = sys.argv[1:]
+device = int(os.environ.get("LOCAL_RANK", 0))
+if enable == "late":
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1024"
+    torch.cuda.set_device(device)
+    a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+    torch.nn.functional.linear(a, a, a[0])  # A GEMM with a bias epilogue runs on cuBLASLt.
+    assert torch.backends.cuda.cublaslt_workspace_size() > 0
+workspace_kib = os.environ.get("MCORE_BI_TEST_CUBLASLT_WORKSPACE_KIB")
+with set_batch_invariant_mode(True, backend=backend):
+    if workspace_kib is not None:
+        torch.backends.cuda.cublaslt_workspace_size(int(workspace_kib) * 1024)
+    elif hasattr(torch.backends.cuda, "cublaslt_workspace_size"):
+        assert torch.backends.cuda.cublaslt_workspace_size() == 0
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+    shapes = [
+        (k, n, (16, 64, 128, 192, 256, 384))
+        for k, n in ((512, 50), (512, 8), (1024, 50), (1024, 100))
+    ]
+    shapes += [(k, n, (1, 4, 16, 64)) for k in (8192, 16384) for n in (8, 64)]
+    varying = []
+    for k, n, row_counts in shapes:
+        weight = torch.randn(2, n, k, device="cuda", dtype=torch.bfloat16)
+        for gemm, heads in ((linear, 1), (per_head, 2)):
+            x = torch.randn(512, heads, k, device="cuda", dtype=torch.bfloat16)
+            full = gemm(x, weight)
+            varying += [
+                (gemm.__name__, k, n, rows)
+                for rows in row_counts
+                if not torch.equal(gemm(x[:rows], weight), full[:rows])
+            ]
+    assert not varying, f"rows differ from the full batch's (GEMM, K, N, rows): {varying}"
+"""
+
+
+@pytest.mark.parametrize(
+    "backend, enable",
+    [
+        ("te_native", "first"),
+        ("triton", "first"),
+        pytest.param(
+            "te_native",
+            "late",
+            marks=pytest.mark.skipif(
+                not hasattr(torch.backends.cuda, "cublaslt_workspace_size"),
+                reason="Enabling after the first GEMM needs PyTorch's cublaslt_workspace_size",
+            ),
+        ),
+    ],
+)
+def test_native_aten_gemms_batch_invariant(backend, enable):
+    """Row slices of aten::mm and aten::bmm outputs give the full batch's bits, whether the
+    backend replaces the GEMM or leaves it native on cuBLASLt. With hidden size 512 and 50 output
+    columns (the GPT output layer for a 100-token vocabulary at TP=2), cuBLAS picks split-K by
+    row count."""
+    result = subprocess.run(
+        [sys.executable, "-c", _ATEN_GEMMS_ROW_INVARIANT, backend, enable],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
 
 
 # ============================================================================
