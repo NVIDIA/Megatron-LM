@@ -95,8 +95,10 @@ jobs:
           MAX_PRS_PER_USER_PER_BRANCH = 2
           CICD_WORKFLOW_NAME = "CICD Megatron-LM"
           FUNCTIONAL_TEST_LABEL = "Run functional tests"
+          MERGE_QUEUE_JOBS_LABEL = "Run Merge-Queue jobs"
+          FUNCTIONAL_TEST_LABELS = {FUNCTIONAL_TEST_LABEL, MERGE_QUEUE_JOBS_LABEL}
           RUN_TESTS_LABEL = "Run tests"
-          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}
+          RUN_ALL_TESTS_LABELS = FUNCTIONAL_TEST_LABELS | {RUN_TESTS_LABEL}
           ALLOW_PR_RUN_ALL_TESTS = (
               os.environ.get("ALLOW_PR_RUN_ALL_TESTS", "").strip().lower() != "false"
           )
@@ -249,7 +251,7 @@ jobs:
 
           def has_functional_test_label(workflow_run):
               """Return whether a PR workflow has opted into functional tests."""
-              return FUNCTIONAL_TEST_LABEL in get_pr_labels(workflow_run)
+              return bool(FUNCTIONAL_TEST_LABELS & get_pr_labels(workflow_run))
 
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
@@ -372,7 +374,7 @@ jobs:
                   )
                   continue
 
-              runs_functional_tests = FUNCTIONAL_TEST_LABEL in workflow_labels
+              runs_functional_tests = bool(FUNCTIONAL_TEST_LABELS & workflow_labels)
               if runs_functional_tests and functional_test_workflow_running:
                   print(
                       f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "
