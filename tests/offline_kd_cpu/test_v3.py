@@ -1274,7 +1274,7 @@ corpus = importlib.import_module(f"{_namespace}.corpus_runtime")
 def corpus_args(args, tmp_path, name="web"):
     dump_args(args)
     args.logits_save_dir = str(tmp_path)
-    args.kd_corpus_dump, args.kd_corpus_split = name, "train"
+    args.kd_corpus_dump = name
     args.data_path, args.mock_data, args.eval_iters, args.train_samples = (
         ["web_text"],
         False,
@@ -1289,10 +1289,11 @@ def test_corpus_dump_validation_sets_its_folder_and_one_epoch_budget(tmp_path, r
     corpus_args(args, tmp_path)
     runtime.validate_options(args)
     assert args.logits_save_inputs and args.kd_corpus_root == str(tmp_path)
-    assert args.logits_save_dir == str(tmp_path / "web" / "train")
+    assert args.logits_save_dir == str(tmp_path / "web")
+    assert args.split == "100,0,0"  # The whole source; a corpus source is never split.
     assert args.train_iters * args.global_batch_size >= 1 << 39  # Until the epoch is known.
     runtime.validate_options(args)  # Idempotent.
-    assert args.logits_save_dir == str(tmp_path / "web" / "train")
+    assert args.logits_save_dir == str(tmp_path / "web")
 
 
 @pytest.mark.parametrize(
@@ -1342,7 +1343,7 @@ def test_corpus_epoch_is_one_seeded_permutation_padded_to_whole_batches():
 
 def test_corpus_epoch_length_sizes_the_run(runtime_environment):
     args, _, _ = runtime_environment
-    args.kd_corpus_dump, args.kd_corpus_split, args.kd_corpus_samples = "web", "train", 17
+    args.kd_corpus_dump, args.kd_corpus_samples = "web", 17
     corpus.agree_corpus_epoch(args)
     assert args.train_iters == 3  # 17 samples in global batches of 8.
 
@@ -1354,7 +1355,7 @@ def test_corpus_metadata_requires_the_epoch_size(tmp_path, runtime_environment):
     args.kd_corpus_samples = 20
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
     assert metadata["contract"]["num_samples"] == 20 and "num_samples" not in metadata["recorded"]
-    assert metadata["recorded"]["split"] == "99,1,0:train"
+    assert "split" not in metadata["recorded"]
     metadata["contract"]["first_sample"] = 0
     codec.validate_metadata(metadata, corpus=True)
     del metadata["contract"]["num_samples"]
@@ -1372,13 +1373,13 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
     other = json.loads(json.dumps(metadata))
     other["contract"]["num_samples"] = 64  # Sources differ in size and data, but share a teacher.
     other["recorded"]["teacher"] = "/other@1"
-    write_cache(tmp_path / "web" / "train", metadata=other, iterations=2)
-    saver = teacher_saver(runtime, tmp_path / "code" / "train")
+    write_cache(tmp_path / "web", metadata=other, iterations=2)
+    saver = teacher_saver(runtime, tmp_path / "code")
     runtime.initialize_dump_metadata(saver)
     assert "recorded settings (teacher)" in capsys.readouterr().out
     other["contract"]["tokenizer"] = {**other["contract"]["tokenizer"], "sha256": "different"}
-    write_cache(tmp_path / "math" / "train", metadata=other, iterations=2)
-    with pytest.raises(RuntimeError, match="math/train uses a different tokenizer"):
+    write_cache(tmp_path / "math", metadata=other, iterations=2)
+    with pytest.raises(RuntimeError, match="source math uses a different tokenizer"):
         runtime.initialize_dump_metadata(saver)
 
 
@@ -1401,7 +1402,7 @@ def corpus_source(root, name, *, samples, iterations, base=0, contract=None):
     metadata["recorded"].pop("num_samples")
     metadata["contract"]["num_samples"] = samples  # Required for corpus sources.
     write_cache(
-        root / name / "train",
+        root / name,
         iterations=iterations,
         metadata=metadata,
         source=lambda ids, packed=False: inputs([base + i for i in ids], packed=packed),
@@ -1410,7 +1411,7 @@ def corpus_source(root, name, *, samples, iterations, base=0, contract=None):
 
 
 def blend_config(root, **overrides):
-    return {"corpus": str(root), "split": "train", "seed": 1, "lanes": 4, "allow_partial": []} | {
+    return {"corpus": str(root), "seed": 1, "lanes": 4} | {
         "sources": {"web": 3, "math": 1},
         **overrides,
     }
@@ -1445,11 +1446,12 @@ def test_blend_upsamples_with_whole_passes(tmp_path):
 def test_blend_excludes_filler_and_refuses_incomplete_sources(tmp_path):
     corpus_source(tmp_path, "web", samples=13, iterations=2)  # 16 positions, 3 filler.
     corpus_source(tmp_path, "math", samples=32, iterations=2, base=500)  # Half dumped.
-    with pytest.raises(ValueError, match="math covers samples 0-16 of 32"):
+    with pytest.raises(ValueError, match="math covers samples 0-16 of 32; finish its dump"):
         blend.plan(blend_config(tmp_path), budget=8)
-    manifest = blend.plan(blend_config(tmp_path, allow_partial=["math"]), budget=8)
+    corpus_source(tmp_path, "math", samples=32, iterations=4, base=500)  # Dump finished.
+    manifest = blend.plan(blend_config(tmp_path), budget=8)
     available = {s["name"]: s["available"] for s in manifest["sources"]}
-    assert available == {"web": 13, "math": 16}
+    assert available == {"web": 13, "math": 32}
 
 
 def test_blend_sources_must_agree_on_required_settings(tmp_path):

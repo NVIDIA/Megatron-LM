@@ -2,13 +2,13 @@
 
 """Plan a blend of corpus sources into a fixed, DP-independent sample schedule.
 
-A blend config names a corpus directory, sources with weights in samples, the split,
-a seed, and a lane count ``L``::
+A blend config names a corpus directory, sources with weights in samples, a seed, and a
+lane count ``L``::
 
     {"corpus": "/data/corpus", "sources": {"web_crawl": 0.7, "math_sft": 0.3},
-     "split": "train", "seed": 1234, "lanes": 64, "allow_partial": []}
+     "seed": 1234, "lanes": 64}
 
-The planner picks each source's rows (whole passes over its blocks, then a seeded
+Every source must be complete. The planner picks each source's rows (whole passes over its blocks, then a seeded
 subset), spreads every source evenly along one stream, and cuts the stream into ``L``
 equal lanes. Global sample ``p`` is row ``p // L`` of lane ``p % L``, so the schedule
 does not depend on the student's data-parallel size; when ``L`` is a multiple of DP ×
@@ -36,7 +36,7 @@ from .arrow import check_index, file_meta
 from .contract import REQUIRED_KEYS, mismatched_settings, validate_metadata
 
 MANIFEST_VERSION = 1
-DEFAULTS = {"split": "train", "seed": 1234, "lanes": 64, "allow_partial": []}
+DEFAULTS = {"seed": 1234, "lanes": 64}
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -52,7 +52,7 @@ def load_config(path: str) -> dict[str, Any]:
     return config
 
 
-def _source_rows(storage: Storage, name: str, partial: bool) -> tuple[dict, list, list, list]:
+def _source_rows(storage: Storage, name: str) -> tuple[dict, list, list, list]:
     """Return a source's settings, files, file sizes, and pieces of real (non-filler) rows."""
     files = list_published(storage)
     if not files:
@@ -72,12 +72,11 @@ def _source_rows(storage: Storage, name: str, partial: bool) -> tuple[dict, list
     contract = meta["contract"]
     writers, mbs, total = contract["writers"], contract["writer_mbs"], contract["num_samples"]
     covered = contiguous_end(complete_ranges(files, writers), 0)
-    if covered < total and not partial:
+    if covered < total:
         raise ValueError(
-            f"Corpus source {name} covers samples 0-{covered} of {total}; finish its dump, or "
-            "list it under allow_partial to blend what is published"
+            f"Corpus source {name} covers samples 0-{covered} of {total}; finish its dump first"
         )
-    limit = min(covered, total)
+    limit = total
     pieces = []  # (file id, block, first row, end row, supervised rows)
     for file_id, (file, index) in enumerate(zip(files, indexes)):
         if file.start >= limit:
@@ -128,7 +127,7 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
     The manifest holds the settings every file shares, the files it reads, per-source
     shares, and ``segments``: rows of ``(lane, file id, block, first row, end row)``.
     """
-    root, split, seed, lanes = config["corpus"], config["split"], config["seed"], config["lanes"]
+    root, seed, lanes = config["corpus"], config["seed"], config["lanes"]
     weights = config["sources"]
     total = lanes * -(-budget // lanes)  # Whole lanes, at least the budget.
     files, sources, streams, reference = [], [], [], None
@@ -137,11 +136,9 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
     for name in sorted(weights)[: total - sum(targets.values())]:
         targets[name] += 1  # Distribute the rounding remainder.
     for name in sorted(weights):
-        folder = f"{name}/{split}"
+        folder = name
         storage = Storage(os.path.join(root, folder))
-        meta, source_files, sizes, pieces = _source_rows(
-            storage, name, name in config.get("allow_partial", [])
-        )
+        meta, source_files, sizes, pieces = _source_rows(storage, name)
         if reference is None:
             reference = meta
         differing = [

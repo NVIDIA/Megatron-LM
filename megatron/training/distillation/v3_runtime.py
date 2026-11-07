@@ -329,7 +329,7 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         # A corpus source's extent is part of its contract: it defines completeness.
         settings["recorded"].pop("num_samples")
         settings["contract"]["num_samples"] = args.kd_corpus_samples
-        settings["recorded"]["split"] = f"{settings['recorded']['split']}:{args.kd_corpus_split}"
+        settings["recorded"].pop("split")  # A corpus source is never split.
     # Compare exactly what a JSON round trip through the files' schema metadata preserves.
     return json.loads(json.dumps(settings))
 
@@ -352,7 +352,7 @@ def _check_corpus_sources(root: str, own: str, expected: dict) -> list[str]:
     """
     storage = Storage(root)
     seen, differing = set(), set()
-    for name in storage.list("*/*/dp*__*.index.json"):
+    for name in storage.list("*/dp*__*.index.json"):
         folder = os.path.dirname(name)
         if folder == own or folder in seen:
             continue

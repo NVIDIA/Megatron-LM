@@ -68,11 +68,13 @@ a file whose required settings differ is rejected, and differences in recorded s
 
 ### Corpus dumps
 
-A corpus dump scores one source dataset into its own folder, so that dumps of several
-sources can later be blended like ordinary dataset files instead of replayed as one run.
-It is a frozen-teacher dump with three restrictions: one unweighted `--data-path` prefix
-(or SFT file), exactly one epoch of it as Megatron builds it (GPT windows or SFT rows, at
-the teacher's `--seq-length`), and a seeded permutation of that epoch (`--seed`), so
+A corpus dump scores one whole source dataset into its own folder, so that dumps of
+several sources can later be blended like ordinary dataset files instead of replayed as
+one run. A corpus source is generic, like the files it comes from: complete, unweighted
+and unsplit. Weights, repetition and train/validation choices belong to blends. It is a
+frozen-teacher dump with three restrictions: one unweighted `--data-path` prefix (or SFT
+file), all of it exactly once as Megatron builds it (GPT windows or SFT rows, at the
+teacher's `--seq-length`; `--split` is ignored), and a seeded permutation (`--seed`), so
 every block is a random sample of the source:
 
 ```sh
@@ -84,8 +86,8 @@ for source in web_crawl math_sft code; do
 done
 ```
 
-Each job writes `<corpus>/<source>/<split>/` (`--kd-corpus-split train` or `valid` picks
-the `--split` part) and sizes itself to the epoch, ignoring `--train-iters`. Jobs for
+Each job writes `<corpus>/<source>/` and sizes itself to the source, ignoring
+`--train-iters`. Jobs for
 different sources can run in parallel, and each source can itself be split into parallel
 range jobs as above. Sources of one corpus must share a tokenizer (a job refuses to start
 otherwise); a different teacher is reported, not refused.
@@ -132,7 +134,7 @@ A student trains on a blend of corpus sources (see [Corpus dumps](#corpus-dumps)
 
 ```json
 {"corpus": "/data/corpus", "sources": {"web_crawl": 0.7, "math_sft": 0.3},
- "split": "train", "seed": 1234, "lanes": 64, "allow_partial": []}
+ "seed": 1234, "lanes": 64}
 ```
 
 Weights are in samples, as in Megatron's `BlendedDataset`. At startup, world rank 0
@@ -142,8 +144,7 @@ tokens:
 
 - Each source contributes whole seeded passes over its blocks, then a seeded subset, so a
   weight above one epoch repeats the source and one below it subsamples it. Filler
-  samples and, unless the source is listed in `allow_partial`, incomplete sources are
-  refused.
+  samples are skipped, and a source whose dump is not finished is refused.
 - Every source is spread evenly along one stream, and the stream is cut into `lanes`
   equal lanes. Global sample `p` is position `p // lanes` of lane `p % lanes`, so the
   schedule does not depend on the student's DP size, and every global batch draws from
@@ -157,7 +158,7 @@ The sources must share the required settings; a different teacher is reported. T
 is fixed by the checkpoint: a resume re-plans and refuses a different schedule (a changed
 config, budget or set of files). Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
-LM loss only.
+LM loss only; to hold data out of a blend, dump it as its own source and leave it out.
 
 Outside Megatron, `format/blend.py` plans the same schedule and `format/hf.py` is a
 torch-only reference consumer: `CorpusStream` yields one rank's samples in Megatron's

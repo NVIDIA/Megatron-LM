@@ -3677,15 +3677,13 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-load-inputs', action='store_true',
                        help='Use a v3 cache as the training dataset and KD target source.')
     group.add_argument('--kd-corpus-dump', type=str, default=None, metavar='SOURCE',
-                       help='Dump a v3 corpus source: score exactly one shuffled epoch of the '
-                            'single --data-path dataset with a frozen teacher, into '
-                            '<--logits-save-dir>/SOURCE/<--kd-corpus-split>/. The run sizes '
-                            'itself to the epoch; --train-iters is ignored.')
-    group.add_argument('--kd-corpus-split', type=str, default='train', choices=['train', 'valid'],
-                       help='Which --split part a corpus dump scores.')
+                       help='Dump a v3 corpus source: score the whole single --data-path '
+                            'dataset once, in a seeded order, with a frozen teacher, into '
+                            '<--logits-save-dir>/SOURCE/. The run sizes itself to the source; '
+                            '--train-iters and --split are ignored.')
     group.add_argument('--kd-corpus-blend', type=str, default=None, metavar='CONFIG',
                        help='Train on a blend of v3 corpus sources described by a JSON config '
-                            '(corpus directory, source weights in samples, split, seed, lanes). '
+                            '(corpus directory, source weights in samples, seed, lanes). '
                             'The schedule is planned at startup for the training budget and '
                             'fixed by the checkpoint.')
     group.add_argument('--logits-load-shuffle-shards', type=int, default=None, metavar='SEED',
