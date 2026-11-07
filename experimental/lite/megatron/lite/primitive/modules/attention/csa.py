@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import math
 from collections.abc import Hashable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,10 @@ from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.linear import AccumulatingLinear
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
+
+if TYPE_CHECKING:
+    from megatron.lite.primitive.kernels.indexer_topk import IndexerGeometry
+    from megatron.lite.primitive.modules.attention.indexer_topk import IndexerTopKBinding
 
 
 @jit_fuser
@@ -95,11 +99,7 @@ def build_yarn_rope_cos_sin(
         * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     low, high = _yarn_find_correction_range(
-        config.beta_fast,
-        config.beta_slow,
-        dim,
-        rope_theta,
-        config.original_max_position_embeddings,
+        config.beta_fast, config.beta_slow, dim, rope_theta, config.original_max_position_embeddings
     )
     inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2, device)
     inv_freq = inv_freq_inter * (1 - inv_freq_mask) + inv_freq_extra * inv_freq_mask
@@ -135,11 +135,15 @@ def rope_table(
     pair for a model declaring a million positions and using four thousand.
     """
     yarn = (
-        float(config.rotary_scaling_factor),
-        float(config.beta_fast),
-        float(config.beta_slow),
-        int(config.original_max_position_embeddings),
-    ) if use_yarn else None
+        (
+            float(config.rotary_scaling_factor),
+            float(config.beta_fast),
+            float(config.beta_slow),
+            int(config.original_max_position_embeddings),
+        )
+        if use_yarn
+        else None
+    )
     key = (int(rope_head_dim), float(rope_theta), bool(use_yarn), yarn, str(device), str(dtype))
     hit = _ROPE_TABLES.get(key)
     if hit is not None and hit[0] >= max_positions:
@@ -160,11 +164,7 @@ def rope_table(
 
 
 def rope_rows_for(
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    global_start: int,
-    length: int,
+    cos: torch.Tensor, sin: torch.Tensor, cu_seqlens: torch.Tensor, global_start: int, length: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long().view(-1)
     return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
@@ -203,12 +203,7 @@ def _build_compressed_rope_cos_sin_uncached(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if use_yarn:
         return build_yarn_rope_cos_sin(
-            position_ids,
-            rope_head_dim,
-            rope_theta,
-            config=config,
-            device=device,
-            dtype=dtype,
+            position_ids, rope_head_dim, rope_theta, config=config, device=device, dtype=dtype
         )
     return build_rope_cos_sin(position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype)
 
@@ -397,6 +392,21 @@ def _load_dsa_kernels():
     return dsa_kernels
 
 
+def _bound_indexer_topk(module) -> "IndexerTopKBinding | None":
+    """Return the module's indexer top-k binding when it selects.
+
+    A binding selects only in eval mode with gradients disabled. A training forward keeps the
+    upstream selector even without autograd: Lite's reentrant activation recompute
+    (``primitive/recompute.py``) runs it under ``torch.no_grad()`` and recomputes it with
+    gradients in the backward pass, and both must select the same top-k. ``getattr`` keeps test
+    doubles of the module (no binding set, no ``training`` flag) working.
+    """
+    binding = getattr(module, "_indexer_topk", None)
+    if binding is None or getattr(module, "training", False) or not binding.active():
+        return None
+    return binding
+
+
 class CompressedSparseAttentionIndexer(nn.Module):
     def __init__(self, config, compress_ratio: int):
         super().__init__()
@@ -457,7 +467,9 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = 0
         self.wq_a = AccumulatingLinear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = AccumulatingLinear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wq_b = AccumulatingLinear(
+            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.wkv = AccumulatingLinear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
@@ -465,7 +477,9 @@ class CompressedSparseAttention(nn.Module):
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = AccumulatingLinear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = AccumulatingLinear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
@@ -482,6 +496,46 @@ class CompressedSparseAttention(nn.Module):
         if self.indexer is not None and not self.dsa_indexer_loss_coeff:
             for parameter in self.indexer.parameters():
                 parameter.requires_grad_(False)
+        # Optional selector of the indexer top-k in eval mode with gradients disabled
+        # (set_indexer_topk).
+        self._indexer_topk: "IndexerTopKBinding | None" = None
+
+    def indexer_geometry(self) -> "IndexerGeometry | None":
+        """Return the shape of this layer's indexer for an indexer top-k binding.
+
+        Returns:
+            The geometry of the layer's C4 indexer (four tokens per compressed key), or None
+            when the layer has no indexer (compression ratios other than 4).
+        """
+        if self.indexer is None or self.compress_ratio != 4:
+            return None
+        from megatron.lite.primitive.kernels.indexer_topk import IndexerGeometry
+
+        return IndexerGeometry(
+            num_heads=int(self.indexer.index_n_heads),
+            head_dim=int(self.indexer.index_head_dim),
+            topk=int(self.indexer.index_topk),
+            key_ratio=self.compress_ratio,
+        )
+
+    def set_indexer_topk(self, binding: "IndexerTopKBinding | None") -> None:
+        """Select this layer's indexer top-k with ``binding`` in eval mode with gradients disabled.
+
+        Args:
+            binding: The binding (see ``configure_indexer_topk``), or None for the upstream
+                selector. Training forwards (also those without autograd, as in a reentrant
+                activation recompute) and every forward with autograd enabled always use the
+                upstream selector.
+
+        Raises:
+            ValueError: If a binding is given to a layer without an indexer.
+        """
+        if binding is not None and self.indexer_geometry() is None:
+            raise ValueError(
+                f"CSA layer {self.layer_idx} (compress ratio {self.compress_ratio}) has no "
+                "indexer; it takes no indexer top-k binding"
+            )
+        self._indexer_topk = binding
 
     def forward(
         self,
@@ -541,12 +595,7 @@ class CompressedSparseAttention(nn.Module):
             )
         if use_sparse_backend and self.ps.cp_size == 1 and attention_mask is None:
             return self._forward_fused_sparse_no_indexer_cp1(
-                x,
-                q,
-                kv,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
+                x, q, kv, position_ids=position_ids, cos=cos, sin=sin
             )
 
         # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
@@ -587,18 +636,13 @@ class CompressedSparseAttention(nn.Module):
         kv_full = kv.squeeze(1)
         kv_full = kv_full.transpose(0, 1).contiguous()
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
 
         compressed = None
         if self.compressor is not None and self.compress_ratio > 1:
             compressed = self.compressor(
-                x,
-                position_ids=position_ids,
-                rope_theta=self.config.compress_rope_theta,
+                x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
             )
             if compressed is not None:
                 compressed_kv = compressed.squeeze(1)
@@ -611,32 +655,21 @@ class CompressedSparseAttention(nn.Module):
                 torch.arange(1, seq_len + 1, device=x.device) // self.compress_ratio
             ).view(seq_len, 1)
             compress_topk_idxs = torch.where(
-                comp_idx < valid_per_pos,
-                comp_idx + seq_len,
-                torch.full_like(comp_idx, -1),
+                comp_idx < valid_per_pos, comp_idx + seq_len, torch.full_like(comp_idx, -1)
             )
             compress_topk_idxs = (
                 compress_topk_idxs.unsqueeze(0).expand(batch, -1, -1).to(torch.int32)
             )
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                compress_topk_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, compress_topk_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
 
         out = dsa_kernels.dsa_sparse_attn(
-            query,
-            kv_full,
-            self.sinks.float(),
-            flat_idxs,
-            self.head_dim**-0.5,
+            query, kv_full, self.sinks.float(), flat_idxs, self.head_dim**-0.5
         )
         context = (
             out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
@@ -682,14 +715,10 @@ class CompressedSparseAttention(nn.Module):
             kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         index_comp = self.indexer.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         if compressed is None or index_comp is None:
             raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
@@ -723,10 +752,7 @@ class CompressedSparseAttention(nn.Module):
         if indexer_topk <= 0:
             raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
         query = q.transpose(1, 2).transpose(0, 1).contiguous()
         sink = self.sinks.float()
@@ -750,33 +776,29 @@ class CompressedSparseAttention(nn.Module):
                 calculate_per_token_loss=False,
             )
         else:
-            topk_indices, _topk_length = dsa_kernels.indexer_topk(
-                q_indexer,
-                index_k,
-                weights_indexer,
-                indexer_topk,
-                self.compress_ratio,
-                indexer_softmax_scale=self.indexer.softmax_scale,
+            topk_indices = None
+            binding = _bound_indexer_topk(self)
+            if binding is not None:
+                topk_indices = self._select_bshd_indexer_topk(
+                    binding, q_indexer, index_k, weights_indexer, indexer_topk
+                )
+            if topk_indices is None:
+                topk_indices, _topk_length = dsa_kernels.indexer_topk(
+                    q_indexer,
+                    index_k,
+                    weights_indexer,
+                    indexer_topk,
+                    self.compress_ratio,
+                    indexer_softmax_scale=self.indexer.softmax_scale,
+                )
+            topk_indices = torch.where(topk_indices >= 0, topk_indices + seq_len, topk_indices).to(
+                torch.int32
             )
-            topk_indices = torch.where(
-                topk_indices >= 0,
-                topk_indices + seq_len,
-                topk_indices,
-            ).to(torch.int32)
             flat_idxs, flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                topk_indices,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
-                compact=True,
+                window_idxs, topk_indices, batch_size=batch, seqlen_kv=kv_full.size(0), compact=True
             )
             out = dsa_kernels.dsa_sparse_attn(
-                query,
-                kv_full,
-                sink,
-                flat_idxs,
-                self.head_dim**-0.5,
-                topk_length=flat_tlen,
+                query, kv_full, sink, flat_idxs, self.head_dim**-0.5, topk_length=flat_tlen
             )
 
         context = (
@@ -785,6 +807,45 @@ class CompressedSparseAttention(nn.Module):
         if pad:
             context = context[:, :, :orig_seq_len, :].contiguous()
         return self._project_context(context, cos, sin)
+
+    def _select_bshd_indexer_topk(
+        self,
+        binding: "IndexerTopKBinding",
+        q_indexer: torch.Tensor,
+        index_k: torch.Tensor,
+        weights_indexer: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor | None:
+        """Select the compressed-key top-k of a whole prompt with the layer's binding.
+
+        Args:
+            binding: The active binding of the layer.
+            q_indexer: Indexer queries ``[sq, b, H, D]`` (``sq`` a multiple of the ratio).
+            index_k: Compressed indexer keys ``[sq // ratio, b, D]``.
+            weights_indexer: Head weights ``[sq, b, H]``, before the softmax scale.
+            topk: Keys per query row.
+
+        Returns:
+            int32 ``[1, sq, topk]`` compressed key ids of the prompt (-1 for missing keys),
+            the contract of ``dsa_kernels.indexer_topk``; None to run the upstream selector
+            (batches of several prompts, or an inactive binding).
+        """
+        if q_indexer.shape[1] != 1:
+            binding.decline("batch>1")
+            return None
+        from megatron.lite.primitive.kernels.indexer_topk import QueryLayout
+
+        selected = binding.select(
+            q_indexer[:, 0],
+            index_k[:, 0],
+            weights_indexer[:, 0],
+            layout=QueryLayout.full(
+                q_indexer.shape[0], keys=index_k.shape[0], key_ratio=self.compress_ratio
+            ),
+            topk=topk,
+            softmax_scale=self.indexer.softmax_scale,
+        )
+        return None if selected is None else selected.unsqueeze(0)
 
     # ------------------------------------------------------------------
     # THD packed context-parallel path
@@ -823,10 +884,7 @@ class CompressedSparseAttention(nn.Module):
         return bkv.permute(2, 0, 1, 3).contiguous()  # (d_window, 1, 1, head_dim)
 
     def _forward_thd_packed(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        packed_seq_params: Any,
+        self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params: Any
     ) -> torch.Tensor:
         """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention."""
         batch, seq_len, _ = x.shape
@@ -895,7 +953,9 @@ class CompressedSparseAttention(nn.Module):
             # through the same method, so materialize the zero boundary directly
             # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
             d_comp = (
-                8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
+                8
+                if self.compress_ratio == 4
+                else self.compress_ratio if self.compress_ratio > 1 else 0
             )
             d_window = max(int(self.config.sliding_window), d_comp)
             boundary_hidden = x_thd.new_zeros((d_window,) + tuple(x_thd.shape[1:]))
@@ -1031,21 +1091,40 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                # The third value is the compact top-k softmax, returned only when
-                # ``return_softmax=True``; lite does not ask for it.
-                compressed_topk, indexer_layout, _ = cp_utils.compute_cp_indexer_topk(
-                    q_indexer_cp,
-                    weights_indexer_cp,
-                    k_indexer_seq_major,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    ratio,
-                    indexer.index_topk,
-                    indexer.softmax_scale,
-                    max_seqlen_q=max_seqlen_q,
-                    use_fused=self.apply_dsa_kernel_fusion,
-                )
+                selected = None
+                binding = _bound_indexer_topk(self)
+                if binding is not None:
+                    selected = self._select_thd_indexer_topk(
+                        binding,
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start=global_start,
+                        cp_size=cp_size,
+                        max_seqlen_q=max_seqlen_q,
+                    )
+                if selected is not None:
+                    # The logical indexer layout feeds only the indexer loss, which needs
+                    # training with autograd; bindings select only in eval mode without it.
+                    compressed_topk, indexer_layout = selected, None
+                else:
+                    # The third value is the compact top-k softmax, returned only when
+                    # ``return_softmax=True``; lite does not ask for it.
+                    compressed_topk, indexer_layout, _ = cp_utils.compute_cp_indexer_topk(
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        ratio,
+                        indexer.index_topk,
+                        indexer.softmax_scale,
+                        max_seqlen_q=max_seqlen_q,
+                        use_fused=self.apply_dsa_kernel_fusion,
+                    )
 
             compressed_kv_local, _ = self.compressor._forward_thd(
                 hidden_compact,
@@ -1143,8 +1222,7 @@ class CompressedSparseAttention(nn.Module):
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_idx,
-                    num_layers=self.config.num_hidden_layers
-                    + self.config.num_nextn_predict_layers,
+                    num_layers=self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
                     reduce_group=cp_group,
                 )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -1165,3 +1243,72 @@ class CompressedSparseAttention(nn.Module):
                 query, kv_full_thd, self.sinks.float(), topk_idxs, self.softmax_scale
             )
         return output.unsqueeze(1)
+
+    def _select_thd_indexer_topk(
+        self,
+        binding: "IndexerTopKBinding",
+        q_indexer: torch.Tensor,
+        weights_indexer: torch.Tensor,
+        k_indexer_seq_major: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_compressed: torch.Tensor,
+        *,
+        global_start: int,
+        cp_size: int,
+        max_seqlen_q: int,
+    ) -> torch.Tensor | None:
+        """Select this rank's compressed-key top-k of a THD call with the layer's binding.
+
+        The local rows are the packed tokens ``[global_start, global_start + l_local)``;
+        each selects among the compressed keys of its own sequence, which
+        ``k_indexer_seq_major`` holds in sequence order (``length // ratio`` keys per
+        sequence). The rows are described with host integers: a single sequence whose
+        length (``max_seqlen_q``) covers the packed tokens of every rank needs no device
+        read; otherwise ``cu_seqlens`` is read once per call, never cached, because the
+        next batch may reuse its memory with other lengths.
+
+        Args:
+            binding: The active binding of the layer.
+            q_indexer: Indexer queries ``[l_local, H, D]``.
+            weights_indexer: Head weights ``[l_local, H]``, before the softmax scale.
+            k_indexer_seq_major: Compressed indexer keys ``[l_local * cp_size // ratio, D]``.
+            cu_seqlens: Packed token offsets of the sequences.
+            cu_seqlens_compressed: Compressed key offsets of the sequences.
+            global_start: Packed token of the first local row.
+            cp_size: Context-parallel ranks.
+            max_seqlen_q: Length of the longest sequence.
+
+        Returns:
+            int32 ``[l_local, index_topk]`` sequence-relative compressed key ids, -1 for
+            missing keys and for rows past the last sequence: the ids of
+            ``cp_utils.compute_cp_indexer_topk``. None to run the upstream selector, which
+            returns no top-k for calls without compressed keys.
+        """
+        indexer = self.indexer
+        ratio = self.compress_ratio
+        if k_indexer_seq_major.shape[0] == 0 or max_seqlen_q // ratio == 0:
+            return None
+        from megatron.lite.primitive.kernels.indexer_topk import QueryLayout
+
+        l_local = q_indexer.shape[0]
+        packed_rows = l_local * cp_size
+        if cu_seqlens.shape[0] == 2 and max_seqlen_q == packed_rows:
+            host_cu_seqlens = [0, packed_rows]
+        else:
+            host_cu_seqlens = cu_seqlens.tolist()
+        layout = QueryLayout.packed(
+            host_cu_seqlens,
+            row_start=global_start,
+            rows=l_local,
+            key_ratio=ratio,
+            absolute_ids=False,
+        )
+
+        return binding.select(
+            q_indexer,
+            k_indexer_seq_major,
+            weights_indexer,
+            layout=layout,
+            topk=int(indexer.index_topk),
+            softmax_scale=indexer.softmax_scale,
+        )
