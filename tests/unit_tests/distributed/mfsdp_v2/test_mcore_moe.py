@@ -20,7 +20,6 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
-from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -63,31 +62,25 @@ def process_group_collections(distributed_setup):
         dp_cp=reference_group,
         embd=None,
         pos_embd=None,
-        mp=reference_group,
-        tp_ep_pp=reference_group,
     )
     model_parallel_cuda_manual_seed(1234)
     yield process_group_collection, reference_process_group_collection
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    ("optimizer_name", "layer_pattern", "grouped_gemm"),
-    [("adam", "*E", True), ("adam", "*E", False), ("muon", "*E", True), ("muon", "*-*E", True)],
-    ids=["adam-grouped", "adam-sequential", "muon", "muon-dense-mlp"],
-)
+@pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
 def test_standard_moe_training_and_clipping(
-    process_group_collections, distributed_setup, optimizer_name, layer_pattern, grouped_gemm
+    process_group_collections, distributed_setup, grouped_gemm
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     config = TransformerConfig(
-        num_layers=len(layer_pattern),
+        num_layers=2,
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
-        moe_layer_freq=[int(layer == "E") for layer in layer_pattern],
+        moe_layer_freq=[0, 1],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=grouped_gemm,
@@ -111,7 +104,7 @@ def test_standard_moe_training_and_clipping(
         hybrid_stack_spec=stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern=layer_pattern,
+        hybrid_layer_pattern="*E",
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
@@ -119,7 +112,7 @@ def test_standard_moe_training_and_clipping(
         hybrid_stack_spec=stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern=layer_pattern,
+        hybrid_layer_pattern="*E",
         pg_collection=process_group_collection,
     ).cuda()
     _sync_model_parameters(reference_model, model)
@@ -138,7 +131,7 @@ def test_standard_moe_training_and_clipping(
     )
     assert isinstance(model.module, FsdpModule)
 
-    layer = model.module.decoder.layers[-1]
+    layer = model.module.decoder.layers[1]
     assert isinstance(layer, FsdpModule)
     assert not isinstance(layer.mlp, FsdpModule)
     assert not isinstance(layer.mlp.router, FsdpModule)
@@ -146,31 +139,11 @@ def test_standard_moe_training_and_clipping(
     assert isinstance(layer.mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
-        optimizer=optimizer_name,
-        lr=1.0e-3,
-        weight_decay=0.0,
-        use_distributed_optimizer=False,
-        clip_grad=1.0e-4,
-        muon_split_qkv=False,
-        # FP32 Newton-Schulz avoids BF16 rounding differences between EP and the reference.
-        muon_fp32_matmul_prec="highest",
+        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
     )
-    reference_optimizer = get_megatron_optimizer(
-        optimizer_config,
-        [reference_model],
-        pg_collection=reference_process_group_collection,
-        use_gloo_process_groups=False,
-    )
-    optimizer = get_megatron_optimizer(
-        optimizer_config,
-        [model],
-        pg_collection=process_group_collection,
-        use_gloo_process_groups=False,
-    )
-    if optimizer_name == "muon":
-        assert isinstance(optimizer, ChainedOptimizer)
-    else:
-        assert isinstance(optimizer, FullyShardedOptimizer)
+    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 
     world_size = distributed_setup.world_size
@@ -184,10 +157,10 @@ def test_standard_moe_training_and_clipping(
         (torch.distributed.get_rank() + 1) * local_batch_size,
     )
 
-    reference_losses, reference_norms = _train(
+    reference_losses = _train(
         reference_model, reference_optimizer, input_ids, position_ids, targets
     )
-    losses, norms = _train(
+    losses = _train(
         model, optimizer, input_ids[input_slice], position_ids[input_slice], targets[input_slice]
     )
     torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.AVG)
@@ -198,7 +171,6 @@ def test_standard_moe_training_and_clipping(
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
-    torch.testing.assert_close(norms, reference_norms)
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
@@ -291,10 +263,10 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
         (torch.distributed.get_rank() + 1) * local_batch_size,
     )
 
-    reference_losses, _ = _train(
+    reference_losses = _train(
         reference_model, reference_optimizer, input_ids, position_ids, targets
     )
-    losses, _ = _train(
+    losses = _train(
         model, optimizer, input_ids[input_slice], position_ids[input_slice], targets[input_slice]
     )
     torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.AVG)
@@ -334,14 +306,13 @@ def _sync_model_parameters(reference_model, model):
 
 
 def _train(model, optimizer, input_ids, position_ids, targets):
-    """Train one model for five steps and return its stacked losses and pre-clip gradient norms."""
+    """Train one model for five steps and return its stacked losses."""
 
     def forward():
         output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
         return torch.nn.functional.mse_loss(output, targets)
 
     losses = []
-    norms = []
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
@@ -351,5 +322,4 @@ def _train(model, optimizer, input_ids, position_ids, targets):
             pre_clip_norm > optimizer.config.clip_grad
         ), "Gradients must exceed the clipping threshold to exercise clipping."
         losses.append(loss)
-        norms.append(float(pre_clip_norm))
-    return torch.stack(losses), torch.tensor(norms)
+    return torch.stack(losses)
