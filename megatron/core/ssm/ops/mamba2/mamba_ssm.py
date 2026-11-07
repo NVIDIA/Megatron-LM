@@ -29,11 +29,18 @@ except ImportError:
     TRITON3 = False
 
 if TRITON3:
+    # Triton 3 dropped log1p from `tl.math`; libdevice still carries it.
+    from triton.language.extra import libdevice
 
     @triton.jit
     def softplus(dt):
-        """Optimized softplus."""
-        return tl.math.log(tl.math.exp(dt) + 1)
+        """`log1p(exp(dt))` in fp32, as torch's softplus computes it below its threshold.
+
+        `log(exp(dt) + 1)` would round `exp(dt) + 1` to fp32 first: an absolute error of up to
+        2**-24, a relative error of ~5e-5 at the dt ~ 1e-3 that Mamba decodes with, which the
+        recurrent state then accumulates on every step.
+        """
+        return libdevice.log1p(libdevice.exp(dt))
 
 elif HAVE_TRITON:
 
