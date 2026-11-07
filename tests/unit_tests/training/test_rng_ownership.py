@@ -9,9 +9,11 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, checkpointing, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.config.common_config import RNGConfig
+from megatron.training.models import GPTModelConfig
 
 
 def _args_without_rng():
@@ -84,7 +86,7 @@ def test_container_derives_tracker_fields_one_way(
         assert transformer.use_te_rng_tracker is not te_tracker
         assert transformer.inference_rng_tracker is not inference_tracker
         assert asdict(cfg.rng) == before
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=1))
     cfg.finalize()
     assert transformer.use_te_rng_tracker is te_tracker
     assert transformer.inference_rng_tracker is inference_tracker
@@ -92,7 +94,7 @@ def test_container_derives_tracker_fields_one_way(
 
 
 def test_native_cuda_graph_requirement_is_resolved_before_seeding(monkeypatch, run_config):
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=1))
     from megatron.core.transformer import TransformerConfig
     from megatron.training.models import GPTModelConfig
 
@@ -255,6 +257,12 @@ def test_checkpoint_policy_retains_current_run_precedence(
 ):
     args = _args_without_rng()
     args.use_dist_ckpt = False
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+    )
     checkpoint_args = Namespace(**vars(args), seed=123, data_parallel_random_init=saved_dp)
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)

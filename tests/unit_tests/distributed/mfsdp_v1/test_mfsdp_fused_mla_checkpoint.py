@@ -301,10 +301,11 @@ def model_state_dict_for_preprocess(sharded):
 
 
 def preprocess(sharded, state_dict):
+    from megatron.core.transformer import TransformerConfig
     from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 
-    args = SimpleNamespace(swiglu=False, num_experts=None)
-    return preprocess_fsdp_dtensor_state_dict(args, state_dict, sharded)
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    return preprocess_fsdp_dtensor_state_dict(config, state_dict, sharded)
 
 
 def save_checkpoint(sharded, path):

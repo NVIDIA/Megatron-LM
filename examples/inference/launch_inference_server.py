@@ -135,7 +135,7 @@ def main():
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     args = get_args()
