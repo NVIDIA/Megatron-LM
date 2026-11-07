@@ -31,6 +31,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -145,7 +146,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer and Mamba layers, shortcut MoE blocks, and
+                unspecified, transformer and Mamba layers, shortcut MoE blocks, mHC wrappers, and
                 TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
                 replaces these defaults. Expert containers use the expert-DP mesh;
                 custom lists must include them when expert and dense sharding settings
@@ -188,6 +189,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 TransformerLayer,
                 MambaLayer,
                 ShortcutMoEBlock,
+                HyperConnectionHybridLayer,
                 TEGroupedMLP,
                 SequentialMLP,
             ]
@@ -347,6 +349,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError(
                 "MFSDP v2 does not support residual_stream recomputation (#7777). "
                 "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
+            )
+        if "mhc" in (config.recompute_modules or []) and config.mhc_recompute_layer_num != 1:
+            # A multi-layer block replays earlier layers before they gather their weights.
+            raise ValueError(
+                "MFSDP v2 supports mhc recomputation only with mhc_recompute_layer_num=1."
             )
 
         if config.mtp_detach_heads:
