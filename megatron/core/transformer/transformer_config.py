@@ -6,7 +6,6 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import MISSING, dataclass, field, fields
-from types import MemberDescriptorType
 from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
@@ -1814,12 +1813,11 @@ class TransformerConfig(ModelParallelConfig):
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
 
-        The source config's instance dictionary and dataclass fields are deep-copied
-        without invoking the target class's initializer or ``__post_init__``. This
-        preserves normalized values, dynamically added attributes, and slotted fields
-        while producing an independent config. Fields introduced by the target class
-        receive their declared defaults; required new fields must be supplied by
-        constructing the target config directly.
+        The source config's instance dictionary is deep-copied without invoking
+        the target class's initializer or ``__post_init__``. This preserves normalized
+        values and dynamically added attributes while producing an independent config.
+        Fields introduced by the target class receive their declared defaults;
+        required new fields must be supplied by constructing the target config directly.
 
         Args:
             config: The transformer config to copy.
@@ -1831,18 +1829,11 @@ class TransformerConfig(ModelParallelConfig):
         memo = {id(config): new_config}
         new_config.__dict__ = deepcopy(config.__dict__, memo)
 
-        # A subclass can store dataclass fields in slots instead of its dictionary.
-        # Keep one memo so aliases between the two kinds of storage remain intact.
-        for source_field in fields(config):
-            name = source_field.name
-            if hasattr(config, name):
-                setattr(new_config, name, deepcopy(getattr(config, name), memo))
-
         for target_field in fields(cls):
             name = target_field.name
-            if hasattr(config, name):
-                value = deepcopy(getattr(config, name), memo)
-            elif target_field.default is not MISSING:
+            if name in new_config.__dict__:
+                continue
+            if target_field.default is not MISSING:
                 value = deepcopy(target_field.default, memo)
             elif target_field.default_factory is not MISSING:
                 value = target_field.default_factory()
@@ -1852,9 +1843,6 @@ class TransformerConfig(ModelParallelConfig):
                     "construct the config directly."
                 )
             setattr(new_config, name, value)
-            if isinstance(getattr(cls, name, None), MemberDescriptorType):
-                # Do not retain a dictionary value hidden by the target's slot.
-                new_config.__dict__.pop(name, None)
         return new_config
 
     def _validate_cp_layouts(self) -> None:

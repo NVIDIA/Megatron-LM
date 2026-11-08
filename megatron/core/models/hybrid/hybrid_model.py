@@ -67,6 +67,7 @@ def _get_hash_moe_layer_threshold(
         return 0
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit, Symbols
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     if isinstance(main_pattern, str) or main_pattern is None:
         global_layers = (main_pattern or '').replace(Symbols.PIPE, '')
@@ -75,7 +76,7 @@ def _get_hash_moe_layer_threshold(
     moe_layer_numbers = [
         layer_number
         for layer_number, layer_type in enumerate(global_layers, start=1)
-        if layer_type == Symbols.MOE or layer_utils.is_moe_layer_config(layer_type)
+        if layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig
     ]
     if n_hash_layers > len(moe_layer_numbers):
         raise ValueError(
@@ -96,11 +97,12 @@ def _validate_hash_moe_pipeline_placement(
         return
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     local_hash_layer_numbers = [
         layer_offset + local_layer_number
         for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
-        if (layer_type == Symbols.MOE or layer_utils.is_moe_layer_config(layer_type))
+        if (layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig)
         and layer_offset + local_layer_number <= hash_moe_layer_threshold
     ]
     if local_hash_layer_numbers:
@@ -339,13 +341,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 for entry in parsed_config_list.main_layer_config_list
                 if entry is not PipelineSplit
             ) + (self.mtp_layer_config_list or ())
-            # Validate the complete architecture on every rank before creating any modules,
-            # including custom layers assigned to other pipeline stages or MTP depths.
-            for layer_config in architecture_layer_configs:
-                if layer_utils.get_custom_layer_type(layer_config) is not None:
-                    layer_utils._validate_custom_layer_execution(
-                        layer_config, self.config, self.pg_collection
-                    )
             layer_utils.validate_shared_rotary_config(
                 architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
             )
@@ -367,8 +362,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self._mtp_uses_mla = any(
                 type(entry) in mla_config_types for entry in (self.mtp_layer_config_list or ())
             )
+            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
             self.config._hybrid_has_moe_layers = any(
-                layer_utils.is_moe_layer_config(entry) for entry in architecture_layer_configs
+                type(entry) is MoELayerConfig for entry in architecture_layer_configs
             )
             if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
                 self.config.mtp_num_layers = self.mtp_num_depths

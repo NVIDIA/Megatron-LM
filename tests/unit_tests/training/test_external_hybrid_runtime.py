@@ -3,9 +3,7 @@
 """Runtime integration for config-defined layers implemented outside Megatron Core."""
 
 from argparse import Namespace
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import ClassVar
 from unittest.mock import Mock
 
 import pytest
@@ -17,27 +15,15 @@ from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training import checkpointing
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.training import (
     _hybrid_config_list_moe_logging_metadata,
     num_floating_point_operations,
 )
+from megatron.training.utils.checkpoint_utils import read_run_config
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
-
-
-class ExternalMoEMetadataLayer(ExternalGainLayer):
-    """Exercise the standard MoE logging contract without constructing a router."""
-
-    is_moe_layer: ClassVar[bool] = True
-
-
-@dataclass
-class ExternalMoEMetadataConfig(ExternalGainConfig):
-    """Select the test layer that participates in MoE logging."""
-
-    layer_type: ClassVar[type[MegatronModule]] = ExternalMoEMetadataLayer
 
 
 def _config(config_type=ExternalGainConfig, **kwargs):
@@ -188,9 +174,9 @@ def test_mixed_ffn_widths_use_layer_configs_instead_of_stack_defaults():
 
 
 @pytest.mark.parametrize("repeated_mtp", [False, True])
-def test_external_moe_metadata_uses_standard_tracker_conventions(repeated_mtp):
+def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_conventions(repeated_mtp):
     dense = _config()
-    moe = _config(ExternalMoEMetadataConfig, num_moe_experts=4, moe_z_loss_coeff=0.01)
+    moe = MoELayerConfig.from_config(_config(num_moe_experts=4, moe_z_loss_coeff=0.01))
     configs = [dense, moe, PipelineSplit, moe, MTPSplit, moe, MTPSplit, moe]
 
     metadata = _hybrid_config_list_moe_logging_metadata(
@@ -261,3 +247,23 @@ def test_external_layer_keeps_config_list_gpt_conversion_restriction():
         checkpointing._validate_checkpoint_model_family(
             Namespace(), Namespace(hybrid_layer_pattern=None), [model]
         )
+
+
+def test_external_layer_fields_are_recorded_in_run_config(run_config, tmp_path):
+    root = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    custom = ExternalGainConfig.from_config(root)
+    custom.gain_init = 0.5
+    custom.notes.append("architecture-specific")
+    run_config.model = HybridModelConfig(
+        transformer=root, hybrid_layer_config_list=[custom, custom], vocab_size=64
+    )
+    path = tmp_path / "run_config.yaml"
+    run_config.to_yaml(path)
+    for saved in (run_config.to_dict(), read_run_config(str(path))):
+        layers = saved["model"]["hybrid_layer_config_list"]
+        assert layers[0]["_target_"] == (
+            "tests.unit_tests.models.hybrid.external_layer.ExternalGainConfig"
+        )
+        assert layers[0]["gain_init"] == 0.5
+        assert layers[0]["notes"] == ["external", "architecture-specific"]
+        assert layers[0] == layers[1]

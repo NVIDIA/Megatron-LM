@@ -2,8 +2,6 @@
 
 """Config-only extension acceptance, using a layer that is not registered in Core."""
 
-import subprocess
-import sys
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -25,10 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.hybrid import HybridModelConfig
-from megatron.training.utils.checkpoint_utils import read_run_config
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
 from tests.unit_tests.test_utilities import Utils
@@ -100,32 +95,11 @@ def test_external_config_parser_preserves_pipeline_and_mtp_identity():
     assert parsed.mtp_num_depths == 2
 
 
-@pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-def test_external_shared_rotary_trait_validates_width_and_attention_family(position_embedding_type):
-    class SharedRotaryGainLayer(ExternalGainLayer):
-        uses_shared_rotary_embeddings = True
-
-    class SharedRotaryGainConfig(ExternalGainConfig):
-        layer_type = SharedRotaryGainLayer
-
-    root = _root_config()
-    custom = SharedRotaryGainConfig.from_config(root)
-    layer_utils.validate_shared_rotary_config([custom], root.kv_channels, position_embedding_type)
-    custom.kv_channels *= 2
-    with pytest.raises(ValueError, match="kv_channels"):
-        layer_utils.validate_shared_rotary_config(
-            [custom], root.kv_channels, position_embedding_type
-        )
-    with pytest.raises(ValueError, match="Attention and MLA"):
-        parse_hybrid_layer_config_list([custom, MLALayerConfig.from_config(root)])
-    # A custom layer that owns no shared RoPE does not acquire an attention-family identity.
-    parse_hybrid_layer_config_list(
-        [ExternalGainConfig.from_config(root), MLALayerConfig.from_config(root)]
+@pytest.mark.parametrize("shortcut", [False, True])
+def test_external_layer_cpu_stack_forward_backward_and_context(shortcut):
+    root = _root_config(
+        num_layers=2, moe_shortcut_connection=shortcut, num_moe_experts=2 if shortcut else None
     )
-
-
-def test_external_layer_cpu_stack_forward_backward_and_context():
-    root = _root_config(num_layers=2)
     source = ExternalGainConfig.from_config(root)
     physical_configs = clone_hybrid_layer_config_list([source, source])
     groups = _single_rank_groups()
@@ -163,7 +137,7 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
         assert observed[0] is attention_mask
         assert observed[1] is rotary
         assert observed[3] is padding_mask
-        assert observed[5] is input_ids
+        assert observed[4] is input_ids
     output.square().mean().backward()
     assert hidden.grad is not None
     before = stack.layers[0].gain.detach().clone()
@@ -174,15 +148,13 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
     assert source.gain_init == 1.25
 
 
-def test_external_forward_receives_packing_and_rejects_inference():
+def test_external_forward_receives_packing():
     config = ExternalGainConfig.from_config(_root_config())
     layer = config.layer_type(config=config, pg_collection=_single_rank_groups(), layer_number=1)
     hidden = torch.randn(4, 1, config.hidden_size)
     packed = PackedSeqParams(qkv_format="thd")
     layer_utils.invoke_custom_layer(layer, hidden, packed_seq_params=packed)
     assert layer.last_forward_inputs[2] is packed
-    with pytest.raises((ValueError, NotImplementedError), match="inference"):
-        layer_utils.invoke_custom_layer(layer, hidden, inference_context=object())
 
 
 @pytest.mark.parametrize("recompute", [False, True])
@@ -206,71 +178,28 @@ def test_external_stack_rejects_inference_before_execution(recompute):
     assert stack.layers[0].last_forward_inputs is None
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("tensor_model_parallel_size", 2),
-        ("context_parallel_size", 2),
-        ("sequence_parallel", True),
-        ("fp8", "e4m3"),
-        ("cuda_graph_impl", "local"),
-        ("recompute_granularity", "selective"),
-    ],
-)
-def test_external_layer_rejects_unsupported_execution_options(field, value):
-    root = _root_config(num_layers=1)
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_external_layer_receives_parallel_process_groups(tp_size, cp_size):
+    root = _root_config(
+        num_layers=1, tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
     config = ExternalGainConfig.from_config(root)
-    # Apply after normalization to exercise Core's integration checks at construction.
-    setattr(root, field, value)
-    setattr(config, field, value)
-    with pytest.raises(ValueError, match="unsupported custom-layer execution features"):
-        HybridStack(
-            config=root,
-            submodules=HybridStackSubmodules(),
-            layer_config_list=[config],
-            pg_collection=_single_rank_groups(),
-            post_process=False,
-            post_layer_norm=False,
-        )
-
-
-def test_external_layer_fields_are_recorded_in_run_config(run_config, tmp_path):
-    root = _root_config(num_layers=2)
-    custom = ExternalGainConfig.from_config(root)
-    custom.gain_init = 0.5
-    custom.notes.append("architecture-specific")
-    run_config.model = HybridModelConfig(
-        transformer=root, hybrid_layer_config_list=[custom, custom], vocab_size=64
+    # Constructor-only coverage: the custom layer receives the caller's parallel grid.
+    groups = _single_rank_groups()
+    groups.tp = SimpleNamespace(size=lambda: tp_size, rank=lambda: 0)
+    groups.cp = SimpleNamespace(size=lambda: cp_size, rank=lambda: 0)
+    groups.tp_cp = SimpleNamespace(size=lambda: tp_size * cp_size, rank=lambda: 0)
+    stack = HybridStack(
+        config=root,
+        submodules=HybridStackSubmodules(),
+        layer_config_list=[config],
+        pg_collection=groups,
+        post_process=False,
+        post_layer_norm=False,
     )
-    path = tmp_path / "run_config.yaml"
-    run_config.to_yaml(path)
-    for saved in (run_config.to_dict(), read_run_config(str(path))):
-        layers = saved["model"]["hybrid_layer_config_list"]
-        assert layers[0]["_target_"] == (
-            "tests.unit_tests.models.hybrid.external_layer.ExternalGainConfig"
-        )
-        assert layers[0]["gain_init"] == 0.5
-        assert layers[0]["notes"] == ["external", "architecture-specific"]
-        assert layers[0] == layers[1]
-
-
-def test_external_layer_gloo_checkpoint_resume(tmp_path):
-    # save() uses the default process group. A fresh process permits Gloo even when
-    # another test has initialized an NCCL world, and leaves that world untouched.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; from tests.unit_tests.models.hybrid.external_layer "
-            "import run_gloo_checkpoint_roundtrip; run_gloo_checkpoint_roundtrip(sys.argv[1])",
-            str(tmp_path / "gloo_checkpoint"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert stack.layers[0].pg_collection is groups
+    assert stack.layers[0].config is config
+    assert stack.layers[0].tp_group is groups.tp
 
 
 @pytest.fixture

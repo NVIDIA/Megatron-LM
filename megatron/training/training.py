@@ -3982,7 +3982,7 @@ def _hybrid_config_list_moe_logging_metadata(
         PipelineSplit,
         parse_hybrid_layer_config_list,
     )
-    from megatron.core.models.hybrid.layers.utils import is_moe_layer_config
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     parsed_config_list = parse_hybrid_layer_config_list(hybrid_layer_config_list)
     main_configs = [
@@ -3994,8 +3994,8 @@ def _hybrid_config_list_moe_logging_metadata(
 
     # Routers reserve one logging slot per MTP depth, as on the pattern path.
     num_layers = len(main_configs) + parsed_config_list.mtp_num_depths
-    main_moe_configs = [config for config in main_configs if is_moe_layer_config(config)]
-    mtp_moe_configs = [config for config in mtp_configs if is_moe_layer_config(config)]
+    main_moe_configs = [config for config in main_configs if type(config) is MoELayerConfig]
+    mtp_moe_configs = [config for config in mtp_configs if type(config) is MoELayerConfig]
     mtp_repeats = (
         1
         if mtp_use_repeated_layer and parsed_config_list.mtp_num_depths > 0

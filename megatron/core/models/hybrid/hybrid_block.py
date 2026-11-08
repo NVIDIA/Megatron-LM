@@ -163,16 +163,14 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
-        assert pg_collection is not None, "pg_collection must be provided for HybridStack"
         for layer_config in layer_config_list:
-            if layer_utils.get_custom_layer_type(layer_config) is not None:
-                layer_utils._validate_custom_layer_execution(layer_config, config, pg_collection)
+            if layer_utils.get_custom_layer_type(layer_config) is None:
+                segment = layer_utils.get_layer_symbol_from_config(layer_config)
             else:
-                layer_utils.validate_tp_comm_overlap(
-                    layer_config,
-                    layer_utils.get_layer_symbol_from_config(layer_config),
-                    has_mtp=is_mtp_layer,
-                )
+                # Custom layers have no built-in symbol. An empty segment skips symbol-specific
+                # checks while preserving MTP validation.
+                segment = ""
+            layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -187,6 +185,8 @@ class HybridStack(MegatronModule):
         )
         self.mtp_layer_number = mtp_layer_number
         self.boundary_layout = boundary_layout
+
+        assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
@@ -445,7 +445,7 @@ class HybridStack(MegatronModule):
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
-                self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
+                self.layers, self.layer_config_list, self.config, pp_layer_offset=pp_layer_offset
             )
             self._execution_layer_indices = [
                 (
@@ -831,9 +831,7 @@ class HybridStack(MegatronModule):
                                     layer,
                                     hidden_states,
                                     attention_mask=attention_mask,
-                                    inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
-                                    sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
                                     input_ids=input_ids,
