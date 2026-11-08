@@ -19,6 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -35,7 +36,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
@@ -1668,6 +1668,26 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # ==================================
         # core attention computation
         # ==================================
+
+        if (
+            self.offload_core_attention
+            and self.training
+            and self.config.activation_offload_fraction > 0
+        ):
+            # Offload may gather small views into contiguous tensors, while fused
+            # attention backward retains the packed layout selected in forward.
+            # Check the actual inputs after Q/K normalization and rotary embedding.
+            qkv = (query, key, value)
+            storages = [tensor.untyped_storage().data_ptr() for tensor in qkv]
+            if any(
+                not tensor.is_contiguous() and storages.count(storage) > 1
+                for tensor, storage in zip(qkv, storages)
+            ):
+                raise ValueError(
+                    "core_attn offloading does not support packed Q/K/V views sharing storage. "
+                    "Use unpacked attention inputs or remove core_attn from offload_modules "
+                    "(and attn_proj, which requires core_attn)."
+                )
 
         nvtx_range_push(suffix="core_attention")
         core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(

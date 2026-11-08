@@ -8,8 +8,6 @@ import argparse
 from copy import deepcopy
 from typing import Optional
 
-import torch
-
 from megatron.core.activations import fast_gelu
 
 # Keep the example import paths compatible for downstream providers.
@@ -22,6 +20,7 @@ from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_trans
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.global_vars import get_run_config
 
 
 def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -49,24 +48,10 @@ def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.Argument
     return parser
 
 
-def _dtype(args: argparse.Namespace):
-    """Resolve params/pipeline dtype from stock Megatron precision args."""
-    dtype = getattr(args, "params_dtype", None)
-    if dtype is None:
-        if getattr(args, "bf16", False):
-            dtype = torch.bfloat16
-        elif getattr(args, "fp16", False):
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
-    return bool(getattr(args, "bf16", False)), dtype
-
-
-def _base_config(args: argparse.Namespace) -> TransformerConfig:
-    """Stock config from CLI args; the per-tower override helpers deepcopy this."""
-    from megatron.training.argument_utils import core_transformer_config_from_args
-
-    return core_transformer_config_from_args(args)
+def _base_config() -> TransformerConfig:
+    """Shared model config; per-tower application overrides operate on copies."""
+    cfg = get_run_config()
+    return cfg.model.transformer
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
@@ -117,8 +102,8 @@ def _disable_gtp(config: TransformerConfig) -> None:
 
 def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) -> TransformerConfig:
     """RADIO vision config: stock from-args base + RADIO-specific overrides."""
-    config = deepcopy(_base_config(args))
-    bf16, dtype = _dtype(args)
+    config = deepcopy(_base_config())
+    bf16, dtype = config.bf16, config.params_dtype
     config.num_layers = 32
     config.hidden_size = 1280
     config.num_attention_heads = 16

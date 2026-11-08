@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.transformer.torch_norm import LayerNormInterface
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
@@ -85,6 +85,9 @@ class Norm:
             )
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
+
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
 
         def _state_dict_hook(self, state_dict, prefix, local_metadata):
             if "_extra_state" in state_dict:

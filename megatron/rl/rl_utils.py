@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import gc
@@ -55,6 +55,7 @@ from megatron.core.inference.unified_memory import (
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
@@ -247,6 +248,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
 def verify_model_weights_swap(
     train_model: LanguageModule,
     inference_model: LanguageModule,
+    padded_vocab_size: int = 128256,
     seq_len: int = 8,
     batch_size: int = 2,
     atol: float = 1e-4,
@@ -262,6 +264,7 @@ def verify_model_weights_swap(
     Args:
         train_model: The training model (source of weights).
         inference_model: The inference model (target of weights).
+        padded_vocab_size: Vocabulary size used to generate verification tokens.
         seq_len: Sequence length for test input.
         batch_size: Batch size for test input.
         atol: Absolute tolerance for comparing outputs.
@@ -279,14 +282,13 @@ def verify_model_weights_swap(
     train_core = unwrap_model(train_lm)
     inf_core = unwrap_model(inf_lm)
 
-    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
     actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Generate deterministic test input - same across ALL ranks
     torch.manual_seed(1234)
     test_tokens = torch.randint(
-        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
+        low=0, high=padded_vocab_size, size=(batch_size, actual_seq_len),
         device=device, dtype=torch.long
     )
     test_position_ids = (
@@ -720,7 +722,9 @@ def maybe_get_rollout_bank(args):
     if _ROLLOUT_BANK is None:
         from megatron.rl.rollout_bank import RolloutBank
 
-        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(
+            cfg.checkpoint.save or ".", "rollout_bank"
+        )
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
@@ -854,6 +858,7 @@ def colocated_inference(
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
+                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
                 atol=.1,
                 rtol=5e-4,
             )
@@ -1715,7 +1720,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:
@@ -2932,7 +2937,6 @@ def get_grpo_data_iterator(
 
 
 def evaluate_and_print_results_rl(
-    data_iterator: Iterator[TensorDataset],
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     iteration: int,
@@ -2942,7 +2946,6 @@ def evaluate_and_print_results_rl(
     """Helper function to evaluate and dump results on screen.
 
     Args:
-        data_iterator: Iterator over batches of evaluation dataset.
         model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
@@ -3056,6 +3059,68 @@ def evaluate_and_print_results_rl(
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
+
+
+def next_rollout_iterator(
+    iteration: int,
+    current_iterator: Any,
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    ref_state_dict: Optional[dict],
+    rl_config: Any,
+    train_config: Any,
+) -> Any:
+    """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    if optimizer is None:
+        # Release stale CUDA cached memory before inference.
+        torch.cuda.empty_cache()
+    with torch.no_grad():
+        return get_grpo_data_iterator(
+            model,
+            inference_model,
+            optimizer,
+            iteration,
+            ref_state_dict,
+            grpo_iterations=rl_config.grpo_iterations,
+            grpo_prompts_per_step=rl_config.grpo_prompts_per_step,
+            grpo_group_size=rl_config.grpo_group_size,
+            global_batch_size=train_config.global_batch_size,
+            sequence_packing=rl_config.rl_use_sequence_packing,
+            buffered_rollouts=current_iterator,
+            is_correction=rl_config.rl_inference_logprobs_is_correction,
+            optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+        )
+
+
+def evaluate_rollouts(
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    prefix: str,
+    iteration: int,
+    verbose: bool,
+    write_to_tensorboard: bool,
+) -> None:
+    """Run the RL evaluation rollouts, on the separate inference model when there is one."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    eval_model, training_model = model, None
+    if inference_model is not None:
+        # Swap the training weights onto the inference model first.
+        inf_core = unwrap_model(inference_model[0])
+        _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        refit_inference_model(model, inference_model, get_args())
+        eval_model, training_model = inference_model, model
+    evaluate_and_print_results_rl(
+        eval_model,
+        optimizer,
+        iteration,
+        write_to_tensorboard=write_to_tensorboard,
+        training_model=training_model,
+    )
 
 
 def calculate_grpo_loss(
@@ -3192,6 +3257,9 @@ def megatron_rl_inference_mode(
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+    training_lang_module = (
+        unwrap_model(training_model[0]) if training_model is not None else lang_module
+    )
 
     # Switch MoE layers to full CUDA graph capture for inference
     if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
@@ -3215,13 +3283,14 @@ def megatron_rl_inference_mode(
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
-
-    rotary_module = getattr(lang_module, "rotary_pos_emb", None)
-    # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
-    # as it tries to reuse frequences tensors cached in inference mode.
-    has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
-    if has_lru_cache:
-        rotary_module.forward.cache_clear()
+    rotary_modules = (
+        getattr(lang_module, "rotary_pos_emb", None),
+        getattr(training_lang_module, "rotary_pos_emb", None),
+    )
+    # Release ordinary embeddings while retaining constants used by live CUDA graphs.
+    for rotary_module in rotary_modules:
+        if isinstance(rotary_module, RotaryEmbedding):
+            rotary_module.clear_cache()
 
     with torch.no_grad():
 
@@ -3229,11 +3298,14 @@ def megatron_rl_inference_mode(
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not cfg.rl.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
-                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload = (
+                            training_model if training_model is not None else model
+                        )
                         model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                    )
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
@@ -3296,11 +3368,11 @@ def megatron_rl_inference_mode(
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
-        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
         training_lang_module.train()
 
-        if has_lru_cache:
-            rotary_module.forward.cache_clear()
+        for rotary_module in rotary_modules:
+            if isinstance(rotary_module, RotaryEmbedding):
+                rotary_module.clear_cache()
 
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 

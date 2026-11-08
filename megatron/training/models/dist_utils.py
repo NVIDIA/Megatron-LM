@@ -39,6 +39,7 @@ except ImportError:
     correct_amax_history_if_needed = None
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -117,6 +118,9 @@ def unimodal_build_distributed_models(
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
 
+    # Model construction can replace the caller's config, e.g. when HybridModel
+    # clones a root reused as a layer entry before inferring its MTP depth.
+    transformer_config = get_model_config(model_list[0])
     return prepare_existing_model_chunks_for_distributed_training(
         model_list,
         transformer_config,
@@ -388,8 +392,12 @@ def _ddp_wrap(
         ) and ddp_config.megatron_fsdp_version == 2
         construction_context = (
             fully_shard_context(
-                runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    )
                 )
             )
             if is_mfsdp_v2

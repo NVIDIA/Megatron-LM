@@ -1,11 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import functools
 import importlib
-import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -13,50 +12,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-
-# Hooks and callbacks that each run attaches to the live config. Not to be serialized.
-_RUNTIME_FIELDS = frozenset(
-    {
-        "pre_wrap_hooks",
-        "post_wrap_hooks",
-        "timers",
-        "finalize_model_grads_func",
-        "grad_scale_func",
-        "moe_grad_scale_func",
-        "mtp_grad_scale_func",
-        "no_sync_func",
-        "grad_sync_func",
-        "param_sync_func",
-    }
-)
-
-
-def _encode_callable(value: Callable) -> dict[str, Any] | None:
-    """Serialize a callable so that it can be deserialized with `instantiate()`."""
-
-    if isinstance(value, functools.partial):
-        inner = _encode_callable(value.func)
-        if inner is None:
-            return None
-        encoded: dict[str, Any] = {
-            "_target_": inner["_target_"],
-            "_partial_": True,
-            "_args_": list(value.args),
-        }
-        encoded.update(value.keywords)
-        return encoded
-
-    module = inspect.getmodule(value)
-    qualname = getattr(value, "__qualname__", None)
-    if module is None or qualname is None:
-        return None
-    # Encode only paths that resolve back to `value`; a bound method's path drops its instance.
-    resolved = module
-    for part in qualname.split("."):
-        resolved = getattr(resolved, part, None)
-    if resolved != value:
-        return None
-    return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
 
 
 @runtime_checkable
@@ -77,11 +32,11 @@ class Serializable(Protocol):
 class ModelConfig:
     """Base class for model configurations.
 
-    Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
+    Each builder-backed model type (GPT, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
     construction logic lives in the corresponding ``ModelBuilder`` subclass.
 
-    Subclasses must define:
+    Builder-backed subclasses define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
           associated ``ModelBuilder`` (e.g.
           ``'megatron.bridge.models.hybrid.HybridModelBuilder'``).
@@ -141,40 +96,45 @@ class ModelConfig:
         - _target_: Full class path for deserialization
         - _builder_: Full builder class path (serialized from ClassVar)
         - All dataclass fields, including nested dataclasses and config sequences
+        - _config_id_ on shared dataclasses, preserving their identity within this model
         """
 
-        def _as_dict(config):
-            if isinstance(config, (list, tuple)):
-                # Recurse into layer-config sequences so run-config YAML preserves their fields.
-                # Otherwise, the YAML object fallback records only each config's class,
-                # silently losing heterogeneous settings such as MoE expert widths.
-                return [_as_dict(value) for value in config]
-            if not is_dataclass(config) or isinstance(config, type):
-                if callable(config):
-                    return _encode_callable(config)
-                if hasattr(config, "as_dict"):
-                    return config.as_dict()
-                return config
+        from megatron.training.config.utils import serialize_dataclass
 
-            result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
-            for f in dataclass_fields(config):
-                if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
-                    continue
-                value = getattr(config, f.name)
+        result = serialize_dataclass(
+            self,
+            skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
+            encode_callables=True,
+        )
+        shared_configs = {}
 
-                if callable(value) and not is_dataclass(value):
-                    # Encode module-level callables (e.g. activation_func, layer-spec functions)
-                    # so they survive serialization instead of silently reverting to the default.
-                    encoded = _encode_callable(value)
-                    if encoded is not None:
-                        result[f.name] = encoded
-                    continue
+        def _record_shared_configs(value, encoded):
+            # Nested ModelConfig serializers own their IDs; from_dict scopes them likewise.
+            if isinstance(value, ModelConfig) and value is not self:
+                return
+            if is_dataclass(value) and not isinstance(value, type) and isinstance(encoded, dict):
+                config_id = id(value)
+                if config_id in shared_configs:
+                    reference, first = shared_configs[config_id]
+                    first["_config_id_"] = encoded["_config_id_"] = reference
+                else:
+                    shared_configs[config_id] = (len(shared_configs), encoded)
+                for config_field in dataclass_fields(value):
+                    if config_field.name in encoded:
+                        _record_shared_configs(
+                            getattr(value, config_field.name), encoded[config_field.name]
+                        )
+            elif isinstance(value, dict) and isinstance(encoded, dict):
+                for key, item in value.items():
+                    if key in encoded:
+                        _record_shared_configs(item, encoded[key])
+            elif isinstance(value, (list, tuple)) and isinstance(encoded, (list, tuple)):
+                for item, encoded_item in zip(value, encoded, strict=True):
+                    _record_shared_configs(item, encoded_item)
 
-                result[f.name] = _as_dict(value)
-
-            return result
-
-        result = _as_dict(self)
+        # Full dictionaries remain readable metadata. Explicit IDs survive YAML/JSON
+        # and sanitation that rebuilds dictionaries and loses Python object aliases.
+        _record_shared_configs(self, result)
         result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
@@ -183,7 +143,8 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from _builder_ or from the class's ClassVar.
+        The builder is restored from the required _builder_ entry. Shared dataclasses
+        carrying the same _config_id_ are reconstructed once per model config.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -192,10 +153,17 @@ class ModelConfig:
             Instance of the appropriate ModelConfig subclass
         """
 
-        def _from_dict(subdata):
+        def _from_dict(subdata, shared_configs):
             target = subdata.get("_target_")
             if target is None:
                 raise ValueError("Cannot deserialize: missing '_target_' field")
+
+            config_id = subdata.get("_config_id_")
+            if config_id is not None and config_id in shared_configs:
+                previous_data, previous_config = shared_configs[config_id]
+                if subdata != previous_data:
+                    raise ValueError(f"Conflicting definitions for shared config {config_id!r}")
+                return previous_config
 
             # Import the class from the target path
             module_path, class_name = target.rsplit(".", 1)
@@ -206,20 +174,33 @@ class ModelConfig:
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
             filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
 
-            # recurse on serialized nested dataclasses; resolve encoded callables
-            subconfigs = {}
-            for k, v in filtered_data.items():
-                if isinstance(v, dict) and "_target_" in v:
-                    if v.get("_call_", True) is False or v.get("_partial_", False):
+            config = config_cls(
+                **{key: _from_value(value, shared_configs) for key, value in filtered_data.items()}
+            )
+            if config_id is not None:
+                shared_configs[config_id] = (subdata, config)
+            if "_builder_" in subdata:
+                config.builder = subdata["_builder_"]
+            return config
+
+        def _from_value(value, shared_configs):
+            if isinstance(value, dict):
+                if "_target_" in value:
+                    if (
+                        value.get("_call_", True) is False
+                        or value.get("_partial_", False)
+                        or "_args_" in value
+                    ):
                         from megatron.training.config.instantiate_utils import instantiate
-                        subconfigs[k] = instantiate(v)
-                    else:
-                        subconfigs[k] = _from_dict(v)
-            filtered_data.update(subconfigs)
 
-            return config_cls(**filtered_data)
+                        return instantiate(value)
+                    return _from_dict(value, {} if "_builder_" in value else shared_configs)
+                return {key: _from_value(item, shared_configs) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return type(value)(_from_value(item, shared_configs) for item in value)
+            return value
 
-        result = _from_dict(data)
+        result = _from_dict(data, {})
         result.builder = data["_builder_"]
 
         return result

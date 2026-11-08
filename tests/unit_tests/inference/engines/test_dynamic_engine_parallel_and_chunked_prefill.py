@@ -689,9 +689,10 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         original = meta.write_token_maps
         written = set()
         shared = []
-        # `block_ref_counts` exists only under prefix caching; without it no block is ever
-        # shared, so the shared-write check is vacuous rather than skipped.
-        ref_counts = getattr(alloc, "block_ref_counts", None)
+        # Per-block ref counts live on the allocator's prefix-cache state, which exists only
+        # under prefix caching; without it no block is ever shared, so the shared-write check
+        # is vacuous rather than skipped.
+        ref_counts = alloc.pc_state.block_ref_counts if alloc.pc_state is not None else None
 
         def recording(gpu_view, rows, positions, block_table, padded_token_count, **kwargs):
             # Observe the OUTPUT, not the inputs: `write_token_maps` decides the final
@@ -965,13 +966,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                     f"matched={len(m.matched_block_ids)} backed_off={m.backed_off_blocks} "
                     f"skip={m.prefix_skip_tokens} "
                     f"mamba={getattr(req, '_mamba_num_matched_blocks', 'n/a')} "
-                    # The hash map exists only when prefix caching is on; the oracle run has
-                    # no registry at all.
-                    f"registry={len(getattr(alloc, 'kv_hash_to_block_id', ()))}"
+                    # The registry is filled only when prefix caching is on; the oracle run
+                    # registers nothing.
+                    f"registry={len(context.prefix_cache_registry.kv_hash_to_block_id)}"
                 )
                 return m
 
-            alloc = context.kv_block_allocator
             context._compute_prefix_match = _traced_match
 
             def add(request_id, prompt):
@@ -1129,7 +1129,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         def step_and_sample():
             nonlocal max_ref_seen
             env.engine.step_modern()
-            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.block_ref_counts.max()))
+            max_ref_seen = max(
+                max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max())
+            )
 
         with self._record_mtp_kv_writes(context) as (_written, shared_writes):
             add_request(0)
@@ -1393,10 +1395,9 @@ CHUNKED_CG_MAX_SEQ_LEN = 2048
 @pytest.mark.internal
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
 class TestChunkedPrefillCudaGraphs:
-    """Verify correctness across chunked prefill and CUDA graph combinations.
+    """Verify chunked prefill against an unchunked baseline, eagerly and under CUDA graphs.
 
-    For each model type, runs a baseline config (no chunked prefill, no CUDA graphs)
-    and compares output tokens against every other combination.
+    Each test runs an unchunked baseline engine and compares a chunked engine's output against it.
     """
 
     @classmethod
@@ -1549,6 +1550,7 @@ class TestChunkedPrefillCudaGraphs:
         generated_log_probs=None,
         enable_prefix_caching=False,
         ssm_snapshots=None,
+        sampled_logits=None,
     ):
         """Add all prompts and run to completion, returning {req_id: generated_tokens}.
 
@@ -1556,7 +1558,29 @@ class TestChunkedPrefillCudaGraphs:
         request 0's conv / SSM state per step, so a caller can inspect the state at
         a chosen step instead of only the generated tokens. `generated_log_probs`,
         if given, is filled with {req_id: log probs of the generated tokens}.
+
+        `sampled_logits`, if given, maps each request id to the logit rows the
+        controller sampled from, one per step the request was active in. The
+        last `num_tokens_to_generate` rows produced its generated tokens.
         """
+        if sampled_logits is not None:
+            controller = engine.controller
+            sample = controller._dynamic_step_sample_logits
+
+            def recording_sample(*args, **kwargs):
+                context = controller.inference_wrapped_model.inference_context
+                start, end = context.paused_request_count, context.total_request_count
+                logits = controller._all_logits_cuda.squeeze(0)
+                if not context.config.materialize_only_last_token_logits:
+                    last_token_idxs = context.gpu_view.active_request_last_token_idxs[: end - start]
+                    logits = logits[last_token_idxs.long().to(logits.device)]
+                rows = logits[: end - start].float().cpu()
+                for request_id, row in zip(context.request_ids[start:end].tolist(), rows):
+                    sampled_logits.setdefault(request_id, []).append(row)
+                sample(*args, **kwargs)
+
+            controller._dynamic_step_sample_logits = recording_sample
+
         for i, prompt in enumerate(prompts):
             request = DynamicInferenceRequest(
                 request_id=i,
@@ -1597,6 +1621,82 @@ class TestChunkedPrefillCudaGraphs:
 
         return finished, step_count
 
+    @staticmethod
+    def _assert_tokens_match_up_to_ties(
+        label, baseline_tokens, baseline_logits, test_tokens, test_logits
+    ):
+        """Assert two greedy generations agree, allowing a swap of tied tokens.
+
+        Eager and CUDA-graph runs round differently, by about one BF16 ulp per
+        logit. These small random models have nearly flat logits, so some steps
+        have a top-2 gap of one ulp or zero, and the two runs can pick different
+        tokens there. A divergence passes only if each run's logits put the
+        other run's token within two ulps of its own. Later tokens condition on
+        different prefixes, so the comparison stops at the first divergence.
+        """
+        assert len(baseline_tokens) == len(test_tokens), (
+            f"{label}: baseline generated {len(baseline_tokens)} tokens, "
+            f"test generated {len(test_tokens)}"
+        )
+        num_tokens = len(baseline_tokens)
+        rows = {"baseline": baseline_logits[-num_tokens:], "test": test_logits[-num_tokens:]}
+        for step, (baseline_token, test_token) in enumerate(zip(baseline_tokens, test_tokens)):
+            if baseline_token == test_token:
+                continue
+            for name, chosen, other in (
+                ("baseline", baseline_token, test_token),
+                ("test", test_token, baseline_token),
+            ):
+                row = rows[name][step]
+                gap = (row[chosen] - row[other]).item()
+                # The logits are BF16 values, so step two representable BF16 values up.
+                upper = row[other].to(torch.bfloat16)
+                for _ in range(2):
+                    upper = torch.nextafter(upper, torch.full_like(upper, float("inf")))
+                tolerance = (upper.float() - row[other].float()).item()
+                assert gap <= tolerance, (
+                    f"{label}: diverged at step {step} beyond a tie; {name} logit of its "
+                    f"token {chosen} exceeds token {other} by {gap:.5f} > {tolerance:.5f}; "
+                    f"baseline {baseline_tokens} != test {test_tokens}"
+                )
+            return
+
+    # Each case lists the baseline row and the test row; the baseline picks token 0
+    # and the test picks token 1. Gaps count representable BF16 steps.
+    @pytest.mark.parametrize(
+        "baseline_row,test_row,should_pass",
+        [
+            ([1.75, 1.75], [1.75, 1.75], True),
+            ([1.734375, 1.7265625], [1.7265625, 1.734375], True),
+            ([1.7421875, 1.7265625], [1.7265625, 1.7421875], True),
+            ([1.75, 1.7265625], [1.7265625, 1.75], False),
+            ([1.734375, 1.7265625], [1.7265625, 1.75], False),
+            ([-1.7265625, -1.7421875], [-1.7421875, -1.7265625], True),
+            ([-1.7265625, -1.75], [-1.75, -1.7265625], False),
+            ([2.015625, 1.9921875], [1.9921875, 2.015625], True),
+        ],
+        ids=[
+            "zero_steps",
+            "one_step",
+            "two_steps",
+            "three_steps",
+            "three_steps_in_test_only",
+            "negative_two_steps",
+            "negative_three_steps",
+            "binade_crossing_two_steps",
+        ],
+    )
+    def test_tie_tolerance_counts_bf16_steps(self, baseline_row, test_row, should_pass):
+        """Ties pass within two representable BF16 steps and fail beyond them."""
+        baseline_logits = [torch.tensor(baseline_row, dtype=torch.bfloat16).float()]
+        test_logits = [torch.tensor(test_row, dtype=torch.bfloat16).float()]
+        arguments = ("tie", [0], baseline_logits, [1], test_logits)
+        if should_pass:
+            self._assert_tokens_match_up_to_ties(*arguments)
+        else:
+            with pytest.raises(AssertionError, match="beyond a tie"):
+                self._assert_tokens_match_up_to_ties(*arguments)
+
     # Paired rather than crossed: the mixer only means something for a hybrid
     # stack, so a gpt x gdp cell would just re-run the GPT case.
     @pytest.mark.parametrize(
@@ -1604,25 +1704,40 @@ class TestChunkedPrefillCudaGraphs:
         [("gpt", None), ("hybrid", "mamba"), ("hybrid", "gdp")],
         ids=["gpt", "mamba", "gdp"],
     )
-    @pytest.mark.parametrize("chunked_prefill", [False, True])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @pytest.mark.parametrize(
+        "chunked_prefill,num_cuda_graphs",
+        [(False, None), (True, None), (True, 2)],
+        ids=["unchunked_eager", "chunked_eager", "chunked_cuda_graphs"],
+    )
     @torch.inference_mode()
     def test_chunked_prefill_cuda_graphs(
         self, model_provider, ssm_mixer, chunked_prefill, num_cuda_graphs
     ):
-        """Verify generated tokens match across chunked prefill and CUDA graph configs."""
+        """Verify generated tokens match across chunked-prefill configs, per CUDA-graph mode."""
         skip_if_mamba_sequence_packing_not_available(model_provider, ssm_mixer or "mamba")
 
         clear_nvte_env_vars()
 
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-        )
+        # One model per engine: CUDA-graph runners live on the model's layers,
+        # and a second graphed engine on the same model would be handed the first engine's runners.
+        # Reseeding before each build gives both models identical weights.
+        def build_model():
+            random.seed(123)
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(
+                seed=123,
+                inference_rng_tracker=True,
+                use_cudagraphable_rng=False,
+                force_reset_rng=True,
+            )
+            return self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
 
-        # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
-        model = self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
+        baseline_model = build_model()
+        test_model = build_model()
+        for (name, p), (_, q) in zip(
+            baseline_model.named_parameters(), test_model.named_parameters()
+        ):
+            assert torch.equal(p, q), f"reseeded rebuild differs at {name}"
 
         # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
         device = torch.cuda.current_device()
@@ -1635,31 +1750,39 @@ class TestChunkedPrefillCudaGraphs:
         # (only ~1.5 of the 512-token prompts fit per step).
         context_max_tokens = 768 if chunked_prefill else None
 
-        # Baseline: no chunked prefill, no CUDA graphs.
+        # Baseline: no chunked prefill, same CG config (CG padding can flip fp32 near-tie argmax).
         baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+            baseline_model,
+            enable_chunked_prefill=False,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=None,
         )
+        baseline_logits = {}
         baseline_outputs, baseline_steps = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate
+            baseline_engine, prompts, num_tokens_to_generate, sampled_logits=baseline_logits
         )
 
         # Test config.
         test_engine = self._build_engine(
-            model,
+            test_model,
             enable_chunked_prefill=chunked_prefill,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
         )
+        test_logits = {}
         test_outputs, test_steps = self._run_to_completion(
-            test_engine, prompts, num_tokens_to_generate
+            test_engine, prompts, num_tokens_to_generate, sampled_logits=test_logits
         )
 
-        # Correctness: generated tokens must match baseline.
+        # Correctness: generated tokens must match baseline, up to swaps of tied tokens.
         for req_id in range(3):
-            assert baseline_outputs[req_id] == test_outputs[req_id], (
-                f"req {req_id}: baseline {baseline_outputs[req_id]} != "
-                f"test {test_outputs[req_id]} "
-                f"(chunked_prefill={chunked_prefill}, num_cuda_graphs={num_cuda_graphs})"
+            self._assert_tokens_match_up_to_ties(
+                f"req {req_id} (chunked_prefill={chunked_prefill}, "
+                f"num_cuda_graphs={num_cuda_graphs})",
+                baseline_outputs[req_id],
+                baseline_logits[req_id],
+                test_outputs[req_id],
+                test_logits[req_id],
             )
 
         # When chunked prefill is enabled with a constrained token budget, the engine
@@ -1720,12 +1843,14 @@ class TestChunkedPrefillCudaGraphs:
             model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
         baseline_ssm_snapshots = []
+        baseline_logits = {}
         baseline_outputs, _ = self._run_to_completion(
             baseline_engine,
             prompts,
             num_tokens_to_generate,
             conv_snapshots=baseline_snapshots,
             ssm_snapshots=baseline_ssm_snapshots,
+            sampled_logits=baseline_logits,
         )
 
         chunked_snapshots = []
@@ -1736,18 +1861,23 @@ class TestChunkedPrefillCudaGraphs:
             context_max_tokens=context_max_tokens,
         )
         chunked_ssm_snapshots = []
+        chunked_logits = {}
         chunked_outputs, _ = self._run_to_completion(
             chunked_engine,
             prompts,
             num_tokens_to_generate,
             conv_snapshots=chunked_snapshots,
             ssm_snapshots=chunked_ssm_snapshots,
+            sampled_logits=chunked_logits,
         )
 
-        assert baseline_outputs[0] == chunked_outputs[0], (
-            f"{ssm_mixer}: a {final_chunk_len}-token final prefill chunk diverged from "
-            f"the unchunked baseline (num_cuda_graphs={num_cuda_graphs}); baseline "
-            f"{baseline_outputs[0]} != chunked {chunked_outputs[0]}"
+        self._assert_tokens_match_up_to_ties(
+            f"{ssm_mixer}: a {final_chunk_len}-token final prefill chunk against the "
+            f"unchunked baseline (num_cuda_graphs={num_cuda_graphs})",
+            baseline_outputs[0],
+            baseline_logits[0],
+            chunked_outputs[0],
+            chunked_logits[0],
         )
 
         # Generated tokens are too blunt on their own: a zero-filled carry

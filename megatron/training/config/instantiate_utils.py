@@ -82,6 +82,7 @@ class _Keys(str, Enum):
     CALL = "_call_"
     ARGS = "_args_"
     NAME = "_name_"
+    CONFIG_ID = "_config_id_"
 
 
 _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
@@ -269,6 +270,7 @@ def instantiate_node(
     *args: Any,
     partial: bool = False,
     mode: InstantiationMode = InstantiationMode.LENIENT,
+    _shared_configs: dict[Any, tuple[Any, Any]] | None = None,
 ) -> Any:
     """Recursively instantiates a node within a configuration structure.
 
@@ -296,6 +298,8 @@ def instantiate_node(
                  `_partial_` key within the node itself.
         mode: Instantiation mode (STRICT or LENIENT). Determines error handling
               behavior for nested instantiations.
+        _shared_configs: Internal memo for repeated serialized dataclasses. Each
+            ModelConfig subtree owns an independent ID namespace.
 
     Returns:
         The instantiated object, list, or the original node if it wasn't a config.
@@ -324,8 +328,14 @@ def instantiate_node(
             msg += f"\nfull_key: {full_key}"
         raise TypeError(msg)
 
+    if _shared_configs is None:
+        _shared_configs = {}
+
     if OmegaConf.is_list(node):
-        items = [instantiate_node(item, mode=mode) for item in node._iter_ex(resolve=True)]
+        items = [
+            instantiate_node(item, mode=mode, _shared_configs=_shared_configs)
+            for item in node._iter_ex(resolve=True)
+        ]
 
         return items
     elif OmegaConf.is_dict(node):
@@ -348,22 +358,52 @@ def instantiate_node(
                 else:
                     return _target_
 
+            # ModelConfig serializes its builder as metadata, not a constructor field.
+            from megatron.training.models.base import ModelConfig
+
+            model_config_target = isinstance(_target_, type) and issubclass(_target_, ModelConfig)
+            if model_config_target:
+                exclude_keys.add("_builder_")
+                _shared_configs = {}
+
+            # Resolve every target before checking shared identity, preserving the
+            # allowlist and path checks even when a config has already been built.
+            config_id = node.get(_Keys.CONFIG_ID)
+            definition = None
+            if config_id is not None:
+                definition = OmegaConf.to_container(node, resolve=True)
+                if config_id in _shared_configs:
+                    previous_definition, previous_config = _shared_configs[config_id]
+                    if definition != previous_definition:
+                        raise InstantiationException(
+                            f"Conflicting definitions for shared config {config_id!r}"
+                            f"\nfull_key: {full_key}"
+                        )
+                    return previous_config
+
             for key in node.keys():
                 if key not in exclude_keys:
                     if OmegaConf.is_missing(node, key) and is_partial:
                         continue
                     value = node[key]
-                    value = instantiate_node(value, mode=mode)
+                    value = instantiate_node(value, mode=mode, _shared_configs=_shared_configs)
                     kwargs[key] = _convert_node(value)
 
             assert callable(_target_)
             # Drop unexpected kwargs in lenient mode or raise in strict mode
             kwargs = _filter_kwargs_for_target(_target_, kwargs, full_key, mode)
-            return _call_target(_target_, partial, args, kwargs, full_key)
+            result = _call_target(_target_, partial, args, kwargs, full_key)
+            if model_config_target and not partial and "_builder_" in node:
+                result.builder = node["_builder_"]
+            if config_id is not None:
+                _shared_configs[config_id] = (definition, result)
+            return result
         else:
             dict_items = {}
             for key, value in node.items():
-                dict_items[key] = instantiate_node(value, mode=mode)
+                dict_items[key] = instantiate_node(
+                    value, mode=mode, _shared_configs=_shared_configs
+                )
             return dict_items
 
     else:

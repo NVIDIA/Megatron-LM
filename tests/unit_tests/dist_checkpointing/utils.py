@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from typing import Any, Callable, Tuple, Union
@@ -17,7 +17,9 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
-from megatron.training.training import get_model
+from megatron.training.global_vars import get_run_config, is_run_config_initialized
+from megatron.training.training import get_megatron_ddp_config, get_model
+from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -239,12 +241,26 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # The registered run config owns these settings; tests that write to args afterwards call
+    # sync_checkpoint_config(args) again before saving or loading.
+    sync_checkpoint_config(args)
     # Clear the metadata cache to avoid contamination between tests
 
     if HAVE_NVRX:
         CachedMetadataFileSystemReader.clear_metadata_cache()
     else:
         raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
+
+
+def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise):
+    """Make the run config describe the optimizer the test is about to build.
+
+    Checkpoint saving derives the optimizer sharding metadata from the run config, not from args.
+    """
+    if is_run_config_initialized():
+        optimizer_cfg = get_run_config().optimizer
+        optimizer_cfg.use_distributed_optimizer = use_distributed_optimizer
+        optimizer_cfg.use_layer_wise_distributed_optimizer = use_layer_wise
 
 
 def setup_model_and_optimizer(
@@ -317,6 +333,9 @@ def setup_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -328,9 +347,28 @@ def setup_model_and_optimizer(
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
-            )
+            ),
+            config=TransformerConfig(
+                num_layers=NUM_LAYERS,
+                hidden_size=HIDDEN_SIZE,
+                num_attention_heads=NUM_ATTENTION_HEADS,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
+                num_moe_experts=ep if ep > 1 else None,
+                add_bias_linear=False,
+                sequence_parallel=tp > 1 and ep > 1,
+                bf16=bf16,
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -348,6 +386,7 @@ def setup_model_and_optimizer(
         config.lr = 0.0
     elif optimizer_type == 'lion':
         config.lr = 1e-4
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -452,6 +491,9 @@ def setup_moe_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -465,9 +507,26 @@ def setup_moe_model_and_optimizer(
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
-            )
+            ),
+            config=TransformerConfig(
+                num_layers=NUM_LAYERS,
+                hidden_size=HIDDEN_SIZE,
+                num_attention_heads=NUM_ATTENTION_HEADS,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+                expert_model_parallel_size=ep,
+                num_moe_experts=8,
+                add_bias_linear=False,
+                sequence_parallel=tp > 1 and ep > 1,
+                bf16=bf16,
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -478,6 +537,7 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)

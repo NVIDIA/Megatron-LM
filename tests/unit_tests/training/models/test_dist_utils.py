@@ -910,6 +910,7 @@ class TestUnimodalBuildDistributedModels:
 
     def _standard_patches(self):
         """Returns a dict of started patches that the caller must stop."""
+        self.mock_model.config = self.transformer_config
         patches = {
             "bvps": patch(
                 f"{_MODULE}.build_virtual_pipeline_stages", return_value=[self.mock_model]
@@ -1002,6 +1003,7 @@ class TestUnimodalBuildDistributedModels:
         mocks = self._standard_patches()
         try:
             new_list = [_make_model_module()]
+            new_list[0].config = self.transformer_config
             hook = Mock(return_value=new_list)
             unimodal_build_distributed_models(
                 Mock(), self.transformer_config, self.pg, wrap_with_ddp=False, pre_wrap_hook=hook
@@ -1010,6 +1012,32 @@ class TestUnimodalBuildDistributedModels:
             # The mp_wrapper receives the new list
             mp_call_arg = mocks["mp_wrap"].call_args.args[0]
             assert mp_call_arg is new_list
+        finally:
+            self._stop_patches()
+
+    @pytest.mark.parametrize("replace_in_hook", [False, True])
+    def test_mixed_precision_wrapper_receives_resolved_model_config(self, replace_in_hook):
+        mocks = self._standard_patches()
+        try:
+            resolved = _make_transformer_config(bf16=True, mtp_num_layers=1)
+            model = _make_model_module()
+            model.config = resolved
+            if replace_in_hook:
+                pre_wrap_hook = lambda models: [model]
+            else:
+                pre_wrap_hook = None
+                mocks["bvps"].return_value = [model]
+
+            unimodal_build_distributed_models(
+                Mock(),
+                self.transformer_config,
+                self.pg,
+                wrap_with_ddp=False,
+                pre_wrap_hook=pre_wrap_hook,
+            )
+
+            mocks["mp_wrap"].assert_called_once_with([model], resolved, Float16Module)
+            assert self.transformer_config is not resolved
         finally:
             self._stop_patches()
 

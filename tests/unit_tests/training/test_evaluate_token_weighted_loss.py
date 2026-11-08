@@ -16,8 +16,9 @@ from megatron.training.state import TrainState
 @pytest.mark.parametrize("scheduled", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
 def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
-    sft, scheduled, empty, run_config
+    sft, scheduled, empty, run_config, monkeypatch
 ):
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.validation.eval_global_batch_size = 4
     run_config.validation.eval_micro_batch_size = 1
     run_config.validation.eval_iters = 2

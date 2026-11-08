@@ -9,6 +9,7 @@ import torch
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid import HybridLayerEntry
+from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_layer_config_list
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -18,7 +19,12 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
@@ -69,6 +75,10 @@ class HybridModelConfig(ModelConfig):
     still uses the supplied Python definition when resuming from a checkpoint.
     """
     seq_length: int = 8192
+    """Position-embedding capacity, passed to the model as max_sequence_length; the launcher
+    fills it from --max-position-embeddings. The training sequence length that core modules
+    size buffers from is TransformerConfig.max_seq_length_per_sample on ``transformer``.
+    """
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
     rotary_percent: float = 1.0
@@ -121,7 +131,7 @@ class HybridModelConfig(ModelConfig):
             super().__setattr__(name, value)
 
     def finalize(self) -> None:
-        """One time validation to run once config is ready to be used by builder."""
+        """Finalize nested model settings before the run derives optimizer precision."""
 
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
@@ -207,11 +217,30 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
                 self._model_config.hybrid_mlp_ratio != 0.0
             )
-            if self._model_config.hybrid_override_pattern is not None or has_deprecated_ratio:
+            if (
+                self._model_config.hybrid_layer_pattern is not None
+                or self._model_config.hybrid_override_pattern is not None
+                or has_deprecated_ratio
+            ):
                 raise ValueError(
                     "hybrid_layer_config_list is mutually exclusive with "
-                    "hybrid_override_pattern, "
+                    "hybrid_layer_pattern, hybrid_override_pattern, "
                     "hybrid_attention_ratio, and hybrid_mlp_ratio"
+                )
+
+            parsed_config_list = parse_hybrid_layer_config_list(
+                hybrid_layer_config_list,
+                expected_num_layers=self._model_config.transformer.num_layers,
+                expected_mtp_num_layers=self._model_config.transformer.mtp_num_layers,
+            )
+            if (
+                args_mtp_num_layers is not None
+                and args_mtp_num_layers != parsed_config_list.mtp_num_depths
+            ):
+                raise ValueError(
+                    "hybrid_layer_config_list defines "
+                    f"{parsed_config_list.mtp_num_depths} MTP depths, but runtime "
+                    f"mtp_num_layers is {args_mtp_num_layers}"
                 )
 
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
@@ -228,12 +257,15 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = (
-            pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        )
-        post_process = (
-            post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
-        )
+        vp_size = self._model_config.transformer.virtual_pipeline_model_parallel_size
+        if pre_process is None:
+            pre_process = is_vp_first_stage(
+                vp_stage=vp_stage, vp_size=vp_size
+            ) and is_pp_first_stage(pg_collection.pp)
+        if post_process is None:
+            post_process = is_vp_last_stage(
+                vp_stage=vp_stage, vp_size=vp_size
+            ) and is_pp_last_stage(pg_collection.pp)
         model = HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -257,15 +289,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         if hybrid_layer_config_list is not None:
             # Core owns config cloning and MTP inference; retain its resolved root config.
             self._model_config.transformer = model.config
-            if args is not None:
-                if args_mtp_num_layers is not None and args_mtp_num_layers != model.mtp_num_depths:
-                    raise ValueError(
-                        "hybrid_layer_config_list defines "
-                        f"{model.mtp_num_depths} MTP depths, but runtime "
-                        f"mtp_num_layers is {args_mtp_num_layers}"
-                    )
-                if model.mtp_num_depths > 0:
-                    args.mtp_num_layers = model.mtp_num_depths
+            if args is not None and model.mtp_num_depths > 0:
+                args.mtp_num_layers = model.mtp_num_depths
         if args is not None:
             args.is_hybrid_model = True
         return model

@@ -4,6 +4,7 @@ import signal
 import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
@@ -26,6 +27,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.models import BertModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -97,6 +99,14 @@ def test_moe_norm_flag_reaches_transformer_config():
     )
 
     assert config.moe_use_norm_before_up_proj is True
+
+
+@pytest.mark.parametrize("name", ["gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"])
+def test_gtp_userbuffer_flags_preserve_cli_contract(name):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    assert getattr(parser.parse_args([]), name) is False
+    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
 
 
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
@@ -1368,32 +1378,43 @@ class TestMegatronMixedPrecisionArguments:
 
 
 def _make_args(**overrides):
-    """Build the minimum Namespace required by pretrain_cfg_container_from_args.
+    """Build CLI defaults with a small valid callback model.
 
     These fields have non-trivial CLI→config name mappings or boolean inversions
     that pretrain_cfg_container_from_args handles explicitly.
     """
-    defaults = {
-        # CheckpointConfig boolean inversions (legacy-style --no-* flags)
-        "no_save_optim": False,
-        "no_save_rng": False,
-        "no_load_optim": False,
-        "no_load_rng": False,
-        # CheckpointConfig custom argparse dest names
-        "ckpt_fully_parallel_save": True,
-        "ckpt_fully_parallel_load": False,
-        # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
-        "profile": False,
-        # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
-        "check_for_nan_in_loss_and_grad": True,
-    }
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    defaults = vars(parser.parse_args([]))
+    defaults.update(
+        {
+            "num_layers": 2,
+            "hidden_size": 16,
+            "num_attention_heads": 4,
+            "max_position_embeddings": 64,
+            "params_dtype": torch.float32,
+            # CheckpointConfig boolean inversions (legacy-style --no-* flags)
+            "no_save_optim": False,
+            "no_save_rng": False,
+            "no_load_optim": False,
+            "no_load_rng": False,
+            # CheckpointConfig custom argparse dest names
+            "ckpt_fully_parallel_save": True,
+            "ckpt_fully_parallel_load": False,
+            # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
+            "profile": False,
+            # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
+            "check_for_nan_in_loss_and_grad": True,
+        }
+    )
     defaults.update(overrides)
     return Namespace(**defaults)
 
 
 @pytest.fixture
 def mock_optimizer_config():
-    return MagicMock(spec=OptimizerConfig)
+    return OptimizerConfig()
 
 
 @pytest.fixture
@@ -1404,13 +1425,7 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with (
-        patch(
-            "megatron.training.training.get_megatron_optimizer_config",
-            return_value=(mock_optimizer_config, {}),
-        ),
-        patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config),
-    ):
+    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
         yield
 
 
@@ -1422,23 +1437,9 @@ class TestPretrainContainerFromArgsStructure:
         assert isinstance(result, PretrainConfigContainer)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
-        """Test that optimizer config comes from get_megatron_optimizer_config."""
-        mock_optimizer = MagicMock(spec=OptimizerConfig)
-        mock_opt.return_value = (mock_optimizer, {})
-        mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
-        args = _make_args()
-        result = pretrain_cfg_container_from_args(args)
-        mock_opt.assert_called_once_with(args)
-        assert result.optimizer is mock_optimizer
-
-    @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
+    def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
-        mock_opt.return_value = (MagicMock(spec=OptimizerConfig), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
@@ -1447,13 +1448,7 @@ class TestPretrainContainerFromArgsStructure:
 
     @pytest.mark.parametrize("enabled", [False, True])
     def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
-        parser = ArgumentParser()
-        add_megatron_arguments(parser)
-        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
-        monkeypatch.setattr(
-            "megatron.training.training.get_megatron_optimizer_config",
-            lambda args: (OptimizerConfig(), {}),
-        )
+        args = _make_args(use_megatron_fsdp=enabled, fake_process_group=enabled)
 
         cfg = pretrain_cfg_container_from_args(args)
 
@@ -1461,6 +1456,54 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.ddp.use_megatron_fsdp is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
+
+
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("constraint", ["vpp", "grouped_weights"])
+def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, constraint):
+    args = _make_args(moe_grouped_gemm=True, moe_use_grouped_tensor=True)
+    args.micro_batch_size = 1
+    args.global_batch_size = 1
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.optimizer = "adam" if constraint == "vpp" else "muon"
+    args.overlap_param_gather = constraint == "vpp"
+    args.overlap_grad_reduce = constraint == "vpp"
+    args.overlap_param_gather_with_optimizer_step = constraint == "vpp"
+    model_inputs = dict(
+        virtual_pipeline_model_parallel_size=2 if valid else None,
+        moe_single_grouped_weight=not valid,
+    )
+    # Native model values must win even when the old args disagree.
+    args_valid = not valid if native_model else valid
+    args.virtual_pipeline_model_parallel_size = 2 if args_valid else None
+    args.moe_single_grouped_weight = not args_valid
+    model = None
+    if native_model:
+        # Callback models do not proxy TransformerConfig attributes at the top level.
+        transformer = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+        transformer.virtual_pipeline_model_parallel_size = model_inputs[
+            "virtual_pipeline_model_parallel_size"
+        ]
+        transformer.moe_single_grouped_weight = model_inputs["moe_single_grouped_weight"]
+        model = BertModelConfig(transformer=transformer, seq_length=64)
+    message = "interleaved pipeline" if constraint == "vpp" else "single-grouped-weight"
+    with nullcontext() if valid else pytest.raises(AssertionError, match=message):
+        cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
+        cfg.validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
+def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch"
+    args.use_layer_wise_param_layout = False
+    with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
 
 
 class TestCheckpointConfigMapping:
@@ -1569,10 +1612,19 @@ class TestRerunStateMachineConfigMapping:
 
     def test_direct_rerun_state_machine_fields_from_args(self, patch_training_helpers):
         """RerunStateMachineConfig fields with 1-to-1 name mapping are pulled directly from args."""
-        args = _make_args(error_injection_rate=500, rerun_mode="report_stats")
+        args = _make_args(error_injection_rate=500, rerun_mode="report_determinism_stats")
         result = pretrain_cfg_container_from_args(args)
         assert result.rerun_state_machine.error_injection_rate == 500
-        assert result.rerun_state_machine.rerun_mode == "report_stats"
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+
+    @pytest.mark.parametrize("mode", ["report_stats", "report_determinism_stats"])
+    def test_stats_cli_spellings_resolve_to_core_mode(self, patch_training_helpers, mode):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        parsed = parser.parse_args(["--rerun-mode", mode])
+        result = pretrain_cfg_container_from_args(_make_args(rerun_mode=parsed.rerun_mode))
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+        result.rerun_state_machine.validate()
 
 
 class TestTrainingConfigMapping:

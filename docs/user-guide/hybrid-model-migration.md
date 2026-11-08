@@ -366,10 +366,12 @@ remove `--decoder-first-pipeline-num-layers` and
 `--decoder-last-pipeline-num-layers`. Express virtual-pipeline segmentation
 with additional pipe-delimited segments instead.
 
-The declarative `HybridModelBuilder` currently rejects virtual pipeline
-parallelism. Pipe-defined virtual stages are supported by the
-`pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or use
-a path that explicitly supports it.
+The declarative `HybridModelBuilder` supports config-list architectures with a
+preconfigured virtual-pipeline topology and matching `PipelineSplit` markers.
+For these Python definitions, configure the topology with
+`--num-virtual-stages-per-pipeline-rank`, rather than inferring it from
+`--num-layers-per-virtual-pipeline-stage`. The `pretrain_hybrid.py` CLI pattern
+path continues to derive virtual stages from pipe-delimited segments.
 
 ### Update custom providers and conversion mappings
 

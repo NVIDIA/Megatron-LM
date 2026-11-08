@@ -15,9 +15,10 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_global_real_seqlen_stats,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
-    next_hdp_group_packing_aware,
+    next_dynamic_cp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
 )
@@ -90,6 +91,7 @@ class BasePackingScheduler:
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
         pad_sequences: bool = False,
+        max_num_seqs: Optional[int] = None,
     ):
         """
         Args:
@@ -99,12 +101,14 @@ class BasePackingScheduler:
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
             pad_sequences: Account for per-sequence zigzag padding when packing.
+            max_num_seqs: Bound packed documents for fixed CUDA-graph metadata.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
         self.pad_sequences = pad_sequences
+        self.max_num_seqs = max_num_seqs
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -181,7 +185,9 @@ class DpBalancedScheduler(BasePackingScheduler):
             )
             if seq_len > self.max_seq_len_all_ranks:
                 raise ValueError("A padded sequence exceeds the static CP packing capacity")
-            if sum_seqlen + seq_len <= self.max_seq_len_all_ranks:
+            if sum_seqlen + seq_len <= self.max_seq_len_all_ranks and (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
+            ):
                 single_microbatch.append(i)
                 sum_seqlen += seq_len
             else:
@@ -257,8 +263,8 @@ class DpBalancedScheduler(BasePackingScheduler):
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
             num_micro_batches: Number of micro batches after scheduling.
-            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
-            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+            seqlen_sum_this_global_batch: Total real (unpadded) tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
         """
 
         is_first_pp = pp_group.rank() == 0
@@ -316,7 +322,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
             # Step 1: Gather global sequence lengths for the fetched batches
-            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
+            batch, global_id_seqlens, global_ids_this_rank, offsets, _ = (
                 get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
             )
 
@@ -374,10 +380,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 is_dynamic_cp=self.is_dynamic_cp,
             )
 
-            # Step 6: Calculate FLOPs info
-            seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
-            seqlen_squared_sum_this_global_batch = float(
-                sum(seqlen**2 for seqlen in seqlens_gathered)
+            # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
+            # the schedule and the packed buffers.
+            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
+                get_global_real_seqlen_stats(batch, dp_group, dev)
             )
         else:
             (
@@ -457,7 +463,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         sample_id_groups = []
 
         while sample_id_seqlens:
-            _, sample_id_seqlens, _, sample_ids = next_hdp_group_packing_aware(
+            _, sample_id_seqlens, _, sample_ids = next_dynamic_cp_group_packing_aware(
                 sample_id_seqlens,
                 self.total_dpxcp_ranks,
                 max_seq_len_per_rank=self.max_seqlen_per_dp_cp_rank,
@@ -532,6 +538,13 @@ def wrap_data_iterator(
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
     scheduler_kwargs['pad_sequences'] = pad_enabled
+    if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
+        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+        if metadata_capacity is not None:
+            # Main's implicit MXFP8 alignment can append a dummy document too.
+            scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
+            if scheduler_kwargs["max_num_seqs"] < 1:
+                raise ValueError("THD metadata capacity must leave room for a real document.")
     if pad_enabled:
         capacity -= capacity % alignment
         if capacity < alignment:
@@ -581,14 +594,15 @@ def _sequence_parallel_tp_cp_group(
     config,
     tp_group: torch.distributed.ProcessGroup,
     dynamic_cp: bool,
-    local_cp_size: int,
+    local_cp_size: int | None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]],
     tp_cp_group: Optional[torch.distributed.ProcessGroup],
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Return the TP x CP group sequence parallelism needs, or None without it."""
-    if not (config.sequence_parallel and tp_group.size() > 1):
+    if not (getattr(config, "sequence_parallel", False) and tp_group.size() > 1):
         return None
     if dynamic_cp:
+        assert local_cp_size is not None, "dynamic CP requires a runtime CP size"
         if dynamic_tp_cp_group_func is None:
             raise ValueError(
                 "dynamic_tp_cp_group_func is required for dynamic CP with sequence parallelism"
@@ -637,6 +651,8 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if pg_collection is None:
         raise ValueError("pg_collection is required for sequence packing")
+    if dynamic_cp and config is None:
+        raise ValueError("config is required for dynamic CP")
     tp_group = pg_collection.tp
     pp_group = pg_collection.pp
     cp_group = pg_collection.cp
@@ -821,7 +837,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             if dynamic_cp
             else cp_group
         )
-        batch['hybrid_cp_group'] = runtime_cp_group if dynamic_cp else None
+        batch['dynamic_cp_group'] = runtime_cp_group if dynamic_cp else None
         # The CP batch sharders expect (1, num_seqs + 1) cu_seqlens, as returned by
         # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
@@ -829,7 +845,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         additional_layouts = set()
         if config.linear_cp_layout != config.attention_cp_layout:
             additional_layouts.add(config.attention_cp_layout)
-        return get_batches_on_this_cp_rank(
+        cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout=config.linear_cp_layout,
             dynamic_cp=dynamic_cp,
@@ -849,6 +865,19 @@ def get_batch_on_this_rank_for_sequence_packing(
             tokens_per_sample=None,
         )
 
+        if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:
+            # The general batch builder retains TE's physical-offset workaround
+            # for some layouts. Graph padding must keep logical boundaries and
+            # the fixed max-seqlen bound through this new HybridModel return path.
+            for layout, params in cp_batch.packed_seq_params_by_layout.items():
+                values = cp_batch.get_batch(layout)
+                params.cu_seqlens_q = params.cu_seqlens_kv = values["cu_seqlens"].squeeze(0)
+                bound = params.cu_seqlens_q_padded[-1].to(torch.int32)
+                params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
+                params.pad_between_seqs = True
+                values["max_seqlen"] = bound
+        return cp_batch
+
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']
     position_ids = batch['position_ids']
@@ -860,6 +889,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = int(batch['local_cp_size'].item()) if dynamic_cp else None
     runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else None
+    runtime_tp_cp_group = (
+        _sequence_parallel_tp_cp_group(
+            config, tp_group, dynamic_cp, local_cp_size, dynamic_tp_cp_group_func, tp_cp_group
+        )
+        if dynamic_cp and config is not None
+        else None
+    )
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -871,6 +907,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=runtime_cp_group,
+        tp_cp_group=runtime_tp_cp_group,
         total_tokens=int(cu_seqlens_padded[-1].item()),
         pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
     )

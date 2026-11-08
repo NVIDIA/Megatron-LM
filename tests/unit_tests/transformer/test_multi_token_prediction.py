@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -18,9 +18,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -29,7 +34,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -53,6 +57,7 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor_precomputed_embeddings,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_pg_rank,
@@ -70,13 +75,14 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -360,6 +366,33 @@ class TestMultiTokenPredictionLayer:
         for peer_mixed in gathered[1:]:
             torch.testing.assert_close(peer_mixed, gathered[0])
         assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_rng_differs_across_gtp_data_lanes(self):
+        """GTP ranks carry distinct microbatches and must draw independent HSM masks."""
+        gtp = 2
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < gtp or world_size % gtp:
+            pytest.skip(f"GTP={gtp} requires a world size divisible by {gtp}")
+        Utils.initialize_model_parallel(gtp_remat_size=gtp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['dp', 'gtp_remat']
+        )
+        rng_tracker_name = _initialize_hidden_state_mixing_rng_tracker(
+            pg_collection.dp, pg_collection.gtp_remat
+        )
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _mix_hidden_state_history(
+            torch.stack(history[:-1]), history[-1], rng_tracker_name=rng_tracker_name
+        )
+        gathered = [torch.empty_like(mixed) for _ in range(gtp)]
+        torch.distributed.all_gather(gathered, mixed, group=pg_collection.gtp_remat)
+
+        assert not torch.equal(gathered[0], gathered[1])
 
     def test_hsm_rng_differs_across_sequence_parallel_owners(self):
         """Disjoint TP+CP token shards receive different tracked RNG slices."""
@@ -1691,7 +1724,7 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -2508,6 +2541,7 @@ class TestMultiTokenPrediction:
     ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
@@ -2519,9 +2553,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2757,6 +2789,7 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2780,13 +2813,14 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -2910,7 +2944,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -4079,7 +4113,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -4243,6 +4277,135 @@ class TestMultiTokenPredictionHybrid:
         for name, param in model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
+    def _build_shortcut_mtp_model(self, *, disable_mtp=None, repeated=True, wide=False):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        overrides = {} if disable_mtp is None else {"moe_shortcut_disable_mtp": disable_mtp}
+        config = TransformerConfig(
+            num_layers=2,
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=repeated,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            moe_ffn_hidden_size=128,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
+            moe_shortcut_post_norm=True,
+            wide_residual=WideResidualConfig(num_streams=3) if wide else None,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            **overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=wide_residual_hybrid_stack_spec if wide else hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*E/*E/*E",
+            position_embedding_type="none",
+        ).cuda()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+    @pytest.mark.parametrize("repeated", [False, True], ids=["separate", "repeated"])
+    @pytest.mark.parametrize("wide", [False, True], ids=["ordinary", "wide-decoder"])
+    def test_disable_mtp_shortcuts_runs_sequential_moe(self, repeated, wide):
+        """Both MTP depths route normalized attention outputs and backpropagate through the norm."""
+        model = self._build_shortcut_mtp_model(disable_mtp=True, repeated=repeated, wide=wide)
+        decoder_block = model.decoder.layers[0]
+        assert isinstance(decoder_block, ShortcutMoEBlock)
+        assert decoder_block.overlap_mode
+        assert model.decoder.config is model.config
+        assert model.decoder.uses_wide_residual_stream == wide
+        assert len(model.mtp.layers) == (1 if repeated else 2)
+
+        shortcut_flags = (
+            "moe_shortcut_connection",
+            "moe_shortcut_parallel",
+            "moe_shortcut_post_norm",
+        )
+        recordings = []
+        handles = []
+        for mtp_layer in model.mtp.layers:
+            stack = mtp_layer.mtp_model_layer
+            assert stack.config is not model.config
+            for flag in shortcut_flags:
+                assert getattr(model.config, flag)
+                assert not getattr(stack.config, flag)
+                assert not any(getattr(layer.config, flag) for layer in stack.layers)
+            assert not stack.uses_wide_residual_stream
+            assert stack.residual_stream_readout is None
+            assert len(stack.layers) == 2
+            attention, moe = stack.layers
+            assert attention._get_residual_connection_for_self_attention(operation="read") is None
+            assert moe._get_residual_connection_for_mlp(operation="read") is None
+            assert list(moe.pre_mlp_layernorm.parameters()), "MTP must retain its MoE norm"
+            calls = {"attention": [], "norm": []}
+            recordings.append((moe, calls))
+
+            def record_attention(_module, _inputs, output, calls=calls):
+                calls["attention"].append(output[0].detach().clone())
+
+            def record_norm(_module, inputs, calls=calls):
+                calls["norm"].append(inputs[0].detach().clone())
+
+            handles.append(attention.register_forward_hook(record_attention))
+            handles.append(moe.pre_mlp_layernorm.register_forward_pre_hook(record_norm))
+
+        hidden_states = torch.randn(
+            4, 1, model.config.hidden_size, device="cuda", requires_grad=True
+        )
+        input_ids = torch.arange(4, device="cuda").unsqueeze(0)
+        try:
+            output = model.mtp(
+                input_ids=input_ids,
+                position_ids=input_ids,
+                hidden_states=hidden_states,
+                attention_mask=None,
+                embedding=model.embedding,
+            )
+            assert output.shape == (12, 1, model.config.hidden_size)
+            (output * torch.randn_like(output)).sum().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        expected_calls = 2 if repeated else 1
+        for moe, calls in recordings:
+            assert len(calls["attention"]) == len(calls["norm"]) == expected_calls
+            for attention_output, norm_input in zip(calls["attention"], calls["norm"]):
+                torch.testing.assert_close(norm_input, attention_output, rtol=0, atol=0)
+            norm_grad = moe.pre_mlp_layernorm.weight.grad
+            assert norm_grad is not None and torch.isfinite(norm_grad).all()
+            assert torch.count_nonzero(norm_grad) > 0
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        assert all(layer.eh_proj.weight.grad is not None for layer in model.mtp.layers)
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+    def test_mtp_shortcuts_remain_enabled_by_default(self):
+        """Omitting the new flag preserves repeated shortcut MTP under a wide decoder."""
+        model = self._build_shortcut_mtp_model(wide=True)
+        assert model.config.moe_shortcut_disable_mtp is False
+        assert isinstance(model.decoder.layers[0], ShortcutMoEBlock)
+        assert len(model.mtp.layers) == 1
+        stack = model.mtp.layers[0].mtp_model_layer
+        assert stack.config is model.config
+        assert len(stack.layers) == 1
+        shortcut = stack.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert shortcut.is_mtp_layer and shortcut.overlap_mode
+        assert shortcut.shortcut_residual_read is None
+        assert list(shortcut.shortcut_post_norm.parameters())
+        assert not stack.uses_wide_residual_stream
+
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.
 
@@ -4252,6 +4415,7 @@ class TestMultiTokenPredictionHybrid:
         """
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
 
         # MTP is configured via unified pattern in hybrid_layer_pattern
@@ -4259,7 +4423,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4387,6 +4551,7 @@ class TestMultiTokenPredictionHybrid:
                     mhc_multistream=kwargs["mhc_multistream"],
                     labels=kwargs["labels"],
                     loss_mask=kwargs["loss_mask"],
+                    padding_mask=kwargs["padding_mask"],
                     mtp_input_mask=kwargs["mtp_input_mask"],
                     packed_seq_params=kwargs["packed_seq_params"],
                 )
@@ -4425,6 +4590,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
@@ -4509,8 +4675,10 @@ class TestMultiTokenPredictionHybrid:
     @pytest.mark.parametrize("with_mask", [False, True])
     def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch, with_mask):
         model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
-        contiguous_packed_seq_params = object()
-        zigzag_packed_seq_params = object()
+        static_cp_group = types.SimpleNamespace(size=lambda: 1)
+        runtime_cp_group = types.SimpleNamespace(size=lambda: 2)
+        contiguous_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
+        zigzag_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
         zigzag_hidden_states = hidden_states + 10.0
         padding_mask = torch.tensor([[False, True]]) if with_mask else None
         zigzag_padding_mask = torch.tensor([[True, False]]) if with_mask else None
@@ -4521,20 +4689,23 @@ class TestMultiTokenPredictionHybrid:
             "zigzag": zigzag_packed_seq_params,
         }
         cp_layout_plan = object()
-        cp_group = types.SimpleNamespace(size=lambda: 2)
-        tp_group = object()
+        tp_group = types.SimpleNamespace(size=lambda: 2)
         tp_cp_group = object()
+        runtime_tp_cp_group = object()
         model.pg_collection = types.SimpleNamespace(
-            cp=cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
+            cp=static_cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
         )
         model.mtp.config = types.SimpleNamespace(attention_cp_layout="zigzag")
-        model.mtp.cp_group = cp_group
+        model.mtp.cp_group = static_cp_group
         model.mtp.tp_group = tp_group
         model.mtp.tp_cp_group = tp_cp_group
         model.mtp.sequence_parallel = True
         model.mtp.prepare_cp_layout = types.MethodType(
             MultiTokenPredictionBlock.prepare_cp_layout, model.mtp
         )
+        # The batch fetch attaches the runtime TP x CP group to each layout's packed params.
+        contiguous_packed_seq_params.tp_cp_group = runtime_tp_cp_group
+        zigzag_packed_seq_params.tp_cp_group = runtime_tp_cp_group
 
         def convert_cp_layout_spy(
             layer_hidden_states,
@@ -4548,10 +4719,10 @@ class TestMultiTokenPredictionHybrid:
         ):
             assert source_layout == "contiguous"
             assert target_layout == "zigzag"
-            assert passed_cp_group is cp_group
+            assert passed_cp_group is runtime_cp_group
             assert sequence_parallel
             assert passed_tp_group is tp_group
-            assert passed_tp_cp_group is tp_cp_group
+            assert passed_tp_cp_group is runtime_tp_cp_group
             assert thd_plan is cp_layout_plan
             if layer_hidden_states.dtype == torch.bool:
                 torch.testing.assert_close(layer_hidden_states, (~padding_mask).transpose(0, 1))
@@ -4642,6 +4813,7 @@ class TestMultiTokenPredictionHybrid:
             assert captured["mtp"]["padding_mask"] is None
         assert captured["mtp_loss"]["labels"] is zigzag_labels
         assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
+        assert captured["mtp_loss"]["packed_seq_params"] is zigzag_packed_seq_params
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
         assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
@@ -4757,6 +4929,7 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -4784,6 +4957,7 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,
@@ -4794,7 +4968,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

@@ -68,9 +68,6 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     args.modules_to_filter = ['module']
     args.log_interval = 7
     monkeypatch.setattr(
-        training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
-    )
-    monkeypatch.setattr(
         training,
         'get_megatron_ddp_config',
         lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),
@@ -78,7 +75,14 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     if inference:
         cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
     else:
-        cfg = argument_utils.pretrain_cfg_container_from_args(args)
+        from megatron.core.transformer import TransformerConfig
+        from megatron.training.models import GPTModelConfig
+
+        model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+        cfg = argument_utils.pretrain_cfg_container_from_args(args, model_cfg=model)
     config = cfg.logger
     args.modules_to_filter.append('stale')
     assert config.modules_to_filter == ['module']
@@ -101,6 +105,7 @@ def test_native_memory_interval_validation(interval, valid, run_config):
 
 @pytest.mark.parametrize('rank,enabled', [(0, False), (1, True)])
 def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
     factory = Mock()
     monkeypatch.setitem(
         sys.modules, 'torch.utils.tensorboard', SimpleNamespace(SummaryWriter=factory)
@@ -117,6 +122,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
 
 
 def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
     monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
@@ -147,6 +153,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
 
 @pytest.mark.parametrize('wandb_project,asynchronous', [(None, False), ('project', True)])
 def test_one_logger_async_policy(monkeypatch, wandb_project, asynchronous, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     factory = Mock()
     monkeypatch.setitem(sys.modules, 'one_logger', SimpleNamespace(OneLogger=factory))
     monkeypatch.setattr(global_vars, '_GLOBAL_ONE_LOGGER', None)
@@ -222,6 +229,7 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
 
 
 def test_async_worker_telemetry_uses_config(monkeypatch, run_config):
+    monkeypatch.setattr('megatron.training.async_utils.safe_get_world_size', lambda: 8)
     monkeypatch.delenv('OTEL_SERVICE_NAME', raising=False)
     attrs = Mock(return_value={'test': 'resource'})
     monkeypatch.setattr(global_vars, 'build_telemetry_resource_attrs', attrs)
@@ -230,6 +238,7 @@ def test_async_worker_telemetry_uses_config(monkeypatch, run_config):
     run_config.logger = config
     result = build_otel_worker_bootstrap(args)
     assert result['enabled'] is True and result['service_name'] == 'owned'
+    assert result['world_size'] == 8
     assert result['resource_attrs'] == {'test': 'resource'}
     attrs.assert_called_once_with(args)
 
@@ -291,7 +300,6 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     import torch
 
     from megatron.training.argument_utils import core_transformer_config_from_args
-    from megatron.training.training import get_megatron_optimizer_config
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -308,11 +316,8 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     args.main_grads_dtype = args.main_params_dtype = torch.float32
     args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     transformer = core_transformer_config_from_args(args)
-    optimizer, _ = get_megatron_optimizer_config(args)
     assert transformer.log_max_attention_logit is enabled
     assert transformer.barrier_with_L1_time is (not enabled)
-    assert optimizer.log_num_zeros_in_grad is enabled
-    assert optimizer.barrier_with_L1_time is (not enabled)
     names = {item.name for item in fields(LoggerConfig)}
     assert not names & {'log_max_attention_logit', 'log_num_zeros_in_grad', 'barrier_with_L1_time'}
 
@@ -393,8 +398,6 @@ def test_attention_metric_logging_reads_model_config(
     for getter in ('get_wandb_writer', 'get_one_logger', 'get_energy_monitor', 'get_telemetry'):
         monkeypatch.setattr(training, getter, lambda: None)
     model = [SimpleNamespace(config=transformer)] if supplied_model else None
-    if supplied_model:
-        run_config.model = None  # Legacy and MiMo use the built model's transformer config.
     training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, 7.0, model=model)
     logged = [
         call for call in writer.add_scalar.call_args_list if call.args[0] == 'max_attention_logit'

@@ -133,6 +133,8 @@ def test_training_installs_the_policy_before_distributed_init(
     args = parser.parse_args(['--deterministic-mode', '--triton-autotune-modules', 'my_kernels'])
     # Training finalization resolves batch defaults using the registered topology.
     args.batch_parallel_size = 1
+    args.world_size = 1
+    run_config.model.transformer.deterministic_mode = True
     run_config.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
     monkeypatch.setattr(initialization, 'initialize_runtime_services', Mock())
