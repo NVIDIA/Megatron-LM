@@ -2,6 +2,7 @@
 """Tests for the rollout engine's inference container composed by the RL entry point."""
 
 import importlib.util
+import os
 import warnings
 from unittest.mock import patch
 
@@ -28,9 +29,12 @@ from megatron.training.config import (
     TokenizerConfig,
 )
 
+# The unit-test lanes run under torchrun; the training layout is TP 1, so the global batch must
+# be a multiple of the launch's data-parallel size (validate_args checks the eval batch against it).
+_DP = int(os.environ.get("WORLD_SIZE", "1"))
 BASE_ARGV = (
     "test_rollout_inference_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
-    "--micro-batch-size 1 --global-batch-size 4 --seq-length 32 --max-position-embeddings 32 "
+    f"--micro-batch-size 1 --global-batch-size {4 * _DP} --seq-length 32 --max-position-embeddings 32 "
     "--no-rope-fusion --vocab-size 128 --tokenizer-type NullTokenizer"
 ).split()
 

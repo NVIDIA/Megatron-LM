@@ -696,9 +696,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
 
     def _finalize(self) -> None:
-        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
-        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
-        # run, whose arguments validate_args already normalized, stays silent.
+        # The conditions are validate_args', and the warning fires only when a value changes, so a
+        # CLI run, whose arguments validate_args already normalized, stays silent.
         if self.checkpoint.ckpt_convert_format is not None:
             # A conversion run exits instead of training from random weights.
             self.checkpoint.exit_on_missing_checkpoint = True

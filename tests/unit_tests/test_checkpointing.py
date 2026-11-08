@@ -1767,7 +1767,7 @@ def test_the_saved_section_decides_what_a_resume_requests(
             elif section_says_rng is False:
                 with open(config_filename) as handle:
                     saved = yaml.safe_load(handle)
-                saved["checkpoint"]["save_rng"] = False
+                saved["pretrain"]["checkpoint"]["save_rng"] = False
                 with open(config_filename, "w") as handle:
                     yaml.safe_dump(saved, handle)
         torch.distributed.barrier()

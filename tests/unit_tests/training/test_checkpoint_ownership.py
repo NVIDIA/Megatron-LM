@@ -395,13 +395,10 @@ def test_the_invalid_combinations_are_errors_not_flips(monkeypatch, run_config, 
     zero_jump.validate()
     zero_jump.finalize()
     assert zero_jump.checkpoint.replication_jump == 0
-    # --skip-train only evaluates, under an RL step too (rollout collection without updates is
-    # --rl-rollout-only, which keeps its optimizer): the optimizer load is disabled, once.
+    # --skip-train only evaluates: the optimizer load is disabled, once.
     run_config.validation.skip_train = True
-    run_config.rl.perform_rl_step = True
     run_config.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
-    monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
     run_config.finalize()
     assert run_config.checkpoint.load_optim is False
     assert warnings_log == ['enabling --no-load-optim when skipping training.']
@@ -533,7 +530,6 @@ def test_fault_tolerance_sees_the_finalized_checkpoint_policy(monkeypatch, run_c
     run_config.checkpoint = CheckpointConfig(save="/ckpt/out", **_conversion())
     run_config.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
-    monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
     seen = []
 
     class StopAtFaultTolerance(Exception):
