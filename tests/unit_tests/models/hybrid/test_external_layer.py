@@ -206,13 +206,20 @@ def test_external_stack_rejects_inference_before_execution(recompute):
     ],
 )
 def test_external_layer_rejects_unsupported_execution_options(field, value):
-    root = _root_config()
+    root = _root_config(num_layers=1)
     config = ExternalGainConfig.from_config(root)
-    # Apply after normalization so this tests the extension's validation contract.
+    # Apply after normalization to exercise Core's integration checks at construction.
     setattr(root, field, value)
     setattr(config, field, value)
-    with pytest.raises((ValueError, NotImplementedError)):
-        config.validate_hybrid_layer(root, _single_rank_groups())
+    with pytest.raises(ValueError, match="unsupported custom-layer execution features"):
+        HybridStack(
+            config=root,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=[config],
+            pg_collection=_single_rank_groups(),
+            post_process=False,
+            post_layer_norm=False,
+        )
 
 
 def test_external_layer_fields_are_recorded_in_run_config(run_config, tmp_path):

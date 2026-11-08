@@ -345,7 +345,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # including custom layers assigned to other pipeline stages or MTP depths.
             for layer_config in architecture_layer_configs:
                 if isinstance(layer_config, HybridLayerConfig):
-                    layer_config.validate_hybrid_layer(self.config, self.pg_collection)
+                    layer_utils._validate_custom_layer_execution(
+                        layer_config, self.config, self.pg_collection
+                    )
             layer_utils.validate_shared_rotary_config(
                 architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
             )

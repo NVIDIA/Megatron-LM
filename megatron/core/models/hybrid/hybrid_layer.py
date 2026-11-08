@@ -48,8 +48,8 @@ class HybridLayerConfig(TransformerConfig, ABC):
     clones each physical occurrence before construction, including repeated MTP layers.
 
     The initial execution contract supports ordinary residual streams, TP1/CP1, and
-    eager or full-layer recomputation. Parallelism and specialized execution modes
-    rejected by ``validate_hybrid_layer`` need their own integration and validation.
+    eager or full-layer recomputation. HybridModel and HybridStack validate these
+    integration limits; implementations validate their own requirements at construction.
     """
 
     uses_shared_rotary_embeddings: ClassVar[bool] = False
@@ -64,8 +64,8 @@ class HybridLayerConfig(TransformerConfig, ABC):
         Like TransformerConfig.from_config, this avoids rerunning normalization. Unlike
         a plain state copy, converting a common config initializes subclass fields and
         default factories. Construct configs with required new fields directly instead.
-        Layer-specific validation belongs in ``validate_hybrid_layer``; subclasses should
-        call its base implementation before checking their additional fields.
+        Validate layer-specific requirements in ``build_layer`` or the layer constructor,
+        since copying a normalized config does not rerun ``__post_init__``.
         """
         if type(config) is cls:
             # Physical clones must preserve subclass slots as well as __dict__, without
@@ -91,55 +91,6 @@ class HybridLayerConfig(TransformerConfig, ABC):
     def build_layer(self, context: HybridLayerBuildContext) -> "HybridLayer":
         """Construct a fresh module directly from this physical config and placement."""
         raise NotImplementedError
-
-    def validate_hybrid_layer(
-        self, stack_config: TransformerConfig, pg_collection: ProcessGroupCollection
-    ) -> None:
-        """Reject execution modes outside the custom-layer contract before construction.
-
-        Both the stack settings and this layer's settings are checked. Process groups
-        are authoritative when the runtime topology differs from serialized settings.
-        """
-        unsupported = set()
-        for config in (stack_config, self):
-            if config.tensor_model_parallel_size != 1:
-                unsupported.add("tensor parallelism")
-            if config.context_parallel_size != 1:
-                unsupported.add("context parallelism")
-            for field_name in (
-                "sequence_parallel",
-                "tp_comm_overlap",
-                "fp8",
-                "fp4",
-                "quant_recipe",
-                "enable_mhc_connections",
-                "wide_residual",
-                "moe_shortcut_connection",
-                "overlap_moe_expert_parallel_comm",
-                "cpu_offloading",
-                "fine_grained_activation_offloading",
-            ):
-                if getattr(config, field_name, None):
-                    unsupported.add(field_name)
-            if config.cuda_graph_impl != "none":
-                unsupported.add("CUDA graphs")
-            if config.recompute_granularity == "selective":
-                unsupported.add("selective recomputation")
-            if self.is_moe_layer and config.moe_num_hash_layers:
-                unsupported.add("custom hash routing")
-        for group_name in ("tp", "cp"):
-            group = getattr(pg_collection, group_name, None)
-            if group is None:
-                raise ValueError(f"Custom hybrid layers require pg_collection.{group_name}.")
-            if group.size() != 1:
-                unsupported.add(f"{group_name.upper()} process group size > 1")
-        if self.hidden_size != stack_config.hidden_size:
-            raise ValueError("Custom hybrid layers must preserve the stack's hidden_size.")
-        if unsupported:
-            raise ValueError(
-                f"{type(self).__name__} uses unsupported custom-layer execution features: "
-                + ", ".join(sorted(unsupported))
-            )
 
     def estimate_flops(
         self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float

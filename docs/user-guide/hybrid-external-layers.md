@@ -31,12 +31,9 @@ from megatron.core.models.hybrid import (
 class GainConfig(HybridLayerConfig):
     initial_gain: float = 1.0
 
-    def validate_hybrid_layer(self, stack_config, pg_collection):
-        super().validate_hybrid_layer(stack_config, pg_collection)
+    def build_layer(self, context: HybridLayerBuildContext) -> HybridLayer:
         if self.initial_gain <= 0:
             raise ValueError("initial_gain must be positive")
-
-    def build_layer(self, context: HybridLayerBuildContext) -> HybridLayer:
         return GainLayer(self, context)
 
     def estimate_flops(
@@ -117,9 +114,10 @@ model = HybridModel(
 The two occurrences of `gain` create independent configs and parameters. The
 source configs remain unchanged. `from_config` copies normalized common fields
 and initializes defaults for additional dataclass fields. Construct a config
-directly if its new fields are required and have no defaults. Put additional
-validation in `validate_hybrid_layer`, calling the base method first; copying a
-normalized config does not rerun `__post_init__`.
+directly if its new fields are required and have no defaults. Core's model and
+stack check execution compatibility before building layers. Validate
+layer-specific fields in `build_layer` or the layer constructor; copying a
+normalized config with `from_config` does not rerun `__post_init__`.
 
 The standard training entry point uses the same list in
 `megatron.training.models.hybrid.HybridModelConfig`. The existing
@@ -136,8 +134,9 @@ module; the build context identifies its layer and MTP placement. As with
 built-in config lists, repeated MTP sections must refer to the same source config
 objects in the same order.
 
-The base validator rejects sequence parallelism, TP communication overlap,
-quantized execution, CUDA graphs, mHC/wide residual streams, shortcut-MoE,
+For custom layers, Core's `HybridModel` and `HybridStack` reject sequence
+parallelism, TP communication overlap, quantized execution, CUDA graphs,
+mHC/wide residual streams, shortcut-MoE,
 overlapped expert communication, CPU/activation offloading, and selective recomputation.
 Inference contexts are also rejected. Those features require their own layer
 integration and validation; merely inheriting this interface does not enable

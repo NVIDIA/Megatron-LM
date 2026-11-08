@@ -172,7 +172,7 @@ class HybridStack(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
         for layer_config in layer_config_list:
             if isinstance(layer_config, HybridLayerConfig):
-                layer_config.validate_hybrid_layer(config, pg_collection)
+                layer_utils._validate_custom_layer_execution(layer_config, config, pg_collection)
             else:
                 layer_utils.validate_tp_comm_overlap(
                     layer_config,
