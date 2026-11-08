@@ -98,7 +98,6 @@ def _validate_layer_config_sequence(
 ) -> None:
     """Validate built-in/custom config contracts and shared attention compatibility."""
     config_types = set()
-    needs_shared_rotary = False
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
         custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
@@ -109,11 +108,10 @@ def _validate_layer_config_sequence(
                 "or a TransformerConfig with a MegatronModule layer_type."
             )
         config_types.add(type(layer_config))
-        needs_shared_rotary |= layer_utils.uses_shared_rotary_embeddings(layer_config)
 
     attention_type = Symbols.LAYER_CONFIG_MAP[Symbols.ATTENTION]
     mla_types = {Symbols.LAYER_CONFIG_MAP[symbol] for symbol in Symbols.MLA_ATTENTION}
-    if (attention_type in config_types or needs_shared_rotary) and config_types & mla_types:
+    if attention_type in config_types and config_types & mla_types:
         raise ValueError(
             f"Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in the {section_name}"
         )

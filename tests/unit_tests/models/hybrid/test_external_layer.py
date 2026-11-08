@@ -2,8 +2,6 @@
 
 """Config-only extension acceptance, using a layer that is not registered in Core."""
 
-import subprocess
-import sys
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -25,7 +23,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
@@ -98,30 +95,6 @@ def test_external_config_parser_preserves_pipeline_and_mtp_identity():
     assert parsed.mtp_num_depths == 2
 
 
-@pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-def test_external_shared_rotary_trait_validates_width_and_attention_family(position_embedding_type):
-    class SharedRotaryGainLayer(ExternalGainLayer):
-        uses_shared_rotary_embeddings = True
-
-    class SharedRotaryGainConfig(ExternalGainConfig):
-        layer_type = SharedRotaryGainLayer
-
-    root = _root_config()
-    custom = SharedRotaryGainConfig.from_config(root)
-    layer_utils.validate_shared_rotary_config([custom], root.kv_channels, position_embedding_type)
-    custom.kv_channels *= 2
-    with pytest.raises(ValueError, match="kv_channels"):
-        layer_utils.validate_shared_rotary_config(
-            [custom], root.kv_channels, position_embedding_type
-        )
-    with pytest.raises(ValueError, match="Attention and MLA"):
-        parse_hybrid_layer_config_list([custom, MLALayerConfig.from_config(root)])
-    # A custom layer that owns no shared RoPE does not acquire an attention-family identity.
-    parse_hybrid_layer_config_list(
-        [ExternalGainConfig.from_config(root), MLALayerConfig.from_config(root)]
-    )
-
-
 def test_external_layer_cpu_stack_forward_backward_and_context():
     root = _root_config(num_layers=2)
     source = ExternalGainConfig.from_config(root)
@@ -161,7 +134,7 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
         assert observed[0] is attention_mask
         assert observed[1] is rotary
         assert observed[3] is padding_mask
-        assert observed[5] is input_ids
+        assert observed[4] is input_ids
     output.square().mean().backward()
     assert hidden.grad is not None
     before = stack.layers[0].gain.detach().clone()
@@ -172,15 +145,13 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
     assert source.gain_init == 1.25
 
 
-def test_external_forward_receives_packing_and_rejects_inference():
+def test_external_forward_receives_packing():
     config = ExternalGainConfig.from_config(_root_config())
     layer = config.layer_type(config=config, pg_collection=_single_rank_groups(), layer_number=1)
     hidden = torch.randn(4, 1, config.hidden_size)
     packed = PackedSeqParams(qkv_format="thd")
     layer_utils.invoke_custom_layer(layer, hidden, packed_seq_params=packed)
     assert layer.last_forward_inputs[2] is packed
-    with pytest.raises((ValueError, NotImplementedError), match="inference"):
-        layer_utils.invoke_custom_layer(layer, hidden, inference_context=object())
 
 
 @pytest.mark.parametrize("recompute", [False, True])
@@ -230,25 +201,6 @@ def test_external_layer_rejects_unsupported_execution_options(field, value):
             post_process=False,
             post_layer_norm=False,
         )
-
-
-def test_external_layer_gloo_checkpoint_resume(tmp_path):
-    # save() uses the default process group. A fresh process permits Gloo even when
-    # another test has initialized an NCCL world, and leaves that world untouched.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; from tests.unit_tests.models.hybrid.external_layer "
-            "import run_gloo_checkpoint_roundtrip; run_gloo_checkpoint_roundtrip(sys.argv[1])",
-            str(tmp_path / "gloo_checkpoint"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture

@@ -136,22 +136,6 @@ def get_custom_layer_type(layer_config: object) -> type[MegatronModule] | None:
     return layer_type
 
 
-def uses_shared_rotary_embeddings(layer_config: TransformerConfig) -> bool:
-    """Return whether a layer consumes HybridModel's shared position embeddings."""
-    layer_type = get_custom_layer_type(layer_config)
-    if layer_type is not None:
-        return getattr(layer_type, "uses_shared_rotary_embeddings", False)
-    return type(layer_config) is AttentionLayerConfig
-
-
-def is_moe_layer_config(layer_config: TransformerConfig) -> bool:
-    """Identify configs participating in the standard MoE tracker contract."""
-    layer_type = get_custom_layer_type(layer_config)
-    if layer_type is not None:
-        return getattr(layer_type, "is_moe_layer", False)
-    return type(layer_config) is MoELayerConfig
-
-
 def _validate_custom_layer_execution(
     layer_config: TransformerConfig,
     stack_config: TransformerConfig,
@@ -188,8 +172,6 @@ def _validate_custom_layer_execution(
             unsupported.add("CUDA graphs")
         if config.recompute_granularity == "selective":
             unsupported.add("selective recomputation")
-        if is_moe_layer_config(layer_config) and config.moe_num_hash_layers:
-            unsupported.add("custom hash routing")
     for group_name in ("tp", "cp"):
         group = getattr(pg_collection, group_name, None)
         if group is None:
@@ -213,20 +195,15 @@ def invoke_custom_layer(
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
     packed_seq_params: PackedSeqParams | None = None,
     padding_mask: Tensor | None = None,
-    sequence_len_offset: Tensor | None = None,
     input_ids: Tensor | None = None,
-    inference_context=None,
 ) -> Tensor:
     """Apply the custom-layer calling convention in eager and recomputed execution."""
-    if inference_context is not None:
-        raise ValueError("Custom hybrid layers do not support inference contexts yet.")
     output = layer(
         hidden_states,
         attention_mask=attention_mask,
         rotary_pos_emb=rotary_pos_emb,
         packed_seq_params=packed_seq_params,
         padding_mask=padding_mask,
-        sequence_len_offset=sequence_len_offset,
         input_ids=input_ids,
     )
     if not isinstance(output, Tensor) or output.shape != hidden_states.shape:
@@ -244,10 +221,9 @@ def validate_shared_rotary_config(
     if position_embedding_type not in ("rope", "yarn"):
         return
     for layer_config in layer_configs:
-        if uses_shared_rotary_embeddings(layer_config) and layer_config.kv_channels != kv_channels:
+        if type(layer_config) is AttentionLayerConfig and layer_config.kv_channels != kv_channels:
             raise ValueError(
-                f"{type(layer_config).__name__}.kv_channels "
-                f"({layer_config.kv_channels}) must match "
+                f"AttentionLayerConfig.kv_channels ({layer_config.kv_channels}) must match "
                 f"HybridModel config.kv_channels ({kv_channels}) when using "
                 f"position_embedding_type={position_embedding_type!r}: decoder and MTP "
                 "attention layers use the model's shared rotary embeddings."
