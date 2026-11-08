@@ -628,7 +628,8 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
-                TransformerLayer instances. Defaults to None.
+                TransformerLayer instances and custom layers. Defaults to None.
+                Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
         Returns:
             Tensor: the output tensor.
         """
@@ -825,8 +826,13 @@ class HybridStack(MegatronModule):
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
+                        is_custom_layer = (
+                            layer_utils.get_custom_layer_type(layer_config) is not None
+                        )
                         with inner_quant_context:
-                            if layer_utils.get_custom_layer_type(layer_config) is not None:
+                            if is_custom_layer and not isinstance(
+                                layer, HyperConnectionHybridLayer
+                            ):
                                 hidden_states = layer_utils.invoke_custom_layer(
                                     layer,
                                     hidden_states,
@@ -865,7 +871,9 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                if input_ids is not None and self._uses_hash_routing(layer):
+                                if input_ids is not None and (
+                                    is_custom_layer or self._uses_hash_routing(layer)
+                                ):
                                     layer_kwargs["input_ids"] = input_ids
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):

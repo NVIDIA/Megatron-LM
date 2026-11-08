@@ -145,7 +145,11 @@ def invoke_custom_layer(
     padding_mask: Tensor | None = None,
     input_ids: Tensor | None = None,
 ) -> Tensor:
-    """Apply the custom-layer calling convention in eager and recomputed execution."""
+    """Apply the custom-layer calling convention in eager and recomputed execution.
+
+    ``input_ids`` is optional and may be None, including in HybridModel's MTP stacks.
+    Custom layers must handle missing IDs; token-dependent MTP execution is not supported.
+    """
     output = layer(
         hidden_states,
         attention_mask=attention_mask,
