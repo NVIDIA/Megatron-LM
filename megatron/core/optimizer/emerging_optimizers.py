@@ -129,22 +129,22 @@ class EmergingOptimizerEntry:
 
 
 def _create_emerging_optimizer(
-    config, param_groups, eopt_name, model_chunks, pg_collection, *, is_expert: bool = False
+    config, param_groups, eopt_name, model_chunks, pg_collection, *, is_expert_bucket: bool = False
 ):
     """Instantiate an emerging optimizer and return it with its init_state_fn.
 
-    ``is_expert`` marks the expert bucket of a hybrid dense/expert Muon configuration (see
+    ``is_expert_bucket`` marks the expert bucket of a hybrid dense/expert Muon configuration (see
     ``_get_megatron_emerging_optimizer``). Only the ``muon`` entry produces such buckets, and
     its builders take the flag so the bucket gets the class, mode and process-group axes of
     the expert weight family. Every other bucket goes through the entry's registered
     builders unchanged.
     """
     entry = _EMERGING_OPTIMIZERS[eopt_name]
-    if is_expert and eopt_name == 'muon':
+    if is_expert_bucket and eopt_name == 'muon':
         eopt_kwargs = _muon_registry_config_to_kwargs(
-            config, model_chunks, pg_collection, is_expert=True
+            config, model_chunks, pg_collection, is_expert_bucket=True
         )
-        optimizer_cls = _muon_config_to_cls(config, is_expert=True)
+        optimizer_cls = _muon_config_to_cls(config, is_expert_bucket=True)
     else:
         if entry.config_to_kwargs is not None:
             eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
@@ -773,27 +773,28 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
-def _muon_bucket_tp_mode(config, is_expert: bool) -> str:
+def _muon_bucket_tp_mode(config, is_expert_bucket: bool) -> str:
     """NS mode of one Muon bucket: ``muon_tp_mode`` for the dense bucket, the effective expert
     mode (:func:`muon_effective_expert_tp_mode`) for the expert bucket.
 
     The bucket flag is the single input every ``muon`` builder keys on, so class, kwargs and
     process-group axes cannot disagree.
     """
-    if is_expert:
+    if is_expert_bucket:
         return muon_effective_expert_tp_mode(config)
     return muon_effective_dense_mode(config)
 
 
-def _muon_config_to_cls(config, is_expert: bool = False) -> type:
+def _muon_config_to_cls(config, is_expert_bucket: bool = False) -> type:
     """The ``muon`` registry entry's class.
 
     ``LayerShardedMuon`` when the bucket's mode is ``'layer_sharded'`` (a registry-level class
     selector, not a TensorParallelMuon runtime mode), ``TensorParallelMuon`` otherwise. The
-    registry calls this without ``is_expert``, which is the dense bucket and thus the
-    non-hybrid behavior; the expert bucket of a hybrid configuration passes ``is_expert=True``.
+    registry calls this without ``is_expert_bucket``, which is the dense bucket and thus the
+    non-hybrid behavior; the expert bucket of a hybrid configuration passes
+    ``is_expert_bucket=True``.
     """
-    if _muon_bucket_tp_mode(config, is_expert) == 'layer_sharded':
+    if _muon_bucket_tp_mode(config, is_expert_bucket) == 'layer_sharded':
         from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
         return LayerShardedMuon
@@ -815,7 +816,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 
 
 def _muon_registry_config_to_kwargs(
-    config, model_chunks, pg_collection, *, is_expert: bool = False
+    config, model_chunks, pg_collection, *, is_expert_bucket: bool = False
 ) -> dict[str, Any]:
     """``config_to_kwargs`` for the ``muon`` registry entry.
 
@@ -823,17 +824,17 @@ def _muon_registry_config_to_kwargs(
     :func:`_muon_config_to_cls` selects it (the same helper the entry's
     ``config_to_cls`` uses, so class and kwargs cannot disagree).
 
-    ``is_expert`` selects the expert bucket of a hybrid dense/expert configuration
+    ``is_expert_bucket`` selects the expert bucket of a hybrid dense/expert configuration
     (:func:`_create_emerging_optimizer`): its mode is the effective expert mode and its
     LayerShardedMuon defaults to the expert (expt_gtp_remat, expt_tp) axes. The registry
     itself calls this with the default, i.e. for the dense bucket.
     """
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
-    cls = _muon_config_to_cls(config, is_expert)
+    cls = _muon_config_to_cls(config, is_expert_bucket)
     if cls is TensorParallelMuon:
-        if is_expert:
+        if is_expert_bucket:
             # The reflective builder read config.muon_tp_mode; the expert bucket runs its own.
-            kwargs["tp_mode"] = _muon_bucket_tp_mode(config, is_expert)
+            kwargs["tp_mode"] = _muon_bucket_tp_mode(config, is_expert_bucket)
         return kwargs
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
@@ -842,7 +843,7 @@ def _muon_registry_config_to_kwargs(
     # No config attr for these: the axes come from the collection. An expert bucket defaults
     # to the expert axes; per-group NS-home wiring (_wire_layer_sharding_ns_homes) assigns
     # domains group by group regardless, this keeps the fallback consistent.
-    if is_expert:
+    if is_expert_bucket:
         kwargs["gtp_remat_group"] = getattr(pg_collection, "expt_gtp_remat", None)
         kwargs["tp_group"] = getattr(pg_collection, "expt_tp", None)
         # Expert weights own no QKV, so there is nothing to split; but muon_split_qkv is one
