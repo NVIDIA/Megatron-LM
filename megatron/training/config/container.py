@@ -951,8 +951,7 @@ class RunConfigRecord(ConfigContainerBase):
 
     def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
         """The document holds only the members the run has. Section overrides (a checkpoint save's
-        own directory and format) reach the member that is the run config: `pretrain`, else
-        `inference`."""
+        own directory and format) reach the member that is the run config."""
         document = {key: value for key, value in super().to_dict().items() if value is not None}
         if section_overrides:
             owner = "pretrain" if self.pretrain is not None else "inference"

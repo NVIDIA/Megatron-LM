@@ -226,9 +226,8 @@ def _checkpoint_dir(checkpoint_name: str, ckpt_type) -> str:
 
 
 def _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type) -> Optional[dict]:
-    """The run config's sections saved with a checkpoint: the common payload of a local checkpoint,
-    the YAML sidecar of every other kind; a record's `pretrain` member (`run_config_sections`).
-    None for checkpoints written before it was saved."""
+    """The run config saved with a checkpoint: the common payload of a local checkpoint, the YAML
+    sidecar of every other kind. None for checkpoints written before it was saved."""
     from megatron.training.utils.checkpoint_utils import (
         get_checkpoint_run_config_filename,
         read_run_config,
