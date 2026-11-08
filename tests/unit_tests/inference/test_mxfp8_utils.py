@@ -129,6 +129,80 @@ def ref_swizzle(input_matrix) -> torch.Tensor:
 
 class TestMxfp8Quantize:
 
+    @staticmethod
+    def _make_layout_input(layout, dtype):
+        if layout == "transpose":
+            return torch.randn(160, 129, device="cuda", dtype=dtype).t()
+        if layout == "row_slice":
+            return torch.randn(258, 160, device="cuda", dtype=dtype)[::2]
+        if layout == "column_slice":
+            return torch.randn(129, 320, device="cuda", dtype=dtype)[:, ::2]
+        if layout == "offset":
+            return torch.randn(130, 160, device="cuda", dtype=dtype)[1:]
+        return torch.randn(129, 160, device="cuda", dtype=dtype)
+
+    @pytest.mark.parametrize(
+        "layout", ["transpose", "row_slice", "column_slice", "offset", "contiguous"]
+    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("api", ["allocate", "into_uint8", "into_e8m0", "tensor"])
+    def test_input_layout_matches_contiguous(self, layout, dtype, api):
+        """Read logical values for each layout without changing inputs or output storage."""
+        x = self._make_layout_input(layout, dtype)
+        original = x.clone()
+        expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+
+        if api == "allocate":
+            data, scale = mxfp8_quantize(x)
+        elif api == "tensor":
+            quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+            data, scale = quantized.data, quantized.scale
+        else:
+            data = torch.empty_like(expected_data)
+            scale = torch.full_like(expected_scale.view(torch.uint8), 0xFF)
+            if api == "into_e8m0":
+                scale = scale.view(torch.float8_e8m0fnu)
+            pointers = (data.data_ptr(), scale.data_ptr())
+            mxfp8_quantize_into(x, data, scale)
+            assert (data.data_ptr(), scale.data_ptr()) == pointers
+
+        torch.testing.assert_close(
+            data.view(torch.uint8), expected_data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            scale.view(torch.uint8), expected_scale.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(x, original, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("layout", ["transpose", "row_slice", "column_slice"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_strided_input_cuda_graph_replay(self, layout, dtype):
+        """Captured input normalization must read updated values on every replay."""
+        x = self._make_layout_input(layout, dtype)
+        expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+        data, scale = torch.empty_like(expected_data), torch.empty_like(expected_scale)
+        pointers = (data.data_ptr(), scale.data_ptr())
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            mxfp8_quantize_into(x, data, scale)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mxfp8_quantize_into(x, data, scale)
+
+        for _ in range(3):
+            x.copy_(torch.randn(x.shape, device=x.device, dtype=dtype))
+            expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+            graph.replay()
+            assert (data.data_ptr(), scale.data_ptr()) == pointers
+            torch.testing.assert_close(
+                data.view(torch.uint8), expected_data.view(torch.uint8), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                scale.view(torch.uint8), expected_scale.view(torch.uint8), atol=0, rtol=0
+            )
+
     @pytest.mark.parametrize(
         "M,K",
         [

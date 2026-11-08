@@ -1107,6 +1107,7 @@ class TestMegatronFSDPE2E:
             tokenizer_type="NullTokenizer",
             vocab_size=256,
             bf16=True,
+            grad_reduce_in_bf16=True,
             use_megatron_fsdp=True,
             ckpt_format="fsdp_dtensor",
             use_precision_aware_optimizer=True,

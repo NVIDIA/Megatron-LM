@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
-from megatron.core.fusions import fused_cross_entropy
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.ops.loss import fused_cross_entropy
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import kernel_warmup
 from megatron.training.kernel_warmup import _warmup_training_kernels
@@ -295,7 +295,8 @@ def pretrain_until_warmup(monkeypatch):
     monkeypatch.setattr(training.ft_integration, "setup", lambda: None)
     monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: None)
     monkeypatch.setattr(training, "get_timers", lambda: None)
-    monkeypatch.setattr(training, "set_jit_fusion_options", lambda **kwargs: None)
+    monkeypatch.setattr(training, "get_train_state", lambda: Namespace())
+    monkeypatch.setattr(training, "set_jit_fusion_options", lambda *args, **kwargs: None)
 
     def invoke(args, model_config, tp_group):
         monkeypatch.setattr(training, "get_args", lambda: args)

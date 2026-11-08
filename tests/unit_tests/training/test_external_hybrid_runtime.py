@@ -5,7 +5,6 @@
 from argparse import Namespace
 from dataclasses import dataclass
 from functools import partial
-from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
 
@@ -18,6 +17,7 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.training import checkpointing
+from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.training import (
     _hybrid_config_list_moe_logging_metadata,
     num_floating_point_operations,
@@ -70,9 +70,9 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     )
 
     result = num_floating_point_operations(
-        SimpleNamespace(seq_length=128, decoder_seq_length=None),
-        SimpleNamespace(),
+        HybridModelConfig(transformer=config, vocab_size=32),
         batch_size=2,
+        sequence_length=128,
         total_real_tokens_in_batch=7,
         seqlen_squared_sum_in_batch=25,
         model_flops_estimator=estimate_model,
@@ -106,9 +106,9 @@ def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch
     )
     with pytest.raises(NotImplementedError):
         num_floating_point_operations(
-            SimpleNamespace(seq_length=128, decoder_seq_length=None),
-            SimpleNamespace(),
+            HybridModelConfig(transformer=config, vocab_size=32),
             batch_size=2,
+            sequence_length=128,
             model_flops_estimator=estimate_model,
         )
 
@@ -159,6 +159,9 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
     run_config.checkpoint.save = "/configured"
     run_config.checkpoint.save_optim = False
     run_config.tokenizer.padded_vocab_size = 32
+    run_config.model = HybridModelConfig(
+        transformer=config, vocab_size=32, hybrid_layer_config_list=[config]
+    )
 
     state = checkpointing.generate_state_dict(
         args, [model], None, None, None, iteration=3, ckpt_format="torch", save="/actual"
@@ -172,11 +175,9 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
     assert saved_args.padded_vocab_size == 32
     assert vars(args) == original_args
     assert state["model"] == {"weight": 1}
-    assert checkpointing._validate_checkpoint_model_family(args, saved_args, [model]) == (
-        True,
-        True,
-        None,
-    )
+    assert checkpointing._validate_checkpoint_model_family(
+        args, Namespace(is_hybrid_model=False), [model], checkpoint_model=run_config.model.as_dict()
+    ) == (True, True, None)
 
 
 def test_external_layer_keeps_config_list_gpt_conversion_restriction():

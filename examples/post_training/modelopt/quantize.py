@@ -493,7 +493,7 @@ if __name__ == "__main__":
         })
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = inference_cfg_container_from_args(args)
     set_run_config(cfg)
     initialize_megatron(training=False)
 
@@ -575,7 +575,7 @@ if __name__ == "__main__":
             )
             for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
                 sample = get_batch_on_this_cp_rank(
-                    sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                    sample, dynamic_cp=False, cp_group=get_context_parallel_group()
                 )
                 megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 

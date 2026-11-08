@@ -87,6 +87,17 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_normalize_loss_by_main_tokens: bool = False
+    """Normalize summed MTP losses with the global main-loss token count.
+
+    By default, each rank and microbatch first normalizes MTP loss with its local number of
+    valid MTP targets. Enabling this option instead leaves MTP losses as sums so the normal
+    per-token gradient finalization divides them by the global main-loss token count. This
+    makes the MTP objective invariant to how samples with different valid-token fractions are
+    partitioned across ranks and gradient-accumulation microbatches. Requires
+    ``calculate_per_token_loss=True``.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1652,6 +1663,15 @@ class TransformerConfig(ModelParallelConfig):
     gdp_num_householder: int = 3
     """The number of Householder reflections used in Gated Delta Product layers."""
 
+    gdp_g_clamp_value: Optional[float] = None
+    """Optional positive magnitude of the lower bound on GDP's per-token log decay.
+
+    For example, 50 clamps g to a minimum of -50 before the recurrent kernel in
+    training and inference. None leaves g unchanged. GDP gate metrics report raw g.
+    When loading checkpoint arguments, a saved value is restored if this is omitted;
+    an explicit CLI value takes precedence.
+    """
+
     mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
     None causes the states to follow the activation dtype."""
@@ -1951,6 +1971,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
 
+        if self.mtp_normalize_loss_by_main_tokens and not self.calculate_per_token_loss:
+            raise ValueError(
+                "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
+            )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1973,6 +1998,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
             )
+
+        if self.gdp_g_clamp_value is not None and (
+            not math.isfinite(self.gdp_g_clamp_value) or self.gdp_g_clamp_value <= 0
+        ):
+            raise ValueError("gdp_g_clamp_value must be finite and positive when set.")
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:

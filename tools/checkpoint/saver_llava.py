@@ -160,6 +160,15 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
 
         return margs
 
+    def build_model_config(self):
+        """Select the same model family as this converter's provider."""
+        if self.md.model_type == "BERT":
+            return super().build_model_config()
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
+
+        return model_config_from_args(self.margs, model_config_cls=LLaVAModelConfig)
+
     def import_model_provider(self):
         try:
             from megatron.core.enums import ModelType
