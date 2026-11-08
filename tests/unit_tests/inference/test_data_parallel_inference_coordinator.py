@@ -28,11 +28,11 @@ from megatron.core.inference.disaggregation.handoff_ownership import (
     HandoffOwnership,
 )
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
+from megatron.core.inference.engines.dynamic.coordinator import _engine_reply_frames
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
-    _engine_reply_frames,
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
@@ -359,6 +359,9 @@ class DummyContext:
     def get_active_request_count(self) -> int:
         return self.active_cnt
 
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        pass
+
 
 class DummyController:
     """Dummy inference controller."""
@@ -378,6 +381,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()

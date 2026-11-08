@@ -136,7 +136,7 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
     monkeypatch.setattr(engine_service, "initialize_runtime_services", runtime_services)
 
     def initialize():
-        build_config.assert_called_once_with(args, build_model_config=False)
+        build_config.assert_called_once_with(args)
         set_config.assert_called_once_with(config)
         runtime_services.assert_called_once_with(args)
         raise RuntimeError("initialization reached")

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import json
 import os
 import re
@@ -495,6 +496,167 @@ def _run_configure(
 
 
 @pytest.mark.parametrize(
+    ("labels", "overrides", "repeat", "lightweight", "functional", "cadence_bypass"),
+    [
+        pytest.param([], {}, "2", "false", "false", "false", id="default"),
+        pytest.param(["Run tests"], {}, "1", "true", "true", "true", id="lightweight"),
+        pytest.param(
+            ["Run tests", "Run functional tests"],
+            {},
+            "1",
+            "true",
+            "true",
+            "true",
+            id="existing-lightweight-precedence",
+        ),
+        pytest.param(["Run functional tests"], {}, "5", "false", "true", "true", id="five-runs"),
+        pytest.param(
+            ["Run Merge-Queue jobs"], {}, "1", "false", "true", "false", id="merge-queue-label"
+        ),
+        pytest.param(
+            [],
+            {"IS_MERGE_GROUP": "true", "EVENT_NAME": "merge_group"},
+            "1",
+            "false",
+            "true",
+            "false",
+            id="merge-group",
+        ),
+        pytest.param(
+            [],
+            {"IS_CI_WORKLOAD": "true", "EVENT_NAME": "schedule"},
+            "5",
+            "false",
+            "true",
+            "false",
+            id="schedule",
+        ),
+        pytest.param(
+            [], {"EVENT_NAME": "workflow_dispatch"}, "5", "false", "true", "false", id="dispatch"
+        ),
+    ],
+)
+def test_functional_scope_and_repetitions(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    labels: list[str],
+    overrides: dict[str, str],
+    repeat: str,
+    lightweight: str,
+    functional: str,
+    cadence_bypass: str,
+) -> None:
+    """Exercise the actual configure shell across labels and non-PR triggers."""
+    result, outputs = _run_configure(tmp_path, {**configure_environment, **overrides}, labels)
+    assert result.returncode == 0, result.stderr
+    assert outputs["scope"] == ("L1" if functional == "true" else "L0")
+    assert outputs["n_repeat"] == repeat
+    assert outputs["lightweight"] == lightweight
+    assert outputs["run_functional"] == functional
+    assert outputs["run_h100_functional"] == "true"
+    assert outputs["cadence_bypass"] == cadence_bypass
+    assert outputs["lts"] == str("container::lts" in labels).lower()
+    if cadence_bypass == "true":
+        assert outputs["cadence"] == ""
+
+
+@pytest.mark.parametrize("traffic_mode", ["aws", "gcp", "50-50"])
+@pytest.mark.parametrize(
+    "other_labels",
+    [
+        [],
+        ["Run tests"],
+        ["Run functional tests"],
+        ["container::lts"],
+        ["Run NeMoRL tests", "Run MBridge tests"],
+        [
+            "Run tests",
+            "Run functional tests",
+            "container::lts",
+            "Run NeMoRL tests",
+            "Run MBridge tests",
+            "Run selective unit tests",
+        ],
+    ],
+)
+def test_merge_queue_label_matches_merge_group_configuration(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    traffic_mode: str,
+    other_labels: list[str],
+) -> None:
+    """Compare every output from labeled PR and actual merge-group configuration."""
+    environment = {
+        **configure_environment,
+        "H100_TRAFFIC_MODE": traffic_mode,
+        "ENABLE_SELECTIVE_UNIT_TESTS": "true",
+    }
+    result, baseline = _run_configure(
+        tmp_path,
+        {
+            **environment,
+            "IS_MERGE_GROUP": "true",
+            "EVENT_NAME": "merge_group",
+            "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+        },
+        [],
+    )
+    assert result.returncode == 0, result.stderr
+    result, outputs = _run_configure(tmp_path, environment, ["Run Merge-Queue jobs", *other_labels])
+    assert result.returncode == 0, result.stderr
+    assert outputs == baseline
+    for name, expected in {
+        "merge_queue_jobs": "true",
+        "scope": "L1",
+        "n_repeat": "1",
+        "lightweight": "false",
+        "lts": "false",
+        "dev": "true",
+        "run_functional": "true",
+        "run_h100_functional": "true",
+        "cadence": "mergegroup",
+        "cadence_bypass": "false",
+        "unit_testmon_eligible": "false",
+        "run_mbridge": "true",
+        "mbridge_suite": "L1",
+        "run_nemo_rl": "false",
+        "h100_cloud": "aws-h100",
+        "h100_build_runner": "nvidia-ci-aws-cpu",
+        "h100_use_gcp": "false",
+    }.items():
+        assert outputs[name] == expected
+
+
+@pytest.mark.parametrize("is_member", ["false", "true"])
+@pytest.mark.parametrize("is_maintainer", ["false", "true"])
+def test_merge_queue_label_preserves_ephemeral_runner_boundaries(
+    tmp_path: Path, configure_environment: dict[str, str], is_member: str, is_maintainer: str
+) -> None:
+    """Keep untrusted PRs on ephemeral runners despite selecting the queue profile."""
+    runner = "ephe-v2-example-a2"
+    result, outputs = _run_configure(
+        tmp_path,
+        {
+            **configure_environment,
+            "PREFLIGHT_IS_MEMBER": is_member,
+            "IS_MAINTAINER": is_maintainer,
+            "EPHEMERAL_RUNNER": "ephe-v2-example",
+            "RUN_ATTEMPT": "2",
+            "H100_TRAFFIC_MODE": "gcp",
+        },
+        ["Run Merge-Queue jobs"],
+    )
+    assert result.returncode == 0, result.stderr
+    if is_member == "false" or is_maintainer == "false":
+        assert outputs["h100_build_runner"] == runner
+        assert json.loads(outputs["h100_gpu_runs_on"]) == runner
+    else:
+        assert outputs["h100_build_runner"] == "nvidia-ci-aws-cpu"
+    assert outputs["h100_cloud"] == "aws-h100"
+    assert outputs["h100_use_gcp"] == "false"
+
+
+@pytest.mark.parametrize(
     ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
     [
         pytest.param(
@@ -723,6 +885,7 @@ def test_selective_variable_and_label_precedence(
     [
         pytest.param(["Run tests"], {}, id="run-tests-label"),
         pytest.param(["Run functional tests"], {}, id="run-functional-tests-label"),
+        pytest.param(["Run Merge-Queue jobs"], {}, id="run-merge-queue-jobs-label"),
         pytest.param(["force-run-all"], {}, id="force-run-all-label"),
         pytest.param(["container::lts"], {}, id="lts-label"),
         pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),
@@ -766,88 +929,368 @@ def test_full_test_guards_override_selective_requests(
     assert "| `unit_testmon_eligible` | `false` |" in summary
 
 
-@pytest.mark.parametrize("platform", ["h100", "gb200"])
-def test_unit_tests_select_and_execute_in_each_existing_gpu_bucket(
-    tmp_path, shell_environment, platform
+@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
+def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_environment, has_tests):
+    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
+    zstd = tmp_path / "zstd"
+    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
+    zstd.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    result, compression = _run(
+        _step("_unit-tests.yml", "select", "cache-compression")["run"],
+        tmp_path,
+        {**environment, "RUNNER_TEMP": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    restore = _step("_unit-tests.yml", "select", "plan")
+    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert all(
+        "PATH" not in step.get("env", {})
+        for step in workflow["jobs"]["select"]["steps"]
+        if step.get("id") != "plan"
+    )
+    probe = subprocess.run(
+        ["zstd", "--quiet", "--version"],
+        env={**environment, "PATH": compression["path"]},
+        text=True,
+        capture_output=True,
+    )
+    # The pinned cache action uses gzip when the version probe emits no output.
+    assert probe.stdout == probe.stderr == ""
+    assert probe.returncode != 0
+    assert (
+        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
+        == "1.5.7\n"
+    )
+
+    bucket = "tests/unit_tests/test_example.py"
+    outputs = {"has_tests": str(has_tests).lower()}
+    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["select"]["name"] == "unit tests selection"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
+    for step in workflow["jobs"]["select"]["steps"]:
+        assert "unit_testmon_mode" not in step.get("if", "")
+    for platform, parser_job, output in (
+        ("h100", "cicd-parse-unit-tests", "unit-tests"),
+        ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
+        result, parsed = _run(parser["run"], tmp_path, shell_environment)
+        assert result.returncode == 0, result.stderr
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
+        )
+        assert json.loads(parsed[output]) == [
+            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+        ]
+    assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
+    assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
+    assert workflow[True]["workflow_call"]["inputs"]["buckets"]["type"] == "string"
+    assert workflow["jobs"]["run"]["needs"] == "select"
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
+    needs = SimpleNamespace(
+        select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
+    )
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
+    context = {"needs": needs, "inputs": inputs}
+    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
+    )
+    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
+        "${{ inputs.unit_testmon_mode == 'enforce' && "
+        "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
+    )
+    assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
+
+    # CPU failures stop GPU scheduling; full-suite requests bypass selection.
+    needs.select.result = "failure"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "skipped"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    inputs.unit_testmon_mode = "full"
+    assert eval(expression, {"__builtins__": {}}, context)
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    for caller, parser, output in (
+        ("cicd-unit-tests-latest", "cicd-parse-unit-tests", "unit-tests"),
+        ("cicd-unit-tests-latest-gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        assert "strategy" not in callers[caller]
+        assert parser in callers[caller]["needs"]
+        assert callers[caller]["with"]["buckets"] == (
+            "${{ needs." + parser + ".outputs." + output + " }}"
+        )
+    coverage = _step("cicd-main.yml", "Coverage", "coverage")
+    for variable, job, output in (
+        ("H100_BUCKETS", "cicd-parse-unit-tests", "unit-tests"),
+        ("GB200_BUCKETS", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        assert job in callers["Coverage"]["needs"]
+        assert coverage["env"][variable] == (
+            "${{ needs." + job + ".outputs." + output + " || '[]' }}"
+        )
+
+    for platform in ("dgx_h100", "dgx_gb200"):
+        directory = tmp_path / f"unit-test-plan-{platform}"
+        directory.mkdir()
+        (directory / "plan.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "source_sha": "a" * 40,
+                    "bucket": bucket,
+                    "platform": platform,
+                    "mode": "selected",
+                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
+                }
+            )
+        )
+    result, outputs = _run(
+        coverage["run"],
+        tmp_path,
+        {
+            "SELECTIVE": "true",
+            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "SOURCE_SHA": "a" * 40,
+        },
+    )
+    # Missing coverage is valid only when every bucket selected no tests.
+    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
+    assert outputs == ({} if has_tests else {"has_coverage": "false"})
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "target_branch", "cpu_mode", "expected_mode"),
+    [
+        pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
+        pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("full", "main", "", "full", id="explicit-full"),
+        pytest.param("full", "", "", "full", id="merge-group-full"),
+        pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
+    ],
+)
+def test_gpu_reselection_respects_full_run_guards(
+    requested_mode, target_branch, cpu_mode, expected_mode
 ):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert set(workflow["jobs"]) == {"run"}
-    job = workflow["jobs"]["run"]
-    assert "needs" not in job and "if" not in job
-    assert job["runs-on"] == "${{ fromJSON(inputs.runner) }}"
-    assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.buckets) }}"
-    action = job["steps"][-1]["with"]
-    assert action["container-image"] == "${{ inputs.container-image }}"
-    assert action["test_case"] == "${{ matrix.bucket }}"
-    assert action["timeout"] == "${{ matrix.timeout || 30 }}"
-    assert action["sha"] == "${{ inputs.sha }}"
-    assert (
-        action["unit_test_pr_files_artifact_id"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
-    )
-    assert "unit_testmon_plan_artifact" not in action
-    assert "UNIT_TESTMON_COMPARE_SELECTIONS" not in yaml.safe_dump(workflow)
-
-    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
-    suffix = "" if platform == "h100" else "-gb200"
-    caller = callers[f"cicd-unit-tests-latest{suffix}"]
-    parser_job = f"cicd-parse-unit-tests{suffix}"
-    output = f"unit-tests{suffix}"
-    assert caller["uses"] == "./.github/workflows/_unit-tests.yml"
-    assert "strategy" not in caller
-    assert parser_job in caller["needs"]
-    assert caller["with"]["buckets"] == "${{ needs." + parser_job + ".outputs." + output + " }}"
-    assert caller["with"]["runner"] == (
-        "${{ needs.configure.outputs.h100_gpu_runs_on }}"
-        if platform == "h100"
-        else "${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}"
-    )
-    assert caller["with"]["unit_testmon_mode"] == (
-        "${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}"
-    )
-    parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
-    result, parsed = _run(parser["run"], tmp_path, shell_environment)
-    assert result.returncode == 0, result.stderr
-    recipe = yaml.safe_load(
-        (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
-    )
-    assert json.loads(parsed[output]) == [
-        {"bucket": case} for product in recipe["products"] for case in product["test_case"]
-    ]
-
-
-@pytest.mark.parametrize("mode", ["enforce", "full"])
-@pytest.mark.parametrize("branch", ["main", "dev", "core_r0.20.0", "pull-request/8523", ""])
-def test_gpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    action = workflow["jobs"]["run"]["steps"][-1]["with"]
-    expression = action["unit_testmon_mode"].removeprefix("${{").removesuffix("}}")
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    expression = mode.removeprefix("${{").removesuffix("}}")
     expression = expression.replace("&&", "and").replace("||", "or")
-    inputs = SimpleNamespace(unit_testmon_mode=mode, unit_testmon_target_branch=branch)
-    assert eval(expression, {"__builtins__": {}}, {"inputs": inputs}) == (
-        "enforce" if mode == "enforce" and branch == "main" else "full"
+    inputs = SimpleNamespace(
+        unit_testmon_mode=requested_mode, unit_testmon_target_branch=target_branch
+    )
+    matrix = SimpleNamespace(mode=cpu_mode)
+    assert (
+        eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix})
+        == expected_mode
     )
 
 
-@pytest.mark.parametrize("has_coverage", [True, False])
-def test_gpu_selection_requires_uploaded_coverage_without_plan_exceptions(tmp_path, has_coverage):
-    coverage = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"][
-        "Coverage"
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "mixed",
+        "empty",
+        "cache-error",
+        "selector-error",
+        "upload-error",
+        "pinned",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    ],
+)
+def test_grouped_cpu_selection(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("testmon")
+    buckets = [
+        {"bucket": f"tests/unit_tests/{name}/**/*.py", "timeout": 40}
+        for name in (["empty"] if scenario == "empty" else ["selected", "empty", "full"])
     ]
-    assert coverage["needs"] == ["Nemo_CICD_Test", "pre-flight"]
-    assert "unit-test-plan-" not in yaml.safe_dump(coverage)
-    assert "has_coverage" not in yaml.safe_dump(coverage)
-    stale_plan = tmp_path / "unit-test-plan-old"
-    stale_plan.mkdir()
-    (stale_plan / "plan.json").write_text(
-        json.dumps({"mode": "selected", "phases": {"prod": [], "experimental": []}})
+    unit_tests = tmp_path / "tests/unit_tests"
+    unit_tests.mkdir(parents=True)
+    for script in (
+        "testmon_cache.py",
+        "testmon_selector.py",
+        "testmon_plan.py",
+        "testmon_mandatory.py",
+        "find_test_cases.py",
+    ):
+        (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
+    (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
+    dataset = tmp_path / "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("")
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
     )
-    if has_coverage:
-        report = tmp_path / "coverage-unit-test-example"
-        report.mkdir()
-        (report / ".coverage").touch()
-    result, outputs = _run(_step("cicd-main.yml", "Coverage", "coverage")["run"], tmp_path, {})
-    assert (result.returncode == 0) == has_coverage, result.stdout + result.stderr
-    assert outputs == {}
-    if not has_coverage:
-        assert "Missing unit-test coverage artifacts" in result.stderr
+    selected = unit_tests / "selected/test_case.py"
+    selected.parent.mkdir()
+    selected.write_text("def test_case(): pass\n")
+    pr_files = tmp_path / "pr-files"
+    pr_files.mkdir()
+    (pr_files / "changed-files").write_text("")
+    (pr_files / "metadata.json").write_text(
+        json.dumps({"tested_sha": "a" * 40, "changed_paths": 0})
+    )
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "PYTHONPATH": str(unit_tests),
+        "BUCKETS": json.dumps(buckets),
+        "RECIPE_PLATFORM": "dgx_h100",
+        "SOURCE_SHA": "a" * 40,
+        "TARGET_BRANCH": "main",
+        "TESTMON_GENERATION": "111-1" if scenario.startswith("pinned") else "",
+        "TESTMON_BASE_SHA": "b" * 40 if scenario.startswith("pinned") else "",
+        "PR_FILES_DIR": str(pr_files),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+    }
+    # Empty recorded databases are sufficient: a new file is selected, and a
+    # bucket without files is skipped. Use real cache validation and selection.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json, os
+from pathlib import Path
+from testmon.db import DB
+from testmon_cache import PHASES, cache_identity, record_phase, finalize
+for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
+    if '/full/' in entry['bucket']:
+        continue
+    directory = Path('saved') / str(index)
+    for phase in PHASES:
+        database = directory / phase / '.testmondata'
+        database.parent.mkdir(parents=True)
+        DB(str(database)).con.close()
+        record_phase(directory, phase)
+    identity = cache_identity(Path.cwd(), entry['bucket'], 'dgx_h100')
+    finalize(directory, identity, 'b' * 40, '111-1')
+""",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    spec = importlib.util.spec_from_file_location(
+        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    monkeypatch.chdir(tmp_path)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    uploads = []
+    restores = 0
+
+    def actions(operation, *args):
+        nonlocal restores
+        if operation == "restore":
+            path, key, prefix, key_file = args
+            assert path == "assets_dir/testmon"
+            cache_prefix = json.loads((tmp_path / "unit-testmon-identity.json").read_text())[
+                "cache_prefix"
+            ]
+            if scenario.startswith("pinned"):
+                assert key == f"{cache_prefix}111-1"
+                assert prefix == "", "a pinned baseline must not use any restore-key fallback"
+            else:
+                assert prefix == cache_prefix
+                assert key == f"{prefix}lookup-123-2"
+            assert not Path(path).exists(), "previous bucket cache was not cleared"
+            index = restores
+            restores += 1
+            if scenario == "selector-error" and index == 1:
+                (unit_tests / "testmon_selector.py").unlink()
+            if scenario == "cache-error" and index == 0:
+                raise subprocess.CalledProcessError(1, [operation])
+            saved = tmp_path / "saved" / str(index)
+            if scenario == "pinned-miss" and index == 0:
+                Path(key_file).write_text("")
+                return
+            if saved.exists():
+                shutil.copytree(saved, path)
+            matched_generation = "111-1"
+            if scenario == "pinned-other-generation" and index == 0:
+                # Even a complete compatible generation must not substitute for
+                # the baseline used to construct the tested checkout.
+                matched_generation = "222-1"
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["generation"] = matched_generation
+                manifest_path.write_text(json.dumps(manifest))
+            if index == 0 and scenario == "pinned-source-mismatch":
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["source_sha"] = "c" * 40
+                manifest_path.write_text(json.dumps(manifest))
+            Path(key_file).write_text(
+                f"{cache_prefix}{matched_generation}" if saved.exists() else ""
+            )
+        else:
+            assert operation == "upload"
+            if scenario == "upload-error":
+                raise subprocess.CalledProcessError(1, [operation])
+            name, plan, root = args
+            assert root == "assets_dir/testmon-plan"
+            assert plan == f"{root}/plan.json"
+            uploads.append({"name": name, "plan": json.loads(Path(plan).read_text())})
+
+    monkeypatch.setattr(selector, "_actions", actions)
+    if scenario in {"selector-error", "upload-error"}:
+        with pytest.raises(subprocess.CalledProcessError):
+            selector.main()
+        assert not (tmp_path / "outputs").exists()
+        assert restores == (2 if scenario == "selector-error" else 1)
+        assert len(uploads) == (1 if scenario == "selector-error" else 0)
+        return
+    selector.main()
+    assert restores == len(buckets)
+    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
+    matrix = json.loads(outputs["matrix"])
+    assert outputs["has_tests"] == str(scenario != "empty").lower()
+    assert [entry["bucket"] for entry in matrix] == [
+        entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
+    ]
+    fallback = scenario in {
+        "cache-error",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    }
+    assert [entry["mode"] for entry in matrix] == (
+        [] if scenario == "empty" else [("full" if fallback else "preselected"), "full"]
+    )
+    assert all(entry["timeout"] == 40 for entry in matrix)
+    assert bool(caplog.records) == (fallback and scenario != "pinned-miss")
+    for upload in uploads:
+        plan = upload["plan"]
+        assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
+        expected = (
+            ["tests/unit_tests/selected/test_case.py"] if "/selected/" in plan["bucket"] else []
+        )
+        assert plan["phases"] == {"prod": expected, "experimental": expected}
+        assert plan["source_sha"] == "a" * 40
+        matches = [entry for entry in matrix if entry["bucket"] == plan["bucket"]]
+        assert bool(matches) == bool(expected)
+        if matches:
+            assert matches[0]["plan_artifact"] == upload["name"]
+    assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
+    assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")

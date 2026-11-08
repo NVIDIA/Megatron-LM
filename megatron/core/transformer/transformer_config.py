@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -84,6 +84,17 @@ class TransformerConfig(ModelParallelConfig):
     We compute the average of the MTP losses across all depths, 
     and multiply it the scaling factor to obtain the overall MTP loss, 
     which serves as an additional training objective.
+    """
+
+    mtp_normalize_loss_by_main_tokens: bool = False
+    """Normalize summed MTP losses with the global main-loss token count.
+
+    By default, each rank and microbatch first normalizes MTP loss with its local number of
+    valid MTP targets. Enabling this option instead leaves MTP losses as sums so the normal
+    per-token gradient finalization divides them by the global main-loss token count. This
+    makes the MTP objective invariant to how samples with different valid-token fractions are
+    partitioned across ranks and gradient-accumulation microbatches. Requires
+    ``calculate_per_token_loss=True``.
     """
 
     mtp_use_repeated_layer: bool = False
@@ -799,6 +810,9 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    fp8_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP8 recipe."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -839,8 +853,9 @@ class TransformerConfig(ModelParallelConfig):
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
-    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+    """If set, enables the use of FP4 precision through Transformer Engine."""
+    fp4_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
@@ -905,6 +920,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_shortcut_post_norm: bool = False
     """Apply the configured normalization to the combined routed and shared expert output.
     Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_disable_mtp: bool = False
+    """Disable shortcut MoE connections in hybrid MTP stacks while keeping them in the decoder.
+    Each MTP depth runs its compute and MoE layers sequentially, using the ordinary MoE
+    normalization and routing path. Also applies to a shared, repeated MTP layer.
+    Only affects shortcut MoE; other MTP, recomputation, and offloading settings are preserved.
+    Changing this setting requires converting the MTP state when resuming a checkpoint.
+    Defaults to False to preserve existing MTP behavior."""
 
     moe_shortcut_parallel: bool = False
     """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
@@ -1549,6 +1572,19 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    moe_training_matches_inference: bool = False
+    """Run the training MoE forward through generation's FlashInfer routed MXFP8 or
+    per-token NVFP4 expert kernel, so training log-probs match generation bitwise.
+    Tokens go through training's all-to-all dispatcher; the backward comes from the TE
+    recompute pass. Requires transformer_impl='inference_optimized',
+    inference_grouped_gemm_backend='flashinfer', moe_token_dispatcher_type='alltoall',
+    batch_invariant_mode, selective 'moe' recompute, and generation's expert-parallel
+    size. The kernel weights are built
+    from the parameters and held until an in-place write to them, an optimizer step, a
+    checkpoint load, or training_matches_inference.release_inference_value_pass_weights(model).
+    A caller that writes the parameters outside PyTorch in-place ops, an optimizer step
+    or a load (for example TE quantizing a high-precision value into an MXFP8 parameter)
+    must call that first."""
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1562,8 +1598,10 @@ class TransformerConfig(ModelParallelConfig):
       bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
       outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
       below eight and to within the last fp32 bit otherwise. Other score functions,
-      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
-      use the 'torch' path. Default."""
+      group-limited routing, router replay and moe_router_fusion use the 'torch' path.
+      Default.
+    Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
+    routing with an expert bias in both training and inference."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
@@ -1623,6 +1661,15 @@ class TransformerConfig(ModelParallelConfig):
 
     gdp_num_householder: int = 3
     """The number of Householder reflections used in Gated Delta Product layers."""
+
+    gdp_g_clamp_value: Optional[float] = None
+    """Optional positive magnitude of the lower bound on GDP's per-token log decay.
+
+    For example, 50 clamps g to a minimum of -50 before the recurrent kernel in
+    training and inference. None leaves g unchanged. GDP gate metrics report raw g.
+    When loading checkpoint arguments, a saved value is restored if this is omitted;
+    an explicit CLI value takes precedence.
+    """
 
     mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
@@ -1894,6 +1941,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
 
+        if self.mtp_normalize_loss_by_main_tokens and not self.calculate_per_token_loss:
+            raise ValueError(
+                "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
+            )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1916,6 +1968,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
             )
+
+        if self.gdp_g_clamp_value is not None and (
+            not math.isfinite(self.gdp_g_clamp_value) or self.gdp_g_clamp_value <= 0
+        ):
+            raise ValueError("gdp_g_clamp_value must be finite and positive when set.")
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
@@ -2399,6 +2456,96 @@ class TransformerConfig(ModelParallelConfig):
                         "batch_invariant_mode with inference-optimized MoE and expert "
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
+
+        if self.moe_training_matches_inference:
+            if self.transformer_impl != "inference_optimized":
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    f"transformer_impl='inference_optimized'; got '{self.transformer_impl}'."
+                )
+            # Not yet converted to the enum on every path.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            if backend != InferenceGroupedGemmBackend.FLASHINFER.value:
+                raise ValueError(
+                    "moe_training_matches_inference supports only "
+                    f"inference_grouped_gemm_backend='flashinfer'; got '{backend}'. "
+                    "The torch and vLLM kernels already match TE training under "
+                    "batch_invariant_mode."
+                )
+            if (
+                not (bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8)
+                and self.inference_moe_nvfp4_recipe is None
+            ):
+                raise ValueError(
+                    "moe_training_matches_inference requires FlashInfer routed MXFP8 "
+                    "(fp8_recipe='mxfp8') or per-token NVFP4 (inference_moe_nvfp4_recipe). "
+                    "The FlashInfer BF16 kernel is not batch invariant."
+                )
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "moe_training_matches_inference does not support expert tensor parallelism."
+                )
+            if not self.batch_invariant_mode:
+                raise ValueError(
+                    "moe_training_matches_inference requires batch_invariant_mode, so "
+                    "that a token's output does not depend on how many tokens share the "
+                    "kernel launch."
+                )
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    "moe_token_dispatcher_type='alltoall', whose batch-invariant combine "
+                    "adds the EP ranks as generation's does; got "
+                    f"'{self.moe_token_dispatcher_type}'."
+                )
+            # moe_layer_recompute (deprecated) adds 'moe' later; None later means ["core_attn"].
+            if not self.moe_layer_recompute and (
+                self.recompute_granularity != "selective"
+                or "moe" not in (self.recompute_modules or [])
+            ):
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    "recompute_granularity='selective' with 'moe' in recompute_modules: "
+                    "the value pass stores no activations, so the backward must come "
+                    "from a recompute pass."
+                )
+            if self.cuda_graph_impl == "local":
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the overlapped schedule does "
+                    "not go through MoELayer.forward, where the value pass is chosen."
+                )
+            # The recompute runs the training router; these make it pick other experts than
+            # the value pass, which routes as generation does.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_training_matches_inference does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")

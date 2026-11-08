@@ -8,12 +8,12 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -44,6 +44,10 @@ class TestMambaLayer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_activation_must_be_positional(self):
+        with pytest.raises(TypeError, match="hidden_states"):
+            self.layer(hidden_states=torch.empty(0), attention_mask=None)
 
     def test_configured_layernorm_epsilon(self):
         assert self.layer.norm.eps == self.layer.config.layernorm_epsilon

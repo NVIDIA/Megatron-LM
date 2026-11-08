@@ -85,7 +85,7 @@ def build_lm_batch(
     eod_mask_loss: bool = False,
     pad_mask_loss: bool = False,
     cp_group: torch.distributed.ProcessGroup | None = None,
-    is_hybrid_cp: bool = False,
+    dynamic_cp: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build causal-LM training tensors from packed or padded ``input_ids``.
 
@@ -107,7 +107,7 @@ def build_lm_batch(
         eod_mask_loss: Passed through to ``get_ltor_masks_and_position_ids``.
         pad_mask_loss: Passed through to ``get_ltor_masks_and_position_ids``.
         cp_group: When set, slice the batch for context parallelism.
-        is_hybrid_cp: Passed through to ``get_batch_on_this_cp_rank``.
+        dynamic_cp: Passed through to ``get_batch_on_this_cp_rank``.
 
     Returns:
         Dict with ``tokens``, ``labels``, ``loss_mask``, ``attention_mask``, and
@@ -146,7 +146,7 @@ def build_lm_batch(
     }
 
     if cp_group is not None:
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=dynamic_cp, cp_group=cp_group)
 
     return batch
 
@@ -161,7 +161,7 @@ def build_lm_batch_from_input_ids(
     eod_mask_loss: bool = False,
     pad_mask_loss: bool = False,
     cp_group: torch.distributed.ProcessGroup | None = None,
-    is_hybrid_cp: bool = False,
+    dynamic_cp: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build an LM batch dict from a dataloader batch containing ``input_ids``.
 
@@ -187,5 +187,5 @@ def build_lm_batch_from_input_ids(
         eod_mask_loss=eod_mask_loss,
         pad_mask_loss=pad_mask_loss,
         cp_group=cp_group,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=dynamic_cp,
     )
