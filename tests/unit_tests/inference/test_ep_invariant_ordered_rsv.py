@@ -71,3 +71,68 @@ def test_nvls_pairwise_reduce_scatter_equals_ep1(ep_world):
     off = sum(counts[:rank])
     assert torch.equal(_bits(out), _bits(ref[off : off + counts[rank]]))
     SymmetricMemoryManager.destroy("test_ep_inv")
+
+
+@needs_cuda
+@pytest.mark.skipif(
+    Utils.world_size < 2 or Utils.world_size % 2, reason="needs an even number of GPUs"
+)
+def test_expert_tp_fold_adds_matching_rows_across_permutations():
+    """mcore_fused_moe at expert TP 2: the ranks' expert-grouped row orders differ (the
+    permutation claims rows with atomic counters), yet each (token, expert) row must be
+    summed with its own expert-TP partial before the subtree, as training does."""
+    from megatron.core.inference.moe.fused_moe import _rows_in_topk_order
+
+    Utils.initialize_model_parallel(1, 1)
+    rank = torch.distributed.get_rank()
+    groups = [torch.distributed.new_group([r, r + 1]) for r in range(0, Utils.world_size, 2)]
+    group = groups[rank // 2]
+    try:
+        tokens, topk, hidden, experts, num_local, start, leaves, valid = 64, 4, 256, 32, 8, 8, 4, 50
+        gen = torch.Generator(device="cuda").manual_seed(5)  # same routing on both ranks
+        routing = torch.stack(
+            [torch.randperm(experts, device="cuda", generator=gen)[:topk] for _ in range(tokens)]
+        )
+        # Distinct partials per expert-TP rank, in top-k slot order.
+        part_gen = torch.Generator(device="cuda").manual_seed(100 + group.rank())
+        part = torch.randn(tokens * topk, hidden, device="cuda", generator=part_gen)
+        part = part.to(torch.bfloat16)
+
+        # Expert-grouped layout as the permutation produces it; the second rank stores each
+        # expert's rows in reverse, with its inverse map to match.
+        grouped, inverse_map = [], torch.full((tokens, num_local), -1, dtype=torch.int32)
+        reversed_any = False
+        for lid in range(num_local):
+            pairs = [
+                (t, k) for t in range(valid) for k in range(topk) if routing[t, k] == start + lid
+            ]
+            if group.rank() == 1:
+                pairs.reverse()
+                reversed_any |= len(pairs) > 1
+            for t, k in pairs:
+                inverse_map[t, lid] = len(grouped)
+                grouped.append(part[t * topk + k])
+        grouped = torch.stack(grouped + [torch.full((hidden,), 3.0, device="cuda")] * 5).bfloat16()
+        assert group.rank() == 0 or reversed_any, "the test needs differing row orders"
+
+        rows = _rows_in_topk_order(grouped, inverse_map.cuda(), routing, start, num_local)
+        folded = eic.expert_tp_fold(rows, group)
+        valid_t = torch.tensor([valid], dtype=torch.int32, device="cuda")
+        out = torch.full((tokens, hidden), 7.0, device="cuda")
+        eic.tree_combine_topk_forward(folded, routing, start, num_local, leaves, valid_t, out)
+
+        # Reference: the two ranks' partials summed slot by slot, then the same subtree.
+        local = ((routing >= start) & (routing < start + num_local)).flatten()
+        mask = (local & (torch.arange(tokens * topk, device="cuda") // topk < valid))[:, None]
+        mine = torch.where(mask, part, torch.zeros_like(part))
+        parts = torch.empty((2, *mine.shape), dtype=mine.dtype, device="cuda")
+        torch.distributed.all_gather_into_tensor(parts, mine, group=group)
+        ref = torch.full((tokens, hidden), 7.0, device="cuda")
+        eic.tree_combine_topk_forward(
+            eic.fold_expert_tp_partials(parts), routing, start, num_local, leaves, valid_t, ref
+        )
+        assert torch.equal(_bits(out), _bits(ref))
+        assert torch.all(out[valid:] == 7.0)
+    finally:
+        torch.cuda.synchronize()
+        Utils.destroy_model_parallel()

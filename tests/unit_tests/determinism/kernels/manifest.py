@@ -454,10 +454,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_ep_invariant_combine",
         sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
+        ),
         kind="triton",
-        notes="Fixed expert-order leaves and pairwise FP32 tree; bit-exact forward and "
-        "gradient replay, plus parity across EP sizes and training/inference paths.",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; parity across EP sizes and "
+        "training/inference paths. Bit-exact replay of the training tree (forward, row and "
+        "probability gradients) in test_ep_invariant_tree_replays and of the dense-map and "
+        "top-k inference combines in test_ep_invariant_{dense_map,topk}_replays.",
     ),
     KernelEntry(
         name="moe_batch_invariant_unpermute",
