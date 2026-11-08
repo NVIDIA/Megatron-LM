@@ -1,6 +1,6 @@
 ---
 name: batch-and-test-mergequeue-prs
-description: Select queued or pending Megatron-LM PRs, combine their changes into an attributed squash batch, and validate it with the Run Merge-Queue jobs label using the actual merge-queue configuration. Also covers landing the original PRs and stopping obsolete CI when requested.
+description: Batch fully approved Megatron-LM PRs that are actual merge-queue entries and validate them with Run Merge-Queue jobs. Excludes PRs that only have auto-merge enabled. Also covers landing the original PRs and stopping obsolete CI when requested.
 license: Apache-2.0
 ---
 
@@ -15,9 +15,19 @@ Follow repository `AGENTS.md` and the user's requested scope throughout.
 - Read the live `NVIDIA/Megatron-LM` main merge queue through GraphQL
   `repository.mergeQueue(branch: "main").entries`; paginate the connection.
   Keep `AWAITING_CHECKS`, `QUEUED`, and blocked entries distinct.
+- Select sources only from that connection. Query each PR through GraphQL and
+  require `isInMergeQueue: true`, with a non-null `mergeQueueEntry` in
+  `AWAITING_CHECKS` or `QUEUED` state. Record the flag, entry ID, state, and
+  observed source head. A false or missing flag is not verified membership.
+  Do not select blocked entries or widen the pool when it is small.
 - PRs with `autoMergeRequest` but no `mergeQueueEntry` are pending auto-merges,
   not actual queue entries. An `Approved` label alone does not imply either state.
-  Report that distinction when counting or widening the candidate pool.
+  Exclude them from batching, even if they are mergeable or have native approvals.
+- Require full source approval on the selected head: native
+  `reviewDecision=APPROVED` and successful `codeowners-approval` and
+  `multi-approval-bot-summary` checks. Missing, pending, skipped, or failed
+  approval checks make a source ineligible. Native `APPROVED`, an `Approved`
+  label, and a green `Nemo_CICD_Test` do not substitute for these checks.
 - Honor supplied PRs, counts, and exclusions. If selecting a batch, inspect the diffs,
   review state, current CI, and dependencies. Prefer small fixes with regression
   coverage, limited default-behavior changes, and little file overlap. A small
@@ -28,8 +38,30 @@ Follow repository `AGENTS.md` and the user's requested scope throughout.
   Exceed 7 only for very trivial changes. If fewer than 3 suitable candidates are
   available, report the shortage rather than adding risky PRs to reach a count.
 - Record each source PR number, full head SHA, author/coauthors, relevant labels,
-  and changed files. Recheck that the PR is open and its head is unchanged before
-  publishing the batch. Do not silently substitute a later revision.
+  changed files, queue-entry evidence, and exact-head approval-check results.
+  Before publishing, recheck that the PR is open, its head is unchanged,
+  GraphQL still reports `isInMergeQueue: true` with an eligible queue entry,
+  and its approval checks still pass.
+  If any check fails, stop and report it; do not substitute pending auto-merges.
+
+Use this per-PR GraphQL query to verify membership and the source head during
+selection, before publishing, and before dequeueing for an authorized merge:
+
+```graphql
+query ($number: Int!) {
+  repository(owner: "NVIDIA", name: "Megatron-LM") {
+    pullRequest(number: $number) {
+      number
+      state
+      baseRefName
+      headRefOid
+      isInMergeQueue
+      reviewDecision
+      mergeQueueEntry { id state position }
+    }
+  }
+}
+```
 
 ## Assemble an attributed batch
 
@@ -102,13 +134,20 @@ permission to create and test a batch.
 When the user asks to land the sources:
 
 - Recheck each source's current head against the validated head and review/merge
-  requirements. Inspect any upstream-main drift. Resolve dependencies before
+  requirements. Require GraphQL `isInMergeQueue: true`, its actual queue entry,
+  and successful exact-head source approval checks again before dequeueing or
+  merging. If membership or approval is missing, stop and report it. Batch CI
+  success and a generic instruction to merge the batch do not waive source
+  review requirements.
+  Inspect any upstream-main drift. Resolve dependencies before
   merging: open PRs based on `pull-request/<source PR>` must be retargeted to
   `main`, as required by repository guidance.
 - Remove a source from the merge queue when needed for a requested direct merge.
   Squash-merge each original PR through GitHub with an exact head guard, such as
   `gh pr merge <number> --repo NVIDIA/Megatron-LM --squash --match-head-commit <SHA>`.
-  Use an authorized administrative bypass if direct landing requires it.
+  An authorized administrative bypass may handle queue mechanics or redundant
+  source CI only after the full source approval requirements above are verified.
+  Never use it to bypass missing or failing source approval checks.
 - Verify every original PR is marked merged and each resulting single-parent
   commit contains the expected patch. Merging only the batch does not mark the
   originals merged in the GitHub UI. Close the redundant batch after landing.
