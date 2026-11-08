@@ -127,6 +127,5 @@ apidocs/index.rst
 :caption: Resources
 
 user-guide/hybrid-model-migration
-user-guide/hybrid-external-layers
 advanced/index
 ```
