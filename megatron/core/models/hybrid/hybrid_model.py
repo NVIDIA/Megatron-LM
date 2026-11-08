@@ -608,6 +608,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+            if hasattr(module, '_set_dsa_bi_max_seq_length'):
+                module._set_dsa_bi_max_seq_length(self.max_sequence_length)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

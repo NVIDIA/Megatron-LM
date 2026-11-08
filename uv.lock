@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1278,8 +1278,13 @@ wheels = [
 
 [[package]]
 name = "deep-gemm"
-version = "2.8.0+local"
+version = "2.8.0+ea2b780"
 source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=ea2b7805b97956268bed1adf94591f428ded6cc1#ea2b7805b97956268bed1adf94591f428ded6cc1" }
+
+[[package]]
+name = "deep-select"
+version = "1.0.0+bfa4507.20261107.51025"
+source = { git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18#bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" }
 
 [[package]]
 name = "defusedxml"
@@ -2604,6 +2609,7 @@ wheels = [
 [[package]]
 name = "megatron-core"
 source = { editable = "." }
+default-groups = ["build", "linting", "test"]
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
@@ -2639,6 +2645,7 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
+    { name = "deep-select" },
     { name = "flashinfer-python" },
     { name = "torch-memory-saver" },
 ]
@@ -2740,6 +2747,7 @@ requires-dist = [
     { name = "av", marker = "extra == 'dev'" },
     { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
     { name = "datasets", marker = "extra == 'dev'" },
+    { name = "deep-select", marker = "extra == 'inference'", git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },

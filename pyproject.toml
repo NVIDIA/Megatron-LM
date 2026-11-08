@@ -122,6 +122,7 @@ dev = [
 ]
 
 inference = [
+    "deep-select @ git+https://github.com/deepseek-ai/DeepSelect.git@bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18",
     "torch-memory-saver",
     "flashinfer-python>=0.7.2,<0.8.0",
 ]
