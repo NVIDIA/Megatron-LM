@@ -63,16 +63,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.enums import ModelType
-from megatron.core.flops import attn_layer_flops
-from megatron.core.flops import dsv4_attention_flops as _dsv4_attention_flops
-from megatron.core.flops import (
-    gated_delta_product_layer_flops,
-    gdn_layer_flops,
-    mamba_layer_flops,
-    mla_layer_flops,
-    mlp_layer_flops,
-    moe_layer_flops,
-)
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -834,6 +824,65 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_squared_sum):
+    """Estimate DSv4 W/C/H attention FLOPs, including projections and compressors.
+
+    Uses the model-FLOPs convention: multiply/add counts as two
+    operations and forward plus backward as three passes. Window and capped
+    Top-K work are token-linear; HCA and indexer scoring use the real sequence
+    length squared sum. Packed Top-K saturation uses the token-weighted mean
+    length, since these batch statistics do not retain individual document lengths.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    if total_tokens == 0:
+        return 0
+    window_layers = layer_counts[Symbols.WINDOW]
+    csa_layers = layer_counts[Symbols.CSA]
+    hca_layers = layer_counts[Symbols.HCA]
+    attention_layers = window_layers + csa_layers + hca_layers
+    hidden = transformer_cfg.hidden_size
+    heads = transformer_cfg.num_attention_heads
+    head_dim = transformer_cfg.v_head_dim
+    q_rank = transformer_cfg.q_lora_rank
+    output_rank = transformer_cfg.output_projection_lora_rank
+    output_groups = transformer_cfg.output_projection_groups
+    window = transformer_cfg.csa_window_size
+    sequence_length = seqlen_squared_sum / total_tokens
+
+    # Read v_head_dim directly: DSv4 derives qk_head_dim on the layer config,
+    # so the stack config may still carry the ordinary MLA default.
+    query_projection = q_rank * (hidden + heads * head_dim + 1)
+    kv_projection = hidden * head_dim + head_dim
+    output_projection = heads * head_dim * output_rank + output_groups * output_rank * hidden
+    token_term = attention_layers * (query_projection + kv_projection + output_projection)
+    token_term += attention_layers * heads * window * head_dim * 2
+
+    # Ratio-4 compression overlaps two windows; ratio-128 uses one.
+    token_term += csa_layers * hidden * (2 * head_dim) * 2
+    token_term += hca_layers * hidden * head_dim * 2
+    core_term = hca_layers * heads * head_dim / 128
+
+    if csa_layers:
+        if transformer_cfg.csa_dense_mode:
+            # Dense CSA attends to all compressed keys and has no indexer.
+            core_term += csa_layers * heads * head_dim / 4
+        else:
+            indexer_heads = transformer_cfg.dsa_indexer_n_heads
+            indexer_dim = transformer_cfg.dsa_indexer_head_dim
+            topk = min(transformer_cfg.dsa_indexer_topk, sequence_length // 4)
+            average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
+            token_term += csa_layers * heads * average_compressed_keys * head_dim * 2
+            token_term += csa_layers * (
+                hidden * (2 * indexer_dim) * 2
+                + q_rank * indexer_heads * indexer_dim
+                + hidden * indexer_heads
+            )
+            core_term += csa_layers * indexer_heads * indexer_dim / 4
+
+    return 6 * (token_term * total_tokens + core_term * seqlen_squared_sum)
+
+
 def num_floating_point_operations(
     model_config,
     batch_size,
@@ -841,7 +890,7 @@ def num_floating_point_operations(
     sequence_length,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
-    model_flops_estimator: Callable[..., float | None] | None = None,
+    hybrid_model=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -867,13 +916,23 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
-        model_flops_estimator: Optional model-owned estimator receiving the resolved
-            token counts above as keyword arguments. Returning None selects the legacy
-            config-based estimator.
+        hybrid_model: Actual HybridModel, when available. Its config list, resolved
+            root config, vocabulary, and built-in specs define the architecture to count.
+            Pattern-defined models retain the existing calculation.
     """
     from megatron.training.vocab_utils import model_vocab_size
 
+    layer_configs = getattr(hybrid_model, "hybrid_layer_config_list", None)
+    transformer_cfg = hybrid_model.config if layer_configs is not None else model_config.transformer
     llm_seq_length = sequence_length
+    group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
+    swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
+    vocab_size = hybrid_model.vocab_size if layer_configs is not None else model_vocab_size(
+        model_config.vocab_size,
+        should_pad_vocab=model_config.should_pad_vocab,
+        make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
+        tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
+    )
 
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
@@ -883,23 +942,152 @@ def num_floating_point_operations(
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
-    if model_flops_estimator is not None:
-        model_flops = model_flops_estimator(
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-        )
-        if model_flops is not None:
-            return model_flops
+    def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
+        """Calculate FLOPs for an MLP layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        return 4 * expansion * scale_factor * total_tokens * hidden_size**2
 
-    transformer_cfg = model_config.transformer
-    group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
-    swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
-    vocab_size = model_vocab_size(
-        model_config.vocab_size,
-        should_pad_vocab=model_config.should_pad_vocab,
-        make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
-        tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
-    )
+    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
+                        shared_expert_ffn_hidden_size, num_experts_routed_to,
+                        moe_latent_size=None, swiglu=False):
+        """Calculate FLOPs for an MoE layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        if moe_latent_size is None:
+            routed_flops = (4 * total_tokens * hidden_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        else:
+            # Routed experts run on moe_latent_size.
+            routed_flops = (4 * total_tokens * moe_latent_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+            # Up proj and down proj.
+            routed_flops += (4 * total_tokens * hidden_size * moe_latent_size)
+        shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+        return routed_flops + shared_flops
+
+    def attn_layer_flops(
+        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
+        gqa_groups=8, kv_channels=None,
+    ):
+        """Calculate FLOPs for an attention layer.
+
+        Two parts:
+          - Token-linear (QKV + output projections): scales with ``total_tokens``
+            (= ``sum_i(L_i)``). Padding tokens are excluded by passing the real
+            (unpadded) token count.
+          - Core attention (``QK^T`` and ``softmax(QK^T) V``): scales with
+            ``seqlen_squared_sum`` (= ``sum_i(L_i ** 2)``).
+        """
+        p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
+        g = gqa_groups if gqa else num_heads
+        # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
+        return (
+            4 * total_tokens * hidden_size * p
+            * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * seqlen_squared_sum * hidden_size * p
+        )
+
+    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
+                          head_dim=64, num_groups=1, num_heads=128):
+        """Calculate FLOPs for a Mamba layer."""
+        # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
+        # but small percent of overall layer flops
+        d_in = 2 * hidden_size
+        if num_heads:
+            nheads = num_heads
+        else:
+            nheads = d_in // head_dim
+        return (
+            (
+                2
+                * total_tokens
+                * hidden_size
+                * (2 * d_in + 2 * num_groups * state_dim + nheads)
+            )  # in_proj
+            + (7 * total_tokens * d_in * state_dim)  # scan
+            + (2 * total_tokens * d_in * hidden_size)  # out_proj
+        )
+
+    def gated_delta_product_layer_flops(
+        total_tokens,
+        hidden_size,
+        num_householder,
+        state_dim=128,
+        head_dim=64,
+        num_groups=8,
+        num_heads=None,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
+        if num_heads is None:
+            d_inner = 2 * hidden_size
+            num_heads = d_inner // head_dim
+        else:
+            d_inner = num_heads * head_dim
+        in_proj_dim = (
+            d_inner * (1 + num_householder)
+            + num_groups * state_dim * (1 + num_householder)
+            + num_heads * (1 + num_householder)
+        )
+        conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
+        non_core_flops = 2 * total_tokens * (
+            hidden_size * in_proj_dim
+            + conv_kernel_dim * conv_dim
+            + d_inner * hidden_size
+        )
+        # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
+        # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
+        core_flops = (4 * num_householder + 3) * total_tokens * d_inner * state_dim
+        return non_core_flops + core_flops
+
+    def gdn_layer_flops(total_tokens, hidden_size,
+                        qk_head_dim=128, v_head_dim=128,
+                        num_qk_heads=16, num_v_heads=32,
+                        conv_kernel_dim=4, use_gdn2=False):
+        """Calculate FLOPs for a Gated Delta Net (GDN) layer."""
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        if use_gdn2:
+            # GDN2 in_proj: hidden_size -> (4*qk_dim + 3*v_dim) for q, k, v, z, f, b, w
+            in_proj_dim = 4 * qk_dim + 3 * v_dim
+        else:
+            # GDN in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
+            in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
+        return (
+            2 * total_tokens * (
+                # in_proj
+                hidden_size * in_proj_dim
+                # conv1d
+                + conv_kernel_dim * (2 * qk_dim + v_dim)
+                # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                + num_v_heads * (v_head_dim ** 2) * 4
+                # out_proj: v_dim -> hidden_size
+                + hidden_size * v_dim
+            )
+        )
+
+    def mla_layer_flops(total_tokens, squared_lengths, config):
+        """MLA forward projections and causal attention, shared by both architecture paths."""
+        q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+        q_term = (
+            config.hidden_size * config.num_attention_heads * q_dim
+            if config.q_lora_rank is None
+            else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
+        )
+        projections = 2 * (
+            q_term
+            + config.kv_lora_rank
+            * (
+                config.hidden_size
+                + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+                + 1
+            )
+            + config.hidden_size * config.qk_pos_emb_head_dim
+            + config.num_attention_heads * config.v_head_dim * config.hidden_size
+        )
+        return total_tokens * projections + squared_lengths * config.num_attention_heads * (
+            q_dim + config.v_head_dim
+        )
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
@@ -1040,6 +1228,9 @@ def num_floating_point_operations(
         forward_backward_expansion_factor = 3
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
         fma_expansion_factor = 2
+        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
+        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
+        ffn_expansion_factor = 3 if swiglu else 2
 
         # self_attn is split into a token-linear part (projections, multiplied by
         # ``batch_size * llm_seq_length`` like all other token-linear work) and a
@@ -1055,35 +1246,44 @@ def num_floating_point_operations(
             standard_self_attn_term = 0
             standard_self_attn_core_term = 0
         elif transformer_cfg.multi_latent_attention:
-            mla_kwargs = dict(
-                hidden_size=transformer_cfg.hidden_size,
-                num_attention_heads=transformer_cfg.num_attention_heads,
-                q_lora_rank=transformer_cfg.q_lora_rank,
-                kv_lora_rank=transformer_cfg.kv_lora_rank,
-                qk_head_dim=transformer_cfg.qk_head_dim,
-                qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
-                v_head_dim=transformer_cfg.v_head_dim,
-            )
             standard_self_attn_term = forward_backward_expansion_factor * mla_layer_flops(
-                total_tokens=1, seqlen_squared_sum=0, **mla_kwargs
+                1, 0, transformer_cfg
             )
             standard_self_attn_core_term = forward_backward_expansion_factor * mla_layer_flops(
-                total_tokens=0, seqlen_squared_sum=1, **mla_kwargs
+                0, 1, transformer_cfg
             )
+
         else:
-            attention_kwargs = dict(
-                hidden_size=transformer_cfg.hidden_size,
-                num_heads=transformer_cfg.num_attention_heads,
-                gqa=group_query_attention,
-                gqa_groups=transformer_cfg.num_query_groups,
-                kv_channels=transformer_cfg.kv_channels,
-                attention_output_gate=transformer_cfg.attention_output_gate,
+            ## MHA or GQA
+            query_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_attention_heads
+            key_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            value_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            gate_projection_size = query_projection_size if transformer_cfg.attention_output_gate else 0
+            # Token-linear part of self-attention (QKV projection + output projection).
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    ## qkv proj
+                    transformer_cfg.hidden_size
+                    * (
+                        query_projection_size
+                        + key_projection_size
+                        + value_projection_size
+                        + gate_projection_size
+                    )
+                    ## out proj
+                    + query_projection_size
+                    * transformer_cfg.hidden_size
+                )
             )
-            standard_self_attn_term = forward_backward_expansion_factor * attn_layer_flops(
-                total_tokens=1, seqlen_squared_sum=0, **attention_kwargs
-            )
-            standard_self_attn_core_term = forward_backward_expansion_factor * attn_layer_flops(
-                total_tokens=0, seqlen_squared_sum=1, **attention_kwargs
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * query_projection_size
+                / 2  # causal mask (only half of the mask is non-zero)
+                * 2  # QK^T and (QK^T)V
             )
 
         if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
@@ -1120,15 +1320,36 @@ def num_floating_point_operations(
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
-                linear_self_attn_term = forward_backward_expansion_factor * gdn_layer_flops(
-                    total_tokens=1,
-                    hidden_size=transformer_cfg.hidden_size,
-                    qk_head_dim=transformer_cfg.linear_key_head_dim,
-                    v_head_dim=transformer_cfg.linear_value_head_dim,
-                    num_qk_heads=transformer_cfg.linear_num_key_heads,
-                    num_v_heads=transformer_cfg.linear_num_value_heads,
-                    conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim,
-                    use_gdn2=transformer_cfg.experimental_attention_variant == "gdn2",
+                # Calculate the FLOPs for the gated delta net attention.
+                qk_head_dim = transformer_cfg.linear_key_head_dim
+                v_head_dim = transformer_cfg.linear_value_head_dim
+                num_qk_heads = transformer_cfg.linear_num_key_heads
+                num_v_heads = transformer_cfg.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                if transformer_cfg.experimental_attention_variant == "gdn2":
+                    # GDN2 in_proj: q, k, v, z, f, b, w
+                    in_proj_dim = 4 * qk_dim + 3 * v_dim
+                else:
+                    in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj
+                        transformer_cfg.hidden_size
+                        * in_proj_dim
+                        ## conv1d
+                        + transformer_cfg.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## gated delta rule
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        ## out proj
+                        + transformer_cfg.hidden_size
+                        * v_dim
+                    )
                 )
             else:
                 raise ValueError(
@@ -1154,17 +1375,33 @@ def num_floating_point_operations(
         total_floating_point_operations = (
             total_real_tokens_in_batch
             * (
-                # Dense and routed FFNs use the same helpers as HybridModel.
+                # MLP
                 forward_backward_expansion_factor
+                * fma_expansion_factor
+                * transformer_cfg.hidden_size
                 * (
-                    num_dense_layers * mlp_layer_flops(
-                        1, transformer_cfg.hidden_size,
-                        transformer_cfg.ffn_hidden_size / transformer_cfg.hidden_size, swiglu,
+                    # dense layer (deepseek v2, v3 style)
+                    (transformer_cfg.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
+                    # routed experts
+                    + (
+                        (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                        if moe_latent_size is None
+                        else (
+                            (
+                                moe_ffn_hidden_size
+                                * num_experts_routed_to
+                                * ffn_expansion_factor
+                                * moe_latent_size
+                                / transformer_cfg.hidden_size
+                            )  # Routed experts run on moe_latent_size.
+                            + 2 * moe_latent_size  # Up proj and down proj.
+                        )
                     )
-                    + num_moe_layers * moe_layer_flops(
-                        1, transformer_cfg.hidden_size, moe_ffn_hidden_size,
-                        shared_expert_ffn_hidden_size, num_experts_routed_to, moe_latent_size, swiglu,
-                    )
+                    * num_moe_layers
+                    # Shared Experts.
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention (token-linear part).
                 + self_attn_term
@@ -1232,6 +1469,176 @@ def num_floating_point_operations(
             )
         return total_floating_point_operations
 
+    def config_list_flops():
+        """Count each physical execution using the existing per-layer formulas."""
+        from numbers import Real
+
+        from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+        from megatron.core.models.hybrid.layers import utils as layers
+
+        tokens, squared = total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+        forward, expanded, mtp_depths, layer_number = 0, 0, 0, 0
+        for layer in layer_configs:
+            if layer is PipelineSplit:
+                continue
+            if layer is MTPSplit:
+                mtp_depths += 1
+                layer_number = 0
+                continue
+            layer_number += 1
+            implementation = layers.get_custom_layer_type(layer)
+            layer_type = type(layer)
+            if implementation is not None:
+                layer_flops = implementation.estimate_flops(
+                    layer, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=squared
+                )
+                if (
+                    not isinstance(layer_flops, Real)
+                    or isinstance(layer_flops, bool)
+                    or not math.isfinite(layer_flops)
+                    or layer_flops < 0
+                ):
+                    raise ValueError(
+                        f"{implementation.__name__}.estimate_flops must return a finite, "
+                        f"nonnegative real number, got {layer_flops!r}."
+                    )
+                forward += layer_flops
+            elif layer_type is layers.AttentionLayerConfig:
+                forward += attn_layer_flops(
+                    tokens,
+                    squared,
+                    layer.hidden_size,
+                    layer.num_attention_heads,
+                    gqa_groups=layer.num_query_groups,
+                    kv_channels=layer.kv_channels,
+                )
+                if layer.attention_output_gate:
+                    forward += (
+                        2
+                        * tokens
+                        * layer.hidden_size
+                        * layer.kv_channels
+                        * layer.num_attention_heads
+                    )
+            elif layer_type is layers.MLALayerConfig:
+                forward += mla_layer_flops(tokens, squared, layer)
+            elif layer_type is layers.DSALayerConfig:
+                from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+                    AbsorbedMLASelfAttention,
+                )
+                from megatron.core.transformer.experimental_attention_variant.dsa import (
+                    is_dsa_skip_topk_layer,
+                )
+                from megatron.training.logging.dsa_flops import _dsa_indexer_flops
+
+                attention = (
+                    hybrid_model.hybrid_stack_spec.submodules.dsa_layer.submodules.self_attention
+                )
+                forward += dsa_layer_flops(
+                    tokens,
+                    squared,
+                    layer.hidden_size,
+                    layer.num_attention_heads,
+                    layer.q_lora_rank,
+                    layer.kv_lora_rank,
+                    layer.qk_head_dim,
+                    layer.qk_pos_emb_head_dim,
+                    layer.v_head_dim,
+                    layer.dsa_indexer_topk,
+                    dsa_indexer_kpool=layer.dsa_indexer_kpool,
+                    dsa_indexer_kpool_always_select_tail=layer.dsa_indexer_kpool_always_select_tail,
+                    absorbed_mla=attention.module is AbsorbedMLASelfAttention,
+                )
+                token_linear, core = _dsa_indexer_flops(
+                    total_tokens=tokens,
+                    seqlen_squared_sum=squared,
+                    hidden_size=layer.hidden_size,
+                    q_lora_rank=layer.q_lora_rank,
+                    n_heads=layer.dsa_indexer_n_heads,
+                    head_dim=layer.dsa_indexer_head_dim,
+                    num_indexer_layers=int(
+                        not is_dsa_skip_topk_layer(
+                            layer_number,
+                            layer.dsa_indexer_skip_topk_offset,
+                            layer.dsa_indexer_topk_freq,
+                        )
+                    ),
+                    dsa_indexer_loss_enabled=(layer.dsa_indexer_loss_coeff or 0) > 0,
+                    dsa_indexer_use_sparse_loss=layer.dsa_indexer_use_sparse_loss,
+                    dsa_indexer_topk=layer.dsa_indexer_topk,
+                    dsa_indexer_kpool=layer.dsa_indexer_kpool,
+                )
+                expanded += tokens * token_linear + squared * core
+            elif layer_type is layers.CSALayerConfig:
+                if layer.compress_ratio not in (0, 4, 128):
+                    raise ValueError(f"Unsupported CSA compression ratio: {layer.compress_ratio}")
+                counts = {
+                    layers.Symbols.WINDOW: int(layer.compress_ratio == 0),
+                    layers.Symbols.CSA: int(layer.compress_ratio == 4),
+                    layers.Symbols.HCA: int(layer.compress_ratio == 128),
+                }
+                expanded += _dsv4_attention_flops(layer, counts, tokens, squared)
+            elif layer_type is layers.MambaLayerConfig:
+                from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+                mixer = hybrid_model.hybrid_stack_spec.submodules.mamba_layer.submodules.mixer
+                if mixer.module is GatedDeltaProductMixer:
+                    forward += gated_delta_product_layer_flops(
+                        tokens,
+                        layer.hidden_size,
+                        layer.gdp_num_householder,
+                        layer.mamba_state_dim,
+                        layer.mamba_head_dim,
+                        layer.mamba_num_groups,
+                        layer.mamba_num_heads,
+                    )
+                else:
+                    forward += mamba_layer_flops(
+                        tokens,
+                        layer.hidden_size,
+                        layer.mamba_state_dim,
+                        layer.mamba_head_dim,
+                        layer.mamba_num_groups,
+                        layer.mamba_num_heads,
+                    )
+            elif layer_type is layers.GDNLayerConfig:
+                forward += gdn_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.linear_key_head_dim or 128,
+                    layer.linear_value_head_dim or 128,
+                    layer.linear_num_key_heads or 16,
+                    layer.linear_num_value_heads or 32,
+                    layer.linear_conv_kernel_dim or 4,
+                    use_gdn2=layer.experimental_attention_variant == "gdn2",
+                )
+            elif layer_type is layers.MLPLayerConfig:
+                forward += mlp_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.ffn_hidden_size / layer.hidden_size,
+                    layer.gated_linear_unit,
+                )
+            elif layer_type is layers.MoELayerConfig:
+                forward += moe_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.moe_ffn_hidden_size or layer.ffn_hidden_size,
+                    layer.moe_shared_expert_intermediate_size or 0,
+                    layer.moe_router_topk,
+                    layer.moe_latent_size,
+                    layer.gated_linear_unit,
+                )
+            else:
+                raise ValueError(
+                    f"No FLOP estimate is available for hybrid layer config {layer_type.__name__}."
+                )
+        # Count executions, including all repeated MTP depths and their output heads.
+        hidden_size = transformer_cfg.hidden_size
+        forward += 2 * tokens * mtp_depths * (3 * hidden_size + 2 * hidden_size**2)
+        forward += 2 * tokens * hidden_size * vocab_size * (1 + mtp_depths)
+        return 3 * forward + expanded
+
     def _uses_gated_delta_product_spec():
         """Return whether the hybrid stack uses GatedDeltaProductMixer.
 
@@ -1245,6 +1652,8 @@ def num_floating_point_operations(
         return getattr(mixer, "module", None) is GatedDeltaProductMixer
 
     # Main entrypoint for FLOPs calculation.
+    if layer_configs is not None:
+        return config_list_flops()
     if is_hybrid_model(model_config):
         # Calculate the number of each type of layer.
         from operator import itemgetter
@@ -4774,13 +5183,12 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
-    model_flops_estimator = (
-        hybrid_model.estimate_training_flops if hybrid_model is not None else None
-    )
-    if model_flops_estimator is not None:
-        # Estimators are pure: validate their availability and output before the first step.
-        model_flops_estimator(
-            total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1
+    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
+        # Validate custom estimates before the first step through the same accounting path.
+        num_floating_point_operations(
+            cfg.model, 1, sequence_length=1,
+            total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1,
+            hybrid_model=hybrid_model,
         )
     moe_logging_metadata = None
     has_moe_layers = cfg.model.transformer.num_moe_experts is not None
@@ -5436,7 +5844,7 @@ def train(
             sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            model_flops_estimator=model_flops_estimator,
+            hybrid_model=hybrid_model,
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch

@@ -163,8 +163,10 @@ owns any positional-embedding computation it needs.
 
 Implement the optional `MegatronModule.estimate_flops` class method on a custom
 layer to return its **forward** FLOPs for the supplied global-batch token statistics.
-`HybridModel.estimate_training_flops` calls `layer_type.estimate_flops(config, ...)`,
-applies its forward/backward factor, and includes every decoder and MTP occurrence.
+The training FLOP counter calls `layer_type.estimate_flops(config, ...)`, applies
+its forward/backward factor, and includes every decoder and MTP occurrence from
+the constructed model's full config list. Built-in layers use the existing
+training formulas.
 Missing estimates raise an explicit error instead of applying an
 unrelated built-in formula. Keep the estimator pure: model setup may call it to
 validate availability before training starts, independently of the runtime

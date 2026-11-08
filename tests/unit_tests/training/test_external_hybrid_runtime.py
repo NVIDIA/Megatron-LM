@@ -4,18 +4,20 @@
 
 from argparse import Namespace
 from dataclasses import dataclass
-from functools import partial
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
 
 import pytest
 
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec, hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
+from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training import checkpointing
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.training import (
@@ -42,15 +44,31 @@ def _config(config_type=ExternalGainConfig, **kwargs):
     return config_type(num_layers=3, hidden_size=16, num_attention_heads=2, **kwargs)
 
 
-def test_external_flops_count_all_pipeline_and_mtp_layers():
-    config = _config()
+def _model(config, layers, spec=None):
+    return SimpleNamespace(
+        config=config, hybrid_layer_config_list=tuple(layers), vocab_size=32, hybrid_stack_spec=spec
+    )
+
+
+def _flops(model):
+    return num_floating_point_operations(
+        HybridModelConfig(transformer=model.config, vocab_size=32),
+        batch_size=2,
+        sequence_length=128,
+        total_real_tokens_in_batch=7,
+        seqlen_squared_sum_in_batch=25,
+        hybrid_model=model,
+    )
+
+
+@pytest.mark.parametrize("shared_weights", [False, True])
+def test_external_flops_count_all_pipeline_and_mtp_layers(shared_weights):
+    config = _config(mtp_num_layers=2, mtp_use_repeated_layer=shared_weights)
     mlp = MLPLayerConfig.from_config(config)
     configs = [config, PipelineSplit, mlp, config, MTPSplit, config, MTPSplit, config]
     tokens = 7
     vocab_size = 32
-    result = estimate_hybrid_config_list_flops(
-        configs, None, config, vocab_size, tokens, seqlen_squared_sum_in_batch=25
-    )
+    result = _flops(_model(config, configs))
 
     # Four gain executions, one dense MLP, two MTP projections, and three logits heads.
     gain_flops = 4 * tokens * config.hidden_size
@@ -65,17 +83,17 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     config = _config()
     estimate_layer = Mock(return_value=layer_flops)
     monkeypatch.setattr(ExternalGainLayer, "estimate_flops", classmethod(estimate_layer))
-    estimate_model = partial(
-        estimate_hybrid_config_list_flops, [config], None, config, vocab_size=32
-    )
+    model = _model(config, [config])
+    stale_config = _config()
+    stale_config.hidden_size = 32
 
     result = num_floating_point_operations(
-        HybridModelConfig(transformer=config, vocab_size=32),
+        HybridModelConfig(transformer=stale_config, vocab_size=64),
         batch_size=2,
         sequence_length=128,
         total_real_tokens_in_batch=7,
         seqlen_squared_sum_in_batch=25,
-        model_flops_estimator=estimate_model,
+        hybrid_model=model,
     )
 
     estimate_layer.assert_called_once_with(
@@ -91,9 +109,7 @@ def test_invalid_external_flops_are_rejected_before_updating_counters(monkeypatc
         ExternalGainLayer, "estimate_flops", classmethod(Mock(return_value=invalid_flops))
     )
     with pytest.raises(ValueError, match="finite, nonnegative real number"):
-        estimate_hybrid_config_list_flops(
-            [config], None, config, 32, total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25
-        )
+        _flops(_model(config, [config]))
 
 
 def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch):
@@ -101,16 +117,74 @@ def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch
     monkeypatch.setattr(
         ExternalGainLayer, "estimate_flops", classmethod(MegatronModule.estimate_flops.__func__)
     )
-    estimate_model = partial(
-        estimate_hybrid_config_list_flops, [config], None, config, vocab_size=32
-    )
     with pytest.raises(NotImplementedError):
-        num_floating_point_operations(
-            HybridModelConfig(transformer=config, vocab_size=32),
-            batch_size=2,
-            sequence_length=128,
-            model_flops_estimator=estimate_model,
-        )
+        _flops(_model(config, [config]))
+
+
+@pytest.mark.parametrize(
+    "symbol,spec",
+    [(symbol, hybrid_stack_spec) for symbol in ("*", "-", "M", "G", "E", "D", "C")]
+    + [("M", gdp_stack_spec)],
+)
+def test_config_lists_preserve_existing_pattern_flops(symbol, spec):
+    config = MLATransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=2,
+        ffn_hidden_size=32,
+        multi_latent_attention=False,
+        q_lora_rank=4,
+        kv_lora_rank=6,
+        qk_head_dim=4,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=4,
+        num_moe_experts=4 if symbol == "E" else None,
+        moe_ffn_hidden_size=24,
+        moe_router_topk=2,
+        mamba_state_dim=4,
+        mamba_head_dim=8,
+        mamba_num_groups=1,
+        mamba_num_heads=6,
+        gdp_num_householder=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=6,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=4,
+        dsa_indexer_topk=2,
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+        csa_window_size=2,
+        output_projection_groups=2,
+        output_projection_lora_rank=4,
+    )
+    pattern_config = HybridModelConfig(
+        transformer=config, vocab_size=32, hybrid_layer_pattern=symbol * 2, hybrid_stack_spec=spec
+    )
+    expected = num_floating_point_operations(
+        pattern_config,
+        batch_size=2,
+        sequence_length=128,
+        total_real_tokens_in_batch=7,
+        seqlen_squared_sum_in_batch=25,
+    )
+    layers = [create_layer_config(config, symbol) for _ in range(2)]
+    # Preserve the existing formulas and their final integer rounding, including
+    # packed attention and the separate DSA/CSA backward factors.
+    assert _flops(_model(config, layers, spec)) == pytest.approx(expected, rel=0, abs=1)
+
+
+def test_mixed_ffn_widths_use_layer_configs_instead_of_stack_defaults():
+    config = _config()
+    narrow = MLPLayerConfig.from_config(config)
+    wide = MLPLayerConfig.from_config(config)
+    narrow.ffn_hidden_size, wide.ffn_hidden_size = 24, 48
+    layers = [narrow, PipelineSplit, wide, config]
+    expected_forward = 4 * 7 * config.hidden_size * (24 + 48)
+    expected_forward += 7 * config.hidden_size  # external gain
+    expected_forward += 2 * 7 * config.hidden_size * 32  # logits
+    assert _flops(_model(config, layers)) == 3 * expected_forward
 
 
 @pytest.mark.parametrize("repeated_mtp", [False, True])

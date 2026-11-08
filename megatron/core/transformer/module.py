@@ -90,7 +90,7 @@ class MegatronModule(torch.nn.Module):
 
         This optional hook is used by custom HybridModel layers during training. It
         must be pure: do not mutate the config, construct modules, or run collectives.
-        Return a finite nonnegative real number. HybridModel accounts for repeated
+        Return a finite nonnegative real number. Training accounts for repeated
         layer executions and applies the forward/backward multiplier separately.
 
         Existing modules using built-in FLOP formulas need not implement this hook.
