@@ -164,11 +164,10 @@ class HybridStack(MegatronModule):
 
         for layer_config in layer_config_list:
             if layer_utils.get_custom_layer_type(layer_config) is None:
-                layer_utils.validate_tp_comm_overlap(
-                    layer_config,
-                    layer_utils.get_layer_symbol_from_config(layer_config),
-                    has_mtp=is_mtp_layer,
-                )
+                segment = layer_utils.get_layer_symbol_from_config(layer_config)
+            else:
+                segment = ""
+            layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)
         self.pre_process = pre_process
