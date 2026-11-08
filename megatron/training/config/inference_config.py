@@ -157,6 +157,12 @@ class InferenceSetupConfig:
     scheduling phases by reordering them to prepare-before-resolve. Select "legacy" to disable
     async scheduling and use the resolve-before-prepare path."""
 
+    inference_gc_mode: Literal["default", "freeze", "freeze_overlap"] = "freeze_overlap"
+    """Python garbage collection policy while the inference engine serves requests. `default`
+    leaves automatic collection unchanged. `freeze` freezes the long-lived heap after engine
+    setup so collections skip it. `freeze_overlap` also runs due collections right after each
+    forward pass is submitted, overlapping them with GPU work. Defaults to `freeze_overlap`."""
+
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
     )
@@ -251,7 +257,6 @@ class InferenceSetupConfig:
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
 
-
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with
     shards separated by ``+`` or ``;``. Keys are ``tp``, ``pp``, ``ep``, ``expt_tp``,
@@ -294,8 +299,21 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
+    inference_shortcut_moe_overlap: bool = False
+    """Overlap Shortcut MoE routing, experts and communication during dynamic inference."""
+
     def validate(self) -> None:
-        """Check the KV-cache suspend/resume policy before an engine is built from it."""
+        """Check inference setup settings before an engine is built from them."""
+        if self.inference_shortcut_moe_overlap:
+            if not self.inference_dynamic_batching or self.use_legacy_static_engine:
+                raise ValueError(
+                    "Shortcut MoE overlap requires dynamic batching without the legacy static engine"
+                )
+            if self.num_speculative_tokens:
+                raise ValueError(
+                    "Shortcut MoE overlap with speculative decoding requires further testing"
+                )
+
         mode = self.kv_cache_management_mode
         static_pointers = self.static_kv_memory_pointers
         uvm = self.inference_dynamic_batching_unified_memory_level > 0
@@ -399,6 +417,7 @@ class InferenceSetupConfig:
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
         return InferenceConfig(
+            inference_shortcut_moe_overlap=self.inference_shortcut_moe_overlap,
             verbose=verbose,
             block_size_tokens=self.inference_dynamic_batching_block_size,
             buffer_size_gb=self.inference_dynamic_batching_buffer_size_gb,
@@ -468,4 +487,5 @@ class InferenceSetupConfig:
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
+            gc_mode=self.inference_gc_mode,
         )

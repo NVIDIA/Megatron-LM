@@ -257,18 +257,20 @@ class TopKRouter(Router):
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            # Keep the counters exact across micro-batches. Float16Module leaves integer
+            # buffers in their original dtype; in bf16, ga_steps would stop at 256.
             self.register_buffer(
                 'global_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 'ga_steps',
-                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                torch.tensor(0, dtype=torch.int64, device=torch.cuda.current_device()),
                 persistent=False,
             )
         else:
@@ -622,6 +624,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -685,6 +688,7 @@ class TopKRouter(Router):
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_aux_loss_fusion,
+                deterministic=self.config.deterministic_mode,
             )
             / bsz
         )
@@ -737,6 +741,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,

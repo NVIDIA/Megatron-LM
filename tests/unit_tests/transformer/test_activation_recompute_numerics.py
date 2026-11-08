@@ -203,6 +203,7 @@ class TestActivationRecomputeNumerics:
         validate_args(args)
         cfg = pretrain_cfg_container_from_args(args)
         cfg.tokenizer.vocab_size = 1024
+        cfg.model.vocab_size = 1024
         set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
@@ -223,7 +224,7 @@ class TestActivationRecomputeNumerics:
             config=config,
             transformer_layer_spec=layer_spec,
             mtp_block_spec=mtp_block_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,

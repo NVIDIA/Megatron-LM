@@ -27,7 +27,7 @@ DeepEP), and torch ops with a non-deterministic accumulation (``scatter_add_``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 # PR label that lets a kernel change merge without touching its determinism test
@@ -128,10 +128,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
+        tests=(
+            K + "test_fused_activations.py",
+            R + 'test_activation_replay.py',
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
-        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients. "
+        "Direct marker calls replay values and gradients in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="fused_bias_gelu",
@@ -257,7 +262,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/fusions/test_fused_mhc_kernels.py",
+        ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
@@ -364,13 +372,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
+        "the default atomic branch is a negative control.",
     ),
     KernelEntry(
         name="mok_route_adapter",
@@ -398,9 +409,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            "tests/unit_tests/transformer/moe/test_aux_loss.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
+        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
@@ -409,7 +423,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/moe_layer.py",
             "megatron/core/transformer/moe/training_matches_inference.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
@@ -419,7 +436,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
     ),
@@ -445,9 +465,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Activation page copy kernels (no arithmetic); functional round-trip coverage.",
     ),
     KernelEntry(
+        name="moe_ep_invariant_combine",
+        sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
+        tests=("tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",),
+        kind="triton",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; bit-exact forward and "
+        "gradient replay, plus parity across EP sizes and training/inference paths.",
+    ),
+    KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
             K + "test_moe_kernels.py",
@@ -605,6 +634,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -691,7 +721,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_inference_kernels.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
@@ -1009,6 +1044,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
+    KernelEntry(
+        name="dsa_triton_inference",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
+        ),
+        kind="triton",
+        training_path=False,
+        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
+        "Native DSA decode does not support deterministic mode and rejects it before top-k "
+        "execution; this path has no bit-exact replay guarantee.",
+        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
+        "numerical parity coverage in "
+        "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
+        "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

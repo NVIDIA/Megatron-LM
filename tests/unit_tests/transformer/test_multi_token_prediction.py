@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -82,7 +82,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -1724,7 +1724,7 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -2553,9 +2553,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=cfg_container.tokenizer.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2791,6 +2789,7 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2814,13 +2813,14 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -2944,7 +2944,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -4113,7 +4113,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -4423,7 +4423,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4590,6 +4590,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
@@ -4928,6 +4929,7 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -4955,6 +4957,7 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,
@@ -4965,7 +4968,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

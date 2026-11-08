@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import inspect
@@ -35,7 +35,7 @@ from megatron.training.global_vars import (
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 try:
     from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
@@ -145,7 +145,7 @@ class TestMoESingleGroupedWeightNumerics:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -168,6 +168,7 @@ class TestMoESingleGroupedWeightNumerics:
         overlap_param_gather: bool = False,
         overlap_grad_reduce: bool = False,
         grad_reduce_in_fp32: bool = False,
+        model_overrides: dict | None = None,
     ):
         self._cleanup()
 
@@ -228,15 +229,24 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision != "bf16":
             raise ValueError(f"Unknown precision test case: {precision}")
 
+<<<<<<< HEAD
         # Callers may set NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 (TE dbias needs atomic adds),
         # which deterministic mode rejects.
         args.deterministic_mode = False
+=======
+        # Apply architecture changes before constructing/finalizing the run config.
+        for name, value in (model_overrides or {}).items():
+            if not hasattr(args, name):
+                raise ValueError(f"Unknown model argument: {name}")
+            setattr(args, name, value)
+>>>>>>> main
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
         cfg.tokenizer.vocab_size = 1024
+        cfg.model.vocab_size = 1024
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
@@ -472,6 +482,9 @@ class TestMoESingleGroupedWeightNumerics:
             args.no_load_rng = True
             args.load_main_params_from_ckpt = True
         set_args(args)
+        # The fixture built the run config before the save/load settings above were chosen; the
+        # setup load reads the registered checkpoint section, not the namespace.
+        sync_checkpoint_config(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
@@ -510,6 +523,7 @@ class TestMoESingleGroupedWeightNumerics:
         for step in range(4):
             if checkpoint_before_step is not None and step == checkpoint_before_step:
                 force_param_sync(model, optimizer=optimizer)
+                sync_checkpoint_config(get_args())
                 save_checkpoint(step, model, optimizer, opt_param_scheduler, 0)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
@@ -526,6 +540,7 @@ class TestMoESingleGroupedWeightNumerics:
         for _ in range(2):
             self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
         force_param_sync(model, optimizer=optimizer)
+        sync_checkpoint_config(get_args())
         save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -535,6 +550,7 @@ class TestMoESingleGroupedWeightNumerics:
         args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
             single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
         )
+        sync_checkpoint_config(get_args())
         loaded_iteration, _ = load_checkpoint(
             model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
         )

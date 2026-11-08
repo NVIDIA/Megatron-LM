@@ -82,7 +82,7 @@
       "DynamicInferenceContext.round_up_requests:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "DynamicInferenceContext.round_up_tokens:accessor:parallel_state.get_tensor_model_parallel_world_size"
     ],
-    "megatron/core/inference/engines/dynamic_engine.py": [
+    "megatron/core/inference/engines/dynamic/engine.py": [
       "DynamicInferenceEngine.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py": [

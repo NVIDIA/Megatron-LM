@@ -25,6 +25,8 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    _get_fp8_autocast_for_quant_recipe,
+    _get_fp8_autocast_recipe_for_quant_params,
 )
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
@@ -46,6 +48,10 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    EPInvariantCombineArgs,
+    num_leaf_blocks,
+)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -355,15 +361,9 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Keep BF16 overrides on the TE ops path. _fused_forward applies the resolved
+        # precision context, and TE selects either a joint fusion or its basic operations.
+        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
             _require_te_tanh_clamp_support(self.config)
@@ -375,8 +375,8 @@ class TEGroupedMLP(MegatronModule):
         # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
         # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
         # the fc1 input and the activation input separately. The config accepts either spelling
-        # (they are mutually exclusive there); each instance maps it onto its own path, so a
-        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        # (they are mutually exclusive there); each instance maps it onto its own path.
+        # BF16 overrides retain the TE ops path and offload the whole block input as well.
         offloading = self.config.fine_grained_activation_offloading
         self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
         self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules
@@ -913,6 +913,23 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        # Resolve after GPTModel's finish_init sweep, using the original modules' current
+        # train/eval mode. The whole TE sequence must execute under one precision override.
+        fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc1.te_quant_params, self.linear_fc1.training
+        )
+        fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc2.te_quant_params, self.linear_fc2.training
+        )
+        if fc1_recipe != fc2_recipe:
+            raise ValueError(
+                "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+                "and linear_fc2. Apply the override to both linears."
+            )
+        quant_context = (
+            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -985,7 +1002,7 @@ class TEGroupedMLP(MegatronModule):
                 and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
-            with stash_context:
+            with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
                 # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.
@@ -1831,6 +1848,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _batch_invariant_kwargs(self) -> Optional[EPInvariantCombineArgs]:
+        """``moe_ep_invariant_combine``: this rank's subtree of the combine tree (token_combine
+        sums the rank partials over the rest of the tree) and the expert-TP group, else None."""
+        if not self.config.moe_ep_invariant_combine:
+            return None
+        return EPInvariantCombineArgs(
+            leaves=num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size(),
+            expert_tp_group=self.tp_group,
+        )
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1847,6 +1874,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
@@ -1866,6 +1894,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
