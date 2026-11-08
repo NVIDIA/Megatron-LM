@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -593,6 +594,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def estimate_training_flops(
+        self, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float | None:
+        """Estimate global-batch training FLOPs from the complete config list.
+
+        Token statistics describe the global batch's unpadded sequences. The count
+        includes every decoder and MTP execution, regardless of PP/VPP placement
+        or shared MTP weights. Pattern-defined models return None so training can
+        retain its existing estimator.
+        """
+        if self.hybrid_layer_config_list is None:
+            return None
+        return estimate_hybrid_config_list_flops(
+            self.hybrid_layer_config_list,
+            self.hybrid_stack_spec,
+            self.config,
+            self.vocab_size,
+            total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch,
+        )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
