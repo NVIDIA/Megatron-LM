@@ -166,6 +166,8 @@ class HybridStack(MegatronModule):
             if layer_utils.get_custom_layer_type(layer_config) is None:
                 segment = layer_utils.get_layer_symbol_from_config(layer_config)
             else:
+                # Custom layers have no built-in symbol. An empty segment skips symbol-specific
+                # checks while preserving MTP validation.
                 segment = ""
             layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
