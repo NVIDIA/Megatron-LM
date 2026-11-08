@@ -14,6 +14,8 @@
 
 """Select MCore modules for MFSDP v2 sharding."""
 
+from collections.abc import Sequence
+
 from torch import nn
 
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
@@ -28,8 +30,15 @@ class FsdpUnitCollector:
     Known layers select their own inner units; other modules are traversed recursively.
     """
 
-    def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
-        self._fsdp_unit_module_types = fsdp_unit_module_types
+    def __init__(self, fsdp_unit_module_types: Sequence[type[nn.Module]] | None = None) -> None:
+        if fsdp_unit_module_types is None:
+            fsdp_unit_module_types = (
+                TransformerLayer,
+                MambaLayer,
+                ShortcutMoEBlock,
+                HyperConnectionHybridLayer,
+            )
+        self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._units: list[nn.Module] = []
 
     def collect(self, module: nn.Module) -> list[nn.Module]:

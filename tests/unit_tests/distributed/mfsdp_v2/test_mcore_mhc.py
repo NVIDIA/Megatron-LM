@@ -14,14 +14,12 @@ from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -70,9 +68,7 @@ def test_mhc_replay_unit_selection(
     attention, moe = model.decoder.layers
     assert isinstance(attention, HyperConnectionHybridLayer)
     assert isinstance(moe, HyperConnectionHybridLayer)
-    collector = FsdpUnitCollector(
-        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
-    )
+    collector = FsdpUnitCollector()
     expected = []
     if recompute_mhc and not fused_input_layernorm:
         expected.append(attention.inner_layer.input_layernorm)
@@ -113,9 +109,7 @@ def test_mhc_owns_mamba_norm_and_mixer(process_group_collection):
     mamba, attention = model.decoder.layers
     assert isinstance(mamba.inner_layer, MambaLayer)
     assert next(mamba.inner_layer.norm.parameters(), None) is not None
-    collector = FsdpUnitCollector(
-        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
-    )
+    collector = FsdpUnitCollector()
 
     assert collector.collect(model) == [mamba, attention, model]
     assert collector.collect(mamba) == [mamba]

@@ -31,13 +31,9 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
-from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 __all__ = ["FullyShardedDataParallelV2"]
@@ -186,14 +182,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
         from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
-        if fsdp_unit_modules is None:
-            fsdp_unit_modules = [
-                TransformerLayer,
-                MambaLayer,
-                ShortcutMoEBlock,
-                HyperConnectionHybridLayer,
-            ]
-
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
         )
@@ -283,7 +271,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
+            collector = FsdpUnitCollector(fsdp_unit_modules)
             for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:

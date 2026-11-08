@@ -10,7 +10,6 @@ from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -35,7 +34,7 @@ def process_group_collection(distributed_setup):
 
 
 @pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
-def test_routed_experts_are_explicit_units(process_group_collection, grouped_gemm):
+def test_collects_routed_experts_before_transformer_layer(process_group_collection, grouped_gemm):
     """Transformer layers select routed experts directly and own their remaining internals."""
     config = TransformerConfig(
         num_layers=1,
@@ -62,9 +61,7 @@ def test_routed_experts_are_explicit_units(process_group_collection, grouped_gem
     assert isinstance(experts, TEGroupedMLP if grouped_gemm else SequentialMLP)
     assert layer.mlp.shared_experts is not None
     root = nn.Sequential(layer)
-    collector = FsdpUnitCollector(
-        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
-    )
+    collector = FsdpUnitCollector()
 
     assert collector.collect(root) == [experts, layer, root]
 
@@ -96,8 +93,6 @@ def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
     block, sibling = model.decoder.layers
     assert isinstance(block, ShortcutMoEBlock)
     assert isinstance(sibling, TransformerLayer if pattern == "*E*" else MambaLayer)
-    collector = FsdpUnitCollector(
-        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
-    )
+    collector = FsdpUnitCollector()
 
     assert collector.collect(model) == [block.moe_layer.mlp.experts, block, sibling, model]
