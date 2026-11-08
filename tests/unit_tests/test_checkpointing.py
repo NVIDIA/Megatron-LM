@@ -1,7 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
+import contextlib
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -19,16 +20,19 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.parallel_state import get_data_parallel_world_size
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, WideResidualConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     _maybe_setup_gpt_to_hybrid_load,
+    _read_checkpoint_run_config,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
@@ -39,11 +43,27 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.config import (
+    CheckpointConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+    ProfilingConfig,
+)
+from megatron.training.global_vars import get_args, get_run_config, set_args
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
 from megatron.training.state import TrainState
+from megatron.training.utils.checkpoint_utils import (
+    get_checkpoint_run_config_filename,
+    get_checkpoint_train_state_filename,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -53,7 +73,9 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
-    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+    assert _maybe_setup_gpt_to_hybrid_load(
+        args, ckpt_args, [object()], load_optim=True, saved_save_optim=True
+    ) == (None, False)
 
 
 @pytest.mark.parametrize("auto_detect", [False, True])
@@ -72,6 +94,7 @@ def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkey
         mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
     )
     with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        sync_checkpoint_config(args)
         load_checkpoint([], None, None)
 
 
@@ -536,7 +559,7 @@ def test_load_args_restores_wide_residual_config_from_checkpoint():
     assert restored_args.wide_residual_retention_max_forget == 0.2
 
 
-def test_check_checkpoint_args_rejects_wide_residual_mismatch():
+def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
     """Resuming must reject a checkpoint with different wide-residual geometry."""
     current_args = SimpleNamespace(
         num_layers=2,
@@ -555,6 +578,16 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
     )
     checkpoint_args = SimpleNamespace(**vars(current_args))
     checkpoint_args.wide_residual_num_streams = 4
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            wide_residual=WideResidualConfig(num_streams=3),
+        ),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
@@ -564,17 +597,172 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         check_checkpoint_args(checkpoint_args)
 
 
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, BertModelConfig, MimoBuildConfig])
+def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls):
+    kwargs = {"position_embedding_type": "rope"} if model_cls is GPTModelConfig else {}
+    run_config.model = model_cls(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+        vocab_size=128,
+        **kwargs,
+    )
+    args = SimpleNamespace(
+        vocab_file=None,
+        use_dist_ckpt=True,
+        phase_transition_iterations=None,
+        add_position_embedding=True,
+    )
+    saved = run_config.to_dict()
+    stale = SimpleNamespace(num_layers=99, hidden_size=99, num_attention_heads=99)
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(stale, checkpoint_config=saved)
+        saved['model']['transformer']['hidden_size'] = 64
+        with pytest.raises(AssertionError, match='hidden_size value from checkpoint'):
+            check_checkpoint_args(stale, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("saved_config", [False, True])
+def test_checkpoint_allows_rope_to_yarn(run_config, saved_config):
+    args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        add_position_embedding=True,
+        vocab_file=None,
+        use_dist_ckpt=True,
+        phase_transition_iterations=None,
+    )
+    checkpoint_args = SimpleNamespace(**vars(args), position_embedding_type="rope")
+    run_config.model.position_embedding_type = "rope"
+    saved = run_config.to_dict() if saved_config else None
+    run_config.model.position_embedding_type = "yarn"
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        checkpoint_args.add_position_embedding = False
+        with pytest.raises(AssertionError, match="add_position_embedding"):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("saved_config", [False, True])
+def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_config):
+    run_config.checkpoint.ckpt_format = "torch"
+    run_config.tokenizer.vocab_file = "vocab"
+    run_config.tokenizer.tokenizer_type = "NullTokenizer"
+    run_config.tokenizer.padded_vocab_size = 512
+    run_config.model.vocab_size = 640
+    run_config.model.should_pad_vocab = False
+    args = SimpleNamespace(
+        vocab_file="vocab",
+        use_dist_ckpt=False,
+        phase_transition_iterations=None,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=999,
+        add_position_embedding=True,
+    )
+    checkpoint_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        max_position_embeddings=16,
+        make_vocab_size_divisible_by=128,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=512,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    saved = run_config.to_dict() if saved_config else None
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        run_config.tokenizer.padded_vocab_size = 768
+        with pytest.raises(AssertionError, match='padded_vocab_size value from checkpoint'):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        check_checkpoint_args(
+            checkpoint_args, skip_args={'padded_vocab_size'}, checkpoint_config=saved
+        )
+
+
+@pytest.mark.parametrize("restore_parallelism", [False, True])
+def test_checkpoint_args_restore_preserves_mlm_policy(restore_parallelism):
+    """CLI bootstrap retains MLM precedence; saved config does not replace launch settings."""
+    args = SimpleNamespace(
+        load='checkpoint',
+        hidden_size=64,
+        num_layers=None,
+        seq_length=None,
+        attention_dropout=0.3,
+        tensor_model_parallel_size=2,
+        recompute_granularity='selective',
+        tp_comm_overlap=False,
+        bf16=True,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=restore_parallelism,
+    )
+    checkpoint_args = SimpleNamespace(
+        hidden_size=32,
+        num_layers=2,
+        seq_length=128,
+        spec=['custom_model', 'layer_spec'],
+        attention_dropout=0.1,
+        tensor_model_parallel_size=4,
+        recompute_granularity='full',
+        tp_comm_overlap=True,
+        bf16=False,
+    )
+    # Native configuration is not implicitly merged into the CLI bootstrap path.
+    saved_config = {'model': {'transformer': {'num_layers': 99, 'attention_dropout': 0.9}}}
+    state = {'args': checkpoint_args, 'checkpoint_version': 3.0}
+    with (
+        mock.patch(
+            'megatron.training.checkpointing._load_base_checkpoint',
+            return_value=(state, 'checkpoint', False, CheckpointType.LEGACY),
+        ),
+        mock.patch(
+            'megatron.training.checkpointing._read_checkpoint_run_config', return_value=saved_config
+        ),
+    ):
+        load_args_from_checkpoint(args)
+    assert args.hidden_size == 64  # Non-None CLI inputs retain precedence.
+    assert args.num_layers == 2
+    assert args.seq_length == 128
+    assert args.spec == checkpoint_args.spec  # Keep the original CLI import path.
+    assert args.attention_dropout == 0.1  # Existing MLM force=True behavior.
+    assert args.tensor_model_parallel_size == (4 if restore_parallelism else 2)
+    assert args.recompute_granularity == 'selective'
+    assert args.tp_comm_overlap is False
+    assert args.bf16 is True
+
+
 @pytest.mark.parametrize(
     "section,name,current,other",
-    [("train", "global_batch_size", 8, 16), ("rng", "data_parallel_random_init", True, False)],
+    [
+        ("train", "global_batch_size", 8, 16),
+        ("rng", "data_parallel_random_init", True, False),
+        ("tokenizer", "tokenizer_type", "GPT2BPETokenizer", "SentencePieceTokenizer"),
+    ],
 )
 @pytest.mark.parametrize(
-    "saved_source", ["legacy", "missing_section", "missing_field", "config", "config_only"]
+    "saved_source",
+    ["legacy", "missing_section", "null_section", "missing_field", "config", "config_only"],
 )
 def test_check_checkpoint_args_uses_config_owner(
     monkeypatch, run_config, section, name, current, other, saved_source
 ):
     """Config precedence, old checkpoint fallback and skips share one comparison path."""
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+        position_embedding_type="rope",
+    )
     args = SimpleNamespace(
         num_layers=2,
         hidden_size=128,
@@ -586,12 +774,18 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
+    if section == "tokenizer":
+        run_config.tokenizer.vocab_file = "vocab.json"
+        args.max_position_embeddings = run_config.model.seq_length
+        args.make_vocab_size_divisible_by = run_config.model.make_vocab_size_divisible_by
     assert hasattr(owner, name)
     setattr(owner, name, current)
     checkpoint_args = SimpleNamespace(**vars(args))
     checkpoint_config = None
     if saved_source != "legacy":
         checkpoint_config = {} if saved_source == "missing_section" else {section: {}}
+        if saved_source == "null_section":
+            checkpoint_config[section] = None
     if saved_source in ("config", "config_only"):
         saved_owner = checkpoint_config[section]
         saved_owner[name] = current
@@ -659,6 +853,11 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     yield args
 
@@ -672,7 +871,6 @@ def create_ckpt_load_args(create_args):
     args.hidden_size = 2
     args.num_attention_heads = 1
     args.add_position_embedding = False
-    args.vocab_file = None
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
@@ -683,6 +881,9 @@ def create_ckpt_load_args(create_args):
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
     args.phase_transition_iterations = None
+
+    cfg = get_run_config()
+    cfg.tokenizer.vocab_file = None
 
     yield args
 
@@ -719,6 +920,7 @@ def test_load_base_checkpoint(
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
 
+        sync_checkpoint_config(args)
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True
         )
@@ -793,6 +995,7 @@ def test_save_checkpoint(
             "megatron.training.checkpointing.maybe_save_dataloader_state",
             wraps=maybe_save_dataloader_state,
         ) as save_dataloader_state:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -815,6 +1018,7 @@ def test_save_checkpoint(
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        sync_checkpoint_config(args)
         state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
         # Legacy args remain unchanged; the run config records the effective policy.
         assert state["args"].profile is False and state["args"].profile_ranks == [99]
@@ -828,6 +1032,9 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize(
+    "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
+)
 @pytest.mark.parametrize("owned_rng", [False, True])
 @pytest.mark.parametrize("iteration", [0, 123])
 @pytest.mark.parametrize(
@@ -842,14 +1049,22 @@ def test_load_checkpoint(
     iteration,
     run_config,
     load_kwargs,
+    model_cls,
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 128
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
     args.fp16 = False
     args.bf16 = False
+    kwargs = {"encoder_num_layers": 1} if model_cls is T5ModelConfig else {}
+    run_config.model = model_cls(transformer=run_config.model.transformer, seq_length=16, **kwargs)
+    # Live runtime callbacks are not part of the saved model configuration.
+    run_config.model.transformer.grad_scale_func = lambda value: value
+    run_config.model.transformer.no_sync_func = [lambda: None]
     rng_config = run_config.rng
     if owned_rng:
         rng_config.seed = 987
@@ -867,8 +1082,8 @@ def test_load_checkpoint(
         pytest.skip("torch_dcp requires torch >= 2.4.0")
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_checkpoint", sync=True) as ckpt_dir:
-        args.load = ckpt_dir
-        args.save = ckpt_dir
+        args.load = str(ckpt_dir)
+        args.save = str(ckpt_dir)
         args.save_tokenizer_assets = False
         set_args(args)
 
@@ -884,6 +1099,7 @@ def test_load_checkpoint(
         torch.manual_seed(rng_config.seed + (torch.distributed.get_rank() if owned_rng else 0))
         expected_cpu_rng = torch.get_rng_state().clone()
         with mock.patch("torch.save", wraps=torch.save) as serialized:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -894,18 +1110,36 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            # The persisted arguments are a copy: its checkpoint names follow the section (for a
+            # namespace that agrees with it, identical) and its padded_vocab_size is the resolved
+            # vocabulary (#8401); the live namespace is not written.
+            saved_args = serialized.call_args.args[0]["args"]
+            assert saved_args is not args
+            assert vars(saved_args) == {**vars(args), "padded_vocab_size": 128}
+        assert args.padded_vocab_size is None
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
             assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+        restored_config = type(run_config).from_yaml(
+            ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
+        )
+        assert type(restored_config.model) is model_cls
+        # The shared YAML comes from rank 0; distributed rank fields differ on other ranks.
+        assert restored_config.to_dict()["model"] == run_config.to_dict()["model"]
+        assert restored_config.model.transformer.grad_scale_func is None
+        assert restored_config.model.transformer.no_sync_func is None
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
+        with torch.no_grad():
+            new_model.l.weight.zero_()
+            new_model.l.bias.fill_(1)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model], new_optimizer, new_opt_param_scheduler, strict=True, **load_kwargs
         )
@@ -939,6 +1173,7 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
     set_args(args)
 
     with pytest.raises(ValueError, match="inference-only"):
+        sync_checkpoint_config(args)
         load_checkpoint(
             [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
         )
@@ -988,6 +1223,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         num_floating_point_operations_so_far = 456
 
+        sync_checkpoint_config(args)
         save_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
@@ -1006,6 +1242,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         # Load checkpoint and verify runtime overrides are restored.
         train_state = TrainState()
         get_train_state.return_value = train_state
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model],
             new_optimizer,
@@ -1023,6 +1260,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
+        sync_checkpoint_config(args)
         loaded_iter_none, loaded_flops_none = load_checkpoint(
             [new_model], None, None, strict=True, restore_training_state=True
         )
@@ -1036,6 +1274,9 @@ def test_strict_load_idle_rerun_checkpoint(
 ):
     """Load an idle rerun shard without treating it as a pending rerun."""
     args = create_ckpt_load_args
+    # Startup normally fills these; the saved topology must match the real launch.
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = get_data_parallel_world_size()
     args.ckpt_format = "torch_dist"
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
@@ -1059,6 +1300,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(123, [model], None, None, 456)
 
         loaded_model = MockModel(config)
@@ -1068,6 +1310,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
         ):
+            sync_checkpoint_config(args)
             iteration, flops = load_checkpoint(
                 [loaded_model], None, None, strict=True, restore_training_state=True
             )
@@ -1127,12 +1370,13 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_fp_ops = 456
 
-        base_metadata = _build_sharded_state_dict_metadata(args)
+        base_metadata = _build_sharded_state_dict_metadata()
         first_job_mock_metadata = {**base_metadata, 'metadata_A': 42, 'metadata_B_soon_removed': 43}
         with mock.patch(
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
         expected_loaded_metadata = {**first_job_mock_metadata, 'checkpoint_version': 3.1}
 
@@ -1146,12 +1390,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
+            sync_checkpoint_config(args)
             load_checkpoint(
                 [model], optimizer, opt_param_scheduler, strict=True, restore_training_state=True
             )
             assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
@@ -1205,6 +1451,7 @@ def test_checkpoint_load_without_microbatch_calculator(
         config = TransformerConfig(
             num_layers=1, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
         )
+        run_config.model = GPTModelConfig(transformer=config, seq_length=16, vocab_size=32)
 
         def build_model():
             # CPU-initialized DP replicas must match the weights saved by rank 0.
@@ -1222,6 +1469,7 @@ def test_checkpoint_load_without_microbatch_calculator(
 
         torch.manual_seed(123)
         model = build_model()
+        sync_checkpoint_config(args)
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
         saved_cuda_rng = torch.cuda.get_rng_state().clone()
@@ -1245,13 +1493,19 @@ def test_checkpoint_load_without_microbatch_calculator(
             for name in ("global_batch_size", "micro_batch_size"):
                 delattr(args, name)
         unset_num_microbatches_calculator()
+        read_config = mock.Mock(wraps=_read_checkpoint_run_config)
+        monkeypatch.setattr(
+            'megatron.training.checkpointing._read_checkpoint_run_config', read_config
+        )
         if is_inference or load_mode == "converter":
             from megatron.training.argument_utils import inference_cfg_container_from_args
 
             # Converters restore consumed-sample metadata without a training config.
             monkeypatch.setattr(
                 "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
-                inference_cfg_container_from_args(args, build_model_config=False),
+                inference_cfg_container_from_args(
+                    args, model_cfg=run_config.model, build_model_config=False
+                ),
             )
         if is_inference:
             with mock.patch(
@@ -1259,16 +1513,19 @@ def test_checkpoint_load_without_microbatch_calculator(
                 side_effect=AssertionError("Inference must not restore training rerun state"),
             ):
                 load_kwargs = {} if load_mode == "default" else {"restore_training_state": False}
+                sync_checkpoint_config(args)
                 metadata = load_checkpoint([restored], None, None, **load_kwargs)
             assert not hasattr(args, "consumed_train_samples")
             assert not hasattr(args, "skipped_train_samples")
             assert not hasattr(args, "consumed_valid_samples")
         else:
+            sync_checkpoint_config(args)
             metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
             assert train_state.iteration == expected_iteration
             assert train_state.consumed_train_samples == expected_iteration * args.global_batch_size
         assert metadata == (7 if load_mode == "override" else 123, 456)
+        read_config.assert_called_once()
         for expected, actual in zip(model.parameters(), restored.parameters()):
             assert torch.equal(expected, actual)
         assert torch.equal(torch.get_rng_state(), before_load_rng if no_load_rng else saved_rng)
@@ -1304,7 +1561,7 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
 
 
-def _make_metadata_args(
+def _describe_metadata_run(
     run_config,
     use_distributed_optimizer=False,
     use_layer_wise_distributed_optimizer=False,
@@ -1312,16 +1569,17 @@ def _make_metadata_args(
     dist_ckpt_optim_fully_reshardable=False,
     distrib_optim_fully_reshardable_mem_efficient=False,
 ):
-    # The metadata builder reads the optimizer flags from the run config, the rest from args.
+    """The metadata builder reads the optimizer flags from the optimizer section and the
+    checkpoint settings from the checkpoint section."""
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
-    args = SimpleNamespace()
-    args.ckpt_format = ckpt_format
-    args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
-    args.distrib_optim_fully_reshardable_mem_efficient = (
-        distrib_optim_fully_reshardable_mem_efficient
+    run_config.checkpoint = CheckpointConfig(
+        ckpt_format=ckpt_format,
+        dist_ckpt_optim_fully_reshardable=dist_ckpt_optim_fully_reshardable,
+        distrib_optim_fully_reshardable_mem_efficient=(
+            distrib_optim_fully_reshardable_mem_efficient
+        ),
     )
-    return args
 
 
 class TestBuildShardedStateDictMetadata:
@@ -1337,13 +1595,14 @@ class TestBuildShardedStateDictMetadata:
 
     @pytest.mark.parametrize('ckpt_format', ['torch_dist', 'fsdp_dtensor'])
     def test_inference_container_keeps_shared_metadata(self, monkeypatch, run_config, ckpt_format):
+        # No optimizer section: the shared metadata only, whatever the format.
+        run_config.checkpoint.ckpt_format = ckpt_format
         cfg = InferenceConfigContainer(
             model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
         )
         monkeypatch.setattr('megatron.training.checkpointing.get_run_config', lambda: cfg)
-        args = SimpleNamespace(ckpt_format=ckpt_format)
 
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
 
         assert metadata == {
             'singleton_local_shards': False,
@@ -1352,43 +1611,521 @@ class TestBuildShardedStateDictMetadata:
         }
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self, run_config):
-        args = _make_metadata_args(run_config, use_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config, use_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_distributed_optimizer_fully_reshardable_flag(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config, use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
     def test_distributed_optimizer_fsdp_dtensor(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config, use_distributed_optimizer=True, ckpt_format='fsdp_dtensor'
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
     def test_layer_wise_only_still_sets_sharding_type(self, run_config):
         # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
-        args = _make_metadata_args(run_config, use_layer_wise_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config, use_layer_wise_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_layer_wise_with_fully_reshardable(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config,
             use_layer_wise_distributed_optimizer=True,
             dist_ckpt_optim_fully_reshardable=True,
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
     def test_no_distributed_optimizer_no_sharding_type(self, run_config):
-        args = _make_metadata_args(run_config)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+def test_save_follows_the_section_not_the_namespace(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, run_config
+):
+    """A save goes where the registered section says, in its format, whatever the namespace says,
+    and the persisted arguments describe the policy that produced the checkpoint."""
+    args = create_args
+    args.use_distributed_optimizer = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_save_follows_the_section", sync=True) as save_dir:
+        args.save = str(save_dir / "section")
+        args.ckpt_format = "torch"
+        args.use_dist_ckpt = False
+        args.save_tokenizer_assets = False
+        set_args(args)
+        before = replace(sync_checkpoint_config(args))
+        # The namespace now disagrees on every setting a save reads.
+        args.save = str(save_dir / "namespace")
+        args.ckpt_format = "torch_dist"
+        args.use_dist_ckpt = True
+        args.async_save = True
+        args.no_save_optim = True
+
+        save_checkpoint(7, [model], optimizer, opt_param_scheduler, 0)
+
+        ckpt_file = save_dir / "section" / "iter_0000007" / "mp_rank_00" / "model_optim_rng.pt"
+        assert os.path.exists(ckpt_file)
+        assert not os.path.exists(save_dir / "namespace")
+        state = torch.load(ckpt_file, weights_only=False)
+        assert "optimizer" in state
+        assert state["args"].save == str(save_dir / "section")
+        assert state["args"].ckpt_format == "torch"
+        assert state["args"].no_save_optim is False and state["args"].use_dist_ckpt is False
+        # Neither the namespace nor the registered section was written.
+        assert args.ckpt_format == "torch_dist" and args.no_save_optim is True
+        assert run_config.checkpoint == before
+
+
+@pytest.mark.parametrize("section_says_rng", [True, False, None])
+def test_the_saved_section_decides_what_a_resume_requests(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config, section_says_rng
+):
+    """The load template requests what the checkpoint holds as its saved checkpoint section says;
+    the arguments persisted with the checkpoint decide only when there is no saved section (None
+    here: the YAML is removed, and those arguments say the RNG state was saved)."""
+    args = create_ckpt_load_args
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = get_data_parallel_world_size()
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_saved_section_decides", sync=True) as ckpt_dir:
+        args.save = str(ckpt_dir)
+        args.load = str(ckpt_dir)
+        set_args(args)
+        sync_checkpoint_config(args)
+        save_checkpoint(5, [MockModel(config)], None, None, 0)
+
+        config_filename = get_checkpoint_run_config_filename(str(ckpt_dir / "iter_0000005"))
+        if torch.distributed.get_rank() == 0:
+            if section_says_rng is None:
+                os.remove(config_filename)
+            elif section_says_rng is False:
+                with open(config_filename) as handle:
+                    saved = yaml.safe_load(handle)
+                saved["checkpoint"]["save_rng"] = False
+                with open(config_filename, "w") as handle:
+                    yaml.safe_dump(saved, handle)
+        torch.distributed.barrier()
+
+        with mock.patch(
+            "megatron.training.checkpointing.get_rng_state", wraps=checkpointing.get_rng_state
+        ) as rng_template:
+            iteration, _ = load_checkpoint([MockModel(config)], None, None, strict=True)
+        assert iteration == 5
+        # The RNG shard is requested unless the saved section says it is not there.
+        assert rng_template.called is (section_says_rng is not False)
+
+
+@pytest.mark.parametrize(
+    "saved_section, saved_no_save_optim, expected",
+    [
+        ({"checkpoint": {"save_optim": True}}, True, True),  # the saved section wins
+        ({"checkpoint": {"save_optim": False}}, False, False),  # in both directions
+        (None, True, False),  # no saved section: the saved arguments decide
+        (None, False, True),
+    ],
+)
+def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
+    init_model_parallel, monkeypatch, run_config, saved_section, saved_no_save_optim, expected
+):
+    """The guard that keeps optimizer rows from being loaded across a different GLU layout
+    decides whether optimizer state will be loaded exactly as the load template does: from the
+    saved checkpoint section, and from the saved arguments only when the checkpoint has none."""
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=2,
+        use_distributed_optimizer=False,
+    )
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        no_save_optim=saved_no_save_optim,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    run_config.checkpoint.load = "/synthetic"
+    run_config.checkpoint.load_rng = False
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, "/synthetic/iter_0000001", False, CheckpointType.GLOBAL),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: saved_section)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    decisions = []
+
+    class StopAtTheGuard(Exception):
+        pass
+
+    def guard(state_dict, run_args, *, loading_optimizer):
+        decisions.append(loading_optimizer)
+        raise StopAtTheGuard  # Before any tensor storage is read.
+
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", guard)
+    optimizer = SimpleNamespace(is_stub_optimizer=False)
+    with pytest.raises(StopAtTheGuard):
+        load_checkpoint([object()], optimizer, None, restore_training_state=True)
+    assert decisions == [expected]
+
+
+def test_the_pretrained_fallback_makes_the_load_weights_only(
+    init_model_parallel, monkeypatch, run_config
+):
+    """A missing --load with --pretrained-checkpoint loads the pretrained directory weights-only:
+    the base loader is called with finetune=True; neither the registered section nor the
+    namespace is written."""
+    args = SimpleNamespace(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    run_config.checkpoint.load_rng = False
+    loads = []
+
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        loads.append((load_dir, finetune))
+        return None, "", False, None  # Nothing to load: the call ends after the fallback.
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint([object()], None, None) == (0, 0)
+    assert loads and loads[0] == ("/pretrained", True)
+    assert run_config.checkpoint.finetune is False and args.finetune is False
+
+
+def test_the_load_directory_is_the_sections_unless_passed(
+    init_model_parallel, monkeypatch, run_config
+):
+    """``load_dir`` omitted reads the run's load directory; ``None`` clears it, so the
+    pretrained-checkpoint fallback applies (the reference weights of RL); a string names another
+    directory (the distillation teacher's). None of them writes the section."""
+    args = SimpleNamespace(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    run_config.checkpoint.load = "/run"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    loads = []
+
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        if not k.get("rank0"):  # The final read; the rank-0 metadata read carries the same policy.
+            loads.append((load_dir, finetune))
+        return None, "", False, None  # Nothing to load: the call ends after resolving the policy.
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing, "checkpoint_exists", lambda path: path in ("/run", "/pretrained", "/teacher")
+    )
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+
+    load_checkpoint([object()], None, None)
+    load_checkpoint([object()], None, None, load_dir=None, finetune=True, load_optim=False)
+    load_checkpoint([object()], None, None, load_dir="/teacher", finetune=True)
+    assert loads == [("/run", False), ("/pretrained", True), ("/teacher", True)]
+    assert run_config.checkpoint.load == "/run" and run_config.checkpoint.finetune is False
+
+
+@pytest.mark.parametrize("cleared", [True, False])
+def test_the_pretrained_reference_load_requests_the_llm_only_metadata(
+    init_model_parallel, monkeypatch, run_config, cleared
+):
+    """The reference-weights load of RL clears the load directory, so the pretrained fallback
+    classifies it as a pretrained load: with --allow-llm-only-checkpoint the load template then
+    carries ``load_from_llm_only_checkpoint``. Naming the pretrained directory directly is an
+    ordinary load and does not."""
+    args = SimpleNamespace(
+        finetune=False,
+        allow_llm_only_checkpoint=True,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    run_config.checkpoint.ckpt_format = "torch_dist"
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, "/pretrained/iter_0000001", False, CheckpointType.GLOBAL),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: None)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", mock.Mock())
+    templates = []
+
+    class StopAtTheTemplate(Exception):
+        pass
+
+    def capture(*a, model_sd_kwargs, **k):
+        templates.append(model_sd_kwargs["metadata"])
+        raise StopAtTheTemplate  # Before any tensor storage is read.
+
+    monkeypatch.setattr(checkpointing, "generate_state_dict", capture)
+    load_dir = None if cleared else "/pretrained"
+    with pytest.raises(StopAtTheTemplate):
+        load_checkpoint(
+            [object()],
+            None,
+            None,
+            restore_training_state=True,
+            load_dir=load_dir,
+            finetune=True,
+            load_optim=False,
+        )
+    assert templates[0].get("load_from_llm_only_checkpoint", False) is cleared
+
+
+def _loader_args(**overrides):
+    values = dict(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
+    """Stop every load right after its policy is resolved: nothing is read from storage."""
+
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        if not k.get("rank0"):  # The final read; the rank-0 metadata read carries the same policy.
+            loads.append((load_dir, finetune))
+        return None, "", False, None
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path in existing)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+
+
+def test_only_the_primary_load_records_the_finetune_classification(
+    init_model_parallel, monkeypatch, run_config
+):
+    """The primary load writes TrainState.effective_finetune, True or False; the auxiliary loads
+    (the distillation teacher, RL's reference weights and reload) leave it alone. The namespace
+    is not written."""
+    args = _loader_args()
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    loads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/pretrained", "/teacher"), loads)
+
+    # The primary load takes the pretrained fallback: weights-only.
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert train_state.effective_finetune is True
+    # A teacher load and RL's reload are not the primary load.
+    load_checkpoint([object()], None, None, load_dir="/teacher", finetune=False)
+    load_checkpoint([object()], None, None, restore_training_state=True, load_optim=False)
+    assert train_state.effective_finetune is True
+    assert loads == [("/pretrained", True), ("/teacher", False), ("/pretrained", True)]
+    assert args.finetune is False and not hasattr(args, "override_ckpt_iteration")
+
+    # A later primary resume of a saved run resets the classification.
+    run_config.checkpoint.load = "/saved"
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/saved")
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert train_state.effective_finetune is False
+    assert run_config.checkpoint.finetune is False
+
+
+@pytest.mark.parametrize("progress_iteration", [0, 250])
+def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
+    init_model_parallel, monkeypatch, run_config, progress_iteration
+):
+    """--freeze-all-layers loads the model weights-only and resumes the data position from the
+    run's own progress tracker: the classification is recorded on the train state, the position
+    stays the load's own business, and the namespace receives neither."""
+    args = _loader_args(freeze_all_layers=True)
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.checkpoint.load = "/frozen"
+    run_config.checkpoint.save = "/out"
+    progress_reads = []
+
+    def read_progress(save_dir):
+        progress_reads.append(save_dir)
+        return progress_iteration
+
+    monkeypatch.setattr(checkpointing, "read_frozen_resume_iteration", read_progress)
+    loads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/frozen",), loads)
+
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert loads == [("/frozen", True)]
+    assert progress_reads == ["/out"]
+    assert train_state.effective_finetune is True
+    assert not hasattr(args, "override_ckpt_iteration") and args.finetune is False
+    assert run_config.checkpoint.override_ckpt_iteration is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["both", "train_state_only", "tracker_only", "ckpt_step", "release", "pretrained_fallback"],
+)
+def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
+    init_model_parallel, monkeypatch, run_config, tmp_path, case
+):
+    """The directory handed to the fsdp_dtensor reader comes from the same resolution as the base
+    load: latest_train_state.pt when present, the legacy text tracker otherwise, --ckpt-step over
+    both, the release flag honoured, and the pretrained fallback's directory when --load has no
+    checkpoint."""
+
+    def tracked(directory, tracker=None, train_state=None, release=False):
+        directory.mkdir(parents=True, exist_ok=True)
+        if tracker is not None:
+            with open(get_checkpoint_tracker_filename(str(directory)), "w") as f:
+                f.write("release" if release and train_state is None else str(tracker))
+        if train_state is not None:
+            torch.save(
+                TrainState(iteration=train_state, release=release).state_dict(),
+                get_checkpoint_train_state_filename(str(directory), prefix="latest"),
+            )
+
+    load_dir, pretrained_dir = tmp_path / "load", tmp_path / "pretrained"
+    expected = {
+        "both": (dict(tracker=10, train_state=20), "iter_0000020"),
+        "train_state_only": (dict(train_state=20), "iter_0000020"),
+        "tracker_only": (dict(tracker=10), "iter_0000010"),
+        "ckpt_step": (dict(tracker=10, train_state=20), "iter_0000030"),
+        "release": (dict(tracker=10, train_state=20, release=True), "release"),
+        "pretrained_fallback": (None, "iter_0000020"),
+    }
+    files, leaf = expected[case]
+    if files is not None:
+        tracked(load_dir, **files)
+        wanted = str(load_dir / leaf)
+    else:
+        load_dir.mkdir()  # no checkpoint under --load: the pretrained directory is read
+        tracked(pretrained_dir, tracker=10, train_state=20)
+        wanted = str(pretrained_dir / leaf)
+        run_config.checkpoint.pretrained_checkpoint = str(pretrained_dir)
+    run_config.checkpoint.load = str(load_dir)
+    run_config.checkpoint.ckpt_format = "fsdp_dtensor"
+    if case == "ckpt_step":
+        run_config.checkpoint.ckpt_step = 30
+
+    args = _loader_args(use_megatron_fsdp=True)
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, wanted, False, CheckpointType.FSDP_DTENSOR),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: None)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", mock.Mock())
+    readers = []
+
+    class StopAtTheReader(Exception):
+        pass
+
+    def reader(path):
+        readers.append(path)
+        raise StopAtTheReader  # Before any metadata is read from storage.
+
+    monkeypatch.setattr(checkpointing, "FileSystemReader", reader)
+    with pytest.raises(StopAtTheReader):
+        load_checkpoint([object()], None, None, restore_training_state=True)
+    assert readers == [wanted]

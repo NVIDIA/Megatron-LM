@@ -75,11 +75,13 @@ budget, so at most two are alive: one being filled and one being reduced.
 When layer i-1's backward starts, the compute stream waits for that event and then exposes
 the buffer's views as `main_grad`. In the layer-to-layer schedule this wait lands where the
 copy path waits before CI. It is needed even when the order is right: the backward order lists
-a parent before its children, and nothing guarantees that a post-backward wait runs between a
+a parent before its children, and nothing guarantees that a reduction's wait runs between a
 parent's allocation for its last child and that child's backward. The first module in backward
-order has no predecessor and allocates its own buffer the same way. Post-backward adds any
-autograd gradients (biases, LayerNorm, unfused weights) into the buffer, removes `main_grad`
-and launches the reduce-scatter.
+order has no predecessor and allocates its own buffer the same way. Once the module's gradients
+are complete, its reduction adds any autograd gradients (biases, LayerNorm, unfused weights)
+into the buffer, removes `main_grad` and launches the reduce-scatter. Groups that need no
+DP-inner reduction still use the buffer, since Transformer Engine needs `main_grad` to write
+into.
 
 A checkpointed region is recomputed before its modules' backward; recomputation sets no
 `main_grad`. With delayed weight-gradient computation (`delay_wgrad_compute=True`), a

@@ -12,6 +12,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -25,6 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
@@ -52,7 +54,6 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -197,6 +198,9 @@ class TEQuantizationRecipe:
     If no FP8 or FP4 quantization is configured, the recipe is execution
     in high-precision (BF16).
     """
+
+    recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the TE quantization recipe class."""
     custom_recipe_factory: Optional[str] = None
     """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
     fp8_format: str = "e4m3"
@@ -393,6 +397,11 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
+    # Set recipe attrs
+    if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+        for key, val in qrecipe.recipe_attrs.items():
+            setattr(quant_recipe, key, val)
+
     return fp8_model_init(
         enabled=enabled,
         recipe=quant_recipe,
@@ -457,18 +466,38 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
                 quant_recipe = te.common.recipe.NVFP4BlockScaling()
             else:
-                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
+
+        # Set recipe attrs
+        if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+            for key, val in qrecipe.recipe_attrs.items():
+                setattr(quant_recipe, key, val)
 
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_recipe_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active module override, or None when it inherits the surrounding context.
+
+    Resolve this before entering any module-specific context. In particular, op-fuser callers
+    need to compare both linears' overrides against the same surrounding autocast state.
+    """
     if qparams is None:
-        return nullcontext()
+        return None
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        recipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        recipe = qparams.training_recipe
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return recipe if recipe.override_quantized_autocast else None
+    return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -2056,12 +2085,15 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
+        if output_dtype is not None and output_dtype != input_.dtype:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
         with get_fp8_context(self.config):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
@@ -3701,9 +3733,39 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Build fused impl and cache recipe lazily on first forward pass.
             # Both are created once and reused — avoids object creation every call.
+            # This recipe cache is a hack (TEFusedMLP does not need
+            # it). Keep it for now for expediency, but future
+            # developers are warned that this should be refactored to
+            # use the model's recipe config like the other TE modules.
             if not hasattr(self, '_recipe'):
                 if os.getenv("FP4_RECIPE", "") == "nvfp4":
                     self._recipe = te.common.recipe.NVFP4BlockScaling()
+                elif os.getenv("FP4_RECIPE", "") == "nvfp4_ue5m3":
+
+                    def _make_nvfp4_ue5m3_quantizer(
+                        role: te.pytorch.QuantizerRole,
+                    ) -> te.pytorch.NVFP4Quantizer:
+                        """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
+                        scale for activations."""
+                        tensor_type = role.tensor_type if role is not None else None
+                        if not tensor_type:
+                            tensor_type = "input"
+                        with_rht = tensor_type in ("input", "grad_output")
+                        return te.pytorch.NVFP4Quantizer(
+                            scale_dtype=te.pytorch.DType.kFloat8UE5M3,
+                            with_rht=with_rht,
+                            with_post_rht_amax=with_rht,
+                            with_2d_quantization=tensor_type == "weight",
+                            stochastic_rounding=False,
+                            with_random_sign_mask=False,
+                            disable_second_level_scale=tensor_type == "input",
+                        )
+
+                    # Construct custom recipe for NVFP4 with UE5M3 scales
+                    self._recipe = te.common.recipe.CustomRecipe(
+                        qfactory=_make_nvfp4_ue5m3_quantizer
+                    )
+                    self._recipe.enable_cutedsl_fused_grouped_mlp = True
                 else:
                     self._recipe = te.common.recipe.MXFP8BlockScaling()
             recipe = self._recipe
@@ -4182,6 +4244,21 @@ else:
     fused_topk_with_score_function_supports_qb = False
     mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
+
+
+@lru_cache(maxsize=1)
+def te_supports_deterministic_moe_aux_loss() -> bool:
+    """Whether the installed TE aux-loss API accepts a deterministic execution request."""
+    if fused_moe_aux_loss is None:
+        return False
+    try:
+        parameter = inspect.signature(fused_moe_aux_loss).parameters.get("deterministic")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def set_save_original_input(module):

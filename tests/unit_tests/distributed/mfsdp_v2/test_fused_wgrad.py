@@ -31,7 +31,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
 def _default_placements() -> Placements:
@@ -373,12 +372,14 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     for layer in (fused, copied):
+        [group] = layer.parameter_groups
+        [sharded_weight] = [fsdp_parameter.sharded for fsdp_parameter in group.fsdp_parameters]
         layer(x).float().square().mean().backward()
-        assert layer.weight.grad is None
-        assert layer.phase is Phase.BACKWARD
+        # Reduction installs the sharded gradient, which waits for backward_dw().
+        assert sharded_weight.grad is None
         layer.backward_dw()
-        assert layer.phase is Phase.RESTING
         layer.context.finish_grad_sync()
+        assert sharded_weight.grad is not None
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
 
 

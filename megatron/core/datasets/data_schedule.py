@@ -18,7 +18,7 @@ from megatron.core.datasets.data_schedule_utils import (
     get_global_real_seqlen_stats,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
-    next_hdp_group_packing_aware,
+    next_dynamic_cp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
 )
@@ -463,7 +463,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         sample_id_groups = []
 
         while sample_id_seqlens:
-            _, sample_id_seqlens, _, sample_ids = next_hdp_group_packing_aware(
+            _, sample_id_seqlens, _, sample_ids = next_dynamic_cp_group_packing_aware(
                 sample_id_seqlens,
                 self.total_dpxcp_ranks,
                 max_seq_len_per_rank=self.max_seqlen_per_dp_cp_rank,
@@ -837,7 +837,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             if dynamic_cp
             else cp_group
         )
-        batch['hybrid_cp_group'] = runtime_cp_group if dynamic_cp else None
+        batch['dynamic_cp_group'] = runtime_cp_group if dynamic_cp else None
         # The CP batch sharders expect (1, num_seqs + 1) cu_seqlens, as returned by
         # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)

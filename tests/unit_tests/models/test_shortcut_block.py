@@ -109,7 +109,7 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self, operation):
+    def _get_residual_connection_for_mlp(self, operation):
         if self.config.wide_residual is None:
             return None
         match operation:
@@ -352,7 +352,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     compute_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
-    inference_context = object()
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=False)
+    )
     observed = {}
 
     def compute_forward(hidden_states, **kwargs):

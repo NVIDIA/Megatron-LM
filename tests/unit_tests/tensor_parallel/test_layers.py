@@ -164,6 +164,19 @@ def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
         layer(torch.zeros(2, 4), weight=weight)
 
 
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_column_parallel_linear_forward_output_dtype_override(output_dtype):
+    """A per-call `output_dtype` replaces the constructor's for that call; None keeps it."""
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    layer.output_dtype = torch.bfloat16
+    seen = {}
+    layer._forward_impl = lambda **kwargs: seen.update(kwargs) or kwargs["input"]
+
+    layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), output_dtype=output_dtype)
+
+    assert seen["output_dtype"] is (torch.bfloat16 if output_dtype is None else output_dtype)
+
+
 @pytest.mark.parametrize(
     "inference_optimized,inference_active,expected",
     [(True, True, "inference"), (True, False, "default"), (False, True, "default")],
@@ -351,12 +364,12 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
 @pytest.mark.parametrize("cross_entropy_fusion", [False, True])
 def test_fp32_linear_output_is_an_inplace_safe_ce_workspace(frozen_weight, cross_entropy_fusion):
     """FP32 output logits should be one owning allocation reusable by cross entropy."""
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-    from megatron.core.parallel_state import get_tensor_model_parallel_group
-    from megatron.core.tensor_parallel.cross_entropy import (
+    from megatron.core.ops.loss.cross_entropy import (
         VocabParallelCrossEntropy,
         vocab_parallel_cross_entropy,
     )
+    from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
 
     Utils.initialize_model_parallel(1, 1)
 

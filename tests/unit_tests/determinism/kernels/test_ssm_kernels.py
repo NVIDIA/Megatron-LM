@@ -124,6 +124,39 @@ def test_mixer_rmsnorm_gamma_replays(mixer_type):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("clamp_value", [None, 2.0])
+def test_gdp_gating_replays(clamp_value):
+    """GDP's beta and log-decay gating, with and without the optional decay clamp."""
+    from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+    from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+    from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+    if not HAVE_GDP_DEPS:
+        pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config([])
+        config.gdp_g_clamp_value = clamp_value
+        mixer = build_gdp(config)
+        runtime_cp = mixer._resolve_runtime_cp(None)
+        width = runtime_cp.nheads * (mixer.num_householder + 1)
+        # Wide logits so some decays fall below the clamp and its gradient mask is exercised.
+        ba = (8 * torch.randn(2, 4096, width, device="cuda")).to(torch.bfloat16)
+        ba.requires_grad_(True)
+        assert_replays_bit_exact(
+            lambda ba: mixer._compute_gating(ba, runtime_cp=runtime_cp),
+            (ba,),
+            replays=3,
+            contention=True,
+            what=f"GDP gating (clamp {clamp_value})",
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_mamba_chunk_scan_combined_varlen_replays():
     from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
@@ -285,6 +318,58 @@ def test_causal_conv1d_update_replays():
     assert_replays_bit_exact(
         fn, (x, conv_state, weight, bias), replays=4, backward=False, what="causal_conv1d_update"
     )
+
+
+def test_mixer_inference_param_caches_match_per_call_casts():
+    """Inference reads the FP32 conv weight/bias and A from the mixer's caches.
+
+    They must equal the per-call casts of the current parameters bit for bit, also after a
+    dtype conversion of an eval-mode module, so the conv update on FP32 conv states reads
+    the same operands and replays bit-exact.
+    """
+    from einops import rearrange
+
+    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+
+    seeded()
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        mixer.float()
+        with torch.no_grad():
+            # Values that BF16 cannot represent, so a stale FP32 cache would show.
+            for param in (mixer.conv1d_weight, mixer.conv1d_bias, mixer.A_log):
+                param.copy_(torch.randn_like(param) * 0.1 + 1.001)
+        mixer.eval()
+        mixer.bfloat16()  # converts the parameters after the caches were filled
+
+        def per_call():
+            weight = rearrange(mixer.conv1d_weight, "d 1 w -> d w").float()
+            return weight, mixer.conv1d_bias.float(), -torch.exp(mixer.A_log.float())
+
+        with torch.no_grad():
+            weight, bias = mixer._get_conv_params(
+                mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
+            )
+            assert weight.data_ptr() == mixer._inference_cache.conv_weight.data_ptr()
+            for got, want in zip((weight, bias, mixer._inference_cache.A_neg_exp), per_call()):
+                assert torch.equal(got, want)
+
+            batch, dim, width = 64, weight.shape[0], weight.shape[1]
+            x = torch.randn(batch, dim, device="cuda", dtype=torch.float32)
+            conv_state = torch.randn(batch, dim, width - 1, device="cuda", dtype=torch.float32)
+
+            def fn(x, conv_state):
+                return causal_conv1d_update(x, conv_state, weight, bias, True, None), conv_state
+
+            assert_replays_bit_exact(
+                fn,
+                (x, conv_state),
+                replays=4,
+                backward=False,
+                what="causal_conv1d_update on cached FP32 conv params",
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_causal_conv1d_update_spec_decode_replays():

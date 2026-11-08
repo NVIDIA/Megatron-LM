@@ -22,6 +22,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -39,7 +40,6 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -77,14 +77,20 @@ _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET = 1 << 40
 
 def _initialize_hidden_state_mixing_rng_tracker(
     dp_group: Optional[torch.distributed.ProcessGroup],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[str]:
-    """Create one checkpointable hidden-state-mixing RNG stream per DP replica."""
+    """Create one checkpointable HSM RNG stream per distinct-data rank."""
     rng_tracker = tensor_parallel.get_cuda_rng_tracker()
     if not rng_tracker.is_initialized():
         return None
     if _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME not in rng_tracker.get_states():
+        # GTP is the innermost sub-axis of the full data-parallel rank. Its peers carry
+        # distinct microbatches, while TP/CP peers must retain a common HSM stream.
+        data_parallel_rank = get_pg_rank(dp_group) * get_pg_size(gtp_remat_group) + get_pg_rank(
+            gtp_remat_group
+        )
         seed = (
-            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + get_pg_rank(dp_group)
+            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + data_parallel_rank
         ) % (2**63 - 1)
         rng_tracker.add(_HIDDEN_STATE_MIXING_RNG_TRACKER_NAME, seed)
     return _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME
@@ -2493,7 +2499,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            required_pgs = ['cp', 'tp', 'pp'] + (['dp', 'gtp_remat'] if self.config.mtp_hsm else [])
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
             # Ensure the provided process groups include TP, CP, and PP.
@@ -2502,9 +2508,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                     getattr(pg_collection, group_name, None) is not None
                 ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
             if self.config.mtp_hsm:
-                assert hasattr(
-                    pg_collection, 'dp'
-                ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+                for group_name in ('dp', 'gtp_remat'):
+                    assert (
+                        getattr(pg_collection, group_name, None) is not None
+                    ), f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
@@ -2520,8 +2527,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
+        self.gtp_remat_group = pg_collection.gtp_remat if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
-            _initialize_hidden_state_mixing_rng_tracker(self.dp_group)
+            _initialize_hidden_state_mixing_rng_tracker(self.dp_group, self.gtp_remat_group)
             if self.config.mtp_hsm
             else None
         )
