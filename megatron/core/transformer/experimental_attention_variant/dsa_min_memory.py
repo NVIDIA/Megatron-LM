@@ -11,6 +11,7 @@ forward/backward boundary.  Explicit cache flags may trade bounded sequence-size
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -46,6 +47,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
 from megatron.core.utils import ensure_params_ready
 
 _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE = 64
+_BI_SCORE_WIDTH: ContextVar[int | None] = ContextVar("dsa_bi_score_width", default=None)
 
 
 def _module_weight(module) -> torch.Tensor:
@@ -78,12 +80,14 @@ def _distributed_rank() -> int:
 
 
 @contextmanager
-def _triton_dispatch_enabled(enabled: bool):
+def _triton_dispatch_enabled(enabled: bool, bi_score_width: int | None = None):
     previous = set_min_memory_triton_enabled(enabled)
+    token = _BI_SCORE_WIDTH.set(bi_score_width)
     try:
         yield
     finally:
         set_min_memory_triton_enabled(previous)
+        _BI_SCORE_WIDTH.reset(token)
 
 
 # Budget for one routing score tile, which is [batch, query_chunk, key_chunk] in fp32 and is what
@@ -215,6 +219,10 @@ def _plan_execution(
 
 
 def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if _BI_SCORE_WIDTH.get() is not None:
+        from .dsa_batch_invariant import project
+
+        return project(x, weight)
     return F.linear(x, weight, None)
 
 
@@ -482,7 +490,7 @@ def _selected_causal_invalid_mask(topk_indices: torch.Tensor, q_start: int) -> t
         device=topk_indices.device,
         dtype=topk_indices.dtype,
     )
-    return topk_indices > query_positions.view(1, topk_indices.size(1), 1)
+    return (topk_indices < 0) | (topk_indices > query_positions.view(1, topk_indices.size(1), 1))
 
 
 def _merge_topk(
@@ -512,8 +520,10 @@ def _gather_selected_kv(
 ) -> torch.Tensor:
     tensor = tensor[:, :, group_idx, :].permute(1, 0, 2)
     batch_size, query_length, topk = topk_indices.shape
-    gather_index = topk_indices[:, :, :, None].expand(
-        batch_size, query_length, topk, tensor.size(-1)
+    gather_index = (
+        topk_indices.clamp_min(0)
+        .long()[:, :, :, None]
+        .expand(batch_size, query_length, topk, tensor.size(-1))
     )
     return torch.gather(
         tensor[:, None, :, :].expand(batch_size, query_length, tensor.size(1), tensor.size(2)),
@@ -530,6 +540,10 @@ def _sparse_attention_tile(
     softmax_scale: float,
     q_start: int,
 ) -> torch.Tensor:
+    if _BI_SCORE_WIDTH.get() is not None:
+        from .dsa_batch_invariant import attention_contiguous
+
+        return attention_contiguous(query_tile, key, value, topk_indices, softmax_scale, q_start)
     triton_output = triton_sparse_attention_tile(
         query_tile, key, value, topk_indices, softmax_scale, q_start
     )
@@ -774,7 +788,11 @@ def _simplified_index_scores_block(
 def _gather_simplified_selected_key(key: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
     key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
     batch_size, query_length, topk = topk_indices.shape
-    gather_index = topk_indices[..., None].expand(batch_size, query_length, topk, key.size(-1))
+    gather_index = (
+        topk_indices.clamp_min(0)
+        .long()[..., None]
+        .expand(batch_size, query_length, topk, key.size(-1))
+    )
     return torch.gather(
         key_by_batch[:, None, :, :].expand(batch_size, query_length, key.size(0), key.size(-1)),
         2,
@@ -963,6 +981,13 @@ def _simplified_topk_index_tile(
         use_indexer_rope,
         simplified_input_norm,
     )
+    if _BI_SCORE_WIDTH.get() is not None:
+        from .dsa_batch_invariant import route_contiguous
+
+        scores, indices = route_contiguous(
+            q_index, full_k_index, q_start, q_end, index_topk, _BI_SCORE_WIDTH.get(), score_scale
+        )
+        return scores, indices, q_index
     causal_key_limit = min(q_end, key.size(0))
     topk = min(index_topk, causal_key_limit)
     running_scores = None
@@ -1061,13 +1086,19 @@ def _simplified_sparse_forward_impl(
         if loss_coeff > 0:
             # FP32 for the KL below.
             selected_scores = routing_scores.float()
+            loss_indices = topk_indices
+            if _BI_SCORE_WIDTH.get() is not None and topk_indices.size(-1) > key.size(0):
+                # DeepSelect's extra slots are a -1 suffix for every row. Keep the configured
+                # support width in forward attention, but omit this empty suffix from KL.
+                loss_indices = topk_indices[..., : key.size(0)].contiguous()
+                selected_scores = selected_scores[..., : key.size(0)].contiguous()
             if selected_scores_cache is not None:
                 selected_scores_cache.append(selected_scores)
             indexer_loss = indexer_loss + _indexer_loss_tile(
                 selected_scores,
                 query_tile,
                 key,
-                topk_indices,
+                loss_indices,
                 attention_softmax_scale,
                 loss_coeff,
                 total_positions,
@@ -1106,6 +1137,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_selected_scores: bool = False,
         cache_indexer_k: bool = False,
         use_triton: bool = True,
+        bi_score_width: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         key_chunk_size = _plan_execution(
@@ -1113,7 +1145,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ).routing_key_chunk
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
-        with _triton_dispatch_enabled(use_triton):
+        with _triton_dispatch_enabled(use_triton, bi_score_width):
             with torch.no_grad():
                 # Project the indexer K once for the whole sequence. Routing would otherwise
                 # reproject the causal prefix inside every query tile: at sequence 131072 with a
@@ -1182,6 +1214,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
         )
         ctx.use_triton = use_triton
+        ctx.bi_score_width = bi_score_width
         return output, indexer_loss
 
     @staticmethod
@@ -1197,7 +1230,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             # forward does: the tile loop below would otherwise reproject the causal prefix per
             # tile. This is the recompute the empty cached_k asked for, done once rather than
             # once per tile, and it is released when this backward returns.
-            with torch.no_grad():
+            with torch.no_grad(), _triton_dispatch_enabled(ctx.use_triton, ctx.bi_score_width):
                 full_k_index = _build_full_indexer_k(
                     hidden_states,
                     linear_k_weight,
@@ -1243,7 +1276,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         grad_key_accum = None
         grad_value_accum = None
 
-        with _triton_dispatch_enabled(ctx.use_triton):
+        with _triton_dispatch_enabled(ctx.use_triton, ctx.bi_score_width):
             learned_k_norm_stats = None
             if (
                 compute_loss_grad
@@ -1283,6 +1316,12 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             full_k_index=full_k_index,
                         )
 
+                if ctx.bi_score_width is not None and topk_indices.size(-1) > key.size(0):
+                    # Backward consumes the same selected support without its empty suffix.
+                    topk_indices = topk_indices[..., : key.size(0)].contiguous()
+                    if routing_scores is not None:
+                        routing_scores = routing_scores[..., : key.size(0)].contiguous()
+
                 triton_attention_done = False
                 if use_triton_attention_backward:
                     query_tile = query[q_start:q_end]
@@ -1312,9 +1351,12 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             grad_value_accum,
                             ctx.attention_softmax_scale,
                             q_start,
+                            fp32_grad=ctx.bi_score_width is not None,
                         )
 
                 if not triton_attention_done:
+                    if ctx.bi_score_width is not None and needs_query_grad:
+                        raise RuntimeError("Unsupported batch-invariant DSA sparse backward shape.")
                     attention_inputs = []
                     query_tile = (
                         query[q_start:q_end].detach().requires_grad_(ctx.needs_input_grad[0])
@@ -1972,6 +2014,7 @@ def dsa_min_memory_gqa_forward_only(
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
+        bi_width = _indexer_bi_width(indexer, query, use_triton)
         plan = _plan_execution(
             query.size(1),
             query.size(0),
@@ -1983,7 +2026,7 @@ def dsa_min_memory_gqa_forward_only(
         query_chunk_size = plan.query_chunk
         key_chunk_size = plan.routing_key_chunk
         linear_k_weight = _module_weight(indexer.linear_k)
-        with torch.no_grad(), _triton_dispatch_enabled(use_triton):
+        with torch.no_grad(), _triton_dispatch_enabled(use_triton, bi_width):
             # Project once, as the training forward does. Nothing is retained on this path --
             # there is no backward to feed -- so cache_indexer_k has nothing left to decide.
             full_k_index = _build_full_indexer_k(
@@ -2125,4 +2168,16 @@ def dsa_min_memory_gqa(
             cache_selected_scores,
             cache_indexer_k,
             use_triton,
+            _indexer_bi_width(indexer, query, use_triton),
         )
+
+
+def _indexer_bi_width(indexer, query, use_triton):
+    if not getattr(indexer.config, "batch_invariant_mode", False):
+        return None
+    from .dsa_batch_invariant import score_width
+
+    width = score_width(indexer.max_seq_length, indexer.index_topk)
+    if not use_triton or query.dtype != torch.bfloat16 or query.size(0) > indexer.max_seq_length:
+        raise ValueError("Batch-invariant DSA requires BF16 Triton and sequence <= max_seq_length.")
+    return width

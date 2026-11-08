@@ -516,7 +516,7 @@ def _dsa_simplified_selected_scores_kernel(
         mask=support_mask,
         other=0,
     )
-    valid = support_mask & (selected <= q_start + query_idx)
+    valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
     q = tl.load(
         q_ptr + query_idx * q_stride_m + batch_idx * q_stride_b + offs_d * q_stride_d,
         mask=offs_d < HEAD_DIM,
@@ -588,7 +588,7 @@ def _dsa_simplified_selected_scores_backward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         grad_scores = tl.load(
             grad_scores_ptr
             + batch_idx * gs_stride_b
@@ -667,7 +667,7 @@ def _dsa_simplified_selected_scores_backward_qk_kernel(
         mask=support_mask,
         other=0,
     )
-    valid = support_mask & (selected_positions <= q_start + query_idx)
+    valid = support_mask & (selected_positions >= 0) & (selected_positions <= q_start + query_idx)
     grad_scores = tl.load(
         grad_scores_ptr + batch_idx * gs_stride_b + query_idx * gs_stride_m + offs_k * gs_stride_k,
         mask=valid,
@@ -848,7 +848,7 @@ def _dsa_selected_index_scores_kernel(
         mask=support_mask,
         other=0,
     )
-    valid = support_mask & (selected_positions <= q_start + query_idx)
+    valid = support_mask & (selected_positions >= 0) & (selected_positions <= q_start + query_idx)
     score = tl.where(valid, score, -float("inf"))
     tl.store(
         out_scores_ptr
@@ -922,7 +922,7 @@ def _dsa_selected_index_scores_backward_kernel(
         mask=support_mask,
         other=0,
     )
-    valid = support_mask & (selected_positions <= q_start + query_idx)
+    valid = support_mask & (selected_positions >= 0) & (selected_positions <= q_start + query_idx)
     grad_scores = tl.load(
         grad_scores_ptr + batch_idx * gs_stride_b + query_idx * gs_stride_m + offs_k * gs_stride_k,
         mask=support_mask,
@@ -1120,7 +1120,7 @@ def _dsa_sparse_attention_forward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1152,7 +1152,7 @@ def _dsa_sparse_attention_forward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1301,7 +1301,7 @@ def _dsa_sparse_attention_backward_kernel(
     elif VALUE_DTYPE == 2:
         grad_out_for_value = grad_out.to(tl.bfloat16)
     else:
-        grad_out_for_value = grad_out
+        grad_out_for_value = grad_out.to(tl.float32)
     grad_out_block = tl.broadcast_to(tl.expand_dims(grad_out_for_value, 0), (BLOCK_K, BLOCK_DV))
     running_max = tl.full((), -float("inf"), dtype=tl.float32)
     running_sum = tl.full((), 0.0, dtype=tl.float32)
@@ -1318,7 +1318,7 @@ def _dsa_sparse_attention_backward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1364,7 +1364,7 @@ def _dsa_sparse_attention_backward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1550,8 +1550,8 @@ def _dsa_sparse_attention_backward_pair_kernel(
         grad_out0_for_value = grad_out0.to(tl.bfloat16)
         grad_out1_for_value = grad_out1.to(tl.bfloat16)
     else:
-        grad_out0_for_value = grad_out0
-        grad_out1_for_value = grad_out1
+        grad_out0_for_value = grad_out0.to(tl.float32)
+        grad_out1_for_value = grad_out1.to(tl.float32)
     grad_out0_block = tl.broadcast_to(tl.expand_dims(grad_out0_for_value, 0), (BLOCK_K, BLOCK_DV))
     grad_out1_block = tl.broadcast_to(tl.expand_dims(grad_out1_for_value, 0), (BLOCK_K, BLOCK_DV))
 
@@ -1573,7 +1573,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1631,7 +1631,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1786,7 +1786,7 @@ def _dsa_teacher_scores_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1816,7 +1816,7 @@ def _dsa_teacher_scores_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        valid = support_mask & (selected >= 0) & (selected <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1913,6 +1913,7 @@ def _triton_sparse_attention_backward(
     grad_value_accum: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    fp32_grad: bool = False,
 ) -> None:
     query_len, batch_size, num_heads, head_dim = query.shape
     num_groups = key.size(2)
@@ -1921,6 +1922,9 @@ def _triton_sparse_attention_backward(
     block_d = _next_power_of_2(head_dim)
     block_dv = max(32, _next_power_of_2(value_dim))
     topk = topk_indices.size(-1)
+    # Tag zero promotes V*dO and probability products before reduction. The BI path needs
+    # this precision when many query rows accumulate into the same KV gradient.
+    value_math_dtype = 0 if fp32_grad else _value_dtype_tag(value.dtype)
     if repeat_factor >= 2 and repeat_factor % 2 == 0 and block_d <= 256 and block_dv <= 256:
         pairs_per_group = repeat_factor // 2
         grid = (query_len, batch_size, num_groups * pairs_per_group)
@@ -1952,7 +1956,7 @@ def _triton_sparse_attention_backward(
                 VALUE_DIM=value_dim,
                 BLOCK_D=block_d,
                 BLOCK_DV=block_dv,
-                VALUE_DTYPE=_value_dtype_tag(value.dtype),
+                VALUE_DTYPE=value_math_dtype,
             )
             return
         except _TRITON_RESOURCE_ERRORS:
@@ -1984,7 +1988,7 @@ def _triton_sparse_attention_backward(
         VALUE_DIM=value_dim,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        VALUE_DTYPE=_value_dtype_tag(value.dtype),
+        VALUE_DTYPE=value_math_dtype,
     )
 
 
@@ -2033,6 +2037,7 @@ def triton_sparse_attention_backward_accumulate(
     grad_value_accum: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    fp32_grad: bool = False,
 ) -> bool:
     """Accumulate sparse-attention gradients into dQ, dK and dV."""
     if not triton_sparse_attention_backward_supported(
@@ -2057,6 +2062,7 @@ def triton_sparse_attention_backward_accumulate(
         grad_value_accum,
         softmax_scale,
         q_start,
+        fp32_grad,
     )
     return True
 

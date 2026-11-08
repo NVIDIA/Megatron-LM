@@ -1307,6 +1307,10 @@ class TestDSGQADynamicInference:
     @pytest.mark.parametrize("head_dim", [128, 256])
     def test_decode_logprobs_match_training(self, monkeypatch, backend, head_dim):
         """The same weights and token histories give close full-vocabulary logprobs."""
+        from megatron.core.tuning import policy as tuning_policy
+
+        # The non-BI baseline intentionally uses GVR2, which rejects deterministic routing.
+        monkeypatch.setattr(tuning_policy, "_deterministic_override", False)
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Native DSA decode requires Blackwell")
         pytest.importorskip("cutlass.cute")
