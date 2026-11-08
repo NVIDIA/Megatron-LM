@@ -18,12 +18,16 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
 from tests.unit_tests.test_utilities import Utils
@@ -210,6 +214,113 @@ def gpu_model_parallel():
     model_parallel_cuda_manual_seed(1234)
     yield ProcessGroupCollection.use_mpu_process_groups()
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("recompute_mode", [None, "uniform", "block", "mhc"])
+def test_external_layer_mhc_matches_eager(gpu_model_parallel, recompute_mode):
+    def make_stack(mode):
+        options = {}
+        if mode == "mhc":
+            options = dict(
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                mhc_recompute_layer_num=2,
+            )
+        elif mode is not None:
+            options = dict(
+                recompute_granularity="full", recompute_method=mode, recompute_num_layers=1
+            )
+        root = _root_config(
+            num_layers=2,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=3,
+            **options,
+        )
+        custom = ExternalGainConfig.from_config(root)
+        return HybridStack(
+            config=root,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=clone_hybrid_layer_config_list([custom, custom]),
+            pg_collection=gpu_model_parallel,
+            post_layer_norm=False,
+        ).cuda()
+
+    eager = make_stack(None)
+    actual = make_stack(recompute_mode)
+    actual.load_state_dict(eager.state_dict())
+    hidden = torch.randn(4, 2, eager.config.hidden_size, device="cuda")
+    inputs = dict(
+        attention_mask=torch.zeros(2, 1, 4, 4, device="cuda", dtype=torch.bool),
+        rotary_pos_emb=torch.randn(4, 1, 1, eager.config.kv_channels, device="cuda"),
+        packed_seq_params=PackedSeqParams(qkv_format="sbhd"),
+        padding_mask=torch.zeros(2, 4, device="cuda", dtype=torch.bool),
+        input_ids=torch.arange(8, device="cuda").reshape(2, 4),
+    )
+    seen_shapes = []
+    for layer in actual.layers:
+        assert isinstance(layer, HyperConnectionHybridLayer)
+        layer.inner_layer.register_forward_pre_hook(
+            lambda _layer, args: seen_shapes.append(args[0].shape)
+        )
+
+    eager_input = hidden.clone().requires_grad_()
+    actual_input = hidden.clone().requires_grad_()
+    expected = eager(eager_input, **inputs)
+    output = actual(actual_input, **inputs)
+    torch.testing.assert_close(output, expected)
+    assert output.shape == hidden.shape
+    expected.square().mean().backward()
+    output.square().mean().backward()
+    torch.testing.assert_close(actual_input.grad, eager_input.grad)
+    assert seen_shapes and all(shape == hidden.shape for shape in seen_shapes)
+    for layer in actual.layers:
+        for observed, supplied in zip(
+            layer.inner_layer.last_forward_inputs, inputs.values(), strict=True
+        ):
+            if isinstance(supplied, torch.Tensor):
+                torch.testing.assert_close(observed, supplied)
+            else:
+                assert observed is supplied
+        for parameter in (layer.inner_layer.gain, layer.hyper_connection.mapping_proj.weight):
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+    for name, parameter in actual.named_parameters():
+        torch.testing.assert_close(parameter.grad, eager.get_parameter(name).grad, msg=name)
+
+
+def test_external_transformer_subclass_mhc_calls_custom_forward(gpu_model_parallel):
+    class CustomTransformerLayer(TransformerLayer):
+        def __init__(self, config):
+            MegatronModule.__init__(self, config)
+            self.layer_number = 1
+            self.self_attention = torch.nn.Identity()
+            self.cross_attention = IdentityOp()
+            self.mlp = IdentityOp()
+            self.forward_calls = 0
+
+        def forward(self, hidden_states, **_kwargs):
+            self.forward_calls += 1
+            return hidden_states * 1.25
+
+        def _forward_self_attention_output_with_bias(self, **_kwargs):
+            raise AssertionError("Custom TransformerLayer.forward must not be bypassed")
+
+    class CustomTransformerConfig(ExternalGainConfig):
+        layer_type = CustomTransformerLayer
+
+    config = CustomTransformerConfig.from_config(
+        _root_config(num_layers=1, enable_mhc_connections=True, mhc_num_residual_streams=2)
+    )
+    inner = CustomTransformerLayer(config)
+    wrapper = HyperConnectionHybridLayer(config, inner).cuda()
+    hidden = torch.randn(4, 2, config.hidden_size * 2, device="cuda", requires_grad=True)
+    output, context = wrapper(hidden, attention_mask=None)
+    assert inner.forward_calls == 1
+    assert context is None
+    assert output.shape == hidden.shape
+    output.square().mean().backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
 
 
 def _gpu_model(groups, recompute_method=None, with_mtp=False):

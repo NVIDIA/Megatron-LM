@@ -126,10 +126,18 @@ def checkpointed_forward(
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-                if input_ids is not None and getattr(router, "is_hash_layer", False):
+                is_custom_layer = (
+                    hybrid_layer_utils.get_custom_layer_type(getattr(layer, "config", None))
+                    is not None
+                )
+                if input_ids is not None and (
+                    is_custom_layer or getattr(router, "is_hash_layer", False)
+                ):
                     layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
-                    if hybrid_layer_utils.get_custom_layer_type(layer.config) is not None:
+                    if is_custom_layer and not getattr(
+                        layer, "supports_hybrid_recompute_kwargs", False
+                    ):
                         hidden_states = hybrid_layer_utils.invoke_custom_layer(
                             layer,
                             hidden_states,
