@@ -95,8 +95,11 @@ def test_external_config_parser_preserves_pipeline_and_mtp_identity():
     assert parsed.mtp_num_depths == 2
 
 
-def test_external_layer_cpu_stack_forward_backward_and_context():
-    root = _root_config(num_layers=2)
+@pytest.mark.parametrize("shortcut", [False, True])
+def test_external_layer_cpu_stack_forward_backward_and_context(shortcut):
+    root = _root_config(
+        num_layers=2, moe_shortcut_connection=shortcut, num_moe_experts=2 if shortcut else None
+    )
     source = ExternalGainConfig.from_config(root)
     physical_configs = clone_hybrid_layer_config_list([source, source])
     groups = _single_rank_groups()
