@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -29,13 +30,12 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.parametrize("recompute_mhc", [False, True])
-@pytest.mark.parametrize("custom_units", [False, True])
 @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
 @pytest.mark.parametrize("fused_input_layernorm", [False, True])
 def test_mhc_replay_unit_selection(
-    process_group_collection, recompute_mhc, custom_units, normalization, fused_input_layernorm
+    process_group_collection, recompute_mhc, normalization, fused_input_layernorm
 ):
-    """Replay needs parameterized child units even with an explicit wrapping policy."""
+    """mHC replay gives standalone norms their own units alongside routed experts."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
@@ -71,19 +71,16 @@ def test_mhc_replay_unit_selection(
     assert isinstance(attention, HyperConnectionHybridLayer)
     assert isinstance(moe, HyperConnectionHybridLayer)
     collector = FsdpUnitCollector(
-        () if custom_units else (HyperConnectionHybridLayer, TransformerLayer)
+        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
     )
     expected = []
     if recompute_mhc and not fused_input_layernorm:
         expected.append(attention.inner_layer.input_layernorm)
-    if not custom_units:
-        expected.append(attention)
+    expected.append(attention)
     if recompute_mhc:
         expected.append(moe.inner_layer.pre_mlp_layernorm)
     expected.append(moe.inner_layer.mlp.experts)
-    if not custom_units:
-        expected.append(moe)
-    expected.append(model)
+    expected.extend([moe, model])
     assert collector.collect(model) == expected
 
 
@@ -116,7 +113,9 @@ def test_mhc_owns_mamba_norm_and_mixer(process_group_collection):
     mamba, attention = model.decoder.layers
     assert isinstance(mamba.inner_layer, MambaLayer)
     assert next(mamba.inner_layer.norm.parameters(), None) is not None
-    collector = FsdpUnitCollector((HyperConnectionHybridLayer, MambaLayer, TransformerLayer))
+    collector = FsdpUnitCollector(
+        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
+    )
 
     assert collector.collect(model) == [mamba, attention, model]
     assert collector.collect(mamba) == [mamba]

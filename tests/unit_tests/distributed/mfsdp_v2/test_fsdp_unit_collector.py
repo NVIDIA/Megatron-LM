@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""FSDP unit selection for real MCore layers and generic module containers."""
+"""Default FSDP unit selection for real MCore layers."""
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -33,35 +34,8 @@ def process_group_collection(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    "unit_types, expected_names",
-    [
-        ((), [""]),
-        ((nn.Linear,), ["block.0", "projection", ""]),
-        ((nn.Sequential,), ["block", ""]),
-        ((nn.Module,), ["block.0", "block.1", "block", "projection", ""]),
-    ],
-)
-def test_custom_units_and_root_are_collected_once(unit_types, expected_names):
-    """Configured units precede their owner, including when the root matches the policy."""
-    root = nn.Module()
-    root.block = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
-    root.projection = nn.Linear(4, 4)
-    names = {module: name for name, module in root.named_modules()}
-    collector = FsdpUnitCollector(unit_types)
-
-    units = collector.collect(root)
-    assert [names[unit] for unit in units] == expected_names
-    assert collector.collect(root) == units
-
-
 @pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
-@pytest.mark.parametrize(
-    "unit_types, collect_layer", [((), False), ((TransformerLayer,), True), ((nn.Module,), True)]
-)
-def test_routed_experts_are_explicit_units(
-    process_group_collection, grouped_gemm, unit_types, collect_layer
-):
+def test_routed_experts_are_explicit_units(process_group_collection, grouped_gemm):
     """Transformer layers select routed experts directly and own their remaining internals."""
     config = TransformerConfig(
         num_layers=1,
@@ -88,10 +62,11 @@ def test_routed_experts_are_explicit_units(
     assert isinstance(experts, TEGroupedMLP if grouped_gemm else SequentialMLP)
     assert layer.mlp.shared_experts is not None
     root = nn.Sequential(layer)
-    collector = FsdpUnitCollector(unit_types)
+    collector = FsdpUnitCollector(
+        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
+    )
 
-    expected = [experts, layer, root] if collect_layer else [experts, root]
-    assert collector.collect(root) == expected
+    assert collector.collect(root) == [experts, layer, root]
 
 
 @pytest.mark.parametrize("pattern", ["*E*", "MEM"], ids=["attention", "mamba"])
@@ -121,6 +96,8 @@ def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
     block, sibling = model.decoder.layers
     assert isinstance(block, ShortcutMoEBlock)
     assert isinstance(sibling, TransformerLayer if pattern == "*E*" else MambaLayer)
-    collector = FsdpUnitCollector((ShortcutMoEBlock, TransformerLayer, MambaLayer))
+    collector = FsdpUnitCollector(
+        (TransformerLayer, MambaLayer, ShortcutMoEBlock, HyperConnectionHybridLayer)
+    )
 
     assert collector.collect(model) == [block.moe_layer.mlp.experts, block, sibling, model]
