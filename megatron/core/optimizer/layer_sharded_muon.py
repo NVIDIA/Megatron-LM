@@ -772,7 +772,7 @@ class LayerShardedMuon(TensorParallelMuon):
                     for i, ns_output in self._iter_ns(
                         replicated,
                         load=lambda p: ns_input(p).reshape(
-                            getattr(p, 'muon_matrix_shape', None) or p.shape
+                            getattr(p, "muon_matrix_shape", None) or p.shape
                         ),
                     ):
                         self._apply_update(params[i], ns_output.reshape_as(params[i]), lr)
