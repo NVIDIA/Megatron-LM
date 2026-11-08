@@ -109,8 +109,9 @@ class TestLocalCheckpointing:
                     checkpointing_context=context,
                     non_persistent_ckpt=True,
                 )
-            saved_config = save.call_args.args[0].common_state_dict["run_config"]
-            assert saved_config == RunConfigRecord(pretrain=run_config).to_dict()
+            saved_record = save.call_args.args[0].common_state_dict["run_config"]
+            assert saved_record == RunConfigRecord(pretrain=run_config).to_dict()
+            saved_config = saved_record["pretrain"]
             run_config.logger.log_interval += 1
             torch.manual_seed(999)
             sync_checkpoint_config(args)

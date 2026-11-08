@@ -566,6 +566,14 @@ def test_pre_data_run_config_loads_with_the_default_section(run_config):
     assert "data" not in legacy  # the caller's dictionary is not modified
 
 
+def test_run_config_with_the_retired_rl_section_loads(run_config):
+    """A run_config.yaml saved while the pretrain container carried `rl` still loads."""
+    legacy = run_config.to_dict()
+    legacy["rl"] = {"_target_": "megatron.training.config.rl_config.RLConfig"}
+    restored = PretrainConfigContainer.from_dict(legacy)
+    assert "rl" not in restored.to_dict()
+
+
 # The runtime services bind the tokenizer.
 
 

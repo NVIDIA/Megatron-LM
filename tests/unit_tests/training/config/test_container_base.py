@@ -646,6 +646,18 @@ class TestConfigContainer_Integration:
         assert loaded_config.value == config.value
         assert loaded_config.description == config.description
 
+    def test_from_yaml_rejects_a_document_of_another_container(self):
+        """Reading a document through another container class raises instead of returning an
+        instance of the document's own class."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "test_config.yaml")
+            TestConfigContainer(name="saved").to_yaml(tmp_path)
+
+            with pytest.raises(
+                TypeError, match="Expected ComplexConfigContainer, got TestConfigContainer"
+            ):
+                ComplexConfigContainer.from_yaml(tmp_path)
+
 
 class TestConfigContainer_EdgeCases:
     """Test edge cases for ConfigContainer."""
