@@ -386,7 +386,17 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The other KDA module and fusion suites take ~20 min of the broad SSM bucket
+  # on H100 (fused pre-KDA parity alone ~8 min with its cold Triton compilation),
+  # which pushed that bucket past its time limit. Give each its own job.
   - test_case: [tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_kda_gate_precision.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
