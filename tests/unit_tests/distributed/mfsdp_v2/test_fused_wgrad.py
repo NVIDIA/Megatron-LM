@@ -397,6 +397,45 @@ def _delay_inner_reduction_stream(context):
     return hook
 
 
+def _stalled_backward_grads(distributed_setup, model, context, *, delay_wgrad_compute=False):
+    """Return the local gradients of a backward run with the inner reduction stream stalled.
+
+    A first backward without the stall loads every kernel: with lazy module loading, a kernel's
+    first launch can block the CPU until the stalled stream drains, hiding a missing wait.
+    """
+    torch.manual_seed(5678)
+    x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+
+    def backward():
+        model(x).square().mean().backward()
+        if delay_wgrad_compute:
+            # Forward order, the reverse of backward order.
+            for layer in model:
+                layer.backward_dw()
+            context.finish_grad_sync()
+
+    backward()
+    model.zero_grad()
+    # prepend=True: stall before MFSDP's pre-hook allocates the last layer's buffer.
+    model.register_full_backward_pre_hook(_delay_inner_reduction_stream(context), prepend=True)
+    backward()
+    return [parameter.grad.to_local().clone() for parameter in model.parameters()]
+
+
+def _assert_fused_grads_match(grads):
+    """Compare fused against copied gradients, which must be large enough to expose zeros."""
+    # A buffer zeroed after TE wrote into it leaves zeros, which atol accepts for tiny grads.
+    # A rank's shard of a gradient can be empty, so take each gradient's largest entry over all
+    # ranks, in one collective issued before any rank can fail an assertion.
+    largest = torch.stack(
+        [grad.abs().amax() if grad.numel() else grad.new_zeros(()) for grad in grads[False]]
+    )
+    torch.distributed.all_reduce(largest, op=torch.distributed.ReduceOp.MAX)
+    assert (largest > 1e-3).all(), largest
+    for fused_grad, copied_grad in zip(grads[True], grads[False]):
+        torch.testing.assert_close(fused_grad, copied_grad, rtol=1e-5, atol=1e-5)
+
+
 def _fused_linear_stack(
     distributed_setup,
     *,
@@ -427,6 +466,11 @@ def _fused_linear_stack(
             for _ in range(3)
         )
     )
+    # TE's default initialization leaves these gradients near 1e-6, below assert_close's
+    # atol, where a wiped buffer would still match. Unit-scale weights keep them well above it.
+    with torch.no_grad():
+        for layer in model:
+            nn.init.normal_(layer.weight, std=16**-0.5)
     runtime_policy = RuntimePolicy(
         overlap_allgather_reduction=overlap_allgather_reduction,
         caller_managed_grad_sync=caller_managed_grad_sync,
@@ -522,15 +566,8 @@ def test_fused_wgrad_waits_for_its_buffer_to_be_zeroed(
         model, context = _fused_linear_stack(
             distributed_setup, fuse=fuse, overlap_allgather_reduction=overlap_allgather_reduction
         )
-        # prepend=True: stall before MFSDP's pre-hook allocates the last layer's buffer.
-        model.register_full_backward_pre_hook(_delay_inner_reduction_stream(context), prepend=True)
-        torch.manual_seed(5678)
-        x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
-        model(x).square().mean().backward()
-        grads[fuse] = [parameter.grad.to_local().clone() for parameter in model.parameters()]
-
-    for fused_grad, copied_grad in zip(grads[True], grads[False]):
-        torch.testing.assert_close(fused_grad, copied_grad, rtol=1e-5, atol=1e-5)
+        grads[fuse] = _stalled_backward_grads(distributed_setup, model, context)
+    _assert_fused_grads_match(grads)
 
 
 def test_fused_wgrad_delayed_weight_gradients_in_any_order(distributed_setup):
@@ -540,15 +577,7 @@ def test_fused_wgrad_delayed_weight_gradients_in_any_order(distributed_setup):
         model, context = _fused_linear_stack(
             distributed_setup, fuse=fuse, delay_wgrad_compute=True, caller_managed_grad_sync=True
         )
-        model.register_full_backward_pre_hook(_delay_inner_reduction_stream(context), prepend=True)
-        torch.manual_seed(5678)
-        x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
-        model(x).square().mean().backward()
-        # Forward order, the reverse of backward order.
-        for layer in model:
-            layer.backward_dw()
-        context.finish_grad_sync()
-        grads[fuse] = [layer.weight.grad.to_local().clone() for layer in model]
-
-    for fused_grad, copied_grad in zip(grads[True], grads[False]):
-        torch.testing.assert_close(fused_grad, copied_grad, rtol=1e-5, atol=1e-5)
+        grads[fuse] = _stalled_backward_grads(
+            distributed_setup, model, context, delay_wgrad_compute=True
+        )
+    _assert_fused_grads_match(grads)
