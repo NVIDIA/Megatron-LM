@@ -2,21 +2,21 @@
 
 """mHC replay unit selection and training parity with MFSDP v2."""
 
-from types import SimpleNamespace
+from copy import deepcopy
 
 import pytest
 import torch
-from torch import nn
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.extensions.transformer_engine import te
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -30,47 +30,103 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize("recompute_mhc", [False, True])
 @pytest.mark.parametrize("custom_units", [False, True])
-@pytest.mark.parametrize("norm_name", ["input_layernorm", "pre_mlp_layernorm"])
-@pytest.mark.parametrize(
-    "norm_type", [nn.LayerNorm, nn.RMSNorm, te.pytorch.LayerNorm, te.pytorch.RMSNorm]
-)
-def test_mhc_replay_unit_selection(recompute_mhc, custom_units, norm_name, norm_type):
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+@pytest.mark.parametrize("fused_input_layernorm", [False, True])
+def test_mhc_replay_unit_selection(
+    process_group_collection, recompute_mhc, custom_units, normalization, fused_input_layernorm
+):
     """Replay needs parameterized child units even with an explicit wrapping policy."""
-    # Unit selection only needs the module tree, not initialized attention kernels.
-    inner = TransformerLayer.__new__(TransformerLayer)
-    nn.Module.__init__(inner)
-    inner.input_layernorm = nn.LayerNorm(4, elementwise_affine=False)
-    inner.pre_mlp_layernorm = nn.LayerNorm(4, elementwise_affine=False)
-    norm = norm_type(4, device="cpu")
-    setattr(inner, norm_name, norm)
-    inner.mlp = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4))
-    inner.is_moe_layer = False
-    wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
-    nn.Module.__init__(wrapper)
-    wrapper.inner_layer = inner
-    wrapper.hyper_connection = nn.Linear(4, 4)
-    wrapper.config = SimpleNamespace(
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        add_bias_linear=False,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+        normalization=normalization,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
         recompute_granularity="selective" if recompute_mhc else None,
         recompute_modules=["mhc"] if recompute_mhc else None,
+        mhc_recompute_layer_num=2 if recompute_mhc else None,
     )
-    root = nn.Sequential(wrapper, nn.LayerNorm(4))
+    stack_spec = deepcopy(hybrid_stack_spec)
+    if not fused_input_layernorm:
+        attention = stack_spec.submodules.attention_layer.submodules
+        attention.input_layernorm = TENorm
+        attention.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E",
+        pg_collection=process_group_collection,
+    )
+    attention, moe = model.decoder.layers
+    assert isinstance(attention, HyperConnectionHybridLayer)
+    assert isinstance(moe, HyperConnectionHybridLayer)
     collector = FsdpUnitCollector(
         () if custom_units else (HyperConnectionHybridLayer, TransformerLayer)
     )
-    expected = [norm] if recompute_mhc else []
+    expected = []
+    if recompute_mhc and not fused_input_layernorm:
+        expected.append(attention.inner_layer.input_layernorm)
     if not custom_units:
-        expected.append(wrapper)
-    expected.append(root)
-    assert collector.collect(root) == expected
+        expected.append(attention)
+    if recompute_mhc:
+        expected.append(moe.inner_layer.pre_mlp_layernorm)
+    expected.append(moe.inner_layer.mlp.experts)
+    if not custom_units:
+        expected.append(moe)
+    expected.append(model)
+    assert collector.collect(model) == expected
 
-    # Each collection must reflect the current recompute configuration.
-    wrapper.config.recompute_modules = []
-    assert collector.collect(root) == ([root] if custom_units else [wrapper, root])
+
+def test_mhc_owns_mamba_norm_and_mixer(process_group_collection):
+    """mHC owns a real Mamba layer, including its separately constructed input norm."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=256,
+        num_attention_heads=4,
+        add_bias_linear=False,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
+        recompute_granularity="selective",
+        recompute_modules=["mhc"],
+        mhc_recompute_layer_num=2,
+    )
+    stack_spec = deepcopy(hybrid_stack_spec)
+    stack_spec.submodules.mamba_layer.submodules.norm = TENorm
+    stack_spec.submodules.mamba_layer.submodules.mixer.submodules.in_proj = TEColumnParallelLinear
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="M*",
+        pg_collection=process_group_collection,
+    )
+    mamba, attention = model.decoder.layers
+    assert isinstance(mamba.inner_layer, MambaLayer)
+    assert next(mamba.inner_layer.norm.parameters(), None) is not None
+    collector = FsdpUnitCollector((HyperConnectionHybridLayer, MambaLayer, TransformerLayer))
+
+    assert collector.collect(model) == [mamba, attention, model]
+    assert collector.collect(mamba) == [mamba]
 
 
 @pytest.fixture
 def process_group_collection(distributed_setup):
     """Initialize TP=PP=1 so FSDP shards over the data-parallel ranks."""
+    if not torch.cuda.is_available():
+        pytest.skip("MCore model construction requires CUDA.")
     Utils.initialize_model_parallel(1, 1)
     torch.manual_seed(1234)  # mHC also initializes parameters on the CPU.
     model_parallel_cuda_manual_seed(1234)

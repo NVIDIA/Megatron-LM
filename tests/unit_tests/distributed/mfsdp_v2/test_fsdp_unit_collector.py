@@ -1,28 +1,36 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""FSDP unit selection without running model kernels."""
-
-from types import SimpleNamespace
+"""FSDP unit selection for real MCore layers and generic module containers."""
 
 import pytest
+import torch
 from torch import nn
 
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
-from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
+from tests.unit_tests.test_utilities import Utils
 
 
-def _empty_module(module_type):
-    """Build only the module hierarchy, without initializing distributed kernels."""
-    module = module_type.__new__(module_type)
-    nn.Module.__init__(module)
-    if isinstance(module, TransformerLayer):
-        module.is_moe_layer = False
-    return module
+@pytest.fixture
+def process_group_collection(distributed_setup):
+    """Initialize the process groups used by the real model constructors."""
+    if not torch.cuda.is_available():
+        pytest.skip("MCore model construction requires CUDA.")
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(1234)
+    yield ProcessGroupCollection.use_mpu_process_groups()
+    destroy_model_parallel()
 
 
 @pytest.mark.parametrize(
@@ -47,88 +55,72 @@ def test_custom_units_and_root_are_collected_once(unit_types, expected_names):
     assert collector.collect(root) == units
 
 
-@pytest.mark.parametrize("expert_type", [nn.Sequential, TEGroupedMLP, SequentialMLP])
+@pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
 @pytest.mark.parametrize(
-    "unit_types, expected_names",
-    [
-        ((), ["layer.mlp.experts", ""]),
-        ((TransformerLayer,), ["layer.mlp.experts", "layer", ""]),
-        ((MoELayer,), ["layer.mlp.experts", ""]),
-        ((nn.Sequential,), ["layer.mlp.experts", ""]),
-        ((nn.Linear,), ["layer.mlp.experts", ""]),
-    ],
+    "unit_types, collect_layer", [((), False), ((TransformerLayer,), True), ((nn.Module,), True)]
 )
-def test_routed_experts_are_explicit_units(expert_type, unit_types, expected_names):
+def test_routed_experts_are_explicit_units(
+    process_group_collection, grouped_gemm, unit_types, collect_layer
+):
     """Transformer layers select routed experts directly and own their remaining internals."""
-    layer = _empty_module(TransformerLayer)
-    layer.mlp = _empty_module(MoELayer)
-    layer.is_moe_layer = True
-    layer.mlp.experts = _empty_module(expert_type)
-    layer.mlp.experts.projection = nn.Linear(4, 4)
-    layer.mlp.shared = nn.Linear(4, 4)
-    layer.mlp.auxiliary = nn.Sequential(nn.Linear(4, 4))
-    root = nn.Module()
-    root.layer = layer
-    names = {module: name for name, module in root.named_modules()}
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
+        moe_grouped_gemm=grouped_gemm,
+        moe_token_dispatcher_type="alltoall",
+        add_bias_linear=False,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    layer = TransformerLayer(
+        config=config,
+        submodules=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=2, moe_grouped_gemm=grouped_gemm
+        ).submodules,
+        pg_collection=process_group_collection,
+        add_layer_offset=False,
+    )
+    experts = layer.mlp.experts
+    assert isinstance(experts, TEGroupedMLP if grouped_gemm else SequentialMLP)
+    assert layer.mlp.shared_experts is not None
+    root = nn.Sequential(layer)
     collector = FsdpUnitCollector(unit_types)
 
-    assert [names[unit] for unit in collector.collect(root)] == expected_names
+    expected = [experts, layer, root] if collect_layer else [experts, root]
+    assert collector.collect(root) == expected
 
 
-@pytest.mark.parametrize("layer_type", [TransformerLayer, MambaLayer])
-def test_shortcut_owns_helper_called_layers(layer_type):
+@pytest.mark.parametrize("pattern", ["*E*", "MEM"], ids=["attention", "mamba"])
+def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
     """Wrapper units keep helper-called layers and leave expert units independent."""
-    experts = nn.Sequential(nn.Linear(4, 4))
-    layer = _empty_module(layer_type)
-    layer.projection = nn.Linear(4, 4)
-    if isinstance(layer, TransformerLayer):
-        layer.mlp = nn.Identity()
-    moe_layer = _empty_module(TransformerLayer)
-    moe_layer.mlp = _empty_module(MoELayer)
-    moe_layer.is_moe_layer = True
-    moe_layer.mlp.shared = nn.Linear(4, 4)
-    moe_layer.mlp.experts = experts
-    wrapper = _empty_module(ShortcutMoEBlock)
-    wrapper.compute_layer = layer
-    wrapper.moe_layer = moe_layer
-    # A sibling layer outside the wrapper remains an independent unit.
-    sibling = _empty_module(layer_type)
-    sibling.projection = nn.Linear(4, 4)
-    if isinstance(sibling, TransformerLayer):
-        sibling.mlp = nn.Identity()
-    root = nn.ModuleList([wrapper, sibling])
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=512,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_shortcut_connection=True,
+        add_bias_linear=False,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern=pattern,
+        pg_collection=process_group_collection,
+    )
+    block, sibling = model.decoder.layers
+    assert isinstance(block, ShortcutMoEBlock)
+    assert isinstance(sibling, TransformerLayer if pattern == "*E*" else MambaLayer)
     collector = FsdpUnitCollector((ShortcutMoEBlock, TransformerLayer, MambaLayer))
 
-    assert collector.collect(root) == [experts, wrapper, sibling, root]
-
-
-def test_mhc_keeps_replayed_norms_and_routed_experts_independent():
-    """mHC owns the inner layer while norms and routed experts retain their hooks."""
-    layer = _empty_module(TransformerLayer)
-    layer.input_layernorm = nn.LayerNorm(4)
-    layer.pre_mlp_layernorm = nn.Identity()
-    layer.mlp = _empty_module(MoELayer)
-    layer.is_moe_layer = True
-    layer.mlp.shared = nn.Linear(4, 4)
-    layer.mlp.experts = nn.Sequential(nn.Linear(4, 4))
-    wrapper = _empty_module(HyperConnectionHybridLayer)
-    wrapper.inner_layer = layer
-    wrapper.hyper_connection = nn.Linear(4, 4)
-    wrapper.config = SimpleNamespace(recompute_granularity="selective", recompute_modules=["mhc"])
-    collector = FsdpUnitCollector((HyperConnectionHybridLayer, TransformerLayer))
-
-    assert collector.collect(wrapper) == [layer.input_layernorm, layer.mlp.experts, wrapper]
-
-
-def test_mhc_owns_mamba_norm_and_mixer():
-    """A wrapped Mamba has no routed experts or independently replayed Transformer norms."""
-    layer = _empty_module(MambaLayer)
-    layer.norm = nn.LayerNorm(4)
-    layer.mixer = nn.Linear(4, 4)
-    wrapper = _empty_module(HyperConnectionHybridLayer)
-    wrapper.inner_layer = layer
-    wrapper.hyper_connection = nn.Linear(4, 4)
-    wrapper.config = SimpleNamespace(recompute_granularity="selective", recompute_modules=["mhc"])
-    collector = FsdpUnitCollector((HyperConnectionHybridLayer, MambaLayer))
-
-    assert collector.collect(wrapper) == [wrapper]
+    assert collector.collect(model) == [block.moe_layer.mlp.experts, block, sibling, model]
