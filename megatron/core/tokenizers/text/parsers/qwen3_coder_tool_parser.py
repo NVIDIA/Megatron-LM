@@ -339,9 +339,14 @@ class _Qwen3CoderToolParser:
             The index of `</tool_call>`, or None if the call is not (yet) closed.
         """
         end_re = end_re or self._tool_call_end_re
+        end_match = None
         while True:
             param_match = self._parameter_start_re.search(text, pos)
-            end_match = end_re.search(text, pos)
+            # Reuse the candidate end tag while it is still ahead of `pos`;
+            # re-searching from every parameter would rescan the same suffix
+            # and make long calls quadratic in their parameter count.
+            if end_match is None or end_match.start() < pos:
+                end_match = end_re.search(text, pos)
             if end_match is None:
                 return None
             if param_match is None or end_match.start() < param_match.start():

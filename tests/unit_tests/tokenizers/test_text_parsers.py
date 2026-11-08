@@ -328,6 +328,25 @@ def test_qwen3_coder_function_end_inside_value_does_not_terminate_the_function()
     assert call_args(body) == {"a": "see </function> here", "b": 7}
 
 
+def test_qwen3_coder_function_scan_scales_linearly_with_parameter_count():
+    """Locating the closing </function> must not rescan the suffix per parameter."""
+
+    parser = _Qwen3CoderToolParser()
+
+    def scan_time(n):
+        text = "<function=fn>" + "<parameter=p>x</parameter>" * n + "</function>"
+        best = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            parser._find_tool_call_end(text, len("<function=fn>"), parser._function_end_re)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    small, large = scan_time(2000), scan_time(16000)
+    # 8x the parameters: ~8x the time if linear, ~64x if quadratic.
+    assert large < 25 * max(small, 1e-4)
+
+
 @pytest.mark.parametrize(
     "text,expected_name",
     [
