@@ -13,6 +13,8 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "megatron.bridge",
+    "megatron.bridge.*",
 ]
 
 [tool.setuptools.package-data]
