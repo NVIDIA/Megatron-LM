@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utilities for parameter ownership and metadata in FSDP modules."""
+"""Utilities for parameter ownership, metadata, and autograd state in FSDP modules."""
 
+import torch
 from torch import nn
+
+
+def is_in_backward() -> bool:
+    """Return whether the current thread is executing an autograd GraphTask."""
+    return torch._C._current_graph_task_id() != -1
 
 
 def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.Module, str]:

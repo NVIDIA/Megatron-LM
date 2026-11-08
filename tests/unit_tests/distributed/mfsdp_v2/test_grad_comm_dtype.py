@@ -17,6 +17,7 @@ from torch.distributed.tensor import Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -71,7 +72,7 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
         main_grads_dtype=main_grads_dtype,
         grad_comm_dtype=grad_comm_dtype,
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model, mesh=mesh, placements=_default_placements(), mixed_precision_policy=policy
         )
@@ -125,7 +126,7 @@ def test_mxfp8_partial_grad_buffer_follows_grad_comm_dtype(
         main_grads_dtype=main_grads_dtype,
         grad_comm_dtype=grad_comm_dtype,
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model, mesh=mesh, placements=_default_placements(), mixed_precision_policy=policy
         )
@@ -194,7 +195,7 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
         main_grads_dtype=torch.float32,
         grad_comm_dtype=grad_comm_dtype,
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in (model.fc1, model.fc2):
             fully_shard(
                 layer, mesh=mesh, placements=_default_placements(), mixed_precision_policy=policy

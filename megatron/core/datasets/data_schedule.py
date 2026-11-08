@@ -574,6 +574,13 @@ def wrap_data_iterator(
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
     scheduler_kwargs['pad_sequences'] = pad_enabled
+    if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
+        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+        if metadata_capacity is not None:
+            # Main's implicit MXFP8 alignment can append a dummy document too.
+            scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
+            if scheduler_kwargs["max_num_seqs"] < 1:
+                raise ValueError("THD metadata capacity must leave room for a real document.")
     if pad_enabled:
         capacity -= capacity % alignment
         if capacity < alignment:
@@ -581,11 +588,14 @@ def wrap_data_iterator(
 
     # dp_balanced packs only real sequences, so the static THD capacity has to be
     # discounted by the dummy tail sequence; dynamic CP packs against the raw cap.
-    scheduler_kwargs['max_num_seqs'] = (
-        _get_scheduler_max_real_num_seqs(config)
-        if scheduler_type == PackingSchedulerEnum.DP_BALANCED
-        else getattr(config, 'thd_max_packed_sequences', None)
-    )
+    # Keep the cap derived above from cuda_graph_thd_max_packed_sequences; the config
+    # rejects combining it with thd_max_packed_sequences.
+    if scheduler_kwargs.get('max_num_seqs') is None:
+        scheduler_kwargs['max_num_seqs'] = (
+            _get_scheduler_max_real_num_seqs(config)
+            if scheduler_type == PackingSchedulerEnum.DP_BALANCED
+            else getattr(config, 'thd_max_packed_sequences', None)
+        )
 
     scheduler = scheduler_map[scheduler_type](
         capacity,
@@ -896,7 +906,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         additional_layouts = set()
         if config.linear_cp_layout != config.attention_cp_layout:
             additional_layouts.add(config.attention_cp_layout)
-        return get_batches_on_this_cp_rank(
+        cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout=config.linear_cp_layout,
             dynamic_cp=dynamic_cp,
@@ -915,6 +925,19 @@ def get_batch_on_this_rank_for_sequence_packing(
             ),
             tokens_per_sample=None,
         )
+
+        if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:
+            # The general batch builder retains TE's physical-offset workaround
+            # for some layouts. Graph padding must keep logical boundaries and
+            # the fixed max-seqlen bound through this new HybridModel return path.
+            for layout, params in cp_batch.packed_seq_params_by_layout.items():
+                values = cp_batch.get_batch(layout)
+                params.cu_seqlens_q = params.cu_seqlens_kv = values["cu_seqlens"].squeeze(0)
+                bound = params.cu_seqlens_q_padded[-1].to(torch.int32)
+                params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
+                params.pad_between_seqs = True
+                values["max_seqlen"] = bound
+        return cp_batch
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']

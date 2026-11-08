@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -99,7 +100,7 @@ def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monke
     _setup_nvtx_recording(monkeypatch, events)
     model = nn.Linear(4, 4, bias=False).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
@@ -130,7 +131,7 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
@@ -154,7 +155,7 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -185,7 +186,7 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.ones(2, 4, device=distributed_setup.device, requires_grad=True)
@@ -209,7 +210,7 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
     for parameter in model.layers[0].parameters():
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -236,7 +237,7 @@ def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setu
     _setup_nvtx_recording(monkeypatch, events)
     model = TiedLM()
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     token_ids = torch.arange(8, device=distributed_setup.device).reshape(2, 4)

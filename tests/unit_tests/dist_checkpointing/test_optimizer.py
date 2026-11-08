@@ -818,6 +818,7 @@ class TestDistributedOptimizer:
                 tp=tp_pp[0],
                 pp=tp_pp[1],
                 initialize_optimizer_state=False,
+                use_precision_aware_optimizer=True,
                 optimizer_config_kwargs=optimizer_config_kwargs,
             )
             step_hybrid_device_optimizer(optimizer_a, num_steps=3)
@@ -833,6 +834,7 @@ class TestDistributedOptimizer:
                 tp=tp_pp[0],
                 pp=tp_pp[1],
                 initialize_optimizer_state=False,
+                use_precision_aware_optimizer=True,
                 optimizer_config_kwargs=optimizer_config_kwargs,
             )
             step_hybrid_device_optimizer(optimizer_b, num_steps=1)

@@ -297,6 +297,28 @@ def test_deprecated_dsv4_selector_normalizes_layout_before_validation():
         assert getattr(legacy, name) == getattr(canonical, name)
 
 
+def test_ncclep_grouped_tensor_accepts_non_fused_bf16_experts():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=False,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="ncclep",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert config.moe_use_grouped_tensor
+    assert not config.use_transformer_engine_op_fuser
+    assert config.moe_flex_dispatcher_backend == "ncclep"
+
+
 def test_ncclep_static_shape_flag_cannot_silently_ignore_a_capacity():
     with pytest.raises(ValueError, match="moe_ncclep_static_shape=False conflicts"):
         TransformerConfig(

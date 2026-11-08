@@ -67,9 +67,11 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _missing_param_group_message,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
-    param_group_identifier_keys,
+    find_saved_param_group,
+    get_param_group_identifier_tuple,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
@@ -1157,18 +1159,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # per-group config (``param_group_identifier_keys``) rather than by position.
 
         def make_needed_groups(param_group):
-            needed_groups = []
-            for key in param_group_identifier_keys:
-                # NeMo aliases ``lr_mult``/``wd_mult`` as ``pre_lr_mult``/``pre_wd_mult``.
-                if key in param_group:
-                    value = param_group[key]
-                elif f"pre_{key}" in param_group:
-                    value = param_group[f"pre_{key}"]
-                else:
-                    # Treat missing and explicit None identifier values as equivalent.
-                    value = None
-                needed_groups.append(value)
-            return tuple(needed_groups)
+            return get_param_group_identifier_tuple(param_group)
 
         # Duplicate identifiers here silently clobber: two saved groups with the same tuple
         # collapse to whichever was inserted last, and one current group inherits the wrong
@@ -1184,8 +1175,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
+            # Grandfathers checkpoints written before the DSA indexer split
+            saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
+            if saved_param_group is None:
+                raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
             state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                {**saved_param_group, "params": inner_param_group['params']}
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
@@ -3274,11 +3269,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
-        # Staging params into the DDP param buffer invalidates any prior "already
-        # dispatched" state. The next forward pre-hook must run post-sync cleanup,
-        # especially when MXFP8 reuses grad_data as the param AG buffer.
+        # Staging params into this optimizer's DDP param buffers invalidates their prior
+        # "already dispatched" state. The next forward pre-hook must run post-sync cleanup,
+        # especially when MXFP8 reuses grad_data as the param AG buffer. Bucket groups of other
+        # optimizers on the same model chunk keep theirs: e.g. LayerWise groups published
+        # before their master weights were offloaded must not gather again.
+        own_buckets = {id(bucket) for buffer in self.buffers for bucket in buffer.buckets}
         for model_chunk in self.model_chunks:
-            model_chunk.reset_param_sync_dispatch_state()
+            model_chunk.reset_param_sync_dispatch_state(
+                bucket_groups=[
+                    bucket_group
+                    for bucket_group in (
+                        model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                    )
+                    if any(id(bucket) in own_buckets for bucket in bucket_group.buckets)
+                ]
+            )
 
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):

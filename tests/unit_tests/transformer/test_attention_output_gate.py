@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.attention_output_gate import (
@@ -358,17 +359,31 @@ def test_mla_headwise_gate_preserves_upstream_rounding(dtype, attention_class, c
     )
 
 
+@pytest.mark.parametrize("fusion", [False, True], ids=["eager", "fused"])
+@pytest.mark.parametrize(
+    "attention_class",
+    [MultiLatentAttention, AbsorbedMLASelfAttention],
+    ids=["ordinary", "absorbed"],
+)
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "bf16"])
-def test_mla_elementwise_gate_matches_native(dtype, cuda_device):
+def test_mla_elementwise_gate_matches_native(dtype, attention_class, fusion, cuda_device):
     values, logits = _inputs(dtype, cuda_device, "elementwise")
+    if fusion and not HAVE_TRITON:
+        pytest.skip("attention_output_gate_fusion needs Triton")
     attention = SimpleNamespace(
-        config=SimpleNamespace(gated_attention_proj_granularity="elementwise")
+        config=SimpleNamespace(
+            gated_attention_proj_granularity="elementwise", attention_output_gate_fusion=fusion
+        )
     )
+
+    def actual_gate(x, g):
+        output = attention_class._apply_mla_output_gate(attention, x, g)
+        expected_node = "_FusedElementwiseGateBeforeCastBackward" if fusion else "MulBackward0"
+        assert type(output.grad_fn).__name__ == expected_node
+        return output
+
     _assert_output_and_vjp(
-        lambda x, g: MultiLatentAttention._apply_mla_output_gate(attention, x, g),
-        lambda x, g: _native_gate(x, g, "elementwise", "before"),
-        values,
-        logits,
+        actual_gate, lambda x, g: _native_gate(x, g, "elementwise", "before"), values, logits
     )
 
 

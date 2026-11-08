@@ -708,3 +708,65 @@ def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
         replays=3,
         what="eager mHC proj_rms with BF16 saved input",
     )
+
+
+@pytest.mark.parametrize("attention", ["ordinary", "absorbed"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_mla_elementwise_output_gate_dispatch_replays(attention, dtype):
+    """MLA's elementwise output-gate dispatch reaches the fused Triton kernels and replays.
+
+    ``attention_output_gate_fusion`` routes ``_apply_mla_output_gate`` of both MLA variants
+    through ``fused_elementwise_attention_output_gate_before_cast``; the result and both
+    input gradients must be byte-identical across replays and to the eager composition.
+    """
+    from types import SimpleNamespace
+
+    from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
+    from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+        AbsorbedMLASelfAttention,
+    )
+    from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
+    from tests.unit_tests.determinism.kernels.harness import (
+        assert_replays_bit_exact,
+        bytes_equal,
+        seeded,
+    )
+
+    if not torch.cuda.is_available() or not HAVE_TRITON:
+        pytest.skip("needs a GPU and Triton")
+    attention_class = MultiLatentAttention if attention == "ordinary" else AbsorbedMLASelfAttention
+
+    def build(fusion):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                gated_attention_proj_granularity="elementwise", attention_output_gate_fusion=fusion
+            )
+        )
+
+    seeded()
+    core_attn_out = (torch.randn(6, 3, 1001, device="cuda") * 3).to(dtype).requires_grad_()
+    gate = (torch.randn(6, 3, 1001, device="cuda") * 4).float().requires_grad_()
+    grad_output = (torch.randn(6, 3, 1001, device="cuda") * 2).to(dtype)
+
+    def fused(core_attn_out, gate):
+        output = attention_class._apply_mla_output_gate(build(True), core_attn_out, gate)
+        assert type(output.grad_fn).__name__ == "_FusedElementwiseGateBeforeCastBackward"
+        return output
+
+    outputs, grads = assert_replays_bit_exact(
+        fused,
+        {"core_attn_out": core_attn_out, "gate": gate},
+        grad_outputs={"out": grad_output},
+        replays=3,
+        contention=True,
+        what=f"{attention_class.__name__} fused elementwise output gate",
+    )
+
+    x = core_attn_out.detach().clone().requires_grad_()
+    g = gate.detach().clone().requires_grad_()
+    eager = attention_class._apply_mla_output_gate(build(False), x, g)
+    assert type(eager.grad_fn).__name__ == "MulBackward0"
+    eager.backward(grad_output)
+    assert bytes_equal(outputs["out"], eager.detach())
+    assert bytes_equal(grads["in.core_attn_out"], x.grad)
+    assert bytes_equal(grads["in.gate"], g.grad)

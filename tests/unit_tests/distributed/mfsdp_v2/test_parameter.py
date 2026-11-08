@@ -9,6 +9,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -88,7 +89,7 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     model = NestedModel().to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
@@ -103,7 +104,7 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
     model = TiedLM()
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     (parameter_group,) = model.parameter_groups
@@ -123,7 +124,7 @@ def test_parameterless_parent_with_child_modules_trains(distributed_setup):
     torch.manual_seed(5678)
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model[0], mesh=mesh, placements=_default_placements())
         fully_shard(model[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -150,7 +151,7 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     model = nn.Linear(4, 4, bias=False).to(device)
     model.weight.requires_grad_(False)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     (group,) = model.parameter_groups
@@ -172,7 +173,7 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     # Shard the second layer's parameters onto the mesh device; the unwrapped
     # first layer's parameters remain on CPU until model.to(device) below.
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model[1], mesh=mesh, placements=_default_placements())
 
     assert model[0].weight.device.type == "cpu"
@@ -196,7 +197,7 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
         nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
     )
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     nn.init.constant_(model[0].weight, 2.0)
@@ -220,7 +221,7 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = NonLeafViewModel().to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     group = model.parameter_groups[0]
@@ -249,7 +250,7 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
     model = nn.Sequential(trainable_linear, frozen_linear).to(device)
     nn.init.ones_(frozen_linear.weight)
     frozen_weight = frozen_linear.weight
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 

@@ -55,6 +55,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -266,6 +267,9 @@ stimer = StragglerDetector()
 # first time an update lands this iteration and is the gate that decides
 # whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
+# Right-padded SBHD validation (``--varlen-sbhd-validation``) feeds its real
+# per-sample lengths through ``update_seqlen_stats_from_padding_mask`` so the
+# padding tail is not reported as useful work either.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
@@ -813,6 +817,50 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
     _seqlen_stats_are_global = True
 
 
+def reset_seqlen_stats_in_iteration():
+    """Discard any per-iteration sequence statistics accumulated so far.
+
+    The producers run inside ``get_batch`` / ``forward_step``, so they also fire during
+    evaluation forwards and in every forward/backward attempt the rerun state machine
+    repeats for one logical iteration, while :func:`consume_seqlen_stats_in_iteration`
+    drains the accumulator only once per training iteration. ``train_step`` calls this at
+    the start of every attempt and ``evaluate`` on entry and exit, so a training
+    iteration's FLOPs only ever see the micro-batches of its own, final attempt. The
+    tensor stays allocated.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
+
+
+def update_seqlen_stats_from_padding_mask(padding_mask):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one right-padded SBHD micro-batch.
+
+    Args:
+        padding_mask: ``[micro_batch_size, seq_length]`` boolean tensor with
+            ``True`` at padded positions (the layout emitted by
+            ``VarlenDataset`` under ``--varlen-sbhd-validation``). The real
+            length of sample ``i`` is its number of ``False`` entries.
+
+    Padded SBHD validation runs every sample through the model at full
+    ``seq_length``, but only the real tokens are useful work, so the reported
+    FLOPs would otherwise count the padding tail (about 80% of the tokens for
+    ~14K-token documents in a 64K window). Feeding the real lengths here makes
+    the SBHD reference report the same useful-work FLOPs as its packed THD
+    counterpart. Pass the CP-unsliced mask, and call this once per pipeline
+    rank and micro-batch, like the packed-sequence callers of
+    :func:`update_seqlen_stats_from_cu_seqlens`.
+    """
+    if padding_mask is None:
+        return
+    real_lens = (~padding_mask).sum(dim=1).to(torch.int32)
+    cu_seqlens = torch.zeros(real_lens.numel() + 1, dtype=torch.int32, device=real_lens.device)
+    cu_seqlens[1:] = torch.cumsum(real_lens, dim=0)
+    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+
+
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
     """Read, reset and globally reduce the per-iteration packed-sequence stats.
 
@@ -1259,6 +1307,7 @@ def _dsv4_hybrid_self_attention_flops(
     dsa_indexer_n_heads,
     dsa_indexer_head_dim,
     dsa_indexer_topk,
+    csa_dense_mode=False,
 ):
     """Per-iteration DSv4-hybrid self-attention FLOPs coefficients.
 
@@ -1275,6 +1324,11 @@ def _dsv4_hybrid_self_attention_flops(
       * ``r==4``   (CSA):    window + learned-topk over compressed KV
         (compressor + indexer).
       * ``r==128`` (HCA):    window + all compressed KV (compressor only).
+
+    ``csa_dense_mode`` makes ``r==4`` layers attend to every compressed key
+    (an ``L^2`` term) with no indexer. ``seq_length`` caps the learned top-k;
+    the hybrid path passes the token-weighted mean real sequence length when DSv4
+    is detected from the layer pattern alone.
 
     Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
     expansion factors -- the caller applies those. Multiply ``token_linear`` by
@@ -1313,7 +1367,13 @@ def _dsv4_hybrid_self_attention_flops(
     )
 
     # ---- r=4 layers: sparse attention + indexer ----
-    if n_layers_r4 > 0:
+    if n_layers_r4 > 0 and csa_dense_mode:
+        # Dense CSA: window (token-linear) + all ~L/4 compressed keys (L^2), no indexer.
+        sparse_attn_r4 = n_layers_r4 * num_attention_heads * csa_window_size * v_head_dim * 2
+        sparse_attn_r4_core = n_layers_r4 * num_attention_heads * v_head_dim / 4
+        indexer_token_term = 0
+        indexer_scoring_core = 0
+    elif n_layers_r4 > 0:
         assert (
             dsa_indexer_n_heads is not None
         ), "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
@@ -1336,8 +1396,10 @@ def _dsv4_hybrid_self_attention_flops(
         )
         # Indexer L^2: scoring each query against ~L/4 compressed positions.
         indexer_scoring_core = n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
+        sparse_attn_r4_core = 0
     else:
         sparse_attn_r4 = 0
+        sparse_attn_r4_core = 0
         indexer_token_term = 0
         indexer_scoring_core = 0
 
@@ -1349,7 +1411,7 @@ def _dsv4_hybrid_self_attention_flops(
         + main_compressor_term
         + indexer_token_term
     )
-    core = sparse_attn_r128_core + indexer_scoring_core
+    core = sparse_attn_r128_core + sparse_attn_r4_core + indexer_scoring_core
     return token_linear, core
 
 
@@ -1944,6 +2006,7 @@ def num_floating_point_operations(
         o_groups=None,
         o_lora_rank=None,
         csa_window_size=None,
+        csa_dense_mode=False,
         seq_length=None,
         dsa_indexer_n_heads=None,
         dsa_indexer_head_dim=None,
@@ -1963,6 +2026,7 @@ def num_floating_point_operations(
                 o_groups=o_groups,
                 o_lora_rank=o_lora_rank,
                 csa_window_size=csa_window_size,
+                csa_dense_mode=csa_dense_mode,
                 seq_length=seq_length,
                 n_layers_r0=dsv4_n_layers_r0,
                 n_layers_r4=dsv4_n_layers_r4,
@@ -2576,6 +2640,7 @@ def num_floating_point_operations(
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
+            parse_hybrid_pattern,
         )
 
         layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -2585,12 +2650,32 @@ def num_floating_point_operations(
         num_mlp_layers = layer_counts[Symbols.MLP]
         num_moe_layers = layer_counts[Symbols.MOE]
 
+        # Prefer the canonical DSv4 output-projection names. validate_args mirrors them
+        # onto the legacy o_groups / o_lora_rank aliases, but not every caller runs it.
+        dsv4_o_groups = getattr(args, "output_projection_groups", None)
+        if dsv4_o_groups is None:
+            dsv4_o_groups = getattr(args, "o_groups", None)
+        dsv4_o_lora_rank = getattr(args, "output_projection_lora_rank", None)
+        if dsv4_o_lora_rank is None:
+            dsv4_o_lora_rank = getattr(args, "o_lora_rank", None)
+
+        # The static C/H/W specs select DSv4 even when the CLI variant is inferred
+        # only on the layer config (argument_utils writes it into the config kwargs,
+        # never back onto ``args``), so key off the layer pattern as well. Pattern-only
+        # detection also needs the DSv4 output-projection dims; callers that leave them
+        # unset (for example, args built without validate_args) keep the dense-MLA
+        # estimate for C/H/W layers instead of failing inside the DSv4 attention helper.
+        has_dsv4_layers = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
+        is_dsv4_hybrid = args.experimental_attention_variant == "dsv4_hybrid" or (
+            has_dsv4_layers and dsv4_o_groups is not None and dsv4_o_lora_rank is not None
+        )
+
         # DSv4 D/C/H/W layers are MLA variants, but their
         # sparse attention FLOPs are handled by the DSv4 branch.
         dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
         dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
         num_mla_layers = layer_counts[Symbols.MLA]
-        if args.experimental_attention_variant == "dsv4_hybrid":
+        if is_dsv4_hybrid:
             num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
         else:
             num_attn_layers = layer_counts[Symbols.ATTENTION]
@@ -2599,7 +2684,7 @@ def num_floating_point_operations(
         dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
         dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
-        if args.experimental_attention_variant == "dsv4_hybrid":
+        if is_dsv4_hybrid:
             assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
             assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
                 "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
@@ -2629,6 +2714,20 @@ def num_floating_point_operations(
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
+        if is_dsv4_hybrid:
+            # The pattern owns the DSv4 MTP depth; args.mtp_num_layers may be unset.
+            mtp_num_layers = parse_hybrid_pattern(args.hybrid_layer_pattern).mtp_num_depths
+        # CSA top-k saturation depends on the real sequence length. An explicit dsv4_hybrid
+        # variant keeps the standard-model estimate, which caps top-k with args.seq_length,
+        # so the two paths stay bit-identical. DSv4 detected from the static C/H/W pattern
+        # alone uses the token-weighted mean real length because packed statistics keep no
+        # per-document lengths (llm_seq_length for BSHD).
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            dsv4_seq_length = args.seq_length
+        elif total_real_tokens_in_batch:
+            dsv4_seq_length = seqlen_squared_sum_in_batch / total_real_tokens_in_batch
+        else:
+            dsv4_seq_length = llm_seq_length
 
         # Compute hybrid decoder FLOPs.
         total_floating_point_operations = hybrid_flops(
@@ -2684,7 +2783,7 @@ def num_floating_point_operations(
             mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
             mtp_detach_heads=getattr(args, "mtp_detach_heads", False),
             q_lora_rank=args.q_lora_rank,
-            kv_lora_rank=args.kv_lora_rank,
+            kv_lora_rank=getattr(args, "kv_lora_rank", 0),
             qk_head_dim=args.qk_head_dim,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
             v_head_dim=args.v_head_dim,
@@ -2692,14 +2791,17 @@ def num_floating_point_operations(
             gated_attention_proj_granularity=getattr(
                 args, "gated_attention_proj_granularity", "elementwise"
             ),
-            experimental_attention_variant=args.experimental_attention_variant,
+            experimental_attention_variant=(
+                "dsv4_hybrid" if is_dsv4_hybrid else args.experimental_attention_variant
+            ),
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,
             dsv4_n_layers_r128=dsv4_n_layers_r128,
-            o_groups=getattr(args, "o_groups", None),
-            o_lora_rank=getattr(args, "o_lora_rank", None),
+            o_groups=dsv4_o_groups,
+            o_lora_rank=dsv4_o_lora_rank,
             csa_window_size=getattr(args, "csa_window_size", None),
-            seq_length=args.seq_length,
+            csa_dense_mode=getattr(args, "csa_dense_mode", False),
+            seq_length=dsv4_seq_length,
             dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
             dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
             dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
@@ -2725,8 +2827,21 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
-    assert args.save is not None
-    progress_log_filename = os.path.join(args.save, "progress.txt")
+    return _get_start_time_from_progress_log(args.save, args.world_size)
+
+
+# The start time will not change across multiple calls, so we can cache it.
+@functools.cache
+def _get_start_time_from_progress_log(save_dir: str, world_size: int):
+    """
+    Gets start time of earliest job in the specified save directory with the
+    specified world size. Also returns the number of floating-point operations
+    completed in last saved checkpoint.
+
+    Implementation function cached on save_dir and world_size arguments.
+    """
+    assert save_dir is not None
+    progress_log_filename = os.path.join(save_dir, "progress.txt")
 
     # start_time is time when job with same world size started.
     # start_num_floating_point_operations is the number of floating-point operations
@@ -2762,7 +2877,7 @@ def get_start_time_from_progress_log():
                         latest_num_floating_point_operations_uncommitted
                     )
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != args.world_size:
+            if world_size_in_line != world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
@@ -3420,7 +3535,10 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+        # A relaunch resumes the same wandb run, which may hold an earlier job name.
+        wandb_writer.config.update(
+            {'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True
+        )
 
     # OTel: megatron.startup deliberately stays open into train() -- its
     # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
@@ -3711,8 +3829,12 @@ def wrap_model_chunks_with_ddp(
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
         fully_shard_context(
-            runtime_policy=RuntimePolicy(
-                use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+            FsdpContext(
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ddp_config.nccl_ub,
+                    caller_managed_grad_sync=True,
+                    overlap_outer_communication=ddp_config.overlap_outer_communication,
+                )
             )
         )
         if is_mfsdp_v2
@@ -3816,7 +3938,7 @@ def get_model(
     pg_collection=None,
     ddp_config=None,
 ):
-    """Build the model using a finalized DDP config, or legacy args if omitted."""
+    """Build the model using the supplied DDP config or the finalized run config."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -3964,7 +4086,7 @@ def get_model(
         config = get_model_config(model[0])
 
         if ddp_config is None:
-            ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=cfg.dist.use_torch_fsdp2)
+            ddp_config = cfg.ddp
         if not cfg.dist.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -3976,7 +4098,7 @@ def get_model(
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -4004,9 +4126,7 @@ def get_model(
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -4035,8 +4155,8 @@ def get_optimizer_param_scheduler(optimizer):
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=cfg.scheduler.lr_warmup_init,
-        max_lr=args.lr,
-        min_lr=args.min_lr,
+        max_lr=cfg.optimizer.lr,
+        min_lr=cfg.optimizer.min_lr,
         lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
         lr_decay_steps=cfg.scheduler.lr_decay_steps,
         lr_decay_style=cfg.scheduler.lr_decay_style,
@@ -4048,6 +4168,8 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
         wsd_decay_steps=cfg.scheduler.wsd_decay_steps,
         lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
+        step_lr_rescale_schedule=cfg.scheduler.step_lr_rescale_schedule,
+        step_lr_rescale_warmup_samples=cfg.scheduler.step_lr_rescale_warmup_samples,
     )
 
     return opt_param_scheduler
@@ -4065,22 +4187,6 @@ def _reduce_sum_across_data_parallel_group(
         group=mpu.get_data_parallel_group(with_context_parallel=with_context_parallel),
     )
     return None if value.item() == 0.0 else value.item()
-
-
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
-
-    return config, config_overrides
 
 
 def get_megatron_ddp_config(
@@ -4262,25 +4368,27 @@ def setup_model_and_optimizer(
     if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
+        optim_cfg = cfg.optimizer
+        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
+        optim_cfg.timers = timers
+        # TODO (@chencui): address in model config args->config PR
         if getattr(args, "use_mup", False):
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )
             model_config = get_model_config(model_config_source)
             mup_overrides = get_mup_config_overrides(
-                config=config,
+                config=optim_cfg,
                 mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+                optimizer_type=optim_cfg.optimizer,
             )
             if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
-            config,
+            optim_cfg,
             model,
-            config_overrides=config_overrides,
+            config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
@@ -4714,6 +4822,10 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        # Sequence statistics are attempt-scoped: a retried forward/backward replaces, not
+        # adds to, the statistics of the superseded attempt, and nothing accumulated outside
+        # train_step (e.g. by evaluation forwards) reaches this iteration's consumer.
+        reset_seqlen_stats_in_iteration()
         # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
         # remain readable until their delayed D2H after the main-param copy below.
         if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
@@ -4993,7 +5105,7 @@ def train_step(
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
+    if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -6372,7 +6484,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and args.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -6452,11 +6564,13 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = (
+            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
+        )
         forward_backward_func = PagedStashRunner(
             config, copy_main_params, model, optimizer, forward_backward_func
         )
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
@@ -7120,7 +7234,7 @@ def train(
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
@@ -7220,6 +7334,10 @@ def evaluate(
     args = get_args()
     timers = get_timers()
     train_state = get_train_state()
+    # Evaluation forwards run the same get_batch / forward_step producers as training, but
+    # their sequence statistics must not reach the training FLOPs consumer: start from, and
+    # leave behind, an empty accumulator.
+    reset_seqlen_stats_in_iteration()
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
@@ -7262,7 +7380,9 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = (
+            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
+        )
         forward_backward_func = PagedStashRunner(
             config, copy_main_params, model, None, forward_backward_func
         )
@@ -7372,6 +7492,7 @@ def evaluate(
                 done = done_cuda.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
+                    reset_seqlen_stats_in_iteration()
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
 
@@ -7405,6 +7526,7 @@ def evaluate(
     timers.log(['evaluate'])
 
     rerun_state_machine.set_mode(rerun_mode)
+    reset_seqlen_stats_in_iteration()
 
     # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
     # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
@@ -7588,12 +7710,16 @@ def get_train_valid_test_num_samples():
             eval_iters = cfg.validation.eval_iters
         else:
             assert cfg.train.train_iters is not None
-            total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
-            if cfg.validation.start_eval_at_iter is not None:
-                skipped_eval_points = (
-                    cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
-                )
-                total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            if cfg.validation.eval_interval:
+                total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
+                if cfg.validation.start_eval_at_iter is not None:
+                    skipped_eval_points = (
+                        cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
+                    )
+                    total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            else:
+                # Without eval_interval, validation only runs once, after training.
+                total_eval_points = 1
             eval_iters = total_eval_points * cfg.validation.eval_iters
         eval_samples = eval_iters * cfg.validation.eval_global_batch_size
     test_samples = cfg.validation.eval_iters * cfg.validation.eval_global_batch_size
@@ -7722,7 +7848,8 @@ def backfill_consumed_samples_from_iteration():
 
         train_state.consumed_train_samples = train_state.iteration * cfg.train.global_batch_size
     if train_state.iteration > 0 and train_state.consumed_valid_samples == 0:
-        if cfg.train.train_samples is None:
+        # Without eval_interval, no validation runs during training, so none was consumed.
+        if cfg.train.train_samples is None and cfg.validation.eval_interval:
             effective_start = (
                 cfg.validation.start_eval_at_iter
                 if cfg.validation.start_eval_at_iter is not None
@@ -7845,14 +7972,15 @@ def should_disable_forward_pre_hook(args, optimizer):
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = optimizer is not None
+    cfg = get_run_config()
     return (
         not args.use_megatron_fsdp
         and has_optimizer
         and (
-            args.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            cfg.optimizer.use_distributed_optimizer
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
-        and args.overlap_param_gather
+        and cfg.optimizer.overlap_param_gather
     )
 
 
