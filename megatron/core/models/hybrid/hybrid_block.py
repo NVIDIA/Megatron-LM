@@ -162,11 +162,8 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
-        assert pg_collection is not None, "pg_collection must be provided for HybridStack"
         for layer_config in layer_config_list:
-            if layer_utils.get_custom_layer_type(layer_config) is not None:
-                layer_utils._validate_custom_layer_execution(layer_config, config, pg_collection)
-            else:
+            if layer_utils.get_custom_layer_type(layer_config) is None:
                 layer_utils.validate_tp_comm_overlap(
                     layer_config,
                     layer_utils.get_layer_symbol_from_config(layer_config),
@@ -186,6 +183,8 @@ class HybridStack(MegatronModule):
         )
         self.mtp_layer_number = mtp_layer_number
         self.boundary_layout = boundary_layout
+
+        assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp

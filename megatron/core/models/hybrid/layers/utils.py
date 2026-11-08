@@ -5,7 +5,6 @@ from collections.abc import Callable, Sequence
 from torch import Tensor
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -134,57 +133,6 @@ def get_custom_layer_type(layer_config: object) -> type[MegatronModule] | None:
     if not isinstance(layer_type, type) or not issubclass(layer_type, MegatronModule):
         raise TypeError("layer_type must be a MegatronModule subclass.")
     return layer_type
-
-
-def _validate_custom_layer_execution(
-    layer_config: TransformerConfig,
-    stack_config: TransformerConfig,
-    pg_collection: ProcessGroupCollection,
-) -> None:
-    """Enforce Core's custom-layer integration limits without changing either config.
-
-    HybridModel checks the complete architecture before construction. HybridStack
-    checks physical configs too, including standalone stacks and nested MTP stacks.
-    Layer-specific requirements belong to the layer's construction code.
-    """
-    unsupported = set()
-    for config in (stack_config, layer_config):
-        if config.tensor_model_parallel_size != 1:
-            unsupported.add("tensor parallelism")
-        if config.context_parallel_size != 1:
-            unsupported.add("context parallelism")
-        for field_name in (
-            "sequence_parallel",
-            "tp_comm_overlap",
-            "fp8",
-            "fp4",
-            "quant_recipe",
-            "enable_mhc_connections",
-            "wide_residual",
-            "moe_shortcut_connection",
-            "overlap_moe_expert_parallel_comm",
-            "cpu_offloading",
-            "fine_grained_activation_offloading",
-        ):
-            if getattr(config, field_name, None):
-                unsupported.add(field_name)
-        if config.cuda_graph_impl != "none":
-            unsupported.add("CUDA graphs")
-        if config.recompute_granularity == "selective":
-            unsupported.add("selective recomputation")
-    for group_name in ("tp", "cp"):
-        group = getattr(pg_collection, group_name, None)
-        if group is None:
-            raise ValueError(f"Custom hybrid layers require pg_collection.{group_name}.")
-        if group.size() != 1:
-            unsupported.add(f"{group_name.upper()} process group size > 1")
-    if layer_config.hidden_size != stack_config.hidden_size:
-        raise ValueError("Custom hybrid layers must preserve the stack's hidden_size.")
-    if unsupported:
-        raise ValueError(
-            f"{type(layer_config).__name__} uses unsupported custom-layer execution features: "
-            + ", ".join(sorted(unsupported))
-        )
 
 
 def invoke_custom_layer(

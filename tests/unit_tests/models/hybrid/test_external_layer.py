@@ -175,32 +175,28 @@ def test_external_stack_rejects_inference_before_execution(recompute):
     assert stack.layers[0].last_forward_inputs is None
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("tensor_model_parallel_size", 2),
-        ("context_parallel_size", 2),
-        ("sequence_parallel", True),
-        ("fp8", "e4m3"),
-        ("cuda_graph_impl", "local"),
-        ("recompute_granularity", "selective"),
-    ],
-)
-def test_external_layer_rejects_unsupported_execution_options(field, value):
-    root = _root_config(num_layers=1)
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_external_layer_receives_parallel_process_groups(tp_size, cp_size):
+    root = _root_config(
+        num_layers=1, tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
     config = ExternalGainConfig.from_config(root)
-    # Apply after normalization to exercise Core's integration checks at construction.
-    setattr(root, field, value)
-    setattr(config, field, value)
-    with pytest.raises(ValueError, match="unsupported custom-layer execution features"):
-        HybridStack(
-            config=root,
-            submodules=HybridStackSubmodules(),
-            layer_config_list=[config],
-            pg_collection=_single_rank_groups(),
-            post_process=False,
-            post_layer_norm=False,
-        )
+    # Constructor-only coverage: the custom layer receives the caller's parallel grid.
+    groups = _single_rank_groups()
+    groups.tp = SimpleNamespace(size=lambda: tp_size, rank=lambda: 0)
+    groups.cp = SimpleNamespace(size=lambda: cp_size, rank=lambda: 0)
+    groups.tp_cp = SimpleNamespace(size=lambda: tp_size * cp_size, rank=lambda: 0)
+    stack = HybridStack(
+        config=root,
+        submodules=HybridStackSubmodules(),
+        layer_config_list=[config],
+        pg_collection=groups,
+        post_process=False,
+        post_layer_norm=False,
+    )
+    assert stack.layers[0].pg_collection is groups
+    assert stack.layers[0].config is config
+    assert stack.layers[0].tp_group is groups.tp
 
 
 @pytest.fixture

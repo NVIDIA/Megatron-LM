@@ -341,13 +341,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 for entry in parsed_config_list.main_layer_config_list
                 if entry is not PipelineSplit
             ) + (self.mtp_layer_config_list or ())
-            # Validate the complete architecture on every rank before creating any modules,
-            # including custom layers assigned to other pipeline stages or MTP depths.
-            for layer_config in architecture_layer_configs:
-                if layer_utils.get_custom_layer_type(layer_config) is not None:
-                    layer_utils._validate_custom_layer_execution(
-                        layer_config, self.config, self.pg_collection
-                    )
             layer_utils.validate_shared_rotary_config(
                 architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
             )
