@@ -22,6 +22,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.rl.config import (
     add_rl_args,
     finalize_rl_run,
+    get_rl_config,
     get_rl_run_config,
     rollout_inference_container_from_args,
     set_rl_run_config,
@@ -117,7 +118,7 @@ def print_config_summary(cfg, args, src_config, dst_config, world_size, mode):
     print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={cfg.tokenizer.vocab_size}")
     if args.num_experts:
         print_rank_0(f"MoE: {args.num_experts} experts, top-{args.moe_router_topk}")
-    print_rank_0(f"Backend: {get_rl_run_config().posttrain.rl.refit_method}")
+    print_rank_0(f"Backend: {get_rl_config().refit_method}")
     print_rank_0(f"{'='*80}\n")
 
 
@@ -289,7 +290,8 @@ def benchmark_collocated():
     # Create refit service
     print_rank_0(f"Creating {cfg.posttrain.rl.refit_method} service...")
     refit_service = create_refit_service(
-        cfg.posttrain.rl.refit_method, execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes
+        cfg.posttrain.rl.refit_method,
+        execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
     )
     print_rank_0("Service created.\n")
 
@@ -343,7 +345,9 @@ def benchmark_non_collocated():
     # Print config
     src_config = {'tp': src_tp, 'pp': src_pp, 'ep': src_ep, 'dp': 1}
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': 1}
-    print_config_summary(get_run_config(), args, src_config, dst_config, world_size, 'non-collocated')
+    print_config_summary(
+        get_run_config(), args, src_config, dst_config, world_size, 'non-collocated'
+    )
     if world_size > required_size:
         print_rank_0(f"Note: Ranks {required_size}-{world_size-1} are idle\n")
 
@@ -402,7 +406,8 @@ def benchmark_non_collocated():
     # Create refit service
     print_rank_0(f"Creating {cfg.posttrain.rl.refit_method} service...")
     refit_service = create_refit_service(
-        cfg.posttrain.rl.refit_method, execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes
+        cfg.posttrain.rl.refit_method,
+        execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
     )
     print_rank_0("Service created.\n")
 
@@ -439,7 +444,9 @@ def main():
     # the destination deployment described like the RL loop's rollout engine, and the RL section.
     pretrain_container = pretrain_cfg_container_from_args(args)
     set_run_config(pretrain_container)
-    model_cfg = hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
+    model_cfg = (
+        hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
+    )
     record = RunConfigRecord(
         pretrain=pretrain_container,
         inference=rollout_inference_container_from_args(

@@ -15,7 +15,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.utils import get_model_config
-from megatron.rl.config import get_rl_run_config, rollout_model_is_separate
+from megatron.rl.config import get_rl_config, rollout_model_is_separate
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
@@ -33,9 +33,6 @@ except ImportError:
     HAVE_FSDP2 = False
 
 
-"""Name of the rollout engine's inference container YAML next to ``run_config.yaml`` in a
-checkpoint directory."""
-
 def build_rollout_inference_model(
     inference_container: InferenceConfigContainer,
     args: Any,
@@ -51,13 +48,18 @@ def build_rollout_inference_model(
             args,
             model_type,
             config,
-            rl_config=get_rl_run_config().posttrain.rl,
+            rl_config=get_rl_config(),
             model_config=inference_container.model,
             model_alloc_ctx=inference_model_alloc_context(),
         )
     if not rollout_model_is_separate(inference_container, get_run_config().model):
         return None
 
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+    # The copy was taken before the tokenizer bound the run's vocabulary;
+    # bind it from the tokenizer section the deployment shares with the run.
+    resolve_tokenizer_vocab_size(inference_container)
     deployment = inference_container.model.transformer
     print_rank_0(
         "Building separate RL inference model with custom parallelism: "
@@ -170,7 +172,9 @@ def reinitialize_grpo_microbatch_calculator(args: Any, data_parallel_size: int) 
 class RLSetupCallback(Callback):
     """Builds the RL loop's state at `on_data_init_start` and keeps it for the rollout hooks."""
 
-    def __init__(self, inference_container: Any, *, model_provider: Any, model_type: Any) -> None:
+    def __init__(
+        self, inference_container: InferenceConfigContainer, *, model_provider: Any, model_type: Any
+    ) -> None:
         self._inference_container = inference_container
         self._model_provider = model_provider
         self._model_type = model_type
@@ -197,7 +201,7 @@ class RLSetupCallback(Callback):
                 self.model,
                 context.checkpointing_context,
                 args,
-                rollout_only=get_rl_run_config().posttrain.rl.rl_rollout_only,
+                rollout_only=get_rl_config().rl_rollout_only,
             )
             # RL runs on the plain MPU groups: the loop's data-parallel size for them.
             reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())

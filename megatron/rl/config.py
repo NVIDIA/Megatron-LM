@@ -21,11 +21,14 @@ _DEPLOYMENT_ARGS = {
     "expert_tensor_parallel_size": "rl_inference_expert_tensor_model_parallel_size",
 }
 
+
 def rollout_model_is_separate(inference_container, training_model_cfg) -> bool:
-    """Whether rollouts run on their own copy of the model instead of the training model itself:
-    disaggregated shards (each built from the shard specification), or a deployment layout that
-    differs from the training model's (the CP forced to 1 under context-parallel training counts).
-    Without a model config on both sides, distinct model objects are a separate build."""
+    """Whether rollouts need their own model instead of the training model.
+
+    True for disaggregated shards, or for a deployment layout that differs from the training
+    model's in TP, PP, EP, expert TP or CP. When either side has no transformer section, a
+    distinct model config object counts as separate.
+    """
     if spec_declares_disaggregation(inference_container.inference.inference_shards):
         return True
     deployment, training = inference_container.model, training_model_cfg
@@ -62,13 +65,28 @@ def rollout_inference_container_from_args(
         inference_model_cfg = model_cfg
     else:
         if model_cfg.transformer.context_parallel_size > 1:
-            # CP ranks become extra data-parallel replicas of the rollout model.
+            # Rollout inference does not support CP; CP ranks become extra data-parallel replicas.
             overrides["context_parallel_size"] = 1
+        # An override equal to the training layout changes nothing: rollouts share the model.
+        overrides = {
+            name: value
+            for name, value in overrides.items()
+            if getattr(model_cfg.transformer, name) != value
+        }
         if overrides:
             inference_model_cfg = copy.deepcopy(model_cfg)
             transformer = inference_model_cfg.transformer
             for name, value in overrides.items():
                 setattr(transformer, name, value)
+            # Fields derived from the tensor parallelism follow the rollout layout, so the section
+            # loads again: sequence parallelism needs TP > 1, and with CP 1 the rollout shards a
+            # sequence only across its sequence-parallel ranks.
+            transformer.sequence_parallel = (
+                transformer.sequence_parallel and transformer.tensor_model_parallel_size > 1
+            )
+            transformer.tensor_parallel_num_sequence_shards = (
+                transformer.tensor_model_parallel_size if transformer.sequence_parallel else 1
+            )
             # The weight-shard counts are derived with the tensor parallelism.
             transformer.tensor_parallel_num_weight_shards = (
                 transformer.tensor_model_parallel_size * transformer.gtp_weight_remat_size
@@ -96,9 +114,11 @@ def rollout_inference_container_from_args(
     )
 
 
-def validate_rl_run(record: RunConfigRecord) -> None:
+def validate_rl_run(record: RunConfigRecord, *, global_batch_size: int | None = None) -> None:
     """Validate an RL run's record."""
     pretrain, inference, rl = record.pretrain, record.inference, record.posttrain.rl
+    if global_batch_size is None:
+        global_batch_size = pretrain.train.global_batch_size
     # The offload `finalize_rl_run` will request, checked like the offload the DDP section
     # requests (`PretrainConfigContainer._validate_ddp_config`).
     if (
@@ -117,7 +137,7 @@ def validate_rl_run(record: RunConfigRecord) -> None:
     rl.validate_run(
         cuda_graph_impl=cuda_graph_impl,
         micro_batch_size=pretrain.train.micro_batch_size,
-        global_batch_size=pretrain.train.global_batch_size,
+        global_batch_size=global_batch_size,
         train_iters=pretrain.train.train_iters,
         train_samples=pretrain.train.train_samples,
         skip_train=pretrain.validation.skip_train,
@@ -137,7 +157,14 @@ def validate_rl_run(record: RunConfigRecord) -> None:
 
 def finalize_rl_run(record: RunConfigRecord) -> None:
     """Validate the record, then finalize the deployment."""
-    validate_rl_run(record)
+    global_batch_size = record.pretrain.train.global_batch_size
+    if global_batch_size is None:
+        # The pretrain container derives an unset global batch size when it finalizes,
+        # after this call; check the RL rules against the size it will derive.
+        global_batch_size, _, _ = record.pretrain._resolve_batch_sizes(
+            record.pretrain.get_batch_parallel_size()
+        )
+    validate_rl_run(record, global_batch_size=global_batch_size)
     record.inference.finalize()
     if record.posttrain.rl.requires_grad_buffer_offload:
         # Applied before the training container finalizes its DDP section.
@@ -145,30 +172,46 @@ def finalize_rl_run(record: RunConfigRecord) -> None:
 
 
 def add_rl_args(parser: ArgumentParser) -> ArgumentParser:
-    """Add the `rl` argument group generated from `RLConfig`."""
+    """Add the `rl` argument group generated from `RLConfig`, then the rollout inference group."""
     ArgumentGroupFactory(RLConfig).build_group(parser, "rl")
     return add_rollout_inference_args(parser)
 
 
 def add_rollout_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """The rollout engine's deployment, read by `rollout_inference_container_from_args`."""
-    group = parser.add_argument_group(title='rollout inference')
-    group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
-                       help='Tensor model parallelism of the rollout engine (default: training).')
-    group.add_argument('--rl-inference-pipeline-model-parallel-size', type=int, default=None,
-                       help='Pipeline model parallelism of the rollout engine (default: training).')
-    group.add_argument('--rl-inference-expert-model-parallel-size', type=int, default=None,
-                       help='Expert model parallelism of the rollout engine (default: training).')
-    group.add_argument('--rl-inference-expert-tensor-model-parallel-size', type=int, default=None,
-                       help='Expert tensor parallelism of the rollout engine (default: training).')
+    group = parser.add_argument_group(title="rollout inference")
+    group.add_argument(
+        "--rl-inference-tensor-model-parallel-size",
+        type=int,
+        default=None,
+        help="Tensor model parallelism of the rollout engine (default: training).",
+    )
+    group.add_argument(
+        "--rl-inference-pipeline-model-parallel-size",
+        type=int,
+        default=None,
+        help="Pipeline model parallelism of the rollout engine (default: training).",
+    )
+    group.add_argument(
+        "--rl-inference-expert-model-parallel-size",
+        type=int,
+        default=None,
+        help="Expert model parallelism of the rollout engine (default: training).",
+    )
+    group.add_argument(
+        "--rl-inference-expert-tensor-model-parallel-size",
+        type=int,
+        default=None,
+        help="Expert tensor parallelism of the rollout engine (default: training).",
+    )
     return parser
 
 
 def set_rl_run_config(record: RunConfigRecord) -> None:
     """Register an RL run's record."""
-    assert record.inference is not None and record.posttrain is not None, (
-        "an RL run's record carries its inference and posttrain members"
-    )
+    assert (
+        record.inference is not None and record.posttrain is not None
+    ), "an RL run's record carries its inference and posttrain members"
     assert record.posttrain.rl is not None, "an RL run's posttrain container carries its rl section"
     set_run_config_record(record)
 
@@ -180,6 +223,11 @@ def get_rl_run_config() -> RunConfigRecord:
         record is not None and record.posttrain is not None and record.posttrain.rl is not None
     ), "RL run config is not initialized."
     return record
+
+
+def get_rl_config() -> RLConfig:
+    """Return the registered RL run's RL section."""
+    return get_rl_run_config().posttrain.rl
 
 
 def unset_rl_run_config() -> None:

@@ -484,17 +484,17 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 def get_dynamic_inference_engine(
     model: MegatronModule | None = None,
-    setup_cfg: InferenceSetupConfig | None = None,
     engine_class: type[DynamicInferenceEngine] | None = None,
+    *,
+    setup_cfg: InferenceSetupConfig | None = None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
     Args:
         model: Model to serve. Builds and loads one when omitted.
-        setup_cfg: Inference config.
         engine_class: Optional engine implementation override. When omitted,
-            the core factory selects the implementation from the inference
-            configuration.
+            the core factory selects the implementation from the inference configuration.
+        setup_cfg: `InferenceSetupConfig`; built from the parsed arguments when omitted.
     """
     args = get_args()
     if model is None:

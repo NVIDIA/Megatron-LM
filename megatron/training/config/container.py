@@ -145,7 +145,12 @@ class ConfigContainerBase:
 
         # Use instantiate to create the object
         instance = instantiate(config_dict, mode=mode)
-
+        if not isinstance(instance, cls):
+            name = type(instance).__qualname__
+            raise TypeError(
+                f"Expected {cls.__qualname__}, got {name}; load this document with "
+                f"{name}.from_dict or {name}.from_yaml."
+            )
         return instance
 
     @classmethod
@@ -299,6 +304,16 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
+
+    @classmethod
+    def from_dict(
+        cls: Type[T],
+        config_dict: dict[str, Any],
+        mode: InstantiationMode = InstantiationMode.STRICT,
+    ) -> T:
+        """Create a container from a dictionary."""
+        config_dict = {key: value for key, value in config_dict.items() if key != "rl"}
+        return super().from_dict(config_dict, mode=mode)
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -875,7 +890,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
-    """Checkpoint configuration used to load model weights."""
+    """Checkpoint configuration used to load model weights; ``load=None`` for a deployment whose
+    weights come from an in-process training model (the RL rollout engine)."""
 
     inference: InferenceSetupConfig
     """Declarative inference settings (the serializable, args-shaped layer). Use
@@ -901,6 +917,7 @@ class PosttrainConfigContainer(ConfigContainerBase):
     """Top-level container for what a post-training run does on top of its base recipe."""
 
     rl: RLConfig | None = None
+    """The RL loop's section; `None` for a post-training run without RL."""
 
 
 @dataclass(kw_only=True)
@@ -915,12 +932,17 @@ class RunConfigRecord(ConfigContainerBase):
     """
 
     pretrain: PretrainConfigContainer | None = None
+    """The training sections; for a training or RL run, the run config the loop reads."""
+
     inference: InferenceConfigContainer | None = None
+    """An inference or converter process's sections, or an RL run's rollout engine deployment."""
+
     posttrain: PosttrainConfigContainer | None = None
+    """What a post-training run adds on top of `pretrain` (the RL section)."""
 
     @classmethod
-    def wrap(cls, run_config):
-        """The record of a process that registered only its run config."""
+    def wrap(cls, run_config: ConfigContainerBase) -> ConfigContainerBase:
+        """Wrap a lone run config under the member its type names; return other types as is."""
         if isinstance(run_config, PretrainConfigContainer):
             return cls(pretrain=run_config)
         if isinstance(run_config, InferenceConfigContainer):

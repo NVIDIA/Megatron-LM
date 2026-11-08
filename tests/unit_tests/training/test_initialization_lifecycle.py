@@ -1276,7 +1276,7 @@ def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run
 
 
 def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config):
-    # The RL rules live on the RL container (tests/unit_tests/rl/test_rl_config.py).
+    # The RL rules are tested in tests/unit_tests/training/config/test_rl_config.py.
     monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 3
     run_config.validation.eval_micro_batch_size = 4
@@ -1868,8 +1868,8 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
 
     args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
     model = Mock()
-    # The real RL callback derives its rollout interval from these batch values, and the RL
-    # container validates the run against them (rollout-only needs a training horizon).
+    # The real RL callback derives its rollout interval from these batch values, and
+    # validate_rl_run checks the run against them (rollout-only needs a training horizon).
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
@@ -1890,8 +1890,8 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
         rl_config_module, "rollout_inference_container_from_args", Mock(return_value=deployment)
     )
     monkeypatch.setattr(argument_utils, "_default_config_from_args", Mock(return_value=rl_section))
-    set_rl_run_config = Mock()
-    monkeypatch.setattr(rl_config_module, "set_rl_run_config", set_rl_run_config)
+    register = Mock()
+    monkeypatch.setattr(rl_config_module, "set_run_config_record", register)
     services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
@@ -1916,11 +1916,20 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     assert kwargs["suppress_microbatch_rampup_handling"] is False
     assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
-    set_rl_run_config.assert_called_once()
-    record = set_rl_run_config.call_args.args[0]
+    register.assert_called_once()
+    record = register.call_args.args[0]
     assert isinstance(record, RunConfigRecord)
     assert record.pretrain is cfg and record.inference is deployment
     assert record.posttrain.rl is rl_section
     assert deployment._finalized  # the entrypoint finalized the record
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()
+    # A run the RL rules reject fails before the try whose finally exits with code 0: 128
+    # samples per collection are 16 global batches of 8, which an exit interval of 3 splits.
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    cfg.train.exit_interval = 3
+    train_rl = str(Path(__file__).resolve().parents[3] / "train_rl.py")
+    with pytest.raises(ValueError, match="exit_interval should be divisible"):
+        runpy.run_path(train_rl, run_name="__main__")
+    pretrain.assert_called_once()
+    shutdown.assert_called_once()

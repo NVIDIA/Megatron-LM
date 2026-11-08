@@ -97,7 +97,7 @@ from megatron.rl.agent.api import (
 )
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
-from megatron.rl.config import get_rl_run_config
+from megatron.rl.config import get_rl_config
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
@@ -148,7 +148,7 @@ _INFERENCE_MODEL_IS_PAUSED = False
 
 def inference_model_alloc_context():
     """Return the allocation context for a separate RL inference model."""
-    rl_config = get_rl_run_config().posttrain.rl
+    rl_config = get_rl_config()
     uvm_level = rl_config.rl_inference_model_unified_memory_level
     if rl_config.rl_offload_inference_model_weights and uvm_level == 0 and HAVE_TORCH_MEMORY_SAVER:
         return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
@@ -160,7 +160,7 @@ def inference_model_alloc_context():
 def refit_inference_model(model, inference_model, args) -> int:
     """Copy training weights and return the number of destination pools."""
 
-    rl_config = get_rl_run_config().posttrain.rl
+    rl_config = get_rl_config()
     num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
     prepare_swap_model_weights(
         src_model=model,
@@ -220,10 +220,10 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     1. UVM-based offloading (when --rl-inference-model-unified-memory-level=1)
     2. torch_memory_saver-based offloading (when offloading is enabled but UVM is not)
 
-    Gated by the run config's RL section; this assumes the separate inference model was allocated
-    with UVM or torch_memory_saver when enabled.
+    Gated by the RL section's `rl_offload_inference_model_weights`; this assumes the separate
+    inference model was allocated with UVM or torch_memory_saver when enabled.
     """
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     if not rl_cfg.rl_offload_inference_model_weights:
         return
 
@@ -452,7 +452,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -716,7 +716,7 @@ _ROLLOUT_BANK = None
 def maybe_get_rollout_bank(args):
     """Return the durable rollout bank singleton, creating it on first use."""
     global _ROLLOUT_BANK
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     if not rl_cfg.rl_durable_rollout_bank:
         logger.debug("Durable rollout bank is disabled; proceeding without it.")
         return None
@@ -831,12 +831,13 @@ def colocated_inference(
         optimizer: Optimizer to offload to CPU before the switch when configured.
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
+        inference_container: The rollout engine's config.
 
     Returns:
         Collected rollout groups (on rank 0) and the merged per-request metadata ledger.
     """
     args = get_args()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
 
@@ -973,11 +974,12 @@ def get_environment_rollouts(
         samples_per_group: Amount of trajectories per prompt.
         run_inference: If True, swap to the inference engine to collect rollouts.
             If False, consume a batch already banked by the rollout pipeline.
+        inference_container: The rollout engine's config.
 
     Returns:
         (GroupedRollouts, per-request metadata ledger)
     """
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
@@ -1347,7 +1349,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
     # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
     # When sequence_packing is disabled, construct a single-sequence default so the CUDA
@@ -2556,7 +2558,7 @@ def prepare_data_for_update(
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
     """
     args = get_args()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     train_cfg = get_run_config().train
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
@@ -2889,6 +2891,7 @@ def get_grpo_data_iterator(
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
         optimizer_is_on_cpu: If True, the optimizer is offloaded to CPU during inference.
+        inference_container: The rollout engine's config.
 
     Returns:
         RerunDataIterator for the current training step
@@ -2966,9 +2969,10 @@ def evaluate_and_print_results_rl(
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
         training_model: Training model (if separate from inference model). Used to offload
             grad buffers and restore to train mode. If None, uses model parameter.
+        inference_container: The rollout engine's config.
     """
     args = get_args()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     train_state = get_train_state()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
@@ -3256,13 +3260,14 @@ def megatron_rl_inference_mode(
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         training_model: training model (if separate from inference model). Used to offload
             grad buffers and restore to train mode. If None, uses model parameter.
+        inference_container: The rollout engine's config.
 
     Yields:
         None: this context manager does not return a value.
 
     """
     args = get_args()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     train_state = get_train_state()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()

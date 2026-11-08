@@ -3,7 +3,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -60,11 +60,15 @@ def test_validation_is_read_only_and_finalization_runs_once(
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        # The RL run's root validates the RL section against the run and derives its DDP layout.
+        # validate_rl_run checks the RL section; finalize_rl_run applies its DDP layout. The
+        # deployment shares the training model and the run's RNG section, as the entry point's.
         rl_run = RunConfigRecord(
             pretrain=cfg,
             inference=InferenceConfigContainer(
-                model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+                model=cfg.model,
+                checkpoint=CheckpointConfig(),
+                inference=InferenceSetupConfig(),
+                rng=cfg.rng,
             ),
             posttrain=PosttrainConfigContainer(
                 rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
@@ -94,8 +98,10 @@ def test_validation_is_read_only_and_finalization_runs_once(
     cfg.validate()
     cfg.finalize()
     assert cfg.to_dict() == after
-    rng_finalize.assert_called_once_with(model)
-    model_finalize.assert_called_once_with()
+    # The deployment's finalize runs the RNG finalizer on the shared model first; the pretrain
+    # container's finalize runs it again with the same result.
+    assert rng_finalize.call_args_list == [call(model)] * (1 if rl_run is None else 2)
+    assert model_finalize.call_args_list == [call()] * (1 if rl_run is None else 2)
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 

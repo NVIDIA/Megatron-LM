@@ -342,7 +342,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
     cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
     RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
 
-    # Through the RL container, against the pretrain container it drives; the pretrain
+    # Through validate_rl_run, against the pretrain member of the record; the pretrain
     # container itself carries no RL section. Training containers require a transformer
     # section for the CUDA-graph rule.
     from megatron.training.models.base import ModelConfig
@@ -421,6 +421,16 @@ def test_validate_run_from_the_container_and_the_entry_point():
         )
     with pytest.raises(ValueError, match="must be 1"):
         validate_rl_run(_rl_run(_pretrain_container(), rl_use_sequence_packing=True))
+    # An unset global batch size is derived when the run finalizes, and the RL rules check the
+    # derived size: 4 x 3 samples over 2 GRPO iterations are 24, which 3 x 3 does not divide.
+    derived_run = _rl_run(_pretrain_container(micro_batch_size=3))
+    derived_run.pretrain.train.global_batch_size = None
+    validate_rl_run(derived_run)
+    # Three ranks with TP = PP = 1 are three batch partitions: the derived global batch is 9.
+    with patch("megatron.training.config.container.safe_get_world_size", lambda: 3):
+        with pytest.raises(ValueError, match="divisible by global_batch_size"):
+            finalize_rl_run(derived_run)
+    assert not derived_run.inference._finalized
 
     # Through the entry point: parsing with the RL group and validate_args both pass; the
     # containers built from args reject the run.
@@ -470,7 +480,7 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
     cfg = _record_from_args(args).posttrain.rl
-    # validate_args neither derives nor mirrors RL values; the container does.
+    # validate_args neither derives nor mirrors RL values; the RL section does.
     assert not hasattr(args, "grpo_samples_per_iteration")
     assert args.rl_generation_lag is None
     assert (cfg.grpo_samples_per_iteration, cfg.rl_generation_lag) == (samples, 1.0)
@@ -590,7 +600,7 @@ def test_model_setup_uses_owned_ddp_config(
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    # The RL container, not legacy args, owns the RL policy.
+    # The record's posttrain section, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
     args.batch_parallel_size = 1
     args.world_size = 1
@@ -662,12 +672,19 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
     shared = InferenceConfigContainer(
         model=pretrain.model, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
     )
-    assert not rollout_model_is_separate(shared, pretrain.model)
-    if offload:
-        with pytest.raises(ValueError, match="requires a separate inference model"):
-            validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
-    else:
-        validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
+    # Shards without roles are plain data-parallel inference on the training model.
+    roleless = InferenceConfigContainer(
+        model=pretrain.model,
+        checkpoint=CheckpointConfig(),
+        inference=InferenceSetupConfig(inference_shards="tp=1+tp=1"),
+    )
+    for deployment in (shared, roleless):
+        assert not rollout_model_is_separate(deployment, pretrain.model)
+        if offload:
+            with pytest.raises(ValueError, match="requires a separate inference model"):
+                validate_rl_run(_rl_run(pretrain, inference=deployment, **rl))
+        else:
+            validate_rl_run(_rl_run(pretrain, inference=deployment, **rl))
     refit = InferenceConfigContainer(
         model=_model_with_layout(tensor_model_parallel_size=2),
         checkpoint=CheckpointConfig(),
@@ -683,7 +700,11 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
         validate_rl_run(_rl_run(pretrain, inference=deployment, **rl))
 
 
-def test_rl_run_config_is_a_singleton():
+def test_rl_run_config_is_a_singleton(monkeypatch):
+    from megatron.training import global_vars
+
+    # The registered record is process-wide; monkeypatch puts the previous one back afterwards.
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
     with pytest.raises(AssertionError, match="not initialized"):
         get_rl_run_config()
     record = RunConfigRecord(
@@ -701,9 +722,9 @@ def test_rl_run_config_is_a_singleton():
 
 def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
     """Every process writes a RunConfigRecord whose members are its containers: a training run
-    records `pretrain`, an inference run `inference`, an RL run adds `inference` and `rl`; absent
-    members stay out of the document; any record plus the missing members is the larger run's
-    record; and a legacy flat record still yields its sections."""
+    records `pretrain`, an inference run `inference`, an RL run adds `inference` and `posttrain`;
+    absent members stay out of the document; any record plus the missing members is the larger
+    run's record; and a legacy flat record still yields its sections."""
     import yaml
 
     from megatron.training import checkpointing, global_vars

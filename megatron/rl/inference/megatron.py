@@ -19,7 +19,7 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.rl.config import get_rl_run_config
+from megatron.rl.config import get_rl_config
 from megatron.training.config import InferenceConfigContainer
 from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import print_rank_0
@@ -100,7 +100,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         # Import here to avoid circular imports
         from megatron.inference.utils import get_dynamic_inference_engine
 
-        rl_cfg = get_rl_run_config().posttrain.rl
+        rl_cfg = get_rl_config()
         tokenizer = get_tokenizer()
 
         if tokenizer.bos is None:

@@ -35,6 +35,7 @@ def remove_profiling_args(args):
 @pytest.mark.parametrize("cleanup", ["unset_global_variables", "destroy_global_vars"])
 def test_run_config_lifecycle(monkeypatch, cleanup):
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
     with pytest.raises(AssertionError, match="run config is not initialized"):
         global_vars.get_run_config()
     config = SimpleNamespace(profiling=ProfilingConfig())
@@ -42,10 +43,15 @@ def test_run_config_lifecycle(monkeypatch, cleanup):
     assert global_vars.get_run_config() is config
     with pytest.raises(AssertionError, match="run config is already initialized"):
         global_vars.set_run_config(SimpleNamespace(profiling=ProfilingConfig()))
-    # Both cleanup paths clear the owner before a subsequent run.
+    record = SimpleNamespace(pretrain=config)
+    global_vars.set_run_config_record(record)
+    with pytest.raises(AssertionError, match="run config record is already initialized"):
+        global_vars.set_run_config_record(record)
+    # Both cleanup paths clear the owner and the record before a subsequent run.
     getattr(global_vars, cleanup)()
     with pytest.raises(AssertionError, match="run config is not initialized"):
         global_vars.get_run_config()
+    assert global_vars.get_run_config_record() is None
     global_vars.set_run_config(config)
     assert global_vars.get_run_config() is config
 

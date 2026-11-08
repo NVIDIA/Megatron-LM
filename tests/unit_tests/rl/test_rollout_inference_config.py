@@ -38,7 +38,7 @@ BASE_ARGV = (
 def _containers(*extra):
     with patch("sys.argv", BASE_ARGV + list(extra)), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        # train_rl.py's provider: the inference server flags plus the RL and rollout-inference groups.
+        # train_rl.py's provider: inference server flags plus the RL and rollout-inference groups.
         args = validate_args(
             parse_args(extra_args_provider=lambda parser: add_rl_args(add_inference_args(parser)))
         )
@@ -74,6 +74,14 @@ def test_shared_weights_when_parallelism_matches():
         assert getattr(deployment, name) is getattr(pretrain, name)
 
 
+def test_override_equal_to_training_layout_shares_the_training_model():
+    """An explicit --rl-inference-* value equal to the training layout builds no second rollout
+    model (main built and refit one for any explicit override)."""
+    _, pretrain, deployment = _containers("--rl-inference-tensor-model-parallel-size", "1")
+    assert deployment.model is pretrain.model
+    assert not rollout_model_is_separate(deployment, pretrain.model)
+
+
 @pytest.mark.parametrize(
     "extra, expected",
     [
@@ -86,6 +94,10 @@ def test_shared_weights_when_parallelism_matches():
                 "2",
             ],
             {"pipeline_model_parallel_size": 2, "expert_model_parallel_size": 2},
+        ),
+        (
+            ["--rl-inference-expert-tensor-model-parallel-size", "2"],
+            {"expert_tensor_parallel_size": 2, "expert_tensor_parallel_num_weight_shards": 2},
         ),
     ],
 )
@@ -150,14 +162,17 @@ def test_finalize_applies_the_training_rng_policy_to_the_rollout_model():
     training run's tracker policy rather than the section defaults."""
     _, pretrain, deployment = _containers(
         "--rl-inference-tensor-model-parallel-size",
-        "1",
+        "2",
         "--te-rng-tracker",
         "--inference-rng-tracker",
     )
     assert deployment.rng is pretrain.rng
     assert deployment.model is not pretrain.model
-    deployment.finalize()
     transformer = deployment.model.transformer
+    # The model builder already applied the CLI policy to the copy; reset it so that only
+    # finalize() can produce the asserted values.
+    transformer.use_te_rng_tracker = transformer.inference_rng_tracker = False
+    deployment.finalize()
     assert (transformer.use_te_rng_tracker, transformer.inference_rng_tracker) == (True, True)
 
 
@@ -183,26 +198,37 @@ def test_disaggregated_shards_take_their_parallelism_from_the_spec(flag):
 
 
 @pytest.mark.skipif(importlib.util.find_spec("omegaconf") is None, reason="omegaconf not installed")
-@pytest.mark.parametrize("training_tp", [1, 2])
-def test_deployment_round_trips_through_the_container_serialization(training_tp, tmp_path):
-    """The record written next to a checkpoint reads back as itself, also when the rollout tensor
-    parallelism differs from training's: the weight-shard counts, which ModelParallelConfig
-    derives the GTP remat sizes from, follow the deployment's parallelism."""
-    args, pretrain, _ = _containers("--rl-inference-tensor-model-parallel-size", "1")
+@pytest.mark.parametrize(
+    "training_tp, sequence_parallel, rollout_tp",
+    # Last row: the MoE GRPO recipe's layout (TP 8 with sequence parallelism, rollouts at TP 4).
+    [(1, False, 1), (2, False, 1), (2, True, 1), (8, True, 4)],
+)
+def test_deployment_round_trips_through_the_container_serialization(
+    training_tp, sequence_parallel, rollout_tp, tmp_path
+):
+    """The deployment reads back as itself through YAML, also when the rollout tensor
+    parallelism differs from training's: the fields ModelParallelConfig derives from the tensor
+    parallelism (weight shards, sequence shards, sequence parallelism) follow the deployment's."""
+    args, pretrain, _ = _containers("--rl-inference-tensor-model-parallel-size", str(rollout_tp))
     training = pretrain.model.transformer
-    # As --tensor-model-parallel-size would set them: one weight shard per TP rank (no GTP).
+    # As --tensor-model-parallel-size and --sequence-parallel would set them (validate_args
+    # resolves the sequence shards to the sequence-parallel size).
     training.tensor_model_parallel_size = training.tensor_parallel_num_weight_shards = training_tp
+    training.sequence_parallel = sequence_parallel
+    training.tensor_parallel_num_sequence_shards = training_tp if sequence_parallel else 1
     deployment = rollout_inference_container_from_args(args, pretrain)
     serialized = deployment.to_dict()
     assert serialized["_target_"].endswith("InferenceConfigContainer")
-    deployment.to_yaml(str(tmp_path / "rollout_inference_config.yaml"))
-    rebuilt = InferenceConfigContainer.from_yaml(str(tmp_path / "rollout_inference_config.yaml"))
+    deployment.to_yaml(str(tmp_path / "deployment.yaml"))
+    rebuilt = InferenceConfigContainer.from_yaml(str(tmp_path / "deployment.yaml"))
     assert rebuilt.to_dict() == serialized
     rollout = rebuilt.model.transformer
     assert (
         rollout.tensor_model_parallel_size,
         rollout.tensor_parallel_num_weight_shards,
         rollout.gtp_weight_remat_size,
-    ) == (1, 1, 1)
+        rollout.gtp_remat_num_sequence_shards,
+    ) == (rollout_tp, rollout_tp, 1, 1)
+    assert rollout.sequence_parallel is (sequence_parallel and rollout_tp > 1)
     assert training.tensor_parallel_num_weight_shards == training_tp
     assert isinstance(rebuilt.tokenizer, TokenizerConfig)

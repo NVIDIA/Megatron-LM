@@ -19,7 +19,7 @@ from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.config import (
     add_rl_args,
     finalize_rl_run,
-    get_rl_run_config,
+    get_rl_config,
     rollout_inference_container_from_args,
     set_rl_run_config,
 )
@@ -210,7 +210,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         model (GPTModel): The GPT Model
     """
     runtime_state = get_rl_runtime_state()
-    rl_cfg = get_rl_run_config().posttrain.rl
+    rl_cfg = get_rl_config()
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
