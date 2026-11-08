@@ -12,24 +12,30 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.training import checkpointing
 from megatron.training.training import (
     _hybrid_config_list_moe_logging_metadata,
     num_floating_point_operations,
 )
-from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
+from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
+
+
+class ExternalMoEMetadataLayer(ExternalGainLayer):
+    """Exercise the standard MoE logging contract without constructing a router."""
+
+    is_moe_layer: ClassVar[bool] = True
 
 
 @dataclass
 class ExternalMoEMetadataConfig(ExternalGainConfig):
-    """Exercise the standard MoE logging contract without constructing a router."""
+    """Select the test layer that participates in MoE logging."""
 
-    is_moe_layer: ClassVar[bool] = True
+    layer_type: ClassVar[type[MegatronModule]] = ExternalMoEMetadataLayer
 
 
 def _config(config_type=ExternalGainConfig, **kwargs):
@@ -58,7 +64,7 @@ def test_external_flops_count_all_pipeline_and_mtp_layers():
 def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypatch, layer_flops):
     config = _config()
     estimate_layer = Mock(return_value=layer_flops)
-    monkeypatch.setattr(config, "estimate_flops", estimate_layer)
+    monkeypatch.setattr(ExternalGainLayer, "estimate_flops", classmethod(estimate_layer))
     estimate_model = partial(
         estimate_hybrid_config_list_flops, [config], None, config, vocab_size=32
     )
@@ -73,7 +79,7 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     )
 
     estimate_layer.assert_called_once_with(
-        total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25
+        ExternalGainLayer, config, total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25
     )
     assert result == 3 * (layer_flops + 2 * 7 * config.hidden_size * 32)
 
@@ -81,7 +87,9 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
 @pytest.mark.parametrize("invalid_flops", [None, float("nan"), float("inf"), -1, True, "123"])
 def test_invalid_external_flops_are_rejected_before_updating_counters(monkeypatch, invalid_flops):
     config = _config()
-    monkeypatch.setattr(config, "estimate_flops", Mock(return_value=invalid_flops))
+    monkeypatch.setattr(
+        ExternalGainLayer, "estimate_flops", classmethod(Mock(return_value=invalid_flops))
+    )
     with pytest.raises(ValueError, match="finite, nonnegative real number"):
         estimate_hybrid_config_list_flops(
             [config], None, config, 32, total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25
@@ -90,7 +98,9 @@ def test_invalid_external_flops_are_rejected_before_updating_counters(monkeypatc
 
 def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch):
     config = _config()
-    monkeypatch.setattr(config, "estimate_flops", HybridLayerConfig.estimate_flops.__get__(config))
+    monkeypatch.setattr(
+        ExternalGainLayer, "estimate_flops", classmethod(MegatronModule.estimate_flops.__func__)
+    )
     estimate_model = partial(
         estimate_hybrid_config_list_flops, [config], None, config, vocab_size=32
     )

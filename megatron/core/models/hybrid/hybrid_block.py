@@ -22,12 +22,6 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.hybrid_layer import (
-    HybridLayer,
-    HybridLayerBuildContext,
-    HybridLayerConfig,
-    invoke_hybrid_layer,
-)
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
     validate_segment_layers,
@@ -171,7 +165,7 @@ class HybridStack(MegatronModule):
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
         for layer_config in layer_config_list:
-            if isinstance(layer_config, HybridLayerConfig):
+            if layer_utils.get_custom_layer_type(layer_config) is not None:
                 layer_utils._validate_custom_layer_execution(layer_config, config, pg_collection)
             else:
                 layer_utils.validate_tp_comm_overlap(
@@ -207,7 +201,8 @@ class HybridStack(MegatronModule):
 
         self.layer_config_list = layer_config_list
         self._has_custom_layers = any(
-            isinstance(layer_config, HybridLayerConfig) for layer_config in self.layer_config_list
+            layer_utils.get_custom_layer_type(layer_config) is not None
+            for layer_config in self.layer_config_list
         )
         self._has_linear_layer_with_chunkwise_cp = any(
             type(layer_config) is layer_utils.MambaLayerConfig
@@ -247,24 +242,26 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if isinstance(layer_config, HybridLayerConfig):
-                    layer = layer_config.build_layer(
-                        HybridLayerBuildContext(
-                            pg_collection=pg_collection,
-                            layer_number=layer_number,
-                            pp_layer_offset=pp_layer_offset,
-                            is_mtp_layer=is_mtp_layer,
-                            mtp_layer_number=mtp_layer_number,
-                            name=(name + f".layers.{i}") if name is not None else None,
-                        )
+                custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
+                if custom_layer_type is not None:
+                    layer = custom_layer_type(
+                        config=layer_config,
+                        pg_collection=pg_collection,
+                        layer_number=layer_number,
+                        pp_layer_offset=pp_layer_offset,
+                        is_mtp_layer=is_mtp_layer,
+                        mtp_layer_number=mtp_layer_number,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
-                    if not isinstance(layer, HybridLayer):
-                        raise TypeError("HybridLayerConfig.build_layer() must return a HybridLayer")
-                    if layer.config is not layer_config or layer.layer_number != layer_number:
+                    if (
+                        layer.config is not layer_config
+                        or getattr(layer, "layer_number", None) != layer_number
+                    ):
                         raise ValueError(
-                            "HybridLayerConfig.build_layer() must preserve the supplied config "
-                            "and layer number"
+                            "Custom layers must preserve the supplied config and layer number."
                         )
+                    if getattr(layer, "tp_group", None) is not pg_collection.tp:
+                        raise ValueError("Custom layers must retain the supplied tp_group.")
                 elif type(layer_config) is layer_utils.MambaLayerConfig:
                     layer = build_module(
                         submodules.mamba_layer,
@@ -829,8 +826,8 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
-                            if isinstance(layer, HybridLayer):
-                                hidden_states = invoke_hybrid_layer(
+                            if layer_utils.get_custom_layer_type(layer_config) is not None:
+                                hidden_states = layer_utils.invoke_custom_layer(
                                     layer,
                                     hidden_states,
                                     attention_mask=attention_mask,
@@ -985,6 +982,13 @@ class HybridStack(MegatronModule):
         sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+
+        if self._has_custom_layers:
+            metadata = dict(metadata or {})
+            if metadata.get("dp_cp_group") is None:
+                metadata["dp_cp_group"] = getattr(self.pg_collection, "dp_cp", None)
+            if metadata["dp_cp_group"] is None:
+                raise ValueError("Custom layer checkpoints require pg_collection.dp_cp.")
 
         for local_layer_idx, layer in enumerate(self.layers):
 

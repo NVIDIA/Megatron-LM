@@ -5023,7 +5023,9 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
-    model_flops_estimator = hybrid_model.estimate_flops if hybrid_model is not None else None
+    model_flops_estimator = (
+        hybrid_model.estimate_training_flops if hybrid_model is not None else None
+    )
     if model_flops_estimator is not None:
         # Estimators are pure: validate their availability and output before the first step.
         model_flops_estimator(

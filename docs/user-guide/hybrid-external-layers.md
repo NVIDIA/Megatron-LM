@@ -1,14 +1,14 @@
 # Defining HybridModel layers outside Core
 
 `HybridModel` accepts layers implemented in a downstream package through
-`hybrid_layer_config_list`. A layer's configuration constructs its implementation
-directly. No layer symbol, registration, or module specification is needed for the
-new layer.
+`hybrid_layer_config_list`. A layer's configuration references its implementation
+class directly. No layer symbol, registration, or module specification is needed
+for the new layer.
 
-The downstream package imports Core's `HybridLayerConfig`, `HybridLayer`, and
-`HybridLayerBuildContext`. Core calls these interfaces without importing the
-downstream package. The same mechanism can be used by model code in
-`megatron.bridge` when that package is introduced.
+The downstream package uses the existing `TransformerConfig` and
+`MegatronModule` classes. Core constructs the supplied layer class without
+importing the downstream package. The same mechanism can be used by model code
+in `megatron.bridge` when that package is introduced.
 
 ## Define a config and a layer
 
@@ -17,34 +17,33 @@ in an importable module in your package:
 
 ```python
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
-from megatron.core.models.hybrid import (
-    HybridLayer,
-    HybridLayerBuildContext,
-    HybridLayerConfig,
-)
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-@dataclass
-class GainConfig(HybridLayerConfig):
-    initial_gain: float = 1.0
-
-    def build_layer(self, context: HybridLayerBuildContext) -> HybridLayer:
-        if self.initial_gain <= 0:
+class GainLayer(MegatronModule):
+    def __init__(
+        self,
+        config,
+        *,
+        pg_collection,
+        layer_number,
+        pp_layer_offset=0,
+        is_mtp_layer=False,
+        mtp_layer_number=None,
+        name=None,
+    ) -> None:
+        super().__init__(config)
+        if config.initial_gain <= 0:
             raise ValueError("initial_gain must be positive")
-        return GainLayer(self, context)
-
-    def estimate_flops(
-        self, *, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
-    ):
-        return total_real_tokens_in_batch * self.hidden_size
-
-
-class GainLayer(HybridLayer):
-    def __init__(self, config, context) -> None:
-        super().__init__(config, context)
+        self.layer_number = layer_number
+        self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
+        self.is_mtp_layer = is_mtp_layer
         device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
         self.gain = torch.nn.Parameter(
             torch.full(
@@ -54,6 +53,12 @@ class GainLayer(HybridLayer):
                 device=device,
             )
         )
+
+    @classmethod
+    def estimate_flops(
+        cls, config, *, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+    ):
+        return total_real_tokens_in_batch * config.hidden_size
 
     def forward(
         self,
@@ -67,12 +72,19 @@ class GainLayer(HybridLayer):
         input_ids=None,
     ):
         return hidden_states * self.gain
+
+
+@dataclass
+class GainConfig(TransformerConfig):
+    layer_type: ClassVar[type[MegatronModule]] = GainLayer
+    initial_gain: float = 1.0
 ```
 
-`build_layer` receives a cloned config for one physical layer. Return a fresh
-`HybridLayer` using that config and the supplied context. The base class records
-the layer number and explicit process groups. Keep live modules, process groups,
-and other runtime resources out of config fields.
+`layer_type` binds the config to a `MegatronModule` subclass. Model construction
+clones the config for each physical layer. `HybridStack` calls that class with the config,
+explicit process groups, and ordinary layer-number and pipeline/MTP placement
+arguments. Preserve the supplied config and layer number on the module. Keep
+live modules, process groups, and other runtime resources out of config fields.
 
 The layer owns its entire computation, including any normalization and residual
 connection. Its `forward` method returns one tensor with the same shape and
@@ -116,8 +128,8 @@ source configs remain unchanged. `from_config` copies normalized common fields
 and initializes defaults for additional dataclass fields. Construct a config
 directly if its new fields are required and have no defaults. Core's model and
 stack check execution compatibility before building layers. Validate
-layer-specific fields in `build_layer` or the layer constructor; copying a
-normalized config with `from_config` does not rerun `__post_init__`.
+layer-specific fields in the layer constructor; copying a normalized config with
+`from_config` does not rerun `__post_init__`.
 
 The standard training entry point uses the same list in
 `megatron.training.models.hybrid.HybridModelConfig`. The existing
@@ -130,43 +142,47 @@ The initial extension supports ordinary hidden-state streams with TP=1 and CP=1,
 including eager training and full-layer recomputation (`uniform` and `block`).
 Pipeline selection and MTP use the existing `PipelineSplit` and `MTPSplit`
 mechanisms. Each selected decoder or MTP occurrence receives its own config and
-module; the build context identifies its layer and MTP placement. As with
+module; the constructor arguments identify its layer and MTP placement. As with
 built-in config lists, repeated MTP sections must refer to the same source config
 objects in the same order.
 
 For custom layers, Core's `HybridModel` and `HybridStack` reject sequence
 parallelism, TP communication overlap, quantized execution, CUDA graphs,
-mHC/wide residual streams, shortcut-MoE,
-overlapped expert communication, CPU/activation offloading, and selective recomputation.
+mHC/wide residual streams, shortcut-MoE, overlapped expert communication,
+CPU/activation offloading, and selective recomputation.
 Inference contexts are also rejected. Those features require their own layer
-integration and validation; merely inheriting this interface does not enable
-them. Distributed wrappers still require their normal supported configurations.
+integration and validation; binding a layer class does not enable them.
+Distributed wrappers still require their normal supported configurations.
 
-A custom attention layer can set the class attribute
+A custom attention module can set the class attribute
 `uses_shared_rotary_embeddings = True` to use the model's shared RoPE. Its
 `kv_channels` must match the model's shared rotary width. Otherwise, the layer
 owns any positional-embedding computation it needs.
 
 ## Metrics and checkpoints
 
-The standard training loop requires `estimate_flops` to return this layer's
-**forward** FLOPs for the supplied global-batch token statistics. The model
-estimator applies its forward/backward factor and includes every decoder and MTP
-occurrence. Missing estimates raise an explicit error instead of applying an
+Implement the optional `MegatronModule.estimate_flops` class method on a custom
+layer to return its **forward** FLOPs for the supplied global-batch token statistics.
+`HybridModel.estimate_training_flops` calls `layer_type.estimate_flops(config, ...)`,
+applies its forward/backward factor, and includes every decoder and MTP occurrence.
+Missing estimates raise an explicit error instead of applying an
 unrelated built-in formula. Keep the estimator pure: model setup may call it to
 validate availability before training starts, independently of the runtime
 layer's construction or forward passes.
 
 A custom MoE implementation that participates in the standard MoE tracker can
-set `is_moe_layer = True` and use the inherited MoE logging fields. The
-implementation must produce the expected tracker data; the flag does not
-implement routing, loss scaling, or expert parallelism. Custom hash routing is
+set `is_moe_layer = True` on its module class and use the config's inherited MoE
+logging fields. The implementation must produce the expected tracker data; the
+flag does not implement routing, loss scaling, or expert parallelism. Custom hash routing is
 outside this initial contract.
 
-`HybridLayer` supplies the standard `MegatronModule.sharded_state_dict` behavior
-with the caller's process groups. Parameters and buffers must still obey that
-checkpoint contract. Run-config metadata records the external config's fields
-and Python class path. Resume constructs the architecture from the supplied
-Python definition, as it does for built-in config lists; metadata is not a
+Use the standard `MegatronModule.sharded_state_dict` behavior and keep the
+module's `tp_group` bound to the supplied group. `HybridStack` supplies the
+data/context-parallel group in checkpoint metadata. When checkpointing a layer
+directly, pass `metadata={"dp_cp_group": pg_collection.dp_cp}` explicitly.
+Parameters and buffers must still obey the checkpoint contract. Run-config
+metadata records the external config's fields and Python class path. Resume
+constructs the architecture from the supplied Python definition, as it does for
+built-in config lists; metadata is not a
 replacement for that definition. Keep the defining package available and the
 architecture compatible when resuming.

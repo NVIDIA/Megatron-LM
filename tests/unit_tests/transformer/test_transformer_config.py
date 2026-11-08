@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -278,6 +279,83 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
 
     layer_config.dynamic_value["items"].append("changed")
     assert config.dynamic_value == {"items": []}
+
+
+@pytest.mark.parametrize("slots", [False, True])
+def test_from_config_initializes_subclass_defaults_and_preserves_existing_values(slots):
+    @dataclass(slots=slots)
+    class LayerConfig(TransformerConfig):
+        scale: float = 1.5
+        annotations: list = field(default_factory=list)
+        values: list = field(default_factory=list)
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.values = [3]
+    config.values_alias = config.values
+
+    first = LayerConfig.from_config(config)
+    second = LayerConfig.from_config(config)
+
+    assert first.scale == 1.5
+    assert first.annotations == []
+    assert first.annotations is not second.annotations
+    assert first.values == [3]
+    assert first.values is first.values_alias
+    assert first.values is not config.values
+    assert first.ffn_hidden_size == config.ffn_hidden_size
+
+    first.values = [4]
+    copied = LayerConfig.from_config(first)
+    assert copied.values == [4]
+    assert copied.values is not first.values
+    assert copied.values_alias == [3]
+    if slots:
+        assert "values" not in vars(first)
+        assert "values" not in vars(copied)
+
+
+@pytest.mark.parametrize("target_kind", ["same", "subclass", "base"])
+def test_from_config_preserves_slotted_fields_and_state_aliases(target_kind):
+    @dataclass(slots=True)
+    class SlottedConfig(TransformerConfig):
+        values: list = field(default_factory=list)
+
+    @dataclass(slots=True)
+    class ExtendedConfig(SlottedConfig):
+        scale: float = 1.5
+
+    config = SlottedConfig(num_layers=1, hidden_size=128, num_attention_heads=4, values=[3])
+    config.values_alias = config.values
+    config.self_reference = config
+    config.state_reference = config.__dict__
+    target_cls = {"same": SlottedConfig, "subclass": ExtendedConfig, "base": TransformerConfig}[
+        target_kind
+    ]
+
+    copied = target_cls.from_config(config)
+
+    assert type(copied) is target_cls
+    assert copied.values == [3]
+    assert copied.values is not config.values
+    assert copied.values is copied.values_alias
+    assert copied.self_reference is copied
+    assert copied.state_reference is copied.__dict__
+    if target_kind == "subclass":
+        assert copied.scale == 1.5
+
+
+def test_from_config_rejects_missing_required_subclass_fields():
+    @dataclass(kw_only=True, slots=True)
+    class LayerConfig(TransformerConfig):
+        required_value: int
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    with pytest.raises(TypeError, match="requires a value for 'required_value'"):
+        LayerConfig.from_config(config)
 
 
 def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:

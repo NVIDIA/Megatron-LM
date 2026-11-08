@@ -17,7 +17,6 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -119,7 +118,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     Args:
         config (TransformerConfig): Model config
         hybrid_stack_spec (ModuleSpec, optional): Legacy override for built-in layer construction.
-            When omitted, use the standard Core stack; custom configs construct their own layers.
+            When omitted, use the standard Core stack; custom configs supply a layer_type class.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
@@ -197,7 +196,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             raise ValueError("vocab_size and max_sequence_length must be provided.")
         if hybrid_stack_spec is None:
             # Resolve the existing built-in construction only at the model boundary. External
-            # configs construct their modules directly, independently of this compatibility API.
+            # configs supply module classes directly, independently of this compatibility API.
             from megatron.core.models.hybrid.hybrid_layer_specs import (
                 hybrid_stack_spec as default_hybrid_stack_spec,
             )
@@ -231,7 +230,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
         self._has_custom_layers = any(
-            isinstance(entry, HybridLayerConfig)
+            layer_utils.get_custom_layer_type(entry) is not None
             for entry in (hybrid_layer_config_list_snapshot or ())
         )
         self.pre_process = pre_process
@@ -344,7 +343,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # Validate the complete architecture on every rank before creating any modules,
             # including custom layers assigned to other pipeline stages or MTP depths.
             for layer_config in architecture_layer_configs:
-                if isinstance(layer_config, HybridLayerConfig):
+                if layer_utils.get_custom_layer_type(layer_config) is not None:
                     layer_utils._validate_custom_layer_execution(
                         layer_config, self.config, self.pg_collection
                     )
@@ -614,7 +613,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
-    def estimate_flops(
+    def estimate_training_flops(
         self, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
     ) -> float | None:
         """Estimate global-batch training FLOPs for a list-defined model.

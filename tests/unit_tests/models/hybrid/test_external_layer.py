@@ -5,13 +5,13 @@
 import subprocess
 import sys
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
 
 from megatron.core import dist_checkpointing
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerBuildContext, invoke_hybrid_layer
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     MTPSplit,
     PipelineSplit,
@@ -76,6 +76,15 @@ def test_external_config_initializes_new_defaults_and_clones_mutable_fields():
     assert root.normalized_extra == first.normalized_extra == {"values": [7]}
 
 
+@pytest.mark.parametrize("bad_type", [object(), torch.nn.Linear, "ExternalGainLayer"])
+def test_external_config_rejects_invalid_layer_binding(bad_type):
+    class InvalidGainConfig(ExternalGainConfig):
+        layer_type: ClassVar[object] = bad_type
+
+    with pytest.raises((TypeError, ValueError), match="layer_type"):
+        parse_hybrid_layer_config_list([InvalidGainConfig.from_config(_root_config())])
+
+
 def test_external_config_parser_preserves_pipeline_and_mtp_identity():
     root = _root_config()
     custom = ExternalGainConfig.from_config(root)
@@ -93,8 +102,11 @@ def test_external_config_parser_preserves_pipeline_and_mtp_identity():
 
 @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
 def test_external_shared_rotary_trait_validates_width_and_attention_family(position_embedding_type):
-    class SharedRotaryGainConfig(ExternalGainConfig):
+    class SharedRotaryGainLayer(ExternalGainLayer):
         uses_shared_rotary_embeddings = True
+
+    class SharedRotaryGainConfig(ExternalGainConfig):
+        layer_type = SharedRotaryGainLayer
 
     root = _root_config()
     custom = SharedRotaryGainConfig.from_config(root)
@@ -127,7 +139,7 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
         post_layer_norm=False,
         pp_layer_offset=4,
     )
-    assert all(isinstance(layer, ExternalGainLayer) for layer in stack.layers)
+    assert all(type(layer) is source.layer_type for layer in stack.layers)
     assert [layer.layer_number for layer in stack.layers] == [5, 6]
     assert stack.layers[0].config is physical_configs[0]
     assert stack.layers[1].config is physical_configs[1]
@@ -164,13 +176,13 @@ def test_external_layer_cpu_stack_forward_backward_and_context():
 
 def test_external_forward_receives_packing_and_rejects_inference():
     config = ExternalGainConfig.from_config(_root_config())
-    layer = config.build_layer(HybridLayerBuildContext(_single_rank_groups(), layer_number=1))
+    layer = config.layer_type(config=config, pg_collection=_single_rank_groups(), layer_number=1)
     hidden = torch.randn(4, 1, config.hidden_size)
     packed = PackedSeqParams(qkv_format="thd")
-    invoke_hybrid_layer(layer, hidden, packed_seq_params=packed)
+    layer_utils.invoke_custom_layer(layer, hidden, packed_seq_params=packed)
     assert layer.last_forward_inputs[2] is packed
     with pytest.raises((ValueError, NotImplementedError), match="inference"):
-        invoke_hybrid_layer(layer, hidden, inference_context=object())
+        layer_utils.invoke_custom_layer(layer, hidden, inference_context=object())
 
 
 @pytest.mark.parametrize("recompute", [False, True])

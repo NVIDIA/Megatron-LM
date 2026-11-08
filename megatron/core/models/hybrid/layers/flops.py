@@ -6,12 +6,12 @@ import math
 from numbers import Real
 from typing import Sequence
 
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     HybridLayerEntry,
     MTPSplit,
     PipelineSplit,
 )
+from megatron.core.models.hybrid.layers.utils import get_custom_layer_type
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -273,8 +273,10 @@ def estimate_hybrid_config_list_flops(
             continue
 
         layer_number += 1
-        if isinstance(entry, HybridLayerConfig):
-            layer_flops = entry.estimate_flops(
+        custom_layer_type = get_custom_layer_type(entry)
+        if custom_layer_type is not None:
+            layer_flops = custom_layer_type.estimate_flops(
+                entry,
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             )
@@ -285,7 +287,7 @@ def estimate_hybrid_config_list_flops(
                 or layer_flops < 0
             ):
                 raise ValueError(
-                    f"{type(entry).__name__}.estimate_flops must return a finite, "
+                    f"{custom_layer_type.__name__}.estimate_flops must return a finite, "
                     f"nonnegative real number, got {layer_flops!r}."
                 )
             forward_flops += layer_flops

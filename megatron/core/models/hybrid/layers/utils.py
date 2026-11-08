@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 
 from torch import Tensor
 
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
@@ -16,6 +16,7 @@ from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config 
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -123,22 +124,36 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
 
 
+def get_custom_layer_type(layer_config: object) -> type[MegatronModule] | None:
+    """Resolve a config's direct implementation reference without a registry or imports."""
+    if not isinstance(layer_config, TransformerConfig):
+        return None
+    layer_type = getattr(layer_config, "layer_type", None)
+    if layer_type is None:
+        return None
+    if not isinstance(layer_type, type) or not issubclass(layer_type, MegatronModule):
+        raise TypeError("layer_type must be a MegatronModule subclass.")
+    return layer_type
+
+
 def uses_shared_rotary_embeddings(layer_config: TransformerConfig) -> bool:
     """Return whether a layer consumes HybridModel's shared position embeddings."""
-    return type(layer_config) is AttentionLayerConfig or (
-        isinstance(layer_config, HybridLayerConfig) and layer_config.uses_shared_rotary_embeddings
-    )
+    layer_type = get_custom_layer_type(layer_config)
+    if layer_type is not None:
+        return getattr(layer_type, "uses_shared_rotary_embeddings", False)
+    return type(layer_config) is AttentionLayerConfig
 
 
 def is_moe_layer_config(layer_config: TransformerConfig) -> bool:
     """Identify configs participating in the standard MoE tracker contract."""
-    return type(layer_config) is MoELayerConfig or (
-        isinstance(layer_config, HybridLayerConfig) and layer_config.is_moe_layer
-    )
+    layer_type = get_custom_layer_type(layer_config)
+    if layer_type is not None:
+        return getattr(layer_type, "is_moe_layer", False)
+    return type(layer_config) is MoELayerConfig
 
 
 def _validate_custom_layer_execution(
-    layer_config: HybridLayerConfig,
+    layer_config: TransformerConfig,
     stack_config: TransformerConfig,
     pg_collection: ProcessGroupCollection,
 ) -> None:
@@ -173,7 +188,7 @@ def _validate_custom_layer_execution(
             unsupported.add("CUDA graphs")
         if config.recompute_granularity == "selective":
             unsupported.add("selective recomputation")
-        if layer_config.is_moe_layer and config.moe_num_hash_layers:
+        if is_moe_layer_config(layer_config) and config.moe_num_hash_layers:
             unsupported.add("custom hash routing")
     for group_name in ("tp", "cp"):
         group = getattr(pg_collection, group_name, None)
@@ -188,6 +203,35 @@ def _validate_custom_layer_execution(
             f"{type(layer_config).__name__} uses unsupported custom-layer execution features: "
             + ", ".join(sorted(unsupported))
         )
+
+
+def invoke_custom_layer(
+    layer: MegatronModule,
+    hidden_states: Tensor,
+    *,
+    attention_mask: Tensor | None = None,
+    rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
+    packed_seq_params: PackedSeqParams | None = None,
+    padding_mask: Tensor | None = None,
+    sequence_len_offset: Tensor | None = None,
+    input_ids: Tensor | None = None,
+    inference_context=None,
+) -> Tensor:
+    """Apply the custom-layer calling convention in eager and recomputed execution."""
+    if inference_context is not None:
+        raise ValueError("Custom hybrid layers do not support inference contexts yet.")
+    output = layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        rotary_pos_emb=rotary_pos_emb,
+        packed_seq_params=packed_seq_params,
+        padding_mask=padding_mask,
+        sequence_len_offset=sequence_len_offset,
+        input_ids=input_ids,
+    )
+    if not isinstance(output, Tensor) or output.shape != hidden_states.shape:
+        raise ValueError("A custom hybrid layer must return a tensor with the input shape.")
+    return output
 
 
 def validate_shared_rotary_config(

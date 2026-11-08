@@ -7,7 +7,7 @@ from torch import Tensor
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.hybrid.hybrid_layer import HybridLayer, invoke_hybrid_layer
+from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
@@ -129,8 +129,8 @@ def checkpointed_forward(
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
                     layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
-                    if isinstance(layer, HybridLayer):
-                        hidden_states = invoke_hybrid_layer(
+                    if hybrid_layer_utils.get_custom_layer_type(layer.config) is not None:
+                        hidden_states = hybrid_layer_utils.invoke_custom_layer(
                             layer,
                             hidden_states,
                             attention_mask=attention_mask,

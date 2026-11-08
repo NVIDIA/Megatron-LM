@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Sequence, Tuple, TypeAlias
 
 import torch
 
-from megatron.core.models.hybrid.hybrid_layer import HybridLayerConfig
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
@@ -39,7 +38,7 @@ class MTPSplit:
 
 
 # A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
-# Parsing accepts built-in configs and HybridLayerConfig implementations, validating markers.
+# Parsing accepts built-in configs and configs with a direct layer_type, validating markers.
 HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
@@ -102,13 +101,12 @@ def _validate_layer_config_sequence(
     needs_shared_rotary = False
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
-        if type(layer_config) not in supported_types and not isinstance(
-            layer_config, HybridLayerConfig
-        ):
+        custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
+        if type(layer_config) not in supported_types and custom_layer_type is None:
             raise ValueError(
                 f"{section_name} entry {index} has unsupported hybrid layer config type "
                 f"{type(layer_config).__name__}. Expected an exact built-in layer config type "
-                "or a HybridLayerConfig implementation."
+                "or a TransformerConfig with a MegatronModule layer_type."
             )
         config_types.add(type(layer_config))
         needs_shared_rotary |= layer_utils.uses_shared_rotary_embeddings(layer_config)
