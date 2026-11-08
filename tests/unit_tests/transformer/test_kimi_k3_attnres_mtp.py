@@ -317,7 +317,8 @@ def test_hybrid_delta_does_not_cancel_small_bf16_branch(pg_collection, attention
 
 @pytest.mark.parametrize("mtp_pattern", ["+E", "KE"])
 def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
-    """Real KDA / gated MLA / latent MoE: two MTP depths, real losses and updates."""
+    """Real KDA/NoPE gated MLA/MoE: two MTP depths, real losses and updates."""
+    from megatron.core.activations import situlu
     from megatron.core.ssm.gated_delta_net import KimiDeltaAttention
     from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 
@@ -360,9 +361,7 @@ def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
         moe_latent_up_projection_rmsnorm=True,
         moe_shared_expert_intermediate_size=1024,
         gated_linear_unit=True,
-        # K3 pairs SiTU-GLU MLPs with a SiLU KDA convolution; that split needs the KDA
-        # activation pin of PR #6877 and is exercised on the Kimi-K3 integration branch.
-        activation_func=F.silu,
+        activation_func=situlu,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         add_bias_linear=False,
@@ -387,6 +386,11 @@ def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
     convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
     assert any(isinstance(m, KimiDeltaAttention) for m in model.decoder.modules())
     assert any(isinstance(m, MLASelfAttention) for m in model.decoder.modules())
+    for module in model.modules():
+        if isinstance(module, KimiDeltaAttention):
+            assert module.act_fn is F.silu
+            assert module.activation == "silu"
+            assert module.config.activation_func is situlu
     for depth in model.mtp.layers:
         attention = depth.mtp_model_layer.layers[0].inner_layer.self_attention
         assert attention.is_mtp_layer
@@ -414,3 +418,80 @@ def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
     for name, param in model.named_parameters():
         if name in watched:
             assert not torch.equal(param, watched[name]), name
+
+
+def test_k3_nope_mla_native_parity(pg_collection):
+    """Keep all 192 Q/K channels, skip RoPE, and retain the gated output VJP."""
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=7168,
+        num_attention_heads=96,
+        kv_channels=128,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+        v_head_dim=128,
+        qk_layernorm=True,
+        layernorm_epsilon=1e-6,
+        attention_latent_norm_epsilon=1e-6,
+        rope_type="rope",
+        no_rope_freq=1,
+        attention_output_gate=True,
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    spec = deepcopy(hybrid_stack_spec.submodules.mla_layer.submodules.self_attention)
+    spec.submodules.q_layernorm = TENorm
+    spec.submodules.kv_layernorm = TENorm
+    module = build_module(spec, config=config, layer_number=1, pg_collection=pg_collection).cuda()
+    convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+    params = dict(module.named_parameters())
+    reference_params = {name: p.detach().clone().requires_grad_() for name, p in params.items()}
+    expected_names = {
+        f"{name}.weight"
+        for name in (
+            "linear_q_down_proj",
+            "linear_q_up_proj",
+            "linear_kv_down_proj",
+            "linear_kv_up_proj",
+            "q_layernorm",
+            "kv_layernorm",
+            "linear_proj",
+            "linear_gate",
+        )
+    }
+    assert set(params) == expected_names
+    hidden = torch.randn(4, 1, 7168, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    p = reference_params
+    q = F.linear(reference_hidden, p["linear_q_down_proj.weight"])
+    q = _native_norm(q, p["q_layernorm.weight"])
+    q = F.linear(q, p["linear_q_up_proj.weight"]).view(4, 1, 96, 192)
+    kv = F.linear(reference_hidden, p["linear_kv_down_proj.weight"])
+    compressed, k_shared = kv.split([512, 64], dim=-1)
+    compressed = _native_norm(compressed, p["kv_layernorm.weight"])
+    kv = F.linear(compressed, p["linear_kv_up_proj.weight"]).view(4, 1, 96, 256)
+    k, v = kv.split([128, 128], dim=-1)
+    k = torch.cat((k, k_shared.unsqueeze(-2).expand(4, 1, 96, 64)), dim=-1)
+    scores = torch.einsum("sbhd,tbhd->bhst", q.float(), k.float()) * (192**-0.5)
+    mask = torch.ones(4, 4, device="cuda", dtype=torch.bool).triu(1)
+    weights = scores.masked_fill(mask, float("-inf")).softmax(-1).to(v.dtype)
+    context = torch.einsum("bhst,tbhd->sbhd", weights, v).reshape(4, 1, -1)
+    gate = F.linear(reference_hidden, p["linear_gate.weight"]).float().sigmoid().to(context.dtype)
+    expected = F.linear(context * gate, p["linear_proj.weight"])
+    actual, _ = module(hidden, attention_mask=mask[None, None])
+    _assert_similarity(actual, expected, "NoPE gated MLA output")
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    _assert_similarity(hidden.grad, reference_hidden.grad, "NoPE gated MLA input")
+    for name, param in params.items():
+        _assert_similarity(param.grad, p[name].grad, name)
