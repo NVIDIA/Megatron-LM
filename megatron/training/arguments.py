@@ -1660,10 +1660,10 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
         if getattr(args, 'muon_expert_tp_mode', None) is not None:
-            # An explicit expert mode routes expert-parallel weights separately;
+            # An explicit expert mode gives the routed MoE expert weights their own optimizer;
             # a model without experts has no expert bucket to route.
             assert args.num_experts is not None and args.num_experts > 0, (
-                "--muon-expert-tp-mode routes expert-parallel weights, but this "
+                "--muon-expert-tp-mode sets the mode of the routed MoE expert weights, but this "
                 "model has no experts (--num-experts). Drop the flag for "
                 "dense-only models (expert weights follow --muon-tp-mode)."
             )
@@ -2724,17 +2724,22 @@ def _add_regularization_args(parser):
                        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
                        'OptimizerConfig.muon_tp_mode.')
     group.add_argument('--muon-expert-tp-mode', type=str, default=None,
-                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
-                                'layer_sharded'],
-                       help='NS mode for expert-parallel weights. Default (unset): '
+                       choices=['blockwise', 'duplicated', 'distributed', 'layer_sharded'],
+                       help='NS mode for the routed MoE expert weights (including EP=1 '
+                       'experts). Default (unset): '
                        'expert weights follow --muon-tp-mode. Set to give the expert '
                        'domain its own mode — e.g. --muon-tp-mode auto '
                        '--muon-expert-tp-mode layer_sharded runs the per-weight '
                        'cost model on dense weights while layer-sharding the MoE '
-                       'expert weights. When the modes differ, the optimizer builder '
+                       'expert weights. When the modes differ (auto with duplicated '
+                       'counts as equal: auto already runs expert weights '
+                       'duplicated), the optimizer builder '
                        'keeps dense/expert buckets separate and constructs one base '
                        'optimizer per bucket. Requires --num-experts when set; only '
-                       '--optimizer muon implements it. See '
+                       '--optimizer muon implements it. auto is not offered: its cost '
+                       'model covers dense weights only. Changing this flag on resume '
+                       'changes the optimizer param-group layout, so resuming a '
+                       'checkpoint across the switch is not supported. See '
                        'OptimizerConfig.muon_expert_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '

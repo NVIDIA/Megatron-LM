@@ -3,8 +3,9 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import astuple
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -324,7 +325,7 @@ def _get_param_groups(
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     process_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
-    expert_param_fn: Optional[Callable[[torch.nn.Parameter], bool]] = None,
+    expert_param_fn: Callable[[torch.nn.Parameter], bool] | None = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -345,7 +346,7 @@ def _get_param_groups(
             empty dictionary rather than the default value of None.
         process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
             aligned parameter groups. ``None`` preserves the WORLD-group behavior.
-        expert_param_fn (Optional[Callable[[torch.nn.Parameter], bool]]): semantic
+        expert_param_fn (Callable[[torch.nn.Parameter], bool] | None): semantic
             routed-expert predicate. When given, the groups are additionally keyed by it and
             carry ``is_expert``, so dense and routed-expert weights never share a group even
             when they share process groups (EP=1 with matching dense/expert TP and GTP sizes,
@@ -531,8 +532,8 @@ def _is_routed_expert_param(param: torch.nn.Parameter) -> bool:
 
 
 def _bucket_emerging_param_groups(
-    param_groups: List[Dict], eopt_name: str, use_layer_wise: bool, hybrid_muon_modes: bool
-) -> Dict[Tuple[str, bool, bool], List[Dict]]:
+    param_groups: list[dict], eopt_name: str, use_layer_wise: bool, use_hybrid_muon_modes: bool
+) -> defaultdict[tuple[str, bool, bool], list[dict]]:
     """Bucket param groups by ``(optimizer_name, is_expert_parallel, is_expert)``; one base
     optimizer is built per bucket.
 
@@ -544,11 +545,13 @@ def _bucket_emerging_param_groups(
     selects. Scalar (adam/lion) groups never split on it: the non-emerging fallback path
     rejects expert-parallel groups.
     """
-    grouped: Dict[Tuple[str, bool, bool], List[Dict]] = defaultdict(list)
+    grouped: defaultdict[tuple[str, bool, bool], list[dict]] = defaultdict(list)
     for group in param_groups:
         opt_name = group.get('optimizer', eopt_name)
         is_expert_parallel = bool(group['is_expert_parallel']) and not use_layer_wise
-        is_expert = hybrid_muon_modes and opt_name == 'muon' and bool(group.get('is_expert', False))
+        is_expert = (
+            use_hybrid_muon_modes and opt_name == 'muon' and bool(group.get('is_expert', False))
+        )
         grouped[(opt_name, is_expert_parallel, is_expert)].append(group)
     return grouped
 
@@ -976,16 +979,16 @@ def _get_megatron_emerging_optimizer(
     # Muon modes the groups are additionally keyed by the routed-expert marker, so EP=1
     # experts (allreduce=True, otherwise grouped with the dense weights) still form their own
     # groups and reach the expert bucket.
-    hybrid_muon_modes = eopt_name == 'muon' and muon_modes_are_hybrid(config)
+    use_hybrid_muon_modes = eopt_name == 'muon' and muon_modes_are_hybrid(config)
     all_param_groups = _get_param_groups(
         model_chunks,
         config,
         config_overrides,
         param_group_process_group,
-        expert_param_fn=_is_routed_expert_param if hybrid_muon_modes else None,
+        expert_param_fn=_is_routed_expert_param if use_hybrid_muon_modes else None,
     )
     grouped_param_groups = _bucket_emerging_param_groups(
-        all_param_groups, eopt_name, use_layer_wise, hybrid_muon_modes
+        all_param_groups, eopt_name, use_layer_wise, use_hybrid_muon_modes
     )
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll

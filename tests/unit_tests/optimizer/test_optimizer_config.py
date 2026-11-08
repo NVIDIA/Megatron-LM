@@ -3,7 +3,12 @@ import pytest
 import torch
 
 from megatron.core.optimizer import get_megatron_optimizer
-from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
+from megatron.core.optimizer.optimizer_config import (
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    muon_modes_are_hybrid,
+)
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
@@ -57,6 +62,11 @@ def test_hybrid_muon_expert_tp_mode_requirements():
     OptimizerConfig(**reverse, muon_split_qkv=False, **ok).validate()
     with pytest.raises(ValueError, match="split-QKV"):
         OptimizerConfig(**reverse, muon_split_qkv=True, **ok).validate()
+    # 'auto' is a dense-only cost model; on expert weights it would run duplicated.
+    with pytest.raises(ValueError, match="muon_expert_tp_mode='auto' is not supported"):
+        OptimizerConfig(
+            optimizer='muon', muon_tp_mode='duplicated', muon_expert_tp_mode='auto'
+        ).validate()
     # An explicit expert mode equal to the dense one changes nothing.
     OptimizerConfig(
         optimizer='muon', muon_tp_mode='duplicated', muon_expert_tp_mode='duplicated'
@@ -74,6 +84,33 @@ def test_hybrid_muon_expert_tp_mode_requirements():
             ).validate()
         with pytest.raises(ValueError, match="only implemented for optimizer='muon'"):
             OptimizerConfig(optimizer=other, **hybrid).validate()
+
+
+@pytest.mark.parametrize(
+    "tp_mode, expert_tp_mode, hybrid",
+    [
+        ('auto', None, False),
+        ('duplicated', 'duplicated', False),
+        # 'auto' already runs every expert weight 'duplicated' (its cost model covers dense
+        # GTP weights only), so the explicit pair builds no separate expert optimizer.
+        ('auto', 'duplicated', False),
+        ('auto', 'distributed', True),
+        ('auto', 'layer_sharded', True),
+        ('layer_sharded', 'duplicated', True),
+    ],
+)
+def test_muon_modes_are_hybrid(tp_mode, expert_tp_mode, hybrid):
+    """The expert optimizer splits off only when the expert weights would run a different
+    NS mode than the dense optimizer already gives them."""
+    config = OptimizerConfig(
+        optimizer='muon',
+        use_layer_wise_distributed_optimizer=True,
+        muon_tp_mode=tp_mode,
+        muon_expert_tp_mode=expert_tp_mode,
+        muon_split_qkv=False,
+    )
+    config.validate()
+    assert muon_modes_are_hybrid(config) is hybrid
 
 
 def test_paramkey_matches():

@@ -25,7 +25,12 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
-from .optimizer_config import ParamKey, ParamPredicate, muon_effective_expert_tp_mode
+from .optimizer_config import (
+    ParamKey,
+    ParamPredicate,
+    muon_effective_dense_mode,
+    muon_effective_expert_tp_mode,
+)
 
 try:
     from emerging_optimizers import registry
@@ -135,10 +140,7 @@ def _create_emerging_optimizer(
     builders unchanged.
     """
     entry = _EMERGING_OPTIMIZERS[eopt_name]
-    if is_expert:
-        assert (
-            eopt_name == 'muon'
-        ), f"expert buckets exist only for the muon entry, got {eopt_name!r}"
+    if is_expert and eopt_name == 'muon':
         eopt_kwargs = _muon_registry_config_to_kwargs(
             config, model_chunks, pg_collection, is_expert=True
         )
@@ -780,7 +782,7 @@ def _muon_bucket_tp_mode(config, is_expert: bool) -> str:
     """
     if is_expert:
         return muon_effective_expert_tp_mode(config)
-    return getattr(config, 'muon_tp_mode', 'duplicated')
+    return muon_effective_dense_mode(config)
 
 
 def _muon_config_to_cls(config, is_expert: bool = False) -> type:
@@ -814,7 +816,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 
 def _muon_registry_config_to_kwargs(
     config, model_chunks, pg_collection, *, is_expert: bool = False
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """``config_to_kwargs`` for the ``muon`` registry entry.
 
     TensorParallelMuon kwargs, plus LayerShardedMuon's own when
@@ -843,6 +845,9 @@ def _muon_registry_config_to_kwargs(
     if is_expert:
         kwargs["gtp_remat_group"] = getattr(pg_collection, "expt_gtp_remat", None)
         kwargs["tp_group"] = getattr(pg_collection, "expt_tp", None)
+        # Expert weights own no QKV, so there is nothing to split; but muon_split_qkv is one
+        # global flag that the dense bucket may keep on, and LayerShardedMuon's constructor
+        # rejects split_qkv=True. Pass False so the expert bucket is not refused for it.
         kwargs["split_qkv"] = False
     else:
         kwargs["gtp_remat_group"] = getattr(pg_collection, "gtp_remat", None)

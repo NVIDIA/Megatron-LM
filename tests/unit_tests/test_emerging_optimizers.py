@@ -695,12 +695,19 @@ def test_hybrid_buckets_get_their_domain_groups_and_class():
     assert expert_opt.tp_mode == 'duplicated'
 
 
-@pytest.mark.parametrize("tp_mode", ['layer_sharded', 'auto'])
-@pytest.mark.parametrize("explicit", [False, True], ids=['unset', 'explicit_equal'])
-def test_expert_mode_equal_to_dense_is_not_hybrid(tp_mode, explicit):
+@pytest.mark.parametrize(
+    "tp_mode, expert_tp_mode",
+    [
+        ('layer_sharded', None),
+        ('auto', None),
+        ('layer_sharded', 'layer_sharded'),
+        ('duplicated', 'duplicated'),
+    ],
+)
+def test_expert_mode_equal_to_dense_is_not_hybrid(tp_mode, expert_tp_mode):
     """An unset expert mode, or one set equal to the dense mode, is NOT hybrid: both bucket
     flags resolve to the single mode's class and mode."""
-    cfg = _hybrid_cfg(tp_mode, tp_mode if explicit else None)
+    cfg = _hybrid_cfg(tp_mode, expert_tp_mode)
     assert not muon_modes_are_hybrid(cfg)
     expected = LayerShardedMuon if tp_mode == 'layer_sharded' else eo_mod.TensorParallelMuon
     for is_expert in (False, True):
@@ -735,7 +742,7 @@ def test_bucketing_splits_on_the_two_expert_notions():
 
     # Layer-wise + hybrid: the comm split is collapsed, the semantic split applies to muon.
     buckets = _bucket_emerging_param_groups(
-        groups, 'muon', use_layer_wise=True, hybrid_muon_modes=True
+        groups, 'muon', use_layer_wise=True, use_hybrid_muon_modes=True
     )
     assert set(buckets) == {('muon', False, False), ('muon', False, True), ('adam', False, False)}
     assert buckets[('muon', False, True)] == [routed, routed_ep1]
@@ -743,14 +750,14 @@ def test_bucketing_splits_on_the_two_expert_notions():
 
     # Layer-wise, not hybrid: one bucket per optimizer name, as before this flag existed.
     buckets = _bucket_emerging_param_groups(
-        groups, 'muon', use_layer_wise=True, hybrid_muon_modes=False
+        groups, 'muon', use_layer_wise=True, use_hybrid_muon_modes=False
     )
     assert set(buckets) == {('muon', False, False), ('adam', False, False)}
 
     # Plain path + hybrid: the comm flag splits too; the EP=1 expert shares the dense comm
     # groups (grad stats over mp) but still gets the expert mode.
     buckets = _bucket_emerging_param_groups(
-        groups, 'muon', use_layer_wise=False, hybrid_muon_modes=True
+        groups, 'muon', use_layer_wise=False, use_hybrid_muon_modes=True
     )
     assert set(buckets) == {
         ('muon', False, False),

@@ -139,23 +139,39 @@ class ParamKey:
         return False
 
 
+def muon_effective_dense_mode(config) -> str:
+    """NS mode the dense weights run under: ``muon_tp_mode``.
+
+    Accepts any object carrying the attribute (an OptimizerConfig or the parsed training
+    args), so every reader shares one default.
+    """
+    return getattr(config, 'muon_tp_mode', 'duplicated')
+
+
 def muon_effective_expert_tp_mode(config) -> str:
     """NS mode the routed MoE expert weights run under: ``muon_expert_tp_mode`` when set,
-    otherwise ``muon_tp_mode``.
+    otherwise the dense mode (:func:`muon_effective_dense_mode`).
 
     Accepts any object carrying the two attributes (an OptimizerConfig or the parsed training
     args), so the CLI validation and the optimizer builders share this one definition.
     """
-    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
-        config, 'muon_tp_mode', 'duplicated'
-    )
+    return getattr(config, 'muon_expert_tp_mode', None) or muon_effective_dense_mode(config)
 
 
 def muon_modes_are_hybrid(config) -> bool:
     """Whether dense and expert weights run DIFFERENT NS modes, so the Muon builder keeps the
     two weight families in separate base optimizers (see
-    ``megatron.core.optimizer._get_megatron_emerging_optimizer``)."""
-    return muon_effective_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated')
+    ``megatron.core.optimizer._get_megatron_emerging_optimizer``).
+
+    TensorParallelMuon's 'auto' already runs every expert weight 'duplicated' (its cost model
+    covers dense GTP weights only), so 'auto' with an explicit 'duplicated' expert mode is not
+    hybrid: it keeps the single optimizer of the unset default.
+    """
+    dense_mode = muon_effective_dense_mode(config)
+    expert_mode = muon_effective_expert_tp_mode(config)
+    if dense_mode == 'auto' and expert_mode == 'duplicated':
+        return False
+    return expert_mode != dense_mode
 
 
 @dataclass
@@ -344,7 +360,7 @@ class OptimizerConfig:
     mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
     emerging-optimizers >= 0.3.0."""
 
-    muon_expert_tp_mode: Optional[str] = None
+    muon_expert_tp_mode: str | None = None
     """NS mode for the routed MoE expert weights. None (default): expert weights follow
     muon_tp_mode. Any muon_tp_mode value gives the expert weights their own mode — e.g.
     muon_tp_mode='auto' with muon_expert_tp_mode='layer_sharded' runs the per-weight
@@ -359,7 +375,12 @@ class OptimizerConfig:
     would silently apply muon_tp_mode to all weights. layer_sharded on either side needs the
     layer-wise path; the split-QKV restriction is keyed to muon_tp_mode only, since expert
     weights own no QKV. Requires num_experts when set explicitly (validate_args: a model
-    without expert weights has no expert bucket to route)."""
+    without expert weights has no expert bucket to route). 'auto' is rejected: its cost model
+    covers dense weights only, so on expert weights it would run duplicated. Switching this
+    setting on resume changes the optimizer's param-group layout (the routed experts move to
+    their own base optimizer), so resuming a checkpoint across that switch is not supported.
+    muon_tp_mode='auto' with muon_expert_tp_mode='duplicated' counts as equal modes ('auto'
+    already runs expert weights duplicated), so it builds no separate expert optimizer."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -531,6 +552,15 @@ class OptimizerConfig:
                 f"muon_expert_tp_mode is only implemented for optimizer='muon' (got "
                 f"{self.optimizer!r}); other optimizers, including adaptive_muon, apply "
                 "muon_tp_mode to every weight and would silently ignore it."
+            )
+        if self.muon_expert_tp_mode == 'auto':
+            # TensorParallelMuon applies the auto cost model to dense weights only; expert
+            # weights under 'auto' run duplicated, so an explicit 'auto' would build a separate
+            # expert optimizer that runs exactly what the default does.
+            raise ValueError(
+                "muon_expert_tp_mode='auto' is not supported: the auto cost model only covers "
+                "dense weights, so expert weights would run 'duplicated'. Set 'duplicated' "
+                "(or leave muon_expert_tp_mode unset) instead."
             )
         # Expert weights follow muon_tp_mode unless muon_expert_tp_mode overrides it.
         muon_expert_tp_mode = muon_effective_expert_tp_mode(self)
