@@ -11,6 +11,7 @@ on real GPUs.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import megatron.core.distributed.distributed_data_parallel as ddp_module
@@ -20,6 +21,8 @@ from megatron.core.distributed.distributed_data_parallel import (
 )
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.transformer import hyper_connection
+from megatron.core.transformer.experimental_attention_variant import csa
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
@@ -198,3 +201,74 @@ class TestDSAFineGrainedReadiness:
         )
 
         assert DSAttention not in recurse_types
+
+
+class _StopAtReadiness(Exception):
+    pass
+
+
+def _stop_at_readiness(monkeypatch, module):
+    """Replace ``module.ensure_params_ready`` with a recorder that ends the call there."""
+    calls = []
+
+    def ensure_params_ready(params):
+        calls.append(list(params))
+        raise _StopAtReadiness
+
+    monkeypatch.setattr(module, "ensure_params_ready", ensure_params_ready)
+    return calls
+
+
+class TestReadsOutsideForwardPublishFirst:
+    """Call sites that read a parameter without calling its owning module must publish it first.
+
+    The owning module's forward pre-hook is what waits for an overlapped all-gather, so a read
+    that bypasses ``__call__`` would otherwise see the pre-update values. Each test stops at the
+    readiness call; without it the method runs on into the stub and fails differently.
+    """
+
+    def test_mhc_projection_publishes_mapping_proj(self, monkeypatch):
+        weight = torch.nn.Parameter(torch.zeros(1))
+        stub = SimpleNamespace(mapping_proj=SimpleNamespace(weight=weight))
+        calls = _stop_at_readiness(monkeypatch, hyper_connection)
+
+        with pytest.raises(_StopAtReadiness):
+            hyper_connection.HyperConnectionModule._projection_and_get_norm(
+                stub, torch.zeros(2, 1, 4)
+            )
+
+        assert len(calls) == 1 and len(calls[0]) == 1 and calls[0][0] is weight
+
+    def test_fused_mhc_mappings_publish_mapping_proj_before_kernel(self, monkeypatch):
+        def fused_kernel(*args, **kwargs):
+            raise AssertionError("fused kernel read mapping_proj.weight before it was published")
+
+        weight = torch.nn.Parameter(torch.zeros(1))
+        stub = SimpleNamespace(
+            mapping_proj=SimpleNamespace(weight=weight),
+            _proj_rms_compute_h_op=fused_kernel,
+            n=2,
+            hidden_size=2,
+        )
+        calls = _stop_at_readiness(monkeypatch, hyper_connection)
+
+        with pytest.raises(_StopAtReadiness):
+            hyper_connection.HyperConnectionModule.compute_mappings(stub, torch.zeros(2, 1, 4))
+
+        assert len(calls) == 1 and len(calls[0]) == 1 and calls[0][0] is weight
+
+    def test_compressor_context_parallel_path_publishes_ape(self, monkeypatch):
+        ape = torch.nn.Parameter(torch.zeros(1))
+        calls = _stop_at_readiness(monkeypatch, csa)
+
+        with pytest.raises(_StopAtReadiness):
+            csa.Compressor._forward_thd_cp(
+                SimpleNamespace(ape=ape),
+                torch.zeros(1),
+                boundary_hidden=None,
+                cu_seqlens=None,
+                layout=None,
+                max_seqlen_q=0,
+            )
+
+        assert len(calls) == 1 and len(calls[0]) == 1 and calls[0][0] is ape
