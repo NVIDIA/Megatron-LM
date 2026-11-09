@@ -326,7 +326,10 @@ class BaseTransformerLayer(ABC):
     #: (``ResidualStreamRecomputeContext``) and finalizes each replay block after its
     #: last layer. This replaces the ``mhc_recompute_manager`` keyword and the manager's
     #: ``is_last_layer_in_recompute_block`` flag. The context holds a live checkpoint
-    #: manager, so keep it out of CUDA-graph kwargs.
+    #: manager, so keep it out of CUDA-graph kwargs. If stored on the layer, retain it
+    #: only for the duration of the public call and clear that reference in a ``finally``
+    #: block, including on exceptions. Deferred local CUDA-graph capture bypasses
+    #: ``__call__`` and must not reuse a context whose replay block was already finalized.
     supports_mhc_connections: bool = False
 
     #: Whether the layer owns wide-residual branch connections.
