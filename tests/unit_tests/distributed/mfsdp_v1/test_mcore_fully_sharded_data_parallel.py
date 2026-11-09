@@ -1721,3 +1721,79 @@ class TestMegatronFsdpSynchronousGradReduce:
         wrong width here rescales every gradient in the run.
         """
         self._reduce_once(sharding_strategy)
+
+
+class TestMegatronFsdpMetaDeviceInitRouterBuffers:
+    """Meta-device initialization of a MoE router with an aux-loss-free expert bias.
+
+    With init_model_with_meta_device, Megatron builds the model under torch.device("meta"). The
+    router's weight is a meta tensor, but its expert_bias and local_tokens_per_expert buffers
+    are created on the GPU, and its reset_parameters() initializes only the weight. Materializing
+    the router's meta parameters must leave those buffers as they are.
+    """
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("sharding_strategy", ["optim", "optim_grads", "optim_grads_params"])
+    def test_router_buffers_survive_meta_device_init(self, sharding_strategy):
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+        from megatron.core.models.gpt.gpt_model import GPTModel
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        num_experts = 4
+        Utils.initialize_model_parallel()
+        try:
+            model_parallel_cuda_manual_seed(0)
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=64,
+                num_attention_heads=4,
+                add_bias_linear=False,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                num_moe_experts=num_experts,
+                moe_router_topk=2,
+                moe_router_score_function="sigmoid",
+                moe_router_enable_expert_bias=True,
+                init_model_with_meta_device=True,
+            )
+            with torch.device("meta"):
+                model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_decoder_block_spec(
+                        config=config, use_transformer_engine=True
+                    ),
+                    vocab_size=128,
+                    max_sequence_length=32,
+                )
+
+            routers = [module for module in model.modules() if isinstance(module, TopKRouter)]
+            assert routers, "The model has no TopKRouter."
+            # Values that uninitialized memory would not reproduce.
+            expert_bias = torch.arange(1, num_experts + 1, dtype=torch.float32).cuda()
+            tokens_per_expert = torch.full((num_experts,), 7, dtype=torch.int64).cuda()
+            for router in routers:
+                assert not router.expert_bias.is_meta
+                router.expert_bias.copy_(expert_bias)
+                router.local_tokens_per_expert.copy_(tokens_per_expert)
+
+            FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    data_parallel_sharding_strategy=sharding_strategy,
+                    overlap_grad_reduce=True,
+                    overlap_param_gather=True,
+                    use_megatron_fsdp=True,
+                ),
+                module=model,
+                fsdp_unit_modules=[TransformerLayer],
+            )
+
+            for router in routers:
+                assert_close(router.expert_bias, expert_bias, rtol=0, atol=0)
+                assert_close(router.local_tokens_per_expert, tokens_per_expert, rtol=0, atol=0)
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()

@@ -295,7 +295,8 @@ def pretrain_until_warmup(monkeypatch):
     monkeypatch.setattr(training.ft_integration, "setup", lambda: None)
     monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: None)
     monkeypatch.setattr(training, "get_timers", lambda: None)
-    monkeypatch.setattr(training, "set_jit_fusion_options", lambda **kwargs: None)
+    monkeypatch.setattr(training, "get_train_state", lambda: Namespace())
+    monkeypatch.setattr(training, "set_jit_fusion_options", lambda *args, **kwargs: None)
 
     def invoke(args, model_config, tp_group):
         monkeypatch.setattr(training, "get_args", lambda: args)
@@ -306,12 +307,14 @@ def pretrain_until_warmup(monkeypatch):
             raise WarmupReached
 
         monkeypatch.setattr(kernel_warmup, "_warmup_training_kernels", observe)
-        # Only what pretrain() touches before the warmup call; validate() is a no-op here.
+        # Only what pretrain() touches before the warmup call; validate() and finalize() are
+        # no-ops here.
         cfg = Namespace(
             model=model_config,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
+            finalize=lambda: None,
         )
         with pytest.raises(WarmupReached):
             training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))

@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -82,7 +82,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -366,6 +366,33 @@ class TestMultiTokenPredictionLayer:
         for peer_mixed in gathered[1:]:
             torch.testing.assert_close(peer_mixed, gathered[0])
         assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_rng_differs_across_gtp_data_lanes(self):
+        """GTP ranks carry distinct microbatches and must draw independent HSM masks."""
+        gtp = 2
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < gtp or world_size % gtp:
+            pytest.skip(f"GTP={gtp} requires a world size divisible by {gtp}")
+        Utils.initialize_model_parallel(gtp_remat_size=gtp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['dp', 'gtp_remat']
+        )
+        rng_tracker_name = _initialize_hidden_state_mixing_rng_tracker(
+            pg_collection.dp, pg_collection.gtp_remat
+        )
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _mix_hidden_state_history(
+            torch.stack(history[:-1]), history[-1], rng_tracker_name=rng_tracker_name
+        )
+        gathered = [torch.empty_like(mixed) for _ in range(gtp)]
+        torch.distributed.all_gather(gathered, mixed, group=pg_collection.gtp_remat)
+
+        assert not torch.equal(gathered[0], gathered[1])
 
     def test_hsm_rng_differs_across_sequence_parallel_owners(self):
         """Disjoint TP+CP token shards receive different tracked RNG slices."""
@@ -2526,9 +2553,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=cfg_container.tokenizer.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2764,6 +2789,7 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2787,6 +2813,7 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
@@ -4396,7 +4423,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4563,6 +4590,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
@@ -4901,6 +4929,7 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -4928,6 +4957,7 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,

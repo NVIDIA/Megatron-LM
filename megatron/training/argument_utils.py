@@ -2,6 +2,7 @@
 
 import ast
 import builtins
+import copy
 import dataclasses
 import enum
 import importlib
@@ -47,7 +48,15 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
-from megatron.training.models import GPTModelConfig, HybridModelConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    ModelConfig,
+    T5ModelConfig,
+)
 from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
@@ -586,13 +595,13 @@ def resolve_tokenizer_vocab_size(
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
-            vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
+            vocabulary is preserved; only unresolved model sizes are bound.
 
     Raises:
-        ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
+        ValueError: A model's vocabulary remains unresolved.
     """
     padded_vocab_size = cfg.tokenizer.padded_vocab_size
-    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
+    if cfg.model is not None and hasattr(cfg.model, "vocab_size") and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
         cfg.model.vocab_size = padded_vocab_size
@@ -789,6 +798,156 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
         kwargs["use_nsys_profiler"] = args.profile and not use_pytorch
         kwargs["use_pytorch_profiler"] = args.profile and use_pytorch
     return ProfilingConfig(**deepcopy(kwargs))
+
+
+def model_config_from_args(
+    args: Namespace,
+    *,
+    model_config_cls: type[
+        ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
+    ]
+    | None = None,
+) -> ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig:
+    """Build a model-family config at the CLI boundary.
+
+    BERT, T5, LLaVA, and MIMO applications select their config class explicitly.
+    Decoder-only callers use the existing GPT/Hybrid adapters. Model construction
+    remains independent: an explicit provider callback is retained by pretrain.
+    Add a dedicated <model>_config_from_args adapter for model-specific handling;
+    keep the shared field mapping below independent of individual model families.
+    """
+    if model_config_cls is None:
+        model_config_cls = (
+            HybridModelConfig
+            if getattr(args, "hybrid_layer_pattern", None) is not None
+            else GPTModelConfig
+        )
+    if issubclass(model_config_cls, GPTModelConfig):
+        return gpt_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, HybridModelConfig):
+        return hybrid_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, BertModelConfig):
+        return bert_config_from_args(args, model_config_cls=model_config_cls)
+    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+
+
+def bert_config_from_args(
+    args: Namespace, model_config_cls: type[BertModelConfig] = BertModelConfig
+) -> BertModelConfig:
+    """Resolve the BERT layer spec and shared model fields at the CLI boundary."""
+    from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
+
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if args.spec is not None:
+        kwargs["transformer_layer_spec"] = (
+            bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    return model_config_cls(**kwargs)
+
+
+def _model_config_kwargs_from_args(args: Namespace, model_config_cls: type) -> dict[str, Any]:
+    """Map common CLI fields without applying model-specific policies."""
+    if args.yaml_cfg is not None:
+        from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+        transformer = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        transformer = core_transformer_config_from_args(args)
+    vocab_size = getattr(args, "padded_vocab_size", None)
+    if vocab_size is None and not args.pad_vocab_size:
+        vocab_size = args.vocab_size
+    kwargs = _default_config_from_args(model_config_cls, args, return_instance=False)
+    aliases = dict(
+        transformer=transformer,
+        seq_length=args.max_position_embeddings,
+        vocab_size=vocab_size,
+        should_pad_vocab=False,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        rope_scaling=args.use_rope_scaling,
+        seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+    )
+    model_fields = {f.name for f in fields(model_config_cls) if f.init}
+    kwargs.update({name: value for name, value in aliases.items() if name in model_fields})
+    return kwargs
+
+
+def checkpoint_config_from_args(args: Namespace) -> CheckpointConfig:
+    """Build the checkpoint section from the argparse namespace.
+
+    One translation for the training container, the inference container and the parse-time base
+    load of ``--use-checkpoint-args``. The four ``--no-*`` flags and the two ``ckpt_fully_parallel_*``
+    dests are folded here; a namespace without them (an args-only entry point) keeps the field
+    defaults. The CLI alias wins over a same-named field when a namespace carries both.
+    """
+    kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            kwargs[name] = getattr(args, f"ckpt_{name}")
+    return CheckpointConfig(**kwargs)
+
+
+def project_checkpoint_policy(
+    args: Namespace, checkpoint: CheckpointConfig, **overrides: Any
+) -> Namespace:
+    """The inverse of ``checkpoint_config_from_args``: a shallow copy of ``args`` whose
+    checkpoint-owned names reflect ``checkpoint``, with ``overrides`` (field name to value) in
+    place of the section's values: the directory and format of a conversion save.
+
+    Used for the argument namespace persisted in a checkpoint, so that saved arguments describe
+    the policy that produced the file; neither the live namespace nor the section is written.
+
+    This reverse projection exists for two reasons, and goes when they do: six argument dests
+    differ from their field names (the ``--no-*`` flags and the ``ckpt_fully_parallel_*`` dests),
+    and checkpoints still persist ``args``, which this loader (for checkpoints without a saved
+    section), older trees and Megatron-Bridge's compatibility reader consult.
+    """
+    missing = object()
+    aliased_fields = frozenset(
+        ("save_optim", "save_rng", "load_optim", "load_rng", "fully_parallel_save", "fully_parallel_load")
+    )
+    unknown = set(overrides) - {item.name for item in fields(CheckpointConfig)}
+    if unknown:
+        raise TypeError(f"not checkpoint fields: {sorted(unknown)}")
+    values = {item.name: getattr(checkpoint, item.name) for item in fields(CheckpointConfig)}
+    values.update(overrides)
+    projected = copy.copy(args)
+    defaults = {item.name: item.default for item in fields(CheckpointConfig)}
+    for item in fields(CheckpointConfig):
+        value = values[item.name]
+        if item.name in aliased_fields:
+            # A namespace built in Python may carry the canonical name; it follows the policy.
+            # The CLI spellings are handled below.
+            if hasattr(args, item.name):
+                setattr(projected, item.name, value)
+            continue
+        # A field with no CLI flag (most_recent_k) is added only when it departs from its default.
+        if hasattr(args, item.name) or value != item.default:
+            setattr(projected, item.name, value)
+    # An alias that already agrees with the policy keeps its spelling (an unset store_true flag
+    # is None, not False), so a CLI run's saved arguments are byte-identical to the parsed ones.
+    # A namespace with neither spelling gets the alias when the value departs from the default,
+    # which is what the factory would otherwise reconstruct.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        alias, value = f"no_{name}", values[name]
+        if hasattr(args, alias):
+            if bool(getattr(args, alias)) != (not value):
+                setattr(projected, alias, not value)
+        elif not hasattr(args, name) and value != defaults[name]:
+            setattr(projected, alias, not value)
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        alias, value = f"ckpt_{name}", values[name]
+        if hasattr(args, alias):
+            if getattr(args, alias) != value:
+                setattr(projected, alias, value)
+        elif not hasattr(args, name) and value != defaults[name]:
+            setattr(projected, alias, value)
+    use_dist_ckpt = values["ckpt_format"] != "torch"
+    if getattr(args, "use_dist_ckpt", missing) != use_dist_ckpt:
+        projected.use_dist_ckpt = use_dist_ckpt
+    return projected
 
 
 # args attribute -> Megatron Core GPTDatasetConfig field, as the legacy entry-point factories read
@@ -991,33 +1150,19 @@ def pretrain_cfg_container_from_args(
         data_cfg = DataConfig(dataloader=dataloader_config_from_args(args))
 
     if model_cfg is None:
-        msg = """
-        It is recommended to use a ModelConfig (e.g. megatron.training.models.HybridModelConfig) instead
-        of a model builder/model provider function pointer.
-        """
-        warnings.warn(msg)
-
-    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+        model_cfg = model_config_from_args(args)
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+    # Preserve the legacy CLI spelling; native configs use Core's canonical mode.
+    if rerunsm_kwargs.get("rerun_mode") == "report_stats":
+        warn_rank_0(
+            "Prefer --rerun-mode report_determinism_stats over --rerun-mode report_stats "
+            "for consistency with the naming in cfg.rerun_state_machine."
+        )
+        rerunsm_kwargs["rerun_mode"] = "report_determinism_stats"
 
     optim_cfg = _default_config_from_args(OptimizerConfig, args)
-    if model_cfg is None:
-        # Legacy model providers still own these inputs in args. Do not create a placeholder
-        # model config: that would select the native model builder instead of the provider.
-        optim_cfg.validate_model(
-            moe_single_grouped_weight=getattr(args, "moe_single_grouped_weight", False),
-            virtual_pipeline_model_parallel_size=getattr(
-                args, "virtual_pipeline_model_parallel_size", None
-            ),
-        )
     ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
@@ -1031,7 +1176,7 @@ def pretrain_cfg_container_from_args(
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
-        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        checkpoint=checkpoint_config_from_args(args),
         profiling=profiling_config_from_args(args),
         tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
@@ -1070,28 +1215,15 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        build_model_config: If False, retain model_cfg (including None) for legacy callers
-            that still construct the model through a model provider.
+        build_model_config: If False, leave model_cfg=None until the caller resolves
+            its model inputs. Application-specific families pass model_cfg explicitly.
     """
     if model_cfg is None and build_model_config:
-        if getattr(args, "hybrid_layer_pattern", None) is not None:
-            model_cfg = hybrid_config_from_args(args)
-        else:
-            model_cfg = gpt_config_from_args(args)
-
-    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
-    # Preserve canonical config values or defaults when an alias is absent.
-    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
-        if hasattr(args, f"no_{name}"):
-            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
-    for name in ("fully_parallel_save", "fully_parallel_load"):
-        if hasattr(args, f"ckpt_{name}"):
-            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
+        model_cfg = model_config_from_args(args)
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
-        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        checkpoint=checkpoint_config_from_args(args),
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),

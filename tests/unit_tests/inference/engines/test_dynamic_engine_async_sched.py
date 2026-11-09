@@ -73,6 +73,7 @@ def _make_engine(
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
+        max_prefill_tokens=8,
         chunked_prefill_request_id=-1,
     )
     model_config = SimpleNamespace(
@@ -1637,7 +1638,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "last-logits" in signals:
             assert context.config.materialize_only_last_token_logits
             assert runtime["last-logits-forward"] == runtime["model-forward"]
-            assert runtime["logits-dtype:torch.bfloat16"] > 0
+            assert runtime["logits-dtype:torch.float32"] > 0
         if "events" in signals:
             for request in env.requests:
                 event_types = [event.type for event in request.events]
