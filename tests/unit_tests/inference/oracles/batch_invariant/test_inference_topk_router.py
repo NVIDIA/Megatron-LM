@@ -5,8 +5,10 @@
 Kernel: `megatron/core/transformer/moe/router.py` (`InferenceTopKRouter._forward` under
 `InferenceMode`), which dispatches to `torch.compile`'d `topk_routing_with_score_function`
 (`moe_utils.py`), the Triton sigmoid top-k kernel (`inference/moe/sigmoid_topk.py`, backend
-'triton', the default), eager routing in batch-invariant mode, or TE's fused router
-(`moe_router_fusion`). Every MoE layer of an inference-optimized model routes through it.
+'triton', the default), eager routing in batch-invariant mode (which itself runs the sigmoid
+kernel with a batch-invariant launch where it applies, since #8602), or TE's fused router
+(`moe_router_fusion`). Every MoE layer of an inference-optimized model routes through it. The
+kernel's own oracle is `test_sigmoid_topk_kernel.py`.
 
 Contract (written from the routing semantics, `TransformerConfig`'s documented router options and
 the eval-mode `TopKRouter` the model was trained with):
@@ -39,7 +41,10 @@ the eval-mode `TopKRouter` the model was trained with):
   sigmoid scores, an expert bias, fp32 logits, 1 < k <= min(32, E), E <= 512 and no
   batch-invariant mode, group-limited routing, router replay, micro-batch QB or fusion runs the
   Triton kernel (global-batch QB's bias is an expert bias); batch-invariant mode runs the routing
-  eagerly; everything else runs the compiled routing.
+  eagerly, and that routing runs the kernel with `batch_invariant=True` exactly for sigmoid
+  scores with an expert bias, k > 1, fp32 logits and a supported shape, without quantile
+  balancing or router replay (#8602, `_use_batch_invariant_sigmoid_topk`); everything else runs
+  the compiled routing.
 - CUDA-graph replay with new inputs gives the eager bits.
 
 Reference: fp64 routing written from the semantics above (`routing_reference`), on logits built
@@ -97,6 +102,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.router import InferenceTopKRouter
@@ -498,27 +504,36 @@ def test_hash_layer_routing(kind, topk):
 
 
 class _PathSpy:
-    """Records which routing implementation ran: the sigmoid kernel or the compiled routing.
+    """Records which routing implementation ran: the sigmoid kernel called by the router, the
+    compiled routing, or the sigmoid kernel called by the eager batch-invariant routing.
 
-    Eager routing (batch-invariant mode) is the case where neither ran; its result is checked
-    like every other. The eager function itself is not wrapped, because the compiled routing
-    traces through it.
+    Eager routing (batch-invariant mode) without the kernel is the case where none ran; its
+    result is checked like every other. The eager function itself is not wrapped, because the
+    compiled routing traces through it.
     """
 
     def __init__(self, monkeypatch):
         self.calls = []
         kernel = router_module.sigmoid_topk_routing
+        bi_kernel = moe_utils.sigmoid_topk_routing
         compiled = InferenceTopKRouter.__dict__["_compiled_topk_routing"].__func__
 
         def kernel_spy(*args, **kwargs):
             self.calls.append("triton_kernel")
             return kernel(*args, **kwargs)
 
+        def bi_kernel_spy(*args, **kwargs):
+            # The batch-invariant routing must ask for the batch-invariant launch.
+            launch = "bi_kernel" if kwargs.get("batch_invariant") else "bi_kernel_unpinned"
+            self.calls.append(launch)
+            return bi_kernel(*args, **kwargs)
+
         def compiled_spy(*args, **kwargs):
             self.calls.append("compiled")
             return compiled(*args, **kwargs)
 
         monkeypatch.setattr(router_module, "sigmoid_topk_routing", kernel_spy)
+        monkeypatch.setattr(moe_utils, "sigmoid_topk_routing", bi_kernel_spy)
         monkeypatch.setattr(
             InferenceTopKRouter, "_compiled_topk_routing", staticmethod(compiled_spy)
         )
@@ -534,7 +549,12 @@ _DISPATCH = [
     ("triton", "sigmoid", 64, 6, False, "compiled"),
     ("triton", "softmax", 64, 6, False, "compiled"),
     ("torch", "sigmoid_bias", 64, 6, False, "compiled"),
-    ("triton", "sigmoid_bias", 64, 6, True, "eager"),
+    # Batch-invariant mode: eager routing, which runs the kernel's batch-invariant launch for
+    # sigmoid + bias on supported shapes whatever the router backend (#8602).
+    ("triton", "sigmoid_bias", 64, 6, True, "bi_kernel"),
+    ("torch", "sigmoid_bias", SIGMOID_KERNEL_MAX_EXPERTS, 8, True, "bi_kernel"),
+    ("triton", "sigmoid_bias", 64, SIGMOID_KERNEL_MAX_TOPK + 1, True, "eager"),
+    ("triton", "sigmoid", 64, 6, True, "eager"),
     ("torch", "softmax", 64, 6, True, "eager"),
 ]
 
@@ -725,9 +745,9 @@ _QB_MICRO_CASES = ou.pairwise_cases(
 @pytest.mark.parametrize("case", _QB_MICRO_CASES, ids=[_qb_id(c) for c in _QB_MICRO_CASES])
 def test_quantile_balancing_micro_batch_selects_on_logits_minus_beta(case, monkeypatch):
     """Micro-batch QB on every path: the experts with the k largest z - beta, probs from the
-    score function, and the QB state read only. The compiled routing (or eager routing in
-    batch-invariant mode) runs, never the sigmoid kernel, which knows no QB bias. The eval-mode
-    router outside InferenceMode selects the same experts."""
+    score function, and the QB state read only. The compiled routing (or eager routing without
+    the kernel in batch-invariant mode) runs, never the sigmoid kernel, which knows no QB bias.
+    The eval-mode router outside InferenceMode selects the same experts."""
     num_experts, kind, tokens = case["e"], case["kind"], case["t"]
     topk = min(case["topk"], num_experts - 1)  # QB requires k < E
     backend = "torch" if case["path"] == "compiled" else "triton"
@@ -769,8 +789,9 @@ _QB_GLOBAL_CASES = ou.pairwise_cases(
 def test_quantile_balancing_global_batch_routes_with_its_bias(case, monkeypatch):
     """Global-batch QB on every path: the k largest sigmoid(z) + bias, probs sigmoid(z)
     normalized, histogram and bias read only. The QB bias is an expert bias, so the Triton
-    backend runs the sigmoid kernel wherever it supports the shape. The eval-mode router
-    selects the same experts."""
+    backend runs the sigmoid kernel wherever it supports the shape; batch-invariant mode keeps
+    the reference routing for QB (`allow_batch_invariant_sigmoid_topk` is off for it). The
+    eval-mode router selects the same experts."""
     num_experts, tokens, scaling = case["e"], case["t"], case["scaling"]
     topk = min(case["topk"], num_experts - 1)
     backend = "torch" if case["path"] == "compiled" else "triton"
