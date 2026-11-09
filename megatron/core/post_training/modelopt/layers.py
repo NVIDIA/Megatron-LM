@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.transformer.torch_norm import LayerNormInterface
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
