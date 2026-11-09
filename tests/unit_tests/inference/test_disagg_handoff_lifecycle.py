@@ -2064,18 +2064,12 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
 class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
     """Prefill engine shell that drives the real coordinator loop on scripted work."""
 
-    def __init__(
-        self, *, ep_world_size, peer_work, iterations, dummy_forward, tp_ep_world_size=None
-    ) -> None:
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward) -> None:
         self._initialize_disaggregation_state()
         self._kv_transfer_role = "prefill"
         self.state = EngineState.RUNNING
         self.rank = 0
-        # With expert-TP == 1 the tp_ep group is the EP group; expert-TP peers widen it.
-        if tp_ep_world_size is None:
-            tp_ep_world_size = ep_world_size
-        self.tp_ep_world_size = tp_ep_world_size
-        self.ep_world_size = ep_world_size
+        self.tp_ep_world_size = ep_world_size
         self.ep_consensus_interval = 20
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus = (0, False)
@@ -2091,7 +2085,7 @@ class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
         self.all_reduce_inputs = []
         self._peer_work = peer_work
         self._iterations_left = iterations
-        if tp_ep_world_size > 1:
+        if ep_world_size > 1:
             self.expert_parallel_zmq_communicator = SimpleNamespace(
                 all_reduce_max=self._all_reduce_max
             )
@@ -2139,32 +2133,6 @@ def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loo
 
     _run_coordinator_loop(engine, handoff_loop)
 
-    assert engine.step_calls == 1
-    dummy_forward.assert_not_called()
-    assert engine.context.step_count == 0
-    assert engine._last_ep_consensus == (0, False)
-
-
-def test_idle_tensor_parallel_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loop):
-    """A drained TP>1, EP=1 engine must refresh consensus instead of reusing a cached one.
-
-    Its consensus peers are expert-TP ranks with identical schedules, so once local work drains
-    the cached global work is stale. Acting on it would run a dummy forward that needs a
-    recurrent-state slot, and EP=1 reserves none while pending handoffs may hold them all.
-    """
-    dummy_forward = mock.Mock(
-        side_effect=AssertionError(
-            "No free recurrent-state slots for 1 expert-parallel dummy request(s)"
-        )
-    )
-    engine = _CoordinatorLoopPrefillEngine(
-        ep_world_size=1, tp_ep_world_size=2, peer_work=0, iterations=4, dummy_forward=dummy_forward
-    )
-
-    _run_coordinator_loop(engine, handoff_loop)
-
-    # Consensus is re-established on every iteration, and the TP peer mirrors the drain.
-    assert engine.all_reduce_inputs == [1, 0, 0, 0]
     assert engine.step_calls == 1
     dummy_forward.assert_not_called()
     assert engine.context.step_count == 0

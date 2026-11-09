@@ -741,7 +741,6 @@ class EngineLoopMixin:
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         self.tp_ep_world_size == 1
-                        or self.ep_world_size == 1
                         or global_work_from_last_consensus == 0
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
@@ -751,14 +750,9 @@ class EngineLoopMixin:
                         #    with no collective to join. Such a dummy forward would also need a
                         #    request-owned recurrent-state slot (the dedicated dummy slot is only
                         #    reserved for EP > 1), which pending handoffs may all be holding.
-                        # 1. there is no expert parallelism (e.g. TP > 1, EP = 1) -> the consensus
-                        #    peers are only TP ranks with identical schedules, so a cached value is
-                        #    pure staleness. Reusing it after local work drains would run the same
-                        #    unneeded dummy forward that case 0 avoids, again without a reserved
-                        #    recurrent-state slot. Refresh every step instead.
-                        # 2. there is no global work -> engine is idle. At any step in the future
+                        # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
-                        # 3. it has been 20 steps since we last established consensus, and that consensus
+                        # 2. it has been 20 steps since we last established consensus, and that consensus
                         #    had some work.
                         # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
