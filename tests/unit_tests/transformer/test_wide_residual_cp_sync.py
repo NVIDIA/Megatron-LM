@@ -13,11 +13,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
-from megatron.core.transformer.residual_recompute import (
-    build_residual_stream_recompute_plan,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
-)
+from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -67,17 +63,16 @@ class _WideResidualReplayHarness(nn.Module):
     def forward(self, residual_stream: torch.Tensor, *, replay: bool) -> torch.Tensor:
         contexts = build_residual_stream_recompute_plan(2, 2) if replay else [None, None]
         for (reader, writer), context in zip(self.connections, contexts):
-            if context is None:
-                branch_input, state = reader(residual_stream)
-            else:
-                branch_input, state = checkpoint_residual_read(
-                    reader, residual_stream, context, fp32_residual_connection=False
-                )
+            branch_input, state = reader(residual_stream, recompute_context=context)
 
             branch_update = torch.tanh(branch_input) + 0.125 * branch_input
             if context is not None and not context.is_block_end:
-                residual_stream = checkpoint_residual_write(
-                    writer, branch_update, state, context, dropout_probability=0.0, training=False
+                residual_stream = writer(
+                    branch_update,
+                    state=state,
+                    recompute_context=context,
+                    dropout_probability=0.0,
+                    training=False,
                 )
             else:
                 residual_stream = writer(

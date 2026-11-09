@@ -203,7 +203,11 @@ def main():
     logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron()
 
     # Set up model and load checkpoint.
