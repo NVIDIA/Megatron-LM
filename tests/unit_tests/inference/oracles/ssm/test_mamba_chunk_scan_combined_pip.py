@@ -22,7 +22,9 @@ the kernel):
       dt' = softplus(dt + dt_bias);  h_t = exp(dt' A) h_{t-1} + dt' x_t (outer) B_t,g(h)
       y_t = (C_t . h_t + D x_t) * z_t sigmoid(z_t)   (no gate without z);   final = h_L
 
-  y in x's dtype; final in `state_dtype` (fp32 when not given).
+  y in x's dtype. `state_dtype` sets the dtype of the chunk states the scan reads; the final state is
+  the fp32 carry, returned in fp32 whatever `state_dtype` says (H100, pdx 7986854), and the call site
+  copies it into the cache's dtype, so its dtype is not part of the contract.
 * Call site: a static prefill of b prompts (`forward` with a StaticInferenceContext at offset 0) leaves,
   in the static caches, conv_state[i] = the prompt's last d_conv pre-conv xBC columns, zero-padded on the
   left (exact) and ssm_state[i] = request i's final state after the conv and scan of its prompt, in the
@@ -183,11 +185,13 @@ def _run_pip_scan(
         ou.assert_exact(inputs[name], value, what=f"{name} is read-only")
     assert y.shape == x.shape and y.dtype == dtype
     assert final.shape == (batch, heads, headdim, dstate)
-    if kwargs:
-        assert final.dtype == state_dtype
     args = (x, dt, A, B, C, D, z, dt_bias)
     ref_y, ref_final = ou.fp64_reference(reference_scan, *args)
-    t_y, t_final = trusted_scan(*args, chunk_size, final.dtype)
+    # y: Megatron's scan with the same state dtype, which sets the chunk states the scan reads.
+    t_y, _ = trusted_scan(*args, chunk_size, kwargs.get("state_dtype"))
+    # The final state: the fp32 carry, stored in the dtype mamba_ssm returns (fp32 at H100, pdx
+    # 7986854, whatever state_dtype says; the call site casts it into the cache).
+    _, t_final = trusted_scan(*args, chunk_size, final.dtype)
     ou.assert_close_to_reference(y, ref_y, t_y, what="y")
     ou.assert_close_to_reference(final, ref_final, t_final, what="final states")
 

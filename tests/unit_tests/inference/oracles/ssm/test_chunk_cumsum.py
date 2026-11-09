@@ -22,9 +22,12 @@ reading the kernel body):
       dt_out      = clamp(softplus(v) if dt_softplus else v, dt_min, dt_max)
       dA_cumsum   = sum_{i <= k} dt_out[h, c, i] * A[h]
 
-  and for positions len(c) <= k < chunk_size: dt_out = 0 and dA_cumsum = dA_cumsum at len(c) - 1 (the
-  window's total; zero for an empty window). The chunk-state and state-passing kernels read the
-  window's total decay at position chunk_size - 1, so this padding is part of the interface. A skipped
+  and for positions len(c) <= k < chunk_size: dt_out = 0 and dA_cumsum = the window's total (zero for an
+  empty window). The chunk-state and state-passing kernels read the window's total decay at position
+  chunk_size - 1, so this padding is part of the interface. The total there is the prefix sum at that
+  position, which adds the same terms as position len(c) - 1 but, in a parallel scan, possibly grouped
+  differently: equal to dA_cumsum[len(c) - 1] only up to fp32 rounding (H100, pdx 7986854: 1-2 ulp in
+  29 of the cases), exactly when every partial sum is exact (the dyadic cases). A skipped
   target-rows entry writes nothing. Tokens outside every window (padded tail tokens) are never read; dt
   is read-only.
 * softplus(v): log(1 + exp(v)) for v <= 20, v above. The kernel and the training scan (mamba_ssm) evaluate
@@ -35,7 +38,7 @@ reading the kernel body):
 * Tolerance class: floating point. Reference: the formulas above in fp64 (exact softplus, no chunking of
   the sum). Trusted: torch fp32 on the same device (the training formula for softplus; the prefix sum
   accumulated in fp32 in order, which is no more accurate than the kernel's scan).
-  Exact: the padding positions (zeros, the window total), skipped entries (still NaN-poisoned through the
+  Exact: dt_out's zeros past each window, skipped entries (still NaN-poisoned through the
   launcher's own allocation), and every output for dyadic inputs without softplus (each product and
   partial sum is then exact in fp32).
 
@@ -156,29 +159,25 @@ def run_cumsum(
     live_windows = [windows[c] for c in live]
     dA, dt_out = dA[:, live], dt_out[:, live]
 
-    # The padding past each window is part of the interface: zeros and the window total, exactly.
-    mask = su.window_mask(live_windows, chunk_size, dt.device)[None].expand_as(dt_out)
-    su.assert_equal(dt_out[~mask], torch.zeros_like(dt_out[~mask]), what="dt_out past the window")
-    lengths = torch.tensor([n for _, n in live_windows], device=dt.device)
-    last = (lengths - 1).clamp(min=0)[None, :, None].expand(dt_out.shape[0], -1, 1)
-    total = torch.where(
-        lengths[None, :, None] > 0, dA.gather(2, last), torch.zeros_like(dA[..., :1])
-    )
-    su.assert_equal(
-        dA[~mask], total.expand_as(dA)[~mask], what="dA_cumsum past the window (the window's total)"
-    )
-
     kw = dict(softplus=softplus, dt_limit=dt_limit)
     ref_dA, ref_dt = ou.fp64_reference(
         cumsum_reference, dt, A, dt_bias, live_windows, chunk_size, **kw
     )
+    # Past each window the reference holds dt 0 and the window's total, so every check below covers the
+    # padding as well; dt_out's zeros are exact whatever the inputs.
+    mask = su.window_mask(live_windows, chunk_size, dt.device)[None].expand_as(dt_out)
+    su.assert_equal(dt_out[~mask], torch.zeros_like(dt_out[~mask]), what="dt_out past the window")
     if exact:
         su.assert_equal(dt_out, ref_dt, what="dt_out (exact inputs)")
-        su.assert_equal(dA, ref_dA, what="dA_cumsum (exact inputs)")
+        su.assert_equal(
+            dA, ref_dA, what="dA_cumsum (exact inputs, incl. the totals past each window)"
+        )
         return dA, dt_out
     t_dA, t_dt = trusted_cumsum(dt, A, dt_bias, live_windows, chunk_size, **kw)
     ou.assert_close_to_reference(dt_out, ref_dt, t_dt, what="dt_out")
-    ou.assert_close_to_reference(dA, ref_dA, t_dA, what="dA_cumsum")
+    ou.assert_close_to_reference(
+        dA, ref_dA, t_dA, what="dA_cumsum (incl. the totals past each window)"
+    )
     return dA, dt_out
 
 

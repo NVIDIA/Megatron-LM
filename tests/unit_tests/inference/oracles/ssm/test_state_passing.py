@@ -32,6 +32,13 @@ and `_mamba_chunk_scan_decode_rows`, before reading the kernel body):
   exact), the restart rule (a NaN-poisoned initial state of a padded request reaches exactly its own
   chunk), untouched dst rows, guard bands.
 
+Finding O7-M3 (H100, pdx 7986854): dst mode updates `dst_states` in place, and production passes the same
+tensor as `initial_states`, so the update is not idempotent; the kernel's `@triton.autotune` has no
+`restore_value`, so timed autotuning (a cold cache at a new key, with more than one candidate) runs the
+update once per benchmark launch. Batch-invariant mode pins the autotuner (`enable_batch_invariant_mode`
+-> `_pin_mamba_autotuners`), which avoids it; a batch-invariant mixer run without that pin does not.
+`test_dst_mode_commits_once_under_timed_autotuning` asserts the contract and fails on main.
+
 Variants and dispatch (from the kernel, read after the contract): autotune BLOCK_SIZE in {64, ..., 2048}
 keyed on dim, each pinned in turn at dim BLOCK_SIZE - 1, BLOCK_SIZE, BLOCK_SIZE + 1; constexpr
 HAS_INITSTATES (with and without initial states) and HAS_DST_STATES; out_dtype fp32 and bf16 (an SSM
@@ -301,8 +308,16 @@ def test_every_block_size_at_its_edges(config_index, dim):
 def test_dst_states_commit_flagged_entries(aliased, dyadic):
     """dst mode as batch-invariant decode runs it: shuffled slots, a padding entry (slot -1, flag 0),
     flagged entries commit exp(total) * slot state + contribution into their slot; every other slot row
-    is untouched. In place (initial_states is dst_states, production) and into a separate dst."""
-    g = ou.make_generator(device=DEVICE)
+    is untouched. In place (initial_states is dst_states, production) and into a separate dst. The
+    autotuner is pinned, as batch-invariant mode pins it (`_pin_mamba_autotuners`); timed autotuning is
+    `test_dst_mode_commits_once_under_timed_autotuning`."""
+    with su.pinned(KERNEL, su.default_config(KERNEL)):
+        run_dst(*dst_case(dyadic, aliased), exact=dyadic)
+
+
+def dst_case(dyadic, aliased, seed=ou.DEFAULT_SEED):
+    """A decode step's dst-mode inputs: (states, dA, slots, flags, initial_states, dst)."""
+    g = ou.make_generator(seed, device=DEVICE)
     entries, heads, dim, c = 29, 4, 64 * 128, su.PRODUCTION_CHUNK
     win = su.decode_windows(entries, c, padding=(0, 13), device=DEVICE)
     flags = win["chunk_flags"].clone()
@@ -322,7 +337,23 @@ def test_dst_states_commit_flagged_entries(aliased, dyadic):
         ssm = torch.randn(slots_total, heads, dim, device=DEVICE, generator=g)
         dA = -(torch.rand(heads, entries, c, device=DEVICE, generator=g) * 0.05).cumsum(-1)
     dst = ssm if aliased else torch.randn_like(ssm)
-    run_dst(states, dA, win["slots"], flags, ssm, dst, exact=dyadic)
+    return states, dA, win["slots"], flags, ssm, dst
+
+
+@ou.requires_sm(ou.HOPPER)
+def test_dst_mode_commits_once_under_timed_autotuning():
+    """dst mode in place (production's aliasing) from a cold autotune cache: the step must commit each
+    flagged entry's boundary state once. Fails on main (finding O7-M3): the kernel's autotuner has no
+    `restore_value`, so each timed benchmark launch applies the in-place update again (H100, pdx 7986854:
+    error 0.33 against a bound of 9.5e-7, while the same step pinned, or into a separate dst, passes).
+    """
+    tuner = su.autotuner(KERNEL)
+    saved = tuner.cache
+    tuner.cache = {}
+    try:
+        run_dst(*dst_case(False, True))
+    finally:
+        tuner.cache = saved
 
 
 @ou.requires_sm(ou.HOPPER)

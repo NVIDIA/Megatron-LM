@@ -143,10 +143,15 @@ def test_production_decode_batch(state_dtype):
 def test_decode_matches_the_training_conv_bitwise(state_dtype):
     """Batch invariance: 37 tokens decoded one at a time from a zero state give, bit for bit at the
     activation dtype (bf16; an fp32 state's output is cast back as the call site does), the training
-    conv `causal_conv1d_fn` over the whole sequence, for 3 sequences in shuffled slots."""
+    conv `causal_conv1d_fn` over the whole sequence, for 3 sequences in shuffled slots.
+
+    The training conv takes the channel-last layout Mamba's training forward gives it (a transposed
+    (b, l, d) view), whose kernel requires a channel count divisible by 8, as every Mamba conv dim
+    (d_inner + 2 * ngroups * dstate) is: 136 (17 x 8, not a multiple of the kernel's channel tile).
+    """
     update, conv_fn = _pip()
     g = ou.make_generator(device=DEVICE)
-    batch, dim, length = 3, 129, 37
+    batch, dim, length = 3, 136, 37
     seq = torch.randn(batch, length, dim, device=DEVICE, generator=g).bfloat16()
     conv1d_weight = torch.randn(dim, 1, D_CONV, device=DEVICE, generator=g).bfloat16() * 0.5
     conv1d_bias = torch.randn(dim, device=DEVICE, generator=g).bfloat16()
