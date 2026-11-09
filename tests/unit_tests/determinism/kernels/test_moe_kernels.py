@@ -753,7 +753,8 @@ def test_batch_invariant_sigmoid_topk_routing_replays(num_tokens, topk, scaling_
 
 
 @pytest.mark.parametrize("det_algos", [True, False])
-def test_quantile_balancing_histogram_and_bias_replay(det_algos):
+@pytest.mark.parametrize("replay_action", [None, *RouterReplayAction])
+def test_quantile_balancing_histogram_and_bias_replay(det_algos, replay_action):
     """Replay accumulated integer histograms, routing gradients, and the batch update."""
     seeded()
     num_tokens, num_experts, num_bins = 8192, 64, 128
@@ -761,11 +762,20 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
     bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
     bounds = torch.tensor([-1.0, 1.0], device="cuda")
     histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    targets = (
+        torch.arange(num_tokens, device="cuda")[:, None] + torch.arange(8, device="cuda")[None, :]
+    ) % num_experts
+    replay = None
 
     def fn(logits, histogram):
         # The harness clones the caller-owned histogram before every replay.
         outputs = []
-        for microbatch in logits.chunk(2):
+        if replay is not None:
+            replay.clear_indices()
+            replay.set_router_replay_action(replay_action)
+        for microbatch, target in zip(logits.chunk(2), targets.chunk(2)):
+            if replay is not None:
+                replay.set_target_indices(target)
             outputs.append(
                 moe_utils.topk_routing_with_score_function(
                     microbatch,
@@ -774,8 +784,16 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
                     expert_bias=bias,
                     qb_histogram=histogram,
                     qb_bin_bounds=bounds,
+                    router_replay=replay,
                 )
             )
+            if replay_action == RouterReplayAction.RECORD and replay is not None:
+                recorded_map = torch.zeros_like(microbatch, dtype=torch.bool).scatter(
+                    1, replay.get_recorded_indices(), True
+                )
+                assert torch.equal(outputs[-1][1], recorded_map)
+        if replay_action == RouterReplayAction.REPLAY_BACKWARD and replay is not None:
+            assert not replay.replay_backward_list
         probs = torch.cat([output[0] for output in outputs])
         routing_map = torch.cat([output[1] for output in outputs])
         updated_bias, updated_bounds = moe_utils.get_updated_expert_bias_with_quantile(
@@ -783,15 +801,31 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
         )
         return probs, routing_map, histogram, updated_bias, updated_bounds
 
-    with deterministic_algorithms(det_algos):
-        outputs, grads = assert_replays_bit_exact(
-            fn,
-            (logits, histogram),
-            grad_outputs={"out[0]": torch.randn_like(logits)},
-            replays=3,
-            contention=True,
-            what="global-batch QB histogram and bias update",
-        )
+    with torch.no_grad():
+        reference = fn(logits, histogram.clone())
+    if replay_action is not None:
+        replay = RouterReplay()
+    try:
+        with deterministic_algorithms(det_algos):
+            outputs, grads = assert_replays_bit_exact(
+                fn,
+                (logits, histogram),
+                grad_outputs={"out[0]": torch.randn_like(logits)},
+                replays=3,
+                contention=True,
+                what=f"global-batch QB histogram and bias update[{replay_action}]",
+            )
+    finally:
+        if replay is not None:
+            RouterReplay.global_router_replay_instances.remove(replay)
+    for index in (2, 3, 4):
+        assert bytes_equal(outputs[f"out[{index}]"], reference[index])
+    if replay_action in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD):
+        expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, targets, True)
+        assert torch.equal(outputs["out[1]"], expected_map)
+    else:
+        for index in (0, 1):
+            assert bytes_equal(outputs[f"out[{index}]"], reference[index])
     assert torch.equal(
         outputs["out[2]"].sum(dim=-1),
         torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
@@ -1212,7 +1246,13 @@ class TestMoEModules:
         )
 
     @pytest.mark.parametrize("accumulate", [True, False])
-    def test_global_batch_quantile_router_replays(self, accumulate):
+    @pytest.mark.parametrize(
+        "replay_action,fusion",
+        [(None, False)]
+        + [(action, False) for action in RouterReplayAction]
+        + [(RouterReplayAction.REPLAY_FORWARD, True)],
+    )
+    def test_global_batch_quantile_router_replays(self, accumulate, replay_action, fusion):
         """Include the router's nonpersistent histogram in the replay comparison."""
         self._init()
         seeded()
@@ -1223,6 +1263,8 @@ class TestMoEModules:
             moe_router_quantile_balancing_estimation_scope="global_batch",
             moe_router_score_function="sigmoid",
             moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=replay_action is not None,
+            moe_router_fusion=fusion,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
@@ -1232,19 +1274,45 @@ class TestMoEModules:
             router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
         logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
 
+        targets = (
+            torch.arange(8192, device="cuda")[:, None] + torch.arange(8, device="cuda")[None, :]
+        ) % 64
+        replay = router.router_replay
+
         def fn(logits):
+            if replay is not None:
+                replay.clear_indices()
+                replay.set_target_indices(targets)
+                replay.set_router_replay_action(replay_action)
             router.qb_histogram.zero_()
             probs, routing_map = router.quantile_balancing(logits)
+            if replay_action == RouterReplayAction.RECORD:
+                recorded_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+                    1, replay.get_recorded_indices(), True
+                )
+                assert torch.equal(routing_map, recorded_map)
+            if replay_action == RouterReplayAction.REPLAY_BACKWARD:
+                assert not replay.replay_backward_list
             return probs, routing_map, router.qb_histogram.clone()
 
-        outputs, grads = assert_replays_bit_exact(
-            fn,
-            (logits,),
-            grad_outputs={"out[0]": torch.randn_like(logits)},
-            replays=3,
-            contention=True,
-            what=f"global-batch TopKRouter[accumulate={accumulate}]",
-        )
+        try:
+            outputs, grads = assert_replays_bit_exact(
+                fn,
+                (logits,),
+                grad_outputs={"out[0]": torch.randn_like(logits)},
+                replays=3,
+                contention=True,
+                what=(
+                    f"global-batch TopKRouter[{replay_action}, "
+                    f"fusion={fusion}, accumulate={accumulate}]"
+                ),
+            )
+        finally:
+            if replay is not None:
+                RouterReplay.global_router_replay_instances.remove(replay)
+        if replay_action in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD):
+            expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, targets, True)
+            assert torch.equal(outputs["out[1]"], expected_map)
         assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
         assert grads["in[0]"].abs().sum() > 0
 
