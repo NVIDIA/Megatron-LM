@@ -2,11 +2,13 @@
 """MiniMax-M3 lite model protocol for the Megatron Lite runtime.
 
 Data path per microbatch (``_forward_step``): documents are packed without
-padding; the Magi-MSA runtime key is built once from host ``cu_seqlens`` and
-cached on ``batch.extras`` so recompute reuses it, then the embedding (first
-stage) and the labels / loss mask (last stage) are dispatched with it. Labels
+padding; the :class:`MsaContext` (token placement over context parallelism and
+attention metadata) is built once from the host document lengths and cached on
+``batch.extras`` so recompute reuses it, then each rank takes the input ids
+(first stage) and the labels / loss mask (last stage) of its own tokens. Labels
 are the next token within each document; the last token of every document and
-tokens with ``loss_mask == 0`` get label ``-100``.
+tokens with ``loss_mask == 0`` get label ``-100``. With context parallelism the
+packed row length must be a multiple of ``2 * cp``.
 
 Scope: TP = ETP = 1 (the MSA v1 kernels fix the head counts); CP, PP, EP, DP.
 """
@@ -24,10 +26,9 @@ from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.modules.attention.msa import (
+    MsaContext,
     MsaV1Numerics,
-    build_msa_runtime_key,
-    msa_dispatch,
-    msa_position_ids,
+    build_msa_context,
     rotary_freqs_for_positions,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -36,7 +37,7 @@ from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks, n
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
-_MSA_KEY = "_mlite_msa_runtime_key"
+_MSA_CONTEXT = "_mlite_msa_context"
 IGNORE_INDEX = -100
 
 
@@ -60,11 +61,9 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     optimizer_config: OptimizerConfig | None = None
     use_deepep: bool = False
-    # Deterministic kernels (Magi-MSA ordered reductions, deterministic
-    # embedding / MoE index ops); requires torch deterministic algorithms.
+    # Deterministic kernels (MSA ordered reductions, deterministic embedding /
+    # MoE index ops); requires torch deterministic algorithms.
     deterministic: bool = False
-    # Magi dispatch chunk; None = tokens // cp // 2.
-    msa_chunk_size: int | None = None
     qat: QATSpec | dict | None = None
 
 
@@ -114,7 +113,7 @@ def _shift_within_documents(
 
 def _aux_loss_scale() -> float:
     """The runtime's auxiliary-loss gradient scale (``1 / num_microbatches``), which the
-    pre-forward hook sets before every microbatch. The MSA KL gradient is injected in backward,
+    pre-forward hook sets before every microbatch. The MSA KL gradient is added in backward,
     outside the loss scalar, so its coefficient takes this scale explicitly."""
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
@@ -122,54 +121,50 @@ def _aux_loss_scale() -> float:
     return 1.0 if scale is None else float(scale)
 
 
-def get_msa_runtime_key(model: nn.Module, batch: PackedBatch) -> Any:
-    """Build (once per microbatch) and cache the Magi-MSA runtime key on ``batch.extras``."""
-    key = batch.extras.get(_MSA_KEY)
-    if key is not None:
-        return key
+def _cu_seqlens(seq_lens: torch.Tensor) -> torch.Tensor:
+    cu_seqlens = torch.zeros(seq_lens.numel() + 1, dtype=torch.int64)
+    cu_seqlens[1:] = torch.cumsum(seq_lens, 0)
+    return cu_seqlens
+
+
+def get_msa_context(model: nn.Module, batch: PackedBatch) -> MsaContext:
+    """Build (once per microbatch) and cache the :class:`MsaContext` on ``batch.extras``."""
+    context = batch.extras.get(_MSA_CONTEXT)
+    if context is not None:
+        return context
     ps = parallel_state_from_model(model) or ParallelState()
     config: MiniMaxM3Config = unwrap_model(model).config
     impl = unwrap_model(model).impl_options
-    seq_lens = batch.seq_lens.detach().to("cpu", torch.int64)
-    cu_seqlens = torch.zeros(seq_lens.numel() + 1, dtype=torch.int32)
-    cu_seqlens[1:] = torch.cumsum(seq_lens, 0).to(torch.int32)
-    total = int(cu_seqlens[-1])
-    key = build_msa_runtime_key(
-        cu_seqlens,
-        ps.cp_group,
+    context = build_msa_context(
+        batch.seq_lens.detach().to("cpu", torch.int64),
+        ps.cp_group if ps.cp_size > 1 else None,
         numerics=msa_numerics(config),
-        chunk_size=impl["msa_chunk_size"] or total // ps.cp_size // 2,
         tp_size=ps.tp_size,
         grad_scale=_aux_loss_scale(),
         deterministic=impl["deterministic"],
-        dense_heads=(
-            (config.num_attention_heads, config.num_key_value_heads)
-            if config.has_full_attention_layers
-            else None
-        ),
     )
-    batch.extras[_MSA_KEY] = key
-    batch.extras["_mlite_msa_cu_seqlens"] = cu_seqlens
-    return key
+    batch.extras[_MSA_CONTEXT] = context
+    return context
 
 
 def prepare_forward_kwargs(model: nn.Module, batch: PackedBatch) -> dict[str, Any]:
     config: MiniMaxM3Config = unwrap_model(model).config
-    key = get_msa_runtime_key(model, batch)
-    cu_seqlens = batch.extras["_mlite_msa_cu_seqlens"]
+    context = get_msa_context(model, batch)
+    layout = context.layout
     kwargs: dict[str, Any] = {
-        "runtime_key": key,
+        "msa_context": context,
         "rotary_freqs": rotary_freqs_for_positions(
-            msa_position_ids(key), rotary_dim=config.rotary_dim, base=config.rope_theta
+            layout.position_ids, rotary_dim=config.rotary_dim, base=config.rope_theta
         ),
-        "dispatch": lambda t: msa_dispatch(t, key),
     }
     if unwrap_model(model).pre_process:
-        kwargs["input_ids"] = batch.input_ids.reshape(1, -1)
+        input_ids = batch.input_ids.reshape(-1).index_select(0, layout.token_index)
+        kwargs["input_ids"] = input_ids.reshape(1, -1)
     if unwrap_model(model).post_process and batch.labels is not None:
+        cu_seqlens = _cu_seqlens(batch.seq_lens.detach().to("cpu", torch.int64))
         labels, mask = _shift_within_documents(batch.labels, batch.loss_mask, cu_seqlens)
-        kwargs["labels"] = msa_dispatch(labels, key)
-        kwargs["loss_mask"] = msa_dispatch(mask, key)
+        kwargs["labels"] = labels.index_select(0, layout.token_index)
+        kwargs["loss_mask"] = mask.index_select(0, layout.token_index)
     return kwargs
 
 
@@ -212,10 +207,7 @@ def build_chunk(model_cfg: MiniMaxM3Config, impl_cfg: ImplConfig, ps: ParallelSt
         model_cfg, ps, deterministic=impl_cfg.deterministic, use_deepep=impl_cfg.use_deepep
     )
     chunk = chunk.to(torch.bfloat16).cuda()
-    chunk.impl_options = {
-        "deterministic": impl_cfg.deterministic,
-        "msa_chunk_size": impl_cfg.msa_chunk_size,
-    }
+    chunk.impl_options = {"deterministic": impl_cfg.deterministic}
     return chunk
 
 
@@ -290,7 +282,7 @@ __all__ = [
     "build_model",
     "build_model_config",
     "export_hf_weights",
-    "get_msa_runtime_key",
+    "get_msa_context",
     "is_expert_param",
     "load_hf_weights",
     "prepare_forward_kwargs",

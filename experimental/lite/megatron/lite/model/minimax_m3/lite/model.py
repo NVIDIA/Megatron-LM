@@ -2,14 +2,13 @@
 """MiniMax-M3 language model (text tower) for Megatron Lite.
 
 Decoder layer: ``x + attn(norm(x))`` then ``x + ffn(norm(x))`` with (1 + w) RMSNorms,
-MiniMax sparse attention (Magi-MSA ``MSAV1``) and either a dense clamped
+MiniMax sparse attention (MSA v1) or dense attention, and either a dense clamped
 quick-GEGLU FFN or a sigmoid top-k MoE with one shared expert.
 
-Token layout: one packed microbatch per forward (micro-batch 1). The embedding
-is computed for the full packed row and then dispatched to this CP rank's
-tokens with the microbatch's Magi-MSA runtime key, so every layer, RoPE and the
-loss see the dispatched order; the embedding gradient is scaled by 1/CP so the
-sum over CP ranks is the full-sequence gradient. Tensors are ``[S, 1, H]``.
+Token layout: one packed microbatch per forward (micro-batch 1). Each CP rank gets
+the input ids, labels and loss mask of its own tokens, placed by the microbatch's
+:class:`MsaContext`, so the embedding, every layer, RoPE and the loss see that
+order. Tensors are ``[S, 1, H]``.
 
 Loss: per-token cross-entropy masked and summed over this rank's tokens
 (``loss_sum``); the protocol divides it by this rank's token count (``num_tokens``).
@@ -18,15 +17,17 @@ The indexer KL enters the backward only.
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 import torch.nn as nn
 
 from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.quick_geglu import clamped_quick_geglu
-from megatron.lite.primitive.modules.attention.msa import MsaDenseAttention, MsaV1Attention
+from megatron.lite.primitive.modules.attention.msa import (
+    MsaContext,
+    MsaDenseAttention,
+    MsaV1Attention,
+)
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
@@ -50,17 +51,6 @@ def _rms_norm(config: MiniMaxM3Config) -> nn.Module:
 
 def _linear(in_features: int, out_features: int) -> nn.Module:
     return te.Linear(in_features, out_features, bias=False, params_dtype=torch.bfloat16)
-
-
-class _ScaleGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
 
 
 class GatedMLP(nn.Module):
@@ -152,9 +142,9 @@ class MiniMaxM3Layer(nn.Module):
         else:
             self.mlp = GatedMLP(config, config.dense_intermediate_size)
 
-    def forward(self, x: torch.Tensor, *, runtime_key: Any, rotary_freqs: torch.Tensor):
+    def forward(self, x: torch.Tensor, *, msa_context: MsaContext, rotary_freqs: torch.Tensor):
         x = x + self.self_attention(
-            self.input_layernorm(x), runtime_key=runtime_key, rotary_freqs=rotary_freqs
+            self.input_layernorm(x), msa_context=msa_context, rotary_freqs=rotary_freqs
         )
         return x + self.mlp(self.pre_mlp_layernorm(x))
 
@@ -162,9 +152,9 @@ class MiniMaxM3Layer(nn.Module):
 class MiniMaxM3Model(nn.Module):
     """One pipeline chunk of the MiniMax-M3 text model.
 
-    ``forward`` takes the full packed ``input_ids`` (embedding stage) or the
-    previous stage's hidden states, plus this microbatch's Magi-MSA ``runtime_key``,
-    dispatched RoPE angles, and (last stage) dispatched ``labels`` / ``loss_mask``.
+    ``forward`` takes this rank's ``input_ids`` (embedding stage) or the previous
+    stage's hidden states, plus this microbatch's ``msa_context``, the RoPE angles of
+    the local tokens, and (last stage) the local ``labels`` / ``loss_mask``.
     """
 
     def __init__(
@@ -206,32 +196,23 @@ class MiniMaxM3Model(nn.Module):
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
-    def embed_and_dispatch(self, input_ids: torch.Tensor, dispatch) -> torch.Tensor:
-        """Embed the full packed row ``[1, T]`` and keep this CP rank's tokens ``[S, 1, H]``."""
-        assert self.embed is not None
-        h = self.embed(input_ids)  # [T, 1, H]
-        if self.ps.cp_size > 1:
-            h = _ScaleGrad.apply(h, 1.0 / self.ps.cp_size)
-        return dispatch(h[:, 0]).clone().unsqueeze(1)
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
         *,
-        runtime_key: Any,
+        msa_context: MsaContext,
         rotary_freqs: torch.Tensor,
-        dispatch=None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
     ) -> dict:
         if self.embed is not None:
-            h = self.embed_and_dispatch(input_ids, dispatch)
+            h = self.embed(input_ids)  # [1, S] -> [S, 1, H]
         else:
             h = self._input_tensor
             assert h is not None
         for layer in self.layers:
-            h = layer(h, runtime_key=runtime_key, rotary_freqs=rotary_freqs)
-        output: dict[str, Any] = {"hidden_states": h}
+            h = layer(h, msa_context=msa_context, rotary_freqs=rotary_freqs)
+        output: dict = {"hidden_states": h}
         if self.head is None:
             return output
         assert self.norm is not None
@@ -243,7 +224,7 @@ class MiniMaxM3Model(nn.Module):
         return output
 
     def loss(self, logits: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor) -> dict:
-        """``labels``/``loss_mask``: dispatched ``[S]``; masked labels must already be -100."""
+        """``labels``/``loss_mask``: local ``[S]``; masked labels must already be -100."""
         token_loss = vocab_parallel_cross_entropy(
             logits, labels.view(-1, 1), self.ps.tp_group
         ).view(-1)

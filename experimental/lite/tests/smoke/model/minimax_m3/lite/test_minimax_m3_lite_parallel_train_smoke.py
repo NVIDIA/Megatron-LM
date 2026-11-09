@@ -6,7 +6,7 @@ over two pipeline stages, 1F1B over four microbatches per data-parallel rank. Th
 follow a fixed bigram chain, so the next token is learnable. Steps on the same data must start
 within 25% of ``ln(vocab)`` and lower the loss every step.
 
-The MSA kernels need Blackwell and the Magi-MSA ``magi_attn_extensions.MSA`` backend.
+The MSA kernels need Blackwell and the ``msa_v1`` package (MiniMax MSA).
 """
 
 from __future__ import annotations
@@ -31,9 +31,7 @@ STEPS = 3
 
 
 def _init_dist_or_skip():
-    pytest.importorskip(
-        "magi_attn_extensions.MSA", reason="MiniMax-M3 MSA needs the Magi-MSA backend."
-    )
+    pytest.importorskip("msa_v1", reason="MiniMax-M3 MSA needs the MiniMax MSA v1 kernels.")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the MiniMax-M3 parallel training smoke.")
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:

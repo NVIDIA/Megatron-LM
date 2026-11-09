@@ -125,8 +125,13 @@ def test_labels_shift_within_documents_and_mask_document_ends():
 
 def test_kl_coefficient_scaling_per_rank():
     numerics = MsaV1Numerics(kl_loss_coeff=0.5, kl_temperature=3.0)
-    assert msa_v1_rank_kl_coeff(numerics, tp_size=1, cp_size=2) == 4.5 * 2
-    assert msa_v1_rank_kl_coeff(numerics, tp_size=1, cp_size=2, grad_scale=0.25) == 4.5 * 2 * 0.25
+    one = dict(tp_size=1, local_tokens=8, total_tokens=8)
+    assert msa_v1_rank_kl_coeff(numerics, cp_size=1, **one) == 4.5
+    assert msa_v1_rank_kl_coeff(numerics, cp_size=1, grad_scale=0.25, **one) == 4.5 * 0.25
+    # Equal CP shards: the kernel's mean over the rank's tokens is cp_size times its share of
+    # the microbatch mean, and the CP gradient average divides it back.
+    half = dict(tp_size=1, cp_size=2, local_tokens=4, total_tokens=8)
+    assert msa_v1_rank_kl_coeff(numerics, **half) == 4.5
 
 
 def test_loss_terms_are_off_by_default():
@@ -134,7 +139,7 @@ def test_loss_terms_are_off_by_default():
     assert not (config.sparse_kl_loss_coeff or config.aux_loss_alpha)
 
 
-def test_runtime_key_reads_the_minimax_config_through_a_ddp_wrapper(monkeypatch):
+def test_msa_context_reads_the_minimax_config_through_a_ddp_wrapper(monkeypatch):
     """Under dist_opt the forward step gets the DDP-wrapped chunk, whose own ``config`` is a
     Megatron-Core TransformerConfig; the protocol must read the wrapped MiniMax model's."""
     from megatron.lite.model.minimax_m3.lite import protocol
@@ -142,36 +147,31 @@ def test_runtime_key_reads_the_minimax_config_through_a_ddp_wrapper(monkeypatch)
 
     seen = {}
 
-    def fake_key(cu_seqlens, group, **kwargs):
-        seen.update(kwargs)
-        return "key"
+    def fake_context(seq_lens, group, **kwargs):
+        seen.update(kwargs, seq_lens=seq_lens.tolist(), group=group)
+        return "context"
 
-    monkeypatch.setattr(protocol, "build_msa_runtime_key", fake_key)
+    monkeypatch.setattr(protocol, "build_msa_context", fake_context)
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(0.25))
     inner = torch.nn.Module()
     inner.config = MiniMaxM3Config._from_hf_dict(_hf_config())
-    inner.impl_options = {"deterministic": True, "msa_chunk_size": None}
+    inner.impl_options = {"deterministic": True}
     wrapper = torch.nn.Module()
     wrapper.config = object()
     wrapper.module = inner
     batch = PackedBatch(
         input_ids=torch.zeros(8, dtype=torch.long), labels=None, seq_lens=torch.tensor([5, 3])
     )
-    assert protocol.get_msa_runtime_key(wrapper, batch) == "key"
+    assert protocol.get_msa_context(wrapper, batch) == "context"
     assert seen["numerics"] == protocol.msa_numerics(inner.config)
     assert seen["grad_scale"] == 0.25
-    assert seen["dense_heads"] is None
-
-    hf = _hf_config()
-    hf["text_config"]["sparse_attention_config"]["sparse_attention_freq"] = [0] + [1] * 5
-    inner.config = MiniMaxM3Config._from_hf_dict(hf)
-    batch = PackedBatch(
-        input_ids=torch.zeros(8, dtype=torch.long), labels=None, seq_lens=torch.tensor([8])
-    )
-    protocol.get_msa_runtime_key(wrapper, batch)
-    assert seen["dense_heads"] == (64, 4)
+    assert seen["deterministic"] is True
+    assert seen["seq_lens"] == [5, 3] and seen["group"] is None
+    # Cached on the batch: recompute and later pipeline stages reuse it.
+    seen.clear()
+    assert protocol.get_msa_context(wrapper, batch) == "context" and not seen
 
 
 def test_full_attention_layers_from_either_hf_field_and_their_weight_map():

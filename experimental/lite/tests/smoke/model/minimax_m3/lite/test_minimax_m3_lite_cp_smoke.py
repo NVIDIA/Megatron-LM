@@ -2,12 +2,12 @@
 """MiniMax-M3 context parallelism: CP2 matches CP1 on a tiny hybrid model.
 
 Layer 0 is dense attention with a dense FFN and layer 1 is MSA with an MoE FFN, so both attention
-kinds run on the MSA dispatch. Every rank holds the same weights: the CP1 model computes the whole
-packed row, the CP2 model this rank's dispatched half. Each rank's loss is the token mean of its
-share; averaged over the two ranks, as the data-parallel gradient reduction does, the CP2 loss and
+kinds run on the CP token placement. Every rank holds the same weights: the CP1 model computes the
+whole packed row, the CP2 model this rank's half. Each rank's loss is the token mean of its share;
+averaged over the two ranks, as the data-parallel gradient reduction does, the CP2 loss and
 gradients must match the CP1 ones up to reduction-order rounding.
 
-The MSA kernels need Blackwell and the Magi-MSA ``magi_attn_extensions.MSA`` backend.
+The MSA kernels need Blackwell and the ``msa_v1`` package (MiniMax MSA).
 """
 
 from __future__ import annotations
@@ -24,16 +24,16 @@ pytestmark = [
     pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
 ]
 
-# Two documents of more than ``topk_blocks * block_size`` = 2048 tokens, so attention is sparse.
-SEQ_LENS = (3000, 5192)
+# The middle document has more than ``topk_blocks * block_size`` = 2048 tokens, so attention is
+# sparse, and spans both of rank 0's chunks (the first and last quarter of the row), so its two
+# query fragments there share its keys.
+SEQ_LENS = (1000, 7000, 192)
 LOSS_RTOL = 1e-4
 GRAD_REL_L2 = 5e-2
 
 
 def _init_dist_or_skip():
-    pytest.importorskip(
-        "magi_attn_extensions.MSA", reason="MiniMax-M3 MSA needs the Magi-MSA backend."
-    )
+    pytest.importorskip("msa_v1", reason="MiniMax-M3 MSA needs the MiniMax MSA v1 kernels.")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the MiniMax-M3 CP smoke.")
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
