@@ -41,7 +41,7 @@ def _uses_mhc_attention_cuda_graph_split(config: TransformerConfig) -> bool:
     """
     return (
         config.mhc_recompute_attn_cuda_graph_split
-        and config.cuda_graph_impl == 'transformer_engine'
+        and config.cuda_graph_impl == "transformer_engine"
     )
 
 
@@ -54,26 +54,26 @@ def _validate_mhc_te_graph_inputs(
     outside the graph, where its eager MLP and mHC steps consume them. With scheduler-packed
     sequences, the split graph also takes their metadata as fixed-capacity offsets.
     """
-    unsupported = ['packed_sequence_cp_metadata', 'inference_context']
+    unsupported = ["packed_sequence_cp_metadata", "inference_context"]
     if not (attention_graph_split and packed_sequences):
-        unsupported.append('packed_seq_params')
+        unsupported.append("packed_seq_params")
     if not attention_graph_split:
-        unsupported.append('padding_mask')
+        unsupported.append("padding_mask")
     for name in unsupported:
         if kwargs.get(name) is not None:
             raise NotImplementedError(
-                f'mHC TE graphs do not support {name} here. Packed THD sequences require '
-                'mhc_recompute_attn_cuda_graph_split with sequence_packing_scheduler, and '
-                'padding_mask requires the attention graph split.'
+                f"mHC TE graphs do not support {name} here. Packed THD sequences require "
+                "mhc_recompute_attn_cuda_graph_split with sequence_packing_scheduler, and "
+                "padding_mask requires the attention graph split."
             )
     if attention_graph_split:
         return
-    if kwargs.get('mhc_recompute_manager') is not None:
+    if kwargs.get("mhc_recompute_manager") is not None:
         raise NotImplementedError(
-            'mHC TE graphs support mHC selective recompute only with '
-            'mhc_recompute_attn_cuda_graph_split.'
+            "mHC TE graphs support mHC selective recompute only with "
+            "mhc_recompute_attn_cuda_graph_split."
         )
-    kwargs.pop('mhc_recompute_manager', None)
+    kwargs.pop("mhc_recompute_manager", None)
 
 
 class HyperConnectionTransformerLayer(TransformerLayer):
@@ -128,7 +128,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             CudaGraphModule.moe_router,
             CudaGraphModule.moe_preprocess,
         }
-        if self.config.cuda_graph_impl == 'transformer_engine':
+        if self.config.cuda_graph_impl == "transformer_engine":
             # The TE path explicitly transports subclass MLP state across the
             # router graph boundary; local graphs retain their existing limits.
             unsupported_moe_cuda_graph_modules = {CudaGraphModule.moe}
@@ -282,7 +282,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
     def _pack_mlp_cuda_graph_state(self, outputs, residual, mlp_state):
         # The read state already carries the residual, H_res and H_post.
-        assert len(mlp_state) == 3, 'mHC partial MoE graphs require the MLP read state.'
+        assert len(mlp_state) == 3, "mHC partial MoE graphs require the MLP read state."
         return list(outputs) + list(mlp_state)
 
     def _unpack_mlp_cuda_graph_state(self, outputs):

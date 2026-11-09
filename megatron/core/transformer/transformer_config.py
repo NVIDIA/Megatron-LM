@@ -4193,69 +4193,69 @@ class TransformerConfig(ModelParallelConfig):
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
 
-        uses_mhc_recompute = self.recompute_granularity == 'selective' and 'mhc' in (
+        uses_mhc_recompute = self.recompute_granularity == "selective" and "mhc" in (
             self.recompute_modules or []
         )
         if self.mhc_recompute_attn_cuda_graph_split:
             if not self.enable_mhc_connections:
                 raise ValueError(
-                    'mhc_recompute_attn_cuda_graph_split requires enable_mhc_connections=True.'
+                    "mhc_recompute_attn_cuda_graph_split requires enable_mhc_connections=True."
                 )
-            if self.cuda_graph_impl != 'transformer_engine':
+            if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
-                    'mhc_recompute_attn_cuda_graph_split requires '
+                    "mhc_recompute_attn_cuda_graph_split requires "
                     "cuda_graph_impl='transformer_engine'."
                 )
             if self.cuda_graph_modules != [CudaGraphModule.attn]:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires cuda_graph_modules=['attn']; "
-                    'the mHC MLP sublayers stay eager.'
+                    "the mHC MLP sublayers stay eager."
                 )
             if not uses_mhc_recompute:
                 raise ValueError(
-                    'mhc_recompute_attn_cuda_graph_split requires selective recompute with '
+                    "mhc_recompute_attn_cuda_graph_split requires selective recompute with "
                     "'mhc' in recompute_modules."
                 )
-            if set(self.recompute_modules) - {'mhc', 'mla_up_proj'}:
+            if set(self.recompute_modules) - {"mhc", "mla_up_proj"}:
                 raise ValueError(
-                    'mhc_recompute_attn_cuda_graph_split supports recompute_modules '
+                    "mhc_recompute_attn_cuda_graph_split supports recompute_modules "
                     f"['mhc'] or ['mhc', 'mla_up_proj']; got {self.recompute_modules}."
                 )
         if self.enable_mhc_connections and self.cuda_graph_impl in (
-            'transformer_engine',
-            'full_iteration',
+            "transformer_engine",
+            "full_iteration",
         ):
             if uses_mhc_recompute and not self.mhc_recompute_attn_cuda_graph_split:
                 raise NotImplementedError(
-                    'mHC CUDA graphs capture the mHC aggregate and bias-dropout-add, which '
-                    'selective mHC recompute must run eagerly. For Transformer Engine graphs, '
-                    'set mhc_recompute_attn_cuda_graph_split=True to capture only the input '
-                    'layernorm and self-attention of each mHC attention sublayer.'
+                    "mHC CUDA graphs capture the mHC aggregate and bias-dropout-add, which "
+                    "selective mHC recompute must run eagerly. For Transformer Engine graphs, "
+                    "set mhc_recompute_attn_cuda_graph_split=True to capture only the input "
+                    "layernorm and self-attention of each mHC attention sublayer."
                 )
             if self.fine_grained_activation_offloading or self.cpu_offloading:
                 raise NotImplementedError(
-                    'mHC CUDA graphs do not yet support activation offloading.'
+                    "mHC CUDA graphs do not yet support activation offloading."
                 )
             if self.overlap_moe_expert_parallel_comm:
-                raise NotImplementedError('mHC CUDA graphs do not yet support EP A2A overlap.')
+                raise NotImplementedError("mHC CUDA graphs do not yet support EP A2A overlap.")
             if (
-                self.cuda_graph_impl == 'transformer_engine'
+                self.cuda_graph_impl == "transformer_engine"
                 and self.sequence_packing_scheduler is not None
                 and not self.mhc_recompute_attn_cuda_graph_split
             ):
                 raise NotImplementedError(
-                    'mHC TE graphs support scheduler-packed THD sequences only with '
-                    'mhc_recompute_attn_cuda_graph_split.'
+                    "mHC TE graphs support scheduler-packed THD sequences only with "
+                    "mhc_recompute_attn_cuda_graph_split."
                 )
-            if self.cuda_graph_impl == 'transformer_engine' and self.mtp_use_repeated_layer:
+            if self.cuda_graph_impl == "transformer_engine" and self.mtp_use_repeated_layer:
                 raise NotImplementedError(
-                    'mHC TE graphs require independent MTP layers; disable mtp_use_repeated_layer.'
+                    "mHC TE graphs require independent MTP layers; disable mtp_use_repeated_layer."
                 )
-            if self.cuda_graph_impl == 'transformer_engine' and self.num_moe_experts:
+            if self.cuda_graph_impl == "transformer_engine" and self.num_moe_experts:
                 if not self.cuda_graph_modules or CudaGraphModule.moe in self.cuda_graph_modules:
                     raise NotImplementedError(
-                        'mHC TE graphs support partial MoE capture only. Select attn and/or '
-                        'moe_router (optionally moe_preprocess), not whole-layer or moe capture.'
+                        "mHC TE graphs support partial MoE capture only. Select attn and/or "
+                        "moe_router (optionally moe_preprocess), not whole-layer or moe capture."
                     )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules

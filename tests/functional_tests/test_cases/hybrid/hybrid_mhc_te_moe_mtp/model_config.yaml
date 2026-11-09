@@ -77,6 +77,7 @@ MODEL_ARGS:
 TEST_TYPE: regular
 METRICS:
 - lm loss
+- num-zeros
 - mtp_1 loss
 - mtp_2 loss
 LAUNCHER: ft_launcher

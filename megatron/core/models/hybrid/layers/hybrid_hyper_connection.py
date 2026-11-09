@@ -46,16 +46,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             isinstance(layer.mlp, IdentityOp) and isinstance(layer.cross_attention, IdentityOp)
         ):
             raise NotImplementedError(
-                'mhc_recompute_attn_cuda_graph_split requires attention-only inner layers. '
-                'Use separate attention and MLP layers in the Hybrid pattern.'
+                "mhc_recompute_attn_cuda_graph_split requires attention-only inner layers. "
+                "Use separate attention and MLP layers in the Hybrid pattern."
             )
-        if config.cuda_graph_impl == 'transformer_engine' and self._is_partial_moe_graph():
+        if config.cuda_graph_impl == "transformer_engine" and self._is_partial_moe_graph():
             if not isinstance(layer.self_attention, IdentityOp) or not isinstance(
                 layer.cross_attention, IdentityOp
             ):
                 raise NotImplementedError(
-                    'Hybrid mHC partial MoE graphs require a MoE-only inner layer. '
-                    'Use separate attention and MoE layers in the Hybrid pattern.'
+                    "Hybrid mHC partial MoE graphs require a MoE-only inner layer. "
+                    "Use separate attention and MoE layers in the Hybrid pattern."
                 )
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
         if config.params_dtype is not None:
@@ -76,17 +76,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
         The attention graph split starts from the aggregated single-stream input.
         """
-        if hasattr(self.inner_layer, 'get_layer_static_inputs'):
+        if hasattr(self.inner_layer, "get_layer_static_inputs"):
             inputs = self.inner_layer.get_layer_static_inputs(seq_length, micro_batch_size)
         else:
             inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         if self._is_attention_graph_split():
             # The eager MLP consumes these; the attention graph is captured without them.
-            inputs.pop('input_ids', None)
-            inputs.pop('padding_mask', None)
+            inputs.pop("input_ids", None)
+            inputs.pop("padding_mask", None)
             return inputs
-        hidden = inputs['hidden_states']
-        inputs['hidden_states'] = torch.ones(
+        hidden = inputs["hidden_states"]
+        inputs["hidden_states"] = torch.ones(
             (*hidden.shape[:-1], self.config.mhc_num_residual_streams * self.config.hidden_size),
             dtype=hidden.dtype,
             device=hidden.device,
@@ -119,30 +119,30 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             _validate_mhc_te_graph_inputs(
                 kwargs, attention_graph_split=True, packed_sequences=self._packed_sequences()
             )
-            hidden_states = args[0] if args else kwargs.pop('hidden_states')
+            hidden_states = args[0] if args else kwargs.pop("hidden_states")
             # The graph starts from the aggregate and ends before the mHC bias-dropout-add.
             (output, bias), _, _ = self.inner_layer._forward_self_attention_output_with_bias(
                 hidden_states,
-                attention_mask=kwargs.get('attention_mask'),
-                rotary_pos_emb=kwargs.get('rotary_pos_emb'),
-                packed_seq_params=kwargs.get('packed_seq_params'),
+                attention_mask=kwargs.get("attention_mask"),
+                rotary_pos_emb=kwargs.get("rotary_pos_emb"),
+                packed_seq_params=kwargs.get("packed_seq_params"),
             )
             return (output,) if bias is None else (output, bias)
         _validate_mhc_te_graph_inputs(kwargs)
         if self._is_partial_moe_graph():
-            hidden_states = args[0] if args else kwargs.pop('hidden_states')
+            hidden_states = args[0] if args else kwargs.pop("hidden_states")
             aggregated, h_res, h_post, residual = self.hyper_connection(
                 hidden_states, return_residual=True
             )
             inner_kwargs = dict(kwargs)
-            inner_kwargs.pop('hidden_states', None)
+            inner_kwargs.pop("hidden_states", None)
             outputs = self.inner_layer._te_cuda_graph_capture(aggregated, **inner_kwargs)
             # The residual must cross the graph boundary as an output so that
             # its gradient participates in the captured backward graph.
             return (*outputs, h_res, h_post, residual)
         hidden_states, context = self.forward(*args, **kwargs)
         if context is not None:
-            raise NotImplementedError('Hybrid mHC TE graphs do not support cross-attention.')
+            raise NotImplementedError("Hybrid mHC TE graphs do not support cross-attention.")
         return (hidden_states,)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -171,16 +171,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _replay_attention_graph_split(self, *args, **kwargs):
         """Run eager mHC aggregate, attention graph and eager mHC bias-dropout-add."""
-        mhc_recompute_manager = kwargs.pop('mhc_recompute_manager', None)
+        mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         _validate_mhc_te_graph_inputs(
             kwargs, attention_graph_split=True, packed_sequences=self._packed_sequences()
         )
         # The attention-only inner layer has no MLP to consume these.
-        kwargs.pop('padding_mask', None)
-        kwargs.pop('input_ids', None)
+        kwargs.pop("padding_mask", None)
+        kwargs.pop("input_ids", None)
         # The graph takes scheduler-packed metadata as fixed-capacity offsets.
         kwargs = self.inner_layer._decompose_packed_graph_inputs(kwargs)
-        hidden_states = args[0] if args else kwargs.pop('hidden_states')
+        hidden_states = args[0] if args else kwargs.pop("hidden_states")
         # TE copies the aggregate into the graph's static input and keeps that copy for the
         # graph's backward, so the aggregate is not checkpointed.
         aggregated, h_res, h_post, residual = self.hyper_connection(
@@ -206,7 +206,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             graph_args, graph_kwargs = self.inner_layer._get_te_cuda_graph_replay_args(
                 *args, **kwargs
             )
-            graph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+            graph_kwargs["is_first_microbatch"] = getattr(self, "current_microbatch", 0) == 0
             return graph_args, graph_kwargs
         return super()._get_te_cuda_graph_replay_args(*args, **kwargs)
 

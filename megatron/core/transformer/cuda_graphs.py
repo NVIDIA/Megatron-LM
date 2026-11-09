@@ -2366,7 +2366,7 @@ def _get_mtp_te_layers(mtp_model_layer):
 def _is_mtp_te_layer(layer, model):
     return any(
         layer is candidate
-        for mtp_layer in getattr(getattr(model, 'mtp', None), 'layers', [])
+        for mtp_layer in getattr(getattr(model, "mtp", None), "layers", [])
         for candidate in _get_mtp_te_layers(mtp_layer.mtp_model_layer)
     )
 

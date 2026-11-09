@@ -1470,7 +1470,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _pack_mlp_cuda_graph_state(self, outputs, residual, mlp_state):
         """Append the layer's residual state to the partial MoE graph outputs."""
-        assert not mlp_state, 'Override partial graph state packing for subclass MLP state.'
+        assert not mlp_state, "Override partial graph state packing for subclass MLP state."
         return list(outputs) + [residual]
 
     def _unpack_mlp_cuda_graph_state(self, outputs):
@@ -2121,7 +2121,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 valid_cudagraph_attrs
             ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
             for i, attr_name in enumerate(valid_cudagraph_attrs):
-                hier_attr_name = attr_name.split('.')
+                hier_attr_name = attr_name.split(".")
                 attr = self.mlp.token_dispatcher
                 for name in hier_attr_name[:-1]:
                     attr = getattr(attr, name)

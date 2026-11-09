@@ -245,7 +245,7 @@ class _count_recompute_rebuilds:
 
     count = 0
 
-    def __init__(self, monkeypatch):
+    def __init__(self, monkeypatch) -> None:
         rebuild = tensor_parallel_random._RecomputeRegion.rebuild
 
         def counted_rebuild(region):
