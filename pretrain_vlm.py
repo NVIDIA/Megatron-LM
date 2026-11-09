@@ -16,6 +16,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
 from megatron.core.models.multimodal.llava_spec import (
@@ -28,6 +29,7 @@ from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import get_submodules, import_module
 from megatron.training import (
     get_args,
@@ -42,6 +44,26 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.vocab_utils import model_vocab_size
 from pretrain_gpt import loss_func
+
+
+def get_vision_projection_submodules(language_transformer_layer_spec, use_te=True):
+    """Return the MLP submodules for the vision projection.
+
+    The projection is a dense MLP. It reuses the language layer's MLP submodules, unless that MLP
+    is a mixture of experts (--num-experts), whose submodules have no linear_fc1/linear_fc2. In
+    that case it uses the default dense MLP of the same backend.
+
+    Args:
+        language_transformer_layer_spec (ModuleSpec): Language model transformer layer spec.
+        use_te (bool): Use Transformer Engine modules for the dense MLP fallback.
+
+    Returns:
+        MLPSubmodules: Submodules for the vision projection MLP.
+    """
+    mlp_submodules = get_submodules(language_transformer_layer_spec.submodules.mlp)
+    if not isinstance(mlp_submodules, MLPSubmodules):
+        mlp_submodules = get_submodules(get_mlp_module_spec(use_te=use_te))
+    return deepcopy(mlp_submodules)
 
 
 def model_provider(
@@ -196,8 +218,8 @@ def model_provider(
     vision_transformer_config.pipeline_model_parallel_size = 1
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    vision_projection_modules = deepcopy(
-        get_submodules(language_transformer_layer_spec.submodules.mlp)
+    vision_projection_modules = get_vision_projection_submodules(
+        language_transformer_layer_spec, use_te=args.transformer_impl == "transformer_engine"
     )
 
     language_max_sequence_length = args.decoder_seq_length
