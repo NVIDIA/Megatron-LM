@@ -248,18 +248,20 @@ class TestGDPCudaGraphE2E:
             for n in (70, 129, 33, 200)
         ]
 
-    def _run(self, engine, prompts, stagger):
+    def _run(self, engine, prompts, stagger, replay_log=None):
         """Drive the engine to completion, returning tokens and a per-step log.
 
         With `stagger`, two requests are held back and added once the first
         batch has reached decode, which forces mixed prefill+decode steps.
+        Each CUDA graph replay is appended to `replay_log` when one is given.
         """
         initial = prompts[:2] if stagger else prompts
         for i, prompt in enumerate(initial):
             engine._add_request(self._make_request(i, prompt))
 
         ctx = engine.context
-        finished, step_log, replay_log = {}, [], []
+        finished, step_log = {}, []
+        replay_log = [] if replay_log is None else replay_log
         pending = list(enumerate(prompts))[2:] if stagger else []
 
         original_replay = _CudaGraphRunner.replay_graph_capture
@@ -294,7 +296,7 @@ class TestGDPCudaGraphE2E:
                 for request in result["finished_requests"]:
                     finished[request.request_id] = list(request.generated_tokens)
 
-        return finished, step_log, replay_log
+        return finished, step_log
 
     @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
     @torch.inference_mode()
@@ -308,10 +310,11 @@ class TestGDPCudaGraphE2E:
             prompts = self._create_prompts()
 
             eager_engine = self._build_engine(model, num_cuda_graphs=None)
-            eager_outputs, eager_log, eager_replays = self._run(eager_engine, prompts, stagger)
+            eager_replays, cg_replays = [], []
+            eager_outputs, eager_log = self._run(eager_engine, prompts, stagger, eager_replays)
 
             cg_engine = self._build_engine(model, num_cuda_graphs=NUM_CUDA_GRAPHS)
-            cg_outputs, cg_log, cg_replays = self._run(cg_engine, prompts, stagger)
+            cg_outputs, cg_log = self._run(cg_engine, prompts, stagger, cg_replays)
 
         assert set(eager_outputs) == set(range(len(prompts))), "not every request finished"
         for req_id in sorted(eager_outputs):

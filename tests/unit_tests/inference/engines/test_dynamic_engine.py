@@ -1466,7 +1466,7 @@ class DynamicEngineTestConfig:
     top_p: float = 0.0
     offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
-    engine_cls: type = DynamicInferenceEngine
+    engine_cls: Optional[type] = None
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -2033,14 +2033,16 @@ class DynamicInferenceEngineTestBase:
 
         delete_cuda_graphs()
 
-        # Inference engine.
+        # Inference engine. Resolve the default at call time so real_engine's patch of this
+        # module applies.
+        engine_cls = test_config.engine_cls or DynamicInferenceEngine
         if test_config.defer_cuda_graph_creation:
             with mock.patch.object(
-                test_config.engine_cls, "create_cuda_graphs", autospec=True, return_value=None
+                engine_cls, "create_cuda_graphs", autospec=True, return_value=None
             ):
-                engine = test_config.engine_cls(text_generation_controller, inference_context)
+                engine = engine_cls(text_generation_controller, inference_context)
         else:
-            engine = test_config.engine_cls(text_generation_controller, inference_context)
+            engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
