@@ -436,7 +436,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     if args.init_method == "xavier_uniform":
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
-        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['output_layer_init_method'] = torch.nn.init.xavier_uniform_
     if args.embedding_init_method == "xavier_uniform":
         kw_args['embedding_init_method'] = torch.nn.init.xavier_uniform_
     

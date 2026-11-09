@@ -213,6 +213,47 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     assert config.deallocate_pipeline_outputs is expected
 
 
+def test_init_method_xavier_uniform_reaches_transformer_config(monkeypatch):
+    """--init-method-xavier-uniform sets both the init and the output-layer init methods."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--init-method-xavier-uniform'])
+    args = parse_args()
+    # parse_args reads WORLD_SIZE from the environment; pin it so the test does not depend
+    # on how the job was launched.
+    args.world_size = 1
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    validate_args(args)
+
+    config = core_transformer_config_from_args(args)
+
+    assert config.init_method is torch.nn.init.xavier_uniform_
+    assert config.output_layer_init_method is torch.nn.init.xavier_uniform_
+
+
+def test_yaml_xavier_uniform_init_method_reaches_transformer_config():
+    """The YAML init_method 'xavier_uniform' sets both the init and output-layer init methods."""
+    language_model = Namespace(
+        **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
+    )
+    language_model.params_dtype = torch.float32
+    language_model.activation_func = "gelu"
+    language_model.init_method = "xavier_uniform"
+    args = SimpleNamespace(language_model=language_model, model_parallel=SimpleNamespace())
+
+    config = core_transformer_config_from_yaml(args)
+
+    assert config.init_method is torch.nn.init.xavier_uniform_
+    assert config.output_layer_init_method is torch.nn.init.xavier_uniform_
+
+
 def test_wide_residual_cli_builds_typed_config():
     """Flat training arguments should build the nested core configuration."""
     parser = ArgumentParser()
