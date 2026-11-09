@@ -22,7 +22,23 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
   </thead>
   <tbody>
     <tr>
-      <td>DeepSeek-V4-Pro</td>
+      <td rowspan="3">DeepSeek-V4-Pro</td>
+      <td><a href="deepseek_v4_pro/gb200/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB200 MXFP8 BSHD 4K</a></td>
+      <td>256</td>
+      <td>1/4/64/1/1</td>
+      <td>1/4096/4096</td>
+      <td>VPP4; MoK; Muon; full recompute; full CG</td>
+      <td>744.0 / 736.7</td>
+    </tr>
+    <tr>
+      <td><a href="deepseek_v4_pro/gb200/mxfp8_THD64K_256GPU_TP1PP4EP64CP16.yaml">GB200 MXFP8 THD 64K</a></td>
+      <td>256</td>
+      <td>1/4/64/16/1</td>
+      <td>1/256/65536</td>
+      <td>VPP4; THD packing; MoK; Muon; full recompute; eager</td>
+      <td>570.2 / 569.7</td>
+    </tr>
+    <tr>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
       <td>256</td>
       <td>1/4/64/1/1</td>
@@ -240,3 +256,39 @@ convergence or a controlled speedup over earlier recipes.
 The cuTile compilation cache is placed in node-local `/tmp` to avoid SQLite
 locking across ranks on a shared home directory. If the launcher overrides
 `CUDA_TILE_CACHE_DIR`, keep it on a node-local filesystem.
+
+
+## DeepSeek-V4 Pro GB200 MXFP8 recipes
+
+The GB200 BSHD 4K and THD 64K recipes use HybridModel with 61 attention/MoE
+blocks and one MTP layer, compact Muon, MoK, an MXFP8 indexer and grouped output
+projection, and BF16 shared experts. They share the Flash recipes' pinned build
+dependencies and parameter-readiness fixes. Run from the repository root so the
+shared-expert precision configuration resolves.
+
+Both use 256 GPUs, TP1/PP4/VPP4/EP64, and full recompute with one checkpoint per
+attention/MoE block (`recompute_num_layers: 2` hybrid layers) to fit GB200 memory.
+The 4K recipe uses full-iteration CUDA graphs; 64K adds CP16 and runs eagerly
+because per-layer TE graphs do not support full recompute. Each step contains
+16,777,216 tokens. Keep each EP64 group within one NVL72 domain (16 four-GPU nodes).
+
+Each configuration completed two full-scale runs with the parameter-readiness
+fix at source revision `ae5978fb8e90e06b1d7e6cd565e435fdd45b027c`, before the
+latest dev merge. These are mock-data, forced-routing throughput measurements,
+not convergence validation or a controlled comparison with the existing GB300
+recipe. The refreshed GB300 benchmark is still pending; the GB300 row above
+refers to the previously listed TE/paged-stash configuration.
+
+| Recipe | Measured steps | TFLOP/s/GPU from mean step time, trials 1 / 2 | Mean step (s), trials 1 / 2 | Peak allocated memory (GiB/GPU) |
+| --- | --- | --- | --- | --- |
+| BSHD 4K | 21–100 | 743.8 / 736.4 | 28.420 / 28.705 | 152.8 |
+| THD 64K | 41–130 | 569.5 / 568.6 | 41.702 / 41.768 | 150.3 |
+
+The Pro index rows report each trial's median separately. The table here uses
+model FLOPs divided by mean measured step time; extra recompute work is excluded
+from the FLOPs numerator. Memory includes initialization and graph capture, and
+is the maximum allocated high-water mark over all ranks and both trials.
+All four 256-GPU runs completed the requested iterations with finite logged
+losses/gradient norms, no skipped/NaN iterations, clean all-rank log audits, and
+FLOPs consistent with independent fixed-length accounting. The 64K recipe runs 130 iterations to provide a stable
+90-step window after warmup; it retains the measured 100-step LR decay schedule.
