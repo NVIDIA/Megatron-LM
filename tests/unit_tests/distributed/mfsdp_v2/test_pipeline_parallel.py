@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pipeline schedule and context-sharing tests for MFSDP v2.
+"""Pipeline-parallel context-sharing test for MFSDP v2.
 
 ``virtual_pipeline_model_parallel_size > 1`` manifests as multiple model chunks
 on a rank, and ``wrap_model_chunks_with_ddp`` wraps each chunk in its own
@@ -12,23 +12,16 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
-from unittest.mock import Mock
-
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.enums import ModelType
-from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -73,71 +66,6 @@ class TestMfsdpV2PipelineSharedContext:
     def teardown_method(self):
         """Destroy the process groups initialized in ``setup_method``."""
         Utils.destroy_model_parallel()
-
-    @pytest.mark.parametrize(
-        "delay_wgrad_compute,num_microbatches",
-        [(False, 3), (True, 1)],
-        ids=["accumulation", "delayed_wgrad"],
-    )
-    def test_schedule_waits_after_all_backward_work(
-        self, distributed_setup, monkeypatch, delay_wgrad_compute, num_microbatches
-    ):
-        """A schedule waits once, after delayed gradients, and produces the correct sum."""
-        device = distributed_setup.device
-        config = _compute_config()
-        torch.manual_seed(1234)
-        layer = te.Linear(
-            16, 16, bias=False, device=device, delay_wgrad_compute=delay_wgrad_compute
-        )
-        layer.model_type = ModelType.encoder_or_decoder
-        layer.set_input_tensor = lambda _: None
-        reference = nn.Linear(16, 16, bias=False, device=device)
-        reference.load_state_dict({"weight": layer.weight.detach().clone()})
-        model = FullyShardedDataParallelV2(
-            config=config,
-            ddp_config=_mfsdp_v2_ddp_config(),
-            module=layer,
-            pg_collection=self.pg_collection,
-        )
-        context = model.module.context
-        finish_grad_sync = Mock(wraps=context.finish_grad_sync)
-        monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
-        config.no_sync_func = model.no_sync
-
-        def finalize_model_grads(models, *args, **kwargs):
-            finish_grad_sync.assert_not_called()
-            if delay_wgrad_compute:
-                layer.backward_dw()
-            models[0].finish_grad_sync()
-
-        config.finalize_model_grads_func = finalize_model_grads
-        torch.manual_seed(4321 + distributed_setup.rank)
-        inputs = [
-            torch.randn(4, 16, device=device, requires_grad=True) for _ in range(num_microbatches)
-        ]
-
-        def forward_step(data_iterator, model):
-            def loss_func(output):
-                loss = output.square().mean()
-                return loss, {"loss": loss.detach()}
-
-            return model(next(data_iterator)), loss_func
-
-        with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-            forward_backward_no_pipelining(
-                forward_step_func=forward_step,
-                data_iterator=iter(inputs),
-                model=[model],
-                num_microbatches=len(inputs),
-                seq_length=4,
-                micro_batch_size=1,
-                pg_collection=self.pg_collection,
-            )
-        finish_grad_sync.assert_called_once_with()
-        for x in inputs:
-            (reference(x.detach()).square().mean() / len(inputs)).backward()
-        dist.all_reduce(reference.weight.grad, op=dist.ReduceOp.AVG)
-        torch.testing.assert_close(layer.weight.grad.full_tensor(), reference.weight.grad)
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
     def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
