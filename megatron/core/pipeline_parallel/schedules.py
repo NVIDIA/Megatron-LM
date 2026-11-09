@@ -1114,8 +1114,7 @@ def forward_backward_pipelining_with_interleaving(
                 return stack
 
             no_sync_func = multi_no_sync
-    grad_sync_context = contextlib.ExitStack()
-    grad_sync_enabled = True
+    no_sync_context = None
 
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
         config.grad_sync_func = [config.grad_sync_func for _ in model]
@@ -1130,17 +1129,19 @@ def forward_backward_pipelining_with_interleaving(
         grad_sync_func, param_sync_func = config.grad_sync_func, config.param_sync_func
         config.grad_sync_func, config.param_sync_func = None, None
 
-    def set_grad_sync(enabled):
-        """Switch between accumulation and reduction without nesting scopes."""
-        nonlocal grad_sync_enabled
-        if enabled == grad_sync_enabled:
-            return
-        grad_sync_context.close()
-        grad_sync_context.enter_context(sync_func() if enabled else no_sync_func())
-        grad_sync_enabled = enabled
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
 
-    disable_grad_sync = partial(set_grad_sync, False)
-    enable_grad_sync = partial(set_grad_sync, True)
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
 
     disable_grad_sync()
 
@@ -1468,7 +1469,10 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        with sync_func() if no_sync_context is None else contextlib.nullcontext():
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -1505,6 +1509,12 @@ def forward_backward_pipelining_with_interleaving(
                 collect_non_loss_data,
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
                 b_virtual_microbatch_id=b_virtual_microbatch_id,
+                sync_func=sync_func,
+                sync_gradients=(
+                    b_virtual_microbatch_id is not None
+                    and is_last_microbatch_for_model_chunk(b_virtual_microbatch_id)
+                    and config.grad_sync_func is None
+                ),
                 pre_forward=pre_forward,
                 pre_backward=pre_backward,
                 post_forward=post_forward,
@@ -2085,9 +2095,10 @@ def forward_backward_pipelining_with_interleaving(
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        finish_embedding_wgrad_compute(
-            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
-        )
+        with sync_func():
+            finish_embedding_wgrad_compute(
+                config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
+            )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
@@ -2113,8 +2124,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
-    grad_sync_context.close()
-
+    enable_grad_sync()
     return forward_data_store
 
 
@@ -2288,20 +2298,21 @@ def forward_backward_pipelining_without_interleaving(
     else:
         no_sync_func = config.no_sync_func or contextlib.nullcontext
         sync_func = contextlib.nullcontext
-    grad_sync_context = contextlib.ExitStack()
-    grad_sync_enabled = True
+    no_sync_context = None
 
-    def set_grad_sync(enabled):
-        """Switch between accumulation and reduction without nesting scopes."""
-        nonlocal grad_sync_enabled
-        if enabled == grad_sync_enabled:
-            return
-        grad_sync_context.close()
-        grad_sync_context.enter_context(sync_func() if enabled else no_sync_func())
-        grad_sync_enabled = enabled
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
 
-    disable_grad_sync = partial(set_grad_sync, False)
-    enable_grad_sync = partial(set_grad_sync, True)
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
 
     disable_grad_sync()
 
@@ -2481,9 +2492,10 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with sync_func() if no_sync_context is None else contextlib.nullcontext():
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
             if last_iteration:
                 input_tensor = None
@@ -2518,14 +2530,15 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with sync_func() if no_sync_context is None else contextlib.nullcontext():
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
         # Launch any remaining grad reductions.
-        if not grad_sync_enabled:
+        if no_sync_context is not None:
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
@@ -2534,9 +2547,10 @@ def forward_backward_pipelining_without_interleaving(
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        finish_embedding_wgrad_compute(
-            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
-        )
+        with sync_func():
+            finish_embedding_wgrad_compute(
+                config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
+            )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
@@ -2557,6 +2571,5 @@ def forward_backward_pipelining_without_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
-    grad_sync_context.close()
-
+    enable_grad_sync()
     return forward_data_store
