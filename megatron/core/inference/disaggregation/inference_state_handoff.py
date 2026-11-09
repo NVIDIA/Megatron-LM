@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 
 from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    ContextOverflowError,
+    MaxSequenceLengthOverflowError,
+    request_limit_errors,
+)
 from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -892,6 +898,13 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff requires every prompt KV block, including the partial tail: "
                 f"expected {expected_blocks}, got {num_blocks}"
             )
+        # An import that can never fit would wait at the head of the FIFO capacity queue
+        # forever and block every later handoff. Fail it now instead.
+        limit_error = self._handoff_limit_error(
+            request_id, len(prompt), sampling_params, num_blocks, len(resume_tokens)
+        )
+        if limit_error is not None:
+            raise limit_error
         future = self._loop.create_future()
         request_metadata = kv_meta.get("request_metadata")
         handoff = DeferredKvHandoff(
@@ -931,6 +944,56 @@ class InferenceStateHandoffMixin:
                 len(self._deferred_kv_handoffs),
             )
         return future
+
+    def _handoff_limit_error(
+        self,
+        request_id: int,
+        prompt_length: int,
+        sampling_params: "SamplingParams",
+        prompt_block_count: int,
+        resume_token_count: int,
+    ) -> ContextOverflowError | None:
+        """Return why an import can never be admitted, whatever capacity frees up later.
+
+        Applies the fixed limits that `add_request()` enforces on admission, and the
+        import's own need: every prompt block plus the blocks of its first decode step.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
+        context = self.context
+        # The generation budget that add_request() resolves on admission.
+        remaining = context.max_sequence_length - prompt_length
+        if sampling_params.num_tokens_total is not None:
+            budget = sampling_params.num_tokens_total - prompt_length
+        elif sampling_params.num_tokens_to_generate is None:
+            budget = remaining
+        else:
+            budget = sampling_params.num_tokens_to_generate
+        if budget < 0 or remaining < 0:
+            return MaxSequenceLengthOverflowError(request_id)
+        import_block_count = prompt_block_count + additional_decode_blocks(
+            prompt_length,
+            resume_token_count,
+            context.block_size_tokens,
+            mtp_kv_cache=getattr(context, "enable_mtp_kv_cache", False),
+        )
+        usable_block_count = context.kv_block_allocator.pool_size - 1
+        if import_block_count > usable_block_count:
+            return BlockOverflowError(
+                request_id,
+                f"the import needs {import_block_count} KV blocks, "
+                f"but the pool has {usable_block_count}",
+                is_transient=False,
+            )
+        errors = request_limit_errors(
+            context,
+            request_id,
+            prompt_length,
+            min(budget, remaining),
+            chunked_prefill=self.enable_chunked_prefill,
+        )
+        return errors[0] if errors else None
 
     def _try_start_kv_handoff_import(self, handoff: DeferredKvHandoff) -> bool:
         """Reserve cache state and start one import, or return without mutation.
