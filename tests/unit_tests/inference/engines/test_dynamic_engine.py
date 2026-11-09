@@ -7914,6 +7914,147 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), f"Expected 6 tokens, got {len(finished_req.generated_tokens)}. Double counting occurred."
 
     @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "num_speculative_tokens, prompt_length, num_tokens_to_generate, draft_kv_cache, "
+        "suspend_after, fits",
+        [
+            # The prompt fills the pool and its last token sits within k+1 of the block end,
+            # so admission wants a reserve block past the pool.
+            (1, 47, 1, True, None, False),
+            # The last decode steps need 2k = 6 lookahead tokens; the old check counted k = 3.
+            (3, 33, 13, True, None, False),
+            # A checkpoint with one token left is a 47-token prompt that wants the reserve.
+            (1, 40, 8, True, None, False),
+            # Just inside the bound: no reserve, and the last decode step's lookahead fits.
+            (1, 46, 1, True, None, True),
+            (3, 33, 11, True, None, True),
+            # Just inside the bound for re-admission: a RECOMPUTE suspend with one token left.
+            (1, 39, 8, True, 7, True),
+            # Without the draft KV cache nothing changes.
+            (1, 47, 1, False, None, True),
+        ],
+        ids=[
+            "reserve",
+            "lookahead",
+            "checkpoint",
+            "reserve-fits",
+            "lookahead-fits",
+            "checkpoint-fits",
+            "cache-off",
+        ],
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_cache_submission_counts_peak_blocks(
+        self,
+        num_speculative_tokens,
+        prompt_length,
+        num_tokens_to_generate,
+        draft_kv_cache,
+        suspend_after,
+        fits,
+    ):
+        """With the MTP draft KV cache, a request that passes submission can be scheduled.
+
+        The pool has 6 blocks of 8 tokens. Each admission may add a reserve block for the
+        draft loop, and each decode step holds max(k+1, 2k) lookahead tokens. A request whose
+        peak exceeds the pool fails at submission with BlockOverflowError instead of waiting
+        forever at the queue head. A request just inside the bound completes, with every
+        draft rejected so that it reaches each committed length, and across a RECOMPUTE
+        suspend where one is given.
+        """
+        vocab = DynamicEngineTestConfig.vocab_size
+        block_size, usable_blocks = 8, 6
+        # bf16 key and value, hidden 32, for 4 decoder layers plus the draft plane.
+        block_bytes = 2 * 2 * block_size * 32 * (5 if draft_kv_cache else 4)
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_sequence_length=256,
+            context_buffer_size_gb=(usable_blocks + 1.5) * block_bytes / 1024**3,
+            context_paused_buffer_size_gb=0.5 * block_bytes / 1024**3,
+            context_block_size_tokens=block_size,
+            context_max_requests=2,
+            context_max_tokens=48,
+            num_speculative_tokens=num_speculative_tokens,
+            mtp_use_repeated_layer=draft_kv_cache,
+            async_sched_mode=AsyncScheduleMode.LEGACY,
+            kv_cache_management_mode=(
+                KVCacheManagementMode.RECOMPUTE if suspend_after else KVCacheManagementMode.PERSIST
+            ),
+            static_kv_memory_pointers=not suspend_after,
+        )
+        env = self._build_test_env(test_config)
+        engine, context = env.engine, env.engine.context
+        assert context.kv_block_allocator.pool_size == usable_blocks + 1
+        assert context.enable_mtp_kv_cache == draft_kv_cache
+        model = engine.controller.inference_wrapped_model.model
+        hidden_size = model.config.hidden_size
+
+        def successor(tokens, positions):
+            return 1 + (tokens * 7 + positions * 13 + 5) % (vocab - 3)
+
+        def forward(input_ids, position_ids, *args, **kwargs):
+            tokens, positions = input_ids[0].long(), position_ids[0].long()
+            logits = torch.zeros(
+                1, tokens.numel(), vocab, device=tokens.device, dtype=torch.bfloat16
+            )
+            logits[0].scatter_(1, successor(tokens, positions)[:, None], 100.0)
+            context.mtp_decoder_hidden_states = torch.zeros(
+                tokens.numel(), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return context.last_token_logits(logits).unsqueeze(0)
+
+        def draft(hidden_states, next_token_ids, position_ids, *args, **kwargs):
+            # Every draft is wrong, so each step adds one token.
+            drafts = 1 + (successor(next_token_ids[0].long(), position_ids[0].long()) + 3) % (
+                vocab - 3
+            )
+            logits = torch.zeros(drafts.numel(), 1, vocab, device=drafts.device)
+            logits[:, 0].scatter_(1, drafts[:, None], 100.0)
+            return hidden_states, logits
+
+        model.forward = forward
+        model.compute_mtp_single_step = draft
+        model.mtp.layers[0].forward_single_position = lambda hidden_states, *a, **kw: hidden_states
+
+        prompt = [1 + (i * 11 + 3) % (vocab - 3) for i in range(prompt_length)]
+        engine.add_request(
+            0,
+            prompt,
+            SamplingParams(
+                num_tokens_to_generate=num_tokens_to_generate, termination_id=vocab - 1, top_k=1
+            ),
+        )
+        request = engine.get_request(0)
+        if not fits:
+            assert request.status == Status.FAILED, (
+                "a request whose peak exceeds the pool was accepted",
+                list(engine.waiting_request_ids),
+            )
+            errors = [
+                type(e.payload)
+                for e in request.events
+                if e.type is DynamicInferenceEventType.ERROR_NONTRANSIENT
+            ]
+            assert errors == [BlockOverflowError]
+            assert engine.failed_request_ids == [0] and not engine.waiting_request_ids
+            return
+
+        finished, suspended = [], False
+        for _ in range(4 * num_tokens_to_generate + 8):
+            if finished:
+                break
+            if suspend_after and not suspended:
+                if len(engine.get_request(0).generated_tokens) >= suspend_after:
+                    engine.suspend()
+                    engine.resume()
+                    suspended = True
+            finished.extend(engine.step_modern()["finished_requests"])
+        assert [r.request_id for r in finished] == [0], list(engine.waiting_request_ids)
+        assert finished[0].status == Status.COMPLETED
+        assert len(finished[0].generated_tokens) == num_tokens_to_generate
+        assert suspended or not suspend_after
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
