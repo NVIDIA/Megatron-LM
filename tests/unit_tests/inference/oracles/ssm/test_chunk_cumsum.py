@@ -344,10 +344,14 @@ def test_cumsum_exact_on_dyadic_inputs(chunk_size, dtype):
 def test_target_rows_windows(chunk_size, exact):
     """Fixed windows (the batch-invariant decode tile path): each entry reads [slot * c, slot * c + c)
     of the replay buffer whatever its target row; padding entries (target row -1, chunk start -c) write
-    nothing. Random production-range inputs with softplus, and dyadic inputs without (exact)."""
+    nothing, live ones are computed whatever their row, including row 0 (a slot's first token after a
+    chunk boundary). Random production-range inputs with softplus, and dyadic inputs without (exact).
+    """
     g = ou.make_generator(device=DEVICE)
     entries, heads = 37, 8
-    win = su.decode_windows(entries, chunk_size, padding=(3, 20), device=DEVICE)
+    rows = [0, 1, 15, 16, 17, chunk_size // 2, chunk_size - 2, chunk_size - 1]
+    win = su.decode_windows(entries, chunk_size, padding=(3, 20), rows=rows, device=DEVICE)
+    assert (win["target_rows"] == 0).any(), "a live entry on row 0"
     if exact:
         dt = ou.dyadic_tensor(
             (entries * chunk_size, heads),
