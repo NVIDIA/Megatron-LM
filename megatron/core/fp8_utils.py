@@ -3,6 +3,7 @@
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
 import importlib
+import math
 import weakref
 from contextlib import nullcontext
 from functools import wraps
@@ -1006,16 +1007,19 @@ if HAVE_TE:
                 # all-gather and reduce-scatter externally
                 module.sequence_parallel = False
 
-            seq_len, batch_size, hidden_size = input_tensor.shape
-            # Reshape to (S, B*H) to pad sequence dimension
-            input_2d = input_tensor.reshape(seq_len, -1)
+            # The input is [S, B, H] for most layers and [T, H] for SequentialMLP experts.
+            # Pad the first dimension in both cases.
+            seq_len = input_tensor.shape[0]
+            # Reshape to (S, B*H) to pad sequence dimension. The width is explicit because an
+            # expert can receive no tokens, and reshape cannot infer -1 for an empty tensor.
+            input_2d = input_tensor.reshape(seq_len, math.prod(input_tensor.shape[1:]))
             # Pad the sequence dimension
             padded_input_2d, _ = _pad_func(input_2d, [seq_len])
             padded_seq_len = padded_input_2d.shape[0]
 
-            # Reshape back to (padded_S, B, H)
-            padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)
-            output = original_forward(padded_input_3d, *args, **kwargs)
+            # Reshape back to (padded_S, B, H) or (padded_T, H)
+            padded_input = padded_input_2d.view(padded_seq_len, *input_tensor.shape[1:])
+            output = original_forward(padded_input, *args, **kwargs)
 
             # Handle output
             if isinstance(output, tuple):
@@ -1026,10 +1030,9 @@ if HAVE_TE:
                 other_outputs = ()
 
             # Unpad output - reshape to 2D, unpad, reshape back
-            _, _, output_hidden_size = output_tensor.shape
-            output_2d = output_tensor.reshape(padded_seq_len, -1)
+            output_2d = output_tensor.reshape(padded_seq_len, math.prod(output_tensor.shape[1:]))
             unpadded_output_2d = _unpad_func(output_2d, [seq_len])
-            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
+            unpadded_output = unpadded_output_2d.reshape(seq_len, *output_tensor.shape[1:])
 
             if is_sequence_parallel:
                 # Reduce-scatter after unpadding

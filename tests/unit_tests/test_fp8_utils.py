@@ -209,6 +209,96 @@ class TestFP8Padding:
             # Verify output has original shape
             assert output.shape == (6, 2, 4096)  # Back to original seq_len
 
+    def test_padding_mechanism_works_with_2d_input(self):
+        """Test padding of [tokens, hidden] inputs, as SequentialMLP experts pass them."""
+
+        with (
+            patch.object(fp8_utils, 'HAVE_TE', True),
+            patch.object(fp8_utils, 'Fp8Padding') as mock_pad_class,
+            patch.object(fp8_utils, 'Fp8Unpadding') as mock_unpad_class,
+        ):
+
+            # Setup padding mock to pad from 6 to 16
+            mock_pad_instance = Mock()
+            mock_pad_instance.return_value = (torch.zeros(16, 4096), [16])
+            mock_pad_class.return_value = mock_pad_instance
+
+            # Setup unpadding mock to unpad from 16 to 6
+            mock_unpad_instance = Mock()
+            mock_unpad_instance.return_value = torch.zeros(6, 1024)
+            mock_unpad_class.return_value = mock_unpad_instance
+
+            module = MockTELinear(4096, 1024)
+            module.cuda()
+
+            original_forward_input = None
+
+            def track_forward(x):
+                nonlocal original_forward_input
+                original_forward_input = x
+                return torch.randn(x.shape[0], 1024).cuda()
+
+            module.forward = track_forward
+
+            fp8_utils._wrap_te_linear_for_padding(module)
+            padded_forward = module.forward
+
+            with patch(
+                'transformer_engine.pytorch.fp8.FP8GlobalStateManager.is_fp8_enabled',
+                return_value=True,
+            ):
+                # Create input: (num_tokens=6, hidden=4096)
+                input_tensor = torch.randn(6, 4096).cuda()
+                output = padded_forward(input_tensor)
+
+            call_args = mock_pad_instance.call_args[0]
+            assert call_args[0].shape == (6, 4096)
+            assert call_args[1] == [6]
+
+            # The original forward received the padded 2-D input
+            assert original_forward_input.shape == (16, 4096)
+
+            unpad_args = mock_unpad_instance.call_args[0]
+            assert unpad_args[0].shape == (16, 1024)
+            assert unpad_args[1] == [6]
+
+            # Output keeps the input's rank and token count
+            assert output.shape == (6, 1024)
+
+    def test_padding_mechanism_works_with_empty_2d_input(self):
+        """Test an expert that receives no tokens: a [0, hidden] input must not break the reshapes."""
+
+        with (
+            patch.object(fp8_utils, 'HAVE_TE', True),
+            patch.object(fp8_utils, 'Fp8Padding') as mock_pad_class,
+            patch.object(fp8_utils, 'Fp8Unpadding') as mock_unpad_class,
+        ):
+
+            # Zero tokens need no padding
+            mock_pad_instance = Mock()
+            mock_pad_instance.return_value = (torch.zeros(0, 4096), [0])
+            mock_pad_class.return_value = mock_pad_instance
+
+            mock_unpad_instance = Mock()
+            mock_unpad_instance.return_value = torch.zeros(0, 1024)
+            mock_unpad_class.return_value = mock_unpad_instance
+
+            module = MockTELinear(4096, 1024)
+            module.cuda()
+            module.forward = lambda x: torch.randn(x.shape[0], 1024).cuda()
+
+            fp8_utils._wrap_te_linear_for_padding(module)
+            padded_forward = module.forward
+
+            with patch(
+                'transformer_engine.pytorch.fp8.FP8GlobalStateManager.is_fp8_enabled',
+                return_value=True,
+            ):
+                output = padded_forward(torch.randn(0, 4096).cuda())
+
+            assert mock_pad_instance.call_args[0][0].shape == (0, 4096)
+            assert output.shape == (0, 1024)
+
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 class TestCopyTensorsToQuantizedParams:
