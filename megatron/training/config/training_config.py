@@ -51,6 +51,11 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
+    release_initial_grad_sync_cache: bool = False
+    """Synchronize and release unused CUDA allocator blocks before the first gradient
+    finalization only. Live tensors remain allocated; the selected finalizer is preserved.
+    """
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
