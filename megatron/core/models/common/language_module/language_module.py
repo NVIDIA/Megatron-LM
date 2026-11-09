@@ -8,12 +8,9 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import (
-    backend_slot,
-    get_backend_from_config,
-    select_cross_entropy,
-)
+from megatron.core.inference.utils import InferenceMode, lm_head_can_emit
+from megatron.core.models.backends import backend_slot, get_backend_from_config
+from megatron.core.ops.loss.backends import select_cross_entropy
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -235,6 +232,8 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # The input table's post-update transforms must also reach its tied copies.
+            weight.is_word_embedding_parameter = True
             # Keep optimizer grouping consistent for tied embedding/output copies.
             if self.config.use_mup:
                 weight.is_embedding_parameter = True
@@ -398,7 +397,7 @@ class LanguageModule(MegatronModule):
                     "MultimodalRotaryEmbedding yet."
                 )
             rotary_pos_emb = self.rotary_pos_emb(
-                position_ids, self.mrope_section, cp_group=cp_group
+                position_ids, self.mrope_section, packed_seq=packed_seq, cp_group=cp_group
             )
         return rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
 
@@ -421,6 +420,11 @@ class LanguageModule(MegatronModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    @property
+    def lm_head_can_emit_fp32(self) -> bool:
+        """Whether the LM head can emit fp32 logits; reads the batch-invariant mode flag live."""
+        return lm_head_can_emit(self.output_layer, torch.float32)
 
     @torch.inference_mode()
     def compute_mtp_single_step(
@@ -468,8 +472,16 @@ class LanguageModule(MegatronModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
-        logits = self._scale_logits(logits)
+        # Speculative decoding is inference-only, and inference consumes logits in fp32: emit
+        # them so when the head can, upcast otherwise.
+        logits, _ = self.output_layer(
+            mtp_hidden,
+            weight=output_weight,
+            runtime_gather_output=True,
+            output_dtype=torch.float32 if self.lm_head_can_emit_fp32 else None,
+        )
+        # MuP scaling first: a bf16 head scales in bf16, as training does, then the upcast.
+        logits = self._scale_logits(logits).float()
 
         return mtp_hidden, logits
 
