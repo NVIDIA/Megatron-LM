@@ -698,7 +698,16 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        if self.ddp_config.param_gather_in_forward_order and not force_sync:
+            # Buckets are laid out from the end of the model, so the last bucket group of each
+            # buffer list holds the first layers. Gather those first, in the order of the
+            # `next_param_gather_bucket_group` chain. Every rank of a data-parallel group uses
+            # the same order, and dense and expert-parallel groups keep their relative order.
+            bucket_groups = list(reversed(self.bucket_groups)) + list(
+                reversed(self.expert_parallel_bucket_groups)
+            )
+        for bucket_group in bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def reset_param_sync_dispatch_state(self):

@@ -2994,6 +2994,10 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_param_gather')
+    group.add_argument('--param-gather-in-forward-order', action='store_true', default=False,
+                       help='If set, DDP dispatches the param all-gathers of all bucket groups in '
+                       'forward order (first layers first) instead of bucket order (last layers '
+                       'first). Same collectives and results.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],

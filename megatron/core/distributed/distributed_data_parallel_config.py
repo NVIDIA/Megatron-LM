@@ -41,6 +41,16 @@ class DistributedDataParallelConfig:
     gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
     """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
 
+    param_gather_in_forward_order: bool = False
+    """If true, DistributedDataParallel.start_param_sync dispatches the bucket groups' param
+    all-gathers in forward order (the bucket groups holding the first layers first), the order
+    in which the forward pass needs them and in which the overlapped all-gathers
+    (overlap_param_gather) are chained. By default they are dispatched in bucket order, which
+    starts at the end of the model, so the first forward waits for every all-gather of its
+    model chunk. Only the dispatch order changes: the collectives and their results are the same.
+    Does not apply to force_sync=True.
+    """
+
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
