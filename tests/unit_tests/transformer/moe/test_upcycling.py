@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
 import sys
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -255,6 +256,36 @@ class TestGPTModel:
         assert torch.allclose(
             moe_logits, dense_logits, rtol=1e-01, atol=1e-01
         ), "The output of moe model do not match the output of dense model."
+
+    def test_upcycling_setup_loads_dense_checkpoint(self, monkeypatch):
+        """setup_model_and_optimizer calls load_checkpoint with valid arguments when upcycling."""
+        from megatron.training import training
+        from megatron.training.checkpointing import load_checkpoint
+
+        create_test_args(1, False, False, False, use_te=False)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        set_upcycling_args(ep=1, granularity=1, num_experts=2)
+        # The autospec mock checks each call against load_checkpoint's signature.
+        mock_load = create_autospec(load_checkpoint, return_value=(0, 0))
+        mock_save = Mock()
+        monkeypatch.setattr(training, "load_checkpoint", mock_load)
+        monkeypatch.setattr(training, "save_checkpoint", mock_save)
+
+        moe_model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            model_provider,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+
+        mock_load.assert_called_once()
+        assert mock_load.call_args.kwargs["restore_training_state"] is True
+        # The checkpoint is loaded into a dense model, not into a second MoE model.
+        dense_model = mock_load.call_args.kwargs["ddp_model"]
+        assert _find_submodule(unwrap_model(dense_model)[0], "experts") is None
+        mock_save.assert_called_once()
+        assert _find_submodule(unwrap_model(moe_model)[0], "experts") is not None
 
     @pytest.mark.parametrize(
         ('tp_ep', 'granularity', 'grouped_gemm', 'swiglu', 'squared_relu'),

@@ -2990,6 +2990,10 @@ def setup_model_and_optimizer(
             start_memory_history_recording(cfg_container.profiling)
 
             model_config = cfg.model
+            if transformer_config is not None:
+                # Build from a copy of the model config that carries the given transformer config.
+                model_config = copy.copy(cfg.model)
+                object.__setattr__(model_config, "transformer", transformer_config)
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
@@ -3130,21 +3134,23 @@ def setup_model_and_optimizer(
         num_experts = args.num_experts
         expert_model_parallel_size = args.expert_model_parallel_size
         moe_ffn_hidden_size = args.ffn_hidden_size
+        moe_ffn_hidden_size_arg = args.moe_ffn_hidden_size
 
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
+        # A model provider that builds its TransformerConfig from args would otherwise reject
+        # moe_ffn_hidden_size without num_moe_experts.
+        args.moe_ffn_hidden_size = None
         args.expert_model_parallel_size = 1
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
-        # get dense model
-        dense_transformer_config = None
-        if not use_model_builder:
-            # Preserve callback upcycling without mutating the live MoE config.
-            # Native-builder upcycling and its legacy policy remain a separate follow-up.
-            dense_transformer_config = copy.deepcopy(cfg.model.transformer)
-            dense_transformer_config.num_moe_experts = None
-            dense_transformer_config.expert_model_parallel_size = 1
-            dense_transformer_config.ffn_hidden_size *= args.moe_upcycling_granularity
+        # get dense model, from a dense copy of the live MoE config. The model builder
+        # (pretrain_gpt) and the model provider callback both build from it.
+        dense_transformer_config = copy.deepcopy(cfg.model.transformer)
+        dense_transformer_config.num_moe_experts = None
+        dense_transformer_config.moe_ffn_hidden_size = None
+        dense_transformer_config.expert_model_parallel_size = 1
+        dense_transformer_config.ffn_hidden_size *= args.moe_upcycling_granularity
         dense_model_for_upcycling = _build_model_wrapper(
             wrap_with_ddp=True, transformer_config=dense_transformer_config
         )
@@ -3153,6 +3159,7 @@ def setup_model_and_optimizer(
         args.num_experts = num_experts
         args.expert_model_parallel_size = expert_model_parallel_size
         args.ffn_hidden_size = moe_ffn_hidden_size
+        args.moe_ffn_hidden_size = moe_ffn_hidden_size_arg
 
         # execute upcycling
         _, train_state.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
@@ -3160,7 +3167,7 @@ def setup_model_and_optimizer(
             unwrapped_model,
             dense_model_for_upcycling,
             load_kwargs={
-                'model': dense_model_for_upcycling,
+                'ddp_model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
                 'restore_training_state': True,
