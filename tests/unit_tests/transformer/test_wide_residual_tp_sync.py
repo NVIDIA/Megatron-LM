@@ -17,8 +17,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
@@ -129,7 +129,8 @@ def test_wide_residual_mtp_runs_with_tensor_parallelism_and_matching_controller_
     assert type(mtp_stack.layers[0]) is TransformerLayer
     for operation in ("read", "write"):
         assert (
-            mtp_stack.layers[0]._get_self_attention_residual_connection(operation=operation) is None
+            mtp_stack.layers[0]._get_residual_connection_for_self_attention(operation=operation)
+            is None
         )
     assert not mtp_stack.uses_wide_residual_stream
     assert model.mtp.layers[0].eh_proj.weight.grad is not None
