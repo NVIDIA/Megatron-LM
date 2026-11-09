@@ -226,6 +226,9 @@ def _inputs(c: Case, n: int, g):
         # beta |k|^2 <= 2, which is what a layer that turns the norm off feeds it.
         for name in ("q", "k"):
             x[name] = (x[name].float() * c.K**-0.5).to(x[name].dtype)
+    if c.extra.get("qk_scale"):
+        for name in ("q", "k"):
+            x[name] = (x[name].float() * c.extra["qk_scale"]).to(x[name].dtype)
     return x
 
 
@@ -488,6 +491,43 @@ def test_gdn_gate_saturates_above_20(x):
 def test_plain_recurrence_variants(case):
     """Variants the decode call sites do not select: no decay (USE_G off), per-channel beta, an output at
     every step with the query on every step, an explicit scale, no L2 norm."""
+    run_decode(case)
+
+
+@ou.requires_sm(ou.HOPPER)
+@pytest.mark.parametrize(
+    "case",
+    _params(
+        [
+            (
+                "gdn-S1",
+                Case(
+                    mode="gdn",
+                    M=1,
+                    S=1,
+                    H=2,
+                    HV=4,
+                    K=128,
+                    V=16,
+                    state="bf16",
+                    extra={"qk_scale": 1e-3},
+                ),
+            ),
+            (
+                "gdp-S1",
+                Case(mode="gdp", M=3, S=1, H=2, HV=2, K=128, V=16, extra={"qk_scale": 1e-3}),
+            ),
+            (
+                "gdp-S2-prefetch",
+                Case(mode="gdp", M=3, S=2, H=2, HV=2, K=128, V=16, extra={"qk_scale": 1e-3}),
+            ),
+        ]
+    ),
+)
+def test_small_query_and_key_norms(case):
+    """q and k a thousand times smaller (|x|^2 ~ 1e-4), where the L2 norm's epsilon (1e-6) is about 1% of
+    the denominator: the epsilon must be the contract's, on the single-step and the prefetching loops.
+    """
     run_decode(case)
 
 
