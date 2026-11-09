@@ -592,3 +592,284 @@ def few_hot_tokens(
         k = int(torch.randint(exponents[0], exponents[1] + 1, (1,), generator=generator))
         x[t, cols] = 2.0**k / v0[cols]
     return x
+
+
+# ---------------------------------------------------------------------------------------------
+# NVFP4 quantization spec and inputs (the direct quantizer oracles)
+# ---------------------------------------------------------------------------------------------
+
+E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+"""E2M1 rounding boundaries: the midpoints of adjacent magnitudes on ``E2M1_GRID``."""
+
+NVFP4_MARGIN = 2.0**-16
+"""Relative distance the direct NVFP4 tests keep every block value ``amax_b * encode / 6`` from
+an E4M3 rounding boundary and every scaled element ``x * encode / scale_b`` from an E2M1 one.
+The definition fixes those values exactly, but any FP32 recipe evaluates them with a few
+roundings and reciprocals (FlashInfer: ``rcp.approx.ftz`` by default, IEEE division with
+``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1``), which moves them by about 2**-21 relative: the
+margin is 32 times that, so every such recipe must give the spec's codes and scales. Exact ties
+are tested apart, with power-of-two scales, where FP32 evaluation is exact."""
+
+NVFP4_PER_TOKEN_SCALE_ROUNDINGS = 4
+"""The per-token FP32 decode scale ``amax / 2688`` may be any FP32 evaluation with at most four
+correctly rounded operations (FlashInfer: ``amax * fp32(1 / 2688)``, or ``1 / (2688 / amax)``
+with IEEE division): within 4 unit roundoffs (2**-24) of the exact value."""
+
+NVFP4_ALPHA_ROUNDINGS = 3
+"""The per-expert FP32 decode scale ``alpha = 1 / g = amax / 2688`` of the weight recipe: three
+FP32 roundings (PyTorch evaluates ``2688 / amax`` with a scalar numerator as
+``reciprocal(amax) * 2688``, then the reciprocal of that)."""
+
+
+def assert_fp32_evaluation(got: torch.Tensor, exact: torch.Tensor, *, roundings: int, what: str):
+    """``got`` (FP32) is an FP32 evaluation of ``exact`` (fp64) with at most ``roundings``
+    correctly rounded operations: ``|got - exact| <= roundings * 2**-24 * |exact|`` (a bound from
+    the operation count, not a tolerance); an exact 0 must give 0."""
+    assert got.dtype == torch.float32, (what, got.dtype)
+    g, e = got.double().cpu().reshape(-1), exact.double().cpu().reshape(-1)
+    bad = (g - e).abs() > roundings * 2.0**-24 * e.abs()
+    if bool(bad.any()):
+        i = int(bad.nonzero()[0])
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} of {bad.numel()} values are not FP32 evaluations of the"
+            f" exact value within {roundings} roundings; first at {i}: got {float(g[i])!r},"
+            f" exact {float(e[i])!r}"
+        )
+
+
+def e4m3_boundaries(device_: torch.device | str = "cpu") -> torch.Tensor:
+    """Midpoints between adjacent non-negative E4M3 values (from 2**-10 to 432), ascending fp64."""
+    grid = e4m3_values(device_)[:127]
+    return (grid[:-1] + grid[1:]) / 2
+
+
+def relative_margin(values: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
+    """Distance of each ``|value|`` to the nearest of the ascending ``boundaries``, relative to the
+    value (fp64); ``inf`` for zeros."""
+    v = values.double().abs()
+    b = boundaries.to(device=v.device, dtype=torch.float64)
+    hi = torch.searchsorted(b, v.contiguous()).clamp(max=b.numel() - 1)
+    lo = (hi - 1).clamp(min=0)
+    dist = torch.minimum((v - b[lo]).abs(), (v - b[hi]).abs())
+    return torch.where(v > 0, dist / v.clamp(min=1e-300), torch.full_like(v, math.inf))
+
+
+def nvfp4_quantize_spec(x: torch.Tensor, encode) -> Tuple[torch.Tensor, ...]:
+    """Spec NVFP4 of ``x [R, C]`` (``C % 16 == 0``) with the encode scale ``encode`` (a number, a
+    one-element tensor, or ``[R, 1]`` per row), in exact fp64 arithmetic.
+
+    Block value ``v = amax_b * encode / 6``; block scale ``s_b = E4M3(v)`` (nearest even,
+    saturating at 448); codes ``E2M1(x * encode / s_b)`` (nearest even, saturating at 6, the sign
+    of zero kept). A block whose scale is 0 encodes ``x * 0``: signed zeros.
+
+    Returns ``(codes, scales, defined, block_margin, element_margin)``: E2M1 codes ``[R, C]``
+    (uint8 in [0, 16), bit 3 the sign), E4M3 scale bytes ``[R, C // 16]``, ``defined [R, C]``
+    (False in blocks whose nonzero amax rounds to a zero scale: every code decodes to 0 there,
+    so the codes are not part of the contract), and the relative margins of each block value and
+    each scaled element to their rounding boundaries.
+    """
+    r, c = x.shape
+    assert c % NVFP4_BLOCK == 0, c
+    xb = x.double().reshape(r, c // NVFP4_BLOCK, NVFP4_BLOCK)
+    enc = torch.as_tensor(encode, dtype=torch.float64).to(x.device)
+    enc = enc.reshape(-1, 1, 1) if enc.numel() > 1 else enc.reshape(1, 1, 1)
+    amax_b = xb.abs().amax(-1, keepdim=True)
+    v = amax_b * enc / E2M1_MAX
+    scale_bytes = e4m3_encode(v)
+    s = e4m3_values(x.device)[scale_bytes.long()]
+    y = torch.where(s > 0, xb * enc / torch.where(s > 0, s, torch.ones_like(s)), xb * 0.0)
+    codes = e2m1_encode(y)
+    defined = ((s > 0) | (amax_b == 0)).expand_as(xb)
+    bounds = torch.tensor(E2M1_BOUNDARIES, dtype=torch.float64, device=x.device)
+    element_margin = torch.where(s > 0, relative_margin(y, bounds), torch.full_like(y, math.inf))
+    block_margin = relative_margin(v, e4m3_boundaries(x.device))
+    return (
+        codes.reshape(r, c),
+        scale_bytes.reshape(r, c // NVFP4_BLOCK),
+        defined.reshape(r, c),
+        block_margin.reshape(r, c // NVFP4_BLOCK),
+        element_margin.reshape(r, c),
+    )
+
+
+def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
+    """E2M1 codes ``[..., 2n]`` (uint8 in [0, 16)) held in packed bytes ``[..., n]``: the even
+    element in the low nibble (the cuBLAS / ``torch.float4_e2m1fn_x2`` storage order)."""
+    b = packed.contiguous().view(torch.uint8)
+    return torch.stack((b & 0xF, b >> 4), dim=-1).flatten(-2)
+
+
+def nvfp4_decode(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """fp64 ``E2M1(codes) * E4M3(scales)`` per 16-block (multiply by the per-tensor or per-token
+    decode scale to finish)."""
+    values = e2m1_values(codes.device)[codes.long()]
+    return values * e4m3_values(codes.device)[scales.long()].repeat_interleave(NVFP4_BLOCK, -1)
+
+
+def nvfp4_weight_encode(amax: torch.Tensor) -> torch.Tensor:
+    """The exact NVFP4 per-tensor encode scale ``448 * 6 / amax`` (fp64, shape ``[1]``; 1 for an
+    all-zero tensor, as the recipe's guard sets it). The FP32 value a recipe passes differs from
+    it by a rounding or two, which ``NVFP4_MARGIN`` covers."""
+    a = amax.double().reshape(1)
+    return torch.where(a > 0, NVFP4_PER_TOKEN_DIVISOR / a.clamp(min=1e-300), torch.ones_like(a))
+
+
+def nvfp4_per_token_encode(x: torch.Tensor) -> torch.Tensor:
+    """Exact per-token encode scales ``2688 / amax_t`` (``[R, 1]`` fp64; 0 for zero rows)."""
+    amax = x.double().abs().amax(-1, keepdim=True)
+    return torch.where(
+        amax > 0, NVFP4_PER_TOKEN_DIVISOR / amax.clamp(min=1e-300), torch.zeros_like(amax)
+    )
+
+
+def nvfp4_spread_values(
+    rows: int,
+    cols: int,
+    *,
+    generator: torch.Generator,
+    row_exponents: Tuple[int, int] = (0, 0),
+    small_blocks: float = 0.25,
+) -> torch.Tensor:
+    """Random BF16-exact ``[rows, cols]`` fp64 values for the direct NVFP4 tests: Gaussian, times
+    ``2**g_r`` per row (``g_r`` in ``row_exponents``) and ``2**f_b`` per 16-block. A fraction
+    ``small_blocks`` of the blocks gets ``f_b`` in [-20, -5], so their block scale is an E4M3
+    subnormal or rounds to zero; the others ``f_b`` in [-4, 0]."""
+    blocks = cols // NVFP4_BLOCK
+    x = torch.randn(rows, blocks, NVFP4_BLOCK, generator=generator, dtype=torch.float64)
+    small = torch.rand(rows, blocks, 1, generator=generator) < small_blocks
+    f = torch.where(
+        small,
+        torch.randint(-20, -4, (rows, blocks, 1), generator=generator),
+        torch.randint(-4, 1, (rows, blocks, 1), generator=generator),
+    )
+    g = torch.randint(row_exponents[0], row_exponents[1] + 1, (rows, 1, 1), generator=generator)
+    x = x * pow2(f + g)
+    return x.reshape(rows, cols).to(torch.bfloat16).double()
+
+
+def nvfp4_away_from_ties(
+    x: torch.Tensor,
+    encode_of: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    generator: torch.Generator,
+    margin: float = NVFP4_MARGIN,
+    max_rounds: int = 200,
+) -> torch.Tensor:
+    """Return BF16-exact ``x`` (fp64) redrawn until every block value and every scaled element
+    lies at least ``margin`` (relative) from its rounding boundary under ``nvfp4_quantize_spec``
+    with ``encode_of(x)``.
+
+    A block whose value is too close is scaled down by a factor in [1/2, 7/8); an element too
+    close is redrawn below its block's amax (a block's largest element is never redrawn, so the
+    block scale stays). Blocks that hold the amax ``encode_of`` depends on (row or tensor) have
+    value 448 exactly and are never changed, so the encode scale stays fixed. Random draws use
+    ``generator`` (CPU); the arithmetic runs on ``x``'s device.
+    """
+    x = x.double().clone()
+    rows, cols = x.shape
+    nb = cols // NVFP4_BLOCK
+    encode = encode_of(x)
+    for _ in range(max_rounds):
+        _, _, _, block_margin, element_margin = nvfp4_quantize_spec(x, encode)
+        xb = x.reshape(rows, nb, NVFP4_BLOCK)
+        amax_b = xb.abs().amax(-1, keepdim=True)
+        bad_element = element_margin.reshape(rows, nb, NVFP4_BLOCK) < margin
+        bad_block = (block_margin < margin) | (bad_element & (xb.abs() == amax_b)).any(-1)
+        if not bool(bad_block.any() or bad_element.any()):
+            assert torch.equal(encode_of(x), encode), "the encode scale moved"
+            return x
+        shrink = (0.5 + 0.375 * torch.rand(rows, nb, 1, generator=generator)).to(x.device)
+        fresh = (torch.rand(rows, nb, NVFP4_BLOCK, generator=generator) * 2 - 1).to(x.device)
+        fresh = (fresh * amax_b * 0.96875).to(torch.bfloat16).double()
+        replace = bad_element & ~bad_block[..., None] & (xb.abs() < amax_b)
+        xb = torch.where(bad_block[..., None], (xb * shrink).to(torch.bfloat16).double(), xb)
+        x = torch.where(replace, fresh, xb).reshape(rows, cols)
+    raise AssertionError("could not draw NVFP4 inputs away from rounding boundaries")
+
+
+def nvfp4_tie_blocks(k: int, generator: torch.Generator) -> torch.Tensor:
+    """One BF16-exact row whose amax is ``2688 * 2**-k`` (so the per-tensor and per-token encode
+    scale is ``2**k`` exactly) and whose other blocks have power-of-two scales ``2**j`` (``j``
+    from -9, the smallest E4M3 subnormal, to 8): block amax ``6 * 2**(j - k)``, and the other 15
+    elements on E2M1 rounding boundaries times ``2**(j - k)``, with random signs. FP32 evaluation
+    is exact there (powers of two), so the codes test round-half-to-even itself. Block 0 holds
+    the amax (scale 448) and E2M1 grid values times ``448 * 2**-k``."""
+    bounds = torch.tensor(E2M1_BOUNDARIES, dtype=torch.float64)
+    head = torch.tensor(E2M1_GRID[1:], dtype=torch.float64) * 448.0 * 2.0**-k
+    first = torch.cat([torch.tensor([E4M3_MAX * E2M1_MAX * 2.0**-k]), head, head, head[:1]])
+    signs = random_signs((NVFP4_BLOCK,), generator)
+    signs[0] = 1.0
+    blocks = [first * signs]
+    for j in range(-9, 9):
+        ties = torch.cat([bounds, bounds, bounds[:1]])[torch.randperm(15, generator=generator)]
+        ties = ties * random_signs((15,), generator)
+        blocks.append(torch.cat([torch.tensor([E2M1_MAX]), ties]) * 2.0 ** (j - k))
+    row = torch.cat(blocks)
+    assert torch.equal(row.to(torch.bfloat16).double(), row), "tie pattern is not BF16-exact"
+    return row
+
+
+def pack_fp4(codes: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``unpack_fp4``: E2M1 codes ``[..., 2n]`` packed two per byte ``[..., n]``."""
+    c = codes.to(torch.uint8)
+    return (c[..., 0::2] | (c[..., 1::2] << 4)).contiguous()
+
+
+def cute_dsl_fc1_rows(w1: torch.Tensor, gated: bool, padded_i: int, padded_h: int) -> torch.Tensor:
+    """One FC1 expert ``[I or 2I, H]`` in FlashInfer's CuTe DSL MoE layout, zero-padded to
+    ``[padded_i or 2 padded_i, padded_h]`` (fp64). Gated FC1 is MCore's ``[gate; up]``; FlashInfer
+    takes ``[up, gate]`` halves, each padded on its own, interleaved in blocks of 64 rows
+    (FlashInfer's ``interleave_linear_and_gate(group_size=64)``): destination block ``2 b`` is up
+    block ``b`` and ``2 b + 1`` gate block ``b``."""
+
+    def pad(t):
+        out = torch.zeros(padded_i, padded_h, dtype=torch.float64, device=t.device)
+        out[: t.shape[0], : t.shape[1]] = t.double()
+        return out
+
+    if not gated:
+        return pad(w1)
+    gate, up = w1.chunk(2, dim=0)
+    up, gate = pad(up), pad(gate)
+    out = torch.empty(2 * padded_i, padded_h, dtype=torch.float64, device=w1.device)
+    for b in range(padded_i // 64):
+        out[128 * b : 128 * b + 64] = up[64 * b : 64 * (b + 1)]
+        out[128 * b + 64 : 128 * (b + 1)] = gate[64 * b : 64 * (b + 1)]
+    return out
+
+
+def mma_layout_expected(scales: torch.Tensor) -> torch.Tensor:
+    """The 6-D CuTe DSL MMA scale-factor tensor ``(32, 4, m_tiles, 4, k_tiles, groups)`` of
+    logical scales ``[groups, M, K / 16]`` (``M % 128 == 0``, ``K / 16 % 4 == 0``), from its
+    documented mapping: entry ``(m % 32, m % 128 // 32, m // 128, k % 4, k // 4, g)`` is the
+    scale of group ``g``, row ``m``, scale column ``k``."""
+    groups, m, kb = scales.shape
+    assert m % 128 == 0 and kb % 4 == 0, (m, kb)
+    s = scales.reshape(groups, m // 128, 4, 32, kb // 4, 4)
+    return s.permute(3, 2, 1, 5, 4, 0)
+
+
+def nvfp4_quantize_standin(a: torch.Tensor, a_global_sf: torch.Tensor, *args, **kwargs):
+    """A spec stand-in for FlashInfer's ``nvfp4_quantize(a, a_global_sf,
+    sfLayout=layout_128x4)`` (the expert-weight call): the spec codes of ``a`` with encode scale
+    ``a_global_sf``, packed two per byte, and the spec scale bytes in the 128x4 layout. For tests
+    of the layout around the quantizer (it runs on any device), not of the quantizer."""
+    codes, scales, _, _, _ = nvfp4_quantize_spec(a.double(), a_global_sf.double())
+    return pack_fp4(codes), swizzle_128x4(scales)
+
+
+NVFP4_MOE_ALIGNMENT = 256
+"""``flashinfer_nvfp4._ALIGNMENT``: the per-token NVFP4 MoE pads H and I to multiples of 256."""
+
+FP4_FAST_MATH_ENV = ("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
+
+
+def set_fp4_fast_math(monkeypatch, mode: str) -> None:
+    """Select FlashInfer's FP4 quantizer variant: ``fast`` (the default, ``rcp.approx.ftz``) or
+    ``ieee`` (``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1``, read at every launch)."""
+    for name in FP4_FAST_MATH_ENV:
+        monkeypatch.delenv(name, raising=False)
+    if mode == "ieee":
+        monkeypatch.setenv(FP4_FAST_MATH_ENV[0], "1")
+    else:
+        assert mode == "fast", mode

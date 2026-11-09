@@ -3,8 +3,10 @@
 """Oracle for FlashInfer's ``mxfp8_quantize`` at Megatron's call sites: the routed-MoE input,
 ``mxfp8_quantize(x, False)`` (linear scales) in
 ``megatron/core/inference/moe/flashinfer_mxfp8.py:quantize_routed_mxfp8_input``, and the swizzled
-variant ``MXFP8Tensor.from_bf16(x, backend="flashinfer")``
-(``megatron/core/inference/quantization/mxfp8_tensor.py``), which feeds ``mm_mxfp8``.
+variant ``mxfp8_quantize(x)`` in ``MXFP8Tensor.from_bf16(x, backend="flashinfer")`` (the default
+backend) and ``MXFP8Tensor.quantize_`` / ``copy_``
+(``megatron/core/inference/quantization/mxfp8_tensor.py``), which feed ``mm_mxfp8``, the
+``quantize_*_to_mxfp8`` utilities and the MXFP8 refit transforms.
 
 Contract (OCP MX v1.0 element and scale encodings, NVIDIA's RCEIL scale rule; see ``spec``):
 
@@ -16,7 +18,12 @@ Contract (OCP MX v1.0 element and scale encodings, NVIDIA's RCEIL scale rule; se
   E4M3 value nearest ``x / X`` with ties to even; the sign of zero is kept. Blocks and rows are
   independent, so padding columns are zero codes and rows never affect one another.
 * The swizzled variant returns the same codes and the same scales in the cuBLAS 128x4 layout
-  (1-D, rows padded to 128, scale columns to 4).
+  (1-D, rows padded to 128, scale columns to 4). ``MXFP8Tensor.from_bf16`` takes any 2-D CUDA
+  ``[M, K]`` BF16 or FP16 tensor (``K % 32 == 0``), whatever its strides (the Triton backend reads
+  strided inputs since #8357), keeps the input dtype as the tensor's logical ``dtype`` and returns
+  uint8 scale bytes with ``backend="flashinfer"``. ``quantize_`` / ``copy_`` quantize into the
+  existing storage (same addresses), converting FP32 values to BF16 first (FlashInfer takes
+  BF16/FP16 only) and reading strided values.
 * Non-finite input (never produced by a healthy model) must stay visible: a NaN element decodes
   to NaN; an infinite element decodes to NaN or to the largest MXFP8 magnitude ``448 * 2**127``
   with its sign; every other block and row is still bit-exact.
@@ -30,12 +37,19 @@ flush-to-zero implementation differs from the exact spec; hidden states never ge
 
 Structure (FlashInfer 0.7.2.post1 ``invokeMxFP8Quantization``): 16 elements per thread, 2 threads
 per scale; 128-thread blocks (2048 columns per pass) and a grid-stride loop over rows (grid =
-min(rows, 16 blocks per SM)). The "two-load" variant (``Hp % 1024 == 0``) is selected only on
-devices with at most 1024 resident threads per SM (SM107), not on GB200; the 1024/2048 widths
-stay as boundaries of the 2048-column pass. Inputs cover column counts around 32, 1024 and 2048,
-rows around 128 (the swizzled layout's row tile), rows beyond one grid pass, production sizes
-(H = 2688, 4096, 7168), and (opt-in ``large``) element offsets past 2**31. Hardware: Blackwell
-(FlashInfer's quantizer is SM100-only).
+min(rows, 16 blocks per SM)); the swizzled layout also loops over the padding rows of its last
+128-row tile and the padding scale columns. The "two-load" variant (``Hp % 1024 == 0``) is
+selected only on devices with at most 1024 resident threads per SM (SM107), not on GB200; the
+1024/2048 widths stay as boundaries of the 2048-column pass. Inputs cover column counts around 32,
+1024 and 2048, rows around 128 (the swizzled layout's row tile), rows beyond one grid pass,
+production sizes (H = 2688, 4096, 7168; weights 4096 x 2688 and 7168 x 2048 through
+``from_bf16``), BF16 and FP16, strided inputs, and (opt-in ``large``) element offsets past 2**31.
+Hardware: Blackwell (FlashInfer's quantizer is SM100-only).
+
+Finding O4b-M3 (suspected, Megatron; expected to fail on main): ``from_bf16`` hands a strided
+input straight to FlashInfer, whose binding requires a contiguous tensor (``CHECK_CONTIGUOUS``),
+so a transposed or sliced input raises where the Triton backend (#8357) quantizes it;
+``quantize_`` makes its value contiguous first and is not affected.
 """
 
 import pytest
@@ -210,6 +224,13 @@ def test_round_half_to_even_and_subnormal_codes():
     even code; the block amax (256 * 2**s) fixes the scale, so the ties are exact in BF16."""
     spec.require_flashinfer()
     g = ou.make_generator()
+    x = _blocks_with(_tie_pattern(g), 16, g)
+    _check_linear(x.cuda(), spec._ceil_to(x.shape[1], ROUTED_ALIGN), what="ties")
+
+
+def _tie_pattern(g: torch.Generator) -> torch.Tensor:
+    """Blocks ``[nb, 32]``: amax ``256 * 2**s`` (scale ``2**s`` exactly) and 31 elements
+    exactly halfway between E4M3 neighbours, normal and subnormal (BF16-exact)."""
     grid = _grid()
     mids = (grid[:-1] + grid[1:]) / 2  # 126 midpoints, from 2**-10 up to 432
     mids = mids[mids < 256]
@@ -222,8 +243,7 @@ def test_round_half_to_even_and_subnormal_codes():
     scale_exp = torch.randint(-20, 20, (pattern.shape[0], 1), generator=g)
     pattern = pattern * spec.pow2(scale_exp)
     assert torch.equal(pattern.to(torch.bfloat16).double(), pattern), "ties are not exact in BF16"
-    x = _blocks_with(pattern, 16, g)
-    _check_linear(x.cuda(), spec._ceil_to(x.shape[1], ROUTED_ALIGN), what="ties")
+    return pattern
 
 
 @pytest.mark.launch_on_gb200
@@ -235,13 +255,19 @@ def test_amax_at_and_around_448_times_a_power_of_two(k):
     boundary, where an approximate 1/448 in the scale computation picks the next scale up."""
     spec.require_flashinfer()
     g = ou.make_generator()
+    x = _blocks_with(_amax_pattern(k, g), 8, g)
+    assert float(x.double().abs().amax()) == 450.0 * 2.0**k, "the amax pattern is not exact in BF16"
+    _check_linear(x.cuda(), spec._ceil_to(x.shape[1], ROUTED_ALIGN), what=f"amax near 448*2**{k}")
+
+
+def _amax_pattern(k: int, g: torch.Generator) -> torch.Tensor:
+    """Three blocks with amax ``448 * 2**k`` and its BF16 neighbours ``446 * 2**k``, ``450 *
+    2**k`` (the RCEIL boundary)."""
     patterns = []
     for amax in (448.0 * 2.0**k, 446.0 * 2.0**k, 450.0 * 2.0**k):
         rest = torch.rand(31, generator=g, dtype=torch.float64) * amax
         patterns.append(torch.cat([torch.tensor([amax], dtype=torch.float64), rest]))
-    x = _blocks_with(torch.stack(patterns), 8, g)
-    assert float(x.double().abs().amax()) == 450.0 * 2.0**k, "the amax pattern is not exact in BF16"
-    _check_linear(x.cuda(), spec._ceil_to(x.shape[1], ROUTED_ALIGN), what=f"amax near 448*2**{k}")
+    return torch.stack(patterns)
 
 
 @pytest.mark.launch_on_gb200
@@ -251,8 +277,16 @@ def test_zero_blocks_signed_zeros_and_bf16_subnormals():
     a normal block (they round to a signed zero)."""
     spec.require_flashinfer()
     g = ou.make_generator()
+    x = _blocks_with(_zero_patterns(g), 4, g)
+    x[0, 32:64] = -0.0  # a block of negative zeros
+    _check_linear(x.cuda(), 256, what="zeros and subnormals")
+
+
+def _zero_patterns(g: torch.Generator) -> torch.Tensor:
+    """An all-zero block, BF16 subnormals under a normal amax, a 2**-100 block and a 2**120
+    block."""
     tiny = 2.0**-130
-    patterns = torch.stack(
+    return torch.stack(
         [
             torch.zeros(32, dtype=torch.float64),
             torch.cat([torch.tensor([1.0]), torch.full((31,), tiny)]).double(),
@@ -260,9 +294,6 @@ def test_zero_blocks_signed_zeros_and_bf16_subnormals():
             torch.cat([torch.tensor([2.0**120]), torch.rand(31, generator=g).double() * 2.0**120]),
         ]
     )
-    x = _blocks_with(patterns, 4, g)
-    x[0, 32:64] = -0.0  # a block of negative zeros
-    _check_linear(x.cuda(), 256, what="zeros and subnormals")
 
 
 @pytest.mark.launch_on_gb200
@@ -371,3 +402,219 @@ def test_swizzled_variant_via_mxfp8_tensor(case):
         elems_per_scale=32,
         what="swizzled mxfp8_quantize",
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# MXFP8Tensor.from_bf16 / quantize_ with the FlashInfer backend (the swizzled call)
+# ---------------------------------------------------------------------------------------------
+
+
+def _from_bf16(x: torch.Tensor, backend="flashinfer"):
+    """``MXFP8Tensor.from_bf16(x, backend)`` (``backend=None``: the default argument), checked
+    for its metadata; returns the codes and the unswizzled logical scales."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    before = x.clone()
+    t = MXFP8Tensor.from_bf16(x) if backend is None else MXFP8Tensor.from_bf16(x, backend=backend)
+    ou.assert_exact(x, before, what="input is read-only")
+    rows, cols = x.shape
+    assert t.backend == "flashinfer" and t.dtype == x.dtype, (t.backend, t.dtype)
+    assert t.data.dtype == torch.float8_e4m3fn and tuple(t.data.shape) == (rows, cols)
+    assert t.scale.dtype == torch.uint8 and t.scale.dim() == 1
+    assert t.scale.numel() == spec._ceil_to(rows, 128) * spec._ceil_to(cols // 32, 4)
+    return spec.as_bytes(t.data), spec.unswizzle_128x4(t.scale, rows, cols // 32)
+
+
+def _check_swizzled(x: torch.Tensor, what: str, backend="flashinfer"):
+    codes, scales = _from_bf16(x, backend)
+    ref_codes, ref_scales = spec.mxfp8_quantize_spec(x.double())
+    ou.assert_quantized_bit_exact(
+        codes, scales, ref_codes, ref_scales, elems_per_scale=32, what=what
+    )
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+def test_from_bf16_round_half_to_even_and_subnormal_codes():
+    """The E4M3 midpoints of ``test_round_half_to_even_and_subnormal_codes`` through the swizzled
+    call, on 130 rows (past the 128-row scale tile)."""
+    spec.require_flashinfer()
+    g = ou.make_generator()
+    _check_swizzled(_blocks_with(_tie_pattern(g), 130, g).cuda(), what="swizzled ties")
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize("k", [-90, 0, 119])
+def test_from_bf16_amax_at_and_around_448_times_a_power_of_two(k):
+    spec.require_flashinfer()
+    g = ou.make_generator()
+    _check_swizzled(_blocks_with(_amax_pattern(k, g), 8, g).cuda(), what=f"swizzled 448*2**{k}")
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+def test_from_bf16_zero_blocks_signed_zeros_and_bf16_subnormals():
+    spec.require_flashinfer()
+    g = ou.make_generator()
+    x = _blocks_with(_zero_patterns(g), 4, g)
+    x[0, 32:64] = -0.0
+    _check_swizzled(x.cuda(), what="swizzled zeros and subnormals")
+
+
+def _fp16(rows: int, cols: int, generator: torch.Generator) -> torch.Tensor:
+    """FP16 activations: Gaussian with row magnitudes 2**-12 .. 2**11 (inside FP16's range), and
+    every fifth row's second block made of FP16 subnormals (CPU)."""
+    x = torch.randn(rows, cols, generator=generator, dtype=torch.float64)
+    x = x * spec.pow2(torch.randint(-12, 12, (rows, 1), generator=generator))
+    if cols >= 64:
+        x[::5, 32:64] = x[::5, 32:64] * 2.0**-20
+    return x.to(torch.float16)
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(c, id=f"rows{c['rows']}-H{c['hidden']}")
+        for c in ou.pairwise_cases(
+            {"rows": [1, 127, 128, 129, 2433], "hidden": [32, 96, 160, 2016, 2048, 2080, 2688]}
+        )
+    ],
+)
+def test_from_bf16_fp16_input(case):
+    """FP16 inputs (``from_bf16`` documents BF16 and FP16 for FlashInfer): codes and scales of the
+    FP16 values, ``dtype`` float16; widths around the 2048-column pass, rows past one grid pass."""
+    spec.require_flashinfer()
+    x = _fp16(case["rows"], case["hidden"], ou.make_generator()).cuda()
+    _check_swizzled(x, what=f"fp16 {case['rows']}x{case['hidden']}")
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize("rows,cols", [(4096, 2688), (7168, 2048)], ids=["4096x2688", "7168x2048"])
+def test_from_bf16_production_sizes(rows, cols):
+    """Expert-weight-like sizes through the default backend (``from_bf16(x)``): more rows than
+    one grid pass (16 blocks per SM) and a partial last 2048-column pass."""
+    spec.require_flashinfer()
+    x = _hidden(rows, cols, ou.make_generator()).cuda()
+    _check_swizzled(x, what=f"production {rows}x{cols}", backend=None)
+
+
+STRIDED = ["transpose", "row-slice", "column-slice", "offset"]
+
+
+def _strided(layout: str, generator: torch.Generator) -> torch.Tensor:
+    """A ``[129, 160]`` BF16 view with the given layout (as #8357's Triton test builds them)."""
+    if layout == "transpose":
+        return _hidden(160, 129, generator).cuda().t()
+    if layout == "row-slice":
+        return _hidden(258, 160, generator).cuda()[::2]
+    if layout == "column-slice":
+        return _hidden(129, 320, generator).cuda()[:, ::2]
+    return _hidden(130, 160, generator).cuda()[1:]
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize("layout", STRIDED)
+def test_from_bf16_reads_strided_inputs(layout):
+    """``from_bf16`` quantizes the logical values of a strided input, as the Triton backend does
+    since #8357. Expected to fail on main for transpose, row-slice and column-slice (suspected
+    finding O4b-M3): FlashInfer's binding requires a contiguous input and ``from_bf16`` does not
+    make it one. ``offset`` (a contiguous view at an offset) passes."""
+    spec.require_flashinfer()
+    x = _strided(layout, ou.make_generator())
+    assert tuple(x.shape) == (129, 160) and x.is_contiguous() == (layout == "offset")
+    _check_swizzled(x, what=f"{layout} input")
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize("value", ["bf16", "fp16", "fp32", "strided"])
+def test_quantize_in_place_with_the_flashinfer_backend(value):
+    """``quantize_`` (and its alias ``copy_``) rewrite an existing FlashInfer-backend tensor in
+    place: same data and scale addresses, every code byte poisoned first is rewritten, the logical
+    scales equal the spec of the new value (FP32 values are first rounded to BF16)."""
+    spec.require_flashinfer()
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    g = ou.make_generator()
+    rows, cols = 129, 160
+    t = MXFP8Tensor.from_bf16(_hidden(rows, cols, g).cuda(), backend="flashinfer")
+    pointers = (t.data.data_ptr(), t.scale.data_ptr())
+    for step, method in enumerate(("quantize_", "copy_")):
+        new = _hidden(rows, cols, g).double()
+        if value == "fp16":
+            new = _fp16(rows, cols, g).double()
+        given = {
+            "bf16": lambda: new.to(torch.bfloat16).cuda(),
+            "fp16": lambda: new.to(torch.float16).cuda(),
+            "fp32": lambda: (new * (1 + 2.0**-12)).float().cuda(),  # not BF16-exact
+            "strided": lambda: new.to(torch.bfloat16).cuda().t().contiguous().t(),
+        }[value]()
+        expected = given.to(torch.bfloat16) if value == "fp32" else given
+        spec.as_bytes(t.data).fill_(0xFF)
+        assert getattr(t, method)(given) is t
+        assert (t.data.data_ptr(), t.scale.data_ptr()) == pointers, f"{method} moved storage"
+        ref_codes, ref_scales = spec.mxfp8_quantize_spec(expected.double())
+        ou.assert_quantized_bit_exact(
+            spec.as_bytes(t.data),
+            spec.unswizzle_128x4(t.scale, rows, cols // 32),
+            ref_codes,
+            ref_scales,
+            elems_per_scale=32,
+            what=f"{method} with a {value} value (step {step})",
+        )
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.sanitizer
+def test_from_bf16_input_is_a_prefix_of_a_nan_filled_buffer():
+    """The swizzled call reads only its rows (129, past one 128-row tile) of a NaN buffer."""
+    spec.require_flashinfer()
+    buffer = torch.full((300, 160), float("nan"), dtype=torch.bfloat16, device="cuda")
+    buffer[:129] = _hidden(129, 160, ou.make_generator()).cuda()
+    _check_swizzled(buffer[:129], what="swizzled prefix of a NaN buffer")
+
+
+def _swizzled_other_blocks_exact(x: torch.Tensor, row: int, block: int, what: str):
+    """Every block but ``(row, block)`` of the swizzled call equals the spec."""
+    keep = torch.ones(x.shape[0], x.shape[1] // 32, dtype=torch.bool)
+    keep[row, block] = False
+    finite = x.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+    ref_codes, ref_scales = spec.mxfp8_quantize_spec(finite.double())
+    codes, scales = _from_bf16(x.cuda())
+    mask = keep.repeat_interleave(32, -1)
+    ou.assert_exact(codes.cpu()[mask], ref_codes[mask], what=f"codes outside the {what} block")
+    ou.assert_exact(scales.cpu()[keep], ref_scales[keep], what=f"scales outside the {what} block")
+    return spec.mxfp8_decode(codes.cpu(), scales.cpu())
+
+
+@XFAIL_O4B_N1
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+def test_from_bf16_nan_element_stays_nan_and_is_isolated():
+    """O4b-N1 through the swizzled call (the same FlashInfer kernel with the 128x4 layout)."""
+    spec.require_flashinfer()
+    x = _hidden(4, 128, ou.make_generator())
+    x[1, 37] = float("nan")
+    decoded = _swizzled_other_blocks_exact(x, 1, 1, "NaN")
+    assert torch.isnan(decoded[1, 37]), f"NaN decoded to the finite {float(decoded[1, 37])!r}"
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize(
+    "sign", [pytest.param(1.0, id="+inf"), pytest.param(-1.0, id="-inf", marks=XFAIL_O4B_N2)]
+)
+def test_from_bf16_infinite_element_saturates_with_its_sign_and_is_isolated(sign):
+    """O4b-N2 through the swizzled call; ``[+inf]`` is a control."""
+    spec.require_flashinfer()
+    x = _hidden(4, 128, ou.make_generator())
+    x[2, 70] = sign * float("inf")
+    got = float(_swizzled_other_blocks_exact(x, 2, 2, "inf")[2, 70])
+    largest = 448.0 * 2.0**127
+    assert got != got or got == sign * largest, f"{sign * float('inf')} decoded to {got!r}"
