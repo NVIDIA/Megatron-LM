@@ -34,7 +34,8 @@ in registers, ``BLOCK_K = next_pow2(K)`` with ``BLOCK_GROUPS = BLOCK_K / 32`` bl
 ``K / 32`` are real; scale tiles of 128 rows by 4 columns. Covered: K around powers of two and
 with 1-3 padded scale columns, production widths; M around the 128-row tile; the three input
 dtypes; random, wide-range, round-up-tie and E4M3-midpoint, and zero/sign-of-zero inputs; reused
-storage; the ``scaled_mm`` consumer (Blackwell); row offsets past 2**31 (``large``).
+storage; non-contiguous and unaligned inputs through each entry point (#8357); the ``scaled_mm``
+consumer (Blackwell); row offsets past 2**31 (``large``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -140,6 +141,43 @@ def test_strided_input_is_quantized_or_rejected():
     except (AssertionError, ValueError, RuntimeError):
         return
     mx.assert_matches_spec(data, scale, x.contiguous(), what="strided input")
+
+
+ENTRY_POINTS = ("mxfp8_quantize", "mxfp8_quantize_into", "from_bf16")
+INPUT_LAYOUTS = mx.STRIDED_LAYOUTS + ("offset",)
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+@pytest.mark.parametrize("layout", INPUT_LAYOUTS)
+def test_non_contiguous_inputs(layout, entry):
+    """Every entry point quantizes a non-contiguous view (transpose, column slice, row step,
+    column step, broadcast row) by its values, and a contiguous view at an unaligned offset too;
+    the input is not modified and nothing outside the outputs is written (#8357)."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    dtype = DTYPES[(INPUT_LAYOUTS.index(layout) + ENTRY_POINTS.index(entry)) % len(DTYPES)]
+    rows, width = 128, 160
+    x = mx.input_view(layout, rows, width, dtype, ou.make_generator(), DEVICE)
+    assert x.is_contiguous() == (layout == "offset")
+    before = x.clone()
+    what = f"{layout} {str(dtype)[6:]} view through {entry}"
+    if entry == "mxfp8_quantize":
+        data, scale = quantize_guarded(x)
+    elif entry == "mxfp8_quantize_into":
+        data_buf = ou.guarded_empty((rows, width), torch.float8_e4m3fn, DEVICE)
+        scale_buf = ou.guarded_empty((mx.scale_bytes(rows, width),), torch.uint8, DEVICE)
+        scale_buf.tensor.fill_(0xA7)
+        with _common.launcher_on_cpu():
+            mq.mxfp8_quantize_into(x, data_buf.tensor, scale_buf.tensor)
+        ou.check_guards(data=data_buf, scale=scale_buf)
+        data, scale = data_buf.tensor, scale_buf.tensor
+    else:
+        with _common.launcher_on_cpu():
+            t = MXFP8Tensor.from_bf16(x, backend="triton")
+        assert t.dtype == dtype
+        data, scale = t.data, t.scale
+    ou.assert_exact(x, before, what=f"{what}: x is read-only")
+    mx.assert_matches_spec(data, scale, before.contiguous(), what=what)
 
 
 TINY_AMAX = (448.0 * 2.0**-127, 2.0**-126, 2.0**-127, 2.0**-130, 2.0**-133)

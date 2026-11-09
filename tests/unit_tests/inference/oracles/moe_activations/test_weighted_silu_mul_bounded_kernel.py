@@ -29,7 +29,8 @@ PR #8566's GLU options, gated squared ReLU and ``weights_flat=None`` are covered
 Structure: elementwise persistent 1-D grid of ``num_programs`` programs, ``XBLOCK`` elements per
 step, striding while ``xoffset < bound``; ``HALF_N`` is a compile-time constant; int64 offsets.
 Covered: element counts and bounds around ``XBLOCK`` and the grid stride, a bound inside a row,
-a bound past the buffer, both production ``XBLOCK`` values, several grid sizes.
+a bound past the buffer, both production ``XBLOCK`` values, several grid sizes, CUDA-graph replay
+with changing bounds.
 """
 
 import pytest
@@ -164,6 +165,29 @@ def test_default_grid():
     weights = torch.rand(rows, generator=g, device=DEVICE, dtype=torch.float32)
     out = run_weighted(y, weights, 1500 * half_n, None)
     check_elements(out, y, weights, 1500 * half_n, what="default grid")
+
+
+@_common.needs_cuda
+def test_cuda_graph_replay_follows_device_bound():
+    """Captured once with the default grid, replayed with other element bounds (the vLLM path
+    captures it with ``valid_tokens * topk * half_n`` on device): elements past each bound stay
+    poisoned, the rest meet the contract."""
+    g = ou.make_generator(device=DEVICE)
+    rows, half_n = 300, 256
+    y = _glu.glu_inputs((rows, 2 * half_n), g, DEVICE)
+    weights = torch.rand(rows, generator=g, device=DEVICE, dtype=torch.float32)
+    bound = _common.device_scalar(rows * half_n, torch.int64)
+    batch_invariant.weighted_silu_mul_bounded(y, weights, bound)  # compile
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = batch_invariant.weighted_silu_mul_bounded(y, weights, bound)
+    for elements in (1, 1025, 0, rows * half_n, 211 * half_n + 17):
+        ou.poison_(out)
+        bound.fill_(elements)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_elements(out, y, weights, elements, what=f"replay with bound {elements}")
 
 
 @_common.needs_cuda

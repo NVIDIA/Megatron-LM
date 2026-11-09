@@ -25,7 +25,8 @@ because of the bug #8564 fixes and pass with it.
 Structure: persistent grid of ``NUM_PROGRAMS = max(1, min(M, 4096))`` programs striding over
 rows; each row is the shared ``_mxfp8_quant_swizzle_row`` (``BLOCK_K = next_pow2(K)``). Covered:
 M and ``n_rows`` around the 128-row scale tile and around the 4096-program grid, both count
-dtypes, input dtypes and value kinds, CUDA-graph replay with changing counts.
+dtypes, input dtypes and value kinds, strided and unaligned inputs, a production buffer, CUDA-graph
+replay with changing counts, row offsets past 2**31 (``large``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -125,19 +126,45 @@ def test_count_past_the_buffer(rows, extra):
     check(data, scale, x, rows + extra, f"n_rows = M + {extra}")
 
 
-def test_strided_input_is_quantized_or_rejected():
+@pytest.mark.parametrize("layout", mx.IN_STORAGE_LAYOUTS)
+def test_strided_input_is_quantized_or_rejected(layout):
     """A strided [M, K] view is quantized by its values, or rejected; never misread.
 
-    Fails on main (bug fixed by #8564, d8, which asserts contiguity).
+    Fails on main (bug fixed by #8564, d8, which asserts contiguity; #8357's copy of a
+    non-contiguous input is in ``mxfp8_quantize_into`` only). The views stay inside their
+    storage, so the misreading kernel reads other finite elements instead of faulting.
     """
-    g = ou.make_generator()
-    base = mx.mx_inputs(256, 128, torch.bfloat16, "wide", g).to(DEVICE)
-    x = base.t()
+    rows, width = 128, 160
+    x = mx.input_view(layout, rows, width, torch.bfloat16, ou.make_generator(), DEVICE)
+    before = x.clone()
     try:
-        data, scale = run_rows(x, _common.device_scalar(100))
+        with _common.launcher_on_cpu(), _common.captured_allocations(mq) as allocs:
+            data, scale = mq.mxfp8_quantize_rows(x, _common.device_scalar(100))
     except (AssertionError, ValueError, RuntimeError):
-        return
-    check(data, scale, x.contiguous(), 100, "strided input")
+        return  # rejected before any launch
+    allocs.check(f"outputs for a strided input ({layout})")
+    ou.assert_exact(x, before, what="x is read-only")
+    check(data, scale, before.contiguous(), 100, f"strided input ({layout})")
+
+
+def test_unaligned_contiguous_view():
+    """A contiguous view whose data pointer is one element past an aligned start (not 16-byte
+    aligned) is quantized like any other input."""
+    rows, width = 129, 160
+    x = mx.input_view("offset", rows, width, torch.bfloat16, ou.make_generator(), DEVICE)
+    assert x.is_contiguous()
+    data, scale = run_rows(x, _common.device_scalar(100))
+    check(data, scale, x, 100, "unaligned view")
+
+
+def test_production_buffer():
+    """A production buffer: the FC2 input of a batch-invariant MXFP8 SwiGLU layer at nanov3
+    widths, 16384 rows of 1856, 12032 used (a multiple of the 128-row alignment)."""
+    g = ou.make_generator()
+    rows, width, n = 16384, 1856, 12032
+    x = mx.mx_inputs(rows, width, torch.bfloat16, "randn", g).to(DEVICE)
+    data, scale = run_rows(x, _common.device_scalar(n))
+    check(data, scale, x, n, "production buffer")
 
 
 @pytest.mark.sanitizer
@@ -169,3 +196,27 @@ def test_cuda_graph_replay_follows_device_count():
         graph.replay()
         torch.cuda.synchronize()
         check(data, scale, x, count, f"replay with n_rows={count}")
+
+
+@pytest.mark.parametrize("rows", ou.int32_overflow_params(2688))
+def test_offsets_past_int32(rows):
+    """Row offsets ``row * K`` reach 2**31 at a production width (bf16 source, fp8 output): rows
+    around the crossing and the last rows, all live."""
+    width = 2688
+    ou.require_free_memory(rows * width * 3 + 2**30)
+    x = torch.ones(rows, width, dtype=torch.bfloat16, device=DEVICE)
+    probe = sorted({0, 2**31 // width - 1, min(2**31 // width, rows - 1), rows - 2, rows - 1})
+    x[probe] = mx.mx_inputs(len(probe), width, torch.bfloat16, "wide", ou.make_generator()).to(
+        DEVICE
+    )
+    data, scale = mq.mxfp8_quantize_rows(x, _common.device_scalar(rows))
+    ref_codes, ref_scales = mx.quantize(x[probe].cpu())
+    scales, _ = mx.unswizzle(scale.cpu(), rows, width // mx.BLOCK)
+    ou.assert_quantized_bit_exact(
+        data[probe].cpu().view(torch.uint8),
+        scales[probe],
+        ref_codes,
+        ref_scales,
+        elems_per_scale=mx.BLOCK,
+        what=f"rows {probe}",
+    )

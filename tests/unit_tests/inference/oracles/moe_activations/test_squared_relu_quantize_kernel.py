@@ -30,7 +30,9 @@ spec; written before reading the kernel):
 Structure: persistent grid ``NUM_BLOCKS = min(M, 512)`` over rows; the whole row in registers,
 ``BLOCK_K = next_pow2(K)`` with ``K / 32`` real groups; ``CLAMP`` compile-time variant. Covered:
 both ``CLAMP`` variants, K around powers of two and with padded scale columns, production
-widths, M and ``n_used`` around the grid and the 128-row tile, padding layouts.
+widths and a production buffer, M and ``n_used`` around the grid and the 128-row tile, padding
+layouts, tiny blocks, strided inputs, CUDA-graph replay with changing ``n_used``, row offsets
+past 2**31 (``large``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -213,3 +215,114 @@ def test_sanitizer_small():
     perm = _glu.permutation_map(130, "runs", torch.int32, g, DEVICE)
     t = run_fused(x, perm, _common.device_scalar(100), 8.0)
     check(t, x, perm, 100, 8.0, "sanitizer case")
+
+
+@pytest.mark.parametrize("clamp", [None, 8.0])
+def test_tiny_blocks_take_the_smallest_scale(clamp):
+    """Blocks whose activation amax is at most ``448 * 2**-127`` (normal bf16 values) take
+    E8M0's smallest scale, 0x00; a block just above that bound takes 0x01 (control).
+
+    Fails on main (finding O2-N1, the same quantization code as ``_mxfp8_quant_swizzle_row``):
+    ``amax / 448`` is an fp32 subnormal there, and adding 0x7FFFFF to its bits gives 2**-126
+    (byte 0x01). Fixed by the open PR #8956 (s4f-mxfp8-quant), whose shared scale helper serves
+    this kernel too.
+    """
+    # Activations bf16(x**2): 2**-120, 1.5625 * 2**-120, 3.0625 * 2**-120 and 2**-126 (tiny);
+    # 3.515625 * 2**-120 = 1.7578125 * 2**-119 (just above 448 * 2**-127).
+    tiny = (2.0**-60, 1.25 * 2.0**-60, 1.75 * 2.0**-60, 2.0**-63, 1.875 * 2.0**-60)
+    rows, width = len(tiny), 64
+    x = torch.zeros(rows, width, dtype=torch.float64)
+    for r, v in enumerate(tiny):
+        x[r, 0] = v
+        x[r, 1:32:3] = -v  # ReLU to zero
+        x[r, 2:32:3] = v
+        x[r, 32:] = 1.5  # an ordinary block next to it
+    x = x.to(torch.bfloat16).to(DEVICE)
+    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
+    t = run_fused(x, perm, _common.device_scalar(rows), clamp)
+    check(t, x, perm, rows, clamp, f"tiny blocks, clamp {clamp}")
+
+
+def test_strided_input_is_quantized_or_rejected():
+    """A strided [M, K] ``x`` (transpose, column slice, row step) is quantized by its values or
+    rejected, never misread. The views stay inside their storage, so a misreading kernel reads
+    other finite elements instead of faulting.
+
+    Fails on main (finding O2-N2's precondition, here in the fused kernel): the launcher does
+    not check contiguity and the kernel addresses row r at ``r * K``. Fixed by the open PR #8956
+    (s4f-mxfp8-quant), which asserts a contiguous input here.
+    """
+    g = ou.make_generator(device=DEVICE)
+    rows, width = 128, 160
+    base = (torch.randn(2 * rows, 2 * width, generator=g, device=DEVICE) * 4).to(torch.bfloat16)
+    views = {
+        "transpose": base[:width, :rows].t(),
+        "column-slice": base[:rows, :width],
+        "row-step": base[::2, :width],
+    }
+    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
+    for name, x in views.items():
+        assert x.shape == (rows, width) and not x.is_contiguous()
+        before = x.clone()
+        try:
+            with _common.captured_allocations(activations) as allocs:
+                t = activations.squared_relu_and_quantize_mxfp8(
+                    x, perm, _common.device_scalar(rows)
+                )
+        except (AssertionError, ValueError, RuntimeError):
+            continue  # rejected before any launch
+        allocs.check(f"outputs for a strided input ({name})")
+        ou.assert_exact(x, before, what="x is read-only")
+        check(t, before, perm, rows, None, f"strided input ({name})")
+
+
+@pytest.mark.parametrize("clamp", [None, 10.0])
+def test_production_buffer(clamp):
+    """A production buffer: 8192 expert-grouped rows of the nanov3 expert width (1856), 6016
+    used (a multiple of the 128-row MXFP8 alignment), 10% alignment padding."""
+    g = ou.make_generator(device=DEVICE)
+    rows, width, n_used = 8192, 1856, 6016
+    scale = 4.0 if clamp is None else 1.5 * clamp
+    x = (torch.randn(rows, width, generator=g, device=DEVICE) * scale).to(torch.bfloat16)
+    perm = _glu.permutation_map(rows, "random", torch.int32, g, DEVICE)
+    t = run_fused(x, perm, _common.device_scalar(n_used), clamp)
+    check(t, x, perm, n_used, clamp, f"production buffer, clamp {clamp}")
+
+
+@_common.needs_cuda
+def test_cuda_graph_replay_follows_device_count():
+    """Captured once, replayed with other ``n_used`` values: the data is poisoned and the scales
+    zeroed before each replay, and rows past each count and padding rows must stay so."""
+    g = ou.make_generator(device=DEVICE)
+    rows, width, clamp = 2 * PROGRAMS_CAP, 160, 8.0
+    x = (torch.randn(rows, width, generator=g, device=DEVICE) * 12).to(torch.bfloat16)
+    perm = _glu.permutation_map(rows, "program-stride", torch.int32, g, DEVICE)
+    n_used = _common.device_scalar(rows)
+    activations.squared_relu_and_quantize_mxfp8(x, perm, n_used, clamp_scale=clamp)  # compile
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        t = activations.squared_relu_and_quantize_mxfp8(x, perm, n_used, clamp_scale=clamp)
+    for count in (1, PROGRAMS_CAP + 1, 0, rows, PROGRAMS_CAP - 1):
+        ou.poison_(t.data)
+        t.scale.view(torch.uint8).zero_()
+        n_used.fill_(count)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(t, x, perm, count, clamp, f"replay with n_used={count}")
+
+
+@pytest.mark.parametrize("rows", ou.int32_overflow_params(2688))
+def test_offsets_past_int32(rows):
+    """Row offsets ``row * K`` reach 2**31 at a production width: rows around the crossing and
+    the last rows."""
+    width = 2688
+    ou.require_free_memory(rows * width * 3 + 2**30)
+    x = torch.ones(rows, width, dtype=torch.bfloat16, device=DEVICE)
+    probe = sorted({0, 2**31 // width - 1, min(2**31 // width, rows - 1), rows - 2, rows - 1})
+    g = ou.make_generator(device=DEVICE)
+    x[probe] = (torch.randn(len(probe), width, generator=g, device=DEVICE) * 4).to(torch.bfloat16)
+    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
+    t = activations.squared_relu_and_quantize_mxfp8(x, perm, _common.device_scalar(rows))
+    scales, _ = mx.unswizzle(t.scale.cpu(), rows, width // mx.BLOCK)
+    assert_quantized_activation(t.data[probe], scales[probe], x[probe], None, what=f"rows {probe}")

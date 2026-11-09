@@ -287,3 +287,36 @@ def mx_inputs(rows: int, k: int, dtype: torch.dtype, kind: str, generator: torch
 
 
 VALUE_KINDS = ("randn", "wide", "boundary", "zeros")
+
+
+STRIDED_LAYOUTS = ("transpose", "column-slice", "row-step", "column-step", "broadcast")
+"""Non-contiguous [rows, width] views a caller may pass to a quantizer (``input_view``)."""
+IN_STORAGE_LAYOUTS = ("transpose", "column-slice", "row-step")
+"""The strided layouts whose row-major misreading (row r at ``r * width``) stays inside the
+view's storage, so a kernel that ignores strides reads other finite elements instead of
+faulting (CI.md §2 item 10: never launch a kernel on inputs it is known to fault on)."""
+
+
+def input_view(
+    layout: str, rows: int, width: int, dtype: torch.dtype, generator: torch.Generator, device
+) -> torch.Tensor:
+    """A [rows, width] view of ``layout`` over a [2 * rows, 2 * width] buffer of ``wide`` inputs.
+
+    ``STRIDED_LAYOUTS`` are not contiguous; ``offset`` is contiguous but starts one element past
+    the buffer's (aligned) start, so its data pointer is not 16-byte aligned. Needs
+    ``2 * rows >= width`` for ``transpose``.
+    """
+    base = mx_inputs(2 * rows, 2 * width, dtype, "wide", generator).to(device)
+    if layout == "transpose":
+        return base[:width, :rows].t()
+    if layout == "column-slice":
+        return base[:rows, :width]
+    if layout == "row-step":
+        return base[::2, :width]
+    if layout == "column-step":
+        return base[:rows, ::2]
+    if layout == "broadcast":
+        return base[0, :width].expand(rows, width)
+    if layout == "offset":
+        return base.reshape(-1)[1 : 1 + rows * width].view(rows, width)
+    raise ValueError(layout)
