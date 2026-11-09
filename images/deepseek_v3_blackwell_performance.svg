@@ -1,12 +1,12 @@
 <?xml version='1.0' encoding='utf-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:cc="http://creativecommons.org/ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xlink="http://www.w3.org/1999/xlink" width="900pt" height="511.2pt" viewBox="0 0 900 511.2" version="1.1" role="img" aria-label="DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs and sequence length 4,096. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:cc="http://creativecommons.org/ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xlink="http://www.w3.org/1999/xlink" width="900pt" height="511.2pt" viewBox="0 0 900 511.2" version="1.1" role="img" aria-label="DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs at 4K sequence length. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.">
  <title>DeepSeek-V3 training performance on Blackwell</title>
  <metadata>
   <rdf:RDF>
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
     <dc:title>DeepSeek-V3 training performance on Blackwell</dc:title>
-    <dc:description>DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs and sequence length 4,096. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.</dc:description>
+    <dc:description>DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs at 4K sequence length. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -550,10 +550,10 @@
      <path id="NVIDIASans-Regular-90" d="M 2426 -77  Q 1434 -77 918 480  Q 403 1037 403 2086  L 403 2374  Q 403 3053 636 3542  Q 870 4032 1302 4297  Q 1734 4563 2323 4563  L 2400 4563  Q 3008 4563 3430 4297  Q 3853 4032 4038 3526  L 3552 3360  Q 3296 4090 2400 4090  L 2323 4090  Q 1664 4090 1299 3642  Q 934 3194 934 2381  L 934 2067  Q 934 390 2426 390  L 2502 390  Q 3168 390 3597 646  L 3597 1882  L 2458 1882  L 2522 2330  L 4109 2330  L 4109 403  Q 3827 186 3420 54  Q 3014 -77 2509 -77  L 2426 -77  z " transform="scale(0.015625)" />
      <path id="NVIDIASans-Regular-9e" d="M 3968 4480  L 3968 1754  Q 3968 890 3526 406  Q 3085 -77 2259 -77  L 2176 -77  Q 1350 -77 908 406  Q 467 890 467 1754  L 467 4480  L 998 4480  L 998 1741  Q 998 1075 1299 732  Q 1600 390 2182 390  L 2253 390  Q 2835 390 3136 732  Q 3437 1075 3437 1741  L 3437 4480  L 3968 4480  z " transform="scale(0.015625)" />
      <path id="NVIDIASans-Regular-b3" d="M 512 -1280  L 512 3258  L 979 3258  L 979 2701  Q 1126 2989 1404 3161  Q 1683 3334 2080 3334  L 2125 3334  Q 2534 3334 2848 3152  Q 3162 2970 3344 2614  Q 3526 2259 3526 1747  L 3526 1510  Q 3526 998 3344 643  Q 3162 288 2848 105  Q 2534 -77 2125 -77  L 2080 -77  Q 1715 -77 1443 76  Q 1171 230 1024 493  L 1024 -1280  L 512 -1280  z M 1984 365  L 2042 365  Q 2458 365 2736 646  Q 3014 928 3014 1517  L 3014 1747  Q 3014 2336 2736 2614  Q 2458 2893 2042 2893  L 1984 2893  Q 1722 2893 1501 2771  Q 1280 2650 1152 2394  Q 1024 2138 1024 1728  L 1024 1530  Q 1024 922 1305 643  Q 1587 365 1984 365  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-94" d="M 608 0  L 608 4480  L 1139 4480  L 1139 2176  L 3334 4480  L 4000 4480  L 2246 2669  L 4083 0  L 3469 0  L 1894 2323  L 1139 1530  L 1139 0  L 608 0  z " transform="scale(0.015625)" />
      <path id="NVIDIASans-Regular-b4" d="M 2835 -1280  L 2835 493  Q 2682 230 2413 76  Q 2144 -77 1773 -77  L 1734 -77  Q 1331 -77 1014 105  Q 698 288 515 643  Q 333 998 333 1510  L 333 1741  Q 333 2259 515 2614  Q 698 2970 1014 3152  Q 1331 3334 1734 3334  L 1773 3334  Q 2176 3334 2454 3158  Q 2733 2982 2880 2694  L 2880 3258  L 3347 3258  L 3347 -1280  L 2835 -1280  z M 1818 365  L 1875 365  Q 2138 365 2355 486  Q 2573 608 2704 864  Q 2835 1120 2835 1523  L 2835 1728  Q 2835 2138 2704 2394  Q 2573 2650 2355 2771  Q 2138 2893 1875 2893  L 1818 2893  Q 1402 2893 1123 2611  Q 845 2330 845 1741  L 845 1510  Q 845 928 1123 646  Q 1402 365 1818 365  z " transform="scale(0.015625)" />
      <path id="NVIDIASans-Regular-aa" d="M 1805 -1370  Q 858 -1370 525 -762  L 896 -493  Q 1037 -723 1248 -828  Q 1459 -934 1811 -934  L 1907 -934  Q 2822 -934 2822 77  L 2822 570  Q 2509 13 1773 13  L 1734 13  Q 1312 13 998 208  Q 685 403 509 755  Q 333 1107 333 1574  L 333 1779  Q 333 2246 509 2595  Q 685 2944 998 3139  Q 1312 3334 1734 3334  L 1773 3334  Q 2579 3334 2880 2694  L 2880 3251  L 3347 3251  L 3347 83  Q 3347 -614 2976 -992  Q 2605 -1370 1920 -1370  L 1805 -1370  z M 1818 454  L 1875 454  Q 2323 454 2579 761  Q 2835 1069 2835 1600  L 2835 1754  Q 2835 2285 2579 2589  Q 2323 2893 1875 2893  L 1818 2893  Q 1370 2893 1107 2589  Q 845 2285 845 1773  L 845 1574  Q 845 1062 1107 758  Q 1370 454 1818 454  z " transform="scale(0.015625)" />
      <path id="NVIDIASans-Regular-b7" d="M 1862 -26  Q 1299 -26 1062 236  Q 826 499 826 954  L 826 2835  L 128 2835  L 128 3258  L 826 3258  L 826 4243  L 1338 4243  L 1338 3258  L 2464 3258  L 2394 2835  L 1338 2835  L 1338 986  Q 1338 678 1478 540  Q 1619 403 1914 403  L 2464 403  L 2464 -26  L 1862 -26  z " transform="scale(0.015625)" />
-     <path id="NVIDIASans-Regular-29" d="M 1792 -77  Q 794 -77 493 685  L 947 858  Q 1056 602 1264 486  Q 1472 371 1805 371  L 1869 371  Q 2976 371 2976 1965  L 2976 2125  Q 2810 1843 2506 1689  Q 2202 1536 1811 1536  L 1747 1536  Q 1331 1536 1004 1715  Q 678 1894 496 2211  Q 314 2528 314 2938  L 314 3053  Q 314 3469 509 3792  Q 704 4115 1049 4297  Q 1395 4480 1837 4480  L 1907 4480  Q 2643 4480 3059 4022  Q 3475 3565 3475 2752  L 3475 1971  Q 3475 979 3059 451  Q 2643 -77 1862 -77  L 1792 -77  z M 1869 1971  L 1926 1971  Q 2387 1971 2672 2246  Q 2957 2522 2957 2957  L 2957 3059  Q 2957 3494 2672 3766  Q 2387 4038 1926 4038  L 1869 4038  Q 1408 4038 1120 3766  Q 832 3494 832 3059  L 832 2957  Q 832 2515 1120 2243  Q 1408 1971 1869 1971  z " transform="scale(0.015625)" />
     </defs>
     <use xlink:href="#NVIDIASans-Regular-22" />
     <use xlink:href="#NVIDIASans-Regular-25" transform="translate(60 0)" />
@@ -573,64 +573,61 @@
     <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(766.59375 0)" />
     <use xlink:href="#NVIDIASans-Regular-6" transform="translate(826.390625 0)" />
     <use xlink:href="#NVIDIASans-Regular-3" transform="translate(848.984375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(874.78125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(925.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b4" transform="translate(980.890625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(1041.1875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1099.78125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1154.984375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(1214.78125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1267.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1322.890625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1348.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1372.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1427.890625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(1487.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(1547.1875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(1590.6875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1650.484375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-24" transform="translate(1676.28125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-6" transform="translate(1736.28125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-20" transform="translate(1758.875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-29" transform="translate(1818.875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-26" transform="translate(1878.875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-6" transform="translate(1938.875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1961.46875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1987.265625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2038.171875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2093.375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2117.375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(2172.578125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2224.578125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2267.078125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2322.28125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2382.578125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(2408.375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(2468.671875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(2527.265625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2587.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2611.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2634.765625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(2685.671875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2745.46875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2800.671875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2860.96875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2886.765625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2929.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(2966.46875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3020.765625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(3044.765625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3104.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(3128.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(3188.359375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(3248.65625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(3274.453125 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3311.359375 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(3366.5625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3419.46875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(3443.46875 0)" />
-    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3503.765625 0)" />
-    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(3558.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-24" transform="translate(874.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-94" transform="translate(934.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(999.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1025.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1076.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b4" transform="translate(1131.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(1192.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1250.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1305.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(1365.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1418.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1473.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1499.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1523.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1578.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(1638.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(1698.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(1741.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-6" transform="translate(1801.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1824.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1849.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1900.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1955.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1979.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(2035.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2087.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2129.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2184.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2245.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(2270.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(2331.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(2389.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2450.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2474.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2497.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(2548.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2608.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2663.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2723.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2749.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2792.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(2829.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2883.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2907.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2967.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2991.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(3050.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(3111.265625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(3137.0625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3173.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(3229.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3282.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(3306.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3366.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(3421.578125 0)" />
    </g>
   </g>
   <g id="text_25">

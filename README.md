@@ -86,7 +86,7 @@ Keep [Megatron](https://github.com/NVIDIA/Megatron-LM/releases) up to date to be
 
 ## DeepSeek-V3 performance on Blackwell
 
-Successive Megatron versions have improved published DeepSeek-V3 model TFLOP/s/GPU **2.1× on GB200** and **1.5× on GB300**, using 256 GPUs and sequence length 4,096.
+Successive Megatron versions have improved published DeepSeek-V3 model TFLOP/s/GPU **2.1× on GB200** and **1.5× on GB300**, measured across 256 GPUs at 4K sequence length.
 
 ![DeepSeek-V3 performance across Megatron updates: 2.1× model TFLOP/s/GPU on GB200 and 1.5× on GB300](images/deepseek_v3_blackwell_performance.svg)
 
@@ -103,10 +103,11 @@ Selected results from published Megatron training recipes:
 | Qwen3-235B-A22B | DGX-GB300 | 256 | MXFP8 | 4,096 | 8,832 | 1,306 |
 | Nemotron 3 Ultra | DGX-GB300 | 256 | NVFP4 | 8,192 | 3,744 | 1,348 |
 
-MoE benchmarks use force-balanced expert routing and do not drop tokens. These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
+These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
 
 # Roadmaps
 
+- **[2026 Q4 Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/9232)**
 - **[2026 Q3 Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/5676)**
 - **[2026 Q3 MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6757)** [`dev` branch first developments]
 - **[2026 Q3 Megatron FSDP v2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6812)** [experimental]
