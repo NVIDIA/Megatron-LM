@@ -697,6 +697,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.expert_model_parallel_size > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
+        # Set by setup_kv_transfer. Only disaggregated handoffs hold recurrent-state
+        # slots outside request rows; otherwise every live slot belongs to a row.
+        self.kv_transfer_enabled = False
         reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
@@ -3682,13 +3685,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
         # Hybrid models also need a free recurrent-state slot. The slot pool has one
-        # entry per request row, but slots can be held by state that owns no row:
-        # a prefill engine keeps a finished handoff's slot until the decode peer has
-        # read it, and a decode engine reserves a slot for each incoming handoff
-        # before that request is admitted. A free row therefore does not imply a
-        # free slot, and add_request would fail mid-allocation without this check.
+        # entry per request row, but with KV transfer slots can be held by state that
+        # owns no row: a prefill engine keeps a finished handoff's slot until the
+        # decode peer has read it, and a decode engine reserves a slot for each
+        # incoming handoff before that request is admitted. A free row therefore does
+        # not imply a free slot, and add_request would fail mid-allocation without
+        # this check. Without KV transfer, slots and rows must stay one-to-one.
         if self.is_hybrid_model:
-            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
+            has_free_mamba_slot = self.mamba_metadata.mamba_state_free_slot_count > 0
+            assert self.kv_transfer_enabled or has_free_mamba_slot or not request_can_be_added, (
+                "A free request row has no free Mamba state slot, but only KV transfer "
+                "may hold slots outside request rows"
+            )
+            request_can_be_added &= has_free_mamba_slot
 
         if prefill_chunk_length is None:
             prefill_chunk_length = req.remaining_prompt_length
