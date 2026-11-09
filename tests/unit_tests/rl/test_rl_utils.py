@@ -310,6 +310,15 @@ class MockTokenizer:
         return [str(tok) for tok in tokens]
 
 
+@pytest.mark.parametrize("pad", [None, -1])
+def test_prepare_trajectories_rejects_tokenizer_without_pad(pad):
+    """GPT-2 BPE has no pad token (None) and SentencePiece's default pad id is -1."""
+    tokenizer = MockTokenizer()
+    tokenizer.pad = pad
+    with pytest.raises(ValueError, match="no valid pad id"):
+        rl_utils.prepare_trajectories([], tokenizer, 8, skip_bos_token=False)
+
+
 _NEXT_CID = itertools.count()
 
 

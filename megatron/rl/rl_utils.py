@@ -2331,6 +2331,14 @@ def prepare_trajectories(
         assert "<SPECIAL_233>" in tokenizer.vocab, "Pad token is NOT in the tokenizer"
         tokenizer._pad_id = tokenizer.vocab["<SPECIAL_233>"]
 
+    # Trajectories are padded with this id below, so it must be a real token id.
+    if tokenizer.pad is None or tokenizer.pad < 0:
+        raise ValueError(
+            f"RL pads trajectories with the tokenizer's pad token, but {type(tokenizer).__name__} "
+            f"(library {tokenizer.library!r}) has no valid pad id (got {tokenizer.pad}). "
+            "Use a tokenizer that defines a pad token."
+        )
+
     log_single_rank(logger, logging.INFO, f"Tokenizer vocab size: {tokenizer.vocab_size}")
     log_single_rank(
         logger,
