@@ -2965,6 +2965,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
                 )
+            if scope == "micro_batch" and self.moe_enable_routing_replay:
+                raise ValueError(
+                    "micro_batch quantile_balancing picks experts with its own estimator and "
+                    "does not support routing replay; use the global_batch scope."
+                )
             if scope == "global_batch":
                 if self.moe_router_quantile_balancing_ema != 0.0:
                     raise ValueError(
@@ -2987,10 +2992,9 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if self.moe_router_num_groups is not None or self.moe_router_group_topk is not None:
                     raise ValueError("global_batch quantile_balancing does not support groups.")
-                if self.moe_enable_routing_replay:
-                    raise ValueError(
-                        "global_batch quantile_balancing does not support routing replay."
-                    )
+                # Routing replay is supported: dispatch follows the replayed experts on
+                # the unfused router path, while the K3 histogram keeps this router's
+                # own top-(k+1) cutoff (see topk_routing_with_score_function).
                 if (
                     self.moe_expert_capacity_factor is not None
                     and self.moe_expert_capacity_factor >= 0

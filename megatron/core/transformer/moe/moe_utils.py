@@ -952,8 +952,11 @@ def topk_routing_with_score_function(
             raise ValueError("Quantile Balancing requires topk < num_experts.")
         if num_groups is not None or group_topk is not None:
             raise ValueError("Quantile Balancing does not support group-limited routing.")
-        if router_replay is not None:
-            raise ValueError("Quantile Balancing does not support router replay.")
+        if router_replay is not None and fused:
+            raise ValueError(
+                "Quantile Balancing with router replay needs the unfused router path "
+                "(the fused kernel picks its own experts); set moe_router_fusion=False."
+            )
         if precomputed_indices is not None:
             raise ValueError("Histogram Quantile Balancing computes its own top-(k+1).")
         if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
@@ -1104,6 +1107,18 @@ def topk_routing_with_score_function(
                 topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
                 cutoff = topk_result.values[:, -1:]
                 top_indices = topk_result.indices[:, :-1]
+                if router_replay is not None:
+                    # Dispatch follows the replay (or records this router's own choice);
+                    # the K3 histogram below keeps this router's own (k+1)-th cutoff, so
+                    # the bias still tracks the policy router.
+                    own_values, own_indices = topk_result.values[:, :-1], top_indices
+                    _, top_indices = router_replay.get_replay_topk(
+                        scores_for_routing,
+                        topk,
+                        None,
+                        None,
+                        lambda _s, _k, num_groups=None, group_topk=None: (own_values, own_indices),
+                    )
                 with torch.no_grad():
                     num_bins = qb_histogram.shape[1]
                     lower, upper = qb_bin_bounds.unbind()

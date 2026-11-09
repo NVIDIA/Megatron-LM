@@ -467,7 +467,9 @@ class TopKRouter(Router):
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
-                fused=self.config.moe_router_fusion,
+                # The fused kernel picks its own experts, so replay takes the unfused path.
+                fused=self.config.moe_router_fusion and self.router_replay is None,
+                router_replay=self.router_replay,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
                 # The histogram is only supplied while accumulating, so every pass must
