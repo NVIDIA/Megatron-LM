@@ -163,7 +163,9 @@ class PassthroughHyperConnection(torch.nn.Module):
 def wrap_with_passthrough_mhc(inner_layer):
     wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
     torch.nn.Module.__init__(wrapper)
-    wrapper.config = SimpleNamespace(fp32_residual_connection=False, params_dtype=None)
+    wrapper.config = SimpleNamespace(
+        fp32_residual_connection=False, params_dtype=None, cuda_graph_impl="none"
+    )
     wrapper.inner_layer = inner_layer
     wrapper.layer_number = inner_layer.layer_number
     wrapper.hyper_connection = PassthroughHyperConnection()
