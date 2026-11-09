@@ -960,6 +960,7 @@ def _worker_ag_alloc_routing(rank, world_size, port):
         w = layer.weight
         # Construction leaves the BF16 shard in plain memory; the post-wrap step pools it.
         assert group.group_name not in gtp_symm._pools
+        gtp_module.move_gtp_weights_to_symm_pool(layer)
         gtp_module.classify_gtp_remat_chains(layer)
         assert w.is_in_symm_pool
         w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
@@ -1097,7 +1098,7 @@ def _worker_cpu_init_placement(rank, world_size, port, collectives):
 
         model.cuda()
         pointers = [w.data_ptr() for w in weights]
-        gtp_module.classify_gtp_remat_chains(model)
+        gtp_module.move_gtp_weights_to_symm_pool(model)
         for w, value, ptr in zip(weights, values, pointers):
             assert torch.equal(w.detach().cpu(), value)
             if "ag" in collectives:
@@ -1145,7 +1146,7 @@ def _worker_frozen_placement_under_ddp(rank, world_size, port):
         assert hooks == [(buffer.param_nccl_mem_pool, group)] and trainable.is_in_symm_pool
 
         ptr = trainable.data_ptr()
-        gtp_module.classify_gtp_remat_chains(ddp)
+        gtp_module.move_gtp_weights_to_symm_pool(ddp)
         assert trainable.data_ptr() == ptr
         assert frozen.is_in_symm_pool and _in_pool(frozen, group)
         assert torch.equal(frozen.detach(), frozen_value)

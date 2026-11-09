@@ -746,8 +746,7 @@ def classify_gtp_remat_chains(
     model, *, cuda_graph_modules=None, moe_shared_expert_overlap=False, cuda_graph_impl="none"
 ):
     """
-    Pool the all-gather inputs nothing else placed, then register default prefetch chains
-    and finalize their captured/eager boundaries.
+    Register default prefetch chains and finalize their captured/eager boundaries.
 
     Explicit registrations take precedence. All other eligible weights use the same
     registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
@@ -765,14 +764,24 @@ def classify_gtp_remat_chains(
     # Clear stale process-global chain state so a rebuilt model starts fresh.
     reset_gtp_state()
     models = model if isinstance(model, list) else [model]
-    for model_module in models:
-        for _, param in model_module.named_parameters():
-            if getattr(param, "needs_nccl_mem", False):
-                _move_weight_to_symm_pool(param, param.group)
     _register_default_prefetch_chains(models)
     for model_module in models:
         tag_gtp_params_with_names(model_module)
         classify_gtp_chains(model_module)
+
+
+def move_gtp_weights_to_symm_pool(model) -> None:
+    """Move the all-gather inputs that opted into symmetric memory and that nothing else
+    placed (e.g. frozen or CPU-initialized weights) into their group's registered pool.
+
+    Call once AFTER model build + DDP wrap (DDP places the weights it remaps) and before
+    the first forward.
+    """
+    models = model if isinstance(model, list) else [model]
+    for model_module in models:
+        for param in model_module.parameters():
+            if getattr(param, "needs_nccl_mem", False):
+                _move_weight_to_symm_pool(param, param.group)
 
 
 def gtp_remat_shard_dim0(dim0, gtp_remat_group):
@@ -881,7 +890,7 @@ def _gtp_attach_attrs(
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
     # Opts the all-gather input into symmetric backing: DDP's pool via register_ub_pool, else
-    # the GTP pool after wrapping (classify_gtp_remat_chains).
+    # the GTP pool after wrapping (move_gtp_weights_to_symm_pool).
     gtp_shard.needs_nccl_mem = uses_gtp_symm_pool(gtp_remat_group, collective="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
@@ -1011,7 +1020,7 @@ def attach_gtp_to_presharded_module(
             continue
         if isinstance(param, QuantizedTensor):
             # Pooled whole now, before an outside owner can take part of its storage; plain
-            # weights are placed after wrapping (classify_gtp_remat_chains).
+            # weights are placed after wrapping (move_gtp_weights_to_symm_pool).
             _move_weight_to_symm_pool(param, gtp_remat_group)
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:

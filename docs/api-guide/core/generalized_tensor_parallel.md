@@ -409,7 +409,9 @@ it** — a different collective over a different process group, so enable either
   registration; the sharded output lands in the ordinary `main_grad`.
 - **`ag`** registers the weight all-gather on both sides: the input (the pre-sharded weight
   storage; under the distributed optimizer, the DDP param buffer the optimizer re-homes params
-  into) and the output (the gathered-weight cache buffers).
+  into) and the output (the gathered-weight cache buffers). Inputs DDP does not re-home, such
+  as frozen weights, are moved into the pool by `move_gtp_weights_to_symm_pool(model)`, which
+  `training.py` calls after the DDP wrap.
 
 | | |
 |---|---|

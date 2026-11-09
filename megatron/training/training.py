@@ -3061,8 +3061,12 @@ def setup_model_and_optimizer(
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(cfg.model.transformer):
-        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+        from megatron.core.tensor_parallel.gtp_api import (
+            classify_gtp_remat_chains,
+            move_gtp_weights_to_symm_pool,
+        )
 
+        move_gtp_weights_to_symm_pool(model)
         classify_gtp_remat_chains(
             model,
             cuda_graph_modules=cfg.model.transformer.cuda_graph_modules,
