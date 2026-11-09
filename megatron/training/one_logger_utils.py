@@ -270,10 +270,7 @@ def on_save_checkpoint_start(async_save):
 def on_pretrain_start():
     """ Function to be called at the start of pretrain function to track E2E meta data
     """
-    from megatron.training.config.compat import data_sequence_length
-
     cfg = get_run_config()
-    args = get_args()
     one_logger = get_one_logger()
 
     if one_logger:
@@ -295,7 +292,7 @@ def on_pretrain_start():
                 'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
                 'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
                 'world_size': safe_get_world_size(),
-                'model_seq_length': data_sequence_length(cfg, args),
+                'model_seq_length': cfg.model.transformer.max_seq_length_per_sample,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
                 'is_log_throughput_enabled': cfg.logger.log_throughput,

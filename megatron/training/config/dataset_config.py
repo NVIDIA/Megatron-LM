@@ -17,8 +17,11 @@ layout and the validation flags): the container writes them at ``finalize()``
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
-The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()`` (and the
-data length through ``megatron.training.config.compat``), never through ``args``.
+The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()``, never
+through ``args``; the sample length it runs at is the model section's
+``transformer.max_seq_length_per_sample``, which the container writes from the dataset's
+``sequence_length`` at ``finalize()`` (the launcher fills it from ``--seq-length`` for every
+entry point, so a loader-only section needs no length of its own).
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """

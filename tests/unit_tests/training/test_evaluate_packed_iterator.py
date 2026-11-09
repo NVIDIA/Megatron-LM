@@ -50,7 +50,9 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
         get_batch_parallel_size=lambda: 1,
         model=SimpleNamespace(
             transformer=SimpleNamespace(
-                cuda_graph_impl="none", moe_expert_rank_capacity_factor=None
+                cuda_graph_impl="none",
+                moe_expert_rank_capacity_factor=None,
+                max_seq_length_per_sample=16,
             )
         ),
         validation=SimpleNamespace(

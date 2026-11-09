@@ -220,8 +220,6 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
-    from megatron.training.config.compat import data_sequence_length
-
     cfg = get_run_config()
     if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -237,7 +235,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=data_sequence_length(cfg, args),
+        seq_length=cfg.model.transformer.max_seq_length_per_sample,
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -590,11 +588,14 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
-    # The data sequence length: the dataset's when the run config has a dataset section, else the
-    # namespace's (inference and loader-only runs), skipped like any other unset field.
-    dataset = getattr(getattr(cfg, 'data', None), 'dataset', None)
+    # The per-sample length: a training container's model section carries it (the container
+    # keeps it equal to the dataset's sequence_length); inference keeps its CLI boundary.
+    # Skipped like any other unset field.
+    transformer = getattr(getattr(cfg, 'model', None), 'transformer', None)
     sequence_length = (
-        dataset.sequence_length if dataset is not None else getattr(args, 'seq_length', None)
+        getattr(transformer, 'max_seq_length_per_sample', None)
+        if transformer is not None
+        else getattr(args, 'seq_length', None)
     )
     if sequence_length is not None:
         resource_attrs['dl.sequence_length'] = sequence_length

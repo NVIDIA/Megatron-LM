@@ -572,9 +572,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         With a model section, dataset or not: dynamic CP needs the single loader, and a packing
         scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
         construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
-        length, and a value given for one of the seven fields other sections own
+        length, a value given for one of the seven fields other sections own
         (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
-        ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults).
+        ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
+        and the model section's ``max_seq_length_per_sample``, when given, is the sample length
+        (the container writes it from the dataset at ``finalize()``; the training loop reads the
+        length there, so a container with a dataset has one value for it).
         With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
         sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
         ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
@@ -621,6 +624,13 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "--max-position-embeddings) must be greater than or equal to "
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
+        per_sample = getattr(transformer, "max_seq_length_per_sample", None)
+        if per_sample is not None and per_sample != dataset.sequence_length:
+            raise ValueError(
+                f"model.transformer.max_seq_length_per_sample={per_sample} disagrees with "
+                f"data.dataset.sequence_length={dataset.sequence_length}; the container writes "
+                "this field from the dataset at finalize(), leave it unset."
+            )
         validation = self.validation
         if (
             dataset.full_validation is not None
@@ -773,6 +783,10 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is not None:
             # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
+            # In the other direction, the model section's per-sample length is the dataset's
+            # sequence_length: the training loop reads the length from the transformer config,
+            # for a container with a dataset and for a loader-only one alike.
+            transformer.max_seq_length_per_sample = dataset.sequence_length
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size

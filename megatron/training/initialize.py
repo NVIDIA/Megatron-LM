@@ -49,7 +49,6 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
-from megatron.training.config.compat import data_sequence_length
 from megatron.training.global_vars import (
     get_run_config,
     get_train_state,
@@ -245,7 +244,7 @@ def initialize_megatron(
             sequence_length = (
                 args.decoder_seq_length
                 if getattr(args, "decoder_tp_comm_overlap", False)
-                else data_sequence_length(cfg, args)
+                else cfg.model.transformer.max_seq_length_per_sample
             )
             _initialize_tp_communicators(
                 transformer_config,

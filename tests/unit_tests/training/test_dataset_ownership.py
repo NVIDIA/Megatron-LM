@@ -624,6 +624,32 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
         cfg.validate()
 
 
+def test_the_container_writes_the_sample_length_into_the_model_section(
+    container_factory, monkeypatch
+):
+    """model.transformer.max_seq_length_per_sample is the dataset's sequence_length: an explicit
+    different value is rejected at validation, an unset one is written at finalize(); the
+    launcher's derivation and the data factory agree on --seq-length."""
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout()
+    assert cfg.model.transformer.max_seq_length_per_sample is None
+    cfg.validate()
+    cfg.finalize()
+    assert cfg.model.transformer.max_seq_length_per_sample == 64
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(max_seq_length_per_sample=32)
+    with pytest.raises(ValueError, match="max_seq_length_per_sample=32 disagrees"):
+        cfg.validate()
+    cfg.model.transformer.max_seq_length_per_sample = 64  # the launcher's value agrees
+    cfg.validate()
+    args = _validated(["--seq-length", "48", "--max-position-embeddings", "48", "--mock-data"])
+    cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
+    assert cfg.model.transformer.max_seq_length_per_sample == 48
+    assert cfg.data.dataset.sequence_length == 48
+    cfg.validate()
+
+
 # Serialization and loading.
 
 
@@ -764,9 +790,10 @@ def test_set_global_variables_finalizes_a_dataset_section(
 
 
 def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
-    """dummy_train_step (the skip-iteration path) runs for any container: the batch flags and the
-    data length come from the data section, the model-parallel values from the model section;
-    the poisoned namespace shows which source won."""
+    """dummy_train_step (the skip-iteration path) runs for any container: the batch flags come
+    from the data section, the model-parallel values and the per-sample length (the dataset's,
+    written by the container) from the model section; the poisoned namespace shows which source
+    won."""
     from megatron.training import training
     from megatron.training.config import DataConfig
 
@@ -793,7 +820,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     monkeypatch.setattr(training.mpu, "is_pipeline_first_stage", lambda: True)
     monkeypatch.setattr(training.mpu, "is_pipeline_last_stage", lambda: True)
     args = SimpleNamespace(  # poisoned wherever the data section or the model section rules
-        seq_length=64,
+        seq_length=999,
         context_parallel_size=3,
         pipeline_model_parallel_size=5,
         dynamic_context_parallel=True,
@@ -809,11 +836,12 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         pipeline_model_parallel_size=4,
         dynamic_context_parallel=False,
         sequence_packing_scheduler=None,
+        max_seq_length_per_sample=64,  # the launcher's --seq-length
     )
 
     # A loader-only section (an entry point whose datasets come from its own callbacks): the
-    # length comes from the arguments, the flags are the plain-GPT ones whatever args.sft says,
-    # the model-parallel values are the model section's.
+    # length is the model section's per-sample value, the flags are the plain-GPT ones whatever
+    # args.sft says, the model-parallel values are the model section's.
     monkeypatch.setattr(
         training,
         "get_run_config",
@@ -827,7 +855,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     assert kw["seq_length"] == 64 and kw["micro_batch_size"] == 3
     assert kw["has_cu_seqlens"] is False and kw["create_attention_mask_in_dataloader"] is True
 
-    # A dataset section and a model section: the section's flags and length, the model's values.
+    # A dataset section and a model section: the section's flags, the model's values and length.
     dataset = GPTDatasetConfig(
         sequence_length=16,
         random_seed=1,
@@ -842,6 +870,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         pipeline_model_parallel_size=1,
         dynamic_context_parallel=True,
         sequence_packing_scheduler=None,
+        max_seq_length_per_sample=16,  # what the container writes from the dataset
     )
     monkeypatch.setattr(
         training,
@@ -1003,19 +1032,21 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
     cfg.finalize()
 
 
-def test_the_loop_reads_the_data_length_from_the_section(container_factory, monkeypatch):
-    """Three different numbers: the dataset's sequence_length (what the loop uses), a stale
-    args.seq_length (never read when the section has a dataset) and the model capacity. The
-    calculator and the OTel resource attributes receive the dataset's; a loader-only section
-    falls back to the namespace."""
-    from megatron.training.config.compat import data_sequence_length
-
+def test_the_loop_reads_the_sample_length_the_container_wrote(container_factory, monkeypatch):
+    """Three different numbers: the dataset's sequence_length (what the loop runs at), a stale
+    args.seq_length (never read) and the model capacity. The container writes the dataset's
+    length into model.transformer.max_seq_length_per_sample at finalize(); the calculator and
+    the OTel resource attributes read it there. A loader-only section carries the launcher's
+    value (--seq-length, through model_config_from_args), and nothing reads the namespace."""
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     args, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
     args.rank = 0  # the calculator takes the rank from the namespace
     cfg.model = _layout()
     cfg.model.seq_length = 128
+    cfg.validate()
+    cfg.finalize()
+    assert cfg.model.transformer.max_seq_length_per_sample == 16
     args.seq_length = 64  # stale, must not be read
-    assert data_sequence_length(cfg, args) == 16
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
     calls = []
@@ -1034,26 +1065,29 @@ def test_the_loop_reads_the_data_length_from_the_section(container_factory, monk
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 16
     del args.seq_length  # a GPT run never needs it
-    assert data_sequence_length(cfg, args) == 16
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 16
-    # A loader-only section: the namespace is the source (the callback entry points).
-    args, loader_only = container_factory(["--seq-length", "64"])
+    # A loader-only section (the callback entry points): the model section the builder derives
+    # from the arguments carries --seq-length; the namespace is not read afterwards.
+    args = _validated(["--seq-length", "64", "--max-position-embeddings", "64"])
     args.rank = 0
+    loader_only = pretrain_cfg_container_from_args(args)
+    assert loader_only.data.dataset is None
+    assert loader_only.model.transformer.max_seq_length_per_sample == 64
+    args.seq_length = 999  # stale
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
-    assert data_sequence_length(loader_only, args) == 64
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 64
-    args.seq_length = None
+    loader_only.model.transformer.max_seq_length_per_sample = None
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
 def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point):
-    """The three scripts' get_batch read the batch flags and the data length from the section and
-    the model-parallel values from the model section; every data-owned value on args is poisoned
-    and must not surface in the captured call."""
+    """The three scripts' get_batch read the batch flags from the section and the model-parallel
+    values and the per-sample length from the model section; every data-owned value on args is
+    poisoned and must not surface in the captured call."""
     from megatron.training.config import DataConfig
 
     if entry_point == "gpt":
@@ -1084,6 +1118,7 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
         attention_cp_layout="zigzag",
         sequence_parallel=False,
         tensor_model_parallel_size=1,
+        max_seq_length_per_sample=16,  # what the container writes from the dataset
     )
     cfg = SimpleNamespace(
         model=SimpleNamespace(transformer=transformer),
@@ -1193,7 +1228,12 @@ def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, l
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
-    cfg = SimpleNamespace(data=DataConfig(dataset=dataset), model=SimpleNamespace(seq_length=64))
+    cfg = SimpleNamespace(
+        data=DataConfig(dataset=dataset),
+        model=SimpleNamespace(
+            seq_length=64, transformer=SimpleNamespace(max_seq_length_per_sample=16)
+        ),
+    )
     cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32)
     tokens = torch.zeros((1, 16), dtype=torch.long)
     batch = (

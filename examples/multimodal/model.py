@@ -111,6 +111,10 @@ def model_provider(
     vision_model_type = args.vision_model_type
 
     base_config = deepcopy(config if config is not None else cfg.model.transformer)
+    # The training loop reads the per-sample length from the run config, as it read
+    # args.seq_length before: keep it on the vision length set above. The model's copies,
+    # taken from base_config, keep the launcher's value.
+    cfg.model.transformer.max_seq_length_per_sample = num_image_embeddings
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = not getattr(args, "no_calculate_per_token_loss", False)

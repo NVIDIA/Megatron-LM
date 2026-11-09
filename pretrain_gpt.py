@@ -58,7 +58,6 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.config.compat import data_sequence_length
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
@@ -101,7 +100,6 @@ def get_batch(
     """Generate a batch."""
 
     cfg = get_run_config()
-    args = get_args()
 
     if cfg.model.transformer.sequence_packing_scheduler is not None:
         if pg_collection is None:
@@ -148,7 +146,8 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
-    seq_length = data_sequence_length(cfg, args)  # the data length, for the batch built here
+    # The per-sample length (--seq-length); the container keeps it equal to the dataset's.
+    seq_length = cfg.model.transformer.max_seq_length_per_sample
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -321,7 +320,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model (GPTModel): The GPT Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
-    args = get_args()
     cfg = get_run_config()
     timers = get_timers()
 
@@ -389,7 +387,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=dynamic_cp_group,
-                    tokens_per_sample=data_sequence_length(get_run_config(), args),
+                    tokens_per_sample=cfg.model.transformer.max_seq_length_per_sample,
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)

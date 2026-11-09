@@ -293,7 +293,11 @@ def test_distributed_training_services_require_explicit_opt_in(
     if native_model:
         run_config.model = GPTModelConfig(
             transformer=TransformerConfig(
-                num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
+                num_layers=4,
+                hidden_size=128,
+                num_attention_heads=8,
+                tp_comm_overlap=True,
+                max_seq_length_per_sample=64,  # the training sequence length (--seq-length)
             ),
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},

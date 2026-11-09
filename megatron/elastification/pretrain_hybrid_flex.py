@@ -52,7 +52,6 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.config.compat import data_sequence_length
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_first_or_last_pipeline_stage
@@ -179,9 +178,9 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     cfg = get_run_config()
-    args = get_args()
     # The model section's transformer config (the container builder derives one from the
-    # arguments for this script); the batch flags and the data length come from the data section.
+    # arguments for this script): the parallel values and the per-sample length, which the
+    # container keeps equal to the dataset's; the batch flags come from the data section.
     config = cfg.model.transformer
     flags = cfg.data.batch_flags()
 
@@ -219,7 +218,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_size=cp_size,
         tp_rank=tp_rank,
         micro_batch_size=cfg.train.micro_batch_size,
-        seq_length=data_sequence_length(cfg, args),
+        seq_length=config.max_seq_length_per_sample,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
