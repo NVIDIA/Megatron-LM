@@ -1437,6 +1437,15 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
+    # clip_qk reads the maximum attention logits that only TEDotProductAttention records, which
+    # the transformer_engine and inference_optimized layer specs use.
+    if (args.qk_clip or args.log_max_attention_logit) and args.transformer_impl == "local":
+        raise ValueError(
+            "--qk-clip and --log-max-attention-logit need the maximum attention logits that only "
+            "Transformer Engine attention records; they are not supported with "
+            "--transformer-impl local."
+        )
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
