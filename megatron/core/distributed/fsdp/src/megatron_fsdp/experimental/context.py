@@ -23,7 +23,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import PrefetchOrder, GradientSyncMode, RuntimePolicy
+from .runtime_policy import PrefetchOrder, GradientFinalizationMode, RuntimePolicy
 
 
 class FsdpContext:
@@ -34,7 +34,7 @@ class FsdpContext:
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
     # Outer reduction and completion-wait behavior, scoped by finalize_gradients().
-    grad_sync_mode: GradientSyncMode
+    grad_sync_mode: GradientFinalizationMode
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
@@ -180,13 +180,13 @@ class FsdpContext:
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
         if (
-            self.grad_sync_mode is not GradientSyncMode.REDUCE_OUTER_AND_WAIT
+            self.grad_sync_mode is not GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
             or self._post_backward_hook_registered
         ):
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use RuntimePolicy(grad_sync_mode=GradientSyncMode.REDUCE_OUTER) "
+            "Use RuntimePolicy(grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
@@ -218,7 +218,7 @@ class FsdpContext:
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if self.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT:
+        if self.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 

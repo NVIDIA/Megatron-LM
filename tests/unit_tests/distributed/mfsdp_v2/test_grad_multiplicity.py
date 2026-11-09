@@ -13,7 +13,7 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientSyncMode,
+    GradientFinalizationMode,
     Placements,
     RuntimePolicy,
     SchedulePolicy,
@@ -31,7 +31,7 @@ def _sharded_unit(setup, model, grad_accumulation_count):
     with fully_shard_context(
         FsdpContext(
             device=setup.device,
-            runtime_policy=RuntimePolicy(grad_sync_mode=GradientSyncMode.REDUCE_OUTER),
+            runtime_policy=RuntimePolicy(grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER),
         )
     ):
         fully_shard(

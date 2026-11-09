@@ -28,7 +28,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .module import FsdpModule
 from .placement import ShardLayout
-from .runtime_policy import GradientSyncMode
+from .runtime_policy import GradientFinalizationMode
 from .schedule_policy import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
@@ -196,7 +196,8 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 
 @contextmanager
 def finalize_gradients(
-    context: FsdpContext, mode: GradientSyncMode = GradientSyncMode.REDUCE_OUTER_AND_WAIT
+    context: FsdpContext,
+    mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT,
 ) -> Iterator[None]:
     """Scope outer reduction and completion-wait behavior for backward calls.
 

@@ -15,7 +15,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientSyncMode,
+    GradientFinalizationMode,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -296,7 +296,9 @@ def test_rejects_shared_context_with_automatic_grad_wait(
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
-        with pytest.raises(ValueError, match="grad_sync_mode=GradientSyncMode.REDUCE_OUTER"):
+        with pytest.raises(
+            ValueError, match="grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER"
+        ):
             FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -308,7 +310,7 @@ def test_rejects_shared_context_with_automatic_grad_wait(
                 module=layer,
                 pg_collection=process_group_collection,
             )
-        assert context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT
+        assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
         assert not isinstance(layer, FsdpModule)
 
 

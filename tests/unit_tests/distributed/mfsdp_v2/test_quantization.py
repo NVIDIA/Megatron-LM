@@ -17,7 +17,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientSyncMode,
+    GradientFinalizationMode,
     Placements,
     SchedulePolicy,
     finalize_gradients,
@@ -242,9 +242,9 @@ def _check_mxfp8_mlp_matches_reference(
                 with finalize_gradients(
                     context,
                     mode=(
-                        GradientSyncMode.REDUCE_OUTER_AND_WAIT
+                        GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
                         if index == num_microbatches - 1
-                        else GradientSyncMode.SKIP_OUTER
+                        else GradientFinalizationMode.SKIP_OUTER
                     ),
                 ):
                     with te.autocast(recipe=recipe):

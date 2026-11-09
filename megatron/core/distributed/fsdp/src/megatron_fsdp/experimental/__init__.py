@@ -20,13 +20,13 @@ from .dbuffer import DBuffer
 from .fully_shard import Placements, finalize_gradients, fully_shard, fully_shard_context
 from .optimizer import fully_shard_optimizer, init_optimizer_state
 from .placement import ShardLayout
-from .runtime_policy import PrefetchOrder, GradientSyncMode, RuntimePolicy
+from .runtime_policy import PrefetchOrder, GradientFinalizationMode, RuntimePolicy
 from .schedule_policy import SchedulePolicy
 
 __all__ = [
     "DBuffer",
     "FsdpContext",
-    "GradientSyncMode",
+    "GradientFinalizationMode",
     "Placements",
     "PrefetchOrder",
     "RuntimePolicy",

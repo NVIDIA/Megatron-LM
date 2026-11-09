@@ -275,7 +275,7 @@ context = FsdpContext(
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
         overlap_allgather_reduction=False,
-        grad_sync_mode=GradientSyncMode.REDUCE_OUTER,
+        grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER,
     ),
 )
 with fully_shard_context(context):
@@ -284,9 +284,9 @@ with fully_shard_context(context):
 
 `device` and the construction-only `parameter_to_owner` map remain separate
 `FsdpContext` arguments. The default `grad_sync_mode` is
-`GradientSyncMode.REDUCE_OUTER_AND_WAIT`. Runtime-policy booleans default to `False`,
+`GradientFinalizationMode.REDUCE_OUTER_AND_WAIT`. Runtime-policy booleans default to `False`,
 except `overlap_allgather_reduction`, which defaults to `True`. With
-`GradientSyncMode.REDUCE_OUTER`, call `context.finish_grad_sync()` after all backward
+`GradientFinalizationMode.REDUCE_OUTER`, call `context.finish_grad_sync()` after all backward
 work, including `backward_dw()`, and before the optimizer step.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
@@ -295,7 +295,7 @@ work, including `backward_dw()`, and before the optimizer step.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
 - Scope the gradient synchronization mode with
-  `with finalize_gradients(context, mode=GradientSyncMode.SKIP_OUTER):` around forward
+  `with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):` around forward
   and backward. `SKIP_OUTER` skips outer reduction and the automatic wait during
   accumulation; inner reduction and weight cleanup still run. On the last backward
   before the optimizer step, `REDUCE_OUTER` launches outer reduction and leaves the

@@ -18,7 +18,7 @@ import enum
 from dataclasses import dataclass
 
 
-class GradientSyncMode(enum.Enum):
+class GradientFinalizationMode(enum.Enum):
     """Control outer reduction and the completion wait; inner reduction always runs."""
 
     SKIP_OUTER = enum.auto()
@@ -58,6 +58,6 @@ class RuntimePolicy:
     use_symmetric_memory: bool = False
     overlap_allgather_reduction: bool = True
     overlap_outer_communication: bool = False
-    grad_sync_mode: GradientSyncMode = GradientSyncMode.REDUCE_OUTER_AND_WAIT
+    grad_sync_mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION

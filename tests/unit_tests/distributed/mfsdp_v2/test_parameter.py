@@ -10,7 +10,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientSyncMode,
+    GradientFinalizationMode,
     Placements,
     finalize_gradients,
     fully_shard,
@@ -269,9 +269,9 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
             with finalize_gradients(
                 context,
                 mode=(
-                    GradientSyncMode.REDUCE_OUTER_AND_WAIT
+                    GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
                     if is_last
-                    else GradientSyncMode.SKIP_OUTER
+                    else GradientFinalizationMode.SKIP_OUTER
                 ),
             ):
                 model(torch.ones(2, 4, device=device)).sum().backward()

@@ -18,7 +18,7 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientSyncMode,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
@@ -264,7 +264,8 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
 
 
 @pytest.mark.parametrize(
-    "grad_sync_mode", [GradientSyncMode.REDUCE_OUTER_AND_WAIT, GradientSyncMode.REDUCE_OUTER]
+    "grad_sync_mode",
+    [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER],
 )
 def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     distributed_setup, monkeypatch, grad_sync_mode
@@ -283,13 +284,13 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
 
-    with finalize_gradients(context, mode=GradientSyncMode.SKIP_OUTER):
+    with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
 
     model(torch.ones(2, 4, device=device)).sum().backward()
 
-    if grad_sync_mode is GradientSyncMode.REDUCE_OUTER:
+    if grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER:
         finish_grad_sync.assert_not_called()
         context.finish_grad_sync()
     finish_grad_sync.assert_called_once_with()
@@ -436,18 +437,18 @@ def test_finalize_gradients_scopes_context(distributed_setup):
         for layer in model:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
-    with finalize_gradients(context, mode=GradientSyncMode.SKIP_OUTER):
-        assert context.grad_sync_mode is GradientSyncMode.SKIP_OUTER
-        with finalize_gradients(context, mode=GradientSyncMode.REDUCE_OUTER):
-            assert context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER
+    with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):
+        assert context.grad_sync_mode is GradientFinalizationMode.SKIP_OUTER
+        with finalize_gradients(context, mode=GradientFinalizationMode.REDUCE_OUTER):
+            assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER
             with pytest.raises(RuntimeError, match="backward failed"):
                 with finalize_gradients(context):
-                    assert context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT
+                    assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
                     raise RuntimeError("backward failed")
-            assert context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER
-        assert context.grad_sync_mode is GradientSyncMode.SKIP_OUTER
+            assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER
+        assert context.grad_sync_mode is GradientFinalizationMode.SKIP_OUTER
 
-    assert context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT
+    assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
@@ -479,6 +480,6 @@ def test_delayed_wgrad_requires_explicit_grad_wait(distributed_setup):
     model = te.Linear(16, 16, device=device, delay_wgrad_compute=True)
     with (
         fully_shard_context(FsdpContext(device=device)),
-        pytest.raises(ValueError, match="grad_sync_mode=GradientSyncMode.REDUCE_OUTER"),
+        pytest.raises(ValueError, match="grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER"),
     ):
         fully_shard(model, mesh=mesh, placements=_default_placements())
