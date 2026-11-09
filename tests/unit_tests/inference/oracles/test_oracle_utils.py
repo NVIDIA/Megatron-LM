@@ -14,6 +14,8 @@ import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
 # ---------------------------------------------------------------------------------------------
 # fp64 references
 # ---------------------------------------------------------------------------------------------
@@ -144,11 +146,22 @@ def test_floor_covers_exact_trusted_results():
         ou.assert_close_to_reference(everywhere, reference, trusted)
 
 
-def test_ulp():
-    x = torch.tensor([1.0, 1.5, 2.0, -3.0, 0.0, 1e-40], dtype=torch.float64)
+@pytest.mark.parametrize("device", DEVICES)
+def test_ulp(device):
+    x = torch.tensor([1.0, 1.5, 2.0, -3.0, 0.0, 1e-40], dtype=torch.float64, device=device)
     expected = [2**-7, 2**-7, 2**-6, 2**-6, 0.0, 2**-133]
     assert ou.ulp(x, torch.bfloat16).tolist() == expected
     assert ou.ulp(x[:1], torch.float32).item() == 2**-23
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_pow2_is_exact(device):
+    # Exact on every device, unlike torch.ldexp on CUDA; grids built from it are exact too.
+    e = torch.arange(-1022, 1024, device=device)
+    assert ou.pow2(e).tolist() == [2.0**k for k in range(-1022, 1024)]
+    x = ou.dyadic_tensor((4096,), exponents=(-60, 60), dtype=torch.float32, device=device)
+    m, k = torch.frexp(x.double())
+    assert torch.equal((m * 2**5).frac(), torch.zeros_like(m))  # at most 4 mantissa bits
 
 
 def test_non_finite_values_must_match_the_reference():
@@ -326,8 +339,6 @@ def test_pairwise_cases_cover_every_pair():
 # Memory safety
 # ---------------------------------------------------------------------------------------------
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int32, torch.float8_e4m3fn])
@@ -441,6 +452,45 @@ def test_require_sm_skips_or_fails(monkeypatch):
     monkeypatch.setenv(ou.TARGET_SM_ENV, "10")
     with pytest.raises(pytest.fail.Exception, match="targets sm_10x but the device is sm_9x"):
         ou.require_sm(ou.BLACKWELL)
+
+
+def test_use_local_rank_device(monkeypatch):
+    chosen = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "set_device", chosen.append)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) == 3
+    assert ou.use_local_rank_device({"LOCAL_RANK": "11"}) == 3  # more ranks than GPUs: wrap
+    assert ou.use_local_rank_device({}) is None  # not under torch.distributed.run
+    assert chosen == [3, 3]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) is None
+    assert chosen == [3, 3]
+
+
+def test_installed_version():
+    assert ou.installed_version("pytest") is not None
+    assert ou.installed_version("no-such-distribution-for-oracles") is None
+
+
+def test_xfail_upstream_is_strict_and_bounded_by_version(monkeypatch):
+    def mark_for(installed):
+        monkeypatch.setattr(ou, "installed_version", lambda _: installed and ou.Version(installed))
+        return ou.xfail_upstream(
+            "X-N1", "pkg", fixed_after="0.7.2.post1", reason="audit/x.diff", raises=AssertionError
+        ).mark
+
+    for installed, expected in (("0.7.2", True), ("0.7.2.post1", True), ("0.7.3", False)):
+        mark = mark_for(installed)
+        assert mark.name == "xfail" and mark.args == (expected,)
+        assert mark.kwargs["strict"] is True and mark.kwargs["raises"] is AssertionError
+        assert mark.kwargs["reason"] == "X-N1, upstream in pkg <= 0.7.2.post1: audit/x.diff"
+    assert mark_for(None).args == (False,)  # not installed: the test's own check decides
+
+
+def test_drain_cuda_launch_error_without_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ou.drain_cuda_launch_error() is None
 
 
 @pytest.mark.launch_on_gb200
