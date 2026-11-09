@@ -34,15 +34,12 @@ def _all_partials(local, group):
     return torch.stack(parts)
 
 
-def _left_fold(parts, exact=False):
-    """Reference: ((p_0 + p_1) + p_2) + ... in fp32, one rounding to the input dtype.
-
-    exact=True ("multimem" collective): fp64 accumulation, one rounding to fp32, then the cast.
-    """
-    acc = parts[0].double() if exact else parts[0].float()
+def _left_fold(parts):
+    """Reference: ((p_0 + p_1) + p_2) + ... in fp32, one rounding to the input dtype."""
+    acc = parts[0].float()
     for r in range(1, parts.shape[0]):
-        acc = acc + (parts[r].double() if exact else parts[r].float())
-    return acc.float().to(parts.dtype)
+        acc = acc + parts[r].float()
+    return acc.to(parts.dtype)
 
 
 def _partials(shape, dtype, seed):
@@ -77,25 +74,23 @@ class TestOrderedReduce:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("exact", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("rows,hidden", [(4, 2688), (1024, 8192)])
-    def test_reduce_scatter_matches_left_fold(self, dtype, rows, hidden, exact):
+    def test_reduce_scatter_matches_left_fold(self, dtype, rows, hidden):
         x = _partials((rows, hidden), dtype, seed=rows)
-        ref = _left_fold(_all_partials(x, self.group), exact)
-        out = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+        ref = _left_fold(_all_partials(x, self.group))
+        out = orr.ordered_reduce_scatter(x, self.group)
         k = rows // TP
         rank = self.group.rank()
         assert torch.equal(_bits(out), _bits(ref[rank * k : (rank + 1) * k]))
 
-    @pytest.mark.parametrize("exact", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("shape", [(1, 2688), (3, 1, 4096), (7, 100), (128, 8192)])
-    def test_all_reduce_matches_left_fold(self, dtype, shape, exact):
+    def test_all_reduce_matches_left_fold(self, dtype, shape):
         x = _partials(shape, dtype, seed=len(shape))
-        ref = _left_fold(_all_partials(x, self.group), exact)
+        ref = _left_fold(_all_partials(x, self.group))
         x_before = x.clone()
-        out = orr.ordered_all_reduce(x, self.group, exact=exact)
+        out = orr.ordered_all_reduce(x, self.group)
         assert out.shape == x.shape
         assert torch.equal(_bits(out), _bits(ref))
         assert torch.equal(x, x_before)
@@ -129,8 +124,7 @@ class TestOrderedReduce:
             mappings.reduce_from_tensor_model_parallel_region(y, self.group).sum().backward()
             assert torch.equal(y.grad, torch.ones_like(y))
 
-    @pytest.mark.parametrize("exact", [False, True])
-    def test_symmetric_memory_paths_match_all_to_all(self, exact, monkeypatch):
+    def test_symmetric_memory_paths_match_all_to_all(self, monkeypatch):
         """The inference (symmetric-memory pull) path gives the all-to-all path's bits."""
         buf, hdl = _symm_buffer(self.group, 64 << 20)
         if hdl is None:
@@ -144,10 +138,10 @@ class TestOrderedReduce:
                 sin = buf[off : off + nbytes].view(dtype).view(x.shape)
                 sin.copy_(x)
                 rs = torch.empty(rows // TP, hidden, dtype=dtype, device="cuda")
-                orr.symm_ordered_reduce_scatter(sin, hdl, rs, exact=exact)
+                orr.symm_ordered_reduce_scatter(sin, hdl, rs)
                 with monkeypatch.context() as m:  # no staging -> all-to-all + fold
                     m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
-                    ref_rs = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                    ref_rs = orr.ordered_reduce_scatter(x, self.group)
                 assert torch.equal(_bits(rs), _bits(ref_rs))
 
     def test_inference_embedding_reduce_scatter_takes_a_view(self):
@@ -169,8 +163,7 @@ class TestOrderedReduce:
             want = orr.ordered_reduce_scatter(x.contiguous(), self.group)
         assert torch.equal(_bits(got), _bits(want))
 
-    @pytest.mark.parametrize("exact", [False, True])
-    def test_symmetric_push_matches_all_to_all(self, exact, monkeypatch):
+    def test_symmetric_push_matches_all_to_all(self, monkeypatch):
         """The learner's symmetric-memory push RS gives the all-to-all path's bits.
 
         Sizes span one to several staging iterations per block and a ragged tail.
@@ -180,12 +173,12 @@ class TestOrderedReduce:
         for dtype in (torch.bfloat16, torch.float32):
             for rows, hidden in ((4, 2688), (12, 1000), (2048, 8192), (8192, 4096)):
                 x = _partials((rows, hidden), dtype, seed=rows + hidden + 1)
-                push = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                push = orr.ordered_reduce_scatter(x, self.group)
                 with monkeypatch.context() as m:  # no staging -> all-to-all + fold
                     m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
-                    a2a = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                    a2a = orr.ordered_reduce_scatter(x, self.group)
                 assert torch.equal(_bits(push), _bits(a2a))
-                ref = _left_fold(_all_partials(x, self.group), exact)
+                ref = _left_fold(_all_partials(x, self.group))
                 k = rows // TP
                 rank = self.group.rank()
                 assert torch.equal(_bits(push), _bits(ref[rank * k : (rank + 1) * k]))

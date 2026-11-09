@@ -56,12 +56,11 @@ class TestOrderedReduceKernels:
         return get_tensor_model_parallel_group_if_none(tp_group=None)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("exact", [False, True], ids=["ordered", "multimem"])
-    def test_ordered_fold_replays(self, dtype, exact):
+    def test_ordered_fold_replays(self, dtype):
         seeded()
         parts = _mixed_magnitudes((8, TOKENS, HIDDEN), 0).to(dtype)
         assert_replays_bit_exact(
-            lambda p: orr.ordered_fold(p, exact=exact),
+            lambda p: orr.ordered_fold(p),
             (parts,),
             backward=False,
             contention=True,

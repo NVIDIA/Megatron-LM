@@ -24,10 +24,10 @@ def _bits(t):
     return t.contiguous().view(torch.uint8)
 
 
-def _canonical(x_full, w_full, num_shards, exact=False):
+def _canonical(x_full, w_full, num_shards):
     """The defined value: shard GEMM outputs folded in shard order, one rounding."""
     parts = orr.row_parallel_shard_partials(x_full, w_full, num_shards)
-    return orr.ordered_fold(parts.contiguous(), exact=exact)
+    return orr.ordered_fold(parts.contiguous())
 
 
 def _inputs(m, k, n, seed):
