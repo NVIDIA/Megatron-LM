@@ -127,7 +127,7 @@ class PartitionAdapter:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout=self.cfg.linear_cp_layout,
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=self.cfg.cp_group,
             additional_layouts=additional_layouts,
             sequence_parallel=self.cfg.seq_parallel,

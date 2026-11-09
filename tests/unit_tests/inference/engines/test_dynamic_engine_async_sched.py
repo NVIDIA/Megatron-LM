@@ -30,10 +30,12 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic.loop import _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -72,6 +74,7 @@ def _make_engine(
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
+        max_prefill_tokens=8,
         chunked_prefill_request_id=-1,
     )
     model_config = SimpleNamespace(
@@ -323,11 +326,9 @@ def test_async_forward_routes_one_controller_iteration(
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_push"
+            "megatron.core.inference.engines.dynamic.loop.nvtx_range_push"
         ) as nvtx_range_push,
-        mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"
-        ) as nvtx_range_pop,
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop") as nvtx_range_pop,
     ):
         result, context_state, _ = asyncio.run(engine.async_forward())
 
@@ -402,8 +403,8 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
     }
 
     with (
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_push"),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_push"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop"),
     ):
         asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
 
@@ -681,7 +682,11 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "mtp-depth-one",
         "speculation:mtp-depth-one",
-        config={"num_speculative_tokens": 1},
+        config={
+            "num_speculative_tokens": 1,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+        },
         signals=("mtp",),
     ),
     _pair_scenario(
@@ -693,6 +698,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
             "materialize_only_last_token_logits": False,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
         },
         sampling=(
             {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
@@ -775,8 +782,14 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
     _pair_scenario(
         "recompute-suspend-resume",
         "kv:recompute",
-        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
-        signals=("recompute", "suspend-resume"),
+        config={
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=({"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 3},),
+        signals=("recompute", "suspend-resume", "full-logits", "logprobs", "top-n"),
     ),
 )
 
@@ -1119,6 +1132,39 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     context = env.engine.context
     _instrument_async_phases(controller, runtime)
 
+    if "mtp" in scenario.signals and "cuda-graph" in scenario.signals:
+        model = controller._unwrapped_model
+        manager = getattr(model, "_mtp_cudagraph_manager", None)
+        assert manager is not None
+        wrapped_runners = set()
+        original_get_runner = manager.get_cudagraph_runner
+
+        def traced_get_runner(*args, **kwargs):
+            runner = original_get_runner(*args, **kwargs)
+            if id(runner) not in wrapped_runners:
+                original_replay = runner.replay_graph_capture
+
+                def traced_replay(*replay_args, _real=original_replay, **replay_kwargs):
+                    runtime["mtp-cuda-graph-replays"] += 1
+                    return _real(*replay_args, **replay_kwargs)
+
+                runner.replay_graph_capture = traced_replay
+                wrapped_runners.add(id(runner))
+            return runner
+
+        manager.get_cudagraph_runner = traced_get_runner
+        original_mtp = model.compute_mtp_single_step
+
+        def traced_mtp(*args, **kwargs):
+            result = original_mtp(*args, **kwargs)
+            eager = kwargs.get("eager", False)
+            cache_key = kwargs.get("cache_key")
+            if context.using_cuda_graph_this_step() and not eager and cache_key is not None:
+                runtime["mtp-cuda-graph-invocations"] += 1
+            return result
+
+        model.compute_mtp_single_step = traced_mtp
+
     original_forward = controller._dynamic_step_forward_logits
 
     def traced_forward(*args, **kwargs):
@@ -1262,14 +1308,17 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
     controller._compact_async_sched_forward = traced_compact
 
-    allocator = context.kv_block_allocator
-    original_deregister = allocator._deregister_blocks
+    # Deregistration lives on the allocator's per-block prefix-cache state, which only
+    # exists when prefix caching is on.
+    pc_state = context.kv_block_allocator.pc_state
+    if pc_state is not None:
+        original_deregister = pc_state.deregister_blocks
 
-    def traced_deregister(block_ids):
-        runtime["prefix-blocks-deregistered"] += block_ids.numel()
-        return original_deregister(block_ids)
+        def traced_deregister(block_ids):
+            runtime["prefix-blocks-deregistered"] += block_ids.numel()
+            return original_deregister(block_ids)
 
-    allocator._deregister_blocks = traced_deregister
+        pc_state.deregister_blocks = traced_deregister
 
     if "fused-rope" in scenario.signals:
         original_fused_rope = context.apply_fused_qk_rotary_emb
@@ -1588,7 +1637,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "last-logits" in signals:
             assert context.config.materialize_only_last_token_logits
             assert runtime["last-logits-forward"] == runtime["model-forward"]
-            assert runtime["logits-dtype:torch.bfloat16"] > 0
+            assert runtime["logits-dtype:torch.float32"] > 0
         if "events" in signals:
             for request in env.requests:
                 event_types = [event.type for event in request.events]
@@ -1752,6 +1801,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "mtp" in signals:
             assert env.engine._spec_steps > 0
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+            if "cuda-graph" in signals:
+                assert runtime["mtp-cuda-graph-invocations"] > 0
+                assert runtime["mtp-cuda-graph-replays"] == runtime["mtp-cuda-graph-invocations"]
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
@@ -2056,11 +2108,11 @@ def test_async_reset_clears_pending_logits():
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
@@ -2098,7 +2150,7 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+        mock.patch("megatron.core.inference.engines.dynamic.engine.InferenceMode.unset_active"),
     ):
         engine.suspend()
 
@@ -2182,7 +2234,10 @@ def test_post_process_enforces_per_request_logprob_policy():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
     engine.requests = {
-        request.request_id: SimpleNamespace(record=[request]) for request in requests
+        request.request_id: SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+        for request in requests
     }
     engine.finished_request_count = 0
     engine.evicted_request_count = 0

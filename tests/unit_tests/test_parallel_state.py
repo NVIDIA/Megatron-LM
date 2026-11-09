@@ -592,8 +592,7 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
 
 @pytest.mark.parametrize(
-    "world_size, tp_size, cp_size, dp_size",
-    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
+    "world_size, tp_size, cp_size, dp_size", [(8, 1, 2, 4), (8, 1, 1, 8), (8, 2, 2, 2)]
 )
 def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
@@ -620,6 +619,8 @@ def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
         assert group.size() == group_size
         # distributed_timeout_minutes, not torch's default NCCL timeout (10 minutes)
         assert group._get_backend(torch.device("cuda")).options._timeout == timedelta(minutes=45)
+        tp_dp_cp_group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=group_size)
+        assert tp_dp_cp_group.size() == tp_size * group_size
 
     Utils.destroy_model_parallel()
 

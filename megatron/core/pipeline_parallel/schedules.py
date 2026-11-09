@@ -40,7 +40,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 try:
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
@@ -365,7 +364,9 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    if (hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None) or getattr(
+        config, '_hybrid_has_moe_layers', False
+    ):
         device = get_tensor_device(output_tensor)
         loss_scale = _get_moe_loss_scale(config, device)
         # Set the loss scale
@@ -391,10 +392,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            # TODO: This path assumes static CP across outstanding pipeline microbatches.
-            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
-            # changes, carry the scale per autograd context instead of via a
-            # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches
@@ -806,24 +803,6 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
-        )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            output_tensor_grad,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            first_val_step,
-            forward_only,
-            no_sync_func,
-            total_num_tokens,
-            check_first_val_step,
-            model_type,
         )
     else:
         with no_sync_func():
