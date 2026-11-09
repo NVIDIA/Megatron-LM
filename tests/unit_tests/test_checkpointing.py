@@ -1179,6 +1179,7 @@ def test_checkpoint_model_load_errors_propagate(
         args.save_tokenizer_assets = False
         set_args(args)
         model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+        sync_checkpoint_config(args)
         save_checkpoint(0, [model], None, None, 0)
         error = RuntimeError("checkpoint extra state could not be loaded")
         with mock.patch.object(model, "load_state_dict", side_effect=error):
