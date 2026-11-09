@@ -72,9 +72,68 @@ def experimental(request):
 
 
 @pytest.fixture
+def grouped_mlp_fusions(monkeypatch):
+    """Register supported TE grouped-MLP fusions with test-local state."""
+    from transformer_engine.pytorch.ops.fused import grouped_mlp
+    from transformer_engine.pytorch.ops.fuser import (
+        OperationFuser,
+        register_forward_backward_fusion,
+    )
+
+    checks = (
+        grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
+        grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
+        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+            # Older TE caches a disabled flag and omits registration during import.
+            # Re-evaluate its real support checks and keep registry changes test-local.
+            patch.setattr(
+                OperationFuser,
+                "forward_backward_fusion_functions",
+                list(OperationFuser.forward_backward_fusion_functions),
+            )
+            for check in checks:
+                check.cache_clear()
+            for cls, name, legacy_name in (
+                (grouped_mlp.GroupedMLP_CuTeGEMMGLU, "fuse_glu_ops", "fuse_ops"),
+                (
+                    grouped_mlp.GroupedMLP_CuTeGEMMUnary,
+                    "fuse_unary_activation_ops",
+                    "fuse_srelu_ops",
+                ),
+            ):
+                fuse = getattr(grouped_mlp, name, None)
+                if fuse is None:
+                    fuse = getattr(grouped_mlp, legacy_name)
+                if (
+                    cls.is_supported()
+                    and fuse not in OperationFuser.forward_backward_fusion_functions
+                ):
+                    register_forward_backward_fusion(fuse, prepend=True)
+            yield grouped_mlp
+    finally:
+        # Do not leave a cached True behind after restoring the original environment.
+        for check in checks:
+            check.cache_clear()
+
+
+@pytest.fixture
+def require_te_fused_srelu_mlp(grouped_mlp_fusions):
+    """Require real SReLU fusion after the shared TE setup."""
+    assert grouped_mlp_fusions.GroupedMLP_CuTeGEMMUnary.is_supported(), (
+        "TE fused SReLU grouped MLP remains unsupported after enabling fusion; "
+        "check GPU and cuDNN frontend/kernel support"
+    )
+
+
+@pytest.fixture
 def run_config(monkeypatch):
     """Provide a config owner for isolated training-runtime consumers."""
     from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.transformer import TransformerConfig
     from megatron.training import global_vars
     from megatron.training.config import (
         CheckpointConfig,
@@ -83,11 +142,16 @@ def run_config(monkeypatch):
         SchedulerConfig,
         TrainingConfig,
     )
+    from megatron.training.models import GPTModelConfig
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     container = PretrainConfigContainer(
         train=TrainingConfig(),
-        model=None,
+        model=GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+            vocab_size=128,
+        ),
         optimizer=OptimizerConfig(),
         scheduler=SchedulerConfig(),
         logger=LoggerConfig(),

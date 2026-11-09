@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import json
 import os
 import sys
@@ -127,6 +127,14 @@ class MegatronCheckpointLoaderBase:
 
         self._maybe_ensure_additional_required_arguments()
 
+    def build_model_config(self):
+        """Select the model family before initializing shared runtime services."""
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import BertModelConfig
+
+        config_cls = BertModelConfig if self.args.model_type == "BERT" else None
+        return model_config_from_args(self.margs, model_config_cls=config_cls)
+
     def initialize_megatron_env(self):
         """
         Initialize Megatron global variables and fused kernels.
@@ -140,7 +148,7 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        self.cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        self.cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
         set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
@@ -214,8 +222,11 @@ class MegatronCheckpointLoaderBase:
                 # Each time we load, we set counters to 0, pass None for optimizer/ LR
                 train_state.consumed_train_samples = 0
                 train_state.consumed_valid_samples = 0
-                self.margs.exit_on_missing_checkpoint = True
-                # Preserve training progress in the converted checkpoint.
+                # Preserve training progress in the converted checkpoint; a missing source
+                # checkpoint is an error.
+                from megatron.training.global_vars import get_run_config
+
+                get_run_config().checkpoint.exit_on_missing_checkpoint = True
                 load_checkpoint(model_list, None, None, restore_training_state=True)
 
                 # Validate that train/valid samples match across ranks
