@@ -2163,6 +2163,11 @@ def pretrain(
     callback_manager.callback_context.scheduler = opt_param_scheduler
     callback_manager.trigger("on_data_init_start")
 
+    if cfg_container.train.prewarm_gdp_kernels:
+        from megatron.training.startup_memory import prewarm_gdp_kernels
+
+        prewarm_gdp_kernels(model, args.seq_length, cfg_container.train.micro_batch_size)
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
