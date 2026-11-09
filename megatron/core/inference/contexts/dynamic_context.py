@@ -3693,10 +3693,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # this check. Without KV transfer, slots and rows must stay one-to-one.
         if self.is_hybrid_model:
             has_free_mamba_slot = self.mamba_metadata.mamba_state_free_slot_count > 0
-            assert self.kv_transfer_enabled or has_free_mamba_slot or not request_can_be_added, (
-                "A free request row has no free Mamba state slot, but only KV transfer "
-                "may hold slots outside request rows"
-            )
+            if not self.kv_transfer_enabled and request_can_be_added:
+                assert has_free_mamba_slot, (
+                    "A free request row has no free Mamba state slot, but only KV transfer "
+                    "may hold slots outside request rows"
+                )
             request_can_be_added &= has_free_mamba_slot
 
         if prefill_chunk_length is None:
