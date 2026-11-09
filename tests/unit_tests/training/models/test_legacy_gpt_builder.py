@@ -45,7 +45,8 @@ def _args(**overrides):
 
 @pytest.mark.parametrize("config_source", ["explicit", "args", "yaml"])
 @pytest.mark.parametrize("use_liger", [False, True])
-def test_dense_builder_norm_routing(use_liger, config_source):
+def test_dense_builder_norm_routing(use_liger, config_source, run_config):
+    run_config.tokenizer.padded_vocab_size = 128
     config = _config(use_liger=use_liger)
     args = _args(yaml_cfg="config.yaml" if config_source == "yaml" else None)
     block = TransformerBlockSubmodules(layer_specs=[], layer_norm=object)
@@ -65,6 +66,7 @@ def test_dense_builder_norm_routing(use_liger, config_source):
         )
 
     assert result is model.return_value
+    assert model.call_args.kwargs["vocab_size"] == 128
     if use_liger:
         layer_spec.assert_not_called()
         block_spec.assert_called_once_with(
@@ -104,7 +106,8 @@ def test_local_layer_helper_forwards_liger(use_liger):
 
 @pytest.mark.parametrize("use_liger", [False, True])
 @pytest.mark.parametrize("unsupported", ["experimental", "heterogeneous"])
-def test_default_spec_support_is_unchanged_without_liger(use_liger, unsupported):
+def test_default_spec_support_is_unchanged_without_liger(use_liger, unsupported, run_config):
+    run_config.tokenizer.padded_vocab_size = 128
     args = _args()
     config = _config(use_liger=use_liger)
     if unsupported == "experimental":
@@ -135,7 +138,8 @@ def test_liger_rejects_heterogeneous_config_without_args_path():
 
 
 @pytest.mark.parametrize("unsupported", ["experimental", "heterogeneous"])
-def test_custom_spec_owns_normalization(unsupported):
+def test_custom_spec_owns_normalization(unsupported, run_config):
+    run_config.tokenizer.padded_vocab_size = 128
     args = _args(spec="custom.spec")
     if unsupported == "experimental":
         args.experimental_attention_variant = "dsa"
@@ -153,7 +157,8 @@ def test_custom_spec_owns_normalization(unsupported):
     assert model.call_args.kwargs["transformer_layer_spec"] is import_spec.return_value
 
 
-def test_liger_empty_decoder_stage_forwards_norms_to_mtp():
+def test_liger_empty_decoder_stage_forwards_norms_to_mtp(run_config):
+    run_config.tokenizer.padded_vocab_size = 128
     config = _config(use_liger=True, mtp_num_layers=1)
     args = _args(mtp_num_layers=1)
     block = TransformerBlockSubmodules(layer_specs=[], layer_norm=object)
