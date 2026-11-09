@@ -126,8 +126,10 @@ def test_mxfp8_tensor_entry_points():
 def test_strided_input_is_quantized_or_rejected():
     """A strided [M, K] view is quantized by its values, or rejected; never misread.
 
-    Fails on main: ``mxfp8_quantize`` does not check contiguity and its kernel addresses row r
-    at ``r * K``, so a transposed view quantizes the wrong elements (suspected finding O2-N2).
+    Finding O2-N2: before #8357 (merged into main 2026-11-07), ``mxfp8_quantize`` did not check
+    contiguity and its kernel addresses row r at ``r * K``, so a transposed view quantized the
+    wrong elements. ``mxfp8_quantize_into`` now copies a non-contiguous input to contiguous
+    storage first, so this passes on main (``test_non_contiguous_inputs`` covers more layouts).
     """
     g = ou.make_generator()
     base = mx.mx_inputs(256, 128, torch.bfloat16, "wide", g).to(DEVICE)
