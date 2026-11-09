@@ -30,6 +30,10 @@ def pytest_configure(config):
 
 
 def pytest_runtest_setup(item):
+    # One GPU per rank when CI runs the bucket on every GPU, before anything here touches CUDA.
+    # Not in pytest_configure: pytest also loads this conftest in the buckets that ignore this
+    # directory's files, and their tests must keep their own device.
+    oracle_utils.use_local_rank_device()
     if item.get_closest_marker("large") and not oracle_utils.large_selected():
         pytest.skip("large test: opt in with -m large")
     path = Path(str(item.fspath))
@@ -46,3 +50,10 @@ def pytest_runtest_setup(item):
             pytest.skip(reason)
         if action == "fail":
             pytest.fail(reason, pytrace=False)
+
+
+def pytest_runtest_makereport(item, call):
+    # A test that raised (e.g. on an upstream kernel that fails to launch, xfail_upstream) must
+    # not leave that launch error pending: the next test's first kernel launch would report it.
+    if call.when == "call" and call.excinfo is not None:
+        oracle_utils.drain_cuda_launch_error()
