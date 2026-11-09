@@ -518,10 +518,9 @@ def validate_args(args, defaults={}):
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
 
-    if args.checkpoint_activations:
-        print_rank_0('--checkpoint-activations is no longer valid, use --recompute-activations, '
-                     'or, for more control, --recompute-granularity and --recompute-method.')
-        exit()
+    assert not args.checkpoint_activations, '--checkpoint-activations is no longer valid, ' \
+        'use --recompute-activations, or, for more control, --recompute-granularity and ' \
+        '--recompute-method.'
     del args.checkpoint_activations
 
     if args.recompute_activations:

@@ -304,6 +304,25 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
         validate_args(args)
 
 
+def test_removed_checkpoint_activations_flag_is_rejected(monkeypatch):
+    """validate_args should fail, not exit with status 0, on --checkpoint-activations."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--checkpoint-activations'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+
+    with pytest.raises(AssertionError, match="--checkpoint-activations is no longer valid"):
+        validate_args(args)
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
