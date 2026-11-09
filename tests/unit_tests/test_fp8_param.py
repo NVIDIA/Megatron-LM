@@ -81,6 +81,44 @@ def _gtp_grad_fence():
         wait_for_gtp_grad_reduction_on_current_stream()
 
 
+def _reuse_grad_buf_args(monkeypatch, fp8_recipe):
+    monkeypatch.setattr(sys, "argv", ["test_fp8_param.py"])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 512
+    args.seq_length = 512
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 1024
+    args.bf16 = True
+    args.use_distributed_optimizer = True
+    args.fp8 = "hybrid"
+    args.fp8_recipe = fp8_recipe
+    args.fp8_param_gather = True
+    args.reuse_grad_buf_for_mxfp8_param_ag = True
+    return args
+
+
+@pytest.mark.parametrize("fp8_recipe", ["delayed", "tensorwise", "blockwise"])
+def test_reuse_grad_buf_for_mxfp8_param_ag_rejects_other_fp8_recipes(monkeypatch, fp8_recipe):
+    args = _reuse_grad_buf_args(monkeypatch, fp8_recipe)
+
+    with pytest.raises(ValueError, match="requires --fp8-recipe mxfp8"):
+        validate_args(args)
+
+
+def test_reuse_grad_buf_for_mxfp8_param_ag_accepts_mxfp8(monkeypatch):
+    args = _reuse_grad_buf_args(monkeypatch, "mxfp8")
+
+    validated_args = validate_args(args)
+
+    assert validated_args.reuse_grad_buf_for_mxfp8_param_ag
+
+
 class TestFP8Param:
 
     def setup_method(self, method):

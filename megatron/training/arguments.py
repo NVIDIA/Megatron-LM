@@ -972,6 +972,19 @@ def validate_args(args, defaults={}):
     if args.fp4_param_gather and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
 
+    # The parameter all-gather through the gradient buffer only handles MXFP8 parameters.
+    # Megatron-FSDP turns the option off below.
+    if (
+        args.reuse_grad_buf_for_mxfp8_param_ag
+        and not args.use_megatron_fsdp
+        and args.fp8 is not None
+        and args.fp8_recipe != "mxfp8"
+    ):
+        raise ValueError(
+            "--reuse-grad-buf-for-mxfp8-param-ag requires --fp8-recipe mxfp8, "
+            f"got --fp8-recipe {args.fp8_recipe}."
+        )
+
     # FP4 requires TE >= 2.7.0.dev0
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
