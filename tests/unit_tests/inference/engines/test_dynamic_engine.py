@@ -51,6 +51,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
+from megatron.core.inference.disaggregation.transfer_backends.nixl import _HAVE_NIXL
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
@@ -1682,7 +1683,7 @@ class DynamicInferenceEngineTestBase:
 
     @classmethod
     @torch.inference_mode()
-    def _build_test_env(cls, test_config, engine_cls=DynamicInferenceEngine):
+    def _build_test_env(cls, test_config, engine_cls=None):
         clear_nvte_env_vars()
         set_rounder(4)
 
@@ -2027,6 +2028,8 @@ class DynamicInferenceEngineTestBase:
         delete_cuda_graphs()
 
         # Inference engine.
+        # Resolve the default at call time so real_engine's patch of this module applies.
+        engine_cls = engine_cls or DynamicInferenceEngine
         engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
@@ -4640,6 +4643,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_real_kv_handoff_streams_imported_decode_and_matches_greedy(self, kv_transport_backend):
         """Transfer real prompt KV by push and pull backends, then stream decode."""
+        if kv_transport_backend == "nixl" and not _HAVE_NIXL:
+            pytest.skip("NIXL is not installed")
         rank = torch.distributed.get_rank()
         config = DynamicEngineTestConfig(
             num_requests=0,
