@@ -256,11 +256,14 @@ class TestLoaderSettingsFromTheDataSection:
         config = GPTDatasetConfig(
             sequence_length=16, random_seed=1, tokenizer=tokenizer, context_parallel_size=1, **BOOLS
         )
+        # The sampler yields one micro-batch per data-parallel rank from world_size samples (the
+        # CI runs the data tests on eight ranks), so the mock dataset carries 2 * world_size.
+        n = 2 * Utils.world_size
         dataset = MockSFTDataset(
-            [np.array([1, 2, 3]), np.array([4, 5, 6])],
+            [np.array([1, 2, 3]) if i % 2 == 0 else np.array([4, 5, 6]) for i in range(n)],
             None,
-            np.array([0, 1]),
-            2,
+            np.arange(n),
+            n,
             Split.train,
             config,
         )
