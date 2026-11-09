@@ -207,7 +207,7 @@ def test_nan_propagates(clamp):
     with Triton's default ``propagate_nan=NONE`` (``maxnumf``), so NaN becomes 0. Fixed by the
     open PR #8955 (s4f-nan-relu), which changes ``_clamped_relu``.
     """
-    g = ou.make_generator()
+    g = ou.make_generator(device=DEVICE)
     x = squared_relu_inputs((3, 160), clamp, g).cpu()
     x[0, 3] = float("nan")
     x[2, 100:110] = float("nan")
