@@ -3,7 +3,7 @@
 """Oracle for the NVLS MoE dispatcher's combine: `_multimem_reduce_scatter_v_kernel`
 (megatron/core/inference/communication/torch_symm_triton/variable_collectives.py:153, launched by
 `multimem_reduce_scatter_v`, :250) and its batch-invariant alternative
-`_ordered_reduce_scatter_v_kernel` (megatron/core/inference/moe/batch_invariant.py:309, launched
+`_ordered_reduce_scatter_v_kernel` (megatron/core/inference/moe/batch_invariant.py:440, launched
 by `ordered_reduce_scatter_v`; the dispatcher picks it with batch_invariant_collective="ordered",
 token_dispatcher_inference.py:666-682). The ordered kernel's audit record is in family 02.
 
