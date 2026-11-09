@@ -22,8 +22,13 @@ from megatron.core.inference.config import (
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.headers import Headers, UnknownHeaderError
-from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    Status,
+    compute_block_hashes_batched,
+)
 from megatron.core.inference.routing import select_engine
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
@@ -218,6 +223,7 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
+        self.request_id_to_sampling_params = {}
         self.removed_engine_identities = set()
         self.client_request_to_request_id = {}
 
@@ -318,6 +324,7 @@ class DataParallelInferenceCoordinator:
 
     def _forget_client_request(self, request_id):
         """Remove both directions of client routing and return the former client IDs."""
+        self.request_id_to_sampling_params.pop(request_id, None)
         client_identity = self.request_id_to_client_id.pop(request_id, None)
         client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
         if client_identity is not None and client_request_id is not None:
@@ -333,6 +340,15 @@ class DataParallelInferenceCoordinator:
         """
         if identity not in self.identities_of_data_parallel_ranks:
             return
+        if not self.is_disaggregated_inference():
+            affected_request_ids = [
+                request_id
+                for request_id, assigned_identity in self.request_id_to_rank.items()
+                if assigned_identity == identity
+            ]
+            for request_id in affected_request_ids:
+                self._fail_request(request_id, f"engine {identity!r} disconnected")
+
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
         self._media_cache_affinity = OrderedDict(
@@ -411,6 +427,58 @@ class DataParallelInferenceCoordinator:
             self.known_clients.discard(frames[0])
             logging.warning("Coordinator: client %r disconnected before its reply", frames[0])
             return False
+
+    def _cleanup_request(self, request_id):
+        """Release one request's client ownership and engine load exactly once."""
+        client_identity = self.request_id_to_client_id.pop(request_id, None)
+        client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
+        sampling_params = self.request_id_to_sampling_params.pop(request_id, None)
+        if client_identity is not None and client_request_id is not None:
+            self.client_request_to_request_id.pop((client_identity, client_request_id), None)
+
+        assigned_rank = self.request_id_to_rank.pop(request_id, None)
+        if assigned_rank is not None:
+            idx = self.identity_to_rank_index.get(assigned_rank)
+            if idx is not None:
+                assert self._pending_counts[idx] >= 1
+                self._pending_counts[idx] -= 1
+        return client_identity, client_request_id, sampling_params
+
+    def _fail_request(self, request_id, reason, sampling_params=None):
+        """Resolve an owned request with the engine's existing failed-reply schema."""
+        client_identity, client_request_id, stored_sampling_params = self._cleanup_request(
+            request_id
+        )
+        if client_identity is None or client_request_id is None:
+            return False
+
+        serialized_sampling_params = (
+            sampling_params if sampling_params is not None else stored_sampling_params
+        )
+        try:
+            params = (
+                serialized_sampling_params
+                if isinstance(serialized_sampling_params, SamplingParams)
+                else SamplingParams.deserialize(serialized_sampling_params or {})
+            )
+        except (AssertionError, TypeError, ValueError):
+            # Invalid saved parameters must not prevent a terminal failure reply.
+            logging.warning(
+                "Coordinator: invalid sampling parameters for failed request %d", request_id
+            )
+            params = SamplingParams()
+        failed_request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.empty(0, dtype=torch.int64),
+            sampling_params=params,
+            status=Status.FAILED,
+        )
+        failed_request.add_event_fail()
+        metadata = msgpack.packb([Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True)
+        body = msgpack.packb(failed_request.serialize(), use_bin_type=True)
+        logging.error("Coordinator: failing request %d: %s", request_id, reason)
+        self._send_to_client([client_identity, metadata, body])
+        return True
 
     def _broadcast_to_engines(self, payload):
         """Send a deserialized payload to every connected data parallel rank."""
