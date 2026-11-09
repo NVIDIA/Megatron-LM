@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
