@@ -414,6 +414,7 @@ def _run_step(env, backend, tokens_per_rank, decode_only, seed):
         num_speculative_tokens=0,
         model_is_pipeline_parallel=False,
         _enable_cuda_graph=False,
+        _overlap_gc=False,
         _select_async_sched_routing_buffer=lambda: None,
     )
     rsv = NVLSAllGatherVDispatcher._get_rsv_tensor()
