@@ -1509,11 +1509,12 @@ def forward_backward_pipelining_with_interleaving(
                 collect_non_loss_data,
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
                 b_virtual_microbatch_id=b_virtual_microbatch_id,
-                sync_func=sync_func,
-                sync_gradients=(
-                    b_virtual_microbatch_id is not None
+                sync_func=(
+                    sync_func
+                    if b_virtual_microbatch_id is not None
                     and is_last_microbatch_for_model_chunk(b_virtual_microbatch_id)
                     and config.grad_sync_func is None
+                    else contextlib.nullcontext
                 ),
                 pre_forward=pre_forward,
                 pre_backward=pre_backward,

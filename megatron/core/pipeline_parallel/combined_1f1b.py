@@ -163,7 +163,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     post_forward=None,
     post_backward=None,
     sync_func=contextlib.nullcontext,
-    sync_gradients=False,
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
@@ -242,7 +241,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             b_virtual_microbatch_id, b_model_chunk_id
         )
     # Call combined forward and backward step to overlap the communication and computation
-    with sync_func() if sync_gradients else contextlib.nullcontext():
+    with sync_func():
         output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
             forward_step_func,
             data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
