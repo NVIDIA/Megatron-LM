@@ -19,6 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -35,7 +36,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
