@@ -4472,6 +4472,24 @@ def force_param_sync(model_chunks, optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _rerun_checkpoint_can_be_saved(save_dir: str | None) -> bool:
+    """Whether the checkpoint requested by the rerun state machine can be written.
+
+    After a reproducible unexpected result, the rerun state machine asks for a checkpoint and an
+    exit, so that the job can be resumed on another GPU to establish a diagnostic. Without --save
+    there is no directory to write it to: warn, and let the job exit with the state machine's
+    exit code without a checkpoint.
+    """
+    if save_dir is not None:
+        return True
+    print_rank_0(
+        "WARNING: the rerun state machine requested a checkpoint, but --save is not set. "
+        "Exiting without a checkpoint; set --save to resume from the last iteration and "
+        "establish a diagnostic."
+    )
+    return False
+
+
 def _notify_checkpoint_saved(callback_manager, iteration):
     """Fire on_checkpoint_saved for the checkpoint of ``iteration`` once it is durable."""
     callback_manager.callback_context.durable_iteration = iteration
@@ -5456,7 +5474,7 @@ def train(
             callback_manager.callback_context.skipped_iter = bool(skipped_iter)
             callback_manager.trigger("on_train_step_end")
 
-        if should_checkpoint:
+        if should_checkpoint and _rerun_checkpoint_can_be_saved(cfg.checkpoint.save):
             save_checkpoint_and_time(
                 iteration,
                 model,
