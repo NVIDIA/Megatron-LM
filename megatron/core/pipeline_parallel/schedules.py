@@ -9,6 +9,8 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -50,33 +52,26 @@ except ImportError:
 Shape = Union[List[int], torch.Size]
 
 
+@contextlib.contextmanager
 def _get_grad_sync_context(model, config, enabled):
-    """Select one gradient mode for the current part of the schedule."""
-    from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-        GradientFinalizationMode,
-    )
-
+    """Select gradient reduction behavior for this part of the schedule."""
     chunks = model if isinstance(model, list) else [model]
-    if isinstance(chunks[0], FullyShardedDataParallelV2):
-        contexts = dict.fromkeys(chunk.module.context for chunk in chunks)
-        mode = (
-            GradientFinalizationMode.REDUCE_OUTER
-            if enabled
-            else GradientFinalizationMode.SKIP_OUTER
-        )
-        stack = contextlib.ExitStack()
-        for context in contexts:
-            stack.enter_context(context.finalize_gradients(mode=mode))
-        return stack
-    if enabled or config.no_sync_func is None:
-        return contextlib.nullcontext()
-    if isinstance(config.no_sync_func, list):
-        stack = contextlib.ExitStack()
-        for no_sync in config.no_sync_func:
-            stack.enter_context(no_sync())
-        return stack
-    return config.no_sync_func()
+    with contextlib.ExitStack() as stack:
+        if isinstance(chunks[0], FullyShardedDataParallelV2):
+            mode = (
+                GradientFinalizationMode.REDUCE_OUTER
+                if enabled
+                else GradientFinalizationMode.SKIP_OUTER
+            )
+            for context in {chunk.module.context for chunk in chunks}:
+                stack.enter_context(context.finalize_gradients(mode=mode))
+        elif not enabled and config.no_sync_func is not None:
+            no_sync_funcs = config.no_sync_func
+            if not isinstance(no_sync_funcs, list):
+                no_sync_funcs = [no_sync_funcs]
+            for no_sync in no_sync_funcs:
+                stack.enter_context(no_sync())
+        yield
 
 
 def get_forward_backward_func(
