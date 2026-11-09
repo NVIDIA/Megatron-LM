@@ -17,7 +17,7 @@ import dataclasses
 import enum
 import logging
 import math
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -330,8 +330,9 @@ class LayerShardedMuon(TensorParallelMuon):
             ``fp32_matmul_prec="medium"`` and 8-aligned dims. Same math, different
             kernel — results differ from the GEMM path by kernel-level rounding.
         ns_batch_size: Maximum number of same-shape matrices fused into one batched
-            Newton-Schulz on a home (see ``OptimizerConfig.muon_ns_batch_size``). Defaults
-            to 1, the bit-exact per-matrix path; batches of more than one use ``baddbmm``
+            Newton-Schulz on a home or in a single-rank domain (see
+            ``OptimizerConfig.muon_ns_batch_size``). Defaults to 1, the bit-exact per-matrix
+            path; batches of more than one use ``baddbmm``
             and lose bitwise parity with duplicated mode.
         concurrent_groups: Run each param group's pipeline on its own CUDA stream
             instead of serializing them. Groups own disjoint params and, under MoE,
@@ -346,14 +347,11 @@ class LayerShardedMuon(TensorParallelMuon):
             serialized (NCCL forbids concurrent collectives on one communicator).
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
-            ``pg_collection`` only take effect on the paths that delegate to the
-            parent (the empty-``param_ns_homes`` fallback and the degenerate
-            single-rank domain, both of which run the parent's TP-aware
-            full-matrix Newton-Schulz). "Degenerate" means the LAYER-SHARDING
-            domain (gtp_remat_size * tp_size) is trivial, not that the step is
-            collective-free: with a non-trivial ``pg_collection.tp`` and
-            partition_dim-tagged params (direct API only), the parent path
-            still issues TP collectives.
+            ``pg_collection`` only take effect on the path that delegates to the
+            parent: the fallback taken before ``set_param_ns_homes`` is called,
+            which runs the parent's TP-aware full-matrix Newton-Schulz. The layer-wise
+            wiring sets homes even when the assignment is empty; groups in a single-rank
+            domain then run local Newton-Schulz, batched by shape (``ns_batch_size``).
 
     Note:
         ``None`` for either process group means "no group / size 1", **not** torch's
@@ -534,7 +532,14 @@ class LayerShardedMuon(TensorParallelMuon):
         to bound the transient stack memory. A batch of one stays 2-D, so the
         unbatched numerics are preserved exactly whenever nothing is actually batched.
         """
-        ns_by_k: dict = {}
+        return dict(self._iter_ns(full_by_k))
+
+    def _iter_ns(
+        self, full_by_k: dict, load: Callable = lambda t: t
+    ) -> Iterator[tuple[int, torch.Tensor]]:
+        """:meth:`_run_ns` one chunk at a time: yields ``(k, ns)`` as each chunk finishes,
+        so a caller that consumes each result right away holds one chunk, not all.
+        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts."""
         by_shape: dict = {}
         for k, full in full_by_k.items():
             by_shape.setdefault(tuple(full.shape), []).append(k)
@@ -543,7 +548,8 @@ class LayerShardedMuon(TensorParallelMuon):
             for start in range(0, len(ks), self.ns_batch_size):
                 chunk = ks[start : start + self.ns_batch_size]
                 batched = len(chunk) > 1
-                x = torch.stack([full_by_k[k] for k in chunk]) if batched else full_by_k[chunk[0]]
+                x = [load(full_by_k[k]) for k in chunk]
+                x = torch.stack(x) if batched else x[0]
                 # SYRK halves the two symmetric-output NS GEMMs; for batched (3-D)
                 # chunks newton_schulz dispatches to the batched SYRK kernel, whose
                 # availability _validate_ns_config checked at construction.
@@ -557,14 +563,14 @@ class LayerShardedMuon(TensorParallelMuon):
                 # Two sequential multiplies, NOT a pre-combined scalar: matches
                 # TensorParallelMuon's `orth * scale * extra` rounding exactly, so
                 # duplicated-mode parity holds bitwise (elementwise ops commute with
-                # unbind, so batching does not perturb this).
-                orth = orth * scale * self.extra_scale_factor
+                # unbind, so batching does not perturb this). In place: the same ops, no
+                # temporaries.
+                orth.mul_(scale).mul_(self.extra_scale_factor)
                 if batched:
-                    for k, o in zip(chunk, orth.unbind(0)):
-                        ns_by_k[k] = o
+                    yield from zip(chunk, orth.unbind(0))
                 else:
-                    ns_by_k[chunk[0]] = orth
-        return ns_by_k
+                    yield chunk[0], orth
+                del orth
 
     def _param_group_streams(self) -> list | None:
         """Per-group CUDA streams, or None when the groups must stay serialized.
@@ -741,40 +747,36 @@ class LayerShardedMuon(TensorParallelMuon):
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
 
-            # 1. Momentum update on the local shard. Each entry is this rank's local
-            #    Newton-Schulz input: the Nesterov-corrected direction, or the momentum
-            #    buffer itself.
-            # NOTE: with nesterov=False, ``local_ns_inputs[i]`` aliases the momentum buffer
-            # (``.float()`` is a no-op on fp32); everything below treats it as read-only.
-            local_ns_inputs: list[torch.Tensor] = []
+            # 1. Momentum update on the local shard.
             with _phase("momentum"):
                 for p in params:
                     grad = p.grad
                     state = self.state[p]
                     self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
                     state["momentum_buffer"].lerp_(grad, 1 - beta)
-                    if self.nesterov:
-                        local_ns_input = grad.lerp(state["momentum_buffer"], beta)
-                    else:
-                        local_ns_input = state["momentum_buffer"]
-                    local_ns_inputs.append(local_ns_input.float())
+
+            def ns_input(p):
+                """NS input of ``p``. With nesterov=False it aliases the momentum buffer
+                (``.float()`` is a no-op on fp32); everything below treats it as read-only."""
+                buf = self.state[p]["momentum_buffer"]
+                return (p.grad.lerp(buf, beta) if self.nesterov else buf).float()
 
             # 2. Replicated params (whole on every rank of the domain, which is every param
             #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
             #    batched by shape. Correct and cheaper than electing a home and
-            #    broadcasting the result back.
+            #    broadcasting the result back. Inputs are built per chunk, so the Nesterov
+            #    copies of the whole group are never live at once.
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
-                    replicated_ns_outputs = self._run_ns(
-                        {i: local_ns_inputs[i] for i in plan.replicated}
-                    )
-                    for i, ns_output in replicated_ns_outputs.items():
+                    replicated = {i: params[i] for i in plan.replicated}
+                    for i, ns_output in self._iter_ns(replicated, load=ns_input):
                         self._apply_update(params[i], ns_output, lr)
+                        del ns_output
             if not plan.routed:
                 continue
             # The rank-local shards that enter the GTP_remat / TP routing path.
             local_param_shards = [params[i] for i in plan.routed]
-            local_ns_input_shards = [local_ns_inputs[i] for i in plan.routed]
+            local_ns_input_shards = [ns_input(p) for p in local_param_shards]
             stage1_routed_indices = plan.stage1_routed_indices
             route_plans = plan.route_plans
 

@@ -279,7 +279,7 @@ def test_decode_ssm_preserves_token_padding(
 
 
 class _NonContiguousDecodeSSM(_FakeSSM):
-    """Returns a non-contiguous `[N, S, d]`, as the GDP decode kernel does."""
+    """Returns a non-contiguous `[N, S, d]`, as a decode kernel may."""
 
     def ssm_decode(self, zxBCdt, *args, **kwargs):
         y = super().ssm_decode(zxBCdt, *args, **kwargs)
@@ -312,6 +312,56 @@ def test_decode_ssm_flattens_non_contiguous_output(num_speculative_tokens):
 
     assert output.shape == (token_count, 1, 2)
     assert torch.equal(output, projected[..., :2])
+
+
+def test_decode_ssm_zeroes_padding_rows_on_cuda_graph_replay():
+    """With quantization scales on, padding rows are zeroed by the replay-time token count.
+
+    The graph is captured with every row real, as dummy requests fill the graph during
+    capture, so the captured `padding_slice` is empty.
+    """
+    num_requests = 8
+    original = torch.arange(1, num_requests * 4 + 1, dtype=torch.float32, device="cuda").reshape(
+        num_requests, 1, 4
+    )
+    projected = original.clone()
+    mixer = _FakeSSM(projected)
+    # Turns on the zeroing; the fake runs no quantized kernel.
+    mixer.config = types.SimpleNamespace(fp8="hybrid", fp4=False)
+
+    counts = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    counts.gpu_view = types.SimpleNamespace(
+        real_token_count=torch.tensor([num_requests], dtype=torch.int32, device="cuda")
+    )
+    context = types.SimpleNamespace(
+        batch_invariant_mode=False,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=0,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=num_requests, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(
+            batch_indices_decode=torch.arange(num_requests, dtype=torch.int32, device="cuda")
+        ),
+        padding_slice=slice(num_requests, num_requests),
+        zero_padding_tokens=counts.zero_padding_tokens,
+    )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mixer.ssm_dynamic_inference(torch.empty(0), context)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    for real_token_count in (5, num_requests, 0):
+        projected.copy_(original)
+        counts.gpu_view.real_token_count.fill_(real_token_count)
+        graph.replay()
+        assert torch.equal(output[:real_token_count], original[:real_token_count, :, :2])
+        assert torch.all(output[real_token_count:] == 0)
 
 
 class TestGDPDynamicInference:
@@ -590,7 +640,76 @@ class TestGDPSpeculativeDecode:
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 4])
+    @pytest.mark.parametrize("seq_len", [2, 3, 4])
+    def test_real_mixer_speculative_forward_matches_decode_oracle(self, seq_len):
+        """The complete dynamic mixer preserves token order and padded rows."""
+        indices = torch.tensor([4, -1, 2], device="cuda", dtype=torch.int32)
+        torch.manual_seed(20260929 + seq_len)
+        hidden = torch.randn(
+            self._BATCH * seq_len,
+            1,
+            self.mixer.config.hidden_size,
+            device="cuda",
+            dtype=self.mixer.config.params_dtype,
+        )
+        # Padding inputs are intentionally nonzero. The decode path must zero
+        # their recurrent output before the output projection sees them.
+        hidden[seq_len : 2 * seq_len] = 3.0
+        conv_cache, ssm_cache = self._caches(seed=seq_len)
+        actual_conv, actual_ssm = conv_cache.clone(), ssm_cache.clone()
+        actual_snapshots = self._snapshot_buffers(seq_len, fill=0.0)
+
+        class Context:
+            num_speculative_tokens = seq_len - 1
+            batch_invariant_mode = False
+            padded_batch_dimensions = InferenceBatchDimensions(
+                token_count=self._BATCH * seq_len, decode_req_count=self._BATCH, prefill_req_count=0
+            )
+            mamba_metadata = types.SimpleNamespace(batch_indices_decode=indices)
+            padding_slice = slice(self._BATCH * seq_len, self._BATCH * seq_len)
+
+            def is_dynamic_batching(self):
+                return True
+
+            def mamba_states_cache(self, layer, intermediate=False):
+                assert layer == self_mixer.layer_number - self_mixer.pp_layer_offset
+                return actual_snapshots if intermediate else (actual_conv, actual_ssm)
+
+        self_mixer = self.mixer
+        projected_for_output = []
+        hook = self.mixer.out_proj.register_forward_pre_hook(
+            lambda _module, args: projected_for_output.append(args[0].detach().clone())
+        )
+        try:
+            actual, actual_bias = self.mixer(hidden, inference_context=Context())
+        finally:
+            hook.remove()
+        assert len(projected_for_output) == 1
+        assert torch.count_nonzero(projected_for_output[0][seq_len : 2 * seq_len]) == 0
+
+        projected, _ = self.mixer.in_proj(hidden)
+        ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+        ref_snapshots = self._snapshot_buffers(seq_len, fill=0.0)
+        decoded = self.mixer.ssm_decode(
+            projected.reshape(self._BATCH, seq_len, -1),
+            ref_conv,
+            ref_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=ref_snapshots[0],
+            intermediate_ssm_state=ref_snapshots[1],
+        )
+        assert torch.count_nonzero(decoded[1]) == 0
+        expected, expected_bias = self.mixer.out_proj(decoded.reshape(self._BATCH * seq_len, 1, -1))
+        assert torch.equal(actual, expected)
+        if actual_bias is None:
+            assert expected_bias is None
+        else:
+            assert torch.equal(actual_bias, expected_bias)
+        assert torch.equal(actual_conv, ref_conv)
+        assert torch.equal(actual_ssm, ref_ssm)
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4])
     def test_snapshots_match_truncated_decode_steps(self, num_speculative_tokens):
         """Snapshot `i` is the state a step that stopped at draft token `i` leaves."""
         seq_len = 1 + num_speculative_tokens
@@ -601,7 +720,7 @@ class TestGDPSpeculativeDecode:
         conv_cache, ssm_cache = self._caches()
         int_conv, int_ssm = self._snapshot_buffers(seq_len)
 
-        self.mixer.ssm_decode(
+        full_out = self.mixer.ssm_decode(
             projected,
             conv_cache.clone(),
             ssm_cache.clone(),
@@ -613,9 +732,10 @@ class TestGDPSpeculativeDecode:
         slots = indices.long()
         for accepted in range(seq_len):
             ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
-            self.mixer.ssm_decode(
+            truncated_out = self.mixer.ssm_decode(
                 projected[:, : accepted + 1].contiguous(), ref_conv, ref_ssm, batch_indices=indices
             )
+            assert torch.equal(full_out[:, accepted], truncated_out[:, -1])
             assert torch.equal(int_conv[slots, accepted], ref_conv[slots]), (
                 f"conv snapshot for draft token {accepted} does not match a decode step "
                 "that stopped there"
