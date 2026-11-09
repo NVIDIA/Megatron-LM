@@ -13,6 +13,7 @@ from megatron.core.models.backends import (
     require,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -30,7 +31,6 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -562,6 +562,9 @@ def get_gpt_decoder_layer_specs(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    if normalization is None:
+        normalization = config.normalization
+
     assert config.experimental_attention_variant is None, (
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
@@ -719,10 +722,8 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    # MTP has only ever used the Transformer Engine or the local backend, never the
-    # inference one, so it does not go through _base_backend_name().
     backend: BackendSpecProvider = get_backend_from_config(
-        config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
+        config, transformer_impl=_base_backend_name(config, use_transformer_engine)
     )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
