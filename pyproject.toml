@@ -127,7 +127,7 @@ inference = [
     "flash-attn==2.8.3.post1; sys_platform == 'linux'",
     # FA4's image version (b24) pins CUTLASS below cuDNN Frontend's requirement.
     "flash-attn-4[cu13]==4.0.0b36; sys_platform == 'linux'",
-    "tilelang; sys_platform == 'linux'",
+    "tilelang>=0.1.12; sys_platform == 'linux'",
 ]
 
 nvshmem = [
