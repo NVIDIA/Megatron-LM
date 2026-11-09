@@ -47,6 +47,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic import coordinator as dynamic_engine_coordinator
 from megatron.core.inference.engines.dynamic import multimodal as dynamic_engine_multimodal
@@ -7912,6 +7913,122 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert (
             len(finished_req.generated_tokens) == 6
         ), f"Expected 6 tokens, got {len(finished_req.generated_tokens)}. Double counting occurred."
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_speculative_commit_pass_follows_async_compaction(self):
+        """Each draft-KV commit row comes from its own request after async compaction.
+
+        Three requests decode with two speculative tokens, every draft accepted, under async
+        scheduling with the MTP draft KV cache. The first finishes after one decode step, so
+        overlap resolution moves the third into its row while the next forward is in flight.
+        That forward's hidden states and input tokens keep the old row order. Every row of the
+        following commit pass must still pair a request's own hidden state at the position it
+        writes with that request's next token.
+        """
+        vocab = DynamicEngineTestConfig.vocab_size
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_prompt_length=26,
+            num_tokens_to_generate=16,
+            context_max_requests=4,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+        )
+        env = self._build_test_env(test_config)
+        engine, context = env.engine, env.engine.context
+        assert context.enable_mtp_kv_cache
+        model = engine.controller.inference_wrapped_model.model
+        hidden_size = model.config.hidden_size
+
+        def successor(tokens, positions):
+            # Never the termination ID (vocab - 1).
+            return 1 + (tokens * 7 + positions * 13 + 5) % (vocab - 3)
+
+        def forward(input_ids, position_ids, *args, **kwargs):
+            # Greedy successor of each (token, position); each hidden row records both.
+            tokens, positions = input_ids[0].long(), position_ids[0].long()
+            logits = torch.zeros(
+                1, tokens.numel(), vocab, device=tokens.device, dtype=torch.bfloat16
+            )
+            logits[0].scatter_(1, successor(tokens, positions)[:, None], 100.0)
+            hidden = torch.zeros(
+                tokens.numel(), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            hidden[:, 0, 0] = tokens
+            hidden[:, 0, 1] = positions % 256
+            hidden[:, 0, 2] = positions // 256
+            context.mtp_decoder_hidden_states = hidden
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        def draft(hidden_states, next_token_ids, position_ids, *args, **kwargs):
+            # The head drafts the main model's successor, so every draft is accepted.
+            drafts = successor(next_token_ids[0].long(), position_ids[0].long())
+            logits = torch.zeros(drafts.numel(), 1, vocab, device=drafts.device)
+            logits[:, 0].scatter_(1, drafts[:, None], 100.0)
+            return hidden_states, logits
+
+        commit_rows = []
+
+        def commit_forward(hidden_states, next_token_ids, *args, inference_context, **kwargs):
+            if inference_context.mtp_metadata.forward_mode is MTPForwardMode.COMMIT:
+                total = inference_context.active_token_count
+                encoded = hidden_states[:total, 0, :3].float().round().long()
+                commit_rows.append(
+                    (
+                        inference_context.gpu_view.token_to_pos_ids[:total].long().cpu(),
+                        encoded[:, 1].cpu() + 256 * encoded[:, 2].cpu(),
+                        encoded[:, 0].cpu(),
+                        next_token_ids[0, :total].long().cpu(),
+                    )
+                )
+            return hidden_states
+
+        compactions = []
+        compact = engine.controller._compact_async_sched_forward
+
+        def record_compaction(survivor_idxs):
+            compactions.append(survivor_idxs.cpu().tolist())
+            return compact(survivor_idxs)
+
+        model.forward = forward
+        model.compute_mtp_single_step = draft
+        model.mtp.layers[0].forward_single_position = commit_forward
+        engine.controller._compact_async_sched_forward = record_compaction
+
+        # Each prompt continues the successor chain, so a request's whole sequence is known.
+        streams = {}
+        for request_id, (seed, prompt_length, limit) in enumerate(
+            [(11, 10, 4), (23, 18, 16), (37, 26, 16)]
+        ):
+            sequence = [seed]
+            while len(sequence) < prompt_length + limit:
+                sequence.append(int(successor(sequence[-1], len(sequence) - 1)))
+            streams[request_id] = sequence[prompt_length:]
+            engine.add_request(
+                request_id,
+                sequence[:prompt_length],
+                SamplingParams(num_tokens_to_generate=limit, termination_id=vocab - 1, top_k=1),
+            )
+
+        finished = {}
+        while engine.has_unfinished_requests():
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
+
+        assert finished == streams
+        # Request 0 finished first and request 2 moved into its row.
+        assert [2, 1] in compactions, compactions
+        assert commit_rows, "the commit pass never ran"
+        for written, read, token, next_token in commit_rows:
+            assert torch.equal(read, written), (read.tolist(), written.tolist())
+            assert torch.equal(next_token, successor(token, read)), (
+                token.tolist(),
+                next_token.tolist(),
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

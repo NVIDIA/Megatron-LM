@@ -127,6 +127,7 @@ class MTPControllerMixin:
         num_decode_requests: int,
         active_request_count: int,
         base_position,
+        token_row_indices: Optional[Tensor] = None,
     ) -> bool:
         """Refresh every committed position's draft KV from the MAIN hidden (a per-step first pass).
 
@@ -136,6 +137,10 @@ class MTPControllerMixin:
         projections of the input (no RoPE), so only the write positions matter; the output hidden
         is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments` derive the
         per-request positions.
+
+        `token_row_indices` is the async-scheduling map from each token row of the current
+        (survivor-ordered) batch to its row in the forward that produced `gathered_hidden`; None
+        means the two orders agree.
 
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
@@ -147,7 +152,12 @@ class MTPControllerMixin:
         if num_decode_requests > 0:
             segments.append(
                 self._mtp_decode_commit_segments(
-                    context, gathered_hidden, num_decode_requests, base_position, stride
+                    context,
+                    gathered_hidden,
+                    num_decode_requests,
+                    base_position,
+                    stride,
+                    token_row_indices,
                 )
             )
         if active_request_count > num_decode_requests:
@@ -184,7 +194,13 @@ class MTPControllerMixin:
         return True
 
     def _mtp_decode_commit_segments(
-        self, context, gathered_hidden, num_decode_requests: int, base_position, stride: int
+        self,
+        context,
+        gathered_hidden,
+        num_decode_requests: int,
+        base_position,
+        stride: int,
+        token_row_indices: Optional[Tensor] = None,
     ) -> _CommitSegments:
         """Refresh the accepted-draft positions of every decode request from this step's hiddens.
 
@@ -194,7 +210,6 @@ class MTPControllerMixin:
         decode depth 0, so it is excluded here.
         """
         device = gathered_hidden.device
-        decode_len = num_decode_requests * stride
         accepted = (
             self._accepted_token_counts_per_request[:num_decode_requests]
             .to(device, non_blocking=True)
@@ -209,8 +224,6 @@ class MTPControllerMixin:
         # segment count must stay equal to the active request count.
         total_a = int(accepted.sum().item())
 
-        decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
-        decode_tokens = context.gpu_view.token_to_input_ids[:decode_len]
         # `output_size` is already known on the host, so pass it and skip repeat_interleave's
         # own device sync.
         rows_d = torch.repeat_interleave(
@@ -220,11 +233,19 @@ class MTPControllerMixin:
             torch.arange(total_a, device=device) - (torch.cumsum(accepted, 0) - accepted)[rows_d]
         )
         hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
+        token_idx = hidden_idx + 1  # draft_0..draft_{a-1}
+        if token_row_indices is not None:
+            # Async compaction reorders the pending forward's logits into survivor order but
+            # leaves its hidden states and input tokens in the forward's own row order. Read
+            # them through the same row map as verification, or a request moved into a
+            # finished request's row would commit that request's hiddens and tokens.
+            hidden_idx = token_row_indices[hidden_idx]
+            token_idx = token_row_indices[token_idx]
         return _CommitSegments(
             counts=accepted,
             starts=starts,
-            hidden=decode_hidden[hidden_idx],
-            tokens=decode_tokens[hidden_idx + 1],  # draft_0..draft_{a-1}
+            hidden=gathered_hidden[hidden_idx],
+            tokens=context.gpu_view.token_to_input_ids[token_idx],
         )
 
     def _mtp_prefill_commit_segments(
@@ -426,13 +447,17 @@ class MTPControllerMixin:
         )
         context.mtp_metadata.end_forward()
 
-    def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
+    def _compute_serial_mtp_and_sample(
+        self, base_position: Optional[Tensor] = None, token_row_indices: Optional[Tensor] = None
+    ) -> None:
         """Run the MTP phase with the main forward's execution state held across it."""
         context = self.inference_wrapped_model.inference_context
         with context._mtp_forward_phase():
-            self._compute_serial_mtp_and_sample_impl(base_position)
+            self._compute_serial_mtp_and_sample_impl(base_position, token_row_indices)
 
-    def _compute_serial_mtp_and_sample_impl(self, base_position: Optional[Tensor]) -> None:
+    def _compute_serial_mtp_and_sample_impl(
+        self, base_position: Optional[Tensor], token_row_indices: Optional[Tensor] = None
+    ) -> None:
         """Compute MTP logits serially after verification and sample speculative tokens.
 
         This ensures that MTP predictions are always conditioned on verified tokens.
@@ -447,6 +472,9 @@ class MTPControllerMixin:
         Args:
             base_position (Optional[Tensor]): GPU position of the first new MTP draft
                 for each request. Legacy scheduling derives it from rewound CPU state.
+            token_row_indices (Optional[Tensor]): Async scheduling's map from each token row
+                of the survivor-ordered batch to its row in the pending forward, whose hidden
+                states and input tokens the commit pass reads. None when the orders agree.
         """
         nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
@@ -513,6 +541,7 @@ class MTPControllerMixin:
                 num_decode_requests=active_request_count - context.num_prefill_requests,
                 active_request_count=active_request_count,
                 base_position=base_position,
+                token_row_indices=token_row_indices,
             )
             if not issued_slot:
                 # EP consistency: every rank runs exactly one commit-pass forward per step (real

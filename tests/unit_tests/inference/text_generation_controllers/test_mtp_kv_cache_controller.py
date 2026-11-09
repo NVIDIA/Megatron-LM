@@ -282,6 +282,39 @@ class TestMtpCommitPassDecode:
         assert token_ids == [1001, 1002, 1004]
         assert context.finalize_prefill_calls == 1
 
+    def test_async_compaction_reads_each_request_from_its_own_forward_rows(self):
+        """After async compaction, rows come from the pending forward through the row map.
+
+        The pending forward ran requests A, B and C in rows 0-2, 3-5 and 6-8. A finished, and
+        compaction moved C into A's slot, so the batch is now (C, B) while the hidden states and
+        input tokens keep the forward's order. C must commit rows 6 and 7, not A's rows 0 and 1.
+        """
+        context = _make_context(num_decode_requests=2)
+        model = _make_model()
+        controller = _make_controller(context, model)
+        controller._accepted_token_counts_per_request[:2] = torch.tensor(
+            [2, 1], device=DEVICE, dtype=torch.int64
+        )
+        token_row_indices = torch.tensor([6, 7, 8, 3, 4, 5], device=DEVICE)
+
+        issued = controller._mtp_commit_pass(
+            context,
+            model,
+            _hidden(9),
+            num_decode_requests=2,
+            active_request_count=2,
+            base_position=torch.tensor([30, 7], device=DEVICE),
+            token_row_indices=token_row_indices,
+        )
+
+        assert issued is True
+        call = context.setup_prefill_calls[-1]
+        assert call["append_counts"].cpu().tolist() == [2, 1]
+        assert call["request_start_positions"].cpu().tolist() == [27, 5]
+        forward = model.mtp_layer_calls[-1]
+        assert _row_ids(forward["hidden_states"]) == [6, 7, 3]
+        assert forward["next_token_ids"].view(-1).cpu().tolist() == [1007, 1008, 1004]
+
     def test_request_with_no_accepted_drafts_contributes_nothing(self):
         """A rejected-everything request still occupies a row, with count 0."""
         context = _make_context(num_decode_requests=2)

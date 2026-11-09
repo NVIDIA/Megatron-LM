@@ -2433,7 +2433,9 @@ class TextGenerationController(MTPControllerMixin):
         base_position = (context.gpu_view.token_to_pos_ids[self._last_accepted_seq_indices] + 1).to(
             torch.int64
         )
-        self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._compute_serial_mtp_and_sample(
+            base_position=base_position, token_row_indices=token_row_indices
+        )
         self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
