@@ -681,8 +681,9 @@ def _build_varlen_for_loader(items, config, num_samples):
 
 
 def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
-    """The legacy namespace the loader still receives for the model-parallel values when the run
-    config has no model section (this one); the loader-owned values come from the data section."""
+    """The legacy namespace these tests register (the runtime still expects one); the loader reads
+    none of it: the loader-owned values come from the data section, the model-parallel values
+    from the run config's model section."""
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
