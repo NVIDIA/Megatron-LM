@@ -662,7 +662,6 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
     gtp_remat_size: int = 1,
     expert_gtp_remat_size: int = 1,
@@ -748,9 +747,6 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
-
-        hybrid_context_parallel (bool, default = False):
-            Deprecated alias for ``dynamic_context_parallel``.
 
         dynamic_context_parallel (bool, default = False):
             Create the runtime DPxCP subgroup family used by dynamic context
@@ -1142,16 +1138,6 @@ def initialize_model_parallel(
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
-
-    if hybrid_context_parallel:
-        warnings.warn(
-            "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if dynamic_context_parallel:
-            raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
-        dynamic_context_parallel = True
 
     if dynamic_context_parallel:
         global _DYNAMIC_DP_CP_GROUPS
@@ -2132,19 +2118,6 @@ def get_dynamic_data_context_parallel_groups(
     if check_initialized:
         assert _DYNAMIC_DP_CP_GROUPS is not None
     return _DYNAMIC_DP_CP_GROUPS[group_size]
-
-
-def get_hybrid_data_context_parallel_groups(
-    check_initialized: bool = True, group_size: Optional[int] = None
-) -> torch.distributed.ProcessGroup:
-    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
-    warnings.warn(
-        "get_hybrid_data_context_parallel_groups is deprecated; use "
-        "get_dynamic_data_context_parallel_groups instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
 
 
 def get_dynamic_tensor_data_context_parallel_group(

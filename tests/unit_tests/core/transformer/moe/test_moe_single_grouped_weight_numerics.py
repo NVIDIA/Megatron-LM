@@ -145,7 +145,7 @@ class TestMoESingleGroupedWeightNumerics:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -168,6 +168,7 @@ class TestMoESingleGroupedWeightNumerics:
         overlap_param_gather: bool = False,
         overlap_grad_reduce: bool = False,
         grad_reduce_in_fp32: bool = False,
+        model_overrides: dict | None = None,
     ):
         self._cleanup()
 
@@ -228,12 +229,18 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision != "bf16":
             raise ValueError(f"Unknown precision test case: {precision}")
 
+        # Apply architecture changes before constructing/finalizing the run config.
+        for name, value in (model_overrides or {}).items():
+            if not hasattr(args, name):
+                raise ValueError(f"Unknown model argument: {name}")
+            setattr(args, name, value)
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
         cfg.tokenizer.vocab_size = 1024
+        cfg.model.vocab_size = 1024
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)

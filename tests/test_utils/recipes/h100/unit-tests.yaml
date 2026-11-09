@@ -232,13 +232,6 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/context_parallel/test_batch_api_compat.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
   # These ordinary tensor-parallel tests match the GTP glob but retain their
   # original eight-rank jobs rather than the four-rank GTP job.
   - test_case: [tests/unit_tests/core/tensor_parallel/test_gtp_fp32_accumulation_reduce_scatter.py]

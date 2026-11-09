@@ -31,7 +31,7 @@ def test_runtime_cp_bucket_has_exclusive_ownership(monkeypatch, capsys, platform
     expected = {
         str(path)
         for path in Path("tests/unit_tests/core/context_parallel").glob("test_*.py")
-        if path.name not in {"test_layout.py", "test_batch_api_compat.py"}
+        if path.name != "test_layout.py"
     }
     assert expected
     owners = {path: [] for path in expected}
