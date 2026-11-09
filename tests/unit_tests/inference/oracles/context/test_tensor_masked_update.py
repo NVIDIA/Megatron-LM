@@ -28,8 +28,9 @@ which shares none of the kernel's flatten-and-stride arithmetic.
 1024-element chunk of the flattened row per program, with the row's coordinates rebuilt from
 ``SIZE_D*`` and every stride passed at run time (``tensor_ops.py:412-475``). Factors, combined
 pairwise: rank 2/3/4; rows 1023/1024/1025 and 2047/2048/2049 elements (one, two and three
-chunks), with the 3-D and 4-D shapes chosen so every dimension is above 1; fp32, bf16, fp16;
-int64 and int32 ``idx``; all rows valid, some ``-1``, all ``-1``, ``-1`` at both ends;
+chunks), with 3-D and 4-D shapes whose dimensions read through ``.to`` are above 1 (a leading
+``D0`` of 1 occurs; see O6-M3 below); fp32, bf16, fp16; int64 and int32 ``idx``; all rows
+valid, some ``-1``, all ``-1``, ``-1`` at both ends;
 ``B`` 1, 5, 17; states and new states each contiguous, one element in (unaligned base),
 padded (every other slot, padded trailing dims) or with the last two dims transposed (non-unit
 innermost stride), every pair of the two layouts at every rank. Also ``B = 0`` for each rank;
