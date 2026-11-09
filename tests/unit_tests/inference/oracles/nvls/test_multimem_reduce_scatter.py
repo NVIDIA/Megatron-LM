@@ -44,6 +44,13 @@ guard bands, the input region of the buffer must be unchanged, and a 64 KiB sent
 The production order row-parallel RS -> next layer's equal-size all-gather without a barrier is
 run back to back with changing token counts and data, eagerly and as CUDA graphs (one per token
 count, replayed in a changing order), with a random rank delayed before each step.
+
+Since the medium-risk batch: production shapes at the whole node (`test_production_shapes`:
+Llama-3.1-70B's row-parallel output, [tokens, 8192] bf16, for a 2048-token prefill chunk and a
+128-token decode batch, exact and N(0, 1) data); NaN and infinities in the partials
+(`test_special_values_propagate`, IEEE addition up to the sign of zero, bf16 and fp32); and
+`test_sanitizer_small_case`, the compute-sanitizer case. Int32 offsets cannot overflow (no
+`large` case): the input is in the "tp" buffer, at most 512 MiB.
 """
 
 from types import SimpleNamespace
@@ -67,7 +74,6 @@ CHUNKS_PER_RANK = (
     + [2 * BLOCK_SIZE * MAX_NUM_BLOCKS + 1]
 )
 DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
-SANITIZER_CASE = dict(chunks=1025, ws=2)
 
 
 def gpu_test(fn):
@@ -107,32 +113,25 @@ def _sweep_params():
             "ws": nu.GROUP_SIZES,
         }
     )
-    params = []
-    for c in cases:
-        sanitizer = c["chunks"] == SANITIZER_CASE["chunks"] and c["ws"] == SANITIZER_CASE["ws"]
-        params.append(
-            pytest.param(
-                c["ws"],
-                c["chunks"],
-                c["dtype"],
-                c["data"],
-                id=f"ws{c['ws']}-chunks{c['chunks']}-{c['dtype']}-{c['data']}",
-                marks=[pytest.mark.sanitizer] if sanitizer else [],
-            )
+    return [
+        pytest.param(
+            c["ws"],
+            c["chunks"],
+            c["dtype"],
+            c["data"],
+            id=f"ws{c['ws']}-chunks{c['chunks']}-{c['dtype']}-{c['data']}",
         )
-    return params
+        for c in cases
+    ]
 
 
-@gpu_test
-@pytest.mark.parametrize("ws,chunks,dtype_name,data", _sweep_params())
-def test_reduce_scatter_matches_nccl(nvls_groups, ws, chunks, dtype_name, data):
-    """This rank's output against NCCL / fp64; the buffer is read only; output fully written."""
-    g = nvls_groups.get(ws)
+def run_reduce_scatter(g, x, data, what):
+    """Reduce-scatter ``x`` (this rank's flat input, ``ws * per_rank`` elements) from offset 0
+    of ``g``'s main buffer and check this rank's output against NCCL / fp64; the buffer is
+    read only and the output fully written."""
     symm = g.buffer()
-    dtype = DTYPES[dtype_name]
-    per_rank = chunks * CHUNK_BYTES // dtype.itemsize
-    seed = nu.case_seed("reduce-scatter", ws, chunks, dtype_name, data)
-    x = make_input((ws * per_rank,), dtype, data, g.rank_generator(seed))
+    dtype = x.dtype
+    per_rank = x.numel() // g.ws
     parts = g.gather(x)[:, g.rank * per_rank : (g.rank + 1) * per_rank]
     nccl_rs = g.reduce_scatter_fp32(x)
     view = symm.view(x.shape, dtype)
@@ -149,7 +148,19 @@ def test_reduce_scatter_matches_nccl(nvls_groups, ws, chunks, dtype_name, data):
         ou.assert_exact(region, x, what="input region of the buffer (read-only)")
         after.check("buffer after the input region")
 
-    nu.agree(check, "reduce-scatter")
+    nu.agree(check, what)
+
+
+@gpu_test
+@pytest.mark.parametrize("ws,chunks,dtype_name,data", _sweep_params())
+def test_reduce_scatter_matches_nccl(nvls_groups, ws, chunks, dtype_name, data):
+    """This rank's output against NCCL / fp64; the buffer is read only; output fully written."""
+    g = nvls_groups.get(ws)
+    dtype = DTYPES[dtype_name]
+    per_rank = chunks * CHUNK_BYTES // dtype.itemsize
+    seed = nu.case_seed("reduce-scatter", ws, chunks, dtype_name, data)
+    x = make_input((ws * per_rank,), dtype, data, g.rank_generator(seed))
+    run_reduce_scatter(g, x, data, "reduce-scatter")
 
 
 @gpu_test
@@ -386,6 +397,74 @@ def test_bf16_in_switch_sum_rounding(nvls_groups, ws):
             raise AssertionError(f"{error}\n{rounding_report(got, names, rules)}") from None
 
     nu.agree(check, "bf16 in-switch sum rounding")
+
+
+PRODUCTION_TOKENS = {"prefill": nu.PRODUCTION_TOKENS, "decode": 128}
+"""Tokens of the production cases: a 2048-token prefill chunk and a 128-token decode batch."""
+
+
+def _production_params():
+    return [
+        pytest.param(tokens, data, id=f"llama-70b-{phase}-{tokens}-tokens-{data}")
+        for phase, tokens in PRODUCTION_TOKENS.items()
+        for data in ("exact", "randn")
+    ]
+
+
+@gpu_test
+@pytest.mark.parametrize("tokens,data", _production_params())
+def test_production_shapes(nvls_groups, tokens, data):
+    """The sweep's checks at a production shape and group size (8 ranks on H100, 4 on GB200):
+    the row-parallel output of Llama-3.1-70B (attention projection and fc2; the embedding's
+    reduce-scatter has the same shape), [tokens, 8192] bf16, the dtype both call sites
+    require."""
+    ws = nu.PRODUCTION_GROUP_SIZE
+    g = nvls_groups.get(ws)
+    hidden = nu.PRODUCTION_DENSE["hidden"]
+    gen = g.rank_generator(nu.case_seed("rs-production", tokens, data))
+    x = make_input((tokens * hidden,), torch.bfloat16, data, gen)
+    run_reduce_scatter(g, x, data, f"reduce-scatter, {tokens} tokens of H={hidden}")
+
+
+@gpu_test
+@pytest.mark.parametrize("dtype_name", list(DTYPES))
+@pytest.mark.parametrize("ws", nu.group_size_params())
+def test_special_values_propagate(nvls_groups, ws, dtype_name):
+    """NaN and infinities in a partial reach the sum as IEEE addition says, in any order and
+    rounding: NaN stays NaN, +inf and -inf stay, +inf + -inf is NaN, zeros sum to zero and
+    finite columns are exact (``nu.special_partials``). A reduction that drops a rank, flushes
+    or saturates would turn a NaN or an infinity into a number. Every rank's shard holds every
+    column, so each rank checks every class as the reducing GPU."""
+    g = nvls_groups.get(ws)
+    symm = g.buffer()
+    dtype = DTYPES[dtype_name]
+    parts = nu.special_partials(ws, 2 * ws, dtype)
+    n = parts.shape[1]
+    x = parts[g.rank].repeat(ws).cuda()
+    view = symm.view(x.shape, dtype)
+    view.copy_(x)
+    out = ou.guarded_empty((n,), dtype)
+    multimem_reduce_scatter(out.tensor, view, symm.hdl)
+    got = out.tensor.clone()
+
+    def check():
+        ou.check_guards(output=out)
+        nu.assert_ieee_sum(got, parts, what=f"{dtype_name} sum of special values")
+
+    nu.agree(check, "reduce-scatter of special values")
+
+
+@gpu_test
+@pytest.mark.sanitizer
+def test_sanitizer_small_case(nvls_groups):
+    """The compute-sanitizer (memcheck) case: ws 2, 1025 16-byte chunks per rank (a full block
+    and one lane of a second), bf16 N(0, 1) data, with the sweep's checks. A dedicated
+    function, so the runner selects it by name at any world size."""
+    g = nvls_groups.get(2)
+    per_rank = 1025 * CHUNK_BYTES // torch.bfloat16.itemsize
+    gen = g.rank_generator(nu.case_seed("rs-sanitizer"))
+    x = make_input((2 * per_rank,), torch.bfloat16, "randn", gen)
+    run_reduce_scatter(g, x, "randn", "reduce-scatter sanitizer case")
 
 
 @pytest.mark.parametrize(

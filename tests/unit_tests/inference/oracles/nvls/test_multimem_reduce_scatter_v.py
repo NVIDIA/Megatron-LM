@@ -64,6 +64,13 @@ world size inside the dispatcher and asserts the correctly-rounded claim; it pas
 expert outputs carry few significant bits, so their fp32 sums are exact in any order.
 `test_hopper_refuses_batch_invariant_multimem` fails on main: it is the contract the fix PR
 s4f-multimem-rounding-doc adds (a config-time rejection on Hopper).
+
+Since the medium-risk batch: production shapes at the whole node for both combines
+(`test_production_shapes`: DeepSeek-V3, Nemotron 3 Nano and Nemotron 3 Super's latent MoE,
+2048 tokens per step); NaN and infinities in the partials (`test_special_values_propagate`);
+one compute-sanitizer case per kernel (`test_sanitizer_small_case`); and the int32 limits of
+the row offsets (`test_int32_row_offsets`, `large`: 8 GiB of fp32 rows for the ordered kernel,
+16 GiB for the multimem one; suspected findings O5-M1 and O5-M2 on main).
 """
 
 import pytest
@@ -187,7 +194,6 @@ def _multimem_params():
     params = []
     for c in cases:
         (dtype, hidden), prm = c["row"], c["per_rank_max"]
-        sanitizer = (dtype, hidden, prm, c["ws"]) == ("fp32", 128, 127, 2)
         params.append(
             pytest.param(
                 c["ws"],
@@ -199,7 +205,6 @@ def _multimem_params():
                 c["data"],
                 id=f"ws{c['ws']}-{dtype}-H{hidden}-prm{prm}-{c['counts']}"
                 f"-offset{c['byte_offset']}-{c['data']}",
-                marks=[pytest.mark.sanitizer] if sanitizer else [],
             )
         )
     return params
@@ -243,6 +248,12 @@ def test_multimem_combine_matches_nccl(
     seed = nu.case_seed("rsv", ws, dtype_name, hidden, per_rank_max, counts_pattern, byte_offset)
     counts = nu.token_counts(counts_pattern, ws, per_rank_max, g.shared_generator(seed))
     case = CombineCase(g, hidden, DTYPES[dtype_name], per_rank_max, counts, byte_offset, data, seed)
+    run_multimem_combine(case, data)
+
+
+def run_multimem_combine(case, data):
+    """Launch the multimem combine on ``case`` and check it on every rank (see the module
+    docstring for the tolerance classes)."""
     result = case.launch(multimem_reduce_scatter_v)
     case.snapshot()
 
@@ -262,7 +273,7 @@ def test_multimem_combine_matches_nccl(
                 what="combine",
             )
 
-    nu.agree(check, f"multimem combine, counts {counts}")
+    nu.agree(check, f"multimem combine, counts {case.counts}")
 
 
 PROBES = 3
@@ -396,6 +407,12 @@ def test_ordered_sum_is_rank_ordered(
     seed = nu.case_seed("ordered", ws, hidden, per_rank_max, counts_pattern, byte_offset, data)
     counts = nu.token_counts(counts_pattern, ws, per_rank_max, g.shared_generator(seed))
     case = CombineCase(g, hidden, torch.float32, per_rank_max, counts, byte_offset, data, seed)
+    run_ordered_combine(case)
+
+
+def run_ordered_combine(case):
+    """Launch the ordered combine on ``case`` and check it bit for bit against the rank-order
+    fp32 sum on every rank."""
     result = case.launch(ordered_reduce_scatter_v)
     case.snapshot()
 
@@ -404,4 +421,194 @@ def test_ordered_sum_is_rank_ordered(
         case.check_memory()
         ou.assert_exact(case.out.tensor, rank_ordered_sum(case.parts), what="rank-order sum")
 
-    nu.agree(check, f"ordered combine, counts {counts}")
+    nu.agree(check, f"ordered combine, counts {case.counts}")
+
+
+COMBINES = {"multimem": multimem_reduce_scatter_v, "ordered": ordered_reduce_scatter_v}
+
+
+def _production_params():
+    cases = ou.pairwise_cases(
+        {
+            "combine": list(COMBINES),
+            "model": list(nu.PRODUCTION_MOE),
+            "counts": ["full", "uneven"],
+            "data": ["exact", "randn"],
+        }
+    )
+    return [
+        pytest.param(
+            c["combine"],
+            c["model"],
+            c["counts"],
+            c["data"],
+            id=f"{c['combine']}-{c['model']}-{c['counts']}-{c['data']}",
+        )
+        for c in cases
+    ]
+
+
+@gpu_test
+@pytest.mark.parametrize("combine,model,counts_pattern,data", _production_params())
+def test_production_shapes(nvls_groups, combine, model, counts_pattern, data):
+    """The sweeps' checks at production shapes and group size (EP 8 on H100, EP 4 on GB200):
+    the fp32 combine buffer of DeepSeek-V3 (H 7168: 1792 lanes, two windows of the multimem
+    kernel, seven of the ordered one), Nemotron 3 Nano (H 2688) and Nemotron 3 Super's latent
+    MoE (1024), with ``nu.PRODUCTION_TOKENS`` tokens per step (per_rank_max 256 at EP 8, 512 at
+    EP 4, so the dispatcher's 128-block grid with a grid-stride loop), every rank at
+    per_rank_max (a padded CUDA-graph step) or uneven counts (an eager step)."""
+    ws = nu.PRODUCTION_GROUP_SIZE
+    g = nvls_groups.get(ws)
+    hidden, _ = nu.PRODUCTION_MOE[model]
+    per_rank_max = nu.PRODUCTION_TOKENS // ws
+    seed = nu.case_seed("rsv-production", combine, model, counts_pattern, data)
+    counts = nu.production_counts(counts_pattern, ws, per_rank_max, g.shared_generator(seed))
+    case = CombineCase(g, hidden, torch.float32, per_rank_max, counts, 0, data, seed)
+    if combine == "multimem":
+        run_multimem_combine(case, data)
+    else:
+        run_ordered_combine(case)
+
+
+@gpu_test
+@pytest.mark.parametrize("combine", list(COMBINES))
+@pytest.mark.parametrize("ws", nu.group_size_params())
+def test_special_values_propagate(nvls_groups, ws, combine):
+    """NaN and infinities in an expert output reach the combined row as IEEE addition says
+    (``nu.special_partials``: NaN stays NaN, infinities stay, +inf + -inf is NaN, finite
+    columns exact; the sign of an all-zero sum is not asserted: the ordered kernel starts from
+    +0.0). Every rank owns 3 tokens whose rows all hold the classes; fp32, the production
+    dtype of both combines."""
+    g = nvls_groups.get(ws)
+    symm = g.buffer()
+    parts = nu.special_partials(ws, 2 * ws, torch.float32)
+    hidden = parts.shape[1]
+    rows = 3
+    view = symm.view((rows * ws, hidden), torch.float32)
+    view.copy_(parts[g.rank].expand(rows * ws, hidden))
+    out = ou.guarded_empty((rows, hidden), torch.float32)
+    COMBINES[combine](
+        out.tensor,
+        view,
+        symm.hdl,
+        rank_token_offset=torch.tensor([rows * g.rank], dtype=torch.int32, device="cuda"),
+        ep_max_tokens=torch.tensor([rows], dtype=torch.int32, device="cuda"),
+        per_rank_max_tokens=rows,
+    )
+    got = out.tensor.clone()
+
+    def check():
+        ou.check_guards(output=out)
+        for t in range(rows):
+            nu.assert_ieee_sum(got[t], parts, what=f"{combine} combine, token {t}")
+
+    nu.agree(check, f"{combine} combine of special values")
+
+
+SANITIZER_CASES = {
+    # combine: (hidden, why)
+    "multimem": 4100,  # 1025 fp32 lanes: a full 1024-lane window, then one lane
+    "ordered": 1025,  # a full 1024-element block, then one element
+}
+
+
+@gpu_test
+@pytest.mark.sanitizer
+@pytest.mark.parametrize("combine", list(SANITIZER_CASES))
+def test_sanitizer_small_case(nvls_groups, combine):
+    """The compute-sanitizer (memcheck) cases, one per kernel: ws 2, fp32 rows with a partial
+    last window (SANITIZER_CASES), per_rank_max 129 (the 128-block grid and one grid-stride
+    step), uneven counts (one rank empty), input_byte_offset 1 MiB (sentinels on both sides),
+    N(0, 1) data, with the sweeps' checks. A dedicated function, so the runner selects it by
+    name at any world size."""
+    g = nvls_groups.get(2)
+    hidden, per_rank_max = SANITIZER_CASES[combine], 129
+    seed = nu.case_seed("rsv-sanitizer", combine)
+    counts = nu.token_counts("uneven", 2, per_rank_max, g.shared_generator(seed))
+    case = CombineCase(g, hidden, torch.float32, per_rank_max, counts, 1 << 20, "randn", seed)
+    if combine == "multimem":
+        run_multimem_combine(case, "randn")
+    else:
+        run_ordered_combine(case)
+
+
+INT32_HIDDEN = 7168
+"""Row width of the int32-limit cases (DeepSeek-V3's hidden size)."""
+
+INT32_LIMITS = {
+    # combine: (row width in the unit the kernel indexes, the int32 limit in that unit)
+    # multimem: 16-byte lanes, scaled by 2 into 8-byte units (variable_collectives.py:239-243)
+    "multimem": (INT32_HIDDEN // 4, 2**30),
+    # ordered: fp32 elements, global_token * HIDDEN_SIZE + offsets (batch_invariant.py:486)
+    "ordered": (INT32_HIDDEN, 2**31),
+}
+
+
+def _int32_params():
+    labels = ["fits", "crosses", "row-starts-past"]
+    params = []
+    for k, label in enumerate(labels):  # every control first: a fault later poisons the process
+        for combine, (row_units, limit) in INT32_LIMITS.items():
+            rows = ou.int32_overflow_rows(row_units, limit=limit)[k]
+            params.append(
+                pytest.param(
+                    combine, rows, id=f"{combine}-{rows}[int32-{label}]", marks=pytest.mark.large
+                )
+            )
+    return params
+
+
+@gpu_test
+@pytest.mark.parametrize("combine,rows", _int32_params())
+def test_int32_row_offsets(nvls_groups, combine, rows):
+    """Row offsets at the int32 limit (`large`): the combine buffer holds ``rows`` fp32 rows of
+    H 7168 and the last rank's rows reach the row whose offsets cross 2**31 in the unit the
+    kernel indexes (INT32_LIMITS): 8 GiB of rows for the ordered kernel, 16 GiB for the
+    multimem one. A dispatcher would reach these with EP 32 (ordered) or EP 64 (multimem) at
+    the default 16384 max tokens and H 7168, e.g. on a GB200 NVL72 domain. Contract: the same sums
+    as below the limit. ws 2, counts split in half, data in closed form
+    (``nu.closed_form_rows``: every rank computes the expected sums without moving 16 GiB),
+    exact. The `fits` ids are controls. Suspected on main (findings O5-M1, O5-M2): the row
+    offsets are int32, so the `crosses` and `row-starts-past` ids read rows 16 or 32 GiB
+    before the buffer: wrong sums or an illegal-address fault. A fault on one rank leaves its
+    peer waiting in the next collective until the NCCL timeout: run each id in its own job."""
+    g = nvls_groups.get(2)
+    hidden = INT32_HIDDEN
+    counts = [rows // 2, rows - rows // 2]
+    first = counts[0] * g.rank
+    mine = counts[g.rank]
+    row_bytes = hidden * 4
+    allocated = "large" in g.buffers
+    need = mine * row_bytes + (0 if allocated else nu.LARGE_BUFFER_MB << 20) + (2 << 30)
+    nu.require_free_memory_everywhere(need)
+    symm = g.large_buffer()
+    view = symm.view((rows, hidden), torch.float32)
+    for start, count in nu.row_chunks(0, rows, hidden):
+        view[start : start + count] = nu.closed_form_rows(
+            g.rank, start, count, hidden, torch.float32
+        )
+    after = symm.sentinel_after(rows * row_bytes)
+    out = torch.empty((mine, hidden), dtype=torch.float32, device="cuda")
+    COMBINES[combine](
+        out,
+        view,
+        symm.hdl,
+        rank_token_offset=torch.tensor([first], dtype=torch.int32, device="cuda"),
+        ep_max_tokens=torch.tensor([max(counts)], dtype=torch.int32, device="cuda"),
+        per_rank_max_tokens=max(counts),
+    )
+
+    def check():
+        for start, count in nu.row_chunks(0, mine, hidden):
+            expected = sum(
+                nu.closed_form_rows(q, first + start, count, hidden, torch.float32)
+                for q in range(2)
+            )
+            ou.assert_exact(
+                out[start : start + count],
+                expected,
+                what=f"{combine} combine, global rows {first + start}-{first + start + count - 1}",
+            )
+        after.check("large buffer after the rows")
+
+    nu.agree(check, f"{combine} combine of {rows} rows (counts {counts})")

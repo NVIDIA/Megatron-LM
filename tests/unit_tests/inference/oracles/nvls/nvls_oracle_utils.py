@@ -54,6 +54,35 @@ MAX_SLEEP_CYCLES = 200_000
 one rank makes a missing or misplaced barrier observable: its peers run ahead into data the
 delayed rank has not written yet, or overwrite data it has not read yet."""
 
+PRODUCTION_GROUP_SIZE = max(GROUP_SIZES)
+"""Group size of the production-shape cases: the whole node, as TP and EP run in production
+(8 on an H100 node, 4 on a GB200 node). The case ids do not name it, so they are the same on
+both."""
+
+PRODUCTION_TOKENS = 2048
+"""Tokens per step in the production-shape cases, over the whole group: a 2048-token prefill
+chunk or decode batch, so 256 tokens per rank at 8 ranks and 512 at 4."""
+
+PRODUCTION_DENSE = {"hidden": 8192, "vocab": 128256}
+"""Llama-3.1-70B (TP 8): hidden size and vocabulary (a multiple of 128 * 8, so it splits evenly
+over the TP group without padding)."""
+
+PRODUCTION_MOE = {
+    # name: (hidden width the dispatcher gathers and combines, router top-k)
+    "deepseek-v3": (7168, 8),  # examples/post_training/modelopt/conf/deepseek-ai/DeepSeek-R1.sh
+    "nemotron-3-nano": (2688, 6),  # .../conf/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.sh
+    "nemotron-3-super": (1024, 22),  # ...-Super-120B-A12B-BF16.sh: --moe-latent-size 1024
+}
+"""MoE models served with the NVLS dispatcher. Nemotron 3 Super's latent MoE dispatches the
+1024-wide latent, not the 4096-wide hidden state. Together they cover both lane widths of the
+fp32 probabilities (top-k 8: 128-bit; 6 and 22: 64-bit) and one, two and several windows of the
+fp32 combine rows (256, 672 and 1792 lanes)."""
+
+LARGE_BUFFER_MB = 16 * 1024 + 128
+"""The symmetric buffer of the ``large`` (int32 limit) cases: 16 GiB of rows, so 16-byte-lane
+offsets in 8-byte units reach 2**31, plus the three-tensor all-gather-v's side tensors packed
+after them. Allocated on first use, for groups of 2 only."""
+
 
 def group_size_params() -> List[Any]:
     """``GROUP_SIZES`` as ``pytest.param`` objects with ids ``ws2``, ``ws4``, ``ws8``."""
@@ -147,6 +176,28 @@ class NvlsGroup:
 
     def buffer(self, name: str = "main") -> SymmBuffer:
         return self.buffers[name]
+
+    def large_buffer(self) -> SymmBuffer:
+        """A ``LARGE_BUFFER_MB`` symmetric buffer for this group, made on first use and kept.
+
+        Every rank of the job calls it in the same test. A rank that cannot allocate fails (on
+        target hardware) or skips together with every other rank, so none is left waiting.
+        """
+        if "large" not in self.buffers:
+            from megatron.core.inference.symmetric_memory import SymmetricMemoryBuffer
+
+            buf = SymmetricMemoryBuffer(size_in_mb=LARGE_BUFFER_MB, process_group=self.group)
+            problem = buf.init_failure_reason or ""
+            if not problem and not buf.symm_mem_hdl.multicast_ptr:
+                problem = "no NVLink multicast (multicast_ptr is 0)"
+            anywhere = torch.tensor([1 if problem else 0], device="cuda")
+            dist.all_reduce(anywhere)
+            if int(anywhere):
+                unavailable(
+                    f"{LARGE_BUFFER_MB} MiB symmetric buffer: {problem or 'failed on another rank'}"
+                )
+            self.buffers["large"] = SymmBuffer(raw=buf.symm_buffer, hdl=buf.symm_mem_hdl)
+        return self.buffers["large"]
 
     # NCCL references -------------------------------------------------------------------------
 
@@ -382,3 +433,115 @@ def token_counts(pattern: str, ws: int, per_rank_max: int, generator: torch.Gene
 def concat_rows(gathered: torch.Tensor, counts: Sequence[int]) -> torch.Tensor:
     """Rows ``[0, counts[q])`` of each rank's padded tensor ``gathered[q]``, in rank order."""
     return torch.cat([gathered[q, :c] for q, c in enumerate(counts)], dim=0)
+
+
+# ---------------------------------------------------------------------------------------------
+# Production shapes, special values and int32 limits
+# ---------------------------------------------------------------------------------------------
+
+
+def production_counts(
+    pattern: str, ws: int, per_rank: int, generator: torch.Generator
+) -> List[int]:
+    """Per-rank token counts of a production step: ``full`` (a padded CUDA-graph step, every
+    rank at ``per_rank``) or ``uneven`` (an eager step: rank 0 full, the others between 1 and
+    ``per_rank``, every rank with tokens)."""
+    if pattern == "full":
+        return [per_rank] * ws
+    counts = [int(c) for c in torch.randint(1, per_rank + 1, (ws,), generator=generator)]
+    counts[0] = per_rank
+    return counts
+
+
+SPECIAL_COLUMNS = ["nan", "+inf", "-inf", "+inf-inf", "zeros", "-0", "finite"]
+"""Column classes of the special-value cases (see ``special_partials``)."""
+
+
+def special_partials(ws: int, columns_per_class: int, dtype: torch.dtype) -> torch.Tensor:
+    """[ws, n] partials of the special-value cases, n a multiple of 16 bytes of ``dtype``.
+
+    Per class: ``nan`` one rank holds NaN, the others 1.0; ``+inf`` / ``-inf`` one rank holds
+    the infinity, the others 1.0; ``+inf-inf`` one rank +inf and the next -inf; ``zeros`` +0.0
+    on every rank; ``-0`` -0.0 on every rank; ``finite`` 1.0 everywhere. The rank holding the
+    special value moves with the column. IEEE addition, in any order: NaN, +inf, -inf, NaN, 0,
+    0 (+0.0 or -0.0: the sign of an all-negative-zero sum depends on the accumulator's start)
+    and ws.
+    """
+    lanes = 16 // dtype.itemsize
+    n = -(-(len(SPECIAL_COLUMNS) * columns_per_class) // lanes) * lanes
+    parts = torch.ones((ws, n), dtype=torch.float64)
+    for k, name in enumerate(SPECIAL_COLUMNS):
+        for j in range(columns_per_class):
+            col = k * columns_per_class + j
+            slot = j % ws
+            if name == "nan":
+                parts[slot, col] = float("nan")
+            elif name == "+inf":
+                parts[slot, col] = float("inf")
+            elif name == "-inf":
+                parts[slot, col] = float("-inf")
+            elif name == "+inf-inf":
+                parts[slot, col] = float("inf")
+                parts[(slot + 1) % ws, col] = float("-inf")
+            elif name == "zeros":
+                parts[:, col] = 0.0
+            elif name == "-0":
+                parts[:, col] = -0.0
+    return parts.to(dtype)
+
+
+def assert_ieee_sum(out: torch.Tensor, parts: torch.Tensor, *, what: str) -> None:
+    """``out`` is the IEEE sum over dim 0 of ``parts`` up to the sign of zero: NaN exactly
+    where the sum is NaN, the same infinities, and the same finite values (all exact here)."""
+    expected = parts.double().sum(0)
+    got = out.double().to(expected.device)
+    problems = []
+    nan_expected, nan_got = torch.isnan(expected), torch.isnan(got)
+    if not torch.equal(nan_expected, nan_got):
+        bad = (nan_expected != nan_got).nonzero().reshape(-1)[:8].tolist()
+        problems.append(
+            f"NaN where the sum is not, or a number where it is NaN, at columns {bad}"
+            f" (got {[got[i].item() for i in bad]}, expected {[expected[i].item() for i in bad]})"
+        )
+    keep = ~nan_expected & ~nan_got
+    if not torch.equal(got[keep], expected[keep]):
+        diff = (keep & (got != expected)).nonzero().reshape(-1)[:8].tolist()
+        problems.append(
+            f"values differ at columns {diff}: got {[got[i].item() for i in diff]}, expected"
+            f" {[expected[i].item() for i in diff]}"
+        )
+    if problems:
+        raise AssertionError(f"{what}: " + "; ".join(problems))
+
+
+def closed_form_rows(
+    owner: int, first_row: int, rows: int, hidden: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Rows ``[first_row, first_row + rows)`` of rank ``owner``'s data in the int32-limit
+    cases: (((r mod 61) * 3 + (r // 61) mod 17 + 7 c + 29 q) mod 61 - 30) / 16 at row r, column
+    c, rank q. Every rank can compute any rank's rows without moving data; the values differ
+    between neighbouring rows, columns and ranks, and sums of two of them are exact in bf16 and
+    fp32 under any order (multiples of 1/16 below 4 in magnitude)."""
+    r = torch.arange(first_row, first_row + rows, device="cuda", dtype=torch.int64)[:, None]
+    c = torch.arange(hidden, device="cuda", dtype=torch.int64)[None, :]
+    v = ((r % 61) * 3 + (r // 61) % 17 + 7 * c + 29 * owner) % 61 - 30
+    return (v.to(torch.float32) / 16).to(dtype)
+
+
+def row_chunks(start: int, stop: int, hidden: int, elements: int = 1 << 25):
+    """``(first, count)`` chunks of rows ``[start, stop)`` of at most ``elements`` elements."""
+    step = max(1, elements // hidden)
+    for first in range(start, stop, step):
+        yield first, min(step, stop - first)
+
+
+def require_free_memory_everywhere(nbytes: int) -> None:
+    """Skip on every rank (with the numbers) when any rank has less than ``nbytes`` free."""
+    free, _ = torch.cuda.mem_get_info()
+    least = torch.tensor([free], dtype=torch.int64, device="cuda")
+    dist.all_reduce(least, op=dist.ReduceOp.MIN)
+    if int(least) < nbytes:
+        pytest.skip(
+            f"needs {nbytes / 2**30:.1f} GiB free on every rank; least free"
+            f" {int(least) / 2**30:.1f} GiB"
+        )
