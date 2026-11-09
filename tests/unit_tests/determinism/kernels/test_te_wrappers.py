@@ -971,53 +971,147 @@ def test_te_fused_mla_kv_rope_mxfp8_replays():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_te_quantile_balancing_histogram_replays(dtype):
+@pytest.mark.parametrize("space", ["score", "logit"])
+@pytest.mark.parametrize("indices_dtype", [None, torch.int64, torch.int16])
+def test_te_quantile_balancing_histogram_replays(dtype, space, indices_dtype):
     """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
-    from megatron.core.extensions.transformer_engine import (
-        fused_topk_with_score_function_supports_qb,
-    )
-    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+    from megatron.core.transformer.moe import moe_utils
 
-    if not fused_topk_with_score_function_supports_qb:
+    if not moe_utils.fused_topk_with_score_function_supports_qb:
         pytest.skip("requires the Transformer Engine QB fused-router API")
+    if space == "logit" and not moe_utils.fused_topk_with_score_function_supports_logit_bias:
+        pytest.skip("requires the Transformer Engine logit-bias fused-router API")
+    if (
+        indices_dtype is not None
+        and not moe_utils.fused_topk_with_score_function_supports_topk_indices
+    ):
+        pytest.skip("requires Transformer Engine dense top-k indices")
     seeded()
-    num_tokens, num_experts = 8192, 64
+    num_tokens, num_experts, topk = 8192, 64, 8
     logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=dtype, requires_grad=True)
     bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
-    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    bounds = torch.tensor([-16.0, 16.0] if space == "logit" else [-1.0, 1.0], device="cuda")
     histogram = torch.zeros(num_experts, 128, device="cuda", dtype=torch.int32)
+    span = torch.zeros((), device="cuda")
+    dense_output = indices_dtype is not None
 
-    def fn(logits, histogram):
+    def fn(logits, histogram, span):
         outputs = []
         for microbatch in logits.chunk(2):
+            indices = (
+                torch.empty(microbatch.shape[0], topk, device="cuda", dtype=indices_dtype)
+                if dense_output
+                else None
+            )
             outputs.append(
-                topk_routing_with_score_function(
+                moe_utils.topk_routing_with_score_function(
                     microbatch,
-                    topk=8,
+                    topk=topk,
                     score_function="sigmoid",
                     expert_bias=bias,
                     fused=True,
+                    dense_output=dense_output,
+                    topk_indices=indices,
+                    qb_bias_space=space,
                     qb_histogram=histogram,
                     qb_bin_bounds=bounds,
+                    qb_logit_span=span if space == "logit" else None,
                 )
             )
         return (
             torch.cat([output[0] for output in outputs]),
             torch.cat([output[1] for output in outputs]),
             histogram,
+            span,
         )
 
     outputs, grads = assert_replays_bit_exact(
         fn,
-        (logits, histogram),
-        grad_outputs={"out[0]": torch.randn(num_tokens, num_experts, device="cuda")},
+        (logits, histogram, span),
+        grad_outputs={
+            "out[0]": torch.randn(num_tokens, topk if dense_output else num_experts, device="cuda")
+        },
         replays=3,
         contention=True,
-        what=f"TE quantile balancing[{dtype}]",
+        what=f"TE quantile balancing[{space}, {dtype}, {indices_dtype}]",
     )
     assert torch.all(outputs["out[2]"].sum(dim=-1) == num_tokens)
-    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    if dense_output:
+        ids = outputs["out[1]"]
+        assert ids.shape == (num_tokens, topk) and ids.dtype == indices_dtype
+        assert torch.all((ids >= 0) & (ids < num_experts))
+        assert torch.all(ids.sort(dim=-1).values.diff(dim=-1) != 0)
+    else:
+        assert outputs["out[1]"].dtype == torch.bool
+        assert torch.all(outputs["out[1]"].sum(dim=-1) == topk)
+    if space == "logit":
+        raw = logits.detach().float()
+        torch.testing.assert_close(outputs["out[3]"], (raw.amax(-1) - raw.amin(-1)).amax())
     assert grads["in[0]"].abs().sum() > 0
+
+
+@pytest.mark.parametrize("output_mode", ["map", "allocate", "int64", "int16"])
+def test_te_logit_quantile_balancing_reference(output_mode):
+    """Check real TE selection, unbiased weights, and gradients against an independent oracle."""
+    from megatron.core.transformer.moe import moe_utils
+
+    if not (
+        moe_utils.fused_topk_with_score_function_supports_qb
+        and moe_utils.fused_topk_with_score_function_supports_logit_bias
+    ):
+        pytest.skip("requires the Transformer Engine logit-bias QB fused-router API")
+    dense_output = output_mode != "map"
+    if dense_output and not moe_utils.fused_topk_with_score_function_supports_topk_indices:
+        pytest.skip("requires Transformer Engine dense top-k indices")
+    logits = torch.tensor(
+        [[0.0, -2.0, 1.0, 2.0], [-4.0, -1.0, 0.5, 1.5], [2.0, -3.0, 0.0, -1.0]],
+        device="cuda",
+        requires_grad=True,
+    )
+    bias = torch.tensor([0.2, 2.5, 0.0, 0.0], device="cuda")
+    reference_logits = logits.detach().clone().requires_grad_()
+    expected_ids = (reference_logits.detach() + bias).topk(2, dim=-1).indices
+    selected = reference_logits.sigmoid().gather(1, expected_ids)
+    expected_probs = 2.5 * selected / (selected.sum(-1, keepdim=True) + 1e-20)
+    expected = torch.zeros_like(reference_logits).scatter(1, expected_ids, expected_probs)
+    indices_dtype = {"int64": torch.int64, "int16": torch.int16}.get(output_mode)
+    indices = (
+        torch.empty(3, 2, device="cuda", dtype=indices_dtype) if indices_dtype is not None else None
+    )
+    histogram = torch.zeros(4, 128, device="cuda", dtype=torch.int32)
+    span = torch.zeros((), device="cuda")
+    probs, routes = moe_utils.topk_routing_with_score_function(
+        logits,
+        2,
+        score_function="sigmoid",
+        scaling_factor=2.5,
+        expert_bias=bias,
+        fused=True,
+        dense_output=dense_output,
+        topk_indices=indices,
+        qb_bias_space="logit",
+        qb_histogram=histogram,
+        qb_bin_bounds=torch.tensor([-16.0, 16.0], device="cuda"),
+        qb_logit_span=span,
+    )
+    expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, expected_ids, True)
+    if dense_output:
+        assert probs.shape == routes.shape == expected_ids.shape
+        assert routes.dtype == (indices_dtype or torch.int64)
+        if indices is not None:
+            assert routes.data_ptr() == indices.data_ptr()
+        actual_map = torch.zeros_like(expected_map).scatter(1, routes.long(), True)
+        actual = torch.zeros_like(logits).scatter(1, routes.long(), probs)
+    else:
+        actual_map, actual = routes, probs
+    assert torch.equal(actual_map, expected_map)
+    torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-5)
+    upstream = torch.arange(logits.numel(), device="cuda", dtype=torch.float32).view_as(logits)
+    actual_grad = torch.autograd.grad((actual * upstream).sum(), logits)[0]
+    expected_grad = torch.autograd.grad((expected * upstream).sum(), reference_logits)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=2e-7, rtol=2e-5)
+    assert torch.all(histogram.sum(-1) == logits.shape[0])
+    torch.testing.assert_close(span, (logits.detach().amax(-1) - logits.detach().amin(-1)).amax())
 
 
 # --- fused top-k router with dense indices ------------------------------------------------------

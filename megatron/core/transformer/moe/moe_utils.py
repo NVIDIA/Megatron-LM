@@ -1044,12 +1044,13 @@ def topk_routing_with_score_function(
             )
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
-        if dense_output and topk_indices is None:
+        if dense_output:
             if not fused_topk_with_score_function_supports_topk_indices:
                 raise ValueError("Fused dense output requires TE dense top-k indices.")
-            kwargs["topk_indices"] = torch.empty(
-                (num_tokens, topk), device=logits.device, dtype=torch.int64
-            )
+            if topk_indices is None:
+                kwargs["topk_indices"] = torch.empty(
+                    (num_tokens, topk), device=logits.device, dtype=torch.int64
+                )
         probs, routing_output = fused_topk_with_score_function(**kwargs)
         if qb_logit_span is not None:
             _accumulate_qb_logit_span(logits, qb_logit_span)

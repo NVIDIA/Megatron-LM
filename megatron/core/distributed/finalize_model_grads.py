@@ -378,7 +378,7 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
-            if getattr(module, 'qb_logit_span', None) is not None:
+            if getattr(module, "qb_logit_span", None) is not None:
                 module.qb_logit_span.zero_()
 
 
@@ -485,7 +485,7 @@ def _update_router_expert_bias_with_quantile(
                 expert_bias_list.append(module.expert_bias)
                 qb_histogram_list.append(module.qb_histogram)
                 qb_bin_bounds_list.append(module.qb_bin_bounds)
-                if getattr(module, 'qb_logit_span', None) is not None:
+                if getattr(module, "qb_logit_span", None) is not None:
                     qb_logit_span_list.append(module.qb_logit_span)
 
     if not expert_bias_list:

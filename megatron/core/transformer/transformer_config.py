@@ -1049,7 +1049,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_qb_num_bins: int = 1000
     """Number of persistent uniform histogram bins per expert for global-batch QB."""
 
-    moe_router_qb_bias_space: Literal['score', 'logit'] = 'score'
+    moe_router_qb_bias_space: Literal["score", "logit"] = "score"
     """Space in which global-batch QB selects experts and estimates its additive bias.
 
     ``score`` uses sigmoid(logits) + bias (the existing behavior). ``logit`` uses

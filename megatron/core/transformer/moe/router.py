@@ -222,7 +222,7 @@ class TopKRouter(Router):
         self.frozen_expert_bias = False
         self.qb_estimation_scope = self.config.moe_router_quantile_balancing_estimation_scope
         self.qb_bias_space = self.config.moe_router_qb_bias_space
-        self.register_buffer('qb_logit_span', None, persistent=False)
+        self.register_buffer("qb_logit_span", None, persistent=False)
         self.mtp_layer_number: Optional[int] = None
         self.is_hash_layer = False
         self.register_buffer('tid2eid', None)
@@ -416,7 +416,7 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
             if self.qb_bin_bounds.dtype != torch.float32:
                 self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
-        if getattr(self, 'qb_logit_span', None) is not None:
+        if getattr(self, "qb_logit_span", None) is not None:
             if self.qb_logit_span.dtype != torch.float32:
                 self.qb_logit_span.data = self.qb_logit_span.data.to(torch.float32)
 
@@ -1513,7 +1513,7 @@ class InferenceTopKRouter(TopKRouter):
         """
         return (
             self.config.inference_moe_router_backend == 'triton'
-            and self.qb_bias_space == 'score'
+            and self.qb_bias_space == "score"
             and HAVE_SIGMOID_TOPK_KERNEL
             and logits.is_cuda
             and logits.dtype == torch.float32

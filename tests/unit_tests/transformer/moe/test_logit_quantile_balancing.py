@@ -127,7 +127,7 @@ def test_logit_update_adapts_range(span_value):
     torch.testing.assert_close(bounds, torch.tensor([-0.25 - width, 0.25 + width]))
 
 
-@pytest.mark.parametrize("bad", [float('nan'), float('inf'), -float('inf')])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
 def test_nonfinite_logit_preserves_bias_and_bounds(bad):
     """An invalid batch must not poison persistent histogram bounds."""
     z = torch.zeros(2, 4)
@@ -182,8 +182,8 @@ def test_empty_logit_batch_preserves_state():
         {"moe_router_load_balancing_type": "none"},
         {"moe_router_quantile_balancing_estimation_scope": "micro_batch"},
         {"moe_router_qb_logit_initial_bound": 0},
-        {"moe_router_qb_logit_initial_bound": float('inf')},
-        {"moe_router_qb_logit_initial_bound": float('nan')},
+        {"moe_router_qb_logit_initial_bound": float("inf")},
+        {"moe_router_qb_logit_initial_bound": float("nan")},
     ],
 )
 def test_invalid_logit_config(overrides):
@@ -199,46 +199,46 @@ def test_logit_cli():
     parser = argparse.ArgumentParser()
     add_megatron_arguments(parser)
     args = parser.parse_args(
-        ['--moe-router-qb-bias-space', 'logit', '--moe-router-qb-logit-initial-bound', '32']
+        ["--moe-router-qb-bias-space", "logit", "--moe-router-qb-logit-initial-bound", "32"]
     )
-    assert args.moe_router_qb_bias_space == 'logit'
+    assert args.moe_router_qb_bias_space == "logit"
     assert args.moe_router_qb_logit_initial_bound == 32
 
 
 def test_old_te_rejected_before_logit_dispatch():
     """Do not silently route in score space with an older installed TE."""
     with (
-        patch.object(moe_utils, 'HAVE_TE', True),
-        patch.object(moe_utils, 'fused_topk_with_score_function', lambda **kwargs: None),
-        patch.object(moe_utils, 'fused_topk_with_score_function_supports_logit_bias', False),
+        patch.object(moe_utils, "HAVE_TE", True),
+        patch.object(moe_utils, "fused_topk_with_score_function", lambda **kwargs: None),
+        patch.object(moe_utils, "fused_topk_with_score_function_supports_logit_bias", False),
     ):
-        with pytest.raises(ValueError, match='does not support logit-space'):
+        with pytest.raises(ValueError, match="does not support logit-space"):
             moe_utils.topk_routing_with_score_function(
                 torch.zeros(2, 8),
                 2,
-                score_function='sigmoid',
+                score_function="sigmoid",
                 expert_bias=torch.zeros(8),
-                qb_bias_space='logit',
+                qb_bias_space="logit",
                 fused=True,
             )
 
 
-@pytest.mark.parametrize('requires_grad', [False, True])
+@pytest.mark.parametrize("requires_grad", [False, True])
 def test_logit_bias_bypasses_batch_invariant_score_kernel(requires_grad):
     """The score-space kernel cannot handle logit bias, even without a QB histogram."""
     logits = torch.tensor([[3.0, 2.0, 1.0, -1.0]], requires_grad=requires_grad)
     bias = torch.tensor([-0.5, -0.4, 0.1, 0.8])
     with (
-        patch.object(moe_utils, '_use_batch_invariant_sigmoid_topk', return_value=True),
-        patch.object(moe_utils, 'sigmoid_topk_routing') as kernel,
-        patch.object(moe_utils._BatchInvariantSigmoidTopK, 'apply') as autograd_kernel,
+        patch.object(moe_utils, "_use_batch_invariant_sigmoid_topk", return_value=True),
+        patch.object(moe_utils, "sigmoid_topk_routing") as kernel,
+        patch.object(moe_utils._BatchInvariantSigmoidTopK, "apply") as autograd_kernel,
     ):
         probs, indices = moe_utils.topk_routing_with_score_function(
             logits,
             2,
-            score_function='sigmoid',
+            score_function="sigmoid",
             expert_bias=bias,
-            qb_bias_space='logit',
+            qb_bias_space="logit",
             dense_output=True,
         )
     kernel.assert_not_called()
@@ -253,42 +253,74 @@ def test_logit_bias_bypasses_batch_invariant_score_kernel(requires_grad):
         torch.testing.assert_close(actual_grad, expected_grad)
 
 
-def test_fused_logit_dense_output_contract():
+@pytest.mark.parametrize("space", ["score", "logit"])
+@pytest.mark.parametrize("indices_dtype", [None, torch.int64, torch.int16])
+def test_fused_dense_output_rejects_unsupported_te(space, indices_dtype):
+    """A supplied buffer must not bypass the dense-index capability guard."""
+    logits = torch.randn(2, 8)
+    indices = None if indices_dtype is None else torch.empty(2, 2, dtype=indices_dtype)
+    with (
+        patch.object(moe_utils, "HAVE_TE", True),
+        patch.object(moe_utils, "fused_topk_with_score_function") as kernel,
+        patch.object(moe_utils, "fused_topk_with_score_function_supports_logit_bias", True),
+        patch.object(moe_utils, "fused_topk_with_score_function_supports_topk_indices", False),
+        pytest.raises(ValueError, match="TE dense top-k indices"),
+    ):
+        moe_utils.topk_routing_with_score_function(
+            logits,
+            2,
+            score_function="sigmoid",
+            expert_bias=torch.zeros(8),
+            qb_bias_space=space,
+            dense_output=True,
+            topk_indices=indices,
+            fused=True,
+        )
+    kernel.assert_not_called()
+
+
+@pytest.mark.parametrize("indices_dtype", [None, torch.int64, torch.int16])
+def test_fused_logit_dense_output_contract(indices_dtype):
     """Adapt TE's full-width probabilities and dense IDs to Core's compact pair."""
     logits = torch.tensor([[0.0, -2.0, 1.0, 2.0]])
     bias = torch.tensor([3.0, 0.0, 0.0, 0.0])
+    provided_indices = None if indices_dtype is None else torch.empty(1, 2, dtype=indices_dtype)
     expected, indices = moe_utils.topk_routing_with_score_function(
         logits,
         2,
-        score_function='sigmoid',
+        score_function="sigmoid",
         expert_bias=bias,
-        qb_bias_space='logit',
+        qb_bias_space="logit",
         dense_output=True,
     )
 
     def te_forward(**kwargs):
-        assert kwargs['qb_bias_space'] == 'logit'
-        ids = kwargs['topk_indices']
+        assert kwargs["qb_bias_space"] == "logit"
+        ids = kwargs["topk_indices"]
+        if provided_indices is not None:
+            assert ids is provided_indices
         ids.copy_(indices)
-        return torch.zeros_like(logits).scatter(1, ids, expected), ids
+        return torch.zeros_like(logits).scatter(1, ids.long(), expected), ids
 
     with (
-        patch.object(moe_utils, 'HAVE_TE', True),
-        patch.object(moe_utils, 'fused_topk_with_score_function', te_forward),
-        patch.object(moe_utils, 'fused_topk_with_score_function_supports_logit_bias', True),
-        patch.object(moe_utils, 'fused_topk_with_score_function_supports_topk_indices', True),
+        patch.object(moe_utils, "HAVE_TE", True),
+        patch.object(moe_utils, "fused_topk_with_score_function", te_forward),
+        patch.object(moe_utils, "fused_topk_with_score_function_supports_logit_bias", True),
+        patch.object(moe_utils, "fused_topk_with_score_function_supports_topk_indices", True),
     ):
         actual, actual_ids = moe_utils.topk_routing_with_score_function(
             logits,
             2,
-            score_function='sigmoid',
+            score_function="sigmoid",
             expert_bias=bias,
-            qb_bias_space='logit',
+            qb_bias_space="logit",
             dense_output=True,
+            topk_indices=provided_indices,
             fused=True,
         )
     torch.testing.assert_close(actual, expected)
     assert torch.equal(actual_ids, indices)
+    assert actual_ids.dtype == (torch.int64 if indices_dtype is None else indices_dtype)
 
 
 class TestLogitRouterState:
@@ -300,7 +332,7 @@ class TestLogitRouterState:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def router(self, space='logit', inference=False):
+    def router(self, space="logit", inference=False):
         """Construct an unfused router with the requested checkpoint bias units."""
         cls = InferenceTopKRouter if inference else TopKRouter
         return cls(
@@ -308,20 +340,20 @@ class TestLogitRouterState:
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
 
-    @pytest.mark.parametrize('strict', [False, True])
+    @pytest.mark.parametrize("strict", [False, True])
     def test_checkpoint_units(self, strict):
         """Round-trip logit state, but reject cross-space loads even with strict=False."""
-        logit, score = self.router(), self.router('score')
-        logit.expert_bias.copy_(torch.arange(8, device='cuda'))
+        logit, score = self.router(), self.router("score")
+        logit.expert_bias.copy_(torch.arange(8, device="cuda"))
         saved = logit.state_dict()
-        assert 'logit_expert_bias' in saved and 'expert_bias' not in saved
-        assert 'logit_qb_bin_bounds' in saved and 'qb_logit_span' not in saved
+        assert "logit_expert_bias" in saved and "expert_bias" not in saved
+        assert "logit_qb_bin_bounds" in saved and "qb_logit_span" not in saved
         clone = self.router()
         clone.load_state_dict(saved, strict=strict)
         torch.testing.assert_close(clone.expert_bias, logit.expert_bias)
-        with pytest.raises(RuntimeError, match='score-space'):
+        with pytest.raises(RuntimeError, match="score-space"):
             logit.load_state_dict(score.state_dict(), strict=strict)
-        with pytest.raises(RuntimeError, match='logit-space'):
+        with pytest.raises(RuntimeError, match="logit-space"):
             score.load_state_dict(saved, strict=strict)
 
     def test_repeated_router_and_reset(self):
@@ -329,7 +361,7 @@ class TestLogitRouterState:
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
 
         router = self.router()
-        z = torch.randn(16, 8, device='cuda', requires_grad=True)
+        z = torch.randn(16, 8, device="cuda", requires_grad=True)
         router.quantile_balancing(z)
         router.quantile_balancing(z * 2)
         assert torch.all(router.qb_histogram.sum(-1) == 32)
@@ -344,30 +376,30 @@ class TestLogitRouterState:
     def test_score_only_inference_kernel_is_bypassed(self):
         """A score-space-only inference backend must not handle logit bias."""
         router = self.router(inference=True)
-        router.config.inference_moe_router_backend = 'triton'
-        assert not router._uses_sigmoid_topk_kernel(torch.zeros(16, 8, device='cuda'), None)
+        router.config.inference_moe_router_backend = "triton"
+        assert not router._uses_sigmoid_topk_kernel(torch.zeros(16, 8, device="cuda"), None)
 
-    @pytest.mark.parametrize('space', ['score', 'logit'])
+    @pytest.mark.parametrize("space", ["score", "logit"])
     def test_global_qb_diagnostics(self, space):
         """Global QB diagnostics report its additive bias without reading absent beta."""
         router = self.router(space)
-        router.expert_bias.copy_(torch.arange(8, device='cuda'))
-        target = 'megatron.core.transformer.moe.router'
+        router.expert_bias.copy_(torch.arange(8, device="cuda"))
+        target = "megatron.core.transformer.moe.router"
         with (
-            patch(target + '.is_observing_tensor', return_value=True),
-            patch(target + '.observe_tensor') as observe,
+            patch(target + ".is_observing_tensor", return_value=True),
+            patch(target + ".observe_tensor") as observe,
         ):
-            router.routing(torch.randn(4, 2, 8, device='cuda'))
+            router.routing(torch.randn(4, 2, 8, device="cuda"))
         diagnostics = observe.call_args.args[3]
         torch.testing.assert_close(
             diagnostics[:, RouterDiagnosticChannel.EXPERT_BIAS], router.expert_bias.expand(2, -1)
         )
 
-    @pytest.mark.parametrize('space', ['score', 'logit'])
+    @pytest.mark.parametrize("space", ["score", "logit"])
     def test_global_qb_dense_output(self, space):
         """The global QB entry point honors the compact output contract."""
         router = self.router(space)
-        z = torch.randn(16, 8, device='cuda')
+        z = torch.randn(16, 8, device="cuda")
         probs, ids = router.quantile_balancing(z, dense_output=True)
         full, mask = router.quantile_balancing(z)
         assert probs.shape == ids.shape == (16, 2)
@@ -383,19 +415,19 @@ class TestLogitRouterState:
         router.set_layer_number(1)
         assert router.expert_bias is None
         saved = router.state_dict()
-        assert 'logit_expert_bias' not in saved and 'expert_bias' not in saved
+        assert "logit_expert_bias" not in saved and "expert_bias" not in saved
         router.load_state_dict(saved)
 
-    @pytest.mark.parametrize('virtual_experts', [False, True])
+    @pytest.mark.parametrize("virtual_experts", [False, True])
     def test_training_dispatch_probability_layout(self, virtual_experts):
         """Flex transports consume full-width probabilities; the planner uses compact ones."""
         router = self.router()
         router.config.moe_virtual_expert_load_balance = virtual_experts
         with (
-            patch.object(router, '_dense_route_indices_dtype', return_value=torch.int64),
-            patch('megatron.core.transformer.moe.router.is_observing_tensor', return_value=False),
+            patch.object(router, "_dense_route_indices_dtype", return_value=torch.int64),
+            patch("megatron.core.transformer.moe.router.is_observing_tensor", return_value=False),
         ):
-            probs, routes = router.routing(torch.randn(4, 2, 8, device='cuda'))
+            probs, routes = router.routing(torch.randn(4, 2, 8, device="cuda"))
         width = 2 if virtual_experts else 8
         assert probs.shape == routes.shape == (8, width)
         assert routes.dtype == (torch.int64 if virtual_experts else torch.bool)

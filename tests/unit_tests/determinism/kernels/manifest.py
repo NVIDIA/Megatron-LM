@@ -365,12 +365,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
             K + "test_moe_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "score/logit histogram accumulation, pooled logit ranges, and bias updates.",
+        "score/logit histogram accumulation, pooled logit ranges, and bias updates. "
+        "Real TE score/logit routing, compact outputs, and histograms replay in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="mok_route_adapter",

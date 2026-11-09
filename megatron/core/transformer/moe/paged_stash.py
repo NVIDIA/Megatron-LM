@@ -1133,7 +1133,7 @@ class PagedStashRunner:
             qb_histogram = getattr(router, 'qb_histogram', None)
             if qb_histogram is not None:
                 qb_histogram.zero_()
-            qb_logit_span = getattr(router, 'qb_logit_span', None)
+            qb_logit_span = getattr(router, "qb_logit_span", None)
             if qb_logit_span is not None:
                 qb_logit_span.zero_()
 
