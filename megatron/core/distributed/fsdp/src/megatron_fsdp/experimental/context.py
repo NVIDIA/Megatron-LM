@@ -28,7 +28,18 @@ from .runtime_policy import PrefetchOrder, RuntimePolicy
 
 
 class GradientFinalizationMode(enum.Enum):
-    """Control outer reduction and the automatic wait for gradient reductions."""
+    """Control outer reduction and the automatic wait for gradient reductions.
+
+    | Mode | Outer reduction | Automatic wait at autograd completion |
+    | --- | --- | --- |
+    | SKIP_OUTER | Skip | No |
+    | REDUCE_OUTER | Launch as gradients become ready | No |
+    | REDUCE_OUTER_AND_WAIT (default) | Launch as gradients become ready | Yes |
+
+    Inner reduction or local accumulation runs in every mode. The automatic wait
+    covers both inner and outer reductions. The default applies outside a
+    ``finalize_gradients()`` scope.
+    """
 
     SKIP_OUTER = enum.auto()
     """Skip outer reduction and the automatic completion wait during accumulation."""
