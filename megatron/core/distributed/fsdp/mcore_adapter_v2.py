@@ -42,7 +42,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
-        GradSyncMode,
+        GradientSyncMode,
         Placements,
         RuntimePolicy,
         SchedulePolicy,
@@ -260,16 +260,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     device=device,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        grad_sync_mode=GradSyncMode.REDUCE_OUTER,
+                        grad_sync_mode=GradientSyncMode.REDUCE_OUTER,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
-            if active_context.grad_sync_mode is GradSyncMode.REDUCE_OUTER_AND_WAIT:
+            if active_context.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy(grad_sync_mode=GradSyncMode.REDUCE_OUTER)."
+                    "RuntimePolicy(grad_sync_mode=GradientSyncMode.REDUCE_OUTER)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
@@ -466,7 +466,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with finalize_gradients(self.module.context, mode=GradSyncMode.SKIP_OUTER):
+        with finalize_gradients(self.module.context, mode=GradientSyncMode.SKIP_OUTER):
             yield
 
     @torch.no_grad()

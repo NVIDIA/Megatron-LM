@@ -13,7 +13,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradSyncMode,
+    GradientSyncMode,
     Placements,
     RuntimePolicy,
     SchedulePolicy,
@@ -165,9 +165,9 @@ def test_overlaps_communication_and_compute(
             with finalize_gradients(
                 context,
                 mode=(
-                    GradSyncMode.REDUCE_OUTER_AND_WAIT
+                    GradientSyncMode.REDUCE_OUTER_AND_WAIT
                     if microbatch_index == 1
-                    else GradSyncMode.SKIP_OUTER
+                    else GradientSyncMode.SKIP_OUTER
                 ),
             ):
                 model(x).sum().backward()
@@ -302,9 +302,9 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
             with finalize_gradients(
                 context,
                 mode=(
-                    GradSyncMode.REDUCE_OUTER_AND_WAIT
+                    GradientSyncMode.REDUCE_OUTER_AND_WAIT
                     if microbatch_index == 1
-                    else GradSyncMode.SKIP_OUTER
+                    else GradientSyncMode.SKIP_OUTER
                 ),
             ):
                 model(x).sum().backward()

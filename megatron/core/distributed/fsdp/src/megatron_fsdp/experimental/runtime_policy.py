@@ -18,14 +18,7 @@ import enum
 from dataclasses import dataclass
 
 
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
-
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
-
-
-class GradSyncMode(enum.Enum):
+class GradientSyncMode(enum.Enum):
     """Control outer reduction and the completion wait; inner reduction always runs."""
 
     SKIP_OUTER = enum.auto()
@@ -38,9 +31,16 @@ class GradSyncMode(enum.Enum):
     """Launch outer reduction and wait for all gradient reductions at autograd completion."""
 
 
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
+
+
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication, prefetch, and gradient synchronization for an FSDP context.
+    """Configure communication and gradient synchronization for an FSDP context.
 
     Attributes:
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
@@ -50,12 +50,6 @@ class RuntimePolicy:
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
         overlap_outer_communication: Run the last-microbatch DP-outer reduction on
             a separate stream, independently of overlap_allgather_reduction.
-        prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-            registration order. ``RECORDED`` gathers parameters on demand and records
-            module calls until the first ``post_backward()``. Subsequent passes must
-            repeat the complete sequence consistently across data-parallel ranks.
-            Recording currently requires the ordinary module hooks; combined 1F1B
-            bypasses them. Discard the context if the recorded pass raises.
         grad_sync_mode: Default gradient synchronization mode. Use REDUCE_OUTER
             when the caller waits with finish_grad_sync() after all backward work,
             including delayed weight gradients. finalize_gradients() scopes overrides.
@@ -64,5 +58,6 @@ class RuntimePolicy:
     use_symmetric_memory: bool = False
     overlap_allgather_reduction: bool = True
     overlap_outer_communication: bool = False
-    grad_sync_mode: GradSyncMode = GradSyncMode.REDUCE_OUTER_AND_WAIT
+    grad_sync_mode: GradientSyncMode = GradientSyncMode.REDUCE_OUTER_AND_WAIT
+
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION

@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -22,7 +23,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import GradSyncMode, PrefetchOrder, RuntimePolicy
+from .runtime_policy import PrefetchOrder, GradientSyncMode, RuntimePolicy
 
 
 class FsdpContext:
@@ -33,7 +34,7 @@ class FsdpContext:
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
     # Outer reduction and completion-wait behavior, scoped by finalize_gradients().
-    grad_sync_mode: GradSyncMode
+    grad_sync_mode: GradientSyncMode
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
@@ -57,7 +58,7 @@ class FsdpContext:
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation, stream, prefetch, and gradient-synchronization
+            runtime_policy: Communication allocation, stream, and gradient-synchronization
                 settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
@@ -179,13 +180,13 @@ class FsdpContext:
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
         if (
-            self.grad_sync_mode is not GradSyncMode.REDUCE_OUTER_AND_WAIT
+            self.grad_sync_mode is not GradientSyncMode.REDUCE_OUTER_AND_WAIT
             or self._post_backward_hook_registered
         ):
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use RuntimePolicy(grad_sync_mode=GradSyncMode.REDUCE_OUTER) "
+            "Use RuntimePolicy(grad_sync_mode=GradientSyncMode.REDUCE_OUTER) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
@@ -217,7 +218,7 @@ class FsdpContext:
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if self.grad_sync_mode is GradSyncMode.REDUCE_OUTER_AND_WAIT:
+        if self.grad_sync_mode is GradientSyncMode.REDUCE_OUTER_AND_WAIT:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 

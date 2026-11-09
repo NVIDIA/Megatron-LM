@@ -18,7 +18,7 @@ from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradSyncMode,
+    GradientSyncMode,
     Placements,
     RuntimePolicy,
     finalize_gradients,
@@ -244,7 +244,7 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 @pytest.mark.parametrize("set_to_none", [False, True])
 @pytest.mark.parametrize("grad_scale", [1.0, 0.5, 1 / 3])
 @pytest.mark.parametrize(
-    "grad_sync_mode", [GradSyncMode.REDUCE_OUTER_AND_WAIT, GradSyncMode.REDUCE_OUTER]
+    "grad_sync_mode", [GradientSyncMode.REDUCE_OUTER_AND_WAIT, GradientSyncMode.REDUCE_OUTER]
 )
 def test_local_accumulation_matches_reference(
     distributed_setup, sharding, set_to_none, grad_scale, grad_sync_mode
@@ -307,7 +307,9 @@ def test_local_accumulation_matches_reference(
                 with finalize_gradients(
                     context,
                     mode=(
-                        grad_sync_mode if index == num_microbatches - 1 else GradSyncMode.SKIP_OUTER
+                        grad_sync_mode
+                        if index == num_microbatches - 1
+                        else GradientSyncMode.SKIP_OUTER
                     ),
                 ):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
@@ -321,7 +323,7 @@ def test_local_accumulation_matches_reference(
             if reduce_grads:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-            elif grad_sync_mode is GradSyncMode.REDUCE_OUTER:
+            elif grad_sync_mode is GradientSyncMode.REDUCE_OUTER:
                 context.finish_grad_sync()
             optimizer.step()
         return losses
@@ -367,9 +369,9 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
         with finalize_gradients(
             context,
             mode=(
-                GradSyncMode.REDUCE_OUTER_AND_WAIT
+                GradientSyncMode.REDUCE_OUTER_AND_WAIT
                 if index == len(inputs) - 1
-                else GradSyncMode.SKIP_OUTER
+                else GradientSyncMode.SKIP_OUTER
             ),
         ):
             model(x).float().sum().backward()
