@@ -1194,6 +1194,16 @@ class TransformerConfig(ModelParallelConfig):
     ``__post_init__``.
     """
 
+    moe_router_fused_aux_scores: bool = False
+    """Compute the top-k routing, the aux-loss scores and both token counts (aux loss and expert
+    bias) in one Transformer Engine kernel (``fused_topk_with_aux_loss_scores``), and hand the
+    'deepep' / 'ncclep' flex dispatcher compact [num_tokens, topk] float32 probabilities instead
+    of dense [num_tokens, num_experts] ones. Results are bitwise identical to
+    ``moe_router_fusion`` with ``moe_router_aux_loss_fusion``, which it requires. Used for
+    training steps whose router configuration TE supports (sigmoid scores, 256 experts, top-8,
+    optionally 8 groups with group top-4, as in DeepSeek-V3) without padding mask, token dropping
+    or router replay; all other calls take the unfused path."""
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
@@ -1875,6 +1885,13 @@ class TransformerConfig(ModelParallelConfig):
         # downstream reads a plain bool.
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
+        if self.moe_router_fused_aux_scores and not (
+            self.moe_router_fusion and self.moe_router_aux_loss_fusion
+        ):
+            raise ValueError(
+                "moe_router_fused_aux_scores requires moe_router_fusion and "
+                "moe_router_aux_loss_fusion."
+            )
 
         if self.wide_residual is not None:
             if self.enable_mhc_connections:

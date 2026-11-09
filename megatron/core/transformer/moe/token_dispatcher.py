@@ -979,6 +979,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return tokens_per_expert
 
 
+def _is_compact_route_probs(routing_map: torch.Tensor, probs: torch.Tensor) -> bool:
+    """Whether probs are per-route weights aligned with dense top-k indices.
+
+    Routers may hand the 'deepep' / 'ncclep' managers [num_tokens, topk] probabilities in the
+    order of the dense [num_tokens, topk] indices (see TopKRouter's moe_router_fused_aux_scores)
+    instead of the full [num_tokens, num_experts] weights. Such probabilities are 2-D with the
+    shape of the indices; the full weights reach the managers 3-D from _initialize_metadata.
+    Routes marked -1 must already carry zero weight.
+    """
+    return routing_map.dtype != torch.bool and probs.dim() == 2 and probs.shape == routing_map.shape
+
+
 class _DispatchManager(ABC):
     """
     A manager class to handle dispatch and combine processes for MoE models.
@@ -1506,12 +1518,19 @@ class _DeepepManager(_DispatchManager):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         num_tokens = routing_map.shape[0]
+        compact_probs = _is_compact_route_probs(routing_map, probs)
 
         probs = probs.reshape(num_tokens, -1)
         if routing_map.dtype == torch.bool:
             routing_map = routing_map.reshape(num_tokens, self.num_experts)
             # Convert the format of routing map from multihot to indices.
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        elif compact_probs:
+            # Per-route weights already aligned with the dense top-k indices.
+            self.token_indices = routing_map.contiguous()
+            if self.token_indices.dtype != torch.int64:
+                self.token_indices = self.token_indices.to(torch.int64)
+            self.token_probs = probs
         else:
             # Dense top-k indices (TE's fused router output) paired with the full-width
             # [num_tokens, num_experts] probs; select the weights at those indices here.
@@ -1943,6 +1962,7 @@ class _NCCLEPManager(_DispatchManager):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         num_tokens = routing_map.shape[0]
+        compact_probs = _is_compact_route_probs(routing_map, probs)
         probs = probs.reshape(num_tokens, -1)
         padding_rows = None
         if padding_mask is not None:
@@ -1958,6 +1978,15 @@ class _NCCLEPManager(_DispatchManager):
             if padding_rows is not None:
                 # topk still returns valid ids for a padded row; -1 makes NCCL EP skip the route
                 # and combine writes zeros back for the row.
+                self.token_indices = self.token_indices.masked_fill(padding_rows, -1)
+                self.token_probs = self.token_probs.masked_fill(padding_rows, 0)
+        elif compact_probs:
+            # Per-route weights already aligned with the dense top-k indices.
+            self.token_indices = routing_map.contiguous()
+            if self.token_indices.dtype != torch.int64:
+                self.token_indices = self.token_indices.to(torch.int64)
+            self.token_probs = probs
+            if padding_rows is not None:
                 self.token_indices = self.token_indices.masked_fill(padding_rows, -1)
                 self.token_probs = self.token_probs.masked_fill(padding_rows, 0)
         else:
@@ -2344,8 +2373,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         [num_local_tokens, world_size, num_local_experts]. Dense top-k indices are expanded
         from [num_local_tokens, topk] to [num_local_tokens, topk * expert_tp_size]. probs are
         always the router's full [num_local_tokens, num_experts] weights and are expanded like a
-        bool map; the backend managers select the per-route weights from them.
+        bool map; the backend managers select the per-route weights from them. Compact
+        [num_local_tokens, topk] probs aligned with dense indices (see _is_compact_route_probs)
+        are expanded like the indices, to [num_local_tokens, topk * expert_tp_size].
         """
+        compact_probs = _is_compact_route_probs(routing_map, probs)
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
         if routing_map.dtype == torch.bool:
@@ -2369,6 +2401,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             routing_map = (
                 expanded_indices.reshape(num_local_tokens, -1).to(routing_map.dtype).contiguous()
             )
+        if compact_probs:
+            if self.tp_size > 1:
+                probs = (
+                    probs.unsqueeze(-1).expand(-1, -1, self.tp_size).reshape(num_local_tokens, -1)
+                )
+            return routing_map, probs
         probs = (
             probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
             .expand(-1, -1, self.tp_size, -1)
