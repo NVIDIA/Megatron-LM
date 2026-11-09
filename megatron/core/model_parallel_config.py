@@ -622,6 +622,11 @@ class ModelParallelConfig:
 
         if self.expert_tensor_parallel_size is None:
             self.expert_tensor_parallel_size = self.tensor_model_parallel_size
+        if self.expert_tensor_parallel_size < 1:
+            raise ValueError(
+                "expert_tensor_parallel_size must be at least 1, got "
+                f"{self.expert_tensor_parallel_size}"
+            )
 
         # Derive the internal gtp_weight_remat_size from the user-facing
         # tensor_parallel_num_weight_shards:

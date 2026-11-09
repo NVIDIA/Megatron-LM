@@ -141,3 +141,9 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
     else:
         with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
             ModelParallelConfig(sequence_parallel=True, **kwargs)
+
+
+@pytest.mark.parametrize("expert_tensor_parallel_size", [0, -1])
+def test_rejects_non_positive_expert_tensor_parallel_size(expert_tensor_parallel_size):
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be at least 1"):
+        ModelParallelConfig(expert_tensor_parallel_size=expert_tensor_parallel_size)

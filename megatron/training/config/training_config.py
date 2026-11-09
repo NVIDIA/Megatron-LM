@@ -108,6 +108,13 @@ class TrainingConfig:
     iterations_to_skip: list[int] = field(default_factory=list)
     """List of 1-indexed iterations to skip during training, empty by default."""
 
+    def validate(self) -> None:
+        """Check that the optional step intervals, used as `iteration % interval`, are positive."""
+        for name in ("check_weight_hash_across_dp_replicas_interval", "gpu_sniff_test_interval"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+
 
 @dataclass(kw_only=True)
 class ValidationConfig:
@@ -501,6 +508,13 @@ class LoggerConfig:
 
     def validate(self) -> None:
         """Check logging requirements shared by CLI and native configurations."""
+        # Both are used as `iteration % interval`, and the timers normalize by log_interval.
+        if self.log_interval <= 0:
+            raise ValueError(f"log_interval must be positive, got {self.log_interval}")
+        if self.tensorboard_log_interval <= 0:
+            raise ValueError(
+                f"tensorboard_log_interval must be positive, got {self.tensorboard_log_interval}"
+            )
         if self.log_memory_interval is not None:
             assert self.log_memory_interval % self.log_interval == 0
 
@@ -813,6 +827,18 @@ class CheckpointConfig:
         checks: this is the one set of checkpoint rules.
         """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
+
+        # The dump intervals are used as `(iteration + 1) % interval` in every training step.
+        for name in (
+            "save_params_interval",
+            "save_activations_interval",
+            "save_tokens_per_expert_interval",
+            "save_wgrads_interval",
+            "save_dgrads_interval",
+        ):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."

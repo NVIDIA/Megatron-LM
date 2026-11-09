@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 
@@ -713,4 +713,39 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             dynamic_context_parallel=True,
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        ({"init_method_std": -1.0}, "init_method_std must be non-negative"),
+        ({"embedding_init_method_std": -1.0}, "embedding_init_method_std must be non-negative"),
+        ({"hidden_dropout": -1.0}, "hidden_dropout must be between 0 and 1"),
+        ({"hidden_dropout": 1.5}, "hidden_dropout must be between 0 and 1"),
+        ({"layernorm_epsilon": -1.0}, "layernorm_epsilon must be non-negative"),
+    ],
+)
+def test_rejects_out_of_range_values(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4, **overrides)
+
+
+def test_accepts_range_boundaries():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        init_method_std=0.0,
+        hidden_dropout=1.0,
+        layernorm_epsilon=0.0,
+    )
+    assert config.embedding_init_method_std == 0.0
+
+
+@pytest.mark.parametrize("q_lora_rank", [0, -1])
+def test_mla_rejects_non_positive_q_lora_rank(q_lora_rank):
+    with pytest.raises(ValueError, match="q_lora_rank must be positive or None"):
+        MLATransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=4, q_lora_rank=q_lora_rank
         )

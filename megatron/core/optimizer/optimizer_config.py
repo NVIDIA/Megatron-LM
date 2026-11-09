@@ -451,6 +451,17 @@ class OptimizerConfig:
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
 
+        # Adam's bias corrections divide by 1 - beta**step, which is 0 for beta = 1 (and for
+        # beta = -1 at even steps); the fused Adam kernels do not check this and return NaN.
+        for name in ("adam_beta1", "adam_beta2"):
+            value = getattr(self, name)
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), got {value}")
+        if self.adam_eps is not None and self.adam_eps <= 0.0:
+            raise ValueError(f"adam_eps must be positive, got {self.adam_eps}")
+        if self.loss_scale is not None and self.loss_scale <= 0.0:
+            raise ValueError(f"loss_scale must be positive, got {self.loss_scale}")
+
         if self.embedding_min_norm is not None and (
             not math.isfinite(self.embedding_min_norm) or self.embedding_min_norm <= 0.0
         ):

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import re
 import signal
 import sys
 import types
@@ -302,6 +303,91 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
 
     with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
         validate_args(args)
+
+
+def _range_check_args(monkeypatch, **overrides):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    # parse_args reads WORLD_SIZE from the environment; pin it so the test does not depend
+    # on how the job was launched.
+    args.world_size = 1
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"num_layers": 0}, "--num-layers must be positive, got 0"),
+        (
+            {"num_layers": -1, "num_layers_per_virtual_pipeline_stage": -1},
+            "--num-layers must be positive, got -1",
+        ),
+        (
+            {"num_layers_per_virtual_pipeline_stage": 0},
+            "--num-layers-per-virtual-pipeline-stage must be positive, got 0",
+        ),
+        ({"eval_micro_batch_size": 0}, "--eval-micro-batch-size must be positive, got 0"),
+        ({"ffn_hidden_size": 0}, "--ffn-hidden-size must be positive, got 0"),
+        ({"ffn_hidden_size": -1}, "--ffn-hidden-size must be positive, got -1"),
+        ({"kv_channels": 0}, "--kv-channels must be positive, got 0"),
+        (
+            {"num_experts": 2, "moe_ffn_hidden_size": 0},
+            "--moe-ffn-hidden-size must be positive, got 0",
+        ),
+        (
+            {"make_vocab_size_divisible_by": 0},
+            "--make-vocab-size-divisible-by must be positive, got 0",
+        ),
+        ({"ddp_num_buckets": 0}, "--ddp-num-buckets must be positive, got 0"),
+        (
+            {"num_distributed_optimizer_instances": 0},
+            "--num-distributed-optimizer-instances must be positive, got 0",
+        ),
+        (
+            {"adlr_autoresume": True, "adlr_autoresume_interval": 0},
+            "--adlr-autoresume-interval must be positive, got 0",
+        ),
+        ({"mtp_num_layers": -1}, "--mtp-num-layers must be non-negative, got -1"),
+        (
+            {"num_experts": 2, "moe_router_topk": -1},
+            "--moe-router-topk must be between 1 and --num-experts (2), got -1",
+        ),
+        (
+            {"num_experts": 2, "moe_router_topk": 3},
+            "--moe-router-topk must be between 1 and --num-experts (2), got 3",
+        ),
+        ({"fault_injector_num_ranks": 0}, "--fault-injector-num-ranks must be positive, got 0"),
+        (
+            {"fault_injector_num_ranks": 1},
+            "--fault-injector-fault-types is required when the fault injector is enabled",
+        ),
+        ({"seed": 2**32}, "must be at most 2**32 - 1"),
+    ],
+)
+def test_validate_args_rejects_out_of_range_values(monkeypatch, overrides, error):
+    """validate_args should reject values that would otherwise fail after start-up."""
+    args = _range_check_args(monkeypatch, **overrides)
+
+    with pytest.raises(AssertionError, match=re.escape(error)):
+        validate_args(args)
+
+
+def test_validate_args_accepts_largest_seed(monkeypatch):
+    args = _range_check_args(monkeypatch, seed=2**32 - 1)
+
+    validate_args(args)
 
 
 @pytest.mark.parametrize(

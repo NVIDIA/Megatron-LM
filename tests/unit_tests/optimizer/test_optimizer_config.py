@@ -72,3 +72,23 @@ def test_paramkey_matches():
     #  it has the attribute.
     setattr(p_with_attr, "is_embedding_or_output_parameter", False)
     assert not has_attr.matches(p_with_attr, "interesting.bias")
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        ({"adam_beta1": 1.0}, "adam_beta1 must be in"),
+        ({"adam_beta1": -1.0}, "adam_beta1 must be in"),
+        ({"adam_beta2": 1.0}, "adam_beta2 must be in"),
+        ({"adam_beta2": -1.0}, "adam_beta2 must be in"),
+        ({"adam_eps": 0.0}, "adam_eps must be positive"),
+        ({"loss_scale": -1.0}, "loss_scale must be positive"),
+    ],
+)
+def test_rejects_out_of_range_values(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        OptimizerConfig(**overrides).validate()
+
+
+def test_accepts_range_boundaries():
+    OptimizerConfig(adam_beta1=0.0, adam_beta2=0.0, adam_eps=1e-30, loss_scale=1.0).validate()

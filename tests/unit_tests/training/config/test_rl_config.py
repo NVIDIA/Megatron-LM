@@ -545,3 +545,18 @@ def test_model_setup_uses_owned_ddp_config(
         training.setup_model_and_optimizer(
             Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "rl_inference_tensor_model_parallel_size",
+        "rl_inference_pipeline_model_parallel_size",
+        "rl_inference_expert_model_parallel_size",
+        "rl_inference_expert_tensor_model_parallel_size",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_rl_inference_parallel_sizes_must_be_positive(name, value):
+    with pytest.raises(AssertionError, match=f"--{name.replace('_', '-')} must be at least 1"):
+        RLConfig(**{name: value})

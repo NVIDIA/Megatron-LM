@@ -412,6 +412,67 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _validate_numeric_ranges(args):
+    """Reject counts, sizes and intervals that later code divides by or cannot use.
+
+    Without these checks, such values pass validation and fail later, once the model is built or
+    trains, with an unrelated error (a division by zero, a reshape or a library assertion).
+    """
+
+    def _require_positive(name):
+        value = getattr(args, name, None)
+        assert value is None or value > 0, (
+            f"--{name.replace('_', '-')} must be positive, got {value}"
+        )
+
+    for name in (
+        "num_layers",
+        "num_layers_per_virtual_pipeline_stage",
+        "eval_micro_batch_size",
+        "eval_global_batch_size",
+        "ffn_hidden_size",
+        "kv_channels",
+        "moe_ffn_hidden_size",
+        "make_vocab_size_divisible_by",
+        "ddp_num_buckets",
+        "num_distributed_optimizer_instances",
+        "fault_injector_num_ranks",
+    ):
+        _require_positive(name)
+    if args.adlr_autoresume:
+        _require_positive("adlr_autoresume_interval")
+
+    # Any nonzero value enables MTP (`if args.mtp_num_layers:`), so a negative one is not "off".
+    assert args.mtp_num_layers is None or args.mtp_num_layers >= 0, (
+        f"--mtp-num-layers must be non-negative, got {args.mtp_num_layers}"
+    )
+
+    # The router selects top-k of the experts with torch.topk.
+    if args.num_experts is not None:
+        assert 1 <= args.moe_router_topk <= args.num_experts, (
+            f"--moe-router-topk must be between 1 and --num-experts ({args.num_experts}), "
+            f"got {args.moe_router_topk}"
+        )
+
+    # Any --fault-injector-num-ranks value, 0 included, enables the fault injector.
+    if args.fault_injector_ranks is not None or args.fault_injector_num_ranks is not None:
+        assert args.fault_injector_fault_types is not None, (
+            "--fault-injector-fault-types is required when the fault injector is enabled"
+        )
+
+    # Each rank seeds numpy with --seed plus 100 x its pipeline rank, plus 10 x its data-parallel
+    # rank with --data-parallel-random-init (initialize.py, _set_random_seed). numpy accepts
+    # seeds up to 2**32 - 1.
+    if args.seed is not None:
+        max_seed_offset = 100 * (args.pipeline_model_parallel_size - 1)
+        if args.data_parallel_random_init:
+            max_seed_offset += 10 * (args.data_parallel_size - 1)
+        assert args.seed + max_seed_offset <= 2**32 - 1, (
+            f"--seed ({args.seed}) plus the per-rank seed offset (up to {max_seed_offset}) "
+            f"must be at most 2**32 - 1"
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
@@ -478,6 +539,8 @@ def validate_args(args, defaults={}):
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
     )
+
+    _validate_numeric_ranges(args)
 
     from megatron.training.config import InferenceSetupConfig, RLConfig
 

@@ -1984,6 +1984,23 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.init_method_std < 0.0:
+            raise ValueError(f"init_method_std must be non-negative, got {self.init_method_std}.")
+
+        if self.embedding_init_method_std is not None and self.embedding_init_method_std < 0.0:
+            raise ValueError(
+                "embedding_init_method_std must be non-negative, got "
+                f"{self.embedding_init_method_std}."
+            )
+
+        if not 0.0 <= self.hidden_dropout <= 1.0:
+            raise ValueError(f"hidden_dropout must be between 0 and 1, got {self.hidden_dropout}.")
+
+        if self.layernorm_epsilon < 0.0:
+            raise ValueError(
+                f"layernorm_epsilon must be non-negative, got {self.layernorm_epsilon}."
+            )
+
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
 
@@ -5157,6 +5174,10 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.attention_latent_norm_epsilon is None:
             self.attention_latent_norm_epsilon = self.layernorm_epsilon
+
+        # None means no low-rank query projection; 0 would build an empty projection.
+        if self.q_lora_rank is not None and self.q_lora_rank <= 0:
+            raise ValueError(f"q_lora_rank must be positive or None, got {self.q_lora_rank}.")
 
         if (
             self.multi_latent_attention

@@ -191,6 +191,17 @@ class RLConfig:
     def __post_init__(self):
         self.grpo_samples_per_iteration = self.grpo_prompts_per_step * self.grpo_group_size
 
+        for name in (
+            "rl_inference_tensor_model_parallel_size",
+            "rl_inference_pipeline_model_parallel_size",
+            "rl_inference_expert_model_parallel_size",
+            "rl_inference_expert_tensor_model_parallel_size",
+        ):
+            value = getattr(self, name)
+            assert value is None or value >= 1, (
+                f"--{name.replace('_', '-')} must be at least 1, got {value}"
+            )
+
         if self.refit_execution_batch_bytes is not None:
             assert self.refit_execution_batch_bytes > 0, (
                 "--refit-execution-batch-bytes must be a positive integer"
