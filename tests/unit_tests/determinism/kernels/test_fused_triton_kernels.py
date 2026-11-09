@@ -4,6 +4,9 @@
 
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
+* ``fused_mtp_acceptance_counts``: MTP acceptance counts in one program with integer
+  accumulation -- replay (also under side-stream contention) and agree bit for bit with the
+  PyTorch reference.
 * ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
   ``Tensor.contiguous`` on row-strided views.
 * ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
@@ -30,6 +33,10 @@ from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
+from megatron.core.fusions.fused_mtp_acceptance_counts import (
+    fused_mtp_acceptance_counts,
+    mtp_acceptance_counts_reference,
+)
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
@@ -280,6 +287,29 @@ def test_fused_pad_routing_map_replays_and_matches_torch(
         what="pad_routing_map",
     )
     assert torch.equal(fused["out"].to(torch_out["out"].dtype), torch_out["out"])
+
+
+# --- MTP acceptance counts -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("seq_len, batch", [(4096, 1), (8191, 2)])
+@pytest.mark.parametrize("mask_dtype", [torch.float32, torch.bool])
+def test_fused_mtp_acceptance_counts_replays_and_matches_torch(seq_len, batch, mask_dtype):
+    seeded()
+    preds = torch.randint(0, 129280, (seq_len, batch), device="cuda")
+    labels = torch.randint(0, 129280, (batch, seq_len), device="cuda")
+    labels[:, ::3] = preds.t()[:, ::3]
+    loss_mask = (torch.rand(batch, seq_len, device="cuda") > 0.2).to(mask_dtype)
+    fused, _ = assert_replays_bit_exact(
+        fused_mtp_acceptance_counts,
+        (preds, labels, loss_mask),
+        backward=False,
+        contention=True,
+        what="fused_mtp_acceptance_counts",
+    )
+    ref_correct, ref_total = mtp_acceptance_counts_reference(preds, labels, loss_mask)
+    assert bytes_equal(fused["out[0]"], ref_correct)
+    assert bytes_equal(fused["out[1]"], ref_total)
 
 
 # --- indices <-> multihot ----------------------------------------------------------------
