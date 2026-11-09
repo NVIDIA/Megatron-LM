@@ -48,7 +48,7 @@ _TOPK = 8
 _EPS = 1e-5
 
 
-def _config(backend):
+def _config(backend, kpool_scorer='torch'):
     return MLATransformerConfig(
         num_layers=1,
         hidden_size=_HIDDEN,
@@ -81,6 +81,7 @@ def _config(backend):
         dsa_indexer_kpool_use_quantization=False,
         dsa_indexer_kpool_always_select_tail=True,
         dsa_indexer_kpool_key_dtype_compression=True,
+        dsa_indexer_kpool_scorer_backend=kpool_scorer,
         dsa_indexer_hf_scoring=True,
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_k_norm_epsilon=1e-6,
@@ -304,8 +305,8 @@ def _model_parallel():
         Utils.destroy_model_parallel()
 
 
-def _run_real_layer(backend, monkeypatch, *, compare_native):
-    config = _config(backend)
+def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch'):
+    config = _config(backend, kpool_scorer)
     spec = hybrid_glm53_stack_spec(config).submodules.dsa_layer.submodules.self_attention
     groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     real = build_module(spec, config=config, layer_number=1, pg_collection=groups).cuda()
@@ -325,9 +326,10 @@ def _run_real_layer(backend, monkeypatch, *, compare_native):
                 assert real_parameters[target].shape == native_parameters[source].shape
                 real_parameters[target].copy_(native_parameters[source])
 
-    selected_rows, fused_results = [], []
+    selected_rows, fused_results, kpool_results = [], [], []
     sparse_attention = dsa_module._run_sparse_attention
     fused_attention = dsa_kernels.run_fused_absorbed_sparse_attention
+    kpool_pool_topk = dsa_kernels.run_kpool_pool_topk
 
     def capture_selection(**kwargs):
         selected_rows.append(kwargs['topk_indices'].detach().clone())
@@ -338,8 +340,14 @@ def _run_real_layer(backend, monkeypatch, *, compare_native):
         fused_results.append(result is not None)
         return result
 
+    def capture_kpool_result(*args, **kwargs):
+        result = kpool_pool_topk(*args, **kwargs)
+        kpool_results.append(result is not None)
+        return result
+
     monkeypatch.setattr(dsa_module, '_run_sparse_attention', capture_selection)
     monkeypatch.setattr(dsa_kernels, 'run_fused_absorbed_sparse_attention', capture_fused_result)
+    monkeypatch.setattr(dsa_kernels, 'run_kpool_pool_topk', capture_kpool_result)
     hidden = torch.randn(17, 1, _HIDDEN, device='cuda', dtype=torch.bfloat16, requires_grad=True)
     actual, bias = real(hidden, attention_mask=None)
     assert bias is None
@@ -352,6 +360,8 @@ def _run_real_layer(backend, monkeypatch, *, compare_native):
         assert fused_results == [True], 'cuDNN case must not silently exercise the unfused fallback'
     else:
         assert fused_results == []
+    # The cuDNN KPool scorer must run, not fall back to the PyTorch scorer.
+    assert kpool_results == ([True] if kpool_scorer == 'cudnn' else [])
 
     grad = torch.randn_like(actual)
     actual.backward(grad)
@@ -367,7 +377,16 @@ def _run_real_layer(backend, monkeypatch, *, compare_native):
         return
     native_hidden = hidden.detach().clone().requires_grad_()
     expected, expected_selection = native(native_hidden)
-    torch.testing.assert_close(selected_rows[0], expected_selection, rtol=0, atol=0)
+    if kpool_scorer == 'cudnn':
+        # The fused selector returns pools in its top-k kernel's order, not by score.
+        torch.testing.assert_close(
+            torch.sort(selected_rows[0], dim=-1).values,
+            torch.sort(expected_selection, dim=-1).values,
+            rtol=0,
+            atol=0,
+        )
+    else:
+        torch.testing.assert_close(selected_rows[0], expected_selection, rtol=0, atol=0)
     assert_similarity(actual.detach(), expected.detach(), eps=1e-3, label='attention output')
     expected.backward(grad)
     assert_similarity(hidden.grad, native_hidden.grad, eps=1e-3, label='hidden gradient')
@@ -388,6 +407,20 @@ def test_glm53_real_absorbed_mla_frozen_selector_forward_backward(backend, monke
 @pytest.mark.parametrize('backend', ['none', 'cudnn'])
 def test_glm53_absorbed_mla_matches_independent_hf_attention(backend, monkeypatch):
     _run_real_layer(backend, monkeypatch, compare_native=True)
+
+
+def test_glm53_absorbed_mla_cudnn_kpool_scorer_matches_independent_hf_attention(monkeypatch):
+    """``dsa_indexer_kpool_scorer_backend='cudnn'`` selects the HF pools through DSAttention."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    try:
+        dsa_cudnn_kernels._ensure_dsa_namespace()
+    except ImportError as exc:
+        pytest.skip(f'cuDNN frontend DSA unavailable: {exc}')
+    if not dsa_cudnn_kernels._supports_indexer_q_causal_offsets():
+        # 17 tokens end off the pool grid; without q_causal_offsets the PyTorch scorer runs.
+        pytest.skip('this cuDNN frontend has no q_causal_offsets')
+    _run_real_layer('cudnn', monkeypatch, compare_native=True, kpool_scorer='cudnn')
 
 
 _LEFT_PADDING = 3
