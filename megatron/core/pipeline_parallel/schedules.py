@@ -1114,8 +1114,8 @@ def forward_backward_pipelining_with_interleaving(
                 return stack
 
             no_sync_func = multi_no_sync
-    sync_context = None
-    no_sync_context = None
+    grad_sync_context = contextlib.ExitStack()
+    grad_sync_enabled = True
 
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
         config.grad_sync_func = [config.grad_sync_func for _ in model]
@@ -1130,25 +1130,17 @@ def forward_backward_pipelining_with_interleaving(
         grad_sync_func, param_sync_func = config.grad_sync_func, config.param_sync_func
         config.grad_sync_func, config.param_sync_func = None, None
 
-    def disable_grad_sync():
-        """Skip outer gradient reduction during accumulation."""
-        nonlocal no_sync_context, sync_context
-        if sync_context is not None:
-            sync_context.__exit__(None, None, None)
-            sync_context = None
-        if no_sync_context is None:
-            no_sync_context = no_sync_func()
-            no_sync_context.__enter__()
+    def set_grad_sync(enabled):
+        """Switch between accumulation and reduction without nesting scopes."""
+        nonlocal grad_sync_enabled
+        if enabled == grad_sync_enabled:
+            return
+        grad_sync_context.close()
+        grad_sync_context.enter_context(sync_func() if enabled else no_sync_func())
+        grad_sync_enabled = enabled
 
-    def enable_grad_sync():
-        """Reduce outer gradients and leave the completion wait to the schedule."""
-        nonlocal no_sync_context, sync_context
-        if no_sync_context is not None:
-            no_sync_context.__exit__(None, None, None)
-            no_sync_context = None
-        if sync_context is None:
-            sync_context = sync_func()
-            sync_context.__enter__()
+    disable_grad_sync = partial(set_grad_sync, False)
+    enable_grad_sync = partial(set_grad_sync, True)
 
     disable_grad_sync()
 
@@ -2121,10 +2113,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
-    if sync_context is not None:
-        sync_context.__exit__(None, None, None)
-    if no_sync_context is not None:
-        no_sync_context.__exit__(None, None, None)
+    grad_sync_context.close()
 
     return forward_data_store
 
@@ -2299,28 +2288,20 @@ def forward_backward_pipelining_without_interleaving(
     else:
         no_sync_func = config.no_sync_func or contextlib.nullcontext
         sync_func = contextlib.nullcontext
-    sync_context = None
-    no_sync_context = None
+    grad_sync_context = contextlib.ExitStack()
+    grad_sync_enabled = True
 
-    def disable_grad_sync():
-        """Skip outer gradient reduction during accumulation."""
-        nonlocal no_sync_context, sync_context
-        if sync_context is not None:
-            sync_context.__exit__(None, None, None)
-            sync_context = None
-        if no_sync_context is None:
-            no_sync_context = no_sync_func()
-            no_sync_context.__enter__()
+    def set_grad_sync(enabled):
+        """Switch between accumulation and reduction without nesting scopes."""
+        nonlocal grad_sync_enabled
+        if enabled == grad_sync_enabled:
+            return
+        grad_sync_context.close()
+        grad_sync_context.enter_context(sync_func() if enabled else no_sync_func())
+        grad_sync_enabled = enabled
 
-    def enable_grad_sync():
-        """Reduce outer gradients and leave the completion wait to the schedule."""
-        nonlocal no_sync_context, sync_context
-        if no_sync_context is not None:
-            no_sync_context.__exit__(None, None, None)
-            no_sync_context = None
-        if sync_context is None:
-            sync_context = sync_func()
-            sync_context.__enter__()
+    disable_grad_sync = partial(set_grad_sync, False)
+    enable_grad_sync = partial(set_grad_sync, True)
 
     disable_grad_sync()
 
@@ -2544,7 +2525,7 @@ def forward_backward_pipelining_without_interleaving(
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
         # Launch any remaining grad reductions.
-        if no_sync_context is not None:
+        if not grad_sync_enabled:
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
@@ -2576,9 +2557,6 @@ def forward_backward_pipelining_without_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
-    if sync_context is not None:
-        sync_context.__exit__(None, None, None)
-    if no_sync_context is not None:
-        no_sync_context.__exit__(None, None, None)
+    grad_sync_context.close()
 
     return forward_data_store
