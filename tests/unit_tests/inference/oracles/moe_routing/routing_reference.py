@@ -13,6 +13,9 @@ CPU integer PyTorch, and shares no index math with the Triton kernels:
   exclusive and inclusive running sums (a Python loop).
 * ``expected_expert_rows``: per local expert, the ``(token, prob, hidden row)`` records the
   permutation must place in that expert's block (Python grouping).
+* ``check_permutation_bookkeeping``: the routing outputs of a permute launcher (offsets,
+  per-expert ``(token, prob)`` multisets, ``-1`` padding, untouched rows past ``n_used``,
+  inverse map), shared by the payload-specific oracles.
 
 Inputs: routing maps are built as the head of a larger *canary* buffer whose tail rows route
 every slot to a local expert, so a kernel that reads past the routing map's rows counts them
@@ -203,6 +206,74 @@ def record_rows(tokens: torch.Tensor, probs: torch.Tensor, hidden: torch.Tensor)
         ],
         dim=1,
     ).cpu()
+
+
+def check_permutation_bookkeeping(
+    perm_p: torch.Tensor,
+    perm_map: torch.Tensor,
+    offsets: torch.Tensor,
+    inverse: Optional[torch.Tensor],
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    valid: int,
+    start: int,
+    num_local: int,
+    *,
+    alignment: int,
+    what: str,
+    stale_map: Optional[torch.Tensor] = None,
+) -> Tuple[List[int], List[int], int]:
+    """The routing half of a permute launcher's contract (everything but the row payloads).
+
+    * ``offsets``: the inclusive aligned running sum of the local counts;
+    * expert ``e``'s block ``[exclusive[e], exclusive[e] + c_e)``: its live pairs as
+      ``(permutation_map = token, permuted_probs = probs[token, slot])``, one row each in any
+      order; its alignment padding: ``permutation_map = -1``;
+    * rows ``>= n_used`` of the map: still ``stale_map`` if given, else the allocation poison;
+      of the probabilities: the poison;
+    * ``inverse`` (if not None): ``[rows, E_l]``, the row of pair ``(t, e)``, else ``-1``.
+
+    Returns ``(exclusive, counts, n_used)`` for the payload checks.
+    """
+    counts = local_counts(routing_map, valid, start, num_local)
+    ref_ex, ref_in = aligned_offsets(counts.tolist(), alignment)
+    ou.assert_exact(offsets, torch.tensor(ref_in), what=f"inclusive offsets ({what})")
+    n_used = ref_in[-1]
+    size = perm_map.shape[0]
+    assert perm_p.shape == (size,) and perm_map.dtype == torch.int32, what
+    assert perm_p.dtype == probs.dtype and size >= n_used, f"output_size {size} ({what})"
+    pairs = expected_expert_rows(routing_map, valid, start, num_local)
+    probs_cpu, map_cpu = probs.cpu(), perm_map.cpu()
+    for e in range(num_local):
+        lo, hi, end = ref_ex[e], ref_ex[e] + int(counts[e]), ref_in[e]
+        tokens = torch.tensor([t for t, _ in pairs[e]], dtype=torch.int64)
+        slots = torch.tensor([k for _, k in pairs[e]], dtype=torch.int64)
+        expected = torch.stack([tokens, bits_i64(probs_cpu[tokens, slots])], dim=1)
+        actual = torch.stack([map_cpu[lo:hi].to(torch.int64), bits_i64(perm_p[lo:hi].cpu())], 1)
+        ou.assert_rows_equal_unordered(
+            actual, expected, what=f"expert {e} block [{lo},{hi}) (token, prob) ({what})"
+        )
+        ou.assert_exact(
+            perm_map[hi:end],
+            torch.full((end - hi,), -1, dtype=torch.int32),
+            what=f"expert {e} alignment padding map ({what})",
+        )
+    if stale_map is None:
+        assert_untouched(perm_map[n_used:], what=f"permutation_map rows >= n_used ({what})")
+    else:
+        ou.assert_exact(
+            perm_map[n_used:], stale_map[n_used:], what=f"stale map rows >= n_used ({what})"
+        )
+    assert_untouched(perm_p[n_used:], what=f"permuted_probs rows >= n_used ({what})")
+    if inverse is not None:
+        assert inverse.shape == (routing_map.shape[0], num_local), what
+        assert inverse.dtype == torch.int32, what
+        expected_inv = torch.full(tuple(inverse.shape), -1, dtype=torch.int32)
+        for e in range(num_local):
+            for row in range(ref_ex[e], ref_ex[e] + int(counts[e])):
+                expected_inv[int(map_cpu[row]), e] = row
+        ou.assert_exact(inverse, expected_inv, what=f"inverse map ({what})")
+    return ref_ex, counts.tolist(), n_used
 
 
 def counting_slices(num_local: int, ep: int = 4) -> List[Tuple[str, int]]:

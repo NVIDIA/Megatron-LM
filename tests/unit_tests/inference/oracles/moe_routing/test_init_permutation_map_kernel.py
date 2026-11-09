@@ -3,7 +3,8 @@
 """Oracle for ``_init_permutation_map_kernel`` (megatron/core/inference/moe/permute.py).
 
 Launcher: ``init_permutation_map(permutation_map, n_used)``; called by ``permute_tokens`` and
-``permute_and_quantize_mxfp8`` before the permute kernel claims rows.
+``permute_and_quantize_mxfp8`` before the permute kernel claims rows (both launchers' oracles
+also check its ``-1`` padding marks and the untouched rows past ``n_used``).
 
 Contract (from the launcher's documented API):
 
@@ -20,7 +21,7 @@ Oracle: the definition, element by element (``-1`` below ``n_used``, the poison 
 
 Structure: ``BLOCK_SIZE = 1024``; grid ``cdiv(output_size, 1024)``. Inputs cover
 ``output_size`` and ``n_used`` at B-1/B/B+1 and 2B, ``n_used`` in {0, 1, output_size - 1,
-output_size}, and CUDA-graph replays with ``n_used`` growing and shrinking (the buffer is
+output_size}, the permute launchers' production buffer sizes, and CUDA-graph replays with ``n_used`` growing and shrinking (the buffer is
 re-poisoned between replays, so a write past the new ``n_used`` shows up). The buffer sits
 between guard bands and starts poisoned (``INT32_MIN``). Opt-in (``large``): a buffer of
 more than 2^31 entries behind a 2^31-entry front guard (block offsets).
@@ -55,6 +56,23 @@ def _cases():
 @pytest.mark.parametrize("output_size,n_used", _cases())
 def test_fills_prefix_only(output_size, n_used):
     """``-1`` exactly on ``[0, n_used)``; the rest and the guard bands untouched."""
+    dev = rr.device()
+    buf = ou.guarded_empty((output_size,), torch.int32, dev, guard_bytes=8192)
+    permute.init_permutation_map(buf.tensor, rr.valid_tensor(n_used, dev))
+    _check(buf, n_used, f"size={output_size} n_used={n_used}")
+
+
+@pytest.mark.parametrize(
+    "output_size,n_used",
+    [
+        # rows * min(topk, E_l) + alignment * E_l (rounded to 128 rows on the MXFP8 path)
+        pytest.param(8192 * 6 + 16 * 128, 8192 * 6 + 16 * 128 - 777, id="nanov3-ep1-bf16"),
+        pytest.param(8192 * 8 + 128 * 32, 65536 + 128 * 9, id="dsv3-ep8-mxfp8"),
+        pytest.param(64 * 256 * 4 + 16 * 4, 64 * 256 * 4 // 3, id="dsv3-ep64-decode"),
+    ],
+)
+def test_production_sizes(output_size, n_used):
+    """Buffers of the permute launchers' production sizes (``output_size`` from their formula)."""
     dev = rr.device()
     buf = ou.guarded_empty((output_size,), torch.int32, dev, guard_bytes=8192)
     permute.init_permutation_map(buf.tensor, rr.valid_tensor(n_used, dev))
