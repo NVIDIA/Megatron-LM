@@ -796,6 +796,23 @@ def validate_args(args, defaults={}):
     ):
         args.multi_latent_attention = True
 
+    # Without a hybrid layer pattern, the GDN layers are placed by linear_attention_freq.
+    # TransformerConfig requires it only for gdn, because gdn2 may also select the kernel
+    # for 'G' layers of a hybrid layer pattern.
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        is_gated_delta_net_variant,
+    )
+
+    if (
+        is_gated_delta_net_variant(args.experimental_attention_variant)
+        and args.linear_attention_freq is None
+        and args.hybrid_layer_pattern is None
+    ):
+        raise ValueError(
+            f"--experimental-attention-variant {args.experimental_attention_variant} requires "
+            "--linear-attention-freq unless --hybrid-layer-pattern is set."
+        )
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
