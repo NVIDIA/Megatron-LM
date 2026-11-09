@@ -20,10 +20,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
     RuntimePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -295,7 +295,7 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
         for _ in range(5):
             optimizer.zero_grad(set_to_none=set_to_none)
             for index, (inputs, targets) in enumerate(microbatches):
-                with microbatch(context, is_last=index == num_microbatches - 1):
+                with finalize_gradients(context, enabled=index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
                     losses.append(loss.detach())
                     backward_loss = loss / num_microbatches
@@ -348,7 +348,7 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
     inputs = torch.randn(3, 1, 4096, device=setup.device, dtype=torch.bfloat16, generator=generator)
     expected = torch.zeros(8, 4096, device=setup.device)
     for index, x in enumerate(inputs):
-        with microbatch(context, is_last=index == len(inputs) - 1):
+        with finalize_gradients(context, enabled=index == len(inputs) - 1):
             model(x).float().sum().backward()
         context.finish_grad_sync()
         expected = expected + x.float() * scale
