@@ -84,7 +84,7 @@ class TensorAtomic(Shard):
     """Dim-0 shard placement that assigns each logical tensor as a whole to one rank.
 
     With ``fully_shard``, use ``TensorAtomic()`` in ``Placements`` and supply only
-    ``fully_shard_context(parameter_to_owner=...)``. Each parameter group derives
+    ``FsdpContext(parameter_to_owner=...)``. Each parameter group derives
     its tensor owners from that mapping and passes them to
     ``layout_builder.build_for_tensor_atomic``. Ownership is encoded by the layout's
     offsets; this placement stores no owner assignments.
