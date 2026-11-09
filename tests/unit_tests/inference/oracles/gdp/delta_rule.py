@@ -213,19 +213,24 @@ def local_cumsum(g, cu_seqlens, *, scale=None, reverse=False, chunk=CHUNK, seque
     return out
 
 
-def scaled_dot_kkt(k, beta, G, cu_seqlens, chunk=CHUNK):
+def scaled_dot_kkt(k, beta, G, cu_seqlens, chunk=CHUNK, *, products=None):
     """A[t, hv, j - c0] = beta[t, hv] * (k_t . k_j) * 2^(G[t, hv] - G[j, hv]) for c0 <= j < t.
 
     k [1, T, H, K] (value head hv reads key head hv // (HV / H)), beta [1, T, HV], G [1, T, HV]
     (within-chunk base-2 cumulative decays) or None. Zero on and above the diagonal and in the
     columns past a short chunk's end; NaN in rows outside every sequence. Returns [1, T, HV, chunk].
+    `products`, if given, computes the key products [HV, L, L] from the chunk's keys [L, HV, K]
+    (the trusted implementation: `tensor_core_products`), in place of an einsum in k's dtype.
     """
     heads = beta.shape[2]
     keys = expand_heads(k, heads)
     out = beta.new_full((*beta.shape, chunk), float("nan"))
     for _, start, end in chunks(cu_seqlens, chunk):
         kc = keys[0, start:end]  # [L, HV, K]
-        scores = torch.einsum("ihk,jhk->hij", kc, kc)
+        if products is None:
+            scores = torch.einsum("ihk,jhk->hij", kc, kc)
+        else:
+            scores = products(kc).to(out.dtype)
         if G is not None:
             gc = G[0, start:end].transpose(0, 1)  # [HV, L]
             scores = scores * torch.exp2(gc[:, :, None] - gc[:, None, :])
@@ -235,6 +240,18 @@ def scaled_dot_kkt(k, beta, G, cu_seqlens, chunk=CHUNK):
         block[:, :, :L] = torch.tril(scores, diagonal=-1)
         out[0, start:end] = block.permute(1, 0, 2)
     return out
+
+
+def tensor_core_products(kc):
+    """k_i . k_j of a chunk's keys [L, HV, K] in the activation dtype, as cuBLAS computes them on a
+    GPU: a bf16/fp16 tensor-core GEMM with an fp32 result (`torch.bmm(..., out_dtype=torch.float32)`),
+    the same hardware accumulation a Triton `tl.dot` of those operands uses. Without CUDA (no tensor
+    cores) the fp32 product."""
+    k = kc.transpose(0, 1)  # [HV, L, K]
+    if k.is_cuda and k.dtype in (torch.bfloat16, torch.float16):
+        return torch.bmm(k, k.transpose(1, 2), out_dtype=torch.float32)
+    k = k.float()
+    return (k[:, :, None, :] * k[:, None, :, :]).sum(-1)
 
 
 def tril_inverse(A, cu_seqlens, chunk=CHUNK):

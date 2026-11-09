@@ -30,7 +30,7 @@ and `GatedDeltaNet.ssm_decode` (megatron/core/ssm/gated_delta_net/gdn.py), befor
 
 Tolerance class: floating point. The fp64 reference is `delta_rule.delta_rule`, a step-by-step loop; the
 trusted implementation is the same loop in torch fp32 on the same device, rounded to each output's dtype
-(bound factor 2). Padding outputs, untouched slots and snapshot rows, read-only inputs: exact.
+(bound factor 2; 3 for fp32 states and snapshots, `FP32_STATE_FACTOR`: Triton's approximate exp). Padding outputs, untouched slots and snapshot rows, read-only inputs: exact.
 
 Variants and dispatch (read from the kernel after the contract): heuristics USE_G, USE_INITIAL_STATE,
 STORE_FINAL_STATE, HAS_STATE_INDICES, STORE_INTERMEDIATE, IS_VARLEN, USE_GATE_IN_KERNEL, HAS_DT_BIAS;
@@ -59,8 +59,8 @@ Suspected finding O7b-M1 (GDN decode, no fix PR): with `A_log` the kernel forms 
 log(1 + exp(x)) in fp32 (inline PTX `ex2.approx`/`lg2.approx` on NVIDIA, `tl.math.log(1 + tl.math.exp(x))`
 elsewhere), whose absolute error of ~2^-24 is a relative error of ~1e-4 at production gate arguments
 (x = a + dt_bias ~ -7); exp(A_log) up to 16 carries it into the decay. GDN prefill forms the same gate with
-torch's softplus. With an fp32 state that is ~8x torch's fp32 state error (Triton interpreter; GPU
-unconfirmed), so `test_gdn_decode_fp32_state` and `test_production_decode_shapes[gdn-fp32_state]` are
+torch's softplus. With an fp32 state that is 9.5-11.7x torch's fp32 state error on H100 (pdx 7987035; ~8x
+in the Triton interpreter), so `test_gdn_decode_fp32_state` and `test_production_decode_shapes[gdn-fp32_state]` are
 expected to fail on main on the state check; their outputs (bf16) and every bf16-state case pass. It is the
 GDN analog of O7-N1 (Mamba decode softplus).
 """
@@ -85,6 +85,18 @@ INDEXED_SLOTS = (5, 2, -1, 0, 6)
 SLOT_COUNT = 8
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+FP32_STATE_FACTOR = 3.0
+"""Bound factor for fp32 states and snapshots (bf16 ones keep 2: their final rounding dominates).
+
+The kernel decays the whole carried state each step by `exp(g)`, and Triton's `tl.exp` is the
+approximate `ex2.approx.f32` (up to 2 ulp), where the trusted torch fp32 loop's `exp` is accurate. When a
+large carried state dominates the step's update, that approximation sets the fp32 state's error: in
+`test_dense_initial_and_final_state[h0-dense]` (initial states N(0, 1), four steps) the kernel measured
+2.08x the trusted rms error on H100 (pdx 7987035), every other fp32-state case <= 2x. In the Triton
+interpreter (IEEE exp) the same case measures 1.6x, and 3.1-3.7x with a 1-ulp-rms error injected into
+exp (1.3-1.75x into sqrt and division instead). Wiring errors are O(1); O7b-M1's softplus error measured
+9.5-11.7x on H100, so its cases still fail at this factor."""
 
 
 @dataclass
@@ -334,6 +346,7 @@ def run_decode(c: Case, *, check=("o", "state", "snapshots"), g=None):
             state.tensor[live_slots],
             ref[1],
             trusted[1].to(state_dtype),
+            factor=FP32_STATE_FACTOR if state_dtype == torch.float32 else ou.DEFAULT_FACTOR,
             what=f"{label} final state",
         )
     if snaps is not None and "snapshots" in check:
@@ -343,6 +356,7 @@ def run_decode(c: Case, *, check=("o", "state", "snapshots"), g=None):
                 snaps.tensor[live_slots, i],
                 ref[2][step],
                 trusted[2][step].to(state_dtype),
+                factor=FP32_STATE_FACTOR if state_dtype == torch.float32 else ou.DEFAULT_FACTOR,
                 what=f"{label} snapshot after draft token {i}",
             )
     return o, state.tensor, ref
@@ -584,7 +598,9 @@ def test_dense_initial_and_final_state(varlen, with_h0):
         ou.assert_close_to_reference(
             o[sl], ref[0], trusted[0].bfloat16(), what=f"o of sequence {n}"
         )
-        ou.assert_close_to_reference(final[n : n + 1], ref[1], trusted[1], what=f"final state {n}")
+        ou.assert_close_to_reference(
+            final[n : n + 1], ref[1], trusted[1], factor=FP32_STATE_FACTOR, what=f"final state {n}"
+        )
 
 
 # ---------------------------------------------------------------------------------------------

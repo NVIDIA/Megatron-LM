@@ -16,10 +16,15 @@ chunk (64 rows of a sequence, the last possibly shorter, L rows) and value head 
 and 0 for j >= t and for the columns j - c0 >= L; without g no decay. Rows outside every sequence are not
 written. Output [B, T, HV, 64] in `output_dtype`; k, g, beta read-only.
 
-Tolerance class: floating point against the fp64 definition, trusted = the definition in torch fp32 on the
-same device (factor 2); the zeros on and above the diagonal and past a short chunk are exact (the
-clamp-off decays make 2^(g_t - g_j) overflow there, which must not leak); exact by construction with dyadic
-keys and betas and no decay (the dot products are exact in fp32).
+Tolerance class: floating point against the fp64 definition (factor 2). The trusted implementation takes the
+key products from the same device the way the kernel forms them, a bf16/fp16 tensor-core GEMM with an
+fp32 result (cuBLAS, `delta_rule.tensor_core_products`), then applies the decay and beta in torch fp32.
+The kernel's `tl.dot` is such a product; its fp32 accumulation inside the tensor cores is not the
+round-to-nearest of an fp32 SGEMM, and at K = 256 that made the kernel 2.1-2.9x (rms) an fp32-SGEMM
+trusted implementation's error, every worst element biased toward zero (pdx 7987035; all K <= 128 cases
+passed). The zeros on and above the diagonal and past a short chunk are exact (the clamp-off decays make
+2^(g_t - g_j) overflow there, which must not leak); exact by construction with dyadic keys and betas and no
+decay (the dot products are exact in fp32).
 
 Variants and dispatch (read from the kernel after the contract): heuristics USE_G, IS_VARLEN; constexprs H,
 HV (grouped heads), K, BT; autotune over BK in {32, 64, 128} (the K loop) x num_warps {2, 4, 8} x num_stages
@@ -75,7 +80,15 @@ def _check(A, k, beta, G, cu_dp, *, what):
     T = A.shape[1]
     rows = dr.owned_rows(cu_dp, T).to(A.device)
     ref = ou.fp64_reference(dr.scaled_dot_kkt, k, beta, G, cu_dp)
-    trusted = dr.trusted_fp32(dr.scaled_dot_kkt, k, beta, G, cu_dp)
+    # Trusted: cuBLAS's tensor-core product of the same bf16/fp16 keys, then the fp32 decay and beta.
+    with dr.no_tf32():
+        trusted = dr.scaled_dot_kkt(
+            k,
+            beta.float(),
+            None if G is None else G.float(),
+            cu_dp,
+            products=dr.tensor_core_products,
+        )
     # The structural zeros are exact (clamp-off decays overflow 2^(g_t - g_j) there).
     zeros = A[0].transpose(1, 2)[dr.structural_zeros(cu_dp, T).to(A.device)]
     ou.assert_exact(
