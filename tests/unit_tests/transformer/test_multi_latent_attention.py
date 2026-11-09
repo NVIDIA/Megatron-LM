@@ -2205,6 +2205,27 @@ def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
         _fused_kv_rope_quant_config(**overrides)
 
 
+@pytest.mark.parametrize("q_lora_rank,valid", [(1, False), (2, True)])
+def test_mla_down_proj_fusion_requires_tp_divisible_fused_down_proj(q_lora_rank, valid):
+    # The fused down projection has q_lora_rank + kv_lora_rank + qk_pos_emb_head_dim outputs,
+    # 97 or 98 here, split over the tensor-parallel ranks.
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=32,
+        qk_pos_emb_head_dim=64,
+        mla_down_proj_fusion=True,
+    )
+    if valid:
+        assert MLATransformerConfig(**kwargs).mla_down_proj_fusion
+    else:
+        with pytest.raises(ValueError, match="divisible by tensor_model_parallel_size"):
+            MLATransformerConfig(**kwargs)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     get_device_arch_version() < 10,

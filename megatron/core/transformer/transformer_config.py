@@ -5223,6 +5223,16 @@ class MLATransformerConfig(TransformerConfig):
             self.qk_head_dim = derived
             self.kv_lora_rank = derived
 
+        if self.mla_down_proj_fusion and self.q_lora_rank is not None:
+            # The fused q/kv down projection is one column-parallel linear layer.
+            fused_down_proj_size = self.q_lora_rank + self.kv_lora_rank + self.qk_pos_emb_head_dim
+            if fused_down_proj_size % self.tensor_model_parallel_size != 0:
+                raise ValueError(
+                    "mla_down_proj_fusion requires q_lora_rank + kv_lora_rank + "
+                    f"qk_pos_emb_head_dim ({fused_down_proj_size}) to be divisible by "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+                )
+
         if self.cache_mla_latents:
             assert (
                 self.apply_rope_fusion is False
