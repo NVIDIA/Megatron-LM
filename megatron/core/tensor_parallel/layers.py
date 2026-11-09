@@ -65,6 +65,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
     "qkv_layout": None,
+    "muon_layout": None,
     "qkv_split_shapes": None,
     "qkv_split_shapes_global": None,
     "qkv_gtp_pad_length": 0,

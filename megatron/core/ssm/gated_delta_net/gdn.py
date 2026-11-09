@@ -72,6 +72,8 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    _supports_muon_semantic_layout = True
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
