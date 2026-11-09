@@ -429,32 +429,30 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
     assert model.inner.context is first_context
 
 
-def test_finalize_gradients_scopes_context(distributed_setup):
-    """The default waits automatically, and nested scopes restore each mode."""
+@pytest.mark.parametrize(
+    "mode", [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER]
+)
+def test_finalize_gradients_restores_mode(distributed_setup, mode):
+    """An accumulation scope restores the configured mode on error."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(gradient_finalization_mode=mode))
+    ) as context:
         for layer in model:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
-    with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):
+    with (
+        pytest.raises(RuntimeError, match="backward failed"),
+        finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER),
+    ):
         assert context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER
-        with finalize_gradients(context, mode=GradientFinalizationMode.REDUCE_OUTER):
-            assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
-            with pytest.raises(RuntimeError, match="backward failed"):
-                with finalize_gradients(context):
-                    assert (
-                        context.gradient_finalization_mode
-                        is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-                    )
-                    raise RuntimeError("backward failed")
-            assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
-        assert context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER
+        raise RuntimeError("backward failed")
 
-    assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    assert context.gradient_finalization_mode is mode
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])

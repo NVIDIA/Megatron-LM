@@ -33,7 +33,7 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # Outer reduction and completion-wait behavior, scoped by finalize_gradients().
+    # Active mode, initialized from RuntimePolicy and scoped by finalize_gradients().
     gradient_finalization_mode: GradientFinalizationMode
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
@@ -198,8 +198,9 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
-        # TODO: Support SKIP_OUTER even on the last microbatch by launching pending
+        # TODO(wujingyue): Support SKIP_OUTER even on the last microbatch by launching pending
         # outer reductions here before waiting, instead of requiring backward to launch them.
+
         # A backward prefetch may gather a frozen module that never runs backward.
         # Restore bindings and clear its gather state so the next iteration
         # materializes fresh weights. All backward work, including delayed wgrad,

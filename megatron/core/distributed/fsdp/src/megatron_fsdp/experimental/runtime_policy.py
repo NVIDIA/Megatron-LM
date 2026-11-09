@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 
 class GradientFinalizationMode(enum.Enum):
-    """Control outer reduction and the completion wait; inner reduction always runs."""
+    """Control outer reduction and the automatic wait for gradient reductions."""
 
     SKIP_OUTER = enum.auto()
     """Skip outer reduction and the automatic completion wait during accumulation."""
@@ -40,26 +40,29 @@ class PrefetchOrder(enum.Enum):
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication and gradient synchronization for an FSDP context.
-
-    Attributes:
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        overlap_allgather_reduction: Use separate all-gather and reduction streams.
-            Disable to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        overlap_outer_communication: Run the last-microbatch DP-outer reduction on
-            a separate stream, independently of overlap_allgather_reduction.
-        gradient_finalization_mode: Default gradient finalization mode. Use REDUCE_OUTER
-            when the caller waits with finish_grad_sync() after all backward work,
-            including delayed weight gradients. finalize_gradients() scopes overrides.
-    """
+    """Configure communication and initial gradient finalization behavior for an FSDP context."""
 
     use_symmetric_memory: bool = False
+    """Allocate communication staging buffers from PyTorch's NCCL symmetric-memory pool."""
+
     overlap_allgather_reduction: bool = True
+    """Use separate all-gather and reduction streams.
+
+    Disable to reduce peak transient memory. See
+    https://github.com/NVIDIA/Megatron-LM/issues/6471.
+    """
+
     overlap_outer_communication: bool = False
+    """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
+
     gradient_finalization_mode: GradientFinalizationMode = (
         GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
     )
+    """Set the context's initial outer-reduction and completion-wait behavior.
+
+    ``finalize_gradients()`` temporarily overrides the context's active mode without
+    modifying this policy. Use ``REDUCE_OUTER`` when the caller waits with
+    ``finish_grad_sync()`` after all backward work, including delayed weight gradients.
+    """
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
