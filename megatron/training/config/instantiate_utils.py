@@ -348,6 +348,13 @@ def instantiate_node(
                 else:
                     return _target_
 
+            # ModelConfig serializes its builder as metadata, not a constructor field.
+            from megatron.training.models.base import ModelConfig
+
+            model_config_target = isinstance(_target_, type) and issubclass(_target_, ModelConfig)
+            if model_config_target:
+                exclude_keys.add("_builder_")
+
             for key in node.keys():
                 if key not in exclude_keys:
                     if OmegaConf.is_missing(node, key) and is_partial:
@@ -359,7 +366,10 @@ def instantiate_node(
             assert callable(_target_)
             # Drop unexpected kwargs in lenient mode or raise in strict mode
             kwargs = _filter_kwargs_for_target(_target_, kwargs, full_key, mode)
-            return _call_target(_target_, partial, args, kwargs, full_key)
+            result = _call_target(_target_, partial, args, kwargs, full_key)
+            if model_config_target and not partial and "_builder_" in node:
+                result.builder = node["_builder_"]
+            return result
         else:
             dict_items = {}
             for key, value in node.items():
