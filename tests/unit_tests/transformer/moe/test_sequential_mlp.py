@@ -217,6 +217,50 @@ class TestTEParallelSequentialMLP:
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("linear_impl", ["local", "te"])
+def test_gpu_forward_backward_with_expert_bias(linear_impl):
+    """Experts with a bias and no bias-activation fusion add the probability-scaled FC2 bias.
+
+    The FC2 output can be a view returned by a custom autograd Function, so the bias must be
+    added out of place. The FC2 bias gradient is the sum of the expert's routing probabilities.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            add_bias_linear=True,
+            bias_activation_fusion=False,
+        )
+        if linear_impl == "te":
+            spec = MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear)
+        else:
+            spec = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear)
+        sequential_mlp = SequentialMLP(
+            2, config, spec, pg_collection=get_default_pg_collection()
+        ).cuda()
+
+        tokens_per_expert = torch.tensor([3, 5], device="cuda")
+        hidden_states = torch.rand((8, config.hidden_size), device="cuda", requires_grad=True)
+        probs = torch.rand(8, device="cuda")
+
+        output, output_bias = sequential_mlp(hidden_states, tokens_per_expert, probs)
+        assert output_bias is None
+        output.sum().backward()
+
+        for expert, expert_probs in zip(sequential_mlp.local_experts, torch.split(probs, [3, 5])):
+            fc2_bias = expert.linear_fc2.bias
+            torch.testing.assert_close(fc2_bias.grad, expert_probs.sum().expand_as(fc2_bias))
+    finally:
+        Utils.destroy_model_parallel()
+
+
 if __name__ == "__main__":
     MLP_test = TestTEParallelSequentialMLP()
     MLP_test.setup_method(method=None)
