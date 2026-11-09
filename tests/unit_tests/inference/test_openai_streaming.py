@@ -597,6 +597,21 @@ def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(re
     assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
 
 
+@pytest.mark.parametrize("remove_eos", [True, False])
+def test_eos_before_a_filtered_special_token_is_not_trailing(remove_eos):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode("a<|im_end|><special>", add_special_tokens=False)
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
+
+    streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
+    streamed_text += detokenizer.finish()
+
+    assert streamed_text == "a<|im_end|>"
+    completed_text = detokenize_generated_tokens(tokenizer, [], token_ids, remove_eos=remove_eos)
+    assert completed_text == streamed_text
+
+
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
     with pytest.raises(
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"

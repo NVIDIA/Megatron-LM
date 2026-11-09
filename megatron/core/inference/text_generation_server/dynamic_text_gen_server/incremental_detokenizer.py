@@ -84,14 +84,15 @@ class HuggingFaceFastIncrementalDetokenizer:
         """Decode token IDs and return only newly stable text."""
         decode_ids = []
         for token_id in token_ids:
-            if token_id in self._skipped_token_ids:
-                continue
             if token_id in self._eos_token_ids:
                 self._pending_eos_token_ids.append(token_id)
                 continue
+            # Any later token, even a filtered one, makes the held EOS ids interior, so only
+            # a trailing run of EOS ids is left for `finish` to apply the removal policy to.
             decode_ids.extend(self._pending_eos_token_ids)
             self._pending_eos_token_ids.clear()
-            decode_ids.append(token_id)
+            if token_id not in self._skipped_token_ids:
+                decode_ids.append(token_id)
         return self._decode(decode_ids)
 
     def finish(self) -> str:
