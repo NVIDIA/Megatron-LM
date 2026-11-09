@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Shard spec validation and shard-specific serving/RL model construction."""
 
@@ -22,11 +22,12 @@ from megatron.core.inference.shards_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import unwrap_model
+from megatron.training.argument_utils import tokenizer_config_from_args
 from megatron.training.config import RLConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch):
+def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch, run_config):
     from megatron.inference import utils
     from megatron.rl.inference import disagg
     from megatron.training.arguments import validate_args
@@ -48,6 +49,7 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         args.model_provider = "gpt"
         args.padded_vocab_size = 1024
         args.load = "unused-test-checkpoint"
+        run_config.checkpoint.load = args.load
         args.inference_ckpt_non_strict = False
         args.inference_dynamic_batching_enable_prefix_caching = True
         args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
@@ -57,10 +59,12 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         monkeypatch.setattr(utils, "get_args", lambda: args)
         load = Mock()
         monkeypatch.setattr(utils, "load_checkpoint", load)
+        tokenizer_cfg = tokenizer_config_from_args(args)
+        run_config.tokenizer = tokenizer_cfg
         serving = utils.get_model_for_inference(pg_collection=pg, checkpoint_group=pg.mp)
 
         # Exercise the separate RL builder too, starting with the training config.
-        training_config = utils.get_model_builder(args)._model_config
+        training_config = utils.get_model_builder(args, tokenizer_cfg)._model_config
         shard = SimpleNamespace(pg_collection=pg, spec=InferenceShardSpec(tp=1, role="decode"))
         monkeypatch.setattr(
             disagg, "build_inference_pg_collections_for_shards", lambda **kw: [shard]
@@ -185,7 +189,8 @@ def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
     from megatron.inference import utils
 
     group = Mock(name="checkpoint_group")
-    args = SimpleNamespace(ckpt_step=1, load="checkpoint", checkpoint_model_prefix="model.")
+    args = SimpleNamespace(checkpoint_model_prefix="model.")
+    checkpoint = SimpleNamespace(ckpt_step=1, load="checkpoint")
     world_size = Mock(return_value=1)
     rank = Mock(return_value=0)
     gather = Mock(side_effect=lambda output, keys, **kwargs: output.__setitem__(0, keys))
@@ -199,7 +204,7 @@ def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
         lambda path: {"model.weight": None, "model.unused": None},
     )
 
-    utils._warn_on_unloaded_checkpoint_tensors(args, {"model.weight"}, group)
+    utils._warn_on_unloaded_checkpoint_tensors(args, checkpoint, {"model.weight"}, group)
 
     world_size.assert_called_once_with(group)
     rank.assert_called_once_with(group)
