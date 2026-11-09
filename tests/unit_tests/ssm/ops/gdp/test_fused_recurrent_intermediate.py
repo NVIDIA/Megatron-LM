@@ -58,6 +58,47 @@ class TestGDPDecodeIntermediateStates:
     """Snapshot correctness for the speculative decode path."""
 
     @pytest.mark.parametrize("num_householder", _HOUSEHOLDER)
+    @pytest.mark.parametrize("seq_len", [1, 4])
+    def test_compact_output_matches_last_householder_step(self, num_householder, seq_len):
+        """Compact decode keeps the exact final output of each token, including padding."""
+        _requires_cuda()
+        q, k, v, g, beta = _make_inputs(3, seq_len, num_householder)
+        indices = torch.tensor([2, -1, 0], dtype=torch.int32, device="cuda")
+        for tensor in (q, k, v, g, beta):
+            tensor[1] = float("nan")
+        initial = torch.randn(4, _HV, _K, _V, device="cuda", dtype=torch.float32)
+        full_state, compact_state = initial.clone(), initial.clone()
+        full_snapshots = torch.full(
+            (4, seq_len, _HV, _K, _V), float("nan"), device="cuda", dtype=torch.float32
+        )
+        compact_snapshots = full_snapshots.clone()
+        common = dict(
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+            steps_per_token=num_householder,
+        )
+        full, _ = fused_recurrent_gated_delta_rule_update(
+            q, k, v, state=full_state, intermediate_states=full_snapshots, **common
+        )
+        compact, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=compact_state,
+            intermediate_states=compact_snapshots,
+            compact_output=True,
+            **common,
+        )
+        assert compact.shape == (3, seq_len, _HV, _V)
+        assert torch.equal(compact, full[:, num_householder - 1 :: num_householder])
+        assert torch.equal(compact[1], torch.zeros_like(compact[1]))
+        assert torch.equal(compact_state, full_state)
+        assert torch.equal(torch.isnan(compact_snapshots), torch.isnan(full_snapshots))
+        assert torch.equal(torch.nan_to_num(compact_snapshots), torch.nan_to_num(full_snapshots))
+
+    @pytest.mark.parametrize("num_householder", _HOUSEHOLDER)
     @pytest.mark.parametrize("seq_len", [1, 2, 5])
     def test_snapshots_match_token_by_token_decode(self, num_householder, seq_len):
         """Snapshot `i` equals the state cache after decoding tokens `0..i`."""
@@ -222,24 +263,29 @@ class TestGDPDecodeIntermediateStates:
                 "intermediate_states (dummy-pointer regression)"
             )
 
-    def test_padding_requests_write_no_snapshot(self):
-        """A `-1` slot leaves both the state cache and the snapshot buffer alone.
+    @pytest.mark.parametrize("seq_len", [1, 3])
+    def test_padding_requests_write_no_snapshot(self, seq_len):
+        """A `-1` slot leaves the state cache and any snapshot buffer alone.
 
         Decode batches are padded up to the captured graph's shape, so padding
         rows run the recurrence over whatever the input buffer holds. They must
         not land anywhere a real request can read.
         """
         _requires_cuda()
-        seq_len, num_householder, batch, num_slots = 3, 2, 4, 5
+        num_householder, batch, num_slots = 2, 4, 5
         q, k, v, g, beta = _make_inputs(batch, seq_len, num_householder)
         state_indices = torch.tensor([2, -1, 0, -1], dtype=torch.int32, device="cuda")
+        # Captured padding buffers can retain non-finite values from earlier
+        # replays. Their outputs must still be zero after this decode step.
+        for tensor in (q, k, v, g, beta):
+            tensor[[1, 3]] = float("nan")
 
         initial_state = torch.randn(num_slots, _HV, _K, _V, device="cuda", dtype=torch.float32)
         state = initial_state.clone()
         sentinel = torch.randn(
             (num_slots, seq_len, _HV, _K, _V), device="cuda", dtype=torch.float32
         )
-        intermediate = sentinel.clone()
+        intermediate = sentinel.clone() if seq_len > 1 else None
 
         out, _ = fused_recurrent_gated_delta_rule_update(
             q,
@@ -258,12 +304,14 @@ class TestGDPDecodeIntermediateStates:
         assert torch.count_nonzero(out[1]) == 0
         assert torch.count_nonzero(out[3]) == 0
 
-        # Slots 1, 3 and 4 are named by no request: untouched in both buffers.
+        # Slots 1, 3 and 4 are named by no request: untouched in each buffer.
         untouched = [1, 3, 4]
-        assert torch.equal(intermediate[untouched], sentinel[untouched])
+        if intermediate is not None:
+            assert torch.equal(intermediate[untouched], sentinel[untouched])
         assert torch.equal(state[untouched], initial_state[untouched])
         # ... and the slots that were written are no longer the sentinel.
-        assert not torch.equal(intermediate[[0, 2]], sentinel[[0, 2]])
+        if intermediate is not None:
+            assert not torch.equal(intermediate[[0, 2]], sentinel[[0, 2]])
 
     @pytest.mark.parametrize("num_householder", _HOUSEHOLDER)
     def test_cuda_graph_capture_and_replay(self, num_householder):

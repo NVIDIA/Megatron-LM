@@ -118,10 +118,16 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
 
-        # Bind methods
-        self.mixer.get_ssm_D = MambaMixer.get_ssm_D.__get__(self.mixer, MambaMixer)
-        self.mixer.ssm_prefill = MambaMixer.ssm_prefill.__get__(self.mixer, MambaMixer)
-        self.mixer.ssm_decode = MambaMixer.ssm_decode.__get__(self.mixer, MambaMixer)
+        # Bind methods, including the conv-parameter and D-layout helpers both paths call.
+        self.mixer.training = False
+        for name in (
+            "ssm_prefill",
+            "ssm_decode",
+            "get_ssm_D",
+            "_get_conv_params",
+            "_use_inference_param_caches",
+        ):
+            setattr(self.mixer, name, getattr(MambaMixer, name).__get__(self.mixer, MambaMixer))
 
     def test_ssm_prefill_padding_isolation(self):
         """
@@ -155,14 +161,16 @@ class TestMambaDynamicInference(unittest.TestCase):
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
 
-        # Mock the dynamic inference context. Leaving the chunk metadata (and
-        # extraction buffers) unset exercises the non-precomputed fallback path,
-        # which rebuilds chunk boundaries from cu_seqlens; no slot allocator means
-        # intermediate-state extraction (prefix caching) is disabled.
+        # Mock the dynamic inference context. Leaving the chunk metadata unset
+        # exercises the non-precomputed fallback path, which rebuilds chunk
+        # boundaries from cu_seqlens; None extraction buffers (the plain
+        # MambaMetadata contract) disable intermediate-state extraction (prefix caching).
         mamba_metadata = SimpleNamespace(
             seq_idx=seq_idx,
             cu_seqlens=cu_seqlens,
             batch_indices_prefill=batch_indices,
+            intermediate_ssm_out=None,
+            intermediate_conv_out=None,
             intermediate_chunk_indices=None,
             intermediate_abs_positions=None,
             intermediate_real_count=None,
