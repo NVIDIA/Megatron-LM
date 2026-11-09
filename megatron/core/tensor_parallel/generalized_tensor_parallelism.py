@@ -889,8 +889,7 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
-    # Opts the all-gather input into symmetric backing: DDP's pool via register_ub_pool, else
-    # the GTP pool after wrapping (move_gtp_weights_to_symm_pool).
+    # Flag to indicate that this GTP parameter needs symmetric ub backing for GTP all-gather
     gtp_shard.needs_nccl_mem = uses_gtp_symm_pool(gtp_remat_group, collective="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
@@ -1019,8 +1018,9 @@ def attach_gtp_to_presharded_module(
         if param is None or is_gtp_param(param):
             continue
         if isinstance(param, QuantizedTensor):
-            # Pooled whole now, before an outside owner can take part of its storage; plain
-            # weights are placed after wrapping (move_gtp_weights_to_symm_pool).
+            # Quantized parameters are pooled now, before an outside owner can
+            # take part of its storage. Plain BF16 parameters are placed after
+            # wrapping via move_gtp_weights_to_symm_pool.
             _move_weight_to_symm_pool(param, gtp_remat_group)
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:

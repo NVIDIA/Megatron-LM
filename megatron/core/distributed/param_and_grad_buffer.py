@@ -1489,7 +1489,7 @@ class _ParamAndGradBuffer:
                                     "Failed to remap high-precision TE GroupedTensor parameter "
                                     "storage into DDP param_data."
                                 )
-                    # Hand the pool now backing this param to it if it asked; it registers it.
+                    # Hook to register the symmetric pool backing this param's data.
                     if getattr(param, "needs_nccl_mem", False):
                         param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
 
