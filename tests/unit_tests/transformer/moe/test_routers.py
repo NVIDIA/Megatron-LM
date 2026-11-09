@@ -14,6 +14,7 @@ import megatron.core.parallel_state as parallel_state
 import megatron.core.transformer.moe.moe_utils as moe_utils
 import megatron.core.transformer.moe.router as router_mod
 import megatron.core.transformer.moe.router as router_module
+from megatron.core.extensions.transformer_engine import te_supports_deterministic_moe_aux_loss
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
@@ -851,6 +852,8 @@ class TestTop2Router:
         """Zero valid tokens contribute finite zero auxiliary gradients, even with history."""
         if fused and (fused_moe_aux_loss is None or fused_compute_score_for_moe_aux_loss is None):
             pytest.skip("TE fused auxiliary-loss operators are unavailable")
+        if fused and not te_supports_deterministic_moe_aux_loss():
+            pytest.skip("TE fused auxiliary loss lacks deterministic support (deterministic_mode)")
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,

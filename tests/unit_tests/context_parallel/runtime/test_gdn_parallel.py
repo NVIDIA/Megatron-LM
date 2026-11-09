@@ -56,6 +56,8 @@ def test_gdn_runtime_parallel_correctness(
         experimental_attention_variant=variant,
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
+        # The default FLA GDN kernels are not allowed in deterministic_mode (default on).
+        deterministic_mode=False,
     )
     spec = get_transformer_block_with_experimental_attention_variant_spec(
         config=config, vp_stage=None, pp_rank=0

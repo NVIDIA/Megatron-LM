@@ -58,6 +58,7 @@ def test_dynamic_cp_rejects_incompatible_heads_before_parameter_creation(
         linear_num_key_heads=2,
         linear_num_value_heads=2,
         dynamic_context_parallel=True,
+        deterministic_mode=False,  # dynamic CP does not support deterministic_mode
         calculate_per_token_loss=True,
         max_seqlen_per_dp_cp_rank=128,
     )
@@ -149,6 +150,7 @@ def test_chunkwise_kda_keeps_heads_when_cp_exceeds_head_count(
         linear_cp_mode="chunkwise",
         linear_cp_layout="contiguous",
         dynamic_context_parallel=dynamic_cp,
+        deterministic_mode=False,  # chunkwise KDA CP / dynamic CP exclude deterministic_mode
         calculate_per_token_loss=True,
         max_seqlen_per_dp_cp_rank=128,
     )

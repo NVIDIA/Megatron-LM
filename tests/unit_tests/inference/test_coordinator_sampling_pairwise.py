@@ -45,6 +45,8 @@ async def test_routed_stochastic_first_step_distribution(
         sampling_backend=backend,
         logprobs_mode=logprobs_mode,
         offset_sampling_seed_by_dp_rank=offset_by_dp,
+        # deterministic_mode (on by default) disables the DP-rank seed offset.
+        deterministic_mode=False if offset_by_dp else None,
     ) as h:
         samples = []
         sampler = h.engine.controller._sampling
