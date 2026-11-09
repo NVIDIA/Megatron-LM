@@ -1208,6 +1208,107 @@ class TestMoEModules:
             what=f"InferenceTopKRouter[sigmoid+bias, experts={num_experts}, topk={topk}]",
         )
 
+    @pytest.mark.parametrize("fusion", [False, True])
+    @pytest.mark.parametrize("replay_action", list(RouterReplayAction))
+    def test_inference_quantile_router_routing_replay(self, fusion, replay_action, monkeypatch):
+        """Optimized QB inference honors replay even when fusion is configured."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=True,
+            moe_router_fusion=fusion,
+        )
+        router = (
+            InferenceTopKRouter(
+                config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
+            .cuda()
+            .eval()
+        )
+        replay = router.router_replay
+        logits = torch.tensor([[[3.0, 2.0, 1.0, 0.0]]], device="cuda")
+        # Fix the gate's output so the policy's [0, 1] differs from replay's [2, 3].
+        monkeypatch.setattr(router, "gating", lambda hidden: logits.expand(hidden.shape[0], 1, 4))
+        hidden = torch.zeros(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        targets = torch.tensor([[2, 3]], device="cuda").expand(512, 2).contiguous()
+        histogram = router.qb_histogram.clone()
+
+        def route(hidden):
+            replay.clear_indices()
+            replay.set_target_indices(targets)
+            replay.set_router_replay_action(replay_action)
+            with InferenceMode.active(), torch.inference_mode():
+                probs, indices = router(hidden)
+            if replay_action == RouterReplayAction.RECORD:
+                assert torch.equal(replay.get_recorded_indices(), indices)
+            if replay_action == RouterReplayAction.REPLAY_BACKWARD:
+                assert not replay.replay_backward_list
+            return probs, indices, router.qb_histogram.clone()
+
+        try:
+            outputs, _ = assert_replays_bit_exact(
+                route,
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"InferenceTopKRouter[QB, {replay_action}, fusion={fusion}]",
+            )
+            expected_indices = (
+                torch.tensor([[0, 1]], device="cuda").expand_as(targets)
+                if replay_action == RouterReplayAction.RECORD
+                else targets
+            )
+            assert torch.equal(outputs["out[1]"], expected_indices)
+            scores = logits.squeeze(1).expand(512, 4).sigmoid().gather(1, expected_indices)
+            torch.testing.assert_close(outputs["out[0]"], scores / scores.sum(dim=-1, keepdim=True))
+            assert bytes_equal(outputs["out[2]"], histogram)
+        finally:
+            RouterReplay.global_router_replay_instances.remove(replay)
+
+    @pytest.mark.parametrize("balancing", ["quantile_balancing", "none"])
+    def test_inference_router_keeps_fusion_without_qb_replay(self, balancing, monkeypatch):
+        """QB's replay fallback leaves other optimized inference calls fused."""
+        self._init()
+        config = _moe_config(
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type=balancing,
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=balancing != "quantile_balancing",
+            moe_router_fusion=True,
+        )
+        router = (
+            InferenceTopKRouter(
+                config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
+            .cuda()
+            .eval()
+        )
+        calls = []
+
+        def routing(logits, topk, **kwargs):
+            calls.append(kwargs["fused"])
+            # Inspect the dispatch flag without requiring TE's optional fused kernel.
+            return logits[:, :topk], torch.zeros_like(logits[:, :topk], dtype=torch.int64)
+
+        monkeypatch.setattr(router, "_compiled_topk_routing", routing)
+        try:
+            with InferenceMode.active(), torch.inference_mode():
+                router(torch.zeros(1, 1, 1024, device="cuda", dtype=torch.bfloat16))
+            assert calls == [True]
+        finally:
+            if router.router_replay is not None:
+                RouterReplay.global_router_replay_instances.remove(router.router_replay)
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",

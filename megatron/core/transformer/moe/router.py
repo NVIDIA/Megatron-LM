@@ -1532,7 +1532,12 @@ class InferenceTopKRouter(TopKRouter):
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
-            fused=self.config.moe_router_fusion,
+            fused=(
+                self.config.moe_router_fusion
+                and not (
+                    self.routing_type == "quantile_balancing" and self.router_replay is not None
+                )
+            ),
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
