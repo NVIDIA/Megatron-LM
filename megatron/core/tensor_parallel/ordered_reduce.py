@@ -33,9 +33,6 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
 )
 from megatron.core.inference.communication.torch_symm_triton.utils import sync_threads
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
-)
 from megatron.core.utils import null_decorator
 
 try:
@@ -75,6 +72,12 @@ def use_ordered_tp_reduce(group, dtype: torch.dtype) -> bool:
     ``InferenceRowParallelLinear`` / the inference embedding reduce-scatter
     (``inference_layers.py``) to decide whether to leave the stock collective.
     """
+    # Imported here: megatron.core.transformer imports tensor_parallel (through
+    # context_parallel and mappings), so a module-level import would be circular.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+
     return is_batch_invariant_mode_enabled() and group.size() >= 3 and dtype.is_floating_point
 
 

@@ -38,3 +38,40 @@ CP addresses these tradeoffs. With CP, each GPU computes on part of the sequence
 CP support is included on the GPT code path. Other models that share that path, such as LLaMA, can use CP as well. CP works with TP (tensor model parallelism), PP (pipeline model parallelism), and DP (data parallelism). The total GPU count is TP × CP × PP × DP. CP also works with different attention variants, including MHA, MQA, and GQA, with unidirectional or bidirectional masking.
 
 Enable CP by setting `context_parallel_size=<CP_SIZE>` on the command line. The default `context_parallel_size` is 1, which disables CP. Running with CP requires Megatron Core (>=0.5.0) and Transformer Engine (>=1.1).
+
+## Dynamic context parallelism
+
+Dynamic CP assigns a CP group to each packed microbatch according to its sequence
+lengths. Short sequences can use CP1 while longer sequences share the same DP×CP
+domain at CP2, CP4, and other enabled sizes. The model's build-time group remains
+unchanged. Enable it with `--dynamic-context-parallel --use-varlen-dataset
+--sequence-packing-scheduler default_dynamic_cp --calculate-per-token-loss`, and
+set `--max-seqlen-per-dp-cp-rank` to the token capacity of one rank.
+`--min-dynamic-context-parallel-size` sets the smallest group the scheduler may
+select (default 1). The largest selectable group spans the DP×CP domain; there is
+currently no independent maximum-size option.
+
+GPT and Hybrid models propagate the selected groups through packed microbatch
+metadata. Runtime CP is supported by standard attention, MLA and absorbed MLA,
+DSA with the MLA path, Mamba, GDN/GDN2, GDP, hybrid layout conversion, and MTP.
+Sequence parallelism also carries the matching TP×CP group. CSA and DSA-GQA do
+not support dynamic CP; DeepSeek-V4 is not supported.
+
+The following constraints apply:
+
+- Use per-token loss and variable-length packed training data. Dynamic CP does
+  not support deterministic mode, CUDA graphs, or router z-loss.
+- Headwise Mamba, GDP, and GDN/GDN2 require their TP-local head/group geometry
+  to divide **every** CP size the scheduler can select. Construction validates
+  this against the caller's DP×CP group, before a long sequence reaches forward.
+- Mamba does not support chunkwise CP. Chunkwise GDP keeps all TP-local heads,
+  avoids the head-sharding divisibility restriction, and is recommended when
+  dynamic CP would select more ranks than the head geometry supports.
+- Inference uses CP1. These runtime training groups do not enable CP inference.
+
+MTP with `--calculate-per-token-loss` sums the main and MTP valid-token counts
+over the effective CP group before scaling gradients. This also corrects static
+CP>1 runs whose ranks have different valid-token counts; it adds a two-element
+all-reduce per MTP depth per microbatch. Logged `mtp_N loss` is a global
+token-weighted mean, including under static CP, so packed or masked runs may log
+different values from older mean-of-microbatch-means metrics.

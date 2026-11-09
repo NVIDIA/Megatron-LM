@@ -7,10 +7,10 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import TERowParallelLinear
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel import ordered_reduce as orr
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
