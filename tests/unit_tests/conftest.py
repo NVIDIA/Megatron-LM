@@ -19,6 +19,21 @@ from tests.unit_tests.test_utilities import (
     snapshot_process_state,
 )
 
+_DIRECTORY_COLLECTORS = pytest.StashKey[dict]()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collect_directory(path, parent):
+    """Keep directory fixtures visible when CI targets leave and re-enter a subtree."""
+    collector = yield
+    if collector is None:
+        return None
+    # Explicit file arguments can recollect their parent directory. Pytest 9.1
+    # binds conftest fixtures to collector identity, so fresh child collectors
+    # lose those fixtures. Reuse them without changing the bucket's file order.
+    collectors = parent.config.stash.setdefault(_DIRECTORY_COLLECTORS, {})
+    return collectors.setdefault((parent, path), collector)
+
 
 def pytest_configure(config):
     """Set NCCL defaults for the unit-test suite.

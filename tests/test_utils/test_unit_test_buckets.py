@@ -2,7 +2,11 @@
 
 """Directory moves must preserve CI bucket ownership and collection order."""
 
+import ast
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -141,3 +145,101 @@ def test_missing_explicit_target_fails_instead_of_losing_coverage(tmp_path):
     )
     with pytest.raises(ValueError, match="missing or invalid unit-test target"):
         find_test_cases.resolve_bucket(ROOT_BUCKET, "h100", tmp_path)
+
+
+@pytest.mark.parametrize("import_moved_fixture", [False, True])
+@pytest.mark.parametrize("packaged", [False, True])
+def test_interleaved_targets_preserve_directory_fixtures_and_order(
+    tmp_path, import_moved_fixture, packaged
+):
+    """Returning to MIMO after a relocated root test must retain its autouse fixtures."""
+    # Load the real collection hook without importing the GPU-dependent conftest.
+    source = (REPO_ROOT / "tests/unit_tests/conftest.py").read_text()
+    hook_nodes = [
+        node
+        for node in ast.parse(source).body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_DIRECTORY_COLLECTORS"
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name == "pytest_collect_directory")
+    ]
+    assert len(hook_nodes) == 2
+    hook_source = "\n".join(
+        "\n".join(
+            source.splitlines()[
+                min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+                - 1 : node.end_lineno
+            ]
+        )
+        for node in hook_nodes
+    )
+    suite = tmp_path / "unit_tests"
+    mimo = suite / "core/models/mimo"
+    mimo.mkdir(parents=True)
+    if packaged:
+        for directory in (suite, suite / "core", suite / "core/models", mimo):
+            (directory / "__init__.py").touch()
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (suite / "conftest.py").write_text(
+        "import json\nfrom pathlib import Path\nimport pytest\n"
+        + hook_source
+        + "\n\ndef pytest_configure(config):\n"
+        "    config.fixture_events = []\n"
+        "    config.run_config = None\n"
+        "\ndef pytest_sessionfinish(session):\n"
+        "    Path('events.json').write_text(json.dumps(session.config.fixture_events))\n"
+        "\n@pytest.fixture\n"
+        "def run_config(request):\n"
+        "    request.config.run_config = {'seed': 0}\n"
+        "    yield request.config.run_config\n"
+        "    request.config.run_config = None\n"
+    )
+    (mimo / "conftest.py").write_text(
+        "import pytest\n"
+        "\n@pytest.fixture(autouse=True)\n"
+        "def mimo_run_config(request, run_config):\n"
+        "    run_config['seed'] = 123\n"
+        "    request.config.fixture_events.append('setup:' + request.node.name)\n"
+        "    yield\n"
+        "    request.config.fixture_events.append('teardown:' + request.node.name)\n"
+    )
+    targets = [
+        (mimo / "test_before.py", True),
+        (suite / "test_moved.py", import_moved_fixture),
+        (mimo / "test_after.py", True),
+        (suite / "test_unrelated.py", False),
+    ]
+    expected_events = []
+    for path, uses_mimo_fixture in targets:
+        import_line = (
+            "from unit_tests.core.models.mimo.conftest import mimo_run_config\n"
+            if path.name == "test_moved.py" and import_moved_fixture
+            else ""
+        )
+        expected_config = "{'seed': 123}" if uses_mimo_fixture else "None"
+        path.write_text(
+            import_line
+            + f"def {path.stem}(request):\n"
+            + f"    assert request.config.run_config == {expected_config}\n"
+            + f"    request.config.fixture_events.append('test:{path.stem}')\n"
+        )
+        if uses_mimo_fixture:
+            expected_events.append(f"setup:{path.stem}")
+        expected_events.append(f"test:{path.stem}")
+        if uses_mimo_fixture:
+            expected_events.append(f"teardown:{path.stem}")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", *(str(path) for path, _ in targets)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_ADDOPTS": ""},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "4 passed" in result.stdout
+    assert json.loads((tmp_path / "events.json").read_text()) == expected_events
