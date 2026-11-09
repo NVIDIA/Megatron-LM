@@ -131,21 +131,26 @@ class _EventLoopManager:
         self._stopped = True
         self._started = False
 
-    def stop_when_complete(self, future: concurrent.futures.Future) -> concurrent.futures.Future:
+    def stop_when_complete(
+        self, future: concurrent.futures.Future, first_error: Optional[BaseException] = None
+    ) -> concurrent.futures.Future:
         """Return a future that completes after ``future`` and the thread join.
 
         A dedicated waiter makes cleanup independent of the event loop and
         cancellation state of whichever public async caller initiated it.
+        ``first_error``, raised before ``future`` was submitted, takes precedence
+        over its failure and is raised here rather than inside the loop.
         """
         complete: concurrent.futures.Future = concurrent.futures.Future()
 
         def _wait_and_stop() -> None:
             result = None
-            error: Optional[BaseException] = None
+            error = first_error
             try:
                 result = future.result()
             except BaseException as exc:  # Preserve the teardown failure.
-                error = exc
+                if error is None:
+                    error = exc
             try:
                 self.stop()
             except BaseException as exc:
@@ -466,47 +471,52 @@ class _MegatronLLMBase:
         self._serve_started = False
 
     def _begin_shutdown(self) -> concurrent.futures.Future:
-        """Start teardown once and publish a stable outcome before releasing the caller lock."""
-        if self._shutdown_complete_future is not None:
-            return self._shutdown_complete_future
-        self._shutdown_called = True
-        first_error: Optional[BaseException] = None
-        try:
-            self._stop_frontend_if_started()
-        except BaseException as exc:  # Teardown must continue after a frontend failure.
-            first_error = exc
+        """Start teardown once and return the outcome future every shutdown caller shares.
 
-        complete: concurrent.futures.Future = concurrent.futures.Future()
-        if not self._use_coordinator:
-            if first_error is None:
-                complete.set_result(None)
-            else:
-                complete.set_exception(first_error)
-        else:
-            assert self._loop_manager is not None
-            shutdown_coro = self._shutdown_impl(first_error)
+        The lock publishes the shutdown flag and that future together to callers on any thread.
+        """
+        with self._async_shutdown_lock:
+            if self._shutdown_complete_future is not None:
+                return self._shutdown_complete_future
+            self._shutdown_called = True
+            first_error: Optional[BaseException] = None
             try:
-                self._shutdown_future = self._loop_manager.submit(shutdown_coro)
-            except BaseException as exc:
-                shutdown_coro.close()
+                self._stop_frontend_if_started()
+            except BaseException as exc:  # Teardown must continue after a frontend failure.
+                first_error = exc
+
+            if not self._use_coordinator:
+                complete: concurrent.futures.Future = concurrent.futures.Future()
                 if first_error is None:
-                    first_error = exc
-                # Submission failed, so the loop cannot own cleanup. The runtime's
-                # emergency path is synchronous and idempotent.
-                try:
-                    if self._coord_runtime is not None:
-                        self._coord_runtime.teardown_now()
-                except BaseException:
-                    pass
-                try:
-                    self._loop_manager.stop()
-                except BaseException:
-                    pass
-                complete.set_exception(first_error)
+                    complete.set_result(None)
+                else:
+                    complete.set_exception(first_error)
             else:
-                complete = self._loop_manager.stop_when_complete(self._shutdown_future)
-        self._shutdown_complete_future = complete
-        return complete
+                assert self._loop_manager is not None
+                # The waiter raises a frontend error, Ctrl+C included, after the runtime is
+                # joined. Raised inside the runtime loop, KeyboardInterrupt would kill the loop
+                # thread before teardown finished, and every waiter would hang.
+                self._shutdown_future = self._loop_manager.submit(self._shutdown_impl())
+                complete = self._loop_manager.stop_when_complete(self._shutdown_future, first_error)
+            self._shutdown_complete_future = complete
+            return complete
+
+    def _started_shutdown_future(self) -> Optional[concurrent.futures.Future]:
+        """Return the shared shutdown outcome once shutdown has started, else ``None``."""
+        with self._async_shutdown_lock:
+            return self._shutdown_complete_future
+
+    def _assert_not_on_runtime_loop(self, method: str) -> None:
+        """Reject a caller on the runtime loop, which ``method`` must wait for or join."""
+        if not self._use_coordinator:
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        assert self._loop_manager is not None
+        if running_loop is getattr(self._loop_manager, "_loop", None):
+            raise RuntimeError(f"{method} called from the background loop would deadlock")
 
     def _assert_primary(self) -> None:
         if not self._is_primary_rank:
@@ -655,9 +665,10 @@ class _MegatronLLMBase:
             self._coord_runtime.client.resume_engines()
         await self._engine.wait_until(EngineState.RESUMED)
 
-    async def _shutdown_impl(self, first_error: Optional[BaseException] = None) -> None:
+    async def _shutdown_impl(self) -> None:
         if self._is_primary_rank:
             assert self._coord_runtime is not None
+            first_error: Optional[BaseException] = None
             try:
                 client = self._coord_runtime.client
                 if client is None:

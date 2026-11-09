@@ -78,8 +78,8 @@ class _ShutdownLoopManager:
         self.teardown = teardown
         self.stops = 0
 
-    def stop_when_complete(self, future):
-        return base_mod._EventLoopManager.stop_when_complete(self, future)
+    def stop_when_complete(self, future, first_error=None):
+        return base_mod._EventLoopManager.stop_when_complete(self, future, first_error)
 
     def submit(self, coro):
         coro.close()
@@ -214,21 +214,46 @@ class TestLifecycleGuards:
             await llm._shutdown_impl()
         llm._coord_runtime.teardown.assert_awaited_once_with()
 
-    @pytest.mark.parametrize("cls", [MegatronLLM, MegatronAsyncLLM])
-    def test_shutdown_setup_failure_is_stable_and_cleans_up(self, cls):
+    @pytest.mark.parametrize(
+        ("cls", "error"),
+        [(cls, RuntimeError) for cls in (MegatronLLM, MegatronAsyncLLM)]
+        + [(MegatronLLM, KeyboardInterrupt)],  # Ctrl+C while the frontend stops.
+    )
+    def test_frontend_failure_is_raised_after_runtime_join(self, cls, error):
+        """The waiter raises the frontend error once teardown ends, never inside the loop."""
         llm = _make_worker_instance(cls)
-        llm._coord_runtime = MagicMock()
-        llm._loop_manager = MagicMock()
-        llm._stop_frontend_if_started = MagicMock(side_effect=RuntimeError("frontend failed"))
-        llm._loop_manager.submit.side_effect = RuntimeError("submit failed")
+        teardown = concurrent.futures.Future()
+        teardown.set_result(None)
+        llm._loop_manager = _ShutdownLoopManager(teardown)
+        llm._stop_frontend_if_started = MagicMock(side_effect=error("frontend failed"))
         shutdown = llm.shutdown if cls is MegatronLLM else lambda: asyncio.run(llm.shutdown())
 
-        with pytest.raises(RuntimeError, match="frontend failed"):
-            shutdown()
-        with pytest.raises(RuntimeError, match="frontend failed"):
-            shutdown()
-        llm._coord_runtime.teardown_now.assert_called_once_with()
-        llm._loop_manager.stop.assert_called_once_with()
+        for _ in range(2):
+            with pytest.raises(error, match="frontend failed"):
+                shutdown()
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.parametrize(
+        ("cls", "method"),
+        [(MegatronLLM, "wait_for_shutdown")]
+        + [(MegatronAsyncLLM, method) for method in ("shutdown", "wait_for_shutdown")],
+    )
+    def test_shutdown_waits_reject_the_runtime_loop(self, cls, method):
+        """Teardown joins the runtime thread, so waiting for it from that loop would hang."""
+        llm = _make_worker_instance(cls)
+        llm._loop_manager = base_mod._EventLoopManager()
+        llm._loop_manager.start()
+
+        async def call_on_runtime_loop():
+            result = getattr(llm, method)()
+            if asyncio.iscoroutine(result):
+                await result
+
+        try:
+            with pytest.raises(RuntimeError, match="background loop would deadlock"):
+                llm._loop_manager.submit(call_on_runtime_loop()).result(timeout=10)
+        finally:
+            llm._loop_manager.stop()
 
     @pytest.mark.asyncio
     async def test_concurrent_async_shutdown_callers_wait_for_same_teardown(self):

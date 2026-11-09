@@ -3,6 +3,7 @@
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
 import asyncio
+import concurrent.futures
 from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
@@ -176,8 +177,11 @@ class MegatronAsyncLLM(_MegatronLLMBase):
 
         Idempotent. No-op in direct mode.
         """
-        with self._async_shutdown_lock:
-            shutdown_complete_future = self._begin_shutdown()
+        self._assert_not_on_runtime_loop("shutdown")
+        await self._await_shutdown(self._begin_shutdown())
+
+    @staticmethod
+    async def _await_shutdown(shutdown_complete_future: "concurrent.futures.Future") -> None:
         # Each caller gets a loop-local wrapper around the shared completion
         # future, so concurrent callers and callers on distinct loops are safe.
         await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
@@ -255,12 +259,10 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         """
         if not self._use_coordinator:
             return
-        with self._async_shutdown_lock:
-            shutdown_called = self._shutdown_called
-            shutdown_complete_future = self._shutdown_complete_future
-        if shutdown_called:
-            assert shutdown_complete_future is not None
-            await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
+        self._assert_not_on_runtime_loop("wait_for_shutdown")
+        shutdown_complete_future = self._started_shutdown_future()
+        if shutdown_complete_future is not None:
+            await self._await_shutdown(shutdown_complete_future)
             return
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._wait_for_shutdown_impl())

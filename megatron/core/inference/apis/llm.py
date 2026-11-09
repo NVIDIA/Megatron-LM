@@ -2,7 +2,6 @@
 
 """Sync high-level inference API for Megatron (``MegatronLLM``)."""
 
-import asyncio
 from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
@@ -170,17 +169,8 @@ class MegatronLLM(_MegatronLLMBase):
 
     def shutdown(self) -> None:
         """Tear down the engine and runtime. Idempotent. Direct mode is a no-op."""
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if self._use_coordinator:
-            assert self._loop_manager is not None
-            if running_loop is getattr(self._loop_manager, "_loop", None):
-                raise RuntimeError("shutdown called from the background loop would deadlock")
-        with self._async_shutdown_lock:
-            shutdown_complete_future = self._begin_shutdown()
-        shutdown_complete_future.result()
+        self._assert_not_on_runtime_loop("shutdown")
+        self._begin_shutdown().result()
 
     def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
@@ -251,11 +241,9 @@ class MegatronLLM(_MegatronLLMBase):
         """Block until the engine loop terminates. Direct mode no-op."""
         if not self._use_coordinator:
             return
-        with self._async_shutdown_lock:
-            shutdown_called = self._shutdown_called
-            shutdown_complete_future = self._shutdown_complete_future
-        if shutdown_called:
-            assert shutdown_complete_future is not None
+        self._assert_not_on_runtime_loop("wait_for_shutdown")
+        shutdown_complete_future = self._started_shutdown_future()
+        if shutdown_complete_future is not None:
             shutdown_complete_future.result()
             return
         assert self._loop_manager is not None
