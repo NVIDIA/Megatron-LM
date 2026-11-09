@@ -116,7 +116,7 @@ class HybridModelConfig(ModelConfig):
             super().__setattr__(name, value)
 
     def finalize(self) -> None:
-        """One time validation to run once config is ready to be used by builder."""
+        """Finalize nested model settings before the run derives optimizer precision."""
 
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()

@@ -134,7 +134,7 @@ def main(model_type: str = "gpt"):
     cfg = (
         modelopt_inference_config_from_args(args)
         if use_modelopt
-        else inference_cfg_container_from_args(args, build_model_config=False)
+        else inference_cfg_container_from_args(args)
     )
     set_run_config(cfg)
     initialize_megatron()
