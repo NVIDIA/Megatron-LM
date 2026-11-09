@@ -250,11 +250,13 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
 
 @pytest.mark.parametrize("native_model", [False, True])
 @pytest.mark.parametrize("decoder_overlap", [False, True])
+@pytest.mark.parametrize("configured_length", [False, True])
 def test_distributed_training_services_require_explicit_opt_in(
-    monkeypatch, run_config, native_model, decoder_overlap
+    monkeypatch, run_config, native_model, decoder_overlap, configured_length
 ):
     import torch
 
+    from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
     from megatron.core.transformer import TransformerConfig
     from megatron.training.models import GPTModelConfig
 
@@ -273,6 +275,18 @@ def test_distributed_training_services_require_explicit_opt_in(
     args.batch_parallel_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.train.micro_batch_size = 3
+    if configured_length:
+        run_config.data.dataset = GPTDatasetConfig(
+            sequence_length=32,
+            random_seed=1,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
+        if native_model:
+            del args.seq_length
+        # Legacy model construction still needs its CLI inputs; buffer sizing
+        # must use the dataset length even when that CLI length is stale.
     if native_model:
         run_config.model = GPTModelConfig(
             transformer=TransformerConfig(
@@ -324,7 +338,8 @@ def test_distributed_training_services_require_explicit_opt_in(
     ]
     tp_call = initialize._initialize_tp_communicators.call_args
     assert isinstance(tp_call.args[0], TransformerConfig)
-    assert tp_call.kwargs["sequence_length"] == (96 if decoder_overlap else 64)
+    expected_length = 32 if configured_length else 64
+    assert tp_call.kwargs["sequence_length"] == (96 if decoder_overlap else expected_length)
     assert tp_call.kwargs["micro_batch_size"] == 3
     if native_model:
         assert tp_call.args[0] is run_config.model.transformer

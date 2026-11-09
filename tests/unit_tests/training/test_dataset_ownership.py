@@ -1252,3 +1252,49 @@ def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, l
     packed = model.call_args.kwargs["packed_seq_params"]
     assert packed.tokens_per_sample == 16
     assert torch.equal(packed.cu_seqlens_q, cu_seqlens.squeeze(0))
+
+
+@pytest.mark.parametrize("legacy_length", [64, None])
+@pytest.mark.parametrize("dataset_type", [GPTDataset, SFTDataset, VarlenDataset])
+def test_runtime_estimates_use_dataset_sample_length(monkeypatch, legacy_length, dataset_type):
+    """Estimates use sample length for pretrain/SFT/varlen, not position or packing capacity."""
+    from megatron.training.gpu_sniff_test import _get_ffn_gemm_shapes
+    from megatron.training.theoretical_memory_usage import (
+        compute_activation_memory,
+        compute_activation_memory_without_sp,
+    )
+
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    cfg = SimpleNamespace(
+        data=DataConfig(dataset=dataset, dataset_type=dataset_type),
+        model=SimpleNamespace(seq_length=128),
+        train=SimpleNamespace(micro_batch_size=2),
+        tokenizer=SimpleNamespace(padded_vocab_size=256),
+    )
+    args = Namespace(
+        seq_length=legacy_length,
+        hidden_size=32,
+        ffn_hidden_size=64,
+        num_layers=2,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        max_seqlen_per_dp_cp_rank=512,
+    )
+    if legacy_length is None:
+        del args.seq_length
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: cfg)
+
+    assert _get_ffn_gemm_shapes() == [(32, 32, 32, "up-proj/fc1"), (32, 32, 32, "down-proj/fc2")]
+    # Existing formulas evaluated at sample length=16, micro batch=2, hidden=32.
+    assert compute_activation_memory(cfg, args, 1, micro_batch_size=2) == 45696
+    assert compute_activation_memory_without_sp(cfg, args, 1, micro_batch_size=2) == pytest.approx(
+        59404.8
+    )

@@ -47,6 +47,7 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
+from megatron.training.config.compat import data_sequence_length
 from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
@@ -229,7 +230,7 @@ def initialize_megatron(
             sequence_length = (
                 args.decoder_seq_length
                 if getattr(args, "decoder_tp_comm_overlap", False)
-                else args.seq_length
+                else data_sequence_length(cfg, args)
             )
             _initialize_tp_communicators(
                 transformer_config,
@@ -601,6 +602,7 @@ def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
     cfg = get_run_config()
     args = get_args()
+    sequence_length = data_sequence_length(cfg, args)
     if args.bf16:
         dtype = torch.bfloat16
     elif args.fp16:
@@ -648,7 +650,7 @@ def _warmup_jit_function(tp_size=None):
     )
     input = torch.rand(
         (
-            args.seq_length // args.context_parallel_size,
+            sequence_length // args.context_parallel_size,
             cfg.train.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
@@ -689,9 +691,9 @@ def _warmup_jit_function(tp_size=None):
     # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
         # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
-        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
+        seq_length = sequence_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
     else:
-        seq_length = args.seq_length
+        seq_length = sequence_length
     input = torch.rand(
         (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
