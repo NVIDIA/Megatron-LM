@@ -782,7 +782,9 @@ def _worker_wgrad_shape(rank, world_size, port):
 
 
 def _worker_multilayer_deferred_rs(rank, world_size, port):
-    """Two-layer GTP: async RS deferred for layer0 (non-last), sync for layer1 (last in bwd)."""
+    """Two-layer GTP: async RS deferred for layer0 (non-last), sync for layer1 (last in bwd).
+    Then every deferred RS must land in main_grad exactly once (_check_inflight_rs_added_once).
+    """
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
@@ -805,6 +807,54 @@ def _worker_multilayer_deferred_rs(rank, world_size, port):
     for lyr in [l0, l1]:
         w = lyr.weight
         assert w.main_grad is not None, f"No main_grad on {lyr.__class__.__name__}.weight"
+    gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+
+    _check_inflight_rs_added_once(rank, world_size)
+
+
+def _check_inflight_rs_added_once(rank, world_size):
+    """Every async wgrad RS lands in main_grad exactly once: drained by its chain's next RS, by
+    the same weight's next RS, or collected at the fence.
+
+    Three same-shape weights on one chain share an RS cache key. Round 1 leaves W in flight at
+    the fence. Round 2 re-issues W, then U while W is still in flight: U must get a buffer of its
+    own, not W's. Values are exact, so a lost, doubled or overwritten contribution changes the
+    result.
+    """
+    from collections import Counter
+
+    group = dist.new_group(list(range(world_size)))
+    v, w, u = (_make_gtp_linear(32, 16 * world_size, group).weight for _ in range(3))
+    fired = Counter()
+    for k, p in enumerate((v, w, u)):
+        assert p.pad_length == 0 and p.chain_id == v.chain_id
+        p.main_grad = torch.zeros(p.shape, dtype=torch.float32, device="cuda")
+        p.register_grad_accum_hook(None, lambda k=k: fired.update([k]))
+
+    def issue(k, p):
+        # Rank r sends (k + 1) * (r + 1); the mean reduce-scatter yields (k + 1) * mean.
+        wgrad = torch.full(p._unsharded_shape, (k + 1) * (rank + 1.0), device="cuda")
+        p.wgrad_reduce_scatter(wgrad, async_op=True)
+
+    issue(0, v)
+    issue(1, w)  # drains v (lag 1)
+    issue(1, w)  # drains its own first RS
+    assert w._wgrad_rs_handle is not None, "test is vacuous: nothing in flight at the fence"
+    gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+    issue(1, w)
+    cache = gtp_module.get_global_GTP_cache()
+    in_flight = cache.get(w._rs_ticket).data_ptr()
+    issue(2, u)
+    assert cache.get(u._rs_ticket).data_ptr() != in_flight, "U was given W's in-flight RS buffer"
+    gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+    gtp_module.wait_for_gtp_grad_reduction_on_current_stream()  # a second fence adds nothing
+    torch.cuda.synchronize()
+
+    mean = (world_size + 1) / 2
+    for k, p, uses in ((0, v, 1), (1, w, 3), (2, u, 1)):
+        expected = torch.full_like(p.main_grad, (k + 1) * mean * uses)
+        torch.testing.assert_close(p.main_grad, expected, rtol=0, atol=0)
+        assert fired[k] == uses, f"weight {k}: grad-ready fired {fired[k]}x, not {uses}x"
 
 
 class TestGTPWgradRS:
@@ -847,6 +897,116 @@ class TestGTPMicrobatches:
     def test_consistent_across_microbatches(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_microbatches, 4)
+
+
+# ---------------------------------------------------------------------------
+# Residency: a consume reads the gather still in its buffer instead of gathering again
+# ---------------------------------------------------------------------------
+
+
+def _full_weight(weight):
+    shard = weight.detach().contiguous()
+    full = shard.new_empty((shard.shape[0] * weight.group.size(), *shard.shape[1:]))
+    dist.all_gather_into_tensor(full, shard, group=weight.group)
+    return full[: weight._unsharded_shape[0]]
+
+
+def _consume(model, order, x):
+    """Consume the layers in ``order``; each output must match its CURRENT full weight."""
+    for name in order:
+        layer = model[name]
+        expected = torch.nn.functional.linear(x, _full_weight(layer.weight))
+        torch.testing.assert_close(layer(x), expected)
+
+
+class TestGTPResidency:
+    """Each gather stamps its buffer with the weight it holds; the fence clears the stamps before
+    the optimizer changes the shards. A gather is reused only while its buffer holds it, and a
+    changed shard is never read from a stale buffer -- also in a loop that never calls the fence,
+    where nothing is reused.
+    """
+
+    @pytest.fixture
+    def layers(self, monkeypatch):
+        """Eager GTP linears a (64x64), b (128x64), c (64x64), consumed in that order: a and c
+        share one gather buffer (same shape, not neighbours), b has its own. Counts gathers per
+        layer. Prefetch is off, so every gather is a consume's own and residency alone decides
+        reuse.
+        """
+        _requires_multi_gpu(4)
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        rows = {"a": 64, "b": 128, "c": 64}
+        model = nn.ModuleDict(
+            {n: _make_gtp_linear(64, r, dist.group.WORLD) for n, r in rows.items()}
+        )
+        for layer in model.values():
+            layer.weight._need_weight_prefetch = False
+        gtp_module.classify_gtp_remat_chains(model)
+        names = {id(layer.weight): name for name, layer in model.items()}
+        gathers = []
+        original = GTPShardedParam._all_gather_weight
+
+        def counted(self, *args, **kwargs):
+            gathers.append(names.get(id(self)))
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(GTPShardedParam, "_all_gather_weight", counted)
+        return model, gathers
+
+    @pytest.mark.parametrize("debug", [False, True], ids=["plain", "check_param_states"])
+    def test_reused_until_overwritten_and_cleared_at_fence(self, layers, monkeypatch, debug):
+        model, gathers = layers
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", debug)
+        x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+        _consume(model, "abc", x)
+        gtp_module.wait_for_gtp_grad_reduction_on_current_stream()  # residency starts here
+        # Iterations: recording, planned (the second fence plans), planned.
+        for step in range(3):
+            _consume(model, "abc", x)
+            gathers.clear()
+            # b still holds its gather; a's buffer now holds c, so a gathers again, then c does.
+            _consume(model, "bac", x)
+            assert gathers == ["a", "c"], gathers
+            gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+            assert not any(model[n].weight._prefetch_available(True) for n in "abc")
+            with torch.no_grad():  # the optimizer step, after the fence
+                for n in "abc":
+                    model[n].weight.add_(1.0 + step)
+        chain = GTPShardedParam._chain_state[model["a"].weight.chain_id]
+        assert chain["fwd"].prefetches is not None, "the second fence did not plan the recording"
+
+    def test_without_the_fence_nothing_is_reused_or_recorded(self, layers):
+        """A loop that never calls the fence (inference, a bare SGD loop) re-gathers at every
+        consume, so it reads every shard update, and keeps no prefetch plans.
+        """
+        model, gathers = layers
+        x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+        for step in range(3):
+            _consume(model, "abc", x)
+            with torch.no_grad():  # an optimizer step, no fence
+                for n in "abc":
+                    model[n].weight.add_(1.0 + step)
+        assert gathers.count("b") == 3, gathers
+        for chain in GTPShardedParam._chain_state.values():
+            assert chain["fwd"].consumes is None and chain["bwd"].consumes is None
+
+    @pytest.mark.parametrize("clear", ["cache", "reset"])
+    def test_cache_clear_and_reset_clear_stamps(self, layers, clear):
+        model, _ = layers
+        x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+        _consume(model, "b", x)
+        gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+        _consume(model, "b", x)
+        assert model["b"].weight._prefetch_available(True)
+        if clear == "cache":
+            gtp_module.get_global_GTP_cache().clear()
+        else:
+            gtp_module.reset_gtp_state()
+            gtp_module.classify_gtp_remat_chains(model)  # a reset is always followed by this
+        assert not model["b"].weight._prefetch_available(True)
+        with torch.no_grad():
+            model["b"].weight.add_(1.0)
+        _consume(model, "b", x)
 
 
 # ---------------------------------------------------------------------------
