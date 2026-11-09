@@ -25,10 +25,13 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    _get_fp8_autocast_for_quant_recipe,
+    _get_fp8_autocast_recipe_for_quant_params,
 )
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -97,6 +100,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
+    attach_routed_mxfp8_writeback,
     flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
     prepare_cutlass_mxfp8_weights,
@@ -353,15 +357,9 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Keep BF16 overrides on the TE ops path. _fused_forward applies the resolved
+        # precision context, and TE selects either a joint fusion or its basic operations.
+        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
             _require_te_tanh_clamp_support(self.config)
@@ -373,8 +371,8 @@ class TEGroupedMLP(MegatronModule):
         # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
         # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
         # the fc1 input and the activation input separately. The config accepts either spelling
-        # (they are mutually exclusive there); each instance maps it onto its own path, so a
-        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        # (they are mutually exclusive there); each instance maps it onto its own path.
+        # BF16 overrides retain the TE ops path and offload the whole block input as well.
         offloading = self.config.fine_grained_activation_offloading
         self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
         self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules
@@ -727,13 +725,6 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
-        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
-        # grouped view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
@@ -838,13 +829,6 @@ class TEGroupedMLP(MegatronModule):
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
         op.wgrad_store = self.linear_fc2.wgrad_store
-        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
-        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
-        # view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_grad = True
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -925,6 +909,23 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        # Resolve after GPTModel's finish_init sweep, using the original modules' current
+        # train/eval mode. The whole TE sequence must execute under one precision override.
+        fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc1.te_quant_params, self.linear_fc1.training
+        )
+        fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc2.te_quant_params, self.linear_fc2.training
+        )
+        if fc1_recipe != fc2_recipe:
+            raise ValueError(
+                "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+                "and linear_fc2. Apply the override to both linears."
+            )
+        quant_context = (
+            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -987,15 +988,17 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
-            # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
-            # reads), whose storage is non-resizable — so skip the force-release in that case.
+            # In case of MXFP8 Dispatch permuted_local_hidden_states is GroupedTensor which does
+            # not have a single backing storage to release. Rely on garbage collection to do its
+            # job.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
-                if fine_grained_activation_offloading and output_buffer is None
+                if fine_grained_activation_offloading
+                and output_buffer is None
+                and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
-            with stash_context:
+            with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
                 # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.
@@ -1588,7 +1591,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Build contiguous expert stacks after checkpoint loading.
 
         Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
-        its stacked view. Only FlashInfer routed needs a separate Major-K copy.
+        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
+        the canonical tensors write through to it, releasing their storage.
         """
 
         use_flashinfer = (
@@ -1624,6 +1628,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     concatenated_weight.padded_rows,
                     concatenated_weight.padded_cols,
                 )
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    attach_routed_mxfp8_writeback(weight, concatenated_weight, i)
             else:
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
@@ -1659,20 +1666,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ):
             # Selective-precision recipes also build BF16 expert weights for
             # FlashInfer. BF16 and CUTLASS MXFP8 share canonical storage and are
-            # refit directly; only routed MXFP8 needs a derived copy refreshed.
+            # refit directly; routed MXFP8 is written through by refit as well.
             return False
 
-        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-            flashinfer_weight = getattr(self, buf_name)
-            canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
-            if isinstance(flashinfer_weight, FlashInferRoutedMXFP8Weight):
-                require_flashinfer_routed_mxfp8()
-                prepare_routed_mxfp8_weights(canonical_weight, out=flashinfer_weight)
-            else:
-                raise TypeError(
-                    "FlashInfer MXFP8 weights must use CUTLASS or routed layout; "
-                    f"got {type(flashinfer_weight).__name__}"
-                )
+        # Refit already wrote through to the routed weights (attach_routed_mxfp8_writeback);
+        # returning True still makes refit synchronize before graphs replay.
         return True
 
     @torch.inference_mode(False)
@@ -1706,6 +1704,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return False
         prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
+
+    def refresh_cache(self) -> None:
+        """Requantize the per-token NVFP4 expert weights after a refit.
+
+        Refit writes the BF16 stacks, so without this the NVFP4 kernel keeps
+        serving the weights quantized at the first forward.
+        """
+        super().refresh_cache()
+        if self.refresh_flashinfer_nvfp4_weights():
+            # Requantization is asynchronous. Synchronize before another stream replays
+            # graphs that read these derived weight buffers.
+            torch.cuda.synchronize()
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -1899,7 +1909,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if not InferenceMode.is_active():
             assert (
-                not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
+                not self.config.fp8
+                or self.config.fp8_recipe != Fp8Recipe.mxfp8
+                or self.config.moe_training_matches_inference
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
