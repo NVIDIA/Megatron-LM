@@ -1957,7 +1957,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
 def _warn_sequential_mlp_deprecated() -> None:
     """Emit the migration warning once, even when a model has many MoE layers."""
     warn_single_rank(
-        "SequentialMLP is deprecated. Use TEGroupedMLP with transformer_impl='transformer_engine' and "
+        "SequentialMLP is deprecated. Use TEGroupedMLP with "
+        "transformer_impl='transformer_engine' and "
         "moe_grouped_gemm=True (the default). The local backend still uses SequentialMLP; "
         "switch to the Transformer Engine backend to migrate.",
         FutureWarning,
