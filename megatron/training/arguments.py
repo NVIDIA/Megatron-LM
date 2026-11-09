@@ -999,6 +999,15 @@ def validate_args(args, defaults={}):
             assert not args.use_distributed_optimizer, \
                 '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
         else:
+            # The v1 device mesh lays out only the data-, context-, expert- and tensor-parallel
+            # ranks (mcore_adapter_v1._get_dp_tp_mesh), so it cannot factor a pipeline-parallel
+            # world size.
+            if args.pipeline_model_parallel_size > 1:
+                raise ValueError(
+                    "Megatron-FSDP v1 does not support pipeline parallelism "
+                    f"(--pipeline-model-parallel-size {args.pipeline_model_parallel_size}). "
+                    "Use --pipeline-model-parallel-size 1."
+                )
             # Megatron-FSDP v1 requires the DistributedOptimizer.
             if not args.use_distributed_optimizer:
                 warn_rank_0(
