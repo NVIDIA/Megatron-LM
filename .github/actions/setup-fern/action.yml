@@ -27,7 +27,7 @@ inputs:
   config-path:
     description: 'Path to the fern.config.json that pins the fern-api version'
     required: false
-    default: 'docs/fern/fern.config.json'
+    default: "fern/fern.config.json"
 
 runs:
   using: composite
