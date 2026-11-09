@@ -126,10 +126,9 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
-    # The data section's batch flags and length; the packing path above needs neither.
+    # The data section's batch flags; the packing path above needs neither them nor the length.
     flags = cfg.data.batch_flags()
     cp_size = cfg.model.transformer.context_parallel_size
-    seq_length = data_sequence_length(cfg, args)
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = flags.has_cu_seqlens
     create_attention_mask_in_dataloader = flags.create_attention_mask
@@ -149,6 +148,7 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
+    seq_length = data_sequence_length(cfg, args)  # the data length, for the batch built here
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)

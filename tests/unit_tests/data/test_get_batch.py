@@ -1102,10 +1102,11 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         linear_cp_layout="contiguous",
     )
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    # The batch flags come from the data section (a loader-only one here: plain GPT flags).
     monkeypatch.setattr(
         pretrain_hybrid,
         "get_run_config",
-        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config), data=DataConfig()),
     )
     monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
