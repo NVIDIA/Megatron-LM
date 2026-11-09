@@ -123,7 +123,9 @@ def _forward(module, x, ids, probs, monkeypatch, *, rsv=None, bounded=None):
 
     monkeypatch.setattr(InferenceMode, "_is_active", True)
     if rsv is not None:
-        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_get_rsv_tensor", staticmethod(lambda: rsv))
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher, "_get_rsv_tensor", staticmethod(lambda: rsv.tensor)
+        )
     if bounded is not None:
         monkeypatch.setattr(InferenceMode, "_use_bounded_mxfp8_rows", True)
         module._flashinfer_mxfp8_token_capacity = bounded
