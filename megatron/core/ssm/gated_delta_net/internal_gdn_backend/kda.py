@@ -6,20 +6,28 @@
 # autograd module and every primitive signature are unchanged in v0.5.2).
 # The CP boundary pre-processing is redirected to the in-tree CuTe DSL kernels.
 
-"""Autograd orchestration for KDA: FLA Triton kernels + in-tree CP pre-processing.
+"""Autograd orchestration for KDA: FLA Triton kernels + in-tree CuTe DSL kernels.
 
-Kimi Delta Attention (KDA) is the channel-wise gated delta rule. Its chunked
-kernels live in FLA and are reused verbatim here; the only calls this module
-redirects are the two context-parallel boundary pre-processing steps, which go
-through ``cp_preprocess`` in the CuTe kernels' ``gk`` gate mode (per-K-row
-decay, pre-gated ``kg``/``qg`` operands, no per-token row gating) and fall back
-to FLA's Triton producers whenever the CuTe path refuses the call. Without a CP
-context there is nothing to redirect and the public entry simply calls FLA.
+Kimi Delta Attention (KDA) is the channel-wise gated delta rule. Its forward
+chunked kernels live in FLA and are reused verbatim here. Two parts are
+redirected in-tree:
+
+* the two context-parallel boundary pre-processing steps, which go through
+  ``cp_preprocess`` in the CuTe kernels' ``gk`` gate mode (per-K-row decay,
+  pre-gated ``kg``/``qg`` operands, no per-token row gating) and fall back to
+  FLA's Triton producers whenever the CuTe path refuses the call;
+* on SM100 with ``K == V == 128``, the backward after the state recompute: one
+  fused CuTe DSL kernel (``fused_kda_bwd_cute``) replaces FLA's dAv, dhu, WY/dqkg,
+  intra and reverse dg cumsum launches. It reads the chunk states ``h`` and the
+  terminal state gradient (from the CP pre-process under context parallelism).
+
+Without a CP context and without the fused backward the public entry calls FLA.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 from typing import Any
 
 import torch
@@ -44,6 +52,7 @@ from .implementation import (
     _backend_mode,
     _cp_backward_preprocess,
     _cp_forward_preprocess,
+    _has_module,
     _validate_validated_chunk_indices,
 )
 from .kernels.fused_gdr_cp_cute import (
@@ -129,8 +138,9 @@ def _kda_internal_support_reason(
     return_intermediate_states: bool,
     state_v_first: bool,
     kwargs: dict[str, Any],
+    context_parallel: bool = True,
 ) -> str | None:
-    """Return why the internal CP adapter cannot take this call, or ``None``.
+    """Return why the internal adapter cannot take this call, or ``None``.
 
     Only adapter-level restrictions live here. Device, toolchain, head-count, dtype
     and world-size requirements of the CuTe kernels are decided inside the CP
@@ -158,7 +168,7 @@ def _kda_internal_support_reason(
         return "q, k, and v must use BTHD layout"
     if q.shape != k.shape:
         return "q and k shapes differ"
-    if q.shape[0] != 1:
+    if context_parallel and q.shape[0] != 1:
         return "context parallel KDA requires batch size 1"
     B, T, H, K = q.shape
     HV = v.shape[2]
@@ -173,8 +183,158 @@ def _kda_internal_support_reason(
     return None
 
 
+_FUSED_BWD_ENV = "MCORE_KDA_FUSED_BWD"
+_FUSED_BWD_HEAD_DIM = 128
+_fused_kda_bwd_launches = 0
+
+
+def get_fused_kda_bwd_launch_count() -> int:
+    """Number of fused KDA backward launches in this process."""
+    return _fused_kda_bwd_launches
+
+
+def _fused_kda_bwd_support_reason(
+    *, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor
+) -> str | None:
+    """Return why the fused CuTe DSL KDA backward cannot run, or ``None``.
+
+    Decided in the forward (from the inputs alone) so the backward never changes
+    its mind. ``MCORE_KDA_FUSED_BWD=0`` keeps FLA's backward kernels.
+    """
+    if os.environ.get(_FUSED_BWD_ENV, "1") == "0":
+        return f"{_FUSED_BWD_ENV}=0"
+    if not _has_module("cutlass") or not _has_module("cuda.bindings.driver"):
+        return "CuTe DSL runtime is not installed"
+    if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 10:
+        return "device is not SM100"
+    if not torch.version.cuda or int(torch.version.cuda.split(".", 1)[0]) < 13:
+        return "CUDA 13 or newer is required"
+    if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
+        return "q, k and v must be bf16"
+    if q.ndim != 4 or q.shape[-1] != _FUSED_BWD_HEAD_DIM:
+        return f"head dimension must be {_FUSED_BWD_HEAD_DIM}"
+    if k.shape != q.shape or v.shape != q.shape:
+        return "q, k and v shapes differ"
+    if tuple(beta.shape) != tuple(q.shape[:3]):
+        return "beta must have shape [B, T, H]"
+    return None
+
+
+def _call_fused_kda_bwd(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    Aqk: torch.Tensor,
+    Akk: torch.Tensor,
+    h: torch.Tensor,
+    do: torch.Tensor,
+    dht: torch.Tensor | None,
+    scale: float,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    """Run the fused KDA backward on FLA's residuals; returns ``dq, dk, dv, dg, dbeta``.
+
+    ``g`` is FLA's chunk-local log2 gate cumsum and ``h`` the chunk-start states.
+    Up to a few (sequence, head) pairs per SM, the dS recurrence (``kda_dhu``)
+    writes every chunk's dS and dv_new, and the gradient kernel, launched while
+    it runs, processes the chunks in parallel as they become ready; with more
+    pairs, one fused kernel runs the recurrence and the gradients per
+    (sequence, head). The returned ``dg``
+    already includes FLA's chunk-local reverse cumsum.
+    """
+    global _fused_kda_bwd_launches
+    from .kernels.fused_kda_bwd_cute.launcher import (
+        chunk_offsets_for,
+        fused_kda_bwd,
+        kda_dhu,
+        prefer_tape,
+        tape_flags,
+    )
+
+    batch, seq_len, heads, dim = q.shape
+    tokens = batch * seq_len
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * seq_len
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    num_sequences = cu_seqlens.numel() - 1
+    if dht is None:
+        dht = torch.zeros(num_sequences, heads, dim, dim, dtype=torch.float32, device=q.device)
+
+    def tokens_of(x, dtype, width=dim):
+        return x.detach().reshape(1, tokens, heads, width).to(dtype).contiguous()
+
+    q, k, v, g, Aqk, Akk, do = (
+        tokens_of(q, torch.bfloat16),
+        tokens_of(k, torch.bfloat16),
+        tokens_of(v, torch.bfloat16),
+        tokens_of(g, torch.float32),
+        tokens_of(Aqk, torch.bfloat16, _CHUNK_SIZE),
+        tokens_of(Akk, torch.bfloat16, _CHUNK_SIZE),
+        tokens_of(do, torch.bfloat16),
+    )
+    beta = beta.detach().reshape(1, tokens, heads).to(torch.float32).contiguous()
+    h = h.detach().reshape(1, -1, heads, dim, dim).to(torch.bfloat16).contiguous()
+    dht = dht.detach().reshape(num_sequences, heads, dim, dim).to(torch.float32).contiguous()
+    chunk_offsets = chunk_offsets_for(cu_seqlens)
+    tape = flags = None
+    # Buffers the overlapped recurrence reads; held until the gradient launch.
+    keepalive = []
+    if prefer_tape(num_sequences, heads, q.device):
+        # The gradient kernel starts on each chunk as soon as the recurrence
+        # has written it (chunk ready flags; nothing is enqueued in between).
+        flags = tape_flags(h.shape[1], heads, q.device)
+        dh, _dh0, dv_new = kda_dhu(
+            q,
+            k,
+            g,
+            beta,
+            Aqk,
+            Akk,
+            do,
+            dht,
+            cu_seqlens,
+            scale,
+            chunk_offsets=chunk_offsets,
+            num_chunks=h.shape[1],
+            flags=flags,
+            keepalive=keepalive,
+        )
+        tape = (dh, dv_new)
+    dq, dk, dv, dg, db, _ = fused_kda_bwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        Aqk,
+        Akk,
+        h,
+        do,
+        dht,
+        cu_seqlens,
+        scale,
+        chunk_offsets=chunk_offsets,
+        tape=tape,
+        flags=flags,
+    )
+    del keepalive
+    _fused_kda_bwd_launches += 1
+    shape = (batch, seq_len, heads, dim)
+    return (
+        dq.reshape(shape),
+        dk.reshape(shape),
+        dv.reshape(shape),
+        dg.reshape(shape),
+        db.reshape(shape[:3]),
+    )
+
+
 class InternalChunkKDAFunction(torch.autograd.Function):
-    """FLA 0.5.1 ``ChunkKDAFunction`` with the CP pre-processing redirected in-tree."""
+    """FLA 0.5.1 ``ChunkKDAFunction`` with the CP pre-processing and, where supported,
+    the backward redirected in-tree."""
 
     @staticmethod
     @input_guard
@@ -197,8 +357,13 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         cu_seqlens_cpu: torch.LongTensor | None,
         validated_chunk_indices: torch.LongTensor | None,
         cp_context: object | None,
+        recompute_h: bool,
     ):
         strict = _backend_mode() == "cute"
+        fused_bwd = _fused_kda_bwd_support_reason(q=q, k=k, v=v, beta=beta) is None
+        # The fused backward reads h (and, under CP, v_new) from the forward: keeping
+        # them skips the backward state recompute unless recompute_h is set.
+        save_fused_bwd_state = fused_bwd and not disable_recompute and not recompute_h
         _validate_validated_chunk_indices(validated_chunk_indices, cu_seqlens)
         chunk_indices = validated_chunk_indices
         if chunk_indices is None and cu_seqlens is not None:
@@ -286,7 +451,15 @@ class InternalChunkKDAFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             state_v_first=False,
         )
-        if not disable_recompute:
+        if save_fused_bwd_state:
+            # Keep h (and v_new for the CP pre-process); the gate cumsum is cheap to
+            # recompute and as large as h in fp32.
+            w, u, qg, kg = None, None, None, None
+            if cp_context is None:
+                v_new = None
+            if use_gate_in_kernel:
+                g = None
+        elif not disable_recompute:
             # Delete to save memory; the backward recomputes them.
             w, u, qg, kg, v_new, h = None, None, None, None, None, None
             if use_gate_in_kernel:
@@ -320,6 +493,8 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         ctx.disable_recompute = disable_recompute
         ctx.cp_context = cp_context
         ctx.strict = strict
+        ctx.fused_bwd = fused_bwd
+        ctx.saved_fused_bwd_state = save_fused_bwd_state
         return o.type_as(q), None
 
     @staticmethod
@@ -351,7 +526,10 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         cp_context = ctx.cp_context
 
         # fla/ops/kda/chunk_bwd.py: recompute the gate cumsum, WY tensors and states.
+        # A forward that kept h for the fused backward skips the state recompute; the
+        # CP pre-process still reads the WY tensors and the gated q / k.
         if not ctx.disable_recompute:
+            recompute_state = not ctx.saved_fused_bwd_state
             if ctx.use_gate_in_kernel:
                 g = kda_gate_chunk_cumsum(
                     g=g_org,
@@ -363,135 +541,184 @@ class InternalChunkKDAFunction(torch.autograd.Function):
                     chunk_indices=chunk_indices,
                     lower_bound=ctx.lower_bound,
                 )
-            # Passing q materialises qg = q * 2^gk, which the CP pre-process needs.
-            w, u, qg, kg = recompute_w_u_fwd(
-                q=q,
-                k=k,
-                v=v,
-                beta=beta,
-                A=Akk,
-                gk=g,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
+            if recompute_state or cp_context is not None:
+                # Passing q materialises qg = q * 2^gk, which the CP pre-process needs.
+                w, u, qg, kg = recompute_w_u_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    beta=beta,
+                    A=Akk,
+                    gk=g,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
             if cp_context is not None:
                 initial_state = expand_h0(initial_state, context=cp_context)
-            h, v_new, _final_state = chunk_gated_delta_rule_fwd_h(
-                k=kg,
-                w=w,
-                u=u,
-                gk=g,
-                initial_state=initial_state,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_size=_CHUNK_SIZE,
-                state_v_first=False,
-            )
+            if recompute_state:
+                h, v_new, _final_state = chunk_gated_delta_rule_fwd_h(
+                    k=kg,
+                    w=w,
+                    u=u,
+                    gk=g,
+                    initial_state=initial_state,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                    chunk_size=_CHUNK_SIZE,
+                    state_v_first=False,
+                )
         elif cp_context is not None:
             initial_state = expand_h0(initial_state, context=cp_context)
 
-        # dAqk = do @ v.T ; dv = A @ do (the local term the CP pre-process consumes)
-        dAqk, dv = chunk_kda_bwd_dAv(
-            q=q,
-            k=k,
-            v=v_new,
-            do=do,
-            A=Aqk,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=_CHUNK_SIZE,
-            chunk_indices=chunk_indices,
-        )
+        if ctx.fused_bwd:
+            if cp_context is not None:
+                # The CP terminal gradient reads FLA's local dv = Aqk^T do; the fused
+                # kernel recomputes everything else from h and the returned dht.
+                _, dv_local = chunk_kda_bwd_dAv(
+                    q=q,
+                    k=k,
+                    v=v_new,
+                    do=do,
+                    A=Aqk,
+                    scale=scale,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=_CHUNK_SIZE,
+                    chunk_indices=chunk_indices,
+                )
+                before = _cutedsl_progress(forward=False)
+                dht, _ = _cp_backward_preprocess(
+                    q=qg,
+                    k=kg,
+                    w=w,
+                    do=do,
+                    dv=dv_local,
+                    gk=g,
+                    scale=scale,
+                    cu_seqlens=cu_seqlens,
+                    dht=dht,
+                    initial_state=initial_state,
+                    context=cp_context,
+                )
+                if ctx.strict:
+                    _require_cutedsl_progress(before, forward=False)
+            # h already carries the CP initial state (recomputed from it above).
+            dq, dk, dv, dg, db = _call_fused_kda_bwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                Aqk=Aqk,
+                Akk=Akk,
+                h=h,
+                do=do,
+                dht=dht,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+            )
+        else:
+            # dAqk = do @ v.T ; dv = A @ do (the local term the CP pre-process consumes)
+            dAqk, dv = chunk_kda_bwd_dAv(
+                q=q,
+                k=k,
+                v=v_new,
+                do=do,
+                A=Aqk,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=_CHUNK_SIZE,
+                chunk_indices=chunk_indices,
+            )
 
-        if cp_context is not None:
-            # The only redirected call: CuTe DSL gk-mode terminal gradient, FLA fallback.
-            # The gk-mode kernels never gate q themselves, so ``qg`` must be passed.
-            before = _cutedsl_progress(forward=False)
-            dht, initial_state = _cp_backward_preprocess(
+            if cp_context is not None:
+                # The only redirected call: CuTe DSL gk-mode terminal gradient, FLA fallback.
+                # The gk-mode kernels never gate q themselves, so ``qg`` must be passed.
+                before = _cutedsl_progress(forward=False)
+                dht, initial_state = _cp_backward_preprocess(
+                    q=qg,
+                    k=kg,
+                    w=w,
+                    do=do,
+                    dv=dv,
+                    gk=g,
+                    scale=scale,
+                    cu_seqlens=cu_seqlens,
+                    dht=dht,
+                    initial_state=initial_state,
+                    context=cp_context,
+                )
+                if ctx.strict:
+                    _require_cutedsl_progress(before, forward=False)
+
+            dh, _dh0, dv = chunk_gated_delta_rule_bwd_dhu(
                 q=qg,
                 k=kg,
                 w=w,
+                gk=g,
+                h0=initial_state,
+                dht=dht,
                 do=do,
                 dv=dv,
-                gk=g,
                 scale=scale,
                 cu_seqlens=cu_seqlens,
-                dht=dht,
-                initial_state=initial_state,
-                context=cp_context,
+                chunk_size=_CHUNK_SIZE,
+                chunk_indices=chunk_indices,
+                state_v_first=False,
             )
-            if ctx.strict:
-                _require_cutedsl_progress(before, forward=False)
 
-        dh, _dh0, dv = chunk_gated_delta_rule_bwd_dhu(
-            q=qg,
-            k=kg,
-            w=w,
-            gk=g,
-            h0=initial_state,
-            dht=dht,
-            do=do,
-            dv=dv,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=_CHUNK_SIZE,
-            chunk_indices=chunk_indices,
-            state_v_first=False,
-        )
+            dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
+                q=q,
+                k=k,
+                v=v,
+                v_new=v_new,
+                g=g,
+                beta=beta,
+                A=Akk,
+                h=h,
+                do=do,
+                dh=dh,
+                dv=dv,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=_CHUNK_SIZE,
+                chunk_indices=chunk_indices,
+                state_v_first=False,
+            )
 
-        dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
-            q=q,
-            k=k,
-            v=v,
-            v_new=v_new,
-            g=g,
-            beta=beta,
-            A=Akk,
-            h=h,
-            do=do,
-            dh=dh,
-            dv=dv,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=_CHUNK_SIZE,
-            chunk_indices=chunk_indices,
-            state_v_first=False,
-        )
+            dq, dk, db, dg = chunk_kda_bwd_intra(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                dAqk=dAqk,
+                dAkk=dAkk,
+                dq=dq,
+                dk=dk,
+                db=db,
+                dg=dg,
+                cu_seqlens=cu_seqlens,
+                chunk_size=_CHUNK_SIZE,
+                chunk_indices=chunk_indices,
+                safe_gate=ctx.safe_gate,
+            )
 
-        dq, dk, db, dg = chunk_kda_bwd_intra(
-            q=q,
-            k=k,
-            g=g,
-            beta=beta,
-            dAqk=dAqk,
-            dAkk=dAkk,
-            dq=dq,
-            dk=dk,
-            db=db,
-            dg=dg,
-            cu_seqlens=cu_seqlens,
-            chunk_size=_CHUNK_SIZE,
-            chunk_indices=chunk_indices,
-            safe_gate=ctx.safe_gate,
-        )
+            # For GVA, reduce dq and dk from [B, T, HV, K] back to [B, T, H, K]. The
+            # dispatcher only admits HV == H; kept for parity with FLA's chunk_kda_bwd.
+            H, HV = q.shape[2], v.shape[2]
+            if HV > H:
+                G = HV // H
+                dq = dq.view(*dq.shape[:2], H, G, dq.shape[-1]).sum(dim=3)
+                dk = dk.view(*dk.shape[:2], H, G, dk.shape[-1]).sum(dim=3)
 
-        # For GVA, reduce dq and dk from [B, T, HV, K] back to [B, T, H, K]. The
-        # dispatcher only admits HV == H; kept for parity with FLA's chunk_kda_bwd.
-        H, HV = q.shape[2], v.shape[2]
-        if HV > H:
-            G = HV // H
-            dq = dq.view(*dq.shape[:2], H, G, dq.shape[-1]).sum(dim=3)
-            dk = dk.view(*dk.shape[:2], H, G, dk.shape[-1]).sum(dim=3)
-
+            dg = chunk_local_cumsum(
+                dg,
+                chunk_size=_CHUNK_SIZE,
+                reverse=True,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
         dA, dbias = None, None
-        dg = chunk_local_cumsum(
-            dg,
-            chunk_size=_CHUNK_SIZE,
-            reverse=True,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
         if ctx.use_gate_in_kernel:
             dg, dA, dbias = kda_gate_bwd(
                 g=g_org, A_log=A_log, dt_bias=dt_bias, dyg=dg, lower_bound=ctx.lower_bound
@@ -499,7 +726,7 @@ class InternalChunkKDAFunction(torch.autograd.Function):
 
         # Seven gradients (q, k, v, g, beta, A_log, dt_bias) in FLA's order, then None
         # for scale, safe_gate, lower_bound, use_gate_in_kernel, disable_recompute,
-        # cu_seqlens, cu_seqlens_cpu, validated_chunk_indices and cp_context.
+        # cu_seqlens, cu_seqlens_cpu, validated_chunk_indices, cp_context and recompute_h.
         return (
             dq.to(q),
             dk.to(k),
@@ -508,6 +735,7 @@ class InternalChunkKDAFunction(torch.autograd.Function):
             db.to(beta),
             dA,
             dbias,
+            None,
             None,
             None,
             None,
@@ -543,17 +771,52 @@ def chunk_kda(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     validated_chunk_indices: torch.LongTensor | None = None,
     cp_context: object | None = None,
+    recompute_h: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run FLA's KDA kernels, redirecting only the CP pre-processing in-tree.
+    """Run FLA's KDA kernels with the CP pre-processing and the backward in-tree.
 
-    ``MCORE_GDN_INTERNAL_BACKEND=fla`` and calls without a CP context are FLA
-    verbatim. ``auto`` uses the adapter whenever its restrictions allow and falls
-    back to FLA otherwise; ``cute`` raises instead of falling back, including when
-    the CP dispatcher itself declines the in-tree kernels.
+    When the fused backward runs, the forward keeps the chunk states ``h`` so the
+    backward skips FLA's state recompute; ``recompute_h=True``
+    (``gdn_gdr_recompute_h``) recomputes them instead to save activation memory.
+
+    ``MCORE_GDN_INTERNAL_BACKEND=fla`` is FLA verbatim, and so is a call without a
+    CP context that the fused backward cannot serve (see
+    ``_fused_kda_bwd_support_reason``). ``auto`` uses the adapter whenever its
+    restrictions allow and falls back to FLA otherwise; ``cute`` raises instead of
+    falling back on CP calls, including when the CP dispatcher itself declines the
+    in-tree kernels.
     """
     mode = _backend_mode()
-    if mode == "fla" or cp_context is None:
+    use_adapter = mode != "fla" and (
+        cp_context is not None or _fused_kda_bwd_support_reason(q=q, k=k, v=v, beta=beta) is None
+    )
+    if use_adapter and cp_context is None:
+        # Without CP only the fused backward is in-tree: fall back to FLA verbatim on
+        # anything the adapter cannot take.
+        use_adapter = (
+            _kda_internal_support_reason(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                allow_neg_eigval=allow_neg_eigval,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+                return_intermediate_states=return_intermediate_states,
+                state_v_first=state_v_first,
+                kwargs=kwargs,
+                context_parallel=False,
+            )
+            is None
+        )
+    if not use_adapter:
         return fla_chunk_kda(
             q,
             k,
@@ -595,6 +858,7 @@ def chunk_kda(
         return_intermediate_states=return_intermediate_states,
         state_v_first=state_v_first,
         kwargs=kwargs,
+        context_parallel=cp_context is not None,
     )
     if reason is not None:
         if mode == "cute":
@@ -623,12 +887,13 @@ def chunk_kda(
             **kwargs,
         )
 
-    # fla/ops/kda/chunk.py: the context's local offsets replace the caller's.
-    cu_seqlens = getattr(cp_context, "cu_seqlens", None)
-    if cu_seqlens is None:
-        raise ValueError("cp_context.cu_seqlens is required for context parallel KDA")
-    if getattr(cp_context, "cu_seqlens_cpu", None) is not None:
-        cu_seqlens_cpu = cp_context.cu_seqlens_cpu
+    if cp_context is not None:
+        # fla/ops/kda/chunk.py: the context's local offsets replace the caller's.
+        cu_seqlens = getattr(cp_context, "cu_seqlens", None)
+        if cu_seqlens is None:
+            raise ValueError("cp_context.cu_seqlens is required for context parallel KDA")
+        if getattr(cp_context, "cu_seqlens_cpu", None) is not None:
+            cu_seqlens_cpu = cp_context.cu_seqlens_cpu
 
     A_log, dt_bias = None, None
     if use_gate_in_kernel:
@@ -653,4 +918,5 @@ def chunk_kda(
         cu_seqlens_cpu,
         validated_chunk_indices,
         cp_context,
+        recompute_h,
     )

@@ -179,7 +179,8 @@ def test_kda_binds_gated_delta_rule_by_backend(backend):
     KimiDeltaAttention._setup_variant_attrs(shell)
 
     if backend == "internal":
-        assert shell.gated_delta_rule is internal_backend.chunk_kda
+        assert shell.gated_delta_rule.func is internal_backend.chunk_kda
+        assert shell.gated_delta_rule.keywords == {"recompute_h": shell.config.gdn_gdr_recompute_h}
     else:
         # Every other backend value keeps FLA's chunk_kda (None when FLA is absent).
         assert shell.gated_delta_rule is kda_module.chunk_kda
@@ -550,3 +551,62 @@ def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, 
         micro_batch_size=2,
         sequence_packing=sequence_packing,
     )
+
+
+def _fused_kda_bwd_supported() -> bool:
+    import importlib.util
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and importlib.util.find_spec("cutlass") is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    [
+        (True, 1, False, 1, "chunkwise"),
+        # Headwise CP hands the kernel whole local sequences, as CP1 does.
+        (False, 1, False, 2, "headwise"),
+        # CP4 has first, middle and last ranks, so it covers chunkwise CP2.
+        (True, 1, False, 4, "chunkwise"),
+    ],
+)
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(not _fused_kda_bwd_supported(), reason="needs SM100 and the CuTe DSL runtime.")
+def test_parallel_kda_fused_bwd_correctness(
+    monkeypatch, tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+):
+    """Head dimension 128 runs the fused CuTe DSL backward; check it under CP1, CP2 and CP4."""
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as kda_adapter
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    config = replace(
+        _make_config(linear_cp_mode=linear_cp_mode),
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        gdn_gdr_backend="internal",
+    )
+    before = kda_adapter.get_fused_kda_bwd_launch_count()
+    _test_parallel_attention_correctness(
+        transformer_config=config,
+        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=1e-2,
+        rtol=1e-2,
+        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+        input_grad_rtol=1e-2,
+        # Under CP4 both the fused and the FLA backward move a few BF16 input-grad
+        # values by two bins (relative L2 ~4e-3); bound those outliers globally.
+        cosine_similarity_threshold=0.9999,
+        relative_l2_threshold=1e-2,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=256,
+        micro_batch_size=2,
+        sequence_packing=sequence_packing,
+    )
+    assert kda_adapter.get_fused_kda_bwd_launch_count() > before

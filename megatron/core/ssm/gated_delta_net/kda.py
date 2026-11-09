@@ -148,11 +148,13 @@ class KimiDeltaAttention(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
-        # The internal backend runs FLA's KDA kernels and only redirects the chunkwise-CP
-        # boundary pre-processing to the in-tree CuTe DSL kernels; every other backend
-        # value keeps FLA's chunk_kda.
+        # The internal backend runs FLA's KDA forward and redirects the chunkwise-CP
+        # boundary pre-processing and, on SM100, the backward to the in-tree CuTe DSL
+        # kernels; every other backend value keeps FLA's chunk_kda.
         self.gated_delta_rule = (
-            internal_chunk_kda if self.config.gdn_gdr_backend == "internal" else chunk_kda
+            partial(internal_chunk_kda, recompute_h=self.config.gdn_gdr_recompute_h)
+            if self.config.gdn_gdr_backend == "internal"
+            else chunk_kda
         )
         if self.config.gdn_gdr_backend == "internal":
             KimiDeltaAttention._warn_if_internal_cp_preprocess_cannot_apply(self)

@@ -314,7 +314,7 @@ def test_auto_mode_dispatches_cp_kda_to_local_autograd_function(monkeypatch, sca
 
     assert result is expected
     (args,) = calls
-    assert len(args) == 16
+    assert len(args) == 17
     assert args[0] is inputs["q"] and args[1] is inputs["k"] and args[2] is inputs["v"]
     assert args[3] is inputs["g"] and args[4] is inputs["beta"]
     assert args[5] is gate["A_log"] and args[6] is gate["dt_bias"]
@@ -322,7 +322,7 @@ def test_auto_mode_dispatches_cp_kda_to_local_autograd_function(monkeypatch, sca
     assert args[8] is True and args[9] == -5.0 and args[10] is True and args[11] is False
     # The context's local offsets replace the caller's global ones (FLA semantics).
     assert args[12] is cp_context.cu_seqlens and args[13] is cp_context.cu_seqlens_cpu
-    assert args[14] is validated and args[15] is cp_context
+    assert args[14] is validated and args[15] is cp_context and args[16] is False
 
 
 def _forward_stub_tensors(disable_recompute):
@@ -507,6 +507,7 @@ def test_kda_adapter_redirects_only_the_cp_preprocess(monkeypatch, disable_recom
         cp_context.cu_seqlens_cpu,
         None,
         cp_context,
+        False,
     )
 
     assert final_state is None
@@ -582,7 +583,7 @@ def test_kda_adapter_redirects_only_the_cp_preprocess(monkeypatch, disable_recom
     backward = _unwrap(adapter.InternalChunkKDAFunction.backward)
     grads = backward(ctx, do, None)
 
-    assert len(grads) == 16
+    assert len(grads) == 17
     dq, dk, dv, dg, dbeta, dA, dbias = grads[:7]
     assert dq.dtype == inputs["q"].dtype and torch.all(dq == 1)
     assert dk.dtype == inputs["k"].dtype and torch.all(dk == 2)
@@ -727,6 +728,7 @@ def test_cute_mode_requires_the_cutedsl_preprocess_to_run(monkeypatch, progress)
         cp_context.cu_seqlens_cpu,
         None,
         cp_context,
+        False,
     )
     if not progress:
         with pytest.raises(RuntimeError, match="forward preprocess fell back to FLA Triton"):
@@ -738,7 +740,7 @@ def test_cute_mode_requires_the_cutedsl_preprocess_to_run(monkeypatch, progress)
 
     backward = _unwrap(adapter.InternalChunkKDAFunction.backward)
     grads = backward(ctx, torch.empty(_SHAPE, dtype=torch.bfloat16), None)
-    assert len(grads) == 16
+    assert len(grads) == 17
 
     # A backward whose pre-process neither launches nor no-ops is refused as well.
     counters["noop"] = 0
