@@ -211,6 +211,8 @@ def gpu_model_parallel():
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA for a real HybridModel and distributed checkpoint")
     Utils.initialize_model_parallel(1, 1)
+    # CPU-initialized weights must match across the checkpoint's data-parallel replicas.
+    torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
     yield ProcessGroupCollection.use_mpu_process_groups()
     Utils.destroy_model_parallel()
