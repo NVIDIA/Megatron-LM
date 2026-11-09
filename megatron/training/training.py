@@ -58,7 +58,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientFinalizationMode,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -3543,14 +3542,7 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        # MFSDP v2 chunks share one context. Keep reductions asynchronous until the
-        # schedule's final wait, after all backward work including delayed wgrad.
-        gradient_finalization_context = (
-            model[0].module.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER)
-            if isinstance(model[0], FullyShardedDataParallelV2)
-            else nullcontext()
-        )
-        with grad_context, tensor_metric_context, _fb_cm, gradient_finalization_context:
+        with grad_context, tensor_metric_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,

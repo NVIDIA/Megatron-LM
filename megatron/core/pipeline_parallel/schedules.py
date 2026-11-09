@@ -50,6 +50,35 @@ except ImportError:
 Shape = Union[List[int], torch.Size]
 
 
+def _get_grad_sync_context(model, config, enabled):
+    """Select one gradient mode for the current part of the schedule."""
+    from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        GradientFinalizationMode,
+    )
+
+    chunks = model if isinstance(model, list) else [model]
+    if isinstance(chunks[0], FullyShardedDataParallelV2):
+        contexts = dict.fromkeys(chunk.module.context for chunk in chunks)
+        mode = (
+            GradientFinalizationMode.REDUCE_OUTER
+            if enabled
+            else GradientFinalizationMode.SKIP_OUTER
+        )
+        stack = contextlib.ExitStack()
+        for context in contexts:
+            stack.enter_context(context.finalize_gradients(mode=mode))
+        return stack
+    if enabled or config.no_sync_func is None:
+        return contextlib.nullcontext()
+    if isinstance(config.no_sync_func, list):
+        stack = contextlib.ExitStack()
+        for no_sync in config.no_sync_func:
+            stack.enter_context(no_sync())
+        return stack
+    return config.no_sync_func()
+
+
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
@@ -777,9 +806,8 @@ def forward_backward_no_pipelining(
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
-    no_sync_func = config.no_sync_func
-    if no_sync_func is None:
-        no_sync_func = contextlib.nullcontext
+    no_sync_func = partial(_get_grad_sync_context, model, config, False)
+    sync_func = partial(_get_grad_sync_context, model, config, True)
 
     model_type = get_model_type(model)
 
@@ -803,6 +831,7 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
+            sync_func=sync_func,
         )
     else:
         with no_sync_func():
@@ -830,29 +859,29 @@ def forward_backward_no_pipelining(
                     # and triggering PyTorch's "AccumulateGrad node's stream does
                     # not match" warning. See issue #4124.
                     del output_tensor
-        # Run computation for last microbatch out of context handler (want to
-        # synchronize gradients).
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            pg_collection.cp.size(),
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, num_microbatches == 1
-            ),
-            current_microbatch=num_microbatches - 1,
-        )
+        with sync_func():
+            # Enable outer reduction for the final microbatch.
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                pg_collection.cp.size(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, num_microbatches == 1
+                ),
+                current_microbatch=num_microbatches - 1,
+            )
 
-        total_num_tokens += num_tokens
+            total_num_tokens += num_tokens
 
-        if not forward_only:
-            backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-            del output_tensor
+            if not forward_only:
+                backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -1091,18 +1120,9 @@ def forward_backward_pipelining_with_interleaving(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     # Disable async grad reductions
-    no_sync_func = config.no_sync_func
-    if isinstance(no_sync_func, list):
-
-        def multi_no_sync():
-            stack = contextlib.ExitStack()
-            for model_chunk_no_sync_func in config.no_sync_func:
-                stack.enter_context(model_chunk_no_sync_func())
-            return stack
-
-        no_sync_func = multi_no_sync
-    if no_sync_func is None:
-        no_sync_func = contextlib.nullcontext
+    no_sync_func = partial(_get_grad_sync_context, model, config, False)
+    sync_func = partial(_get_grad_sync_context, model, config, True)
+    sync_context = None
     no_sync_context = None
 
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
@@ -1119,18 +1139,24 @@ def forward_backward_pipelining_with_interleaving(
         config.grad_sync_func, config.param_sync_func = None, None
 
     def disable_grad_sync():
-        """Disable asynchronous grad reductions"""
-        nonlocal no_sync_context
+        """Skip outer gradient reduction during accumulation."""
+        nonlocal no_sync_context, sync_context
+        if sync_context is not None:
+            sync_context.__exit__(None, None, None)
+            sync_context = None
         if no_sync_context is None:
             no_sync_context = no_sync_func()
             no_sync_context.__enter__()
 
     def enable_grad_sync():
-        """Enable asynchronous grad reductions"""
-        nonlocal no_sync_context
+        """Reduce outer gradients and leave the completion wait to the schedule."""
+        nonlocal no_sync_context, sync_context
         if no_sync_context is not None:
             no_sync_context.__exit__(None, None, None)
             no_sync_context = None
+        if sync_context is None:
+            sync_context = sync_func()
+            sync_context.__enter__()
 
     disable_grad_sync()
 
@@ -2103,6 +2129,11 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    if sync_context is not None:
+        sync_context.__exit__(None, None, None)
+    if no_sync_context is not None:
+        no_sync_context.__exit__(None, None, None)
+
     return forward_data_store
 
 
@@ -2269,24 +2300,30 @@ def forward_backward_pipelining_without_interleaving(
         paged_stash_reset(enabled=not forward_only, config=config)
 
     # Disable async grad reductions
-    no_sync_func = config.no_sync_func
-    if no_sync_func is None:
-        no_sync_func = contextlib.nullcontext
+    no_sync_func = partial(_get_grad_sync_context, model, config, False)
+    sync_func = partial(_get_grad_sync_context, model, config, True)
+    sync_context = None
     no_sync_context = None
 
     def disable_grad_sync():
-        """Disable asynchronous grad reductions"""
-        nonlocal no_sync_context
+        """Skip outer gradient reduction during accumulation."""
+        nonlocal no_sync_context, sync_context
+        if sync_context is not None:
+            sync_context.__exit__(None, None, None)
+            sync_context = None
         if no_sync_context is None:
             no_sync_context = no_sync_func()
             no_sync_context.__enter__()
 
     def enable_grad_sync():
-        """Enable asynchronous grad reductions"""
-        nonlocal no_sync_context
+        """Reduce outer gradients and leave the completion wait to the schedule."""
+        nonlocal no_sync_context, sync_context
         if no_sync_context is not None:
             no_sync_context.__exit__(None, None, None)
             no_sync_context = None
+        if sync_context is None:
+            sync_context = sync_func()
+            sync_context.__enter__()
 
     disable_grad_sync()
 
@@ -2541,5 +2578,10 @@ def forward_backward_pipelining_without_interleaving(
 
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
+
+    if sync_context is not None:
+        sync_context.__exit__(None, None, None)
+    if no_sync_context is not None:
+        no_sync_context.__exit__(None, None, None)
 
     return forward_data_store

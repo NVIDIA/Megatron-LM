@@ -50,6 +50,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     no_sync_func,
     total_num_tokens,
     check_first_val_step,
+    sync_func=contextlib.nullcontext,
 ):
     """Scheduler for 1f1b with no pipelining.
 
@@ -120,21 +121,22 @@ def combined_1f1b_schedule_for_no_pipelining(
             )
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
-    # Run computation for last microbatch out of context handler (want to synchronize gradients).
-    output_tensor, num_tokens, _ = combined_forward_backward_step(
-        forward_step_func,
-        data_iterator,
-        None,  # f_model
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        model,  # b_model
-        input_tensor,  # b_input_tensor
-        output_tensor,  # b_output_tensor
-        output_tensor_grad,  # b_output_tensor_grad
-        config,
-        fsdp_wrapper=fsdp_wrapper,
-    )
+    # Enable outer reduction for the final microbatch.
+    with sync_func():
+        output_tensor, num_tokens, _ = combined_forward_backward_step(
+            forward_step_func,
+            data_iterator,
+            None,  # f_model
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            model,  # b_model
+            input_tensor,  # b_input_tensor
+            output_tensor,  # b_output_tensor
+            output_tensor_grad,  # b_output_tensor_grad
+            config,
+            fsdp_wrapper=fsdp_wrapper,
+        )
     return forward_data_store, total_num_tokens
 
 
