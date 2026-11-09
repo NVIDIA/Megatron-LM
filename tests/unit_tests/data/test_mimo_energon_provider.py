@@ -245,6 +245,50 @@ def _build(args, lanes=(0,), module=None, **kwargs):
     )
 
 
+def test_encoder_task_factory_is_optional_and_selected_only_for_encoder_roles(
+    tmp_path, monkeypatch
+):
+    calls = []
+    original = conversation_config
+
+    def factory(role, *, split):
+        assert split == "train"
+        calls.append(role)
+        return ConversationEncoder()
+
+    def role_config(args):
+        config = original(args)
+        return replace(
+            config,
+            create_task_encoder=lambda *, split: factory("language", split=split),
+            create_encoder_task_encoder=lambda *, split: factory("encoder", split=split),
+        )
+
+    monkeypatch.setattr(sys.modules[__name__], "conversation_config", role_config)
+    path = _jsonl(tmp_path / "data.jsonl")
+    args = _args(path, num_workers=0, mimo_llm_dp=1)
+    language = _build(args)
+    encoder = _build(args, module="sound")
+    try:
+        assert calls == ["language", "encoder"]
+        assert language._contracts == encoder._contracts
+        assert language._loaders[0].config() == encoder._loaders[0].config()
+    finally:
+        language.close()
+        encoder.close()
+
+
+def test_encoder_task_factory_rejects_noncallable_before_dataset_open(tmp_path, monkeypatch):
+    original = conversation_config
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "conversation_config",
+        lambda args: replace(original(args), create_encoder_task_encoder=False),
+    )
+    with pytest.raises(ValueError, match="create_encoder_task_encoder must be callable"):
+        _build(_args(tmp_path / "missing.jsonl"), module="sound")
+
+
 def _equal(actual, expected):
     if isinstance(expected, torch.Tensor):
         assert torch.equal(actual, expected)

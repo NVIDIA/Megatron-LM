@@ -3,6 +3,7 @@
 """Native prepared MIMO image-stream replay across fixed-P DP placements."""
 
 import json
+import os
 import struct
 from argparse import Namespace
 from collections import Counter
@@ -17,7 +18,7 @@ from PIL import Image
 from examples.mimo.training import prepared_binidx
 from examples.mimo.training.energon_checkpoint import redistribute_energon_states
 from examples.mimo.training.energon_provider import build_energon_iterator
-from megatron.energon import NoCachePool
+from megatron.energon import NoCachePool, stateless
 from megatron.energon.cache.file_store import SystemFileStore
 from megatron.training.config.training_config import TokenizerConfig
 
@@ -171,6 +172,118 @@ def _save_and_reload_rank_states(streams, directory, *, committed_packs):
             assert checkpoint.offset == 0
             assert checkpoint.state.sample_index == committed_packs
     return states, paths
+
+
+def test_encoder_workers_restore_language_state_with_identical_pixels(tmp_path, monkeypatch):
+    tokenizer = TokenizerConfig(vocab_size=128, padded_vocab_size=128)
+    monkeypatch.setattr(
+        prepared_binidx, "get_run_config", lambda: SimpleNamespace(tokenizer=tokenizer)
+    )
+    public_make_config = prepared_binidx.make_config
+
+    def checkpoint_each_pack(args):
+        config = public_make_config(args)
+        return replace(
+            config,
+            loader_kwargs={
+                **config.loader_kwargs,
+                "checkpoint_every_sec": 0,
+                "checkpoint_every_min_n_samples": 1,
+            },
+        )
+
+    monkeypatch.setattr(prepared_binidx, "make_config", checkpoint_each_pack)
+    recipe = _write_binidx_source(tmp_path / "source")
+    args = _args(recipe, lanes=1, workers=4)
+    args.energon_dp_resume = False
+    args.energon_logical_workers = 1
+    image_directory = str((tmp_path / "source" / "images").resolve())
+    reads = tmp_path / "image-reader-pids.txt"
+    original_getitem = SystemFileStore.__getitem__
+
+    def record_image_reader(store, key):
+        if str(store.get_path()) == image_directory and key == "screen.png":
+            with reads.open("a") as stream:
+                stream.write(f"{os.getpid()}\n")
+        return original_getitem(store, key)
+
+    monkeypatch.setattr(SystemFileStore, "__getitem__", record_image_reader)
+    events = tmp_path / "first-cohort-batches.jsonl"
+    original_batch = prepared_binidx.PreparedMimoTaskEncoder.batch
+
+    @stateless(skip_safe=True)
+    def record_batch(self, samples):
+        batch = original_batch(self, samples)
+        if self.prepare_images:
+            with events.open("a") as stream:
+                stream.write(
+                    json.dumps({"pid": os.getpid(), "ids": batch["input_ids"].tolist()}) + "\n"
+                )
+        return batch
+
+    monkeypatch.setattr(prepared_binidx.PreparedMimoTaskEncoder, "batch", record_batch)
+
+    def build(module_name, checkpoint_paths=None):
+        return build_energon_iterator(
+            args,
+            lane_ids=(0,),
+            language_lanes=1,
+            module_name=module_name,
+            checkpoint_paths=checkpoint_paths,
+        )
+
+    def equal_encoder_batch(actual, expected):
+        assert torch.equal(actual["input_ids"], expected["input_ids"])
+        assert actual.keys() == expected.keys()
+        if "modality_inputs" in expected:
+            a = actual["modality_inputs"]["radio_encoder"]["radio_encoder"]
+            b = expected["modality_inputs"]["radio_encoder"]["radio_encoder"]
+            assert torch.equal(a["x"], b["x"])
+            assert torch.equal(a["imgs_sizes"], b["imgs_sizes"])
+            assert torch.equal(
+                a["packed_seq_params"].cu_seqlens_q, b["packed_seq_params"].cu_seqlens_q
+            )
+            assert a["packed_seq_params"].max_seqlen_q == b["packed_seq_params"].max_seqlen_q
+
+    language, encoder = build(None), build("radio_encoder")
+    try:
+        assert language._contracts == encoder._contracts
+        assert language._loaders[0].config() == encoder._loaders[0].config()
+        prefix = [next(language) for _ in range(9)]
+        # Start the language workers first, including their prefetch. This
+        # proves their pixel-free behavior separately from encoder worker IO.
+        assert not reads.exists() and not events.exists()
+        for batch in prefix:
+            assert torch.equal(batch["input_ids"], next(encoder)["input_ids"])
+        state = language.save_state()
+        expected = [next(encoder) for _ in range(8)]
+    finally:
+        language.close()
+        encoder.close()
+    completed = [json.loads(line) for line in events.read_text().splitlines()]
+    keys = [tuple(row["ids"][0]) for row in completed]
+    delivered = [tuple(batch["input_ids"][0].tolist()) for batch in prefix + expected]
+    # This fixture has 40 distinct packs before source repetition. Seventeen
+    # delivered packs plus at most 8 queued/4 in-flight packs cannot wrap it.
+    # Repeated callback IDs would therefore expose sibling-discarded work.
+    assert len(completed) <= 29
+    assert len(keys) == len(set(keys))
+    assert set(delivered) <= set(keys)
+    assert all(row["pid"] != os.getpid() for row in completed)
+    events = tmp_path / "restored-cohort-batches.jsonl"
+    path = tmp_path / "language-state.pt"
+    torch.save({"dataloader_state_dict": state}, path)
+    restored = build("radio_encoder", {0: path})
+    try:
+        assert restored._contracts[0] == state["contract"]
+        for batch in expected:
+            equal_encoder_batch(next(restored), batch)
+    finally:
+        restored.close()
+    # The separate language-only prefix above checks its no-read contract.
+    # This PID check independently establishes real worker-side image IO.
+    reader_pids = [int(line) for line in reads.read_text().splitlines()]
+    assert reader_pids and os.getpid() not in reader_pids
 
 
 def test_real_prepared_image_suffix_resumes_across_fixed_worker_dp(tmp_path, monkeypatch):

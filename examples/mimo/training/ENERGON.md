@@ -44,6 +44,17 @@ callbacks, labels and loss masks. Do not use training rank or model role to chan
 sample selection. Follow Energon's restorable/stateless callback rules for randomness.
 Native errors fail fast rather than dropping a sample on only one replica.
 
+Applications may optionally supply
+`create_encoder_task_encoder(*, split)` in `EnergonDataConfig`. The bridge uses
+it only on encoder replicas; existing applications keep using
+`create_task_encoder` for both roles. This hook may change terminal stateless
+batch materialization, such as preparing CPU image tensors in loader workers.
+It must preserve sample selection, packing, native loader configuration and
+checkpoint state: authoritative language checkpoints must restore both roles.
+Use the same encoder class and callback identities, and validate actual replay,
+not only matching configuration hashes. Mark a terminal callback skip-safe only
+when omitting it cannot change the subsequent stream or required state.
+
 Native dataset/loader options are forwarded unchanged. The bridge reserves
 path, task encoder, worker config and batch size to maintain lane alignment.
 `shuffle_buffer_size` and `max_samples_per_sequence` default to None when omitted;
@@ -90,6 +101,19 @@ randomness or keep its own cursor. An entirely absent modality can omit
 `modality_inputs` while preserving all input token rows.
 As with all native worker outputs, deferred objects must be serializable and
 usable in the receiving process; do not pass worker-owned locks or thread pools.
+
+The prepared RADIO application uses the optional encoder factory to read,
+decode and transform images in native loader workers. Its terminal batch is
+explicitly `stateless(skip_safe=True)`, using Energon's existing API to omit
+heavy work for sibling-owned outputs during physical-worker fanout. Language
+replicas retain lazy image plans and perform no pixel reads. Encoder consumers
+assemble ordered ready tiles and packed attention metadata without repeating
+image IO or transforms; direct lazy batches retain the existing merge path.
+No sampling, image budget, label, geometry or checkpoint format changes are
+introduced by this work placement. With `--num-workers 0`, the same callback
+runs in the caller; positive workers enable parallel preparation. Prefetched
+decoded tensors consume more memory than lazy plans, so worker/prefetch settings
+still need sizing for the selected image policy.
 
 ## Topology and checkpoints
 
@@ -240,10 +264,11 @@ positions do not reset at fragments. Targetless completed packs reject as descri
 in the streaming task documentation. Other attention/BOS/fully-masked policies
 are separate capabilities.
 
-Language ranks consume IDs and targets without reading image pixels. The encoder
-merger realizes the selected lazy plans in lane-major, then batch-row order and
+Language ranks consume IDs and targets without reading image pixels. Encoder
+loader workers realize the selected plans; the merger assembles their ready
+tiles in lane-major, then batch-row order and
 supplies the actual RADIO wrapper's `x`, host `imgs_sizes` and packed-attention
-metadata. It checks realized patch geometry against the visual spans. Native
+metadata. Realization checks patch geometry against the visual spans. Native
 checkpoint cursors remain authoritative; the application identity fingerprints
 all selected token/objective/sequence/image policies hidden inside callbacks.
 The initial application supports dynamic RADIO with dropped class tokens; it

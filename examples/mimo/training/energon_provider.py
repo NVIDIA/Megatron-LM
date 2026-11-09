@@ -36,6 +36,13 @@ class EnergonDataConfig:
     no sampling, RNG, loader advancement or persistent state. The application
     owns modality-specific concatenation, lengths and optional lazy decoding.
 
+    ``create_encoder_task_encoder(*, split)`` optionally changes terminal batch
+    materialization on encoder replicas, for example preparing image tensors in
+    workers while language replicas retain lazy plans. It must preserve sample
+    selection, packing, native configuration and checkpoint state so a language
+    checkpoint can restore either role. When omitted, both roles use
+    ``create_task_encoder`` as before.
+
     ``checkpoint_identity`` identifies application configuration not captured by
     native ``config()``; change it when task behavior changes. Native dataset and
     loader options are forwarded, except bridge-owned placement/batching keys.
@@ -46,6 +53,7 @@ class EnergonDataConfig:
     merge_encoder_batches: Callable[..., dict[str, Any]] | None = None
     dataset_kwargs: Mapping[str, Any] = field(default_factory=dict)
     loader_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    create_encoder_task_encoder: Callable[..., TaskEncoder] | None = None
 
 
 def add_energon_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -331,6 +339,13 @@ def build_energon_iterator(
         raise ValueError("EnergonDataConfig needs a task-encoder factory and checkpoint_identity")
     if module_name is not None and not callable(config.merge_encoder_batches):
         raise ValueError("encoder data requires merge_encoder_batches")
+    if config.create_encoder_task_encoder is not None and not callable(
+        config.create_encoder_task_encoder
+    ):
+        raise ValueError("create_encoder_task_encoder must be callable when supplied")
+    encoder_factory = config.create_task_encoder
+    if module_name is not None and config.create_encoder_task_encoder is not None:
+        encoder_factory = config.create_encoder_task_encoder
     dataset_kwargs = dict(config.dataset_kwargs)
     loader_kwargs = dict(config.loader_kwargs)
     if {"path", "worker_config", "task_encoder", "batch_size"} & dataset_kwargs.keys():
@@ -357,7 +372,7 @@ def build_energon_iterator(
                 args.data_path[0],
                 worker_config=workers,
                 batch_size=args.micro_batch_size,
-                task_encoder=config.create_task_encoder(split="train"),
+                task_encoder=encoder_factory(split="train"),
                 **options,
             )
             loader = get_savable_loader(dataset, **loader_kwargs)

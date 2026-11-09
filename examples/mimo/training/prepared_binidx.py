@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Prepared BinIdx causal batches and lazy RADIO inputs for the MIMO bridge."""
+"""Prepared BinIdx causal batches and worker-prepared RADIO inputs for MIMO."""
 
 import hashlib
 import json
@@ -25,17 +25,32 @@ from megatron.training.global_vars import get_run_config
 
 
 class PreparedMimoTaskEncoder(PreparedStreamingTaskEncoder):
-    """Batch fixed packs without materializing images or shifting targets again.
+    """Batch fixed packs, optionally preparing encoder pixels without shifting targets.
 
     Positions run from zero across each packed row. Attention is ordinary causal
     attention across the row, including document boundaries. Source fragments
     record provenance; they do not request attention isolation or position resets.
+
+    ``prepare_images`` defaults to False for language replicas and direct users.
+    Encoder replicas set it to True and supply the matching encoder ``geometry``.
+    Only the stateless terminal batch differs; source plans and packing state
+    remain lazy and interchangeable between the two roles.
     """
 
-    @stateless
+    def __init__(self, image_strategy, *, prepare_images=False, geometry=None, **options) -> None:
+        super().__init__(image_strategy, **options)
+        if prepare_images and geometry is None:
+            raise ValueError("worker image preparation requires encoder geometry")
+        self.prepare_images = prepare_images
+        self.geometry = geometry
+
+    # Native fanout replays the logical stream for outputs owned by siblings.
+    # This terminal callback has no persistent state and is safe to omit there;
+    # image reads/transforms must not run for those discarded replicas.
+    @stateless(skip_safe=True)
     def batch(self, samples):
         ids = torch.stack([sample.input_ids for sample in samples])
-        return {
+        batch = {
             "input_ids": ids,
             "labels": torch.stack([sample.labels for sample in samples]),
             "loss_mask": torch.stack([sample.loss_mask for sample in samples]),
@@ -47,14 +62,44 @@ class PreparedMimoTaskEncoder(PreparedStreamingTaskEncoder):
                 ]
             },
         }
+        if self.prepare_images:
+            for row in batch["modality_inputs"]["prepared_images"]:
+                row["tiles"] = _realize_image_row(
+                    row, image_strategy=self.image_strategy, geometry=self.geometry
+                )
+        return batch
+
+
+def _realize_image_row(row, *, image_strategy, geometry):
+    """Prepare ordered CPU tiles without changing lazy source/checkpoint objects."""
+    if len(row["plans"]) != len(row["spans"]):
+        raise ValueError("prepared image plans must match visual spans")
+    images = []
+    for plan, (start, stop) in zip(row["plans"], row["spans"]):
+        pixels = plan.media.value
+        if isinstance(pixels, Lazy):
+            pixels = copy(pixels).get()
+        if not isinstance(pixels, Image.Image):
+            raise TypeError("prepared RADIO images must decode to PIL images")
+        if pixels.size != (plan.media.width, plan.media.height):
+            raise ValueError("decoded image size disagrees with original width/height metadata")
+        realized = replace(plan, media=replace(plan.media, value=pixels))
+        tiles = image_strategy.apply_params(realized)
+        actual = sum(
+            geometry.num_spatial_embeddings(int(tile.shape[-2]), int(tile.shape[-1]))
+            for tile in tiles
+        )
+        if len(tiles) != plan.num_tiles or actual != plan.num_embeddings or actual != stop - start:
+            raise ValueError("realized RADIO geometry disagrees with prepared visual spans")
+        images.extend(tiles)
+    return images
 
 
 def merge_prepared_encoder_batches(batches, *, lane_ids, module_name, image_strategy, geometry):
-    """Realize image plans in lane/row order on encoder ranks only.
+    """Assemble worker tiles in lane/row order on encoder ranks only.
 
-    The same geometry plans selected without pixels determine the transforms.
-    Lazy plan/media objects in the original batches remain unmodified, so replay
-    and subsequent inspection cannot depend on whether this merger has run.
+    Direct users may still supply lazy batches; they use the same realization
+    helper. Worker-prepared batches do not repeat image reads or transforms.
     """
     if len(batches) != len(lane_ids) or not batches:
         raise ValueError("one prepared batch is required per ordered sample lane")
@@ -64,31 +109,11 @@ def merge_prepared_encoder_batches(batches, *, lane_ids, module_name, image_stra
         if len(rows) != batch["input_ids"].shape[0]:
             raise ValueError("prepared image rows must match the native batch rows")
         for row in rows:
-            if len(row["plans"]) != len(row["spans"]):
-                raise ValueError("prepared image plans must match visual spans")
-            for plan, (start, stop) in zip(row["plans"], row["spans"]):
-                pixels = plan.media.value
-                if isinstance(pixels, Lazy):
-                    pixels = copy(pixels).get()
-                if not isinstance(pixels, Image.Image):
-                    raise TypeError("prepared RADIO images must decode to PIL images")
-                if pixels.size != (plan.media.width, plan.media.height):
-                    raise ValueError(
-                        "decoded image size disagrees with original width/height metadata"
-                    )
-                realized = replace(plan, media=replace(plan.media, value=pixels))
-                tiles = image_strategy.apply_params(realized)
-                actual = sum(
-                    geometry.num_spatial_embeddings(int(tile.shape[-2]), int(tile.shape[-1]))
-                    for tile in tiles
-                )
-                if (
-                    len(tiles) != plan.num_tiles
-                    or actual != plan.num_embeddings
-                    or actual != stop - start
-                ):
-                    raise ValueError("realized RADIO geometry disagrees with prepared visual spans")
-                images.extend(tiles)
+            images.extend(
+                row["tiles"]
+                if "tiles" in row
+                else _realize_image_row(row, image_strategy=image_strategy, geometry=geometry)
+            )
     result = {"input_ids": torch.cat([batch["input_ids"] for batch in batches])}
     if images:
         x, sizes, cu, maximum = image_strategy.stack(images)
@@ -111,10 +136,12 @@ def _count_spatial_embeddings(width, height, *, geometry, **kwargs):
     return geometry.num_spatial_embeddings(height, width)
 
 
-def _make_encoder(*, split, strategy, options):
+def _make_encoder(*, split, strategy, options, geometry, prepare_images=False):
     if split != "train":
         raise ValueError("prepared MIMO application currently supports only training")
-    return PreparedMimoTaskEncoder(strategy, **options)
+    return PreparedMimoTaskEncoder(
+        strategy, geometry=geometry, prepare_images=prepare_images, **options
+    )
 
 
 def make_config(args):
@@ -183,7 +210,16 @@ def make_config(args):
         "image_std": pixel_statistics["radio"][1],
     }
     return EnergonDataConfig(
-        create_task_encoder=partial(_make_encoder, strategy=strategy, options=options),
+        create_task_encoder=partial(
+            _make_encoder, strategy=strategy, options=options, geometry=geometry
+        ),
+        create_encoder_task_encoder=partial(
+            _make_encoder,
+            strategy=strategy,
+            options=options,
+            geometry=geometry,
+            prepare_images=True,
+        ),
         checkpoint_identity=hashlib.sha256(
             json.dumps(identity, sort_keys=True, allow_nan=False).encode()
         ).hexdigest(),

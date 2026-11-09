@@ -17,6 +17,7 @@ from megatron.energon.cache import MockLazy
 from megatron.energon.cache.file_store import SystemFileStore
 from megatron.energon.decoders.sample_decoder import SampleDecoder
 from megatron.energon.epathlib import EPath
+from megatron.energon.task_encoder.base import get_skip_safe
 
 
 @pytest.fixture(autouse=True)
@@ -112,6 +113,54 @@ def test_encoder_merger_realizes_lane_then_row_order_without_mutating_lazy_plans
     assert int((result["input_ids"] == 99).sum()) == 16
 
 
+def test_worker_tiles_match_lazy_merger_without_repeating_reads_or_transforms(monkeypatch):
+    config = make_config(_args())
+    language = config.create_task_encoder(split="train")
+    worker = config.create_encoder_task_encoder(split="train")
+    assert type(worker) is type(language)
+    assert not language.prepare_images and worker.prepare_images
+    assert get_skip_safe(worker.batch)
+    reads = []
+    packs = [[_pack(language, n, reads), _pack(language, n + 2, reads)] for n in (10, 20)]
+    lazy = [language.batch(rows) for rows in packs]
+    assert reads == []
+    expected = config.merge_encoder_batches(lazy, lane_ids=(0, 1), module_name="radio_encoder")
+    reads.clear()
+    prepared = [worker.batch(rows) for rows in packs]
+    assert reads == [10, 12, 20, 22]
+    for rows in packs:
+        assert all(isinstance(row.image_params[0].media.value, MockLazy) for row in rows)
+    for batch in prepared:
+        assert all(
+            tile.device.type == "cpu"
+            for row in batch["modality_inputs"]["prepared_images"]
+            for tile in row["tiles"]
+        )
+
+    def reject_transform(*args, **kwargs):
+        raise AssertionError("consumer must not repeat worker image transforms")
+
+    monkeypatch.setattr(worker.image_strategy, "apply_params", reject_transform)
+    actual = config.merge_encoder_batches(prepared, lane_ids=(0, 1), module_name="radio_encoder")
+    assert reads == [10, 12, 20, 22]
+    assert torch.equal(actual["input_ids"], expected["input_ids"])
+    a = actual["modality_inputs"]["radio_encoder"]["radio_encoder"]
+    b = expected["modality_inputs"]["radio_encoder"]["radio_encoder"]
+    assert torch.equal(a["x"], b["x"])
+    assert torch.equal(a["imgs_sizes"], b["imgs_sizes"])
+    assert torch.equal(a["packed_seq_params"].cu_seqlens_q, b["packed_seq_params"].cu_seqlens_q)
+    assert a["packed_seq_params"].max_seqlen_q == b["packed_seq_params"].max_seqlen_q
+
+
+def test_worker_realization_checks_geometry_before_delivery():
+    config = make_config(_args())
+    worker = config.create_encoder_task_encoder(split="train")
+    pack = _pack(worker, 10, [])
+    pack.image_spans = [(2, 5)]
+    with pytest.raises(ValueError, match="geometry disagrees"):
+        worker.batch([pack])
+
+
 def test_text_only_encoder_batch_has_no_modality_inputs():
     config = make_config(_args())
     encoder = config.create_task_encoder(split="train")
@@ -168,7 +217,8 @@ def test_original_dimension_metadata_mismatch_rejects():
         config.merge_encoder_batches([batch], lane_ids=(0,), module_name="radio_encoder")
 
 
-def test_native_direct_lazy_handle_stays_unmaterialized_in_original_batch(tmp_path):
+@pytest.mark.parametrize("prepare_images", [False, True])
+def test_native_direct_lazy_handle_stays_unmaterialized_in_original_batch(tmp_path, prepare_images):
     image_path = tmp_path / "actual.png"
     Image.new("RGB", (64, 64), "red").save(image_path)
     store = SystemFileStore(EPath(tmp_path))
@@ -183,7 +233,8 @@ def test_native_direct_lazy_handle_stays_unmaterialized_in_original_batch(tmp_pa
 
     lazy.ds = DecodedStore(EPath(tmp_path))
     config = make_config(_args())
-    encoder = config.create_task_encoder(split="train")
+    factory = config.create_encoder_task_encoder if prepare_images else config.create_task_encoder
+    encoder = factory(split="train")
     pack = _pack(encoder, 10, [])
     pack.image_params[0].media.value = lazy
     batch = encoder.batch([pack])
