@@ -170,3 +170,18 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
+
+
+@pytest.mark.parametrize("source_flag", ["--data-path", "--data-args-path"])
+def test_single_blend_without_split_gets_the_legacy_default_split(tmp_path, source_flag):
+    # --data-args-path reads the same blend as --data-path from a file; both need a split.
+    source = "a"
+    if source_flag == "--data-args-path":
+        source = str(tmp_path / "data_args.txt")
+        (tmp_path / "data_args.txt").write_text("a")
+    args = _validated([source_flag, source])
+    assert args.split == "969, 30, 1"
+    data = gpt_data_config_from_args(args)
+    data.validate()
+    data.finalize()
+    assert data.dataset.split == "969, 30, 1"

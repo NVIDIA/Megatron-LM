@@ -585,10 +585,11 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
-    if args.data_path is not None and args.split is None:
+    # --data-args-path describes the same kind of single blend as --data-path, read from a file.
+    if (args.data_path is not None or args.data_args_path is not None) and args.split is None:
         legacy_default_split_value = '969, 30, 1'
-        warn_rank_0('Please specify --split when using --data-path. Using legacy default value '
-                    f'of "{legacy_default_split_value}"')
+        warn_rank_0('Please specify --split when using --data-path or --data-args-path. Using '
+                    f'legacy default value of "{legacy_default_split_value}"')
         args.split = legacy_default_split_value
 
     use_data_path = (args.data_path is not None) or (args.data_args_path is not None)
