@@ -120,23 +120,19 @@ def compute_buffer_geometry(
     if ssm_state_kind not in (None, "conv", "recurrent"):
         raise ValueError("ssm_state_kind must be 'conv' or 'recurrent'")
 
-    layout_capable = (
-        None
-        not in (
-            global_rank,
-            tp_size,
-            tp_rank,
-            pp_size,
-            pp_rank,
-            num_layers_global,
-            num_kv_heads_global,
-            heads_per_partition,
-            head_dim,
-            tokens_per_block,
-            layer_start,
-            layer_end,
-        )
-        and heads_per_partition * tp_size == num_kv_heads_global
+    layout_capable = None not in (
+        global_rank,
+        tp_size,
+        tp_rank,
+        pp_size,
+        pp_rank,
+        num_layers_global,
+        num_kv_heads_global,
+        heads_per_partition,
+        head_dim,
+        tokens_per_block,
+        layer_start,
+        layer_end,
     )
 
     shape = list(memory_buffer.shape)

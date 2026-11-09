@@ -19,12 +19,11 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import get_wandb_writer
+from megatron.training import get_run_config, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -33,7 +32,14 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
-from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
+from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
+from megatron.training.models import (
+    GPTModelBuilder,
+    GPTModelConfig,
+    HybridModelBuilder,
+    ModelBuilder,
+)
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -47,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 def get_model_builder(
     args: Namespace,
+    tokenizer_config: TokenizerConfig,
     provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
     *,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -88,16 +95,26 @@ def get_model_builder(
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
-    if provider in ("hybrid", "mamba"):
+        model_config = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = GPTModelBuilder
+    elif provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
-    raise ValueError(f"Invalid model provider {provider}")
+        model_config = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
+        builder_cls = HybridModelBuilder
+    else:
+        raise ValueError(f"Invalid model provider {provider}")
+
+    if model_config.vocab_size is None:
+        if tokenizer_config.padded_vocab_size is None:
+            raise ValueError('Model vocabulary must be resolved before model construction')
+        model_config.vocab_size = tokenizer_config.padded_vocab_size
+        model_config.should_pad_vocab = False
+    return builder_cls(model_config)
 
 
 def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
@@ -123,6 +140,7 @@ def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
 
 def _warn_on_unloaded_checkpoint_tensors(
     args: Namespace,
+    checkpoint,
     requested_keys: set,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
@@ -135,16 +153,16 @@ def _warn_on_unloaded_checkpoint_tensors(
     """
     gathered = [None] * torch.distributed.get_world_size(checkpoint_group)
     torch.distributed.all_gather_object(gathered, sorted(requested_keys), group=checkpoint_group)
-    if args.ckpt_step is not None:
+    if checkpoint.ckpt_step is not None:
         release = False
     else:
-        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+        _, release = read_metadata(get_checkpoint_tracker_filename(checkpoint.load))
     if torch.distributed.get_rank(checkpoint_group) != 0:
         return
 
     requested = set().union(*gathered)
     checkpoint_dir = get_checkpoint_name(
-        args.load, get_loaded_iteration(), release, return_base_dir=True
+        checkpoint.load, get_loaded_iteration(), release, return_base_dir=True
     )
     unloaded = sorted(
         key
@@ -175,6 +193,7 @@ def get_model_for_inference(
     """
 
     args = get_args()
+    tokenizer_config = get_run_config().tokenizer
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
         if pg_collection is not None:
@@ -189,13 +208,14 @@ def get_model_for_inference(
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        builder = get_model_builder(args, pg_collection=pg_collection)
+        builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
-    # Load checkpoint.
-    assert args.load is not None
+    # Load checkpoint. Inference must not start from random weights.
+    checkpoint = get_run_config().checkpoint
+    assert checkpoint.load is not None
+    checkpoint.exit_on_missing_checkpoint = True
     requested_keys = set()
-    args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
@@ -210,7 +230,7 @@ def get_model_for_inference(
         model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )
     if requested_keys:
-        _warn_on_unloaded_checkpoint_tensors(args, requested_keys, checkpoint_group)
+        _warn_on_unloaded_checkpoint_tensors(args, checkpoint, requested_keys, checkpoint_group)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -475,7 +495,7 @@ def get_dynamic_inference_engine(
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     return build_dynamic_inference_engine(
