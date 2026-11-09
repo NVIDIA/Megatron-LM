@@ -3046,12 +3046,12 @@ def setup_model_and_optimizer(
         if cfg.model.transformer.gtp_remat_nccl_ub:
             register_gtp_symm_pool(
                 resolve_gtp_remat_group(pg_collection, is_expert=False),
-                modes=cfg.model.transformer.gtp_remat_nccl_ub,
+                collectives=cfg.model.transformer.gtp_remat_nccl_ub,
             )
         if cfg.model.transformer.gtp_expert_remat_nccl_ub:
             register_gtp_symm_pool(
                 resolve_gtp_remat_group(pg_collection, is_expert=True),
-                modes=cfg.model.transformer.gtp_expert_remat_nccl_ub,
+                collectives=cfg.model.transformer.gtp_expert_remat_nccl_ub,
             )
 
     model = _build_model_wrapper(wrap_with_ddp)

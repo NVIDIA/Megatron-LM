@@ -46,8 +46,8 @@ _pools: typing.Dict[str, torch.cuda.MemPool] = {}
 # teardown needs the group object to deregister.
 _registered: typing.Dict[str, typing.Any] = {}
 
-# Group name -> the sides ({"ag", "rs"}) that route their buffers into its pool.
-_registered_modes: typing.Dict[str, frozenset] = {}
+# Group name -> the collectives ({"ag", "rs"}) that route their buffers into its pool.
+_enabled_collectives: typing.Dict[str, frozenset] = {}
 
 # Pools owned elsewhere, registered on a GTP group: (pool, group name) -> group.
 _registered_ext_pools: typing.Dict[typing.Tuple[torch.cuda.MemPool, str], typing.Any] = {}
@@ -92,19 +92,22 @@ def _register_pool(pool: torch.cuda.MemPool, group: dist.ProcessGroup, label: st
 
 
 def register_gtp_symm_pool(
-    group: dist.ProcessGroup | None, modes: typing.Iterable[str] = ("ag", "rs")
+    group: dist.ProcessGroup | None, collectives: typing.Iterable[str] = ("ag", "rs")
 ) -> torch.cuda.MemPool | None:
     """Create (if needed) and register the group's pool. Safe to call more than once;
     does nothing for ``None`` or single-rank groups.
 
-    ``modes``: non-empty subset of ``{"ag", "rs"}``; re-registering adds modes, no collective.
+    ``collectives``: non-empty subset of ``{"ag", "rs"}``; re-registering adds to them
+    without communicating.
 
     Issues a collective, so call it during model construction — before the first
     forward or any CUDA-graph capture. New segments register automatically afterwards.
     """
-    modes = frozenset(modes)
-    if not modes or not modes <= {"ag", "rs"}:
-        raise ValueError(f"[GTP] modes must be a non-empty subset of {{'ag', 'rs'}}, got {modes}")
+    collectives = frozenset(collectives)
+    if not collectives or not collectives <= {"ag", "rs"}:
+        raise ValueError(
+            f"[GTP] collectives must be a non-empty subset of {{'ag', 'rs'}}, got {collectives}"
+        )
     if group is None or group.size() <= 1:
         return None
     if not is_torch_min_version("2.9.0a0"):
@@ -116,11 +119,11 @@ def register_gtp_symm_pool(
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
-        _registered_modes[group.group_name] |= modes
+        _enabled_collectives[group.group_name] |= collectives
         return pool
     _register_pool(pool, group, "GTP cache")
     _registered[group.group_name] = group
-    _registered_modes[group.group_name] = modes
+    _enabled_collectives[group.group_name] = collectives
     return pool
 
 
@@ -139,14 +142,13 @@ def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
-def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None, mode: str | None = None) -> bool:
-    """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
-    ``None`` and single-rank groups, which are never registered.
-
-    ``mode``: ``None`` asks "registered at all"; ``"ag"``/``"rs"`` asks if that side uses it."""
+def uses_gtp_symm_pool(group: dist.ProcessGroup | None, collective: str) -> bool:
+    """True if ``collective`` (``"ag"`` or ``"rs"``) on ``group`` routes its buffers through
+    the group's registered pool. False for ``None`` and single-rank groups, which are never
+    registered."""
     if group is None or group.size() <= 1 or group.group_name not in _registered:
         return False
-    return mode is None or mode in _registered_modes[group.group_name]
+    return collective in _enabled_collectives[group.group_name]
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +222,7 @@ class RegisteredLIFOPool:
                     f"(group={group.group_name}, numel={numel}, dtype={dtype}): {hint}."
                 )
             # Allocate from the group's registered pool when it has one; else plain memory.
-            if is_gtp_symm_pool_registered(group, mode="rs"):
+            if uses_gtp_symm_pool(group, collective="rs"):
                 with gtp_symm_pool_ctx(group):
                     flat = torch.empty(numel, dtype=dtype, device=device)
             else:
@@ -307,5 +309,5 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     symmetric_wgrad_pool.clear()
     _registered_ext_pools.clear()
     _registered.clear()
-    _registered_modes.clear()
+    _enabled_collectives.clear()
     _pools.clear()

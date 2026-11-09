@@ -52,9 +52,9 @@ from megatron.core.tensor_parallel.gtp_eager_wgrad import (
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     gtp_symm_pool_ctx,
-    is_gtp_symm_pool_registered,
     register_external_pool,
     symmetric_wgrad_pool,
+    uses_gtp_symm_pool,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
 
@@ -882,7 +882,7 @@ def _gtp_attach_attrs(
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
     # Opts the all-gather input into symmetric backing: DDP's pool via register_ub_pool, else
     # the GTP pool after wrapping (classify_gtp_remat_chains).
-    gtp_shard.needs_nccl_mem = is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
+    gtp_shard.needs_nccl_mem = uses_gtp_symm_pool(gtp_remat_group, collective="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -948,7 +948,7 @@ def _move_weight_to_symm_pool(param, gtp_remat_group):
     if (
         getattr(param, "is_in_symm_pool", False)
         or not param.is_cuda
-        or not is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
+        or not uses_gtp_symm_pool(gtp_remat_group, collective="ag")
     ):
         return
     quantizer = getattr(param, "_quantizer", None)
@@ -2193,8 +2193,8 @@ class GTPShardedParam(torch.nn.Parameter):
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
         _prepare_wgrad_reduce_scatter_inputs."""
-        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(
-            self.group, mode="rs"
+        return self.main_grad.dtype == wgrad_dtype and uses_gtp_symm_pool(
+            self.group, collective="rs"
         )
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
@@ -2224,7 +2224,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return ring_slot.tensor[: self._unsharded_shape[0]]
 
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
-        if is_gtp_symm_pool_registered(self.group, mode="rs"):
+        if uses_gtp_symm_pool(self.group, collective="rs"):
             # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
@@ -2472,7 +2472,7 @@ class GTPShardedParam(torch.nn.Parameter):
         fp32_accumulation = (
             GTP_CONFIG.reduce_scatter_with_fp32_accumulation
             and self.group.size() > 2
-            and not is_gtp_symm_pool_registered(self.group, mode="rs")
+            and not uses_gtp_symm_pool(self.group, collective="rs")
         )
 
         if async_op:
@@ -2580,7 +2580,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
                 # With symmetric memory registration, send the padded parent tensor of the
                 # logical view that get_wgrad_tensor handed the GEMM.
-                if is_gtp_symm_pool_registered(weight.group, mode="rs"):
+                if uses_gtp_symm_pool(weight.group, collective="rs"):
                     symm_slot = weight._wgrad_symm_slot
                     weight._wgrad_symm_slot = None
                     if symm_slot is None:
@@ -2913,7 +2913,7 @@ class GTPWeightCache:
         # symmetric kernels; otherwise (reduce-scatter outputs, or no registration) keep
         # the CUDA-graph pool routing. Tickets are persistent and first allocated during
         # eager warmup, so a graphed chain replays stable pool addresses either way.
-        if not reduce_scatter and is_gtp_symm_pool_registered(param.group, mode="ag"):
+        if not reduce_scatter and uses_gtp_symm_pool(param.group, collective="ag"):
             alloc_ctx = gtp_symm_pool_ctx(param.group)
         else:
             alloc_ctx = cuda_graph_pool_allocation(_chain_is_graphed(chain_id))
