@@ -154,6 +154,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     skeleton, the gated output norm + projection, and sharded checkpointing.
     """
 
+    # Variants opt in only when their full projection layout is supported. KDA
+    # shares this base but has separate/direct gates with a different contract.
+    _supports_muon_semantic_layout = False
+
     dt_bias_dim: int
     a_log_dim: int
     in_proj_qkvg_dim: int
@@ -286,13 +290,14 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             name=(name + ".in_proj") if name is not None else None,
         )
 
-        # Variant-owned TP-local sections distinguish Q/K/V matrices from controls.
-        self.in_proj.weight.muon_layout = MuonProjectionLayout.gdn(
-            self.in_proj_split_names,
-            self.in_proj_split_sections,
-            self.key_head_dim,
-            self.value_head_dim,
-        )
+        if self._supports_muon_semantic_layout:
+            # Variant-owned TP-local sections distinguish Q/K/V matrices from controls.
+            self.in_proj.weight.muon_layout = MuonProjectionLayout.gdn(
+                self.in_proj_split_names,
+                self.in_proj_split_sections,
+                self.key_head_dim,
+                self.value_head_dim,
+            )
 
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim

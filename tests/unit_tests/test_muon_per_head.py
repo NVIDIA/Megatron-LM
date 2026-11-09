@@ -93,6 +93,54 @@ class TestMuonPerHeadMultiRankTP:
         assert torch.count_nonzero(opt.state[p]['gate_exp_avg'][:start]) == 0
         assert torch.count_nonzero(opt.state[p]['gate_exp_avg'][start:]) > 0
 
+    @pytest.mark.parametrize("two_stage_gates", [False, True])
+    def test_kda_retains_upstream_layout_and_default_optimizer(self, two_stage_gates):
+        """Sharing the GDN base must not force its layout onto direct/two-stage KDA."""
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
+        from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+        if not HAVE_FLA_KDA:
+            pytest.skip("The KDA variant's FLA kernel is unavailable")
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(123)
+        config = KDALayerConfig(
+            hidden_size=128,
+            num_layers=1,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=32,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            linear_conv_kernel_dim=4,
+            normalization="RMSNorm",
+            tensor_model_parallel_size=2,
+            experimental_attention_variant="kda",
+            is_hybrid_model=True,
+            kda_two_stage_gates=two_stage_gates,
+            kda_safe_gate=True,
+            kda_lower_bound=-5.0,
+            transformer_impl="transformer_engine",
+        )
+        spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
+        model = KimiDeltaAttention(
+            config, submodules=spec.submodules, layer_number=1, pg_collection=pg
+        ).cuda()
+        expected_names = ["query", "key", "value"]
+        if not two_stage_gates:
+            expected_names += ["g", "gate"]
+        assert model.in_proj_split_names == expected_names
+        assert all(getattr(p, "muon_layout", None) is None for p in model.parameters())
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(optimizer="muon", lr=0.01),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=pg,
+        )
+        assert optimizer is not None
+
     def test_attention_gate_and_swiglu_owned_semantic_layouts(self):
         """Fused module parameters retain routing through the public optimizer factory."""
         pg = ProcessGroupCollection.use_mpu_process_groups()

@@ -57,6 +57,8 @@ class GatedDeltaNet2(_GDNBase):
     The layer takes input with size [s, b, h] and returns output of the same size.
     """
 
+    _supports_muon_semantic_layout = True
+
     def _setup_variant_attrs(self):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the

@@ -16,7 +16,7 @@ splitting; `--muon-no-split-qkv` retains whole-matrix MLA updates. Layer-wise da
 and is rejected with this flag. Supported TP modes are `blockwise`, `duplicated`,
 `distributed`, and `auto`; head fragments are reconstructed before local NS.
 
-For Muon, the training CLI translates `--use-distributed-optimizer` into
+For Muon, training config finalization translates `--use-distributed-optimizer` into
 `use_layer_wise_distributed_optimizer=True` and clears `use_distributed_optimizer`.
 The optimizer factory assigns whole matrix parameters to DP ranks through
 `LayerWiseDistributedOptimizer`; BF16 master copies retain their two-dimensional
@@ -45,6 +45,9 @@ This enables the following routing for module-owned fused projections:
 SwiGLU's gate is a full feature projection; it is split from up but still uses Muon.
 GDN and attention output gates instead use elementwise AdamW. Scalar model
 parameters and embeddings retain their existing scalar-optimizer routing.
+Only GDN1/2 opt into the GDN semantic layout. KDA shares their base class but
+retains its upstream optimizer routing; neither direct nor two-stage KDA gates
+are covered by this extension.
 
 The shared `QKVLayout` supplies attention/MLA head boundaries and optional
 AdamW assignments; standard all-Muon QKV and MLA up projections keep the base

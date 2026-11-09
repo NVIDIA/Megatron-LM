@@ -39,6 +39,8 @@ def setup_model_parallel():
 
 def test_cli_selects_layerwise_for_per_head_muon(monkeypatch):
     """The documented CLI selects whole-parameter ownership, not flattened shards."""
+    from megatron.training import global_vars
+    from megatron.training.argument_utils import pretrain_cfg_container_from_args
     from megatron.training.arguments import parse_args, validate_args
 
     monkeypatch.setattr(
@@ -74,9 +76,16 @@ def test_cli_selects_layerwise_for_per_head_muon(monkeypatch):
         ],
     )
     args = validate_args(parse_args())
-    assert args.muon_split_qkv_per_head
-    assert args.use_layer_wise_distributed_optimizer
-    assert not args.use_distributed_optimizer
+    # The CLI namespace is declarative; runtime config finalization now owns
+    # derived optimizer flags. Exercise that boundary as training does.
+    run_config = pretrain_cfg_container_from_args(args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    run_config.validate()
+    run_config.finalize()
+    assert run_config.optimizer.muon_split_qkv_per_head
+    assert run_config.optimizer.use_layer_wise_distributed_optimizer
+    assert not run_config.optimizer.use_distributed_optimizer
+    assert not run_config.ddp.use_distributed_optimizer
 
 
 @pytest.mark.parametrize("use_param_layout", [False, True])
