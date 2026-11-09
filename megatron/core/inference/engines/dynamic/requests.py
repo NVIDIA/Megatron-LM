@@ -411,7 +411,9 @@ class RequestIntakeMixin:
                 + self.context.num_speculative_tokens
             )
         request_block_count = math.ceil(max_stored_tokens / self.context.block_size_tokens)
-        if getattr(self.context, "enable_mtp_kv_cache", False):
+        if self.context.num_speculative_tokens > 0 and getattr(
+            self.context, "enable_mtp_kv_cache", False
+        ):
             # The draft KV cache holds more at the request's peak: a reserve block at each
             # admission and a decode lookahead of max(k + 1, 2k) tokens.
             request_block_count = max(
