@@ -50,6 +50,8 @@ def _storage_view(
     storage: torch.Tensor, shape: tuple[int, ...], *, dtype: torch.dtype, name: str
 ) -> torch.Tensor:
     """Return a zero-copy dense view over a TE grouped backing tensor."""
+    if storage is None:
+        raise RuntimeError(f"MOK {name} requires native TE payload storage")
     if not storage.is_cuda or not storage.is_contiguous():
         raise RuntimeError(f"MOK {name} storage must be contiguous CUDA storage")
     if storage.dtype != dtype:
@@ -386,8 +388,6 @@ def _native_split_weight_view(
     # Keep expert scales in independent allocations just like the native TE
     # parameters. MOK's descriptor table selects the expert; only each
     # expert's logical E8M0 matrix is converted to tcgen05 scale layout.
-    # TODO: Evaluate a batched GPU swizzle (e.g. Triton) that consumes all
-    # independent expert scale pointers in one launch.
     row_scale_tensors = [
         _swizzle_mxfp8_scale(scale.unsqueeze(0), rows=rows, columns=columns) for scale in row_scales
     ]

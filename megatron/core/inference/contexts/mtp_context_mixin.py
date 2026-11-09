@@ -229,6 +229,7 @@ class MTPContextMixin:
             return
         block_ids = self.kv_block_allocator.allocate_memory_blocks(total)
         assert block_ids is not None and block_ids.numel() == total
+        self._initialize_mha_value_pages(block_ids)
         rows = torch.repeat_interleave(
             torch.arange(request_slice.start, request_slice.stop), counts
         )

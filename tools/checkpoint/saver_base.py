@@ -468,7 +468,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:

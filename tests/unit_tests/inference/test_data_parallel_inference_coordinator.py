@@ -198,6 +198,7 @@ class _StubCoordinator:
         self.request_id_to_client_request_id = {}
         self.client_request_to_request_id = {}
         self.request_id_to_rank = {}
+        self.request_id_to_sampling_params = {}
         self.identities_of_data_parallel_ranks = [identity]
         self.identity_to_rank_index = {identity: 0}
         self._pending_counts = np.zeros(1, dtype=np.int64)
@@ -358,6 +359,9 @@ class DummyContext:
     def get_active_request_count(self) -> int:
         return self.active_cnt
 
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        pass
+
 
 class DummyController:
     """Dummy inference controller."""
@@ -377,6 +381,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()

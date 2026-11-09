@@ -19,12 +19,85 @@ from megatron.core.utils import (
 
 from .combined_1f1b_tensor_release import Combined1F1BTensorRelease
 
-try:
-    from transformer_engine.pytorch.ep import is_symm_backed
-except ImportError:
-    is_symm_backed = None
-
 logger = logging.getLogger(__name__)
+
+
+class ScheduleNodeInputWrapper(torch.Tensor):
+    """Storage-free autograd leaf for a ScheduleNode input.
+
+    Construction detaches the real input from its producer graph. Unwrapping
+    then connects that detached tensor to this storage-free leaf, creating the
+    consumer-side autograd graph boundary. After unwrapping, the wrapper retains
+    only tensor metadata and the eventual input gradient.
+    """
+
+    @staticmethod
+    def __new__(cls, real_tensor):
+        assert real_tensor._base is None, "ScheduleNodeInputWrapper real tensor must be viewless"
+        wrapper = torch.Tensor._make_wrapper_subclass(
+            cls,
+            tuple(real_tensor.shape),
+            strides=tuple(real_tensor.stride()),
+            storage_offset=real_tensor.storage_offset(),
+            dtype=real_tensor.dtype,
+            layout=real_tensor.layout,
+            device=real_tensor.device,
+            requires_grad=real_tensor.requires_grad,
+        )
+        wrapper._real_tensor = real_tensor.detach().requires_grad_(real_tensor.requires_grad)
+        return wrapper
+
+    def _take_real_tensor(self):
+        """Transfer the real tensor out of this move-only wrapper."""
+        real_tensor = self._real_tensor
+        if real_tensor is None:
+            raise RuntimeError("Real tensor has already been consumed")
+        self._real_tensor = None
+        return real_tensor
+
+    def unwrap_real_tensor(self):
+        """Unwrap the detached real tensor and route its gradient to this wrapper."""
+        return _UnwrapRealTensor.apply(self)
+
+    def untyped_storage(self):
+        """The wrapper itself never owns activation storage."""
+        return torch.UntypedStorage(0, device=self.device)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # The wrapper is only an autograd leaf; all model operations receive the
+        # normal tensor returned by _UnwrapRealTensor.
+        if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+            wrapper = args[0]
+            out = torch.Tensor._make_wrapper_subclass(
+                cls,
+                tuple(wrapper.shape),
+                strides=tuple(wrapper.stride()),
+                storage_offset=wrapper.storage_offset(),
+                dtype=wrapper.dtype,
+                layout=wrapper.layout,
+                device=wrapper.device,
+                requires_grad=(
+                    False if func == torch.ops.aten.detach.default else wrapper.requires_grad
+                ),
+            )
+            out._real_tensor = wrapper._real_tensor
+            return out
+        raise RuntimeError(f"Unsupported operation on schedule-node input wrapper: {func}")
+
+
+class _UnwrapRealTensor(torch.autograd.Function):
+    """Connect a wrapper leaf to its already-detached real tensor."""
+
+    @staticmethod
+    def forward(ctx, wrapper):
+        """Return the real tensor while connecting it to the wrapper leaf."""
+        return wrapper._take_real_tensor()
+
+    @staticmethod
+    def backward(ctx, grad):
+        """Pass the real tensor's gradient back to the wrapper leaf."""
+        return grad
 
 
 class StageDispatchBwdGrad(torch.autograd.Function):
@@ -213,8 +286,7 @@ class ScheduleNode:
                 microbatch within a model chunk shares the same event, which is used
                 to manage dependencies between nodes operating on different streams.
             backward_func (callable, optional): Function for the backward pass.
-            free_input (bool): Flag to indicate if the input should be freed after the
-                forward pass.
+            free_input (bool): Use a storage-free input-gradient wrapper after forward.
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
@@ -233,23 +305,27 @@ class ScheduleNode:
         self.tensor_release = tensor_release
         self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
-        self.outputs = None
+        # Forward outputs, retained only for scheduled tensor release.
+        self.output = None
+        self._output_edges = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
         # retained; the layer-level full recompute path replays it with grad at backward.
         self.forward_no_grad = False
 
-    def default_backward_func(self, outputs, output_grad):
+    def default_backward_func(self, output_edges, output_grads):
         """Default backward function"""
-        Variable._execution_engine.run_backward(
-            tensors=outputs,
-            grad_tensors=output_grad,
-            keep_graph=False,
-            create_graph=False,
-            inputs=tuple(),
-            allow_unreachable=True,
-            accumulate_grad=True,
-        )
-        return output_grad
+        # The engine accepts GradientEdge roots despite the legacy `tensors` argument name.
+        if output_edges:
+            Variable._execution_engine.run_backward(
+                tensors=output_edges,
+                grad_tensors=output_grads,
+                keep_graph=False,
+                create_graph=False,
+                inputs=tuple(),
+                allow_unreachable=True,
+                accumulate_grad=True,
+            )
+        return output_grads
 
     def forward(self, inputs=()):
         """Schedule node forward"""
@@ -263,12 +339,32 @@ class ScheduleNode:
             self.stream = self.stream()
         node_name = self.forward_nvtx_name
         with self.stream_acquire_context(node_name):
-            self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
-            for i, input in enumerate(self.inputs):
-                if input is not None:
-                    input.requires_grad = inputs[i].requires_grad
+            self.inputs = []
+            real_inputs = []
+            for input in inputs:
+                if isinstance(input, torch.Tensor):
+                    real_input = make_viewless(input).detach()
+                    real_input.requires_grad_(input.requires_grad)
+                    if self.tensor_release is None:
+                        # Backward releases retained inputs after enqueueing their kernels.
+                        # Protect every input until this consumer stream finishes, even
+                        # when the detached leaf keeps its storage through forward.
+                        # Scheduled release instead orders these lifetimes through the
+                        # plan event and keeps the producer's output until its backward.
+                        input.record_stream(self.stream)
+                    if self.free_input:
+                        grad_source = ScheduleNodeInputWrapper(real_input)
+                        real_input = grad_source.unwrap_real_tensor()
+                    else:
+                        grad_source = real_input
+                    real_inputs.append(real_input)
+                    self.inputs.append(grad_source)
+                else:
+                    assert input is None, "ScheduleNode inputs must be tensors or None"
+                    real_inputs.append(None)
+                    self.inputs.append(None)
 
-            data = tuple(self.inputs)
+            data = tuple(real_inputs)
             # Full recompute: skip the graph now, rebuild it by re-running at backward.
             grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
             with grad_ctx:
@@ -292,55 +388,54 @@ class ScheduleNode:
                 else:
                     data = data.detach()
 
-            self.output = data
+            outputs = data if isinstance(data, tuple) else (data,)
+            self._output_edges = tuple(
+                (
+                    torch.autograd.graph.get_gradient_edge(output)
+                    if isinstance(output, torch.Tensor) and output.requires_grad
+                    else None
+                )
+                for output in outputs
+            )
+            if self.tensor_release is not None:
+                # Scheduled release ends recomputed output bindings in backward, so only
+                # this mode keeps the forward outputs; otherwise the node retains edges.
+                self.output = data
 
         if self.tensor_release is not None:
             release_inputs = inputs[0] if len(inputs) == 1 else inputs
             self.tensor_release.consume_inputs_and_publish_outputs(
                 release_inputs,
-                self.output,
+                data,
                 stream=self.stream,
                 node=node_name,
                 release_consumed=self.free_input,
             )
-        elif self.free_input:
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    # Skip symmetric-memory (zero-copy EP) buffers
-                    if not (
-                        self.ncclep_zero_copy
-                        and is_symm_backed is not None
-                        and is_symm_backed(input)
-                    ):
-                        input.untyped_storage().resize_(0)
 
-        return self.output
+        return data
 
-    def get_output(self):
-        """Get the forward output"""
-        return self.output
-
-    def backward(self, output_grad):
+    def backward(self, output_grads):
         """Schedule node backward"""
-        if not isinstance(output_grad, tuple):
-            output_grad = (output_grad,)
-        return self._backward(*output_grad)
+        if not isinstance(output_grads, tuple):
+            output_grads = (output_grads,)
+        return self._backward(*output_grads)
 
-    def _backward(self, *output_grad):
+    def _backward(self, *output_grads):
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
         node_name = self.backward_nvtx_name
         with self.stream_acquire_context(node_name):
-            outputs = self.output
-            if not isinstance(outputs, tuple):
-                outputs = (outputs,)
-            assert len(outputs) == len(output_grad), (
-                f"{len(outputs)} of {type(outputs[0])} is not equal to "
-                f"{len(output_grad)} of {type(output_grad[0])}"
+            output_edges = self._output_edges
+            assert len(output_edges) == len(
+                output_grads
+            ), f"{len(output_edges)} outputs is not equal to {len(output_grads)} output gradients"
+            backward_pairs = tuple(
+                (edge, grad) for edge, grad in zip(output_edges, output_grads) if edge is not None
             )
-            consumed_grads = self.backward_func(outputs, output_grad)
+            backward_edges = tuple(edge for edge, _ in backward_pairs)
+            backward_grads = tuple(grad for _, grad in backward_pairs)
+            consumed_grads = self.backward_func(backward_edges, backward_grads)
 
         grads = self.get_grad()
 
@@ -348,8 +443,8 @@ class ScheduleNode:
             # These gradients come from detach bridges outside the scheduled
             # producer/consumer chain, so retain the allocator fallback.
             if isinstance(consumed_grads, tuple):
-                if len(consumed_grads) > len(output_grad):
-                    for grad in consumed_grads[len(output_grad) :]:
+                if len(consumed_grads) > len(backward_grads):
+                    for grad in consumed_grads[len(backward_grads) :]:
                         if grad is not None:
                             grad.record_stream(self.stream)
             elif consumed_grads is not None:
@@ -358,12 +453,12 @@ class ScheduleNode:
             # A recompute segment's final forward output is consumed by autograd
             # rather than another forward node, so its owner metadata ends here.
             self.tensor_release.consume_forward_outputs(self.output)
-            release_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
+            release_output_grads = output_grads[0] if len(output_grads) == 1 else output_grads
             self.tensor_release.consume_output_grads_and_publish_input_grads(
                 release_output_grads, grads, stream=self.stream, node=node_name
             )
         elif consumed_grads:
-            # Gradients may have been produced on another stream.
+            # Gradients may come from another stream.
             for g in consumed_grads:
                 if g is not None:
                     g.record_stream(self.stream)
@@ -374,7 +469,7 @@ class ScheduleNode:
 
     def get_grad(self):
         """Get the grad of inputs"""
-        grad = tuple([e.grad if e is not None else None for e in self.inputs])
+        grad = tuple(source.grad if source is not None else None for source in self.inputs)
         # multiple in, multiple out
         if len(grad) == 1:
             grad = grad[0]
@@ -412,6 +507,7 @@ class ScheduleNode:
         """Clear the state of the node"""
         self.inputs = None
         self.output = None
+        self._output_edges = None
         del self.forward_func
         del self.backward_func
 

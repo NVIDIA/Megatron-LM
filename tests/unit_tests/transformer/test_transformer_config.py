@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -126,6 +128,28 @@ def test_inactive_glu_interleave_accepts_fp32_model_parameters(overrides):
     config = _make_glu_interleave_config(params_dtype=torch.float32, **overrides)
 
     assert config.params_dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "size_gib, offload, error",
+    [(size, True, None) for size in (0, 0.5, 8, 3, 152)]
+    + [
+        (size, True, "Pinned offload buffer")
+        for size in (-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24)
+    ]
+    + [(0, False, None), (1.5, False, "requires fine_grained_activation_offloading")],
+)
+def test_pinned_offload_buffer_config(size_gib, offload, error):
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            fine_grained_activation_offloading=offload,
+            offload_modules=["moe_act"],
+            fine_grained_offloading_buffer_size_gib=size_gib,
+        )
+        assert config.fine_grained_offloading_buffer_size_gib == size_gib
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
@@ -273,6 +297,28 @@ def test_deprecated_dsv4_selector_normalizes_layout_before_validation():
         assert getattr(legacy, name) == getattr(canonical, name)
 
 
+def test_ncclep_grouped_tensor_accepts_non_fused_bf16_experts():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=False,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="ncclep",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert config.moe_use_grouped_tensor
+    assert not config.use_transformer_engine_op_fuser
+    assert config.moe_flex_dispatcher_backend == "ncclep"
+
+
 def test_ncclep_static_shape_flag_cannot_silently_ignore_a_capacity():
     with pytest.raises(ValueError, match="moe_ncclep_static_shape=False conflicts"):
         TransformerConfig(
@@ -332,6 +378,19 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
+    with pytest.raises(ValueError, match="use_fused_mhc does not support"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            use_fused_mhc=True,
+            **{flag: True},
+        )
+
+
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
 def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
     config = TransformerConfig(
@@ -362,6 +421,21 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
             enable_mhc_connections=True,
             mhc_fused_backend="native",
         )
+
+
+def test_mhc_full_recompute_with_distributed_activations_is_configurable():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=True,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.distribute_saved_activations
 
 
 def test_gdp_num_householder_defaults_to_three():

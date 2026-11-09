@@ -7,11 +7,17 @@ requirements remain explicit; skipped Blackwell kernels are not qualified on Hop
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    deterministic_algorithms,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -236,6 +242,206 @@ def test_kda_recurrence_replays():
     assert_replays_bit_exact(
         run, (q, k, v, raw_g, raw_beta, a_log, dt_bias), contention=True, what="KDA recurrence"
     )
+
+
+def test_kda_low_rank_projection_replays():
+    """Replay KimiDeltaAttention through its bias-free low-rank F-decay / output-gate path.
+
+    ``kda_f_lora_rank`` / ``kda_gate_lora_rank`` take the layer off the legacy fused
+    Q/K/V/F/G projection: the input projection emits Q/K/V only, the raw decay comes from
+    ``f_a_proj -> f_b_proj``, the output gate from ``g_a_proj -> g_b_proj`` and beta from a
+    TP-replicated projection scattered back to the rank, all feeding the FLA chunk_kda
+    recurrence. Under ``--deterministic-mode`` the convolution and the L2 norm take their
+    torch paths; forward and backward must replay bit-exactly, parameter gradients included.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if kda.chunk_kda is None:
+        pytest.skip("FLA KDA kernel is unavailable")
+    if not HAVE_TE:
+        pytest.skip("needs Transformer Engine")
+
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    f_rank, gate_rank = 16, 32
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            kda_f_lora_rank=f_rank,
+            kda_gate_lora_rank=gate_rank,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            experimental_attention_variant="kda",
+            is_hybrid_model=True,
+            transformer_impl="transformer_engine",
+            deterministic_mode=True,
+        )
+        spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
+        module = kda.KimiDeltaAttention(
+            config,
+            submodules=spec.submodules,
+            layer_number=1,
+            conv_init=1.0,
+            pg_collection=ProcessGroupCollection(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                cp=parallel_state.get_context_parallel_group(),
+            ),
+        ).cuda()
+        assert not module.use_legacy_fused_projections
+        assert module.in_proj_split_names == ["query", "key", "value"]
+        assert module.in_proj_dim == 2 * module.qk_dim + module.v_dim
+        assert module.in_proj.weight.shape == (module.in_proj_dim, config.hidden_size)
+        assert module.f_a_proj.weight.shape == (f_rank, config.hidden_size)
+        assert module.f_b_proj.weight.shape == (module.qk_dim, f_rank)
+        assert module.g_a_proj.weight.shape == (gate_rank, config.hidden_size)
+        assert module.g_b_proj.weight.shape == (module.v_dim, gate_rank)
+        assert module.beta_proj.weight.shape == (module.num_key_heads, config.hidden_size)
+        assert module.gated_delta_rule is kda.chunk_kda
+        # The streamed pre-GDR fusion (gdn_pre_gated_delta_rule_fusion) is opt-in and rejected
+        # under deterministic_mode; the deterministic replay stays on pre_gated_delta_rule.
+        assert not module.gdn_pre_gated_delta_rule_fusion
+
+        hidden_states = torch.randn(
+            128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with (
+            deterministic_algorithms(True),
+            patch.object(
+                kda.KimiDeltaAttention, "_fused_streamed_pre_kda", autospec=True
+            ) as fused_pre_kda,
+        ):
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (hidden_states, None),
+                replays=3,
+                contention=True,
+                what="KDA low-rank F/G projections",
+            )
+        assert fused_pre_kda.call_count == 0
+        assert outputs["out[0]"].shape == hidden_states.shape
+        assert "in[0]" in grads
+        for name in ("in_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "beta_proj"):
+            assert f"chunk0.{name}.weight" in grads, name
+        for name in ("chunk0.conv1d.weight", "chunk0.A_log", "chunk0.dt_bias"):
+            assert name in grads, name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_kda_recurrence_with_fused_gated_output_norm_replays():
+    """Replay the KDA recurrence feeding its fused sigmoid output norm (PR #7609).
+
+    With ``gdn_gated_output_norm_fusion`` set, ``KimiDeltaAttention._apply_gated_norm`` routes
+    the ``chunk_kda`` output through ``fused_gated_norm(gate_activation="sigmoid")`` instead of
+    the jit-fused norm and gate. The chain gates -> chunk_kda -> fused RMSNorm/sigmoid is
+    replayed forward and backward with a projection-backed strided gate, comparing every
+    input gradient and the RMSNorm weight gradient.
+    """
+    from megatron.core.fusions import fused_gated_norm
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if kda.chunk_kda is None:
+        pytest.skip("FLA KDA kernel is unavailable")
+    te = pytest.importorskip("transformer_engine.pytorch")
+    seeded()
+    batch, length, heads, dim = 1, 128, 4, 64
+    shape = (batch, length, heads, dim)
+    q, k, v = (
+        torch.randn(shape, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for _ in range(3)
+    )
+    raw_g = torch.randn(batch, length, heads * dim, device="cuda", requires_grad=True)
+    raw_beta = torch.randn(batch, length, heads, device="cuda", requires_grad=True)
+    a_log = torch.zeros(heads, device="cuda", requires_grad=True)
+    dt_bias = torch.zeros(heads * dim, device="cuda", requires_grad=True)
+    # The output gate is a strided slice of the in_proj output, as in pre_gated_delta_rule.
+    projection = torch.randn(
+        length, batch, heads * dim * 2 + 32, device="cuda", dtype=torch.bfloat16
+    )
+    gate = projection[..., 17 : 17 + heads * dim].view(length, batch, heads, dim)
+    gate = gate.permute(1, 0, 2, 3).detach().requires_grad_()
+    gate_layer = SimpleNamespace(key_head_dim=dim)
+
+    class KDAOutput(torch.nn.Module):
+        """The KDA attributes the fused dispatcher and ``validate_gated_norm`` read."""
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                deterministic_mode=False, gdn_gated_output_norm_fusion=True
+            )
+            self.activation = "silu"
+            self.out_norm = te.RMSNorm(dim, eps=1e-6, params_dtype=torch.bfloat16, device="cuda")
+            self.value_head_dim = dim
+
+        def forward(self, q, k, v, g, beta, a_log, dt_bias, gate):
+            decay, extra = kda.KimiDeltaAttention._compute_gates(
+                gate_layer, a_log, dt_bias, batch, length, g, beta
+            )
+            core_attn_out, _ = kda.chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=decay,
+                beta=extra["beta"],
+                A_log=a_log,
+                dt_bias=dt_bias,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                initial_state=None,
+                output_final_state=False,
+                safe_gate=False,
+            )
+            out = kda.KimiDeltaAttention._apply_gated_norm(self, core_attn_out, gate)
+            assert out.shape == (batch * length * heads, dim)
+            return out
+
+    inputs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": raw_g,
+        "beta": raw_beta,
+        "a_log": a_log,
+        "dt_bias": dt_bias,
+        "gate": gate,
+    }
+    with patch.object(
+        fused_gated_norm, "fused_gated_norm", wraps=fused_gated_norm.fused_gated_norm
+    ) as fused:
+        outputs, grads = assert_module_replays_bit_exact(
+            KDAOutput(),
+            inputs,
+            replays=3,
+            contention=True,
+            what="KDA recurrence with fused sigmoid output norm",
+        )
+        assert fused.call_count == 3
+        assert all(call.kwargs.get("gate_activation") == "sigmoid" for call in fused.call_args_list)
+    assert len(outputs) == 1
+    # A_log / dt_bias gradients are compared too whenever chunk_kda produces them.
+    compared = {"in.q", "in.k", "in.v", "in.g", "in.beta", "in.gate", "chunk0.out_norm.weight"}
+    assert compared <= set(grads)
 
 
 def test_mok_route_adapter_replays():

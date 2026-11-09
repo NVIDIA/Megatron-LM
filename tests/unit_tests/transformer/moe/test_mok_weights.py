@@ -6,9 +6,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.megakernel import (
+    megakernel_fuses_shared_expert,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 
 def _mok_transformer_config(**overrides):
@@ -24,8 +30,10 @@ def _mok_transformer_config(**overrides):
         "moe_ffn_hidden_size": 256,
         "moe_shared_expert_intermediate_size": 256,
         "expert_model_parallel_size": 4,
+        "expert_tensor_parallel_size": 1,
         "gated_linear_unit": True,
         "activation_func": F.silu,
+        "add_bias_linear": False,
         "gradient_accumulation_fusion": True,
         "moe_megakernel_backend": "mok",
     }
@@ -55,7 +63,20 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"moe_token_dispatcher_type": "alltoall"},
+        {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
+        {
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 1024,
+            "calculate_per_token_loss": True,
+            "variable_seq_lengths": True,
+        },
         {"moe_shared_expert_gate": True},
+        {"moe_router_dtype": None},
+        {"moe_router_dtype": "fp32"},
+        {"moe_shared_expert_gate": True, "activation_func": situlu},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
@@ -71,18 +92,112 @@ def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
 
 
+def test_native_moe_still_accepts_fp64_router():
+    config = _mok_transformer_config(moe_megakernel_backend=None, moe_router_dtype="fp64")
+    assert config.moe_router_dtype == "fp64"
+
+
+@pytest.mark.skipif(not is_te_min_version("2.14.0"), reason="single grouped weights need TE>=2.14")
+def test_native_single_grouped_weights_do_not_require_op_fuser():
+    config = _mok_transformer_config(
+        moe_megakernel_backend=None,
+        moe_single_grouped_weight=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=False,
+    )
+    assert config.moe_single_grouped_weight
+    assert not config.use_transformer_engine_op_fuser
+
+
+def test_shared_execution_is_independent_of_activation_and_preserves_native_precision():
+    for activation in (F.silu, situlu):
+        for options in (
+            None,
+            {},
+            {"fwd_num_comm_sms": 32},
+            {"shared_expert_mode": "auto"},
+            {"shared_expert_mode": "fused"},
+        ):
+            config = _mok_transformer_config(
+                activation_func=activation, moe_megakernel_backend_config=options
+            )
+            assert megakernel_fuses_shared_expert(config)
+        for overrides in (
+            {"moe_megakernel_backend_config": {"shared_expert_mode": "native"}},
+            {"moe_latent_size": 64},
+            {"moe_shared_expert_intermediate_size": 512},
+            {"moe_shared_expert_intermediate_size": None},
+            {"tensor_model_parallel_size": 4, "sequence_parallel": True},
+        ):
+            config = _mok_transformer_config(
+                activation_func=activation,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+                fp8_param=True,
+                **overrides,
+            )
+            assert not megakernel_fuses_shared_expert(config)
+            assert prepare_megakernel_shared_expert_config(config) is config
+            assert config.fp8_param and config.fp8 == "hybrid"
+    for overrides in (
+        {"moe_latent_size": 64},
+        {"moe_shared_expert_intermediate_size": 512},
+        {"moe_shared_expert_intermediate_size": None},
+        {"tensor_model_parallel_size": 4, "sequence_parallel": True},
+    ):
+        with pytest.raises(ValueError, match="Fused MOK shared execution requires"):
+            _mok_transformer_config(
+                moe_megakernel_backend_config={"shared_expert_mode": "fused"}, **overrides
+            )
+    for mode in ("invalid", None):
+        with pytest.raises(ValueError, match="must be auto, fused, or native"):
+            _mok_transformer_config(moe_megakernel_backend_config={"shared_expert_mode": mode})
+    assert not megakernel_fuses_shared_expert(_mok_transformer_config(moe_megakernel_backend=None))
+    for options in ({"shared_expert_mode": "auto"}, {"fwd_num_comm_sms": 32}):
+        with pytest.raises(ValueError, match="requires moe_megakernel_backend to be set"):
+            _mok_transformer_config(
+                moe_megakernel_backend=None, moe_megakernel_backend_config=options
+            )
+    with pytest.raises(ValueError, match="requires sequence_parallel=True"):
+        _mok_transformer_config(tensor_model_parallel_size=4)
+    with pytest.raises(ValueError, match="requires expert TP=1"):
+        _mok_transformer_config(expert_tensor_parallel_size=2)
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
+        (
+            {"moe_shared_expert_intermediate_size": None, "add_bias_linear": True},
+            "MOK requires add_bias_linear=False",
+        ),
         ({"bf16": False, "fp16": True}, "FP32, FP16, and FP4 are not supported"),
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
+        ({"moe_router_dtype": "fp64"}, "MOK does not support moe_router_dtype='fp64'"),
+        ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
+        ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (
             {"overlap_moe_expert_parallel_comm": True},
             "does not support overlap_moe_expert_parallel_comm",
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
+        ({"moe_shortcut_connection": True}, "does not support moe_shortcut_connection"),
+        ({"add_bias_linear": True}, "add_bias_linear"),
+        ({"moe_apply_probs_on_input": True}, "moe_apply_probs_on_input"),
+        ({"glu_linear_offset": 1.0}, "glu_linear_offset"),
+        ({"activation_func_tanh_clamp_scale": 1.0}, "activation_func_tanh_clamp_scale"),
+        ({"gtp_weight_remat_size": 2}, "GTP"),
+        ({"expert_gtp_weight_remat_size": 2}, "GTP"),
+        (
+            {
+                "transformer_impl": "inference_optimized",
+                "moe_router_dtype": "fp32",
+                "inference_grouped_gemm_backend": "torch",
+            },
+            "does not support inference_optimized",
+        ),
     ],
 )
 def test_mok_rejects_key_incompatible_configurations(overrides, error):

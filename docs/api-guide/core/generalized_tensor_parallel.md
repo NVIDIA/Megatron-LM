@@ -196,7 +196,7 @@ GTP_remat runs under both the standard **Adam** `DistributedOptimizer` and **Muo
   - **Split *after* the all-gather**, never before — a row shard cuts q/k/v mid-boundary. The split is therefore reachable on the **`duplicated`** Newton–Schulz mode only (`--muon-tp-mode`, default `duplicated`).
   - **`auto` is pinned to `duplicated`** whenever a split is requested, since its shape-based cost model has no notion of `qkv_split_shapes` and could otherwise drop the split on some shapes and keep it on others.
   - **`blockwise` and `distributed`, chosen explicitly, fall back** to whole-matrix Newton–Schulz and **warn once**, since neither keeps a q/k/v boundary. `duplicated`, the default, is the path that gets the split.
-- **Native-FP8 optimizer-state matching (Muon path).** The save-side dequantize (§3.3) hands DCP a *fresh* BF16 tensor, which breaks the id-based optimizer-param → model-`ShardedTensor` match for every native-FP8 GTP_remat weight. The dequantized copy carries a `_gtp_dequant_src` backlink to the live FP8 param, and `_backfill_gtp_sharded_param_map` reuses the model's **own** entry (backlink first, tagged-name second) — preserving its full offsets (expert axes included) and `replica_id`. Only truly-unmatched params (the SSM `in_proj` weights, gathered+split factories) take the per-shard rebuild, which refuses expert-parallel params rather than emit EP-colliding shards.
+- **Native-FP8 optimizer-state matching (Muon path).** The save-side dequantize (§3.3) hands DCP a *fresh* BF16 tensor, which breaks the id-based optimizer-param → model-`ShardedTensor` match for every native-FP8 GTP_remat weight. The dequantized copy carries a `_gtp_dequant_src` backlink to the live FP8 param, and `_backfill_gtp_sharded_param_map` reuses the model's **own** entry (backlink first, tagged-name second) — preserving its full offsets (expert axes included) and `replica_id`. Only truly-unmatched params (the SSM `in_proj` weights, saved through split factories) take the per-shard rebuild, which refuses expert-parallel params rather than emit EP-colliding shards.
 
 Neither path adds a GTP_remat-specific checkpoint format or call site.
 
@@ -691,9 +691,39 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
 
-> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: each **all-gathers its GTP_remat shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`. This is required, not just tidier: the split-chunk boundaries do not line up with the GTP_remat slice boundaries, so a raw shard cannot be split at all. The checkpoint therefore matches a non-GTP_remat run byte-for-byte.
+> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: they are saved as split chunks whose boundaries do not line up with the GTP_remat slice boundaries, under the pad-stripped TP-local global shapes a non-GTP_remat run uses, so they need no `allow_shape_mismatch` and the checkpoint matches a non-GTP_remat run byte-for-byte.
 >
-> On **load**, the split factory's `merge_fn` is wrapped to invert this: it cats the chunks back to the unpadded TP-local width, re-pads with zeros up to `gtp_remat_local_size · gtp_remat_size`, and slices by the GTP_remat rank — mirroring `_gtp_slice_one_param` so the tensor lands in the live shard's layout. `gtp_remat_size == 1` skips both the gather and the pad/slice.
+> - **Gated-delta-product** saves, on each GTP_remat rank, the piece of every chunk that the rank's own rows cover, as views of its shard at their offsets within the chunk (uneven shards, which DCP stores as-is); pad rows are not saved, and the load-side merge rebuilds the padded shard. No rank materializes the full tensor.
+> - **Mamba** still **all-gathers its GTP_remat shards** back to the TP-local size and strips the pad before splitting, so every GTP_remat rank briefly holds the full `in_proj` weight of every layer while a save is staged.
+>
+> On **load**, GDP rebuilds only the local shard and zero-fills its padding. Mamba concatenates the
+> TP-local chunks, re-pads, then slices by GTP_remat rank. With `gtp_remat_size == 1`, neither path
+> needs GTP padding or slicing.
+>
+> **GDP padding-only ranks:** a zero-element `LocalNonpersistentObject` preserves the factory key
+> and device through load preprocessing. The merge function restores a zero-filled shard. **Padding
+> and the placeholder are never saved.**
+>
+> ```text
+> Example (TP=1): unsharded in_proj.weight = [61,760 rows, 10,240 columns]
+> 64 GTP ranks (0-63), sharded along rows; alignment = 32 rows per shard
+> Rows per shard = ceil(61,760 / (64 * 32)) * 32 = 992
+> Padded shape: [63,488, 10,240] --> each rank: [992, 10,240]
+>
+> SAVE (tail ranks shown; ranks 0-61 contain only real rows)
+>   Rank 62: [256 real | 736 pad] --> save only 256 real rows
+>   Rank 63: [      992 pad    ] --> local placeholder --> discarded; no rows saved
+>
+> LOAD
+>   Rank 62: checkpoint chunks --> copy 256 real rows + zero-fill 736 pad rows
+>   Rank 63: load-side factory --> [local placeholder] --> preserve key/device
+>                                                              |
+>                                                              v
+>                                                  merge: allocate local shard
+>                                                       [992 zero rows]
+>
+>   The load-side factory creates the placeholder locally; it is not read from disk.
+> ```
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
@@ -980,7 +1010,7 @@ done
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
-| `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` gather+split: the gated-delta-product mixer's factory build/merge at MXFP8 alignment, and a full DCP save→load roundtrip of that mixer. |
+| `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` split: the gated-delta-product mixer's per-shard factory build/merge at MXFP8 alignment (no gather, chunks tiled exactly once), a full DCP save→load roundtrip of that mixer, and loading its `in_proj` across GTP_remat and non-GTP_remat runs in both directions. |
 | `test_gtp_muon.py` | Newton–Schulz per-shard parity for all three GTP_remat modes (§1.6): blockwise/duplicated/distributed at TP1, plus row- and column-parallel cases at `tp_size != gtp_remat_size` in both directions. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_muon_qkv.py` | Layout-invariant split-QKV (§1.6): the decision uses the across-shards row count (with the production shape that a shard-local test rejected), the split runs after the all-gather so the GTP_remat shard equals TP1's result restricted to this rank's rows, and `blockwise`/`distributed` fall back to whole-matrix Newton–Schulz bitwise, warning once. |
@@ -996,4 +1026,7 @@ The parameter-readiness contract itself (§3.2) is likewise covered outside this
 
 The `num_zeros` padding correction (§3.7) has two more layers of coverage outside this suite, both CPU-only: `tests/unit_tests/tensor_parallel/test_layers.py::TestGtpLocalPadZeroCount` unit-tests `gtp_local_pad_zero_count`'s row-offset math directly (no padding, tail-only, DP-fragment overlap variants, and the small-`dim0` spillover case), and `tests/unit_tests/optimizer/test_clip_grads.py::TestCountZerosFp32GtpPadding` checks `count_zeros_fp32`'s subtraction with and without an explicit `.gtp_pad_zeros` stamp.
 
-All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
+The suite targets ≥ 4 GPUs and TransformerEngine >= 2.19.
+
+A green suite run (skips for unmet hardware/config are acceptable) is the minimum bar for any
+GTP_remat change.

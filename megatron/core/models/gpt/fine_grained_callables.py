@@ -402,9 +402,12 @@ class TransformerLayerNode(ScheduleNode):
 
         Under full recompute only each segment's input survives the forward->backward
         gap; the same node is later re-run with grad enabled to rebuild its state.
+        ``_output_edges`` are the backward roots recorded by ``ScheduleNode.forward``;
+        ``output`` is retained only for scheduled tensor release.
         """
         self.inputs = None
         self.output = None
+        self._output_edges = None
         self.detached = tuple()
         self.before_detached = tuple()
 
@@ -720,7 +723,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     pre_mlp_layernorm_output, padding_mask, packed_seq_params=packed_seq_params
                 )
                 local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map, padding_mask
+                    pre_mlp_layernorm_output,
+                    probs,
+                    routing_map,
+                    padding_mask,
+                    packed_seq_params=packed_seq_params,
                 )
                 if is_mhc_layer:
                     return (

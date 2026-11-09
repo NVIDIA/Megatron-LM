@@ -17,8 +17,8 @@ from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -728,9 +728,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         return torch.ones_like(hidden_states), torch.ones_like(hidden_states, dtype=torch.bool)
 
     mlp.route = route
-    mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
-        hidden_states,
-        probs,
+    mlp.preprocess = (
+        lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
+            hidden_states,
+            probs,
+        )
     )
     mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
     mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)

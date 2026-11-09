@@ -40,7 +40,10 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention, QKVLayout
-from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
+from megatron.core.transformer.attention_output_gate import (
+    apply_attention_output_gate,
+    apply_elementwise_attention_output_gate_before_cast,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1118,14 +1121,17 @@ class AbsorbedMLASelfAttention(Attention):
     def _apply_mla_output_gate(
         self, core_attn_out: torch.Tensor, gate: torch.Tensor
     ) -> torch.Tensor:
-        """Dispatch to the compiled headwise or eager elementwise gate."""
+        """Dispatch to the compiled headwise or the eager / fused elementwise gate."""
         granularity = self.config.gated_attention_proj_granularity
         if granularity == 'headwise':
             return self._apply_mla_headwise_output_gate(core_attn_out, gate)
         # Match ordinary MLA's FP32 sigmoid followed by native-dtype multiplication.
         # Do not jit-fuse this elementwise path: preserve its eager cast/multiply
-        # rounding and VJP.
-        return apply_attention_output_gate(core_attn_out, gate, granularity, cast_mode='before')
+        # rounding and VJP; attention_output_gate_fusion runs the same math as one
+        # Triton kernel per direction.
+        return apply_elementwise_attention_output_gate_before_cast(
+            core_attn_out, gate, fusion=self.config.attention_output_gate_fusion
+        )
 
     @staticmethod
     @jit_fuser

@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     prime_cuda_rng_states_for_graph_capture,
 )
+from megatron.core.transformer.cuda_graphs import capture_constants
 from megatron.core.transformer.experimental_attention_variant import dsa_logging
 
 logger = logging.getLogger(__name__)
@@ -351,6 +352,7 @@ class FullCudaGraphWrapper:
             symmetric_wgrad_pool.reset_completed_reuse_events()
             rerun_state_machine = get_rerun_state_machine()
             with (
+                capture_constants(FullCudaGraphWrapper.cuda_graph[training_str]),
                 torch.cuda.graph(
                     FullCudaGraphWrapper.cuda_graph[training_str],
                     stream=capture_stream,
@@ -387,6 +389,8 @@ class FullCudaGraphWrapper:
     def reset_cuda_graph(self, stage=None):
         """Reset CUDA graph."""
         captured = any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values())
+        if captured:
+            torch.cuda.synchronize()
         if stage is None or stage == 'training':
             if FullCudaGraphWrapper.cuda_graph['training'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['training']

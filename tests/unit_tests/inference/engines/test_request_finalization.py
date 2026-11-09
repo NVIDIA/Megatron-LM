@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -73,7 +73,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         request.add_event_add_engine()
         if trim_stop and request_id == 10:
             request.stop_word_ids = [[1]]
-        engine.requests[request_id] = SimpleNamespace(
+        engine.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(request),
             future=asyncio.get_running_loop().create_future(),
         )

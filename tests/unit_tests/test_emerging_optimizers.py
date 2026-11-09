@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import json
@@ -13,6 +13,7 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -44,6 +45,7 @@ from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
@@ -1485,6 +1487,68 @@ class TestMuonOptimizerMultiRankTP:
         expected = F.pad(expected_tp_local, (0, 0, 0, pad_rows))[shard]
         torch.testing.assert_close(actual, expected)
 
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"), reason="TELinear requires TE 1.7.0 or later."
+    )
+    @pytest.mark.parametrize("input_size,output_size", [(6, 8), (16, 8)])
+    def test_duplicated_telinear_muon_update_matches_unsharded_reference(
+        self, input_size, output_size
+    ):
+        """A replicated TELinear must take the same Muon update as the TP1 code path."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if pg_collection.tp.size() != 2:
+            pytest.skip("requires 2-way tensor parallel")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            params_dtype=torch.float32,
+        )
+        layer = TELinear(
+            input_size,
+            output_size,
+            parallel_mode="duplicated",
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+        ).cuda()
+        initial = torch.linspace(-0.4, 0.6, layer.weight.numel(), device="cuda").view_as(
+            layer.weight
+        )
+        grad = torch.linspace(0.7, -0.3, layer.weight.numel(), device="cuda").view_as(layer.weight)
+        layer.weight.data.copy_(initial)
+        layer.weight.grad = grad.clone()
+
+        reference_weight = torch.nn.Parameter(initial.clone())
+        reference_weight.partition_dim = -1
+        reference_weight.tensor_model_parallel = False
+        reference_weight.grad = grad.clone()
+
+        optimizer_kwargs = dict(
+            lr=0.01,
+            momentum=0.95,
+            nesterov=True,
+            weight_decay=0.0,
+            num_ns_steps=5,
+            tp_mode="duplicated",
+        )
+        tp_optimizer = TensorParallelMuon(
+            [layer.weight], pg_collection=pg_collection, **optimizer_kwargs
+        )
+        reference_optimizer = TensorParallelMuon(
+            [reference_weight], pg_collection=None, **optimizer_kwargs
+        )
+
+        tp_optimizer.step()
+        reference_optimizer.step()
+
+        torch.testing.assert_close(layer.weight, reference_weight, rtol=1e-6, atol=1e-7)
+
 
 # All non-custom coefficient types supported by emerging_optimizers.
 _TESTABLE_COEFFICIENT_TYPES = (
@@ -1780,6 +1844,8 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
 )
 def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+    from emerging_optimizers import utils as eopt_utils
+
     torch.manual_seed(42)
     grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
     param = torch.nn.Parameter(torch.zeros_like(grad))
@@ -1796,11 +1862,8 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    # orthogonalize() does not apply fp32_matmul_prec (step() does), and TF32 lets the
-    # batched and 2D GEMM kernels round differently, so pin full FP32 precision here.
-    prev_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")
-    try:
+    # OrthogonalizedOptimizer.step() applies this context around orthogonalize().
+    with eopt_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
         actual = optimizer.orthogonalize(param, grad)
         expected = torch.cat(
             [
@@ -1808,8 +1871,6 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
                 for head in torch.split(grad, [2] * 4)
             ]
         )
-    finally:
-        torch.set_float32_matmul_precision(prev_precision)
     torch.testing.assert_close(actual, expected)
 
 

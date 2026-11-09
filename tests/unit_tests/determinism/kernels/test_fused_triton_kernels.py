@@ -23,6 +23,7 @@ import contextlib
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
@@ -497,6 +498,35 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
     )
 
 
+@pytest.mark.parametrize("compile_cache_limit", [1, 8])
+def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compile_cache_limit):
+    """Checkpointing must reuse the forward arithmetic even after compiler fallback."""
+    from megatron.core.transformer.hyper_connection import native_sinkhorn
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(cache_size_limit=compile_cache_limit):
+            seeded()
+            logits = _mhc_rand(8, 2, 4, 4, dtype=torch.float32)
+            grad_output = torch.randn_like(logits)
+
+            def run(x):
+                # Mapping operations produce logits with requires_grad=False in the
+                # checkpoint's no-grad forward, unlike the original forward.
+                return native_sinkhorn(x * 1.0, 20, 1e-6)
+
+            expected = run(logits)
+            # At limit=1, this backward hits the recompile limit for a new grad-mode guard.
+            expected.backward(grad_output)
+            replay_logits = logits.detach().clone().requires_grad_(True)
+            actual = checkpoint(run, replay_logits, use_reentrant=True)
+            assert bytes_equal(actual, expected)
+            actual.backward(grad_output)
+            assert bytes_equal(replay_logits.grad, logits.grad)
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
@@ -629,3 +659,114 @@ def test_contiguous_thd_rope_and_teacher_replay():
         contention=True,
         what="packed CSA teacher",
     )
+
+
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
+    """Native mHC reductions and FP32 mapping projections replay bit-exactly."""
+    from megatron.core.transformer.hyper_connection import (
+        _proj_rms_impl,
+        native_h_aggregate,
+        native_h_post_bda,
+        native_proj_rms,
+    )
+
+    seeded()
+    s, b, n, c = 128, 2, 4, 128
+    x = _mhc_rand(s, b, n, c)
+    h_pre = _mhc_rand(s, b, n)
+    assert_replays_bit_exact(
+        native_h_aggregate, (x, h_pre), replays=3, what="native mHC h_aggregate"
+    )
+
+    h_res = _mhc_rand(s, b, n, n)
+    original_residual = _mhc_rand(s, b, n, c)
+    h_post = _mhc_rand(s, b, n)
+    x_single = _mhc_rand(s, b, c)
+    bias = _mhc_rand(c)
+    assert_replays_bit_exact(
+        lambda h_res, residual, h_post, x, bias: native_h_post_bda(
+            h_res, residual, h_post, x, bias
+        ),
+        (h_res, original_residual, h_post, x_single, bias),
+        replays=3,
+        what="native mHC h_post_bda",
+    )
+
+    projection_input = _mhc_rand(s * b, n * c, dtype=torch.float32)
+    projection_weight = _mhc_rand(n * n + 2 * n, n * c, dtype=torch.float32)
+    assert_replays_bit_exact(
+        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input, projection_weight),
+        replays=3,
+        what="native mHC proj_rms",
+    )
+    # The module uses eager FP32 projection for both the no-grad forward and replay.
+    assert_replays_bit_exact(
+        lambda x, weight: _proj_rms_impl(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input.to(torch.bfloat16).detach().requires_grad_(True), projection_weight),
+        replays=3,
+        what="eager mHC proj_rms with BF16 saved input",
+    )
+
+
+@pytest.mark.parametrize("attention", ["ordinary", "absorbed"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_mla_elementwise_output_gate_dispatch_replays(attention, dtype):
+    """MLA's elementwise output-gate dispatch reaches the fused Triton kernels and replays.
+
+    ``attention_output_gate_fusion`` routes ``_apply_mla_output_gate`` of both MLA variants
+    through ``fused_elementwise_attention_output_gate_before_cast``; the result and both
+    input gradients must be byte-identical across replays and to the eager composition.
+    """
+    from types import SimpleNamespace
+
+    from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
+    from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+        AbsorbedMLASelfAttention,
+    )
+    from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
+    from tests.unit_tests.determinism.kernels.harness import (
+        assert_replays_bit_exact,
+        bytes_equal,
+        seeded,
+    )
+
+    if not torch.cuda.is_available() or not HAVE_TRITON:
+        pytest.skip("needs a GPU and Triton")
+    attention_class = MultiLatentAttention if attention == "ordinary" else AbsorbedMLASelfAttention
+
+    def build(fusion):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                gated_attention_proj_granularity="elementwise", attention_output_gate_fusion=fusion
+            )
+        )
+
+    seeded()
+    core_attn_out = (torch.randn(6, 3, 1001, device="cuda") * 3).to(dtype).requires_grad_()
+    gate = (torch.randn(6, 3, 1001, device="cuda") * 4).float().requires_grad_()
+    grad_output = (torch.randn(6, 3, 1001, device="cuda") * 2).to(dtype)
+
+    def fused(core_attn_out, gate):
+        output = attention_class._apply_mla_output_gate(build(True), core_attn_out, gate)
+        assert type(output.grad_fn).__name__ == "_FusedElementwiseGateBeforeCastBackward"
+        return output
+
+    outputs, grads = assert_replays_bit_exact(
+        fused,
+        {"core_attn_out": core_attn_out, "gate": gate},
+        grad_outputs={"out": grad_output},
+        replays=3,
+        contention=True,
+        what=f"{attention_class.__name__} fused elementwise output gate",
+    )
+
+    x = core_attn_out.detach().clone().requires_grad_()
+    g = gate.detach().clone().requires_grad_()
+    eager = attention_class._apply_mla_output_gate(build(False), x, g)
+    assert type(eager.grad_fn).__name__ == "MulBackward0"
+    eager.backward(grad_output)
+    assert bytes_equal(outputs["out"], eager.detach())
+    assert bytes_equal(grads["in.core_attn_out"], x.grad)
+    assert bytes_equal(grads["in.gate"], g.grad)

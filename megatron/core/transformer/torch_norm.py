@@ -69,6 +69,8 @@ class WrappedTorchNorm:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
         instance = norm_cls(normalized_shape=hidden_size, eps=eps)
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
         instance.returns_residual = False
         return instance
 

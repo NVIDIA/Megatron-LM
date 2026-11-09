@@ -78,7 +78,7 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "preselected" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
@@ -337,29 +337,18 @@ run_selected_phase() {
 run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
-        # Consume the CPU decision without running selection again on GPU.
-        if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
-                --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
-                --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
-                --source-sha "$(git rev-parse HEAD)"; then
-            write_testmon_summary "CPU selection plan is unavailable or invalid"
-            return 1
-        fi
-    else
-        rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
-        if ! run_testmon_phase select prod \
+    if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
+        || ! run_testmon_phase select prod \
             -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
-            || ! merge_rank_selections prod \
-            || ! apply_mandatory_tests prod \
-            || ! run_testmon_phase select experimental \
-                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
-            || ! merge_rank_selections experimental \
-            || ! apply_mandatory_tests experimental; then
-            write_testmon_summary "full fallback: Testmon selection failed"
-            run_full_tests
-            return
-        fi
+        || ! merge_rank_selections prod \
+        || ! apply_mandatory_tests prod \
+        || ! run_testmon_phase select experimental \
+            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+        || ! merge_rank_selections experimental \
+        || ! apply_mandatory_tests experimental; then
+        write_testmon_summary "full fallback: Testmon selection failed"
+        run_full_tests
+        return
     fi
 
     prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
@@ -392,7 +381,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-enforce|preselected)
+enforce)
     run_enforced_tests
     ;;
 esac

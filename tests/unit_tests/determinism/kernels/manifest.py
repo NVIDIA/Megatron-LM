@@ -122,8 +122,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="triton",
         notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
-        "routing metadata replay. External sparse-attention backward is not certified here; "
+        "routing metadata replay. Stock sparse-attention backward is not certified here; "
         "numerical CP/indexer parity remains in the dev CSA tests.",
+    ),
+    KernelEntry(
+        name="aligned_hca_backward",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/aligned_hca.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="dispatch",
+        notes="FlashMLA forward plus cudnn.aligned_hca_backward_wrapper "
+        "(NVIDIA/cudnn-frontend#1198), with prepared packing and side-stream contention. "
+        "Bypasses stock deterministic backward selection; uses grouped GEMMs and fixed-order "
+        "FP32 partial reductions without atomic accumulation. Requires GB300/Rubin and the "
+        "frontend API; skips on H100 CI.",
     ),
     KernelEntry(
         name="dev_csa_fused_compressor_dispatch",
@@ -201,15 +214,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/gated_delta_net/kda.py",),
         tests=(K + "test_dev_sync_kernels.py",),
         kind="dispatch",
-        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1. "
-        "Multi-rank convolution and chunkwise CP remain in the existing parity suite.",
-    ),
-    KernelEntry(
-        name="mok_route_adapter",
-        sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
-        kind="triton",
-        notes="Authoritative bool-map gather, invalid-slot padding, and probability-gradient scatter.",
+        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1, alone "
+        "and feeding the fused sigmoid output norm that gdn_gated_output_norm_fusion selects in "
+        "_apply_gated_norm, plus a module-level replay of the Kimi-K3 bias-free low-rank "
+        "F-decay / output-gate projections (kda_f_lora_rank / kda_gate_lora_rank) with the "
+        "TP-replicated beta projection under deterministic_mode. Multi-rank convolution and "
+        "chunkwise CP remain in the existing parity suite.",
     ),
     KernelEntry(
         name="balanced_cp_route_metadata",
@@ -220,6 +230,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="Retained integer route metadata only, rebuilt on every replay rather than "
         "cache hits. This entry covers metadata, not balanced-indexer attention numerics.",
+    ),
+    KernelEntry(
+        name="csa_output_rope_reconstruction",
+        sources=("megatron/core/ops/attention/csa/output_rope.py",),
+        tests=(K + "test_csa_output_rope.py",),
+        kind="triton",
+        notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
     ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
@@ -441,6 +458,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(
+            K + "test_mla_device_placement.py",
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
@@ -475,11 +493,37 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_batch_invariant_nvls.py",
+        ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
         "histogram accumulation and bias updates.",
+    ),
+    KernelEntry(
+        name="mok_route_adapter",
+        sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
+        tests=(K + "test_mok_kernels.py", K + "test_dev_sync_kernels.py"),
+        kind="triton",
+        notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
+        "and unique expert indices; replayed with missing routes and side-stream contention. "
+        "test_dev_sync_kernels.py replays the bool-map gather, invalid-slot padding and "
+        "probability-gradient scatter.",
+    ),
+    KernelEntry(
+        name="mok_runtime",
+        sources=(
+            "megatron/core/transformer/moe/megakernel/mok/backend.py",
+            "megatron/core/transformer/moe/megakernel/mok/runtime.py",
+            "megatron/core/transformer/moe/megakernel/mok/weights.py",
+        ),
+        tests=(K + "test_moe_kernels.py",),
+        kind="dispatch",
+        notes="Real BF16/MXFP8 routed-only SiTU with dP/main-grad replay, native shared/latent "
+        "TP/SP, and legacy BF16 fused shared with output gate off/on; requires supported MOK/TE "
+        "on SM100/SM103 with EP4.",
     ),
     KernelEntry(
         name="moe_router",
@@ -536,8 +580,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_batch_invariant_unpermute.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
+            K + "test_moe_kernels.py",
         ),
-        kind="torch-op",
+        kind="triton",
+        notes="Fused rank-tree unpermute (probs=None) and its fixed-shape scatter backward "
+        "replay bit-exactly in test_moe_kernels.py and match the reference loop bitwise.",
     ),
     KernelEntry(
         name="inference_routing_mask_kernel",
@@ -639,6 +687,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/common.py",
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
+            "megatron/core/ssm/gated_delta_net/kda.py",
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
@@ -646,7 +695,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "The GDN family pins SiLU for its convolution and output gate independently of the FFN "
+        "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
+        "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule). The "
+        "opt-in fused output norm (gdn_gated_output_norm_fusion; SiLU for GDN, sigmoid for KDA) "
+        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -657,12 +711,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
     ),
     KernelEntry(
+        name="kda_pre_gated_delta_rule_fusion",
+        sources=("megatron/core/fusions/fused_pre_kda.py",),
+        kind="triton",
+        exempt_reason="KDA pre-GDR fusion is explicitly rejected with deterministic_mode=True "
+        "(KimiDeltaAttention._setup_variant_attrs). It reuses the pre-GDR module's timing-based "
+        "autotuned convolution kernels and its backward's atomic boundary-gradient and "
+        "causal_conv1d weight-gradient reductions; fused-vs-eager parity and the rejection guard "
+        "are covered by tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py.",
+    ),
+    KernelEntry(
         name="gdn_gated_output_norm_fusion",
         sources=("megatron/core/fusions/fused_gated_norm.py",),
         tests=(K + "test_gated_norm.py",),
         kind="triton",
-        notes="GatedDeltaNet._apply_gated_norm dispatches fused RMSNorm/SiLU forward/backward "
-        "with fixed launch configurations and ordered weight-gradient reduction; first-order replay.",
+        notes="GatedDeltaNet._apply_gated_norm (SiLU) and KimiDeltaAttention._apply_gated_norm "
+        "(sigmoid) dispatch the fused RMSNorm forward/backward with fixed launch configurations "
+        "and ordered weight-gradient reduction; first-order replay of both module dispatchers "
+        "and of both GATE_ACTIVATION kernel specialisations with BF16 and FP32 gates.",
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",
@@ -703,12 +769,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
+            "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
-        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration.",
+        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
+        "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
+        "replay, including changing factors and low-precision gradient buffers.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -750,6 +819,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
+            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
@@ -767,6 +837,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
+            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
@@ -871,8 +942,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
-        "GEMM path and mxfp8_quantize_only are not replayed.",
+        "softmax_scale MultiLatentAttention hands to its core attention. NoPE layers "
+        "(no_rope_freq) build no rotary embedding and bypass every RoPE kernel; such a layer's "
+        "forward/backward is replayed in test_te_wrappers.py with the RoPE entry points stubbed "
+        "out. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
@@ -909,7 +982,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
-        "flashinfer on Blackwell and are not replayed in CI.",
+        "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
+        "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
+        "the default atomic top-k finalize and routed backend are not covered by that test.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
@@ -1053,6 +1128,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
+        name="dsa_tilelang_absorbed_shape_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",),
+        tests=(K + "test_dsa_tilelang_shapes.py",),
+        kind="dispatch",
+        notes="SparseMLA forward replay with NoPE channel padding and invalid top-k slot padding. "
+        "Backward atomic accumulation remains covered by the DSA family exemption below; "
+        "output and gradient parity are checked in test_dsa_tilelang_shapes under transformer/.",
+    ),
+    KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
@@ -1093,6 +1177,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "one key more than once, so the sum order follows kernel scheduling. The accumulation runs "
         "in FP32 regardless of the parameter dtype, which "
         "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
+    ),
+    KernelEntry(
+        name="mla_attention_output_gate_fusion",
+        sources=("megatron/core/fusions/fused_attention_output_gate.py",),
+        tests=(K + "test_attention_output_gate_fusion.py",),
+        kind="triton",
+        notes="Elementwise MLA output gate (core_attn_out * sigmoid(gate.float()) cast to the "
+        "activation dtype before the multiply): the forward and backward Triton kernels are "
+        "replayed bit-exactly for BF16 / FP16 / FP32 under serial and contended streams, and "
+        "compared bitwise with the eager composition; the full eager-parity grid lives in "
+        "tests/unit_tests/fusions/test_fused_attention_output_gate.py.",
     ),
 )
 

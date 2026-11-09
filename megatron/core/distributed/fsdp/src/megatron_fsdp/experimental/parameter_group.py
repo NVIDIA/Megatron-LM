@@ -33,7 +33,7 @@ from .dbuffer import DBuffer, symmetric_memory_allocation
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic, TensorAtomic
+from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
@@ -126,6 +126,8 @@ class FsdpParameterGroup:
     _unshard_events: dict[Phase, torch.cuda.Event]
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_scale: float
+    # Padded (equal) or unpadded (unequal) segments for RowAtomic/BlockAtomic layouts.
+    shard_layout: ShardLayout
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class FsdpParameterGroup:
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -159,6 +162,8 @@ class FsdpParameterGroup:
             parameter_to_owner: Construction-time mapping from original parameters to
                 owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
                 entries for other parameters and non-TensorAtomic groups are ignored.
+            shard_layout: Whether RowAtomic/BlockAtomic layouts pad to equal rank segments
+                or pack without padding into generally unequal ones. See ``fully_shard``.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -167,6 +172,12 @@ class FsdpParameterGroup:
         self._unshard_events = {}
         self.mesh = mesh
         self.grad_scale = grad_scale
+        self.shard_layout = shard_layout
+        if shard_layout is ShardLayout.UNPADDED and use_symmetric_memory:
+            raise ValueError(
+                "ShardLayout.UNPADDED is incompatible with use_symmetric_memory: NCCL "
+                "symmetric-memory collectives require equal shard sizes."
+            )
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -241,8 +252,11 @@ class FsdpParameterGroup:
         shapes = (parameter.shape for parameter in parameters)
         if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
             # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
-            return layout_builder.build_for_row_atomic(
-                shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
+            return layout_builder.build_row_atomic_layout(
+                shapes,
+                dp_size=self.mesh.size(),
+                block_size=32 if self.dtype == torch.uint8 else 1,
+                shard_layout=self.shard_layout,
             )
         if _contains_any_placement_type(
             *placement_groups, placement_types=(RowAtomic, BlockAtomic)
@@ -639,19 +653,17 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
-        """Reduce a packed partial gradient buffer into sharded parameter gradients.
+    def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
+        """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
 
-        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
-        accumulating each backward through the standard zero_grad contract; the
-        last microbatch reduces the DP-outer axes, finalizing main_grad to
-        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
-        to RowAtomic for HFSDP) so ``.grad`` is the fully reduced gradient before
-        ``optimizer.step()``. With every axis RowAtomic (plain DP) main_grad already
-        rests finalized.
+        main_grad rests at the DP-outer-Partial accumulation placement, accumulating
+        each backward through the standard zero_grad contract, and ``.grad`` binds to
+        it. The last-microbatch DP-outer reduction is applied separately by
+        ``reduce_outer_gradients``; the caller (``_reduce_gradient_groups``)
+        decides when and on which stream to run it, which is what lets the DP-outer
+        reduction overlap the next group's DP-inner reduction.
         """
         assert self.main_grad is not None
-        assert self.pre_optimizer_main_grad is not None
 
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
@@ -684,24 +696,34 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        def install_sharded_grads(main_grad: DBuffer) -> None:
-            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-                fsdp_parameter.sharded.grad = main_grad.get_dtensor(index)
+        self._install_sharded_grads(self.main_grad)
 
-        if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) into the persistent buffer's optimizer-layout
-            # view before binding the sharded parameter grads.
-            self.main_grad.redistribute(
-                self.main_weight.placements, out=self.pre_optimizer_main_grad
-            )
-            self._main_grad_is_stale = True
-            install_sharded_grads(self.pre_optimizer_main_grad)
-        else:
-            # We could install pre_optimizer_main_grad unconditionally because
-            # sharded.grad is only read by the optimizer. However, for consistency and
-            # debugging, keep sharded.grad valid even between microbatches.
-            install_sharded_grads(self.main_grad)
+    def reduce_outer_gradients(self) -> None:
+        """Finalize the deferred DP-outer reduction into the optimizer-layout view.
+
+        All-reduce (HSDP) or reduce-scatter (HFSDP) the accumulator across DP-outer
+        into ``pre_optimizer_main_grad`` (the persistent buffer's optimizer-layout
+        view), then bind each sharded ``.grad`` to it. Runs after
+        ``reduce_inner_gradients`` on the last microbatch; the caller can run it on
+        its own stream to overlap the DP-inner reductions (see
+        ``FsdpModule._reduce_gradient_groups``). main_grad and its view are
+        persistent, so running on a separate stream needs no cross-stream free.
+        """
+        assert self.main_grad is not None
+        assert self.pre_optimizer_main_grad is not None
+        if self.pre_optimizer_main_grad is self.main_grad:
+            # Optimizer layout equals the accumulation layout (e.g. plain DP): no
+            # DP-outer axis to reduce, so grads already rest finalized.
+            self._install_sharded_grads(self.main_grad)
+            return
+        self.main_grad.redistribute(self.main_weight.placements, out=self.pre_optimizer_main_grad)
+        self._main_grad_is_stale = True
+        self._install_sharded_grads(self.pre_optimizer_main_grad)
+
+    def _install_sharded_grads(self, grad_buffer: DBuffer) -> None:
+        """Bind each sharded parameter's ``.grad`` to the given reduced gradient buffer."""
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.sharded.grad = grad_buffer.get_dtensor(index)
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> FsdpParameterGroup | None:

@@ -1884,9 +1884,7 @@ class TextGenerationController(MTPControllerMixin):
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
             # Draft-only lookahead has no main-model routing to reconstruct.
-            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
-            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
-            valid_blocks = blocks[blocks >= 0].tolist()
+            valid_blocks = context.get_committed_kv_block_ids(finished_idx)
             if valid_blocks:
                 finished_routing_block_ids[request_id] = valid_blocks
         return finished_routing_block_ids
@@ -3138,6 +3136,7 @@ class TextGenerationController(MTPControllerMixin):
         request_result = None
         cuda_graph_request_count = None
         log_probs_transfer = None
+        prompt_logprob_writes = []
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -3154,6 +3153,9 @@ class TextGenerationController(MTPControllerMixin):
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+                # The rows arrive after update and admission, so record their
+                # blocks now and pin them until the rows are stored.
+                prompt_logprob_writes = context.capture_prompt_logprob_writes()
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
@@ -3204,6 +3206,7 @@ class TextGenerationController(MTPControllerMixin):
 
         self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
         log_probs, top_n_logprobs = request_result.log_probs_result
+        context.commit_prompt_logprob_writes(prompt_logprob_writes, log_probs, top_n_logprobs)
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
@@ -3532,6 +3535,12 @@ class TextGenerationController(MTPControllerMixin):
                             log_probs_tensor
                         )
             range_pop()
+
+            # Cache prompt log-prob rows on their blocks before update_requests
+            # changes the layout that locates them.
+            context.commit_prompt_logprob_writes(
+                context.capture_prompt_logprob_writes(), log_probs, top_n_logprobs
+            )
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests

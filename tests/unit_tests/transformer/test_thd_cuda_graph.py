@@ -201,6 +201,7 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
             mtp_num_layers=1 if mtp_enabled else None,
             freeze_base_model_for_mtp=False,
         ),
+        hybrid_layer_config_list=None,
         pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
@@ -1823,6 +1824,10 @@ class TestGraphDynamicRouteMetadataArena:
             cuda_graph_modules=[],
             fine_grained_activation_offloading=False,
             delay_offload_until_cuda_graph=False,
+            # TransformerConfig derives graph dynamic packs from the dp_balanced scheduler.
+            # This single-chunk schedule is PP=1, so TE slot selection keeps modulo reuse.
+            sequence_packing_scheduler="dp_balanced",
+            pipeline_model_parallel_size=1,
             dsa_cp_balance_indexer_graph_dynamic_packs=True,
             context_parallel_size=2,
             max_seqlen_per_dp_cp_rank=8,

@@ -3,9 +3,12 @@ import os
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
-from megatron.rl.rl_utils import selective_log_softmax
+from megatron.rl.rl_utils import selective_log_softmax, vocab_parallel_selective_log_softmax
+from tests.unit_tests.test_utilities import Utils
 
 
 def test_selective_log_softmax_batch_invariant():
@@ -116,3 +119,39 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
         tokens.dtype
     )
     torch.testing.assert_close(graph_out, reference, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="batch-invariant kernels need CUDA")
+def test_vocab_parallel_selective_log_softmax_batch_invariant():
+    """The vocab-parallel path under --batch-invariant-mode, over the whole TP group: a permuted
+    batch and the first sequence alone reproduce their rows bitwise, the output is fp32, and
+    every rank returns the same tensor."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank, tp_world = dist.get_rank(tp_group), dist.get_world_size(tp_group)
+        B, S, V = 4, 7, 16 * tp_world
+        device = torch.device("cuda")
+        torch.manual_seed(0)  # identical full logits, labels and permutation on every rank
+        logits = torch.randn(B, S, V, dtype=torch.bfloat16, device=device)
+        labels = torch.randint(low=0, high=V, size=(B, S), device=device)
+        perm = torch.randperm(B, device=device)
+        partition = V // tp_world
+        local = logits[..., tp_rank * partition : (tp_rank + 1) * partition].contiguous()
+
+        with set_batch_invariant_mode(True):
+            logps = vocab_parallel_selective_log_softmax(local, labels, tp_group)
+            logps_perm = vocab_parallel_selective_log_softmax(local[perm], labels[perm], tp_group)
+            logps_prefix = vocab_parallel_selective_log_softmax(local[:1], labels[:1], tp_group)
+
+        assert logps.dtype == torch.float32
+        assert torch.equal(logps, logps_perm[perm.argsort()])
+        assert torch.equal(logps[:1], logps_prefix)
+        peers = [torch.empty_like(logps) for _ in range(tp_world)]
+        dist.all_gather(peers, logps, group=tp_group)
+        assert all(torch.equal(peer, logps) for peer in peers)
+    finally:
+        Utils.destroy_model_parallel()

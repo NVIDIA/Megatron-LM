@@ -800,6 +800,45 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+def accumulate_qb_histogram(
+    scores: torch.Tensor,
+    cutoff: torch.Tensor,
+    qb_histogram: torch.Tensor,
+    qb_bin_bounds: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> None:
+    """Add one K3 Quantile Balancing margin sample per (token, expert) to ``qb_histogram``.
+
+    Args:
+        scores (torch.Tensor): Unbiased routing scores, shape [num_tokens, num_experts].
+        cutoff (torch.Tensor): Biased score of each token's (topk+1)-th expert, shape
+                               [num_tokens, 1]; ``cutoff - score`` is the margin that is binned.
+        qb_histogram (torch.Tensor): Caller-owned int32 histogram, shape [num_experts, num_bins].
+        qb_bin_bounds (torch.Tensor): FP32 lower and upper margin bounds, shape [2].
+        valid_mask (torch.Tensor, optional): Boolean mask over tokens, True = count the token.
+                                             Padded packed-sequence slots pass False so they
+                                             do not contribute samples. Defaults to all tokens.
+    """
+    with torch.no_grad():
+        num_experts = scores.shape[1]
+        num_bins = qb_histogram.shape[1]
+        lower, upper = qb_bin_bounds.unbind()
+        bin_indices = torch.floor(
+            (cutoff - scores.detach() - lower) * (num_bins / (upper - lower))
+        ).to(torch.int64)
+        bin_indices.clamp_(0, num_bins - 1)
+        expert_offsets = (
+            torch.arange(num_experts, device=scores.device, dtype=torch.int64) * num_bins
+        )
+        flat_indices = (bin_indices + expert_offsets).reshape(-1)
+        if valid_mask is None:
+            src = torch.ones_like(flat_indices, dtype=torch.int32)
+        else:
+            # Static-shape alternative to gathering the valid rows: padded tokens add 0.
+            src = valid_mask.to(torch.int32).unsqueeze(1).expand(-1, num_experts).reshape(-1)
+        qb_histogram.view(-1).scatter_add_(0, flat_indices, src)
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -816,6 +855,7 @@ def topk_routing_with_score_function(
     qb_bin_bounds: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     precomputed_indices: Optional[torch.Tensor] = None,
+    qb_valid_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -850,8 +890,11 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
-        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
-                                               [num_tokens, topk]. Only used by the fused TE path.
+        qb_valid_mask (torch.Tensor, optional): Boolean mask with shape [num_tokens], True for
+                                                real tokens. Padded packed-sequence slots are
+                                                routed like any other token but are left out of
+                                                the Quantile Balancing histogram. Requires
+                                                qb_histogram/qb_bin_bounds. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -901,6 +944,14 @@ def topk_routing_with_score_function(
             raise ValueError("qb_histogram must have dtype torch.int32.")
         if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
             raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
+    if qb_valid_mask is not None:
+        if not use_quantile_balancing:
+            raise ValueError("qb_valid_mask requires qb_histogram and qb_bin_bounds.")
+        if qb_valid_mask.dtype != torch.bool or qb_valid_mask.shape != (num_tokens,):
+            raise ValueError(
+                "qb_valid_mask must be a bool tensor with shape [num_tokens], got "
+                f"{qb_valid_mask.dtype} {tuple(qb_valid_mask.shape)}."
+            )
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -928,14 +979,25 @@ def topk_routing_with_score_function(
                     "Balancing histogram outputs. Upgrade Transformer Engine or disable "
                     "moe_router_fusion."
                 )
-            kwargs.update(
-                qb_histogram=qb_histogram,
-                qb_bin_bounds=qb_bin_bounds,
-                qb_histogram_mode="fused_atomic",
-            )
+            if qb_valid_mask is None:
+                kwargs.update(
+                    qb_histogram=qb_histogram,
+                    qb_bin_bounds=qb_bin_bounds,
+                    qb_histogram_mode="fused_atomic",
+                )
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
-        return fused_topk_with_score_function(**kwargs)
+        outputs = fused_topk_with_score_function(**kwargs)
+        if use_quantile_balancing and qb_valid_mask is not None:
+            # The fused kernel's atomic histogram has no token mask, so with padded
+            # packed-sequence slots the margin samples are recomputed here for the
+            # real tokens only (one extra sigmoid + top-(k+1) over the micro-batch).
+            scores = torch.sigmoid(logits.float())
+            cutoff = torch.topk(scores + expert_bias.float(), topk + 1, dim=1, sorted=True).values[
+                :, -1:
+            ]
+            accumulate_qb_histogram(scores, cutoff, qb_histogram, qb_bin_bounds, qb_valid_mask)
+        return outputs
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -1017,21 +1079,9 @@ def topk_routing_with_score_function(
                 topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
                 cutoff = topk_result.values[:, -1:]
                 top_indices = topk_result.indices[:, :-1]
-                with torch.no_grad():
-                    num_bins = qb_histogram.shape[1]
-                    lower, upper = qb_bin_bounds.unbind()
-                    bin_indices = torch.floor(
-                        (cutoff - scores.detach() - lower) * (num_bins / (upper - lower))
-                    ).to(torch.int64)
-                    bin_indices.clamp_(0, num_bins - 1)
-                    expert_offsets = (
-                        torch.arange(num_experts, device=logits.device, dtype=torch.int64)
-                        * num_bins
-                    )
-                    flat_indices = (bin_indices + expert_offsets).reshape(-1)
-                    qb_histogram.view(-1).scatter_add_(
-                        0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
-                    )
+                accumulate_qb_histogram(
+                    scores, cutoff, qb_histogram, qb_bin_bounds, valid_mask=qb_valid_mask
+                )
             else:
                 _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices)

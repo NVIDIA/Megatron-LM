@@ -29,6 +29,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -37,7 +40,6 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -69,7 +71,13 @@ def get_gated_delta_net_module_spec(
             module=KimiDeltaAttention,
             submodules=KimiDeltaAttentionSubmodules(
                 in_proj=backend.column_parallel_linear(),
-                beta_proj=backend.column_parallel_linear(),
+                beta_proj=backend.linear(),
+                f_proj=backend.column_parallel_linear(),
+                f_a_proj=backend.linear(),
+                f_b_proj=backend.column_parallel_linear(),
+                g_proj=backend.column_parallel_linear(),
+                g_a_proj=backend.linear(),
+                g_b_proj=backend.column_parallel_linear(),
                 out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
                 out_proj=backend.row_parallel_linear(),
             ),

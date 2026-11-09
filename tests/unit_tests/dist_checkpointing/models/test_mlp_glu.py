@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 
 import pytest
@@ -14,11 +14,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def initialize_mlp(glu=True):
+def initialize_mlp(glu=True, use_te_activation_func=False):
     model_parallel_cuda_manual_seed(123)
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     transformer_config = TransformerConfig(
@@ -27,8 +28,13 @@ def initialize_mlp(glu=True):
         num_attention_heads=4,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
+        use_te_activation_func=use_te_activation_func,
     )
-    mlp_submodules = get_submodules(get_gpt_layer_with_transformer_engine_submodules().mlp)
+    mlp_submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(
+            use_te_activation_func=use_te_activation_func
+        ).mlp
+    )
     assert isinstance(mlp_submodules, MLPSubmodules)
     return MLP(transformer_config, mlp_submodules)
 
@@ -87,6 +93,34 @@ class TestParallelMLPWithGLU:
             state_dict_B = load_plain_tensors(ckpt_dir_B)
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.13.0"),
+        reason="TE activation operators require Transformer Engine 1.13 or later.",
+    )
+    def test_te_activation_extra_state_tracks_tp_replica(self, tmp_path_dist_ckpt):
+        """Only one TP replica may own a replicated TE activation extra state."""
+        Utils.initialize_model_parallel(2, 1)
+        mlp = initialize_mlp(use_te_activation_func=True)
+        sharded_state_dict = mlp.sharded_state_dict()
+
+        activation_extra_states = {
+            key: value
+            for key, value in sharded_state_dict.items()
+            if key.endswith("activation_func._extra_state")
+        }
+        assert len(activation_extra_states) == 1
+        activation_extra_state = next(iter(activation_extra_states.values()))
+        assert activation_extra_state.replica_id == (
+            0,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_te_activation_extra_state_tracks_tp_replica", sync=True
+        ) as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir, validate_access_integrity=True)
 
     def test_oom_is_handled(self, caplog):
         Utils.initialize_model_parallel(Utils.world_size, 1)
