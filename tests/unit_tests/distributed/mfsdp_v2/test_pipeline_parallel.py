@@ -18,12 +18,10 @@ import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.pipeline_parallel.schedules import _get_grad_sync_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -108,15 +106,3 @@ class TestMfsdpV2PipelineSharedContext:
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
-
-        # Scheduler scopes select the mode directly and restore it between phases.
-        for enabled, mode in [
-            (False, GradientFinalizationMode.SKIP_OUTER),
-            (True, GradientFinalizationMode.REDUCE_OUTER),
-        ]:
-            with _get_grad_sync_context(wrapped_chunks, wrapped_chunks[0].config, enabled):
-                assert first_context.gradient_finalization_mode is mode
-            assert (
-                first_context.gradient_finalization_mode
-                is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-            )

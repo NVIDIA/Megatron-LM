@@ -52,28 +52,6 @@ except ImportError:
 Shape = Union[List[int], torch.Size]
 
 
-@contextlib.contextmanager
-def _get_grad_sync_context(model, config, enabled):
-    """Select gradient reduction behavior for this part of the schedule."""
-    chunks = model if isinstance(model, list) else [model]
-    with contextlib.ExitStack() as stack:
-        if isinstance(chunks[0], FullyShardedDataParallelV2):
-            mode = (
-                GradientFinalizationMode.REDUCE_OUTER
-                if enabled
-                else GradientFinalizationMode.SKIP_OUTER
-            )
-            for context in {chunk.module.context for chunk in chunks}:
-                stack.enter_context(context.finalize_gradients(mode=mode))
-        elif not enabled and config.no_sync_func is not None:
-            no_sync_funcs = config.no_sync_func
-            if not isinstance(no_sync_funcs, list):
-                no_sync_funcs = [no_sync_funcs]
-            for no_sync in no_sync_funcs:
-                stack.enter_context(no_sync())
-        yield
-
-
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
@@ -801,8 +779,13 @@ def forward_backward_no_pipelining(
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
-    no_sync_func = partial(_get_grad_sync_context, model, config, False)
-    sync_func = partial(_get_grad_sync_context, model, config, True)
+    if isinstance(model, FullyShardedDataParallelV2):
+        context = model.module.context
+        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
+        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
+    else:
+        no_sync_func = config.no_sync_func or contextlib.nullcontext
+        sync_func = contextlib.nullcontext
 
     model_type = get_model_type(model)
 
@@ -1115,8 +1098,22 @@ def forward_backward_pipelining_with_interleaving(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     # Disable async grad reductions
-    no_sync_func = partial(_get_grad_sync_context, model, config, False)
-    sync_func = partial(_get_grad_sync_context, model, config, True)
+    if isinstance(model[0], FullyShardedDataParallelV2):
+        context = model[0].module.context
+        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
+        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
+    else:
+        no_sync_func = config.no_sync_func or contextlib.nullcontext
+        sync_func = contextlib.nullcontext
+        if isinstance(no_sync_func, list):
+
+            def multi_no_sync():
+                stack = contextlib.ExitStack()
+                for chunk_no_sync in config.no_sync_func:
+                    stack.enter_context(chunk_no_sync())
+                return stack
+
+            no_sync_func = multi_no_sync
     sync_context = None
     no_sync_context = None
 
@@ -2295,8 +2292,13 @@ def forward_backward_pipelining_without_interleaving(
         paged_stash_reset(enabled=not forward_only, config=config)
 
     # Disable async grad reductions
-    no_sync_func = partial(_get_grad_sync_context, model, config, False)
-    sync_func = partial(_get_grad_sync_context, model, config, True)
+    if isinstance(model, FullyShardedDataParallelV2):
+        context = model.module.context
+        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
+        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
+    else:
+        no_sync_func = config.no_sync_func or contextlib.nullcontext
+        sync_func = contextlib.nullcontext
     sync_context = None
     no_sync_context = None
 
