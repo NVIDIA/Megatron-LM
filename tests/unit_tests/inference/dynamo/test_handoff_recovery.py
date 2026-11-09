@@ -121,7 +121,7 @@ signal.pause()
         assert ownership.confirm_terminated(replacement._handoff_owner) == [(8, b"prefill-engine")]
         for source in sources:
             assert source.pinned_handoff_block_count == 0
-            assert source.context.kv_block_allocator.block_ref_counts.sum() == 0
+            assert source.context.kv_block_allocator.pc_state.block_ref_counts.sum() == 0
             assert source.context.mamba_metadata.mamba_state_free_slot_count == 1
             assert source.context.mamba_metadata.allocate_slot() is not None
     finally:
