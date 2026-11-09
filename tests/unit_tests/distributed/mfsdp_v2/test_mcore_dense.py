@@ -10,10 +10,13 @@ import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
-import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
+import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -221,13 +224,13 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
         device="cuda", dtype=config.params_dtype
     )
     fully_shard_context_calls = []
-    original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+    original_fully_shard_context = mcore_adapter_v2.fully_shard_context
 
-    def record_fully_shard_context(*args, **kwargs):
-        fully_shard_context_calls.append(kwargs["runtime_policy"].use_symmetric_memory)
-        return original_fully_shard_context(*args, **kwargs)
+    def record_fully_shard_context(context):
+        fully_shard_context_calls.append(context.use_symmetric_memory)
+        return original_fully_shard_context(context)
 
-    monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+    monkeypatch.setattr(mcore_adapter_v2, "fully_shard_context", record_fully_shard_context)
     FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -291,7 +294,7 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
     """The adapter rejects an incompatible shared context before sharding the model."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
-    with fully_shard_context(device=distributed_setup.device) as context:
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
         with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
             FullyShardedDataParallel(
                 config=config,
@@ -370,27 +373,45 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
         graph.replay()
 
 
-def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_setup):
+@pytest.mark.parametrize("init_model_with_meta_device", [False, True], ids=["cuda", "meta"])
+def test_delayed_wgrad_matches_immediate(
+    process_group_collection, distributed_setup, init_model_with_meta_device
+):
     """Delaying weight gradients preserves training losses with microbatch accumulation."""
     num_microbatches = 3
     config = TransformerConfig(
-        num_layers=1, hidden_size=16, num_attention_heads=4, bf16=True, params_dtype=torch.bfloat16
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        init_model_with_meta_device=init_model_with_meta_device,
     )
+    # Every rank initializes both layers with the same weights, also when the adapter
+    # materializes the delayed layer from the meta device.
+    initial_weight = torch.randn(16, 16, generator=torch.Generator().manual_seed(0))
 
-    def build_layer(delay_wgrad_compute):
+    @torch.no_grad()
+    def init_method(weight):
+        weight.copy_(initial_weight)
+
+    def build_layer(delay_wgrad_compute, device):
         return te.Linear(
             16,
             16,
             bias=False,
+            init_method=init_method,
             params_dtype=config.params_dtype,
-            device=distributed_setup.device,
+            device=device,
             delay_wgrad_compute=delay_wgrad_compute,
             fuse_wgrad_accumulation=False,
         )
 
-    immediate_layer = build_layer(delay_wgrad_compute=False)
-    delayed_layer = build_layer(delay_wgrad_compute=True)
-    delayed_layer.load_state_dict(immediate_layer.state_dict())
+    immediate_layer = build_layer(delay_wgrad_compute=False, device=distributed_setup.device)
+    delayed_layer = build_layer(
+        delay_wgrad_compute=True,
+        device="meta" if init_model_with_meta_device else distributed_setup.device,
+    )
     # Both runs see the same inputs, with distinct data on each rank and microbatch.
     batches = [
         [
@@ -450,8 +471,13 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
             losses.append(torch.stack(microbatch_losses).mean())
         return torch.stack(losses)
 
+    def backward_dw():
+        # Delayed wgrad needs the full parameter binding, but not its weight storage.
+        assert delayed_layer.weight.untyped_storage().nbytes() == 0
+        delayed_layer.backward_dw()
+
     immediate_losses = train(immediate_layer)
-    delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
+    delayed_losses = train(delayed_layer, backward_dw)
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
@@ -691,3 +717,49 @@ def test_gradient_clipping_reaches_global_norm(
     torch.testing.assert_close(
         global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
+
+
+def test_transformer_layer_weights_released_before_final_callback(process_group_collection):
+    """Layer input gradients release full weights before final autograd cleanup."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=block,
+        pg_collection=process_group_collection,
+    )
+    released = []
+
+    def check_weights_released(_grad):
+        # Input backward precedes final autograd cleanup; checking after backward
+        # returns would miss weights retained until that cleanup.
+        for layer in block.layers:
+            for group in layer.parameter_groups:
+                assert not group._unsharded_model_weight.is_allocated
+        released.append(True)
+
+    x = torch.randn(
+        8, 2, config.hidden_size, device="cuda", dtype=config.params_dtype, requires_grad=True
+    )
+    x.register_hook(check_weights_released)
+    run_forward_backward_on_microbatches(
+        model, lambda: model(x, attention_mask=None).float().square().mean()
+    )
+    assert released == [True]
