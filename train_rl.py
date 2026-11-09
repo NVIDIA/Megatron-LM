@@ -370,17 +370,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             (args.global_batch_size * args.train_iters) if args.train_iters else args.train_samples
         )
     )
-    valid_ds = MinimalDataset(
-        size=(args.eval_iters * args.global_batch_size)
-        * (
-            (
-                args.train_iters
-                if args.train_iters
-                else (args.train_samples // args.global_batch_size)
-            )
-            // args.eval_interval
-        )
+    train_iters = (
+        args.train_iters if args.train_iters else (args.train_samples // args.global_batch_size)
     )
+    # Without eval_interval, validation runs only once, after training (as in
+    # get_train_valid_test_num_samples).
+    num_eval_points = train_iters // args.eval_interval if args.eval_interval else 1
+    valid_ds = MinimalDataset(size=args.eval_iters * args.global_batch_size * num_eval_points)
     test_ds = MinimalDataset()
 
     print_rank_0("> finished creating minimal datasets for RL")

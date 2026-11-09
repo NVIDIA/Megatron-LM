@@ -138,6 +138,37 @@ def test_entrypoint_loss_checks_read_rerun_config(
         assert call.kwargs["fatal"] == (call.kwargs["message"] != "Spiky loss")
 
 
+@pytest.mark.parametrize(
+    "eval_interval, train_iters, train_samples, expected_valid_size",
+    [
+        # eval_iters * global_batch_size * (train_iters // eval_interval)
+        (5, 10, None, 2 * 4 * 2),
+        (5, None, 40, 2 * 4 * 2),
+        # Without eval_interval, validation runs once, after training.
+        (None, 10, None, 2 * 4),
+        (0, 10, None, 2 * 4),
+    ],
+)
+def test_train_rl_minimal_datasets_handle_unset_eval_interval(
+    monkeypatch, eval_interval, train_iters, train_samples, expected_valid_size
+):
+    with patch("logging.basicConfig"):
+        train_rl = importlib.import_module("train_rl")
+    args = SimpleNamespace(
+        global_batch_size=4,
+        train_iters=train_iters,
+        train_samples=train_samples,
+        eval_iters=2,
+        eval_interval=eval_interval,
+    )
+    monkeypatch.setattr(train_rl, "get_args", lambda: args)
+
+    train_ds, valid_ds, _ = train_rl.train_valid_test_datasets_provider(None)
+
+    assert len(train_ds) == 40
+    assert len(valid_ds) == expected_valid_size
+
+
 class _LenDataloader:
     """Fake dataloader with __len__ (required by the full_validation path)
     and __iter__ (consumed via cyclic_iter)."""
