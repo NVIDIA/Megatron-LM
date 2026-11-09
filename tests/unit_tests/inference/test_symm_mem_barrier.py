@@ -72,10 +72,11 @@ def test_barrier_orders_writes_across_the_group(group_size):
     """
     Utils.initialize_model_parallel(1, 1)
     try:
-        hdl = SymmetricMemoryManager.get_buffer(
+        buf = SymmetricMemoryManager.get_buffer(
             "barrier_test", process_group=dist.group.WORLD, size_mb=1
-        ).symm_mem_hdl
-        assert hdl is not None
+        )
+        hdl = buf.symm_mem_hdl
+        assert hdl is not None, buf.init_failure_reason
         rank = dist.get_rank()
         if rank < group_size:
             out = torch.full((group_size,), -1, dtype=torch.int32, device="cuda")

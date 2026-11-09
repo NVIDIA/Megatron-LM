@@ -208,7 +208,16 @@ def test_cross_entropy_is_tp_and_batch_invariant():
 
     shards, vocab, tokens = 4, 4096, 64
     Utils.initialize_model_parallel(1, 1)
-    groups = {tp: dist.new_group(list(range(tp))) for tp in (2, 4)}  # every rank creates them
+    # Every rank belongs to one group per TP size, so every rank runs (and allocates symmetric
+    # memory for) the same sequence of collectives: a subset allocating alone would make the
+    # ranks' symmetric-memory rendezvous counters diverge and hang a later test.
+    world, rank = dist.get_world_size(), dist.get_rank()
+    groups = {}
+    for tp in (2, 4):
+        for start in range(0, world, tp):
+            group = dist.new_group(list(range(start, start + tp)))  # every rank creates them
+            if start <= rank < start + tp:
+                groups[tp] = group
     try:
         gen = torch.Generator(device="cuda").manual_seed(9)
         logits = torch.randn(tokens, 1, vocab, device="cuda", generator=gen) * 8
@@ -217,10 +226,7 @@ def test_cross_entropy_is_tp_and_batch_invariant():
         with set_batch_invariant_mode(True):
             for tp in (1, 2, 4):
                 group = groups.get(tp)
-                rank = dist.get_rank()
-                if tp > 1 and rank >= tp:
-                    continue
-                local = logits.chunk(tp, dim=-1)[rank if tp > 1 else 0].contiguous()
+                local = logits.chunk(tp, dim=-1)[rank % tp].contiguous()
                 for name, ce in (
                     (
                         "unfused",
@@ -239,10 +245,9 @@ def test_cross_entropy_is_tp_and_batch_invariant():
                     losses[tp, name] = ce(local.clone(), target, g)
                     small = ce(local[8:24].clone(), target[8:24], g)
                     assert torch.equal(_bits(small), _bits(losses[tp, name][8:24])), (tp, name)
-        if dist.get_rank() == 0:
-            ref = losses[1, "unfused"]
-            for key, loss in losses.items():
-                assert torch.equal(_bits(loss), _bits(ref)), key
+        ref = losses[1, "unfused"]
+        for key, loss in losses.items():
+            assert torch.equal(_bits(loss), _bits(ref)), key
     finally:
         Utils.destroy_model_parallel()
 
