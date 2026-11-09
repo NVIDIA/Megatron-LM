@@ -714,3 +714,38 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+def test_group_limited_routing_requires_num_moe_experts():
+    with pytest.raises(ValueError, match="requires num_moe_experts"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            moe_router_group_topk=1,
+            moe_router_num_groups=1,
+        )
+
+
+def _make_group_routing_config(num_moe_experts, moe_router_num_groups):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=num_moe_experts,
+        moe_router_topk=2,
+        moe_router_num_groups=moe_router_num_groups,
+        moe_router_group_topk=1,
+    )
+
+
+def test_group_limited_routing_rejects_groups_smaller_than_per_group_topk():
+    # One expert per group cannot provide the top-2 experts that group scoring takes.
+    with pytest.raises(AssertionError, match="fewer than the 2 experts per group"):
+        _make_group_routing_config(num_moe_experts=5, moe_router_num_groups=5)
+
+
+def test_group_limited_routing_accepts_groups_holding_per_group_topk():
+    config = _make_group_routing_config(num_moe_experts=10, moe_router_num_groups=5)
+
+    assert config.moe_router_group_topk == 1

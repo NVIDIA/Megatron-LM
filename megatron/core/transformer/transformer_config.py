@@ -4066,6 +4066,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_router_topk_limited_devices is deprecated and replaced by "
                     "moe_router_group_topk and moe_router_num_groups."
                 )
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "Group-limited routing (moe_router_group_topk) requires num_moe_experts."
+                )
             if not self.moe_router_num_groups:
                 raise ValueError(
                     "When using group limited routing, moe_router_num_groups must be specified."
@@ -4078,6 +4082,16 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.moe_router_group_topk <= self.moe_router_num_groups, (
                     f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
                     f"moe_router_num_groups ({self.moe_router_num_groups})."
+                )
+                # Group scores take the top (moe_router_topk // moe_router_group_topk) experts
+                # of each group, so every group must hold at least that many experts.
+                experts_per_group = self.num_moe_experts // self.moe_router_num_groups
+                topk_per_group = self.moe_router_topk // self.moe_router_group_topk
+                assert experts_per_group >= topk_per_group, (
+                    f"Each expert group holds {experts_per_group} experts "
+                    "(num_moe_experts // moe_router_num_groups), fewer than the "
+                    f"{topk_per_group} experts per group that routing selects "
+                    "(moe_router_topk // moe_router_group_topk)."
                 )
         elif self.moe_router_topk_limited_devices:
             warnings.warn(
