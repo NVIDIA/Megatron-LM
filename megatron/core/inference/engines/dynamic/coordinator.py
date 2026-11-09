@@ -370,6 +370,9 @@ class CoordinatorMixin:
         tp_ep_group = getattr(self.pg_collection, "tp_ep", self.pg_collection.ep)
         self.tp_ep_rank = get_pg_rank(tp_ep_group)
         self.tp_ep_world_size = get_pg_size(tp_ep_group)
+        # Without expert parallelism the tp_ep peers are only expert-TP ranks, which receive the
+        # same request broadcast and therefore always have identical work schedules.
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.tp_ep_world_size > 1:
