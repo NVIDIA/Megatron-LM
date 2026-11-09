@@ -386,6 +386,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net_recompute.py]
     products:
       - environment: [lts, dev]
@@ -431,6 +438,22 @@ products:
   # Preserve the distributed matrix separately from local fusion/shape checks,
   # leaving room for CI container startup and teardown within the same limit.
   - test_case: [tests/unit_tests/ssm/test_gdn_gated_output_norm_distributed.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Run the long hybrid-block and root-level KDA suites separately so the
+  # remaining SSM tests fit within the job timeout, including startup/teardown.
+  - test_case: [tests/unit_tests/ssm/test_hybrid_block.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_kda.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
