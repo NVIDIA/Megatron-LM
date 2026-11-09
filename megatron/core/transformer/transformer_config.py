@@ -3093,7 +3093,9 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if self.recompute_granularity != "selective" and (
+                self.recompute_num_layers is None or self.recompute_num_layers < 1
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "

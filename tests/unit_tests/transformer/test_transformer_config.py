@@ -240,6 +240,35 @@ def test_mhc_full_recompute_with_distributed_activations_is_configurable():
     assert config.distribute_saved_activations
 
 
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+@pytest.mark.parametrize("recompute_num_layers", [None, 0, -1])
+def test_full_recompute_requires_positive_recompute_num_layers(
+    recompute_method, recompute_num_layers
+):
+    with pytest.raises(ValueError, match="recompute_num_layers must be between 1 and"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            recompute_granularity="full",
+            recompute_method=recompute_method,
+            recompute_num_layers=recompute_num_layers,
+        )
+
+
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+def test_full_recompute_accepts_positive_recompute_num_layers(recompute_method):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        recompute_granularity="full",
+        recompute_method=recompute_method,
+        recompute_num_layers=1,
+    )
+    assert config.recompute_num_layers == 1
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
