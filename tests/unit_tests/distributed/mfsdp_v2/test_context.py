@@ -274,12 +274,7 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(
-        FsdpContext(
-            device=device,
-            runtime_policy=RuntimePolicy(gradient_finalization_mode=gradient_finalization_mode),
-        )
-    ) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
@@ -290,7 +285,8 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
 
-    model(torch.ones(2, 4, device=device)).sum().backward()
+    with context.finalize_gradients(mode=gradient_finalization_mode):
+        model(torch.ones(2, 4, device=device)).sum().backward()
 
     if gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER:
         finish_grad_sync.assert_not_called()
@@ -429,29 +425,25 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
 
 
 @pytest.mark.parametrize(
-    "mode", [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER]
+    "mode", [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
 )
-def test_finalize_gradients_restores_mode(distributed_setup, mode):
-    """An accumulation scope restores the configured mode on error."""
-    world_size = distributed_setup.world_size
+def test_finalize_gradients_restores_automatic_wait(distributed_setup, monkeypatch, mode):
+    """Leaving a scope, including on error, restores the default automatic wait."""
     device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(FsdpContext(device=device)) as context:
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    finish_grad_sync = Mock(wraps=context.finish_grad_sync)
+    monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
 
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(
-        FsdpContext(device=device, runtime_policy=RuntimePolicy(gradient_finalization_mode=mode))
-    ) as context:
-        for layer in model:
-            fully_shard(layer, mesh=mesh, placements=_default_placements())
+    with pytest.raises(RuntimeError, match="step failed"), context.finalize_gradients(mode=mode):
+        model(torch.ones(2, 4, device=device)).sum().backward()
+        finish_grad_sync.assert_not_called()
+        raise RuntimeError("step failed")
 
-    with (
-        pytest.raises(RuntimeError, match="backward failed"),
-        context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER),
-    ):
-        assert context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER
-        raise RuntimeError("backward failed")
-
-    assert context.gradient_finalization_mode is mode
+    model(torch.ones(2, 4, device=device)).sum().backward()
+    finish_grad_sync.assert_called_once_with()
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
@@ -481,10 +473,8 @@ def test_delayed_wgrad_requires_explicit_grad_wait(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = te.Linear(16, 16, device=device, delay_wgrad_compute=True)
-    with (
-        fully_shard_context(FsdpContext(device=device)),
-        pytest.raises(
-            ValueError, match="gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER"
-        ),
-    ):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    with pytest.raises(RuntimeError, match="Delayed weight gradients require"):
+        model(torch.ones(2, 16, device=device, requires_grad=True)).sum().backward()

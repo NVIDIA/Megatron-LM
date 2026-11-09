@@ -273,10 +273,7 @@ def test_local_accumulation_matches_reference(
     reference = nn.Linear(8, 8 * setup.world_size, bias=False, device=setup.device)
     reference.load_state_dict(model.state_dict())
     context = FsdpContext(
-        device=setup.device,
-        runtime_policy=RuntimePolicy(
-            overlap_outer_communication=True, gradient_finalization_mode=gradient_finalization_mode
-        ),
+        device=setup.device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
     )
     with fully_shard_context(context):
         fully_shard(

@@ -18,19 +18,6 @@ import enum
 from dataclasses import dataclass
 
 
-class GradientFinalizationMode(enum.Enum):
-    """Control outer reduction and the automatic wait for gradient reductions."""
-
-    SKIP_OUTER = enum.auto()
-    """Skip outer reduction and the automatic completion wait during accumulation."""
-
-    REDUCE_OUTER = enum.auto()
-    """Launch outer reduction; the caller must call ``finish_grad_sync()`` afterward."""
-
-    REDUCE_OUTER_AND_WAIT = enum.auto()
-    """Launch outer reduction and wait for all gradient reductions at autograd completion."""
-
-
 class PrefetchOrder(enum.Enum):
     """How to choose the module order used for prefetching."""
 
@@ -40,7 +27,7 @@ class PrefetchOrder(enum.Enum):
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication and initial gradient finalization behavior for an FSDP context."""
+    """Configure communication allocation and streams for an FSDP context."""
 
     use_symmetric_memory: bool = False
     """Allocate communication staging buffers from PyTorch's NCCL symmetric-memory pool."""
@@ -54,15 +41,5 @@ class RuntimePolicy:
 
     overlap_outer_communication: bool = False
     """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
-
-    gradient_finalization_mode: GradientFinalizationMode = (
-        GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-    )
-    """Set the context's initial outer-reduction and completion-wait behavior.
-
-    ``FsdpContext.finalize_gradients()`` temporarily overrides the active mode without
-    modifying this policy. Use ``REDUCE_OUTER`` when the caller waits with
-    ``finish_grad_sync()`` after all backward work, including delayed weight gradients.
-    """
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION

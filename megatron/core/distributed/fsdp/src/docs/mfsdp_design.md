@@ -275,7 +275,6 @@ context = FsdpContext(
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
         overlap_allgather_reduction=False,
-        gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
     ),
 )
 with fully_shard_context(context):
@@ -283,11 +282,25 @@ with fully_shard_context(context):
 ```
 
 `device` and the construction-only `parameter_to_owner` map remain separate
-`FsdpContext` arguments. The default `gradient_finalization_mode` is
-`GradientFinalizationMode.REDUCE_OUTER_AND_WAIT`. Runtime-policy booleans default to `False`,
-except `overlap_allgather_reduction`, which defaults to `True`. With
-`GradientFinalizationMode.REDUCE_OUTER`, call `context.finish_grad_sync()` after all backward
-work, including `backward_dw()`, and before the optimizer step.
+`FsdpContext` arguments. Runtime-policy booleans default to `False`, except
+`overlap_allgather_reduction`, which defaults to `True`. Gradient finalization is selected
+at execution time with `context.finalize_gradients(mode=...)`. Outside a scope, backward
+uses `GradientFinalizationMode.REDUCE_OUTER_AND_WAIT`.
+
+For delayed weight gradients, keep both backward and `backward_dw()` inside the scope,
+then wait before the optimizer step:
+
+```python
+with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+    loss = model(inputs).sum()
+    loss.backward()
+    model.backward_dw()
+context.finish_grad_sync()
+optimizer.step()
+```
+
+MCore's schedules select `REDUCE_OUTER` for the schedule, use `SKIP_OUTER` within existing
+`no_sync()` scopes, and wait in `finalize_model_grads()` after all backward work.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
   `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots

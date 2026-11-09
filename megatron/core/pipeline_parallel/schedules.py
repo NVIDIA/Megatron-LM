@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
-from functools import partial
+from functools import partial, wraps
 from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -48,6 +48,39 @@ except ImportError:
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _with_fsdp_gradient_finalization(schedule):
+    """Keep MFSDP reductions asynchronous until the schedule's explicit completion wait."""
+
+    @wraps(schedule)
+    def wrapped(*, model, **kwargs):
+        # Import lazily: the adapter imports model classes that also use schedules.
+        from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+
+        chunks = model if isinstance(model, list) else [model]
+        contexts = {
+            chunk.module.context
+            for chunk in chunks
+            if isinstance(chunk, FullyShardedDataParallelV2)
+        }
+        if not contexts:
+            return schedule(model=model, **kwargs)
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+            GradientFinalizationMode,
+        )
+
+        with contextlib.ExitStack() as stack:
+            for context in contexts:
+                stack.enter_context(
+                    context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER)
+                )
+            # no_sync() temporarily selects SKIP_OUTER. Keep this scope active through
+            # delayed weight gradients and finalize_model_grads(), which owns the wait.
+            return schedule(model=model, **kwargs)
+
+    return wrapped
 
 
 def get_forward_backward_func(
@@ -732,6 +765,7 @@ def _reset_activation_offload(
     off_interface.reset(process_group=pg_collection.tp_dp_cp)
 
 
+@_with_fsdp_gradient_finalization
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -1010,6 +1044,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@_with_fsdp_gradient_finalization
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -2166,6 +2201,7 @@ def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multim
     return chain((batch,), data_iterator)
 
 
+@_with_fsdp_gradient_finalization
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,

@@ -259,21 +259,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     device=device,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
-            if (
-                active_context.gradient_finalization_mode
-                is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-            ):
-                raise ValueError(
-                    "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy("
-                    "gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER)."
-                )
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
