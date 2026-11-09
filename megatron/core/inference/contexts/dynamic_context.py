@@ -3678,14 +3678,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             prefill_chunk_length (Optional[int]): Prompt tokens in the chunk to admit.
                 Defaults to the whole remaining prompt.
         """
-        # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
-        # A handoff is the exception: it keeps its live recurrent-state slot after
-        # its request row is removed, so both capacities must be checked independently.
-        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
+        # Hybrid models also need a free recurrent-state slot. The slot pool has one
+        # entry per request row, but slots can be held by state that owns no row:
+        # a prefill engine keeps a finished handoff's slot until the decode peer has
+        # read it, and a decode engine reserves a slot for each incoming handoff
+        # before that request is admitted. A free row therefore does not imply a
+        # free slot, and add_request would fail mid-allocation without this check.
+        if self.is_hybrid_model:
             request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
         if prefill_chunk_length is None:

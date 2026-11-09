@@ -1132,6 +1132,31 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
 
     @pytest.mark.internal
+    def test_hybrid_admission_counts_slots_reserved_outside_request_rows(self):
+        """A decode engine reserves live slots for incoming handoffs before they own a row.
+
+        Handoff pinning is off on decode, so the free request row must not be taken
+        as proof of a free recurrent-state slot; otherwise add_request raises.
+        """
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        assert not ctx.kv_block_allocator.enable_handoff_pinning
+        reserved_slots = [ctx.mamba_metadata.allocate_slot() for _ in range(ctx.max_requests)]
+        assert None not in reserved_slots
+        assert ctx.total_request_count < ctx.max_requests
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 0
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        ctx.mamba_metadata.free_slot(reserved_slots[0])
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+    @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
         # mamba match limits prefill skip
         ctx = self._mctx()
