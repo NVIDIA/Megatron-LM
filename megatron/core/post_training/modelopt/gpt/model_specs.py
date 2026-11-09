@@ -3,6 +3,7 @@
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
+from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.post_training.modelopt.layers import (
     BlockwiseFP8WeightTransformerLayer,
     FP8WeightTransformerLayer,
@@ -19,7 +20,6 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,

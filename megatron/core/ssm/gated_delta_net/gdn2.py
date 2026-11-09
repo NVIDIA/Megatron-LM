@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -24,7 +24,12 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
 )
 from megatron.core.ssm.ssm_inference import steps_from_zero_state
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    deprecate_inference_params,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 try:
     # The GDN2 kernels are only available in flash-linear-attention >= 0.5.1.
@@ -80,13 +85,7 @@ class GatedDeltaNet2(_GDNBase):
             self.qk_dim_local_tp,  # b (erase gate)
             self.v_dim_local_tp,  # w (write gate)
         )
-        self.feat_dim_split = (
-            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,  # qkv
-            self.v_dim_local_tp // self.cp_size,  # gate (z)
-            self.qk_dim_local_tp // self.cp_size,  # f
-            self.qk_dim_local_tp // self.cp_size,  # b
-            self.v_dim_local_tp // self.cp_size,  # w
-        )
+        self.feat_dim_split = self._get_feat_dim_split(self.cp_size)
 
         # Time step projection (discretization): per-key-channel dt_bias and
         # per-key-head A_log, following the GDN2 reference implementation.
@@ -115,6 +114,17 @@ class GatedDeltaNet2(_GDNBase):
         # FLA's recurrent kernel takes one step per sequence of one token without the chunked
         # kernel's per-sequence chunk state. It has no backward.
         self.single_token_gated_delta_rule = fused_recurrent_gdn2
+
+    def _get_feat_dim_split(self, cp_size: int) -> tuple[int, int, int, int, int]:
+        """Return projection split sizes for the runtime head-parallel CP size."""
+        self._validate_runtime_cp_size(cp_size)
+        return (
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
+            self.v_dim_local_tp // cp_size,
+            self.qk_dim_local_tp // cp_size,
+            self.qk_dim_local_tp // cp_size,
+            self.v_dim_local_tp // cp_size,
+        )
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.
@@ -186,8 +196,11 @@ class GatedDeltaNet2(_GDNBase):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = get_pg_size(cp_group)
+
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * cp_size
 
         if inference_context is not None:
             assert (
@@ -198,6 +211,7 @@ class GatedDeltaNet2(_GDNBase):
             raise NotImplementedError("GDN2 does not support inference for now.")
 
         if steps_from_zero_state(packed_seq_params):
+            assert cp_size == 1, "GDN2 single-token sequences do not support CP."
             return self._single_token_sequences_pre_attn_and_core_attn(hidden_states)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -212,14 +226,14 @@ class GatedDeltaNet2(_GDNBase):
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -242,8 +256,8 @@ class GatedDeltaNet2(_GDNBase):
         qkvzfbw, thd_cp_a2a_inv = a2a_cp_to_hp(
             qkvzfbw,
             self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
+            cp_size,
+            cp_group,
             cu_seqlens_q,
             seq_len,
             packed_seq_params,
@@ -253,7 +267,7 @@ class GatedDeltaNet2(_GDNBase):
         # From sbhd to bshd format
         qkvzfbw = qkvzfbw.transpose(0, 1)
         kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(
-            qkvzfbw, batch, seq_len, cu_seqlens_q
+            qkvzfbw, batch, seq_len, cu_seqlens_q, cp_size, cp_group
         )
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -273,21 +287,33 @@ class GatedDeltaNet2(_GDNBase):
                 thd_cp_a2a_inv=thd_cp_a2a_inv,
                 batch=batch,
                 seq_len=seq_len,
+                cp_size=cp_size,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
             )
             norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
         else:
             norm_out = self._gated_norm_and_a2a(
-                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
+                core_attn_out,
+                gate,
+                thd_cp_a2a_inv,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                packed_seq_params,
             )
 
         return norm_out
 
-    def _conv_and_prepare_kernel_inputs(self, qkvzfbw, batch, seq_len, cu_seqlens_q):
+    def _conv_and_prepare_kernel_inputs(
+        self, qkvzfbw, batch, seq_len, cu_seqlens_q, cp_size=1, cp_group=None
+    ):
         """Split the bshd in_proj output, run the causal conv over q/k/v, and prepare the
-        recurrence inputs. Returns the kernel inputs and the output gate (z)."""
+        recurrence inputs for the runtime CP size and group. Returns the kernel inputs and the
+        output gate (z)."""
         # Split the tensor into q/k/v, gate (z), and the GDN2 gate features f, b, w
-        qkv, gate, f, b, w = torch.split(qkvzfbw, self.feat_dim_split, dim=-1)
+        qkv, gate, f, b, w = torch.split(qkvzfbw, self._get_feat_dim_split(cp_size), dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         # Convolution on qkv
@@ -299,16 +325,13 @@ class GatedDeltaNet2(_GDNBase):
             self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
         )
         conv1d_bias = (
             get_parameter_local_cp(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -323,7 +346,7 @@ class GatedDeltaNet2(_GDNBase):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -340,15 +363,22 @@ class GatedDeltaNet2(_GDNBase):
             )
         nvtx_range_pop(suffix="conv1d")
 
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)
 
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
         kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, f, b, w
+            qkv,
+            gate,
+            A_log_local_cp,
+            dt_bias_local_cp,
+            batch,
+            seq_len,
+            f,
+            b,
+            w,
+            cp_size_headwise=cp_size,
         )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
@@ -360,9 +390,8 @@ class GatedDeltaNet2(_GDNBase):
 
         See ``steps_from_zero_state``. The in_proj output [t, 1, x] is already the bshd batch of
         t length-1 sequences: the conv sees each token alone, and the kernel takes one step per
-        sequence, without the chunked kernel's varlen metadata.
+        sequence, without the chunked kernel's varlen metadata. Requires a runtime CP size of 1.
         """
-        assert self.cp_size == 1, "GDN2 single-token sequences do not support CP."
         nvtx_range_push(suffix="in_proj")
         qkvzfbw, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
