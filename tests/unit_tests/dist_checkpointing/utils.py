@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from typing import Any, Callable, Tuple, Union
@@ -19,6 +19,7 @@ from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.global_vars import get_run_config, is_run_config_initialized
 from megatron.training.training import get_megatron_ddp_config, get_model
+from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -240,6 +241,9 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # The registered run config owns these settings; tests that write to args afterwards call
+    # sync_checkpoint_config(args) again before saving or loading.
+    sync_checkpoint_config(args)
     # Clear the metadata cache to avoid contamination between tests
 
     if HAVE_NVRX:
@@ -344,11 +348,27 @@ def setup_model_and_optimizer(
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
             ),
+            config=TransformerConfig(
+                num_layers=NUM_LAYERS,
+                hidden_size=HIDDEN_SIZE,
+                num_attention_heads=NUM_ATTENTION_HEADS,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
+                num_moe_experts=ep if ep > 1 else None,
+                add_bias_linear=False,
+                sequence_parallel=tp > 1 and ep > 1,
+                bf16=bf16,
+            ),
             ddp_config=get_megatron_ddp_config(
                 mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
             ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -488,11 +508,25 @@ def setup_moe_model_and_optimizer(
                 use_glu=use_glu,
                 bf16=bf16,
             ),
+            config=TransformerConfig(
+                num_layers=NUM_LAYERS,
+                hidden_size=HIDDEN_SIZE,
+                num_attention_heads=NUM_ATTENTION_HEADS,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+                expert_model_parallel_size=ep,
+                num_moe_experts=8,
+                add_bias_linear=False,
+                sequence_parallel=tp > 1 and ep > 1,
+                bf16=bf16,
+            ),
             ddp_config=get_megatron_ddp_config(
                 mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
             ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,

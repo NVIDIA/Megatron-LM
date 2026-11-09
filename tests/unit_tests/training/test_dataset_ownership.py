@@ -18,6 +18,7 @@ from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer import TransformerConfig
 from megatron.training import argument_utils, arguments, global_vars
 from megatron.training.argument_utils import (
     _DATASET_FIELD_SOURCES,
@@ -39,6 +40,7 @@ from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.models import GPTModelConfig
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -47,15 +49,15 @@ MODEL_ARGV = (
 ).split()
 SOURCE = ["--data-path", "prefix-a", "--split", "9,1,0"]
 BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
-# The layout fields the container writes from the model config; a run without one keeps them.
+# The layout fields the container writes from the required model config.
 LAYOUT_FIELDS = (
     "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
-    "dynamic_context_parallel", "hybrid_context_parallel",
+    "dynamic_context_parallel",
 )  # fmt: skip
 # Megatron Core's defaults for the fields the container writes: what an unset field holds.
 CORE_DEFAULTS = {
     "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
-    "dynamic_context_parallel": False, "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
     "multiple_validation_sets": None, "full_validation": None,
 }  # fmt: skip
 
@@ -149,13 +151,13 @@ def container_factory(monkeypatch):
     )
 
     def build(argv, *, data=False, **kwargs):
-        # finalize() resolves the batch sizes from the registered arguments (upstream #8149):
-        # a micro batch and the batch-parallel size validate_args derives from the world size.
+        # These tests exercise data translation; supply the required model section separately.
         args = _parse(["--micro-batch-size", "1", *argv])
         args.batch_parallel_size = 1
         monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
         if data:
             kwargs["data_cfg"] = gpt_data_config_from_args(args)
+        kwargs.setdefault("model_cfg", _layout())
         return args, pretrain_cfg_container_from_args(args, **kwargs)
 
     return build
@@ -170,6 +172,7 @@ def warnings_log(monkeypatch):
 
 def _layout(**overrides):
     layout = dict(
+        fp16=False,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
@@ -179,13 +182,16 @@ def _layout(**overrides):
         calculate_per_token_loss=True,
         max_seqlen_per_dp_cp_rank=None,
         gtp_weight_remat_size=1,
-        gtp_remat_num_sequence_shards=1,
+        tensor_parallel_num_sequence_shards=None,
         cuda_graph_impl="none",
     )
     layout.update(overrides)
     # What Megatron Core derives at construction: a scheduler sets variable_seq_lengths.
     layout.setdefault("variable_seq_lengths", layout["sequence_packing_scheduler"] is not None)
-    return SimpleNamespace(transformer=SimpleNamespace(**layout), seq_length=4096)
+    transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8)
+    for name, value in layout.items():
+        setattr(transformer, name, value)
+    return GPTModelConfig(transformer=transformer, seq_length=4096, vocab_size=2048)
 
 
 # Construction from the arguments.
@@ -364,7 +370,6 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
         args.sequence_parallel
     )
     assert standalone.dynamic_context_parallel is False
-    assert standalone.hybrid_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
     assert _written_fields(owned) == CORE_DEFAULTS
     assert owned.random_seed == 99  # the seed is the section's own setting
@@ -470,7 +475,6 @@ def test_container_writes_the_owned_fields_at_finalize(container_factory, monkey
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
     assert (dataset.context_parallel_size, dataset.sequence_parallel_size) == (2, 2)
     assert dataset.dynamic_context_parallel is True and dataset.data_parallel_size == 2
-    assert dataset.hybrid_context_parallel is False  # the deprecated alias is never written True
     assert cfg.data.dataset_type is MockGPTDataset
     assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
     assert cfg.to_dict()["data"]["dataset"]["random_seed"] == 99
@@ -504,44 +508,14 @@ def test_a_layout_field_at_core_default_carries_no_explicit_value(container_fact
     assert dataset.dynamic_context_parallel is True
 
 
-def test_the_deprecated_hybrid_alias_is_folded_into_dynamic_context_parallel(
-    container_factory, monkeypatch
-):
-    """A section carrying Megatron Core's deprecated hybrid_context_parallel alias (#7047) counts
-    as the canonical flag for the cross-section check and is folded at finalize(): Core warns about
-    the alias in validate_without_tokenizer() and does not rewrite it; the container writes
-    dynamic_context_parallel from the model config and clears the alias."""
+def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
+    """Reloading reconstructs dataset layout from the authoritative model section."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    dataset = cfg.data.dataset
-    dataset.hybrid_context_parallel = True
-    cfg.model = _layout(dynamic_context_parallel=False)
-    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
-    with pytest.warns(DeprecationWarning, match="hybrid_context_parallel is deprecated"):
-        with pytest.raises(
-            ValueError, match="data.dataset.dynamic_context_parallel=True disagrees"
-        ):
-            cfg.validate()
-    cfg.model = _layout(dynamic_context_parallel=True)
-    with pytest.warns(DeprecationWarning):
-        cfg.validate()
-        cfg.finalize()
-    assert dataset.dynamic_context_parallel is True and dataset.hybrid_context_parallel is False
-    cfg.validate()  # nothing deprecated is left on the section
-    assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
-
-
-def test_layout_without_a_model_section_survives_a_reload(
-    container_factory, monkeypatch, tokenizer
-):
-    """What a run without a model section (pretrain_hybrid_flex.py) saves reproduces its layout
-    fields: Megatron Core's defaults."""
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
     layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
-    assert layout == (1, None, 0, False, False)
+    assert layout == (8, 1, 0, False)
     cfg.validate()  # Core's defaults are not explicit values
     reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
     reloaded.finalize()
@@ -549,25 +523,23 @@ def test_layout_without_a_model_section_survives_a_reload(
     assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_FIELDS) == layout
 
 
-def test_owned_fields_without_a_model_section(container_factory, tokenizer):
-    """pretrain_hybrid_flex.py builds its container without a model config: the validation flags
-    are written, the layout fields have no owner and keep what they hold (Megatron Core's defaults
-    from the factory; a Python caller's value is used by the run and not saved)."""
+def test_dataset_layout_requires_a_model_section(container_factory):
+    """A dataset's layout fields cannot replace the required model owner."""
     _, cfg = container_factory(
         ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
     )
     cfg.model = None
     dataset = cfg.data.dataset
     dataset.data_parallel_size = 4
-    cfg.validate()
-    cfg.finalize()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.validate()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.finalize()
     assert dataset.random_seed == 1234  # --seed, from construction
-    assert dataset.full_validation is True and dataset.multiple_validation_sets is False
+    assert dataset.full_validation is None and dataset.multiple_validation_sets is None
     assert dataset.data_parallel_size == 4 and dataset.context_parallel_size is None
     assert "data_parallel_size" not in cfg.to_dict()["data"]["dataset"]
-    cfg.data.bind_tokenizer(tokenizer)  # Core's defaults stay on the rest of the layout
-    assert (dataset.sequence_parallel_size, dataset.hybrid_context_parallel) == (0, False)
-    cfg.validate()
+    assert (dataset.sequence_parallel_size, dataset.dynamic_context_parallel) == (0, False)
 
 
 @pytest.mark.parametrize(
@@ -578,8 +550,6 @@ def test_owned_fields_without_a_model_section(container_factory, tokenizer):
         ("context_parallel_size", 4, "data.dataset.context_parallel_size=4 disagrees with model.transformer.context_parallel_size=2"),
         ("sequence_parallel_size", 1, "data.dataset.sequence_parallel_size=1 disagrees with the model layout"),
         ("dynamic_context_parallel", True, "data.dataset.dynamic_context_parallel=True disagrees with model.transformer.dynamic_context_parallel=False"),
-        # the deprecated alias counts as the canonical flag (Core warns about it)
-        ("hybrid_context_parallel", True, "data.dataset.dynamic_context_parallel=True disagrees with model.transformer.dynamic_context_parallel=False"),
     ],
 )  # fmt: skip
 def test_each_owned_field_is_checked_against_its_owner(container_factory, field, value, message):
@@ -600,13 +570,13 @@ def test_each_owned_field_is_checked_against_its_owner(container_factory, field,
     [
         (8, dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2), 1, 2),
         (8, dict(tensor_model_parallel_size=2, context_parallel_size=2), 2, 2),
-        (16, dict(tensor_model_parallel_size=2, context_parallel_size=2, gtp_weight_remat_size=2, gtp_remat_num_sequence_shards=2), 1, 4),
+        (16, dict(tensor_model_parallel_size=2, sequence_parallel=True, context_parallel_size=2, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=4), 1, 4),
         (16, dict(tensor_model_parallel_size=2, context_parallel_size=2, gtp_weight_remat_size=2), 2, 2),
         (4, dict(), 1, 4),
     ],
 )  # fmt: skip
 def test_get_data_parallel_size_matches_validate_args(
-    container_factory, world_size, layout, configured_cp, expected
+    container_factory, monkeypatch, world_size, layout, configured_cp, expected
 ):
     """validate_args: world_size // (tp * pp * configured cp * weight remat); the model config holds
     the resolved cp (configured cp times the GTP sequence shards)."""
@@ -624,19 +594,21 @@ def test_get_data_parallel_size_matches_validate_args(
         * transformer.gtp_weight_remat_size
     )
     assert expected == legacy
-    assert cfg.get_data_parallel_size(world_size) == expected
-    cfg.model = None
-    assert cfg.get_data_parallel_size(world_size) is None
+    assert cfg.get_parallel_layout(world_size).dp == expected
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: world_size)
+    assert cfg.get_data_parallel_size() == expected
 
 
 def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
     _, cfg = container_factory(["--seq-length", "64"])
     cfg.model = _layout(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
     with pytest.raises(ValueError, match="divisible"):
-        cfg.get_data_parallel_size(6)
-    cfg.model = _layout(context_parallel_size=3, gtp_remat_num_sequence_shards=2)
-    with pytest.raises(ValueError, match="multiple of the GTP sequence shards"):
-        cfg.get_data_parallel_size(12)
+        cfg.get_parallel_layout(6)
+    cfg.model = _layout(
+        context_parallel_size=3, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=2
+    )
+    with pytest.raises(ValueError, match="must contain the GTP sequence shards"):
+        cfg.get_parallel_layout(12)
 
 
 def test_model_capacity_must_cover_the_sample_length(container_factory):
@@ -648,7 +620,8 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
     cfg.model.seq_length = 64
     cfg.validate()
     cfg.model = None
-    cfg.validate()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.validate()
 
 
 # Serialization and loading.
@@ -681,7 +654,6 @@ def test_full_container_round_trips_before_and_after_binding_the_tokenizer(
     assert from_file.data.dataset_type is GPTDataset
     assert from_file.data.to_cfg_dict() == cfg.data.to_cfg_dict()
     # After finalize() and binding the tokenizer the file still carries no runtime state.
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 2)
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
@@ -732,7 +704,6 @@ def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     container_factory, monkeypatch, tokenizer
 ):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
     with pytest.raises(RuntimeError, match="before the container is finalized"):
@@ -752,7 +723,6 @@ def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     loader_only.finalize()
     global_vars._bind_dataset_tokenizer(loader_only)  # nothing to bind
     _, unbound = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    unbound.model = None
     unbound.finalize()
     global_vars._bind_dataset_tokenizer(unbound)  # no tokenizer (build_tokenizer=False)
     assert unbound.data.dataset.tokenizer is None
@@ -779,7 +749,6 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "_set_telemetry", lambda args, **kwargs: None)
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
     args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)  # the bootstrap registers them
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_run_config() is cfg and cfg._finalized
@@ -796,8 +765,8 @@ def test_set_global_variables_finalizes_a_dataset_section(
 
 def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     """dummy_train_step (the skip-iteration path) runs for any container: the batch flags and the
-    data length come from the data section, the model-parallel values from the model section when
-    there is one and from the arguments otherwise; the poisoned namespace shows which source won."""
+    data length come from the data section, the model-parallel values from the model section;
+    the poisoned namespace shows which source won."""
     from megatron.training import training
     from megatron.training.config import DataConfig
 
@@ -823,25 +792,34 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_group", lambda: None)
     monkeypatch.setattr(training.mpu, "is_pipeline_first_stage", lambda: True)
     monkeypatch.setattr(training.mpu, "is_pipeline_last_stage", lambda: True)
-    args = SimpleNamespace(  # poisoned wherever the section or the model section rules
+    args = SimpleNamespace(  # poisoned wherever the data section or the model section rules
         seq_length=64,
-        context_parallel_size=2,
-        pipeline_model_parallel_size=4,
-        dynamic_context_parallel=False,
-        sequence_packing_scheduler=None,
+        context_parallel_size=3,
+        pipeline_model_parallel_size=5,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="dp_balanced",
         sft=True,
         dataloader_inter_document_masking=True,
         create_attention_mask_in_dataloader=False,
     )
     monkeypatch.setattr(training, "get_args", lambda: args)
     train = SimpleNamespace(micro_batch_size=3)
+    transformer = SimpleNamespace(
+        context_parallel_size=2,
+        pipeline_model_parallel_size=4,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+    )
 
-    # No model section (pretrain_hybrid_flex.py) and a loader-only section: the topology and the
-    # length come from the arguments, the flags are the plain-GPT ones whatever args.sft says.
+    # A loader-only section (an entry point whose datasets come from its own callbacks): the
+    # length comes from the arguments, the flags are the plain-GPT ones whatever args.sft says,
+    # the model-parallel values are the model section's.
     monkeypatch.setattr(
         training,
         "get_run_config",
-        lambda: SimpleNamespace(model=None, data=DataConfig(), train=train),
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=transformer), data=DataConfig(), train=train
+        ),
     )
     training.dummy_train_step(None)
     kw = calls.pop()
@@ -977,8 +955,6 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
         cfg.validate()
     cfg.model = _layout()
     cfg.validate()
-    cfg.model = None  # no model section: the model-dependent rules do not apply
-    cfg.validate()
 
 
 def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):
@@ -1046,7 +1022,6 @@ def test_the_loop_reads_the_data_length_from_the_section(container_factory, monk
     monkeypatch.setattr(
         global_vars, "init_num_microbatches_calculator", lambda **kw: calls.append(kw)
     )
-    monkeypatch.setattr(global_vars, "get_batch_parallel_size", lambda ns: 1)
     for name in (
         "_set_tensorboard_writer",
         "_set_one_logger",
@@ -1077,10 +1052,8 @@ def test_the_loop_reads_the_data_length_from_the_section(container_factory, monk
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
 def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point):
     """The three scripts' get_batch read the batch flags and the data length from the section and
-    the model-parallel values from the model section (hybrid-flex: from the transformer config the
-    arguments describe); every data-owned value on args is poisoned and must not surface in the
-    captured call."""
-    from megatron.training import arguments
+    the model-parallel values from the model section; every data-owned value on args is poisoned
+    and must not surface in the captured call."""
     from megatron.training.config import DataConfig
 
     if entry_point == "gpt":
@@ -1112,9 +1085,8 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
         sequence_parallel=False,
         tensor_model_parallel_size=1,
     )
-    model = None if entry_point == "hybrid_flex" else SimpleNamespace(transformer=transformer)
     cfg = SimpleNamespace(
-        model=model,
+        model=SimpleNamespace(transformer=transformer),
         data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
         train=SimpleNamespace(micro_batch_size=5),
     )
@@ -1131,8 +1103,6 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
     )
     monkeypatch.setattr(script, "get_args", lambda: args)
     monkeypatch.setattr(script, "get_run_config", lambda: cfg)
-    # hybrid-flex has no model section: its transformer config is built from the arguments.
-    monkeypatch.setattr(arguments, "core_transformer_config_from_args", lambda ns: transformer)
     monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage: True)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kw: False)
     monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator

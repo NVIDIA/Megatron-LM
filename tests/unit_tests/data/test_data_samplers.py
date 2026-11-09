@@ -10,14 +10,17 @@ the default CPU generator -- except, on the pre-fix code, iterator creation itse
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import megatron.training.datasets.data_samplers as data_samplers
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.utils import Split
+from megatron.core.transformer import TransformerConfig
 from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 
 SEED = 1234
@@ -47,11 +50,16 @@ class TestDataLoaderResume:
 
     def test_building_data_iterators_does_not_move_cpu_rng(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+
         run_config.train.micro_batch_size = 1
         run_config.train.global_batch_size = Utils.world_size
         run_config.data.dataloader.dataloader_type = 'single'
         run_config.data.dataloader.num_workers = 0
-        monkeypatch.setattr(data_samplers, 'get_args', lambda: _legacy_args())
+        monkeypatch.setattr(data_samplers, 'get_args', lambda: _legacy_args(), raising=False)
         steps_before_save = 3
 
         _set_random_seed()
@@ -81,22 +89,67 @@ class TestDataLoaderResume:
             "restored, so the resumed run diverges from the run that saved"
         )
 
+    @pytest.mark.parametrize(
+        "dynamic_cp,scheduler",
+        [(False, None), (False, "dp_balanced"), (True, "default_dynamic_cp")],
+    )
+    def test_sampler_and_collation_use_model_config(
+        self, monkeypatch, run_config, dynamic_cp, scheduler
+    ):
+        Utils.initialize_model_parallel(1, 1)
+        run_config.train.micro_batch_size = 1
+        run_config.train.global_batch_size = 2 * Utils.world_size
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+        run_config.model.transformer.dynamic_context_parallel = dynamic_cp
+        run_config.model.transformer.sequence_packing_scheduler = scheduler
+        # The loader settings are the data section's (its num_workers defaults to 2).
+        run_config.data.dataloader.dataloader_type = "single"
+        run_config.data.dataloader.num_workers = 0
+        monkeypatch.setattr(
+            data_samplers,
+            "get_args",
+            lambda: SimpleNamespace(
+                dataloader_type="single",
+                micro_batch_size=1,
+                global_batch_size=2 * Utils.world_size,
+                num_workers=0,
+                dynamic_context_parallel=not dynamic_cp,
+                sequence_packing_scheduler=None if scheduler else "dp_balanced",
+                use_varlen_dataset=False,
+                varlen_sbhd_validation=False,
+            ),
+            raising=False,
+        )
+
+        loader = data_samplers.build_pretraining_data_loader(_Dataset(), consumed_samples=0)
+
+        assert isinstance(loader.batch_sampler, data_samplers.MegatronPretrainingSampler)
+        batch = next(iter(loader))
+        if dynamic_cp or scheduler is not None:
+            assert isinstance(batch, list)
+            assert len(batch) == 1
+        else:
+            assert batch.shape == (1, 1)
+
 
 BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
 BLEND = (["prefix-a"], None)
 
 
 def _legacy_args(**overrides):
-    """The namespace the loader still receives: loader values it no longer reads (poisoned here,
-    so a read would show) and the topology fallback for a container without a model section."""
+    """The namespace the loader no longer reads (it imports no get_args): poisoned so a read,
+    should one come back, would show (each value selects another sampler or collate)."""
     values = dict(
         dataloader_type="cyclic",
         num_workers=7,
         data_sharding=False,
         use_varlen_dataset=True,
         varlen_sbhd_validation=False,
-        dynamic_context_parallel=False,
-        sequence_packing_scheduler=None,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="dp_balanced",
         context_parallel_size=1,
         pipeline_model_parallel_size=1,
     )
@@ -127,7 +180,7 @@ def _batch(dataset):
 
 class TestLoaderSettingsFromTheDataSection:
     """build_pretraining_data_loader reads cfg.data.dataloader, the dataset family and the model
-    section; the legacy namespace feeds only the topology fallback of a modelless container."""
+    section; the legacy namespace is poisoned and must not be read."""
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -135,7 +188,7 @@ class TestLoaderSettingsFromTheDataSection:
     def test_loader_settings_come_from_the_section_not_from_args(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
-        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args())
+        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args(), raising=False)
         _section(run_config)
         loader = data_samplers.build_pretraining_data_loader(_Dataset(), 0)
         assert isinstance(loader.batch_sampler, data_samplers.MegatronPretrainingSampler)
@@ -160,7 +213,7 @@ class TestLoaderSettingsFromTheDataSection:
     def test_collate_follows_the_dataset_family_and_the_topology(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
-        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args())
+        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args(), raising=False)
         plain = GPTDatasetConfig(sequence_length=16, random_seed=1, **BOOLS)
         # Unpacked varlen samples: the identity collate, a list of sample dicts.
         _section(run_config, dataset=plain, dataset_type=MockVarlenDataset)
@@ -178,19 +231,14 @@ class TestLoaderSettingsFromTheDataSection:
         _section(run_config, dataset=sbhd, dataset_type=VarlenDataset)
         batch = _batch(_DictDataset())
         assert isinstance(batch, dict) and tuple(batch["tokens"].shape) == (1, 2)
-        # A loader-only section: the default collate; the model-owned half of the decision comes
-        # through the topology fallback (this container has no model section).
+        # A loader-only section: the default collate unless the model section selects dynamic CP
+        # or a packing scheduler (the fixture's selects neither; the namespace says both).
         _section(run_config)
         assert isinstance(_batch(_DictDataset()), dict)
-        monkeypatch.setattr(
-            data_samplers, "get_args", lambda: _legacy_args(dynamic_context_parallel=True)
-        )
+        run_config.model.transformer.dynamic_context_parallel = True
         assert isinstance(_batch(_DictDataset()), list)
-        monkeypatch.setattr(
-            data_samplers,
-            "get_args",
-            lambda: _legacy_args(sequence_packing_scheduler="dp_balanced"),
-        )
+        run_config.model.transformer.dynamic_context_parallel = False
+        run_config.model.transformer.sequence_packing_scheduler = "dp_balanced"
         assert isinstance(_batch(_DictDataset()), list)
 
     def test_sft_batches_keep_the_default_collate(self, monkeypatch, run_config):
@@ -199,7 +247,7 @@ class TestLoaderSettingsFromTheDataSection:
         must not drive the collate."""
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
-        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args())
+        monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args(), raising=False)
         tokenizer = SimpleNamespace(
             eod=15, eos=15, pad=-1, vocab_size=16, unique_identifiers={"class": "test"}
         )

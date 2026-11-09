@@ -57,7 +57,7 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.config.compat import data_sequence_length
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
@@ -83,7 +83,7 @@ BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
     "cu_seqlens_padded",
-    "hybrid_cp_group",
+    "dynamic_cp_group",
     "labels",
     "local_cp_size",
     "loss_mask",
@@ -91,23 +91,6 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
-
-
-# The args object and the transformer config built from it, reused until the args object
-# is replaced.
-_transformer_config_cache = None
-
-
-def _get_transformer_config(args):
-    """Return the transformer config for args, building it only when args is a new object.
-
-    get_batch runs every microbatch, and rebuilding the config there re-runs
-    TransformerConfig.__post_init__, which repeats its validation warnings in the log.
-    """
-    global _transformer_config_cache
-    if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
-        _transformer_config_cache = (args, core_transformer_config_from_args(args))
-    return _transformer_config_cache[1]
 
 
 def get_batch(
@@ -119,11 +102,8 @@ def get_batch(
 
     cfg = get_run_config()
     args = get_args()
-    # Keep the legacy config cache for callers without a model section.
-    config = cfg.model.transformer if cfg.model is not None else _get_transformer_config(args)
-    flags = cfg.data.batch_flags()
 
-    if config.sequence_packing_scheduler is not None:
+    if cfg.model.transformer.sequence_packing_scheduler is not None:
         if pg_collection is None:
             # Compatibility for direct entrypoint callers; Core receives explicit groups.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
@@ -131,34 +111,36 @@ def get_batch(
             )
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
-            vpp_size=config.virtual_pipeline_model_parallel_size,
+            vpp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
-                layout=config.pipeline_model_parallel_layout,
-                mtp_num_layers=config.mtp_num_layers,
+                layout=cfg.model.transformer.pipeline_model_parallel_layout,
+                mtp_num_layers=cfg.model.transformer.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
                 pp_group=pg_collection.pp,
-                vp_size=config.virtual_pipeline_model_parallel_size or 1,
+                vp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
-            dynamic_cp=config.dynamic_context_parallel,
+            dynamic_cp=cfg.model.transformer.dynamic_context_parallel,
             pg_collection=pg_collection,
-            config=config,
+            config=cfg.model.transformer,
         )
 
-    cp_size = config.context_parallel_size
-    seq_length = data_sequence_length(cfg, args)  # the packing path above needs no length
+    # The data section's batch flags and length; the packing path above needs neither.
+    flags = cfg.data.batch_flags()
+    cp_size = cfg.model.transformer.context_parallel_size
+    seq_length = data_sequence_length(cfg, args)
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = flags.has_cu_seqlens
     create_attention_mask_in_dataloader = flags.create_attention_mask
     mtp_on_this_rank = mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
     # Dynamic CP always uses the sequence-packing path above.
-    assert not config.dynamic_context_parallel
+    assert not cfg.model.transformer.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -189,7 +171,7 @@ def get_batch(
         micro_batch_size=cfg.train.micro_batch_size,
         seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=config.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -298,7 +280,8 @@ def loss_func(
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
-    if args.check_for_nan_in_loss_and_grad:
+    cfg = get_run_config()
+    if cfg.rerun_state_machine.check_for_nan_in_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isnan,
@@ -314,7 +297,7 @@ def loss_func(
             fatal=True,
         )
     # Check for spiky loss
-    if args.check_for_spiky_loss:
+    if cfg.rerun_state_machine.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=partial(
@@ -339,6 +322,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # Get the batch.
@@ -372,7 +356,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 attention_mask,
                 cu_seqlens,
                 cu_seqlens_padded,
-                hybrid_cp_group,
+                dynamic_cp_group,
                 labels,
                 local_cp_size,
                 loss_mask,
@@ -404,7 +388,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_q=int(max_seqlen.item()),
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-                    cp_group=hybrid_cp_group,
+                    cp_group=dynamic_cp_group,
                     tokens_per_sample=data_sequence_length(get_run_config(), args),
                 )
 
@@ -425,7 +409,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer:
         if return_schedule_plan:
             assert (
-                args.overlap_moe_expert_parallel_comm
+                cfg.model.transformer.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
                 tokens,
@@ -468,11 +452,10 @@ def get_embedding_ranks(pp_ranks: List[int]):
     """Get the embedding ranks."""
     embedding_ranks = [pp_ranks[0]]
     if len(pp_ranks) > 1:
-        args = get_args()
-        if not args.untie_embeddings_and_output_weights:
+        cfg = get_run_config()
+        if cfg.model.share_embeddings_and_output_weights:
             embedding_ranks.append(pp_ranks[-1])
-        config = core_transformer_config_from_args(args)
-        mtp_ranks = get_mtp_ranks(pp_ranks, config)
+        mtp_ranks = get_mtp_ranks(pp_ranks, cfg.model.transformer)
         embedding_ranks.extend(mtp_ranks)
     embedding_ranks = list(set(embedding_ranks))
     embedding_ranks = sorted(embedding_ranks)

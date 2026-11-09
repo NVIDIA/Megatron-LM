@@ -11,8 +11,6 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-from megatron.training import get_args
-from megatron.training.config.compat import model_topology
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.global_vars import get_run_config
 
@@ -29,7 +27,6 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     except TypeError:
         pass
     cfg = get_run_config()
-    args = get_args()  # the topology fallback for a container without a model section
     loader = cfg.data.dataloader
     # Unset selects 'single', as DataloaderConfig.finalize() and validate_args do (a section can be
     # registered unfinalized by tests and direct callers).
@@ -104,12 +101,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # upstream packing scheduler (the varlen family without SBHD validation: the section's
     # yields_unpacked_samples) and for the dynamic-CP and packing-scheduler paths. SFT samples
     # are packed but fixed-width and take the default collate. The model-owned half comes from
-    # the model section when the container has one, from the arguments otherwise.
-    topology = model_topology(cfg, args)
+    # the model section.
     if (
         cfg.data.yields_unpacked_samples()
-        or topology.dynamic_context_parallel
-        or topology.sequence_packing_scheduler is not None
+        or cfg.model.transformer.dynamic_context_parallel
+        or cfg.model.transformer.sequence_packing_scheduler is not None
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
