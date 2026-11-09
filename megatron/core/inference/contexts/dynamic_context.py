@@ -858,8 +858,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if self.is_hybrid_model and mamba_max_requests < self.max_requests:
                 self.max_requests = int(mamba_max_requests)
 
+            # A step holds at least one token per request, so the derived default must not
+            # exceed the token budget (asserted below). Small models fit far more KV blocks
+            # in the default buffer than the default max_tokens.
+            self.max_requests = min(
+                self.max_requests, inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+            )
+
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
+            if self.max_requests < 1:
+                raise ValueError(
+                    f"The inference buffer ({inference_config.buffer_size_gb} GB) holds "
+                    f"{self.kv_block_allocator.pool_size} KV blocks and max_tokens is "
+                    f"{inference_config.max_tokens or self.DEFAULT_MAX_TOKENS}, which leaves no "
+                    f"request slots once rounded to a multiple of tp_size ({tp_size}) and of "
+                    f"{self.REQUEST_ROUNDER}. Increase the buffer size or set max_requests."
+                )
         else:
             # User can control request overflow via max_requests.
             self.max_requests = inference_config.max_requests

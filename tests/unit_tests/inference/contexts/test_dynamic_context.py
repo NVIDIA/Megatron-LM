@@ -470,6 +470,39 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_ids == -1)
 
     @pytest.mark.internal
+    @rounder_override(64)
+    def test_default_max_requests_is_capped_by_max_tokens(self):
+        """The block-derived default (490 usable blocks) must not exceed max_tokens."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=128,
+        )
+        assert dynamic_context.kv_block_allocator.pool_size == 491
+        assert dynamic_context.max_tokens == 128
+        assert dynamic_context.max_requests == 128
+
+    @pytest.mark.internal
+    def test_buffer_without_request_slots_is_rejected(self):
+        """A buffer of 2 KV blocks gives 1 request, which REQUEST_ROUNDER (4) rounds to 0."""
+        with pytest.raises(ValueError, match="leaves no request slots"):
+            self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=4,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.0,
+                block_size_tokens=128,
+                max_tokens=None,
+            )
+
+    @pytest.mark.internal
     def test_is_static_batching(self):
 
         dynamic_context = self._get_dynamic_context(
