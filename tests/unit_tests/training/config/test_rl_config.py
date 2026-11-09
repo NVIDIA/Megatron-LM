@@ -192,6 +192,8 @@ RUN = dict(
     "rl_kwargs, run_overrides, match",
     [
         (dict(rl_training_cuda_graphs=True), dict(cuda_graph_impl="none"), "no CUDA graphs"),
+        (dict(), dict(cuda_graph_impl="full_iteration"), "not supported by RL rollouts"),
+        (dict(), dict(cuda_graph_impl="transformer_engine"), "not supported by RL rollouts"),
         (dict(rl_use_sequence_packing=True), dict(micro_batch_size=4), "must be 1"),
         (dict(grpo_iterations=1), dict(global_batch_size=8), "divisible by global_batch_size"),
         (dict(), dict(exit_interval=3), "exit_interval should be divisible"),
@@ -545,3 +547,10 @@ def test_model_setup_uses_owned_ddp_config(
         training.setup_model_and_optimizer(
             Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["full_iteration", "transformer_engine"])
+def test_validate_run_accepts_other_cuda_graphs_with_training_graphs(cuda_graph_impl):
+    # With --rl-training-cuda-graphs the rollouts do not switch the graph implementation.
+    cfg = RLConfig(perform_rl_step=True, rl_training_cuda_graphs=True, **GRPO_4x3)
+    cfg.validate_run(**{**RUN, "cuda_graph_impl": cuda_graph_impl})

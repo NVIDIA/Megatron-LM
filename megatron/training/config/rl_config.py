@@ -323,6 +323,15 @@ class RLConfig:
         if cuda_graph_impl == "none" and self.rl_training_cuda_graphs:
             raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
 
+        # Without training CUDA graphs, every rollout and RL evaluation switches the model's
+        # graphs off and back on (toggle_cuda_graphs), which supports only the local graphs.
+        if cuda_graph_impl not in (None, "none", "local") and not self.rl_training_cuda_graphs:
+            raise ValueError(
+                f"--cuda-graph-impl {cuda_graph_impl} is not supported by RL rollouts, which "
+                "switch CUDA graphs between training and inference; use --cuda-graph-impl local "
+                "or set --rl-training-cuda-graphs."
+            )
+
         if self.rl_use_sequence_packing and micro_batch_size != 1:
             raise ValueError(
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per "
