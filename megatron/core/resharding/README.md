@@ -174,11 +174,14 @@ of refit.
 
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
-| `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
-| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; source ranks must precede destination ranks; pair-size skew adds padding |
+| `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency for collocated refits; runs the plan in lockstep batches |
+| `nccl_m2n` | Native NCCL M2N reshard of whole tensors | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; disjoint, source-first rank intervals; see restrictions below |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
-| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
+| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging); one destination pool only |
+
+`swap_model_weights()` has no default backend; callers pass `refit_method`
+explicitly. In the built-in RL loop, `--refit-method` defaults to `gloo`.
 
 Backends that support collocated models detect same-rank (local) transfers via
 `task_id` and short-circuit them into direct `tensor.copy_()` instead of going
@@ -197,9 +200,19 @@ assemble the complete BF16 value before quantizing it once.
 model-wide submission because its receive address map must remain stable across
 refits. `nccl_m2n` uses the rank-coordinated value as its native grouped-
 submission limit instead. Ranks agree on the smallest configured non-`None`
-value. When every rank uses `None`, generic backends preserve the previous
-single model-wide submission and NCCL M2N preserves its environment setting or
-256 MiB default.
+value. When every rank uses `None`, NCCL M2N preserves its environment setting
+or 256 MiB default.
+
+Independently of the byte limit, `nccl`, `gloo`, and `nvshmem` cap each batch
+at 32 logical parameters by default (`MEGATRON_REFIT_MAX_PARAMS_PER_BATCH`;
+`0` removes the cap). A byte budget alone can still pack thousands of small
+tensors (norm weights, biases, router `expert_bias`) into one
+`batch_isend_irecv`; NCCL splits such large groups into kernel plans at
+rank-dependent points, and matching sends and receives that land in different
+plans deadlock ([pytorch#174288](https://github.com/pytorch/pytorch/issues/174288)).
+Every rank derives the batches from the same gathered metadata and environment,
+so they agree without another collective. With the cap disabled and no byte
+limit, these backends submit the whole model in one batch.
 
 ### NCCL M2N backend
 
@@ -221,31 +234,63 @@ export NCCL_M2N_LIBRARY=/path/to/libnccl_m2n.so
 ```
 
 Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
-The backend preserves the existing ReFIT planner and packs its operations into
-one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
-0, destination ranks shard dimension 1, and one cross-dimension
-`nccl.m2n.reshard` call moves the entire batch through M2N's managed
-copy/staging transport. Before a plan's first call, ranks exchange byte counts,
-tensor counts, and an ordered layout digest for every source/destination pair;
-any sender/receiver disagreement fails before weight data moves. The result is
-cached with the immutable plan, so subsequent refits do not run that collective
-or repeat the peer/layout validation.
+
+#### How it executes a plan
+
+The backend does not consume the planner's point-to-point slice operations.
+From the same gathered metadata and the same DP-replica source selection, the
+planner also builds backend-neutral `TensorReshardSpec`s, one per logical
+parameter and destination TP mesh. A spec records the global shape, the local
+shapes on the source and destination TP meshes, the shard dimension on each
+side (`None` for a replicated tensor), and the two rank meshes. Packed
+parameters whose components are TP-sharded independently (for example Mamba
+`in_proj` and `conv1d`) produce one spec per component instead of being lowered
+into point-to-point slices.
+
+For each spec, the service wraps the local source and destination tensors as
+`nccl.m2n.DistTensor`s with a `Shard(dim)` or `Replicate()` placement on a 1-D
+mesh and enqueues one `reshard` call. Every distinct (source mesh, destination
+mesh) pair, typically one per pipeline-stage pair, gets its own NCCL4Py
+communicator, created on first use from a unique ID broadcast over the refit
+group with the source ranks first, and its own CUDA stream, so stage pairs run
+concurrently. Within a pair, complete parameters are submitted in
+`m2n.group()` batches of at most `max_group_bytes` destination bytes to
+amortize M2N's fixed per-call work. The limit is the plan's coordinated
+`execution_batch_bytes` if set, otherwise `MEGATRON_NCCL_M2N_MAX_GROUP_BYTES`,
+otherwise 256 MiB; a single parameter may exceed it.
+
+Destination views that are not contiguous are received into a temporary buffer
+and copied back after their group is enqueued. Model parameter storage itself
+is not replaced. With an MXFP8 destination, each parameter is received as one
+full BF16 buffer and quantized once on the same stream, so the group limit also
+bounds the BF16 staging on each destination rank. Only receiver-side MXFP8
+conversion is supported.
+
+On first use, the service all-gathers each rank's source/destination role and
+group-byte limit, validates the rank topology described below and that every
+rank uses the same limit, and caches the result. Each plan's specs are checked
+locally against that topology before any weight data moves. If a submission
+fails, the service is marked unusable; close it and construct a new one.
+
+#### Restrictions
 
 This backend supports only non-collocated multi-rank layouts. The communication
-group must contain a contiguous source interval starting at group rank 0,
-immediately followed by a contiguous destination interval, with no overlapping
-or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
-scoped to exactly one source/destination pool when the application has extra
-ranks. The M2N API describes a regular tensor, so every pair uses the largest
-validated pair payload as its trailing extent; skewed pair sizes therefore add
-wire padding. The logical transfer size is
-`src_count * dst_count * max_pair_bytes`, and each rank temporarily stages
-`peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
-caching allocator after each refit rather than retained by the service. Model
-parameter storage itself is not replaced. Supported mesh sizes are validated
-by `nccl-extensions`. GTP-sharded parameters currently use the generic `nccl`,
-`gloo`, `nvshmem`, or `nixl` slice-transfer path; `nccl_m2n` rejects such plans
-before communication instead of treating a GTP shard as a complete weight.
+group must use NCCL for CUDA tensors and must contain a contiguous source
+interval starting at group rank 0, immediately followed by a contiguous
+destination interval, with no overlapping or idle ranks, and
+`num_dst_pools > 1` is not supported. Use a process group scoped to exactly one
+source/destination pool when the application has extra ranks. Supported mesh
+sizes are validated by `nccl-extensions`.
+
+Plans that cannot be expressed as whole-tensor specs are rejected before
+communication. This currently covers:
+
+- GTP-sharded parameters (use the generic `nccl`, `gloo`, `nvshmem`, or `nixl`
+  slice-transfer path instead of treating a GTP shard as a complete weight);
+- strided TP layouts (`partition_stride != 1`), which includes the `fc1`
+  weight of gated linear units such as SwiGLU;
+- fused expert tensors that are not exposed as per-expert parameters;
+- source and destination dtypes that differ.
 
 The built-in RL loop currently creates its training and inference models on the
 same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public

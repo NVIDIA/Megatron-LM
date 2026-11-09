@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
-from megatron.core.transformer import residual_recompute_plan
+from megatron.core.transformer import residual_recompute
 from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
@@ -66,7 +66,7 @@ def _assert_manager_partition(managers, block_ends):
     ],
 )
 def test_block_end_plan(num_layers, block_size, atomic_layer_pairs, expected):
-    block_ends = residual_recompute_plan.build_recompute_block_end_plan(
+    block_ends = residual_recompute.build_recompute_block_end_plan(
         num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs
     )
 
@@ -78,7 +78,7 @@ def test_block_end_plan(num_layers, block_size, atomic_layer_pairs, expected):
 @pytest.mark.parametrize("block_size", [False, True, 0, -1, 1.5])
 def test_block_end_plan_rejects_invalid_block_size(block_size):
     with pytest.raises(ValueError, match="positive integer"):
-        residual_recompute_plan.build_recompute_block_end_plan(3, block_size)
+        residual_recompute.build_recompute_block_end_plan(3, block_size)
 
 
 @pytest.mark.parametrize(
@@ -101,12 +101,12 @@ def test_block_end_plan_rejects_invalid_block_size(block_size):
 )
 def test_block_end_plan_rejects_malformed_pairs(pairs, message):
     with pytest.raises(ValueError, match=message):
-        residual_recompute_plan.build_recompute_block_end_plan(3, 2, atomic_layer_pairs=pairs)
+        residual_recompute.build_recompute_block_end_plan(3, 2, atomic_layer_pairs=pairs)
 
 
 def test_block_end_plan_rejects_negative_layer_count():
     with pytest.raises(ValueError, match="non-negative layer count"):
-        residual_recompute_plan.build_recompute_block_end_plan(-1, None)
+        residual_recompute.build_recompute_block_end_plan(-1, None)
 
 
 @pytest.mark.parametrize("block_size", [False, True, 0, -1, 1.5])
@@ -126,7 +126,7 @@ def test_active_mhc_adapter_rejects_negative_layer_count():
 
 def test_empty_residual_plan_still_short_circuits_validation(monkeypatch):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
 
     assert build_residual_stream_recompute_plan(0, 0, atomic_layer_pairs=((0, 2),)) == []
     constructor.assert_not_called()
@@ -139,13 +139,13 @@ def test_empty_residual_plan_still_short_circuits_validation(monkeypatch):
 )
 def test_managers_are_fresh_with_exactly_one_allocation_per_block(monkeypatch, block_ends):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
 
-    first = residual_recompute_plan.build_recompute_layer_managers(block_ends)
+    first = residual_recompute.build_recompute_layer_managers(block_ends)
     _assert_manager_partition(first, block_ends)
     assert constructor.call_count == sum(block_ends)
 
-    second = residual_recompute_plan.build_recompute_layer_managers(block_ends)
+    second = residual_recompute.build_recompute_layer_managers(block_ends)
     _assert_manager_partition(second, block_ends)
     assert constructor.call_count == 2 * sum(block_ends)
     assert first is not second
@@ -154,7 +154,7 @@ def test_managers_are_fresh_with_exactly_one_allocation_per_block(monkeypatch, b
 
 @pytest.mark.parametrize("num_layers,block_size", [(0, None), (5, None), (5, 2), (3, 1)])
 def test_adapters_agree_without_atomic_pairs(num_layers, block_size):
-    expected = residual_recompute_plan.build_recompute_block_end_plan(num_layers, block_size)
+    expected = residual_recompute.build_recompute_block_end_plan(num_layers, block_size)
     stack = _make_hybrid_stack(num_layers, block_size)
     assert stack._compute_mhc_block_end_plan() == expected
     assert isinstance(stack._compute_mhc_block_end_plan(), tuple)
@@ -214,7 +214,7 @@ def test_hybrid_caches_only_immutable_boundaries(monkeypatch):
 @pytest.mark.parametrize("num_layers,enabled", [(3, False), (0, False), (0, True)])
 def test_disabled_or_empty_mhc_adapters_do_not_allocate(monkeypatch, num_layers, enabled):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
     stack = _make_hybrid_stack(num_layers, 0)
     compute = Mock(wraps=stack._compute_mhc_block_end_plan)
     monkeypatch.setattr(stack, "_compute_mhc_block_end_plan", compute)
@@ -236,7 +236,7 @@ def test_disabled_or_empty_mhc_adapters_do_not_allocate(monkeypatch, num_layers,
 @pytest.mark.parametrize(
     "finalize",
     [
-        residual_recompute_plan.finalize_recompute_block,
+        residual_recompute.finalize_recompute_block,
         finalize_mhc_recompute_layer,
         HybridStack._finalize_mhc_recompute_layer,
     ],
