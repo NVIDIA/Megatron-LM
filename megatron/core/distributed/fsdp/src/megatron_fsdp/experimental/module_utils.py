@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utilities for parameter ownership and metadata in FSDP modules."""
+"""Utilities for parameter ownership, metadata, and autograd state in FSDP modules."""
 
+import torch
 from torch import nn
+
+
+def is_in_backward() -> bool:
+    """Return whether the current thread is executing an autograd GraphTask."""
+    return torch._C._current_graph_task_id() != -1
 
 
 def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.Module, str]:
@@ -31,11 +37,16 @@ def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.
 #   weights. The Muon optimizer needs to exclude these weights.
 # - is_wide_residual_retention_parameter enforces weight decay, which is disabled
 #   by default for 1-D parameters (see megatron.core.optimizer.get_standard_config_overrides).
+# - skip_backward_post_hook is Transformer Engine's delayed-wgrad marker: those weights
+#   receive gradients from backward_dw(), so FsdpModule must register wgrad hooks rather
+#   than AccumulateGrad hooks. Losing it during meta materialization makes the gradient
+#   countdown complete before backward_dw() runs.
 _PARAMETER_ATTRIBUTES_TO_PRESERVE = (
     "is_embedding_or_output_parameter",
     "is_embedding_parameter",
     "use_muon",
     "is_wide_residual_retention_parameter",
+    "skip_backward_post_hook",
 )
 
 

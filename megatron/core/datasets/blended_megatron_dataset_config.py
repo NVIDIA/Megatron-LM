@@ -1,15 +1,12 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
-import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.utils import Split, log_single_rank, normalize
+from megatron.core.datasets.utils import Split, normalize
 from megatron.core.tokenizers import MegatronTokenizerBase
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -45,12 +42,6 @@ class BlendedMegatronDatasetConfig:
        from a single distribution. Not to be used with 'blend_per_split'.  Defaults to None.
     """
 
-    split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
-    """The split matrix consisting of non-overlapping book-ends of each split in order. For more
-       information, refer to 'convert_split_vector_to_split_matrix'. Created automatically from
-       'split'. Not to be passed in to the constructor.
-    """
-
     num_dataset_builder_threads: int = 1
     """The number of threads to use for dataset building."""
 
@@ -59,12 +50,6 @@ class BlendedMegatronDatasetConfig:
 
     mmap_bin_files: bool = True
     """Whether to mmap the .bin files or use file pointers."""
-
-    mock: bool = field(init=False, default=False)
-    """Whether to bypass real data loading and validation in favor of mock data generation.
-       Created automatically from 'blend' and 'blend_per_split'. Not to be passed in to the
-       constructor.
-    """
 
     tokenizer: Optional[MegatronTokenizerBase] = None
     """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
@@ -96,8 +81,23 @@ class BlendedMegatronDatasetConfig:
        Requires all the dataset caches to be built.
     """
 
-    def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
+    def validate(self) -> None:
+        """Check a complete config: assertions only, idempotent.
+
+        ``validate_without_tokenizer()`` and then the checks that need the tokenizer (none in this
+        class; subclasses add theirs here). Nothing runs at construction: a config can be
+        constructed before its tokenizer exists and completed later, and this runs once it is
+        complete. ``BlendedMegatronDatasetBuilder`` runs it before building, so a config handed
+        complete to the builder needs no explicit call.
+        """
+        self.validate_without_tokenizer()
+
+    def validate_without_tokenizer(self) -> None:
+        """The checks that need no tokenizer: the fast-cache prerequisites and the blend / split
+        rules. Assertions only, idempotent. A config constructed before its tokenizer exists can
+        run this at once; subclasses add their tokenizer-free checks here and the rest in
+        ``validate()``.
+        """
         if self.fast_cache_load:
             assert (
                 self.path_to_cache is not None
@@ -117,39 +117,43 @@ class BlendedMegatronDatasetConfig:
             assert len(self.blend_per_split) == len(
                 Split
             ), f"blend_per_split must contain {len(Split)} blends"
-            for split in Split:
-                if self.blend_per_split[split.value] is None:
-                    log_single_rank(
-                        logger, logging.INFO, f"blend not provided for {split.name} split"
-                    )
-                else:
-                    assert self.blend_per_split[split.value][1] is None or len(
-                        self.blend_per_split[split.value][0]
-                    ) == len(
-                        self.blend_per_split[split.value][1]
-                    ), "blend per split prefixes and weights must be equal in number"
+            for blend in self.blend_per_split:
+                assert (
+                    blend is None or blend[1] is None or len(blend[0]) == len(blend[1])
+                ), "blend per split prefixes and weights must be equal in number"
         else:
             if self.blend is not None:
                 assert self.blend[1] is None or len(self.blend[0]) == len(
                     self.blend[1]
                 ), "blend prefixes and weights must be equal in number"
                 assert self.split is not None, "split must be provided when blend is not None"
-            else:
-                self.mock = True
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Let mock = True, as both blend and blend_per_split are None",
-                )
-                self.split = "1,1,1"
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Let split = {self.split}, an arbitrarily even split, as mock is True",
-                )
-            split_vector = parse_and_normalize_split(self.split)
-            self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
-            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+            if self.split is not None:
+                parse_and_normalize_split(self.split)  # a malformed split string is rejected here
+
+    @property
+    def mock(self) -> bool:
+        """Whether to bypass real data loading and validation in favor of mock data generation:
+        True when neither ``blend`` nor ``blend_per_split`` provides a data source."""
+        return self.blend is None and not (
+            self.blend_per_split is not None and any(self.blend_per_split)
+        )
+
+    @property
+    def split_matrix(self) -> Optional[List[Tuple[float, float]]]:
+        """The split matrix consisting of non-overlapping book-ends of each split in order, from
+        ``split``. Mock data always uses an arbitrarily even split, whatever ``split`` says, as it
+        always has; ``split`` itself is left as given. For more information, refer to
+        'convert_split_vector_to_split_matrix'. None with ``blend_per_split``, which carries one
+        blend per split."""
+        if self.blend_per_split is not None and any(self.blend_per_split):
+            return None
+        if self.mock:
+            split = "1,1,1"
+        elif self.split is None:
+            return None  # validate() rejects a blend without a split
+        else:
+            split = self.split
+        return convert_split_vector_to_split_matrix(parse_and_normalize_split(split))
 
 
 def parse_and_normalize_split(split: str) -> List[float]:
