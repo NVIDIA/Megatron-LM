@@ -194,6 +194,8 @@ RUN = dict(
         (dict(rl_training_cuda_graphs=True), dict(cuda_graph_impl="none"), "no CUDA graphs"),
         (dict(rl_use_sequence_packing=True), dict(micro_batch_size=4), "must be 1"),
         (dict(grpo_iterations=1), dict(global_batch_size=8), "divisible by global_batch_size"),
+        # 24 samples over 2 GRPO iterations divide by 24, but one step samples only 12.
+        (dict(), dict(global_batch_size=24), "must not exceed the rollouts sampled"),
         (dict(), dict(exit_interval=3), "exit_interval should be divisible"),
         (dict(), dict(save_interval=5), "save_interval should be divisible"),
         (

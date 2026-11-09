@@ -332,6 +332,13 @@ class RLConfig:
         # A native config can leave this default unresolved during user validation.
         # Framework finalization repeats these checks with the resolved batch size.
         if global_batch_size is not None:
+            # Each training step consumes one global batch of the rollouts sampled for it.
+            if global_batch_size > self.grpo_samples_per_iteration:
+                raise ValueError(
+                    f"global_batch_size ({global_batch_size}) must not exceed the rollouts sampled "
+                    f"per RL iteration, grpo_prompts_per_step * grpo_group_size "
+                    f"({self.grpo_samples_per_iteration})."
+                )
             # Ensure that collected samples are a multiple of the global batch size.
             samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
             if samples_per_inference_iteration % global_batch_size != 0:
