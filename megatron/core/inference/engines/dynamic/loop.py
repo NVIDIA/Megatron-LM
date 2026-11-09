@@ -578,14 +578,16 @@ class EngineLoopMixin:
         frameworks like pytriton).
         """
         try:
-            asyncio.get_running_loop()
+            running_loop = asyncio.get_running_loop()
         except RuntimeError:
+            running_loop = None
+        # Run the coroutine outside the exception handler, so its own errors propagate
+        # unchained and a RuntimeError it raises is not mistaken for a missing loop.
+        if running_loop is None:
             # No running loop - safe to use run_until_complete.
             return self._loop.run_until_complete(coro)
 
-        # We're inside a running loop - run in a separate thread. Keep this
-        # outside the exception handler so a RuntimeError raised by the
-        # coroutine is propagated instead of being mistaken for a missing loop.
+        # We're inside a running loop - run in a separate thread.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(asyncio.run, coro)
             return future.result()

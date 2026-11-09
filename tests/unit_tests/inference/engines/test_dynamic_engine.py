@@ -4270,10 +4270,10 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert serialized_event_tokens == merged.generated_tokens
 
 
-@pytest.mark.asyncio
-async def test_run_coroutine_sync_preserves_runtime_error_from_running_loop():
+@pytest.mark.parametrize("in_running_loop", [True, False], ids=["running-loop", "no-loop"])
+def test_run_coroutine_sync_preserves_runtime_error(in_running_loop):
     engine = object.__new__(DynamicInferenceEngine)
-    engine._loop = asyncio.get_running_loop()
+    engine._loop = asyncio.new_event_loop()
     call_count = 0
 
     async def fail_from_engine():
@@ -4281,9 +4281,21 @@ async def test_run_coroutine_sync_preserves_runtime_error_from_running_loop():
         call_count += 1
         raise RuntimeError("original engine failure")
 
-    with pytest.raises(RuntimeError, match="original engine failure"):
+    async def call_inside_running_loop():
         engine._run_coroutine_sync(fail_from_engine())
+
+    try:
+        with pytest.raises(RuntimeError, match="original engine failure") as error:
+            if in_running_loop:
+                engine._loop.run_until_complete(call_inside_running_loop())
+            else:
+                engine._run_coroutine_sync(fail_from_engine())
+    finally:
+        engine._loop.close()
     assert call_count == 1
+    if not in_running_loop:
+        # The coroutine's error is not chained to the missing-loop probe.
+        assert error.value.__context__ is None
 
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
