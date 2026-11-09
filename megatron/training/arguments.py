@@ -848,7 +848,35 @@ def validate_args(args, defaults={}):
             args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
                 args.num_layers_per_virtual_pipeline_stage
         else:
-            args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
+            num_virtual_stages = args.num_virtual_stages_per_pipeline_rank
+            if num_virtual_stages < 1:
+                raise ValueError(
+                    f"--num-virtual-stages-per-pipeline-rank must be at least 1, got "
+                    f"{num_virtual_stages}."
+                )
+            # Same layer-count checks as for --num-layers-per-virtual-pipeline-stage. With uneven
+            # first/last stages, TransformerConfig checks the layer counts instead.
+            num_layers = args.num_layers if args.num_layers is not None else args.decoder_num_layers
+            if (
+                num_layers is not None
+                and args.decoder_first_pipeline_num_layers is None
+                and args.decoder_last_pipeline_num_layers is None
+            ):
+                num_layers += int(args.account_for_embedding_in_pipeline_split)
+                num_layers += int(args.account_for_loss_in_pipeline_split)
+                pp_size = args.transformer_pipeline_model_parallel_size
+                if num_layers % pp_size != 0:
+                    raise ValueError(
+                        f"The number of layers ({num_layers}) must be divisible by the "
+                        f"pipeline-model-parallel size ({pp_size})."
+                    )
+                if (num_layers // pp_size) % num_virtual_stages != 0:
+                    raise ValueError(
+                        f"The number of layers per pipeline stage ({num_layers // pp_size}) must "
+                        f"be divisible by --num-virtual-stages-per-pipeline-rank "
+                        f"({num_virtual_stages})."
+                    )
+            args.virtual_pipeline_model_parallel_size = num_virtual_stages
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
