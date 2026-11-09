@@ -50,7 +50,7 @@ class RuntimePolicy:
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
         overlap_outer_communication: Run the last-microbatch DP-outer reduction on
             a separate stream, independently of overlap_allgather_reduction.
-        grad_sync_mode: Default gradient synchronization mode. Use REDUCE_OUTER
+        gradient_finalization_mode: Default gradient finalization mode. Use REDUCE_OUTER
             when the caller waits with finish_grad_sync() after all backward work,
             including delayed weight gradients. finalize_gradients() scopes overrides.
     """
@@ -58,6 +58,8 @@ class RuntimePolicy:
     use_symmetric_memory: bool = False
     overlap_allgather_reduction: bool = True
     overlap_outer_communication: bool = False
-    grad_sync_mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    gradient_finalization_mode: GradientFinalizationMode = (
+        GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    )
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION

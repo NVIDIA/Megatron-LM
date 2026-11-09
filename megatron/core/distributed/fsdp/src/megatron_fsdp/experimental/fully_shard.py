@@ -214,13 +214,13 @@ def finalize_gradients(
         mode: Outer reduction and completion-wait behavior within the scope.
     """
     context.ensure_finalized()
-    previous_mode = context.grad_sync_mode
-    context.grad_sync_mode = mode
+    previous_mode = context.gradient_finalization_mode
+    context.gradient_finalization_mode = mode
 
     try:
         yield
     finally:
-        context.grad_sync_mode = previous_mode
+        context.gradient_finalization_mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

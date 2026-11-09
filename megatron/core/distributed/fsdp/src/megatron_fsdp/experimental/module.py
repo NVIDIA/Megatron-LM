@@ -219,10 +219,13 @@ class FsdpModule:
                         "Transformer Engine does not accumulate their gradients. See "
                         "https://github.com/NVIDIA/TransformerEngine/issues/3437"
                     )
-                if self.context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT:
+                if (
+                    self.context.gradient_finalization_mode
+                    is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+                ):
                     raise ValueError(
                         "Delayed weight gradients require "
-                        "grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER or "
+                        "gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER or "
                         "GradientFinalizationMode.SKIP_OUTER and an explicit "
                         "finish_grad_sync() call."
                     )
@@ -470,7 +473,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if context.grad_sync_mode is GradientFinalizationMode.SKIP_OUTER:
+                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the

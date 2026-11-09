@@ -297,7 +297,7 @@ def test_rejects_shared_context_with_automatic_grad_wait(
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
         with pytest.raises(
-            ValueError, match="grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER"
+            ValueError, match="gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER"
         ):
             FullyShardedDataParallel(
                 config=config,
@@ -310,7 +310,7 @@ def test_rejects_shared_context_with_automatic_grad_wait(
                 module=layer,
                 pg_collection=process_group_collection,
             )
-        assert context.grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+        assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
         assert not isinstance(layer, FsdpModule)
 
 

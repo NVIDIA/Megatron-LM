@@ -2546,7 +2546,7 @@ def wrap_model_chunks_with_ddp(
             FsdpContext(
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub,
-                    grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER,
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
                 )
             )

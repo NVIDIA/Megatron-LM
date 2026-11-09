@@ -275,7 +275,7 @@ context = FsdpContext(
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
         overlap_allgather_reduction=False,
-        grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER,
+        gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
     ),
 )
 with fully_shard_context(context):
@@ -283,7 +283,7 @@ with fully_shard_context(context):
 ```
 
 `device` and the construction-only `parameter_to_owner` map remain separate
-`FsdpContext` arguments. The default `grad_sync_mode` is
+`FsdpContext` arguments. The default `gradient_finalization_mode` is
 `GradientFinalizationMode.REDUCE_OUTER_AND_WAIT`. Runtime-policy booleans default to `False`,
 except `overlap_allgather_reduction`, which defaults to `True`. With
 `GradientFinalizationMode.REDUCE_OUTER`, call `context.finish_grad_sync()` after all backward

@@ -244,11 +244,11 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 @pytest.mark.parametrize("set_to_none", [False, True])
 @pytest.mark.parametrize("grad_scale", [1.0, 0.5, 1 / 3])
 @pytest.mark.parametrize(
-    "grad_sync_mode",
+    "gradient_finalization_mode",
     [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER],
 )
 def test_local_accumulation_matches_reference(
-    distributed_setup, sharding, set_to_none, grad_scale, grad_sync_mode
+    distributed_setup, sharding, set_to_none, grad_scale, gradient_finalization_mode
 ):
     """Scaled singleton-inner accumulation matches dense training, with replicated DP as a control."""
     setup = distributed_setup
@@ -276,7 +276,7 @@ def test_local_accumulation_matches_reference(
     context = FsdpContext(
         device=setup.device,
         runtime_policy=RuntimePolicy(
-            overlap_outer_communication=True, grad_sync_mode=grad_sync_mode
+            overlap_outer_communication=True, gradient_finalization_mode=gradient_finalization_mode
         ),
     )
     with fully_shard_context(context):
@@ -308,7 +308,7 @@ def test_local_accumulation_matches_reference(
                 with finalize_gradients(
                     context,
                     mode=(
-                        grad_sync_mode
+                        gradient_finalization_mode
                         if index == num_microbatches - 1
                         else GradientFinalizationMode.SKIP_OUTER
                     ),
@@ -324,7 +324,7 @@ def test_local_accumulation_matches_reference(
             if reduce_grads:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-            elif grad_sync_mode is GradientFinalizationMode.REDUCE_OUTER:
+            elif gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER:
                 context.finish_grad_sync()
             optimizer.step()
         return losses

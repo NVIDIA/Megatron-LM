@@ -31,7 +31,9 @@ def _sharded_unit(setup, model, grad_accumulation_count):
     with fully_shard_context(
         FsdpContext(
             device=setup.device,
-            runtime_policy=RuntimePolicy(grad_sync_mode=GradientFinalizationMode.REDUCE_OUTER),
+            runtime_policy=RuntimePolicy(
+                gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER
+            ),
         )
     ):
         fully_shard(
