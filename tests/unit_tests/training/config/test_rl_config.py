@@ -13,11 +13,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.transformer import TransformerConfig
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import _add_rl_args, parse_args, validate_args
 from megatron.training.config import RLConfig, rl_config
-from megatron.training.config.container import ConfigContainerBase
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 
 INIT_FIELDS = [f for f in fields(RLConfig) if f.init]
 GRPO_4x3 = dict(grpo_prompts_per_step=4, grpo_group_size=3)  # 12 samples per iteration
@@ -146,7 +146,7 @@ class TestPostInit:
                 id="init-fields",
             ),
             pytest.param(
-                lambda cfg: _instantiate(ConfigContainerBase._convert_value_to_dict(cfg)),
+                lambda cfg: _instantiate(serialize_value(cfg)),
                 id="serialized",
                 marks=pytest.mark.skipif(
                     importlib.util.find_spec("omegaconf") is None, reason="omegaconf not installed"
@@ -305,7 +305,7 @@ def test_validate_run_at_every_call_site():
     RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
 
     # Through the container: the sections supply the inputs.
-    # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
+    # Training containers require a transformer section for the CUDA-graph rule.
     from megatron.training.models.base import ModelConfig
 
     @dataclasses.dataclass
@@ -315,14 +315,16 @@ def test_validate_run_at_every_call_site():
     @dataclasses.dataclass
     class TransformerModelConfig(ModelConfig):
         builder: typing.ClassVar[str] = "tests.transformer"
-        transformer: types.SimpleNamespace = dataclasses.field(
-            default_factory=lambda: types.SimpleNamespace(cuda_graph_impl="none")
+        transformer: TransformerConfig = dataclasses.field(
+            default_factory=lambda: TransformerConfig(
+                num_layers=2, hidden_size=32, num_attention_heads=4
+            )
         )
 
     def container(model=None, rl=None, **rl_kwargs):
         return PretrainConfigContainer(
             train=TrainingConfig(micro_batch_size=4, global_batch_size=12),
-            model=model,
+            model=TransformerModelConfig() if model is None else model,
             optimizer=OptimizerConfig(),
             scheduler=SchedulerConfig(),
             logger=LoggerConfig(),
@@ -344,6 +346,7 @@ def test_validate_run_at_every_call_site():
     cuda_graph_container = container(
         rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
     )
+    cuda_graph_container.model.transformer.cuda_graph_impl = "local"
     cuda_graph_container.validate()
     assert not cuda_graph_container.ddp.grad_buffer_offload
     cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
@@ -356,8 +359,10 @@ def test_validate_run_at_every_call_site():
     explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         explicit_layout_container.validate()
-    container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
-    container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
+    with pytest.raises(ValueError, match="Training requires model.transformer"):
+        container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
+    with pytest.raises(ValueError, match="Training requires model.transformer"):
+        container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
     # The container has no inference section, so it leaves the weight-offload rule to validate_args.
     container(
         rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
@@ -451,9 +456,7 @@ def test_ddp_layout_validation_and_finalization(
     assert ddp.grad_buffer_offload == (
         explicit_layout or (perform_rl_step and offload and not cuda_graphs)
     )
-    assert ConfigContainerBase._convert_value_to_dict(ddp)["grad_buffer_offload"] == (
-        ddp.grad_buffer_offload
-    )
+    assert serialize_value(ddp)["grad_buffer_offload"] == (ddp.grad_buffer_offload)
 
 
 def test_ddp_finalization_rejects_aliasing_before_mutation():
@@ -487,6 +490,8 @@ def test_model_setup_uses_owned_ddp_config(
     monkeypatch, run_config, native_builder, perform_rl_step
 ):
     from megatron.training import arguments, global_vars, training
+    from megatron.training.models import GPTModelConfig
+    from megatron.training.state import TrainState
 
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -494,7 +499,9 @@ def test_model_setup_uses_owned_ddp_config(
     # The container, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
     args.batch_parallel_size = 1
+    args.world_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
     run_config.rl = RLConfig(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )
@@ -524,9 +531,11 @@ def test_model_setup_uses_owned_ddp_config(
 
     if native_builder:
         builder = types.SimpleNamespace(build_distributed_models=construct)
-        run_config.model = types.SimpleNamespace(get_builder_cls=lambda: lambda cfg: builder)
+        run_config.model = GPTModelConfig(
+            transformer=run_config.model.transformer, vocab_size=128, seq_length=16
+        )
+        monkeypatch.setattr(run_config.model, "get_builder_cls", lambda: lambda cfg: builder)
     else:
-        run_config.model = None
         monkeypatch.setattr(training, "get_model", construct)
     # Runtime initialization owns finalization; model setup only consumes its result.
     run_config.train.micro_batch_size = 1
@@ -534,5 +543,5 @@ def test_model_setup_uses_owned_ddp_config(
     run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=Mock(), cfg_container=run_config
+            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )
