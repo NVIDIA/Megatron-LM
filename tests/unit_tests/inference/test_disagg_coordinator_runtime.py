@@ -356,6 +356,88 @@ def test_active_decode_cancellation_waits_for_engine_safety():
     assert 5 not in runtime.terminating_request_ids
 
 
+@pytest.mark.parametrize("read_done", [True, False])
+def test_decode_reply_ends_an_abort_that_raced_completion(read_done):
+    """An abort that reaches the coordinator after decode finished leaves no request state."""
+    runtime, sent = _runtime()
+    _submit(runtime, 5, [1], {})
+    _prefill_done(runtime)
+    if read_done:
+        runtime.handle_kv_read_done(b"decode", 5)
+    sent.clear()
+
+    # Decode already finished the request and ignores the late abort; its reply follows.
+    runtime.abort_request(5)
+    assert sent == [(b"decode", [Headers.ABORT_REQUEST.value, 5])]
+    runtime.handle_decode_done(5)
+
+    assert [(identity, Headers(message[0])) for identity, message in sent[1:]] == (
+        [] if read_done else [(b"prefill", Headers.RELEASE_KV)]
+    )
+    assert 5 not in runtime.terminating_request_ids
+    assert not runtime.requests and not runtime.hop1_request_ids
+    for role in ("prefill", "decode"):
+        assert runtime.scheduler.reserved_engine(role, 5) is None
+        assert runtime.scheduler.assigned_engine(role, 5) is None
+
+
+def test_late_abort_through_coordinator_handlers_leaves_one_reply_and_no_state():
+    """Drive one request through the coordinator's handlers with the abort racing its reply."""
+    runtime, sent = _runtime()
+    coordinator = runtime.coordinator
+    coordinator.known_clients = {b"client"}
+    coordinator.enable_prefix_caching = True
+    coordinator.block_size_tokens = 4
+    coordinator.next_request_id = 7
+    HANDLERS[Headers.SUBMIT_REQUEST](
+        coordinator,
+        b"client",
+        [Headers.SUBMIT_REQUEST.value, 70, {"temperature": 0.0}, None],
+        [msgpack.packb([1, 2, 3]), msgpack.packb([1]), msgpack.packb(None), msgpack.packb(None)],
+    )
+    prefill_reply = {
+        "request_id": 7,
+        "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
+        "prompt_frame": msgpack.packb([1, 2, 3]),
+        "offload_frame": msgpack.packb(None),
+    }
+    HANDLERS[Headers.ENGINE_REPLY](
+        coordinator,
+        b"prefill",
+        [Headers.ENGINE_REPLY.value, [[7, False]]],
+        [msgpack.packb(prefill_reply, use_bin_type=True)],
+    )
+    HANDLERS[Headers.KV_READ_DONE](coordinator, b"decode", [Headers.KV_READ_DONE.value, 7], [])
+    # The client aborts just as decode finishes: the coordinator handles the abort first.
+    HANDLERS[Headers.ABORT_REQUEST](coordinator, b"client", [Headers.ABORT_REQUEST.value, 70], [])
+    decode_reply = msgpack.packb({"request_id": 7, "status": "COMPLETED"}, use_bin_type=True)
+    HANDLERS[Headers.ENGINE_REPLY](
+        coordinator, b"decode", [Headers.ENGINE_REPLY.value, [[7, False]]], [decode_reply]
+    )
+
+    engine_headers = [
+        (identity, Headers(message[0])) for identity, message in sent if identity != b"client"
+    ]
+    assert engine_headers == [
+        (b"prefill", Headers.SUBMIT_REQUEST),
+        (b"decode", Headers.SUBMIT_REQUEST_WITH_KV),
+        (b"prefill", Headers.RELEASE_KV),
+        (b"decode", Headers.ABORT_REQUEST),
+    ]
+    client_replies = [
+        (message[0], Headers(msgpack.unpackb(message[1], raw=False)[0]), message[2:])
+        for identity, message in sent
+        if identity == b"client"
+    ]
+    assert client_replies == [(b"client", Headers.ENGINE_REPLY, [decode_reply])]
+    assert 7 not in runtime.terminating_request_ids
+    assert not runtime.requests and not runtime.hop1_request_ids
+    assert runtime.scheduler.decode_load(b"decode") == (0, 0, 0)
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
+    assert 7 not in coordinator.request_id_to_client_id
+    assert (b"client", 70) not in coordinator.client_request_to_request_id
+
+
 @pytest.mark.parametrize("termination", ["abort", "failure"])
 def test_unsafe_termination_keeps_prefill_capacity_until_read_completes(termination):
     runtime, sent = _runtime(ssm_capacity=1)
