@@ -265,9 +265,9 @@ class _MegatronLLMBase:
     An ``inference_config`` with ``start_suspended=True`` builds the engine in
     the ``SUSPENDED`` state (coordinator mode only): ``serve()`` and request
     submission work immediately, but nothing runs until ``resume()`` and then
-    ``unpause()``.
-    The first ``resume()`` is where the inference-state buffers are allocated
-    and CUDA graphs are captured, so it must occur after the weights are in place.
+    ``unpause()``. The first ``resume()`` captures the CUDA graphs, so it must
+    occur after the weights are in place; the inference-state buffers are
+    allocated at construction and follow ``kv_cache_management_mode``.
     """
 
     def __init__(

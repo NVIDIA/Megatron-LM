@@ -298,19 +298,20 @@ class DynamicInferenceEngine(
                     self.inference_step_offset = int(max_step)
 
         if start_suspended:
-            # Starting in the suspended case must support a case where the weights are not present
-            # upon engine construction; functionality that needs weights is deferred.
-            # The engine can still queue requests however.
+            # The weights may not be present yet, so what needs them waits for the first
+            # resume(): CUDA-graph capture and gc_mode. Requests can still be queued. The
+            # buffers follow kv_cache_management_mode, as after a regular suspend().
             self._deferred_cuda_graph_capture = True
             InferenceMode.unset_active()
             self.context.deallocate_inference_state_buffers()
             self.resume_request_ids = []
             self.state = EngineState.SUSPENDED
             self._state_events[EngineState.RUNNING].clear()
+            self._state_events[EngineState.PAUSED].set()
             self._state_events[EngineState.SUSPENDED].set()
             logger.info(
                 "> dynamic_engine.py: constructed suspended; "
-                "the first resume() allocates the inference-state buffers and captures cuda graphs."
+                "the first resume() captures cuda graphs."
             )
         else:
             # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
@@ -319,7 +320,7 @@ class DynamicInferenceEngine(
             # Create cuda graphs.
             self.create_cuda_graphs()
 
-        self._enter_custom_gc_mode()
+            self._enter_custom_gc_mode()
 
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
