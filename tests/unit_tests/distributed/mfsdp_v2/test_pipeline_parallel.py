@@ -22,6 +22,7 @@ import transformer_engine.pytorch as te
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
@@ -122,15 +123,16 @@ class TestMfsdpV2PipelineSharedContext:
 
             return model(next(data_iterator)), loss_func
 
-        forward_backward_no_pipelining(
-            forward_step_func=forward_step,
-            data_iterator=iter(inputs),
-            model=[model],
-            num_microbatches=len(inputs),
-            seq_length=4,
-            micro_batch_size=1,
-            pg_collection=self.pg_collection,
-        )
+        with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+            forward_backward_no_pipelining(
+                forward_step_func=forward_step,
+                data_iterator=iter(inputs),
+                model=[model],
+                num_microbatches=len(inputs),
+                seq_length=4,
+                micro_batch_size=1,
+                pg_collection=self.pg_collection,
+            )
         finish_grad_sync.assert_called_once_with()
         for x in inputs:
             (reference(x.detach()).square().mean() / len(inputs)).backward()

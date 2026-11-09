@@ -299,8 +299,9 @@ context.finish_grad_sync()
 optimizer.step()
 ```
 
-MCore's schedules select `REDUCE_OUTER` for the schedule, use `SKIP_OUTER` within existing
-`no_sync()` scopes, and wait in `finalize_model_grads()` after all backward work.
+MCore's training loop selects `REDUCE_OUTER` around its schedule call. The schedule uses
+`SKIP_OUTER` within existing `no_sync()` scopes and waits in `finalize_model_grads()` after
+all backward work. Other callers select the mode explicitly with the same context manager.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
   `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
