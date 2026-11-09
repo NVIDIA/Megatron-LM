@@ -38,13 +38,14 @@ on 40k random triples, where a separate multiply and add differ on 6%).
 Structure (read after the contract): one program per (token, hidden block); constexpr
 ``EP_SIZE`` and ``TOPK`` (unrolled), ``EXPERTS_PER_RANK``, ``CROSS_RANK_FP64``,
 ``BF16_RANK_PARTIALS`` and ``BLOCK_H = min(next_pow2(H), 512)``. Inputs therefore cover EP {1,
-2, 4, 8} x experts per rank {1, 2, 5, 16} x top-k {1, 2, 6, 8} x both partial modes x both
+2, 4, 8, 16} x experts per rank {1, 2, 5, 16} x top-k {1, 2, 6, 8} x both partial modes x both
 collectives x bf16 / fp32 rows x H in {1, 3, 100, 511, 512, 513, 1025, 2688} (one to six
 blocks, partial last block) x tokens {1, 2, 37, 300} x values (scaled normal, a 2^+-40 range
 with signed zeros where the fp32 / fp64 rounding points and the order matter, Inf and NaN) x
 invalid routes (``-1`` rows, ``-1`` experts, experts past ``E``, each pointing at a NaN row),
-pairwise; zero tokens; production shapes; CUDA-graph replay; the ``moe_utils.unpermute``
-dispatch; opt-in (``large``), row and output offsets ``row * H`` at 2^31 (``H = 7168``).
+pairwise; hand-placed values at each rounding point; zero tokens; production shapes (EP 1, 8
+and 64); CUDA-graph replay; the ``moe_utils.unpermute`` dispatch; opt-in (``large``), row and
+output offsets ``row * H`` at 2^31 (``H = 7168``).
 Unreferenced rows hold NaN, and the output is allocated NaN-poisoned.
 
 Hardware: any CUDA GPU; marked for H100 and GB200, where batch-invariant generation runs.
@@ -212,7 +213,7 @@ def run_and_check(
 
 _VARIANTS = ou.pairwise_cases(
     {
-        "ep": [1, 2, 4, 8],
+        "ep": [1, 2, 4, 8, 16],
         "per_rank": [1, 2, 5, 16],
         "topk": [1, 2, 6, 8],
         "mode": list(MODES),
@@ -355,6 +356,7 @@ def test_rejects_uneven_expert_shards(ep_and_collective, mode):
         pytest.param(8192, 2688, 6, 128, 1, id="nanov3-ep1"),
         pytest.param(8192, 2688, 6, 128, 8, id="nanov3-ep8"),
         pytest.param(4096, 7168, 8, 256, 8, id="dsv3-ep8"),
+        pytest.param(1024, 7168, 8, 256, 64, id="dsv3-ep64"),
     ],
 )
 @pytest.mark.parametrize("mode", MODES)
