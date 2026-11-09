@@ -2282,7 +2282,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
-                from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
+                from megatron.core.inference.engines.dynamic import engine as dynamic_engine_module
 
                 original_delete_cuda_graphs = dynamic_engine_module.delete_cuda_graphs
 

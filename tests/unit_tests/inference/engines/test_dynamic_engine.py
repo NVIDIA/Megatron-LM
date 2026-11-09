@@ -1384,7 +1384,7 @@ class DynamicEngineTestConfig:
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
     num_moe_experts: Optional[int] = None
-    moe_grouped_gemm: bool = False
+    moe_grouped_gemm: Optional[bool] = None
     sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
@@ -1770,7 +1770,7 @@ class DynamicInferenceEngineTestBase:
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
                 expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=num_moe_experts,
-                moe_grouped_gemm=test_config.moe_grouped_gemm,
+                moe_grouped_gemm=bool(test_config.moe_grouped_gemm),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
@@ -1820,19 +1820,24 @@ class DynamicInferenceEngineTestBase:
             num_experts = (
                 transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
             )
+            # Pass moe_grouped_gemm only when a test sets it, so a test that patches a spec
+            # factory with its own default (test_disagg_moe_pairwise) keeps that default.
+            spec_kwargs = {}
+            if test_config.moe_grouped_gemm is not None:
+                spec_kwargs["moe_grouped_gemm"] = test_config.moe_grouped_gemm
             if test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(
-                    num_experts=num_experts, moe_grouped_gemm=test_config.moe_grouped_gemm
+                    num_experts=num_experts, **spec_kwargs
                 )
             elif test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts, moe_grouped_gemm=test_config.moe_grouped_gemm
+                    num_experts=num_experts, **spec_kwargs
                 )
             elif test_config.transformer_impl == "local":
                 layer_spec = get_gpt_layer_local_spec(
                     num_experts=num_experts,
-                    moe_grouped_gemm=test_config.moe_grouped_gemm,
                     normalization=transformer_config.normalization,
+                    **spec_kwargs,
                 )
 
             # MTP block spec (needed for speculative decoding).
@@ -1923,7 +1928,7 @@ class DynamicInferenceEngineTestBase:
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
                 expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=num_moe_experts,
-                moe_grouped_gemm=test_config.moe_grouped_gemm,
+                moe_grouped_gemm=bool(test_config.moe_grouped_gemm),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
