@@ -386,6 +386,48 @@ class TestNCCLAllGatherDispatcher:
 # NVLSAllGatherVDispatcher
 # ──────────────────────────────────────────────────────────────────────
 
+
+@pytest.mark.parametrize(
+    "reason, match",
+    [
+        (
+            "RuntimeError: CUDA driver error: out of memory",
+            r"need \d+\.\d GiB per GPU .*--inference-dynamic-batching-max-tokens",
+        ),
+        ("triton not installed", r"requires Hopper\+ GPUs fully connected via NVLink"),
+    ],
+)
+def test_nvls_buffer_init_failure_names_its_cause(monkeypatch, reason, match):
+    """An out-of-memory failure reports the requested size, not a hardware requirement."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.moe import token_dispatcher_inference
+
+    class _FailedBuffer:
+        init_failure_reason = reason
+
+        def maybe_get_tensor(self, tensor_shape, dtype):
+            return {"tensor": None, "handle": None}
+
+    class _FailingManager:
+        @classmethod
+        def get_buffer(cls, key, process_group=None, size_mb=None):
+            return _FailedBuffer()
+
+    monkeypatch.setattr(token_dispatcher_inference, "SymmetricMemoryManager", _FailingManager)
+    dispatcher_cls = token_dispatcher_inference.NVLSAllGatherVDispatcher
+    try:
+        with pytest.raises(RuntimeError, match=match):
+            dispatcher_cls.allocate_buffers(
+                per_rank_worst_case_token_count=1 << 20,
+                topk=2,
+                hidden_size=256,
+                tp_ep_group=SimpleNamespace(size=lambda: 2),
+            )
+    finally:
+        dispatcher_cls._delete_buffers()
+
+
 _NVLS_ENGINE_MAX_TOKENS = 512
 
 _QWEN3_30B_A3B_MOE = dict(

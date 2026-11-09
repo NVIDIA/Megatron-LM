@@ -461,10 +461,31 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ]
         if failed:
             details = "; ".join(f"{name}: {reason or 'unknown'}" for name, reason in failed)
+            if any("out of memory" in (reason or "") for _, reason in failed):
+                # The buffers scale with the context's max_tokens; a large token budget asks
+                # for more symmetric memory than the GPU has, which is not a hardware problem.
+                requested_mb = sum(
+                    _size_mb(shape, dtype)
+                    for shape, dtype in (
+                        (agv_h_shape, torch.bfloat16),
+                        (agv_r_shape, torch.int64),
+                        (agv_p_shape, torch.float32),
+                        (rsv_shape, torch.float32),
+                        (meta_shape, torch.int32),
+                    )
+                )
+                raise RuntimeError(
+                    f"NVLSAllGatherVDispatcher: symmetric memory init failed [{details}]. "
+                    f"Its buffers need {requested_mb / 1024:.1f} GiB per GPU for {global_max} "
+                    f"tokens ({per_rank_worst_case_token_count} per rank x {tp_ep_size} ranks) "
+                    f"of hidden size {hidden_size}. Lower the inference context's max_tokens "
+                    f"(--inference-dynamic-batching-max-tokens), or use "
+                    f"inference_moe_token_dispatcher_type='nccl'."
+                )
             raise RuntimeError(
                 f"NVLSAllGatherVDispatcher: symmetric memory init failed [{details}]. "
-                f"This dispatcher requires Hopper+ GPUs fully connected via NVLink, and torch built"
-                f"with torch.distributed._symmetric_memory plus triton installed. "
+                f"This dispatcher requires Hopper+ GPUs fully connected via NVLink, and torch "
+                f"built with torch.distributed._symmetric_memory plus triton installed. "
                 f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 
