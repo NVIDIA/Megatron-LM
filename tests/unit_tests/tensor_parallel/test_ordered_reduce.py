@@ -332,9 +332,16 @@ def test_tp3_symmetric_memory_paths():
     """TP = 3 (not a power of two): push and pull give the left fold, like TP 4."""
 
     Utils.initialize_model_parallel(1, 1)
-    group = dist.new_group([0, 1, 2])  # every rank must create it
+    world = dist.get_world_size()
+    group = dist.new_group([0, 1, 2])  # every rank must create both groups
+    rest = dist.new_group(list(range(3, world)))
     try:
         if dist.get_rank() >= 3:
+            # Symmetric-memory rendezvous counters are per process, not per group: the other
+            # ranks make the same two allocations so every rank's counter stays in step and a
+            # later rendezvous does not hang.
+            orr._push_staging(rest)
+            SymmetricMemoryManager.get_buffer("tp3_test", process_group=rest)
             return
         x = _partials((96, 1024), torch.bfloat16, seed=31)
         rank = group.rank()
