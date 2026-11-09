@@ -141,3 +141,40 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
     else:
         with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
             ModelParallelConfig(sequence_parallel=True, **kwargs)
+
+
+def _moe_tensor_parallel_training_args(monkeypatch, **overrides):
+    monkeypatch.setattr(sys, "argv", ["test_model_parallel_config.py"])
+    args = parse_args()
+    # Pin the world size to the tensor-parallel size, independent of how the job was launched.
+    args.world_size = 2
+    args.tensor_model_parallel_size = 2
+    args.num_experts = 2
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 1024
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_moe_training_with_tensor_parallelism_requires_sequence_parallelism(monkeypatch):
+    args = _moe_tensor_parallel_training_args(monkeypatch, sequence_parallel=False)
+
+    with pytest.raises(ValueError, match="requires sequence parallelism"):
+        validate_args(args)
+
+
+def test_moe_training_with_tensor_and_sequence_parallelism_validates(monkeypatch):
+    args = _moe_tensor_parallel_training_args(monkeypatch, sequence_parallel=True)
+
+    validated_args = validate_args(args)
+
+    assert validated_args.sequence_parallel

@@ -1472,6 +1472,20 @@ def validate_args(args, defaults={}):
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
 
+    # MoELayer.forward rejects tensor parallelism without sequence parallelism in training.
+    # Check it here, before the model and the optimizer are built.
+    if (
+        args.num_experts is not None
+        and args.tensor_model_parallel_size > 1
+        and not args.sequence_parallel
+        and not args.skip_train
+        and (args.train_iters is not None or args.train_samples is not None)
+    ):
+        raise ValueError(
+            "Training MoE models with tensor parallelism requires sequence parallelism. "
+            "Add --sequence-parallel."
+        )
+
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]

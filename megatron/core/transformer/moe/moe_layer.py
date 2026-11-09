@@ -788,8 +788,8 @@ class MoELayer(BaseMoELayer):
         """
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
-                "During training, performance may degrade if MoE and tensor parallelism"
-                "are enabled without also enabling sequence parallelism."
+                "Training MoE layers with tensor parallelism requires sequence parallelism. "
+                "Set sequence_parallel=True (--sequence-parallel)."
             )
         self.select_token_dispatcher()
 
