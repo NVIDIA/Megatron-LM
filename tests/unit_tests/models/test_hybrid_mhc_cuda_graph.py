@@ -169,15 +169,19 @@ def _count_recompute_rebuilds(monkeypatch):
 
 
 def _record_bda_managers(monkeypatch):
-    """Record whether each HyperConnectionModule bias-dropout-add received a recompute manager."""
+    """Record whether each HyperConnectionModule bias-dropout-add was checkpointed for recompute."""
     received = {}
     original = HyperConnectionModule.fused_h_res_h_post_bda
     signature = inspect.signature(original)
 
     def recording(self, *args, **kwargs):
-        # GPT layers pass the manager positionally, Hybrid wrappers by keyword.
-        manager = signature.bind(self, *args, **kwargs).arguments.get('manager')
-        received.setdefault(id(self), []).append(manager is not None)
+        # GPT layers checkpoint through the shared residual writer's checkpoint_fn,
+        # Hybrid wrappers pass the manager by keyword.
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        checkpointed = (
+            arguments.get('manager') is not None or arguments.get('checkpoint_fn') is not None
+        )
+        received.setdefault(id(self), []).append(checkpointed)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(HyperConnectionModule, 'fused_h_res_h_post_bda', recording)
