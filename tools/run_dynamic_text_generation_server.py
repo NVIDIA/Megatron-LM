@@ -178,8 +178,22 @@ def parse_args_and_detect_vlm(
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    # Detection can update text-only and MIMO language backbones as well as VLMs.
+    # Keep the MIMO checkpoint provider's Hybrid configuration and prefix dispatch.
+    model_config_cls = (
+        LLaVAModelConfig
+        if is_vlm and getattr(args, "mimo_checkpoint_prefix_map", None) is None
+        else None
+    )
+    cfg.model = model_config_from_args(args, model_config_cls=model_config_cls)
     cfg.tokenizer = tokenizer_config_from_args(args)
     rebuild_tokenizer(cfg, args)
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+    resolve_tokenizer_vocab_size(cfg)
     # Tiling and dynamic_resolution are mutually exclusive at inference, so
     # use --use-tiling explicitly.
     if getattr(args, 'use_tiling', False):
@@ -192,7 +206,7 @@ def parse_args_and_detect_vlm(
     return args, is_vlm
 
 
-def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
+def _build_engine_for_vlm_or_gpt(cfg, is_vlm: bool) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
     The default ``get_dynamic_inference_engine`` only knows about GPT/Hybrid
@@ -245,7 +259,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 args.pixel_shuffle,
                 args.use_tile_tags,
                 args.max_num_tiles,
-                args.tokenizer_prompt_format,
+                cfg.tokenizer.tokenizer_prompt_format,
             )
             max_num_tiles = args.max_num_tiles + int(getattr(args, 'use_thumbnail', False))
             max_img_tokens = max_num_tiles * args.num_img_embeddings_per_tile
@@ -366,6 +380,7 @@ async def run_text_generation_server(
     try:
         url = None
         if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
+            # Blocks this loop until every replica is listening.
             url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
@@ -487,7 +502,7 @@ if __name__ == "__main__":
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        engine = _build_engine_for_vlm_or_gpt(cfg, is_vlm=is_vlm)
 
         try:
             asyncio.run(

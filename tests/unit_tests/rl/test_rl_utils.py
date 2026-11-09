@@ -62,6 +62,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.callbacks import CallbackContext
 from megatron.training.config import RLConfig
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
 from megatron.training.training import _pop_samples_seen
@@ -524,7 +525,6 @@ class TestRLUtils:
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
         args.num_attention_heads = 8
-        args.vocab_size = VOCAB
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256
@@ -537,7 +537,9 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -1349,7 +1351,7 @@ class TestRLUtils:
         not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
     )
     @pytest.mark.parametrize("packing", [False, True])
-    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+    def test_forward_step_reports_samples_seen(self, monkeypatch, run_config, packing):
         """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
         the sequences packed into the bin, or the batch size; the loop sums the reports."""
         with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
@@ -1374,18 +1376,9 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        monkeypatch.setattr(
-            train_rl,
-            "get_run_config",
-            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
-        )
-        monkeypatch.setattr(
-            train_rl,
-            "get_args",
-            lambda: SimpleNamespace(
-                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-            ),
-        )
+        run_config.rl.rl_use_sequence_packing = packing
+        run_config.rerun_state_machine.check_for_nan_in_loss = False
+        monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         if packing:
             seq_indices = [11, 12, 13, 14, 15]
             monkeypatch.setattr(
