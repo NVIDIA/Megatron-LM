@@ -412,6 +412,36 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _check_interleaved_microbatch_groups(
+    phase: str, *, num_microbatches: int, group_size: int | None, pipeline_parallel_size: int
+) -> None:
+    """Check the micro-batch groups of the interleaved pipeline schedule for one batch size.
+
+    The schedule runs the micro-batches of a step in groups of N
+    (--microbatch-group-size-per-virtual-pipeline-stage, default: the pipeline-parallel size PP).
+    It needs PP <= N <= M, where M is the number of micro-batches per step, and the last group to
+    be empty or to hold at least PP micro-batches.
+    """
+    if group_size is None:
+        group_size = pipeline_parallel_size
+    if not pipeline_parallel_size <= group_size <= num_microbatches:
+        raise ValueError(
+            f"The interleaved pipeline schedule needs the micro-batch group size N "
+            f"(--microbatch-group-size-per-virtual-pipeline-stage, default: the pipeline-parallel "
+            f"size) to be between the pipeline-parallel size and the number of {phase} "
+            f"micro-batches per step, but N={group_size}, PP={pipeline_parallel_size} and "
+            f"M={num_microbatches}."
+        )
+    remainder = num_microbatches % group_size
+    if 0 < remainder < pipeline_parallel_size:
+        raise ValueError(
+            f"The interleaved pipeline schedule needs the number of {phase} micro-batches per "
+            f"step (M={num_microbatches}) to be a multiple of the micro-batch group size "
+            f"(N={group_size}), or the remainder to be at least the pipeline-parallel size "
+            f"(PP={pipeline_parallel_size}), but the remainder is {remainder}."
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
@@ -1830,6 +1860,30 @@ def validate_args(args, defaults={}):
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
+
+    # The interleaved schedule checks its micro-batch groups only when a step starts
+    # (forward_backward_pipelining_with_interleaving). The number of micro-batches per step is
+    # known here unless the batch size changes during training, or sequence packing schedules
+    # the micro-batches, so check them now.
+    if (
+        args.virtual_pipeline_model_parallel_size is not None
+        and args.sequence_packing_scheduler is None
+        and args.rampup_batch_size is None
+        and args.step_batch_size_schedule is None
+        and not args.decrease_batch_size_if_needed
+    ):
+        batch_sizes = [("training", args.global_batch_size, args.micro_batch_size)]
+        if args.full_validation or (args.eval_iters or 0) > 0:
+            batch_sizes.append(
+                ("evaluation", args.eval_global_batch_size, args.eval_micro_batch_size)
+            )
+        for phase, global_batch_size, micro_batch_size in batch_sizes:
+            _check_interleaved_microbatch_groups(
+                phase,
+                num_microbatches=global_batch_size // (micro_batch_size * args.batch_parallel_size),
+                group_size=args.microbatch_group_size_per_vp_stage,
+                pipeline_parallel_size=args.pipeline_model_parallel_size,
+            )
 
     # Print arguments.
     _print_args("arguments", args)
