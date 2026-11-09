@@ -384,9 +384,11 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                 fully_parallel, sharded_part, parallelization_group, exchange_algo
             )
         with debug_time("apply_factory_merges", logger):
-            sharded_part = apply_factory_merges(sharded_part, sh_ten_factories)
             # __adding__ sharded_part
             merge(recreated_state_dict, sharded_part)
+            # Merge factories against the full state dict, as `serialization.load` does: a
+            # factory may build only local nonpersistent objects, which are not in `sharded_part`.
+            recreated_state_dict = apply_factory_merges(recreated_state_dict, sh_ten_factories)
 
         if return_mismatch_keys:
             return recreated_state_dict, missing_keys, unexpected_keys
