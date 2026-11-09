@@ -361,17 +361,46 @@ def test_batch_invariant_inference_activations_replay():
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
-def test_mxfp8_quantize_replays():
+def test_batch_invariant_squared_relu_quantize_replays():
+    """The fused BI activation + MXFP8 quantize replays and equals the two-kernel path."""
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    seeded()
+    rows, ffn, n_used = 16384, 1856, 12000
+    perm, n_used_t = _padded_layout(rows, ffn, n_used)
+    probs = torch.rand(rows, device="cuda")
+    x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16) * 5
+
+    def fn(x):
+        out = batch_invariant.squared_relu_with_probs_quantize_mxfp8(x, perm, n_used_t, probs)
+        return out.data[:n_used].view(torch.uint8), out.scale.view(torch.uint8)
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="squared_relu_with_probs_quantize")
+    data, scale = fn(x)
+    ref = _quantize_mxfp8_used_rows(
+        batch_invariant.squared_relu_with_probs(x, perm, n_used_t, probs, zero_padding=True),
+        n_used_t,
+    )
+    assert torch.equal(data, ref.data[:n_used].view(torch.uint8))
+    assert torch.equal(scale, ref.scale.view(torch.uint8))
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+@pytest.mark.parametrize("transpose", [False, True], ids=["contiguous", "transposed"])
+def test_mxfp8_quantize_replays(transpose):
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
 
     seeded()
     x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
+    if transpose:
+        x = x.t()
 
     def fn(x):
         data, scale = mxfp8_quantize(x)
         return data.view(torch.uint8), scale.view(torch.uint8)
 
-    assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
+    assert_replays_bit_exact(fn, (x,), backward=False, contention=True, what="mxfp8_quantize")
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
