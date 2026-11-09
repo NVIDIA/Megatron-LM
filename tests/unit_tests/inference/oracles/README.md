@@ -67,6 +67,7 @@ Each `test_<kernel>.py` has five parts, in this order.
 | `pytest.mark.launch_on_gb200` | Required, written literally in the file, on every test that includes `BLACKWELL` in `requires_sm`: GB200 CI launches only files containing it and selects only tests carrying it (`tests/unit_tests/find_test_cases.py`). The conftest fails a Blackwell test without it. |
 | `pytest.mark.sanitizer` | A small case selected for the compute-sanitizer pass. It also runs normally. |
 | `pytest.mark.large` | Needs tens of GB (int32-overflow sizes). Skipped unless the `-m` expression names `large`. `ou.int32_overflow_params` adds it. |
+| `ou.xfail_upstream(finding, package, fixed_after=..., reason=...)` | The one allowed xfail: a confirmed bug in an upstream package (e.g. FlashInfer) that no Megatron change can fix. Strict, and only while the installed package is at most `fixed_after` (the release the CI image pins): a newer release runs the test, and an XPASS fails until the mark is removed. `reason` names the finding's drafted upstream patch. Mark exactly the failing cases. A Megatron bug keeps a plain failing test until its fix PR lands; hardware behaviour gets its documented contract asserted instead. After a test raises, the conftest clears any CUDA launch error it left pending (`ou.drain_cuda_launch_error`), so the next test does not report it. |
 
 ## Running
 

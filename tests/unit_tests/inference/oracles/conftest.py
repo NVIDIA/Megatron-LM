@@ -50,3 +50,10 @@ def pytest_runtest_setup(item):
             pytest.skip(reason)
         if action == "fail":
             pytest.fail(reason, pytrace=False)
+
+
+def pytest_runtest_makereport(item, call):
+    # A test that raised (e.g. on an upstream kernel that fails to launch, xfail_upstream) must
+    # not leave that launch error pending: the next test's first kernel launch would report it.
+    if call.when == "call" and call.excinfo is not None:
+        oracle_utils.drain_cuda_launch_error()
