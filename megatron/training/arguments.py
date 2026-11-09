@@ -1185,6 +1185,22 @@ def validate_args(args, defaults={}):
     if args.save is not None and args.save_params_interval is not None:
         assert not args.overlap_param_gather, \
             '--save-params-interval is not supported with --overlap-param-gather'
+    # The parameter, activation, gradient and tokens-per-expert dumps are written under --save.
+    for interval_arg in (
+        "save_params_interval",
+        "save_activations_interval",
+        "save_tokens_per_expert_interval",
+        "save_wgrads_interval",
+        "save_dgrads_interval",
+    ):
+        interval = getattr(args, interval_arg)
+        if interval is None:
+            continue
+        flag = "--" + interval_arg.replace("_", "-")
+        if interval <= 0:
+            raise ValueError(f"{flag} must be positive, got {interval}.")
+        if args.save is None:
+            raise ValueError(f"{flag} writes its dumps under --save, which is not set.")
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
