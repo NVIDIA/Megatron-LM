@@ -17,7 +17,7 @@ import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
-from megatron.training import arguments, global_vars, initialize
+from megatron.training import arguments, global_vars, initialize, vocab_utils
 from megatron.training.argument_utils import (
     _default_config_from_args,
     gpt_config_from_args,
@@ -1370,6 +1370,23 @@ def test_dataset_helpers_use_registered_model(
     assert args.data_parallel_size == 999
     assert args.context_parallel_size == args.tensor_model_parallel_size == 1
     assert args.mtp_num_layers is None
+
+
+@pytest.mark.parametrize("padded_vocab_size", [128, 260, 261, 384])
+def test_padded_vocabulary_must_cover_the_tokenizer(monkeypatch, padded_vocab_size):
+    """Token ids at or above the padded size would index past the embedding table."""
+    monkeypatch.setattr(
+        vocab_utils, "build_tokenizer", lambda _config: SimpleNamespace(vocab_size=261)
+    )
+    config = TokenizerConfig(padded_vocab_size=padded_vocab_size)
+    expectation = (
+        pytest.raises(ValueError, match="smaller than the tokenizer's vocabulary")
+        if padded_vocab_size < 261
+        else nullcontext()
+    )
+    with expectation:
+        build_tokenizer_and_pad_vocab_size(config, make_vocab_size_divisible_by=128)
+    assert config.padded_vocab_size == padded_vocab_size
 
 
 def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_globals):

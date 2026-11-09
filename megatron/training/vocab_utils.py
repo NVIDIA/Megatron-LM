@@ -110,4 +110,12 @@ def build_tokenizer_and_pad_vocab_size(config: TokenizerConfig, make_vocab_size_
         else:
             print_rank_0("padded_vocab_size already configured on TokenizerConfig. Skipping divisibility padding calculation and update.")
 
+    # An explicit or checkpoint-restored size below the tokenizer's vocabulary leaves token ids
+    # without an embedding row: the gather fails with TP=1 and returns zeros with TP>1.
+    if config.padded_vocab_size is not None and config.padded_vocab_size < tokenizer.vocab_size:
+        raise ValueError(
+            f"padded_vocab_size ({config.padded_vocab_size}) is smaller than the tokenizer's "
+            f"vocabulary ({tokenizer.vocab_size}); token ids at or above it have no embedding row."
+        )
+
     return tokenizer
