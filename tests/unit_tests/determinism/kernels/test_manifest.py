@@ -87,7 +87,11 @@ def test_registered_test_imports_kernel(entry):
         return
     sources = {_module_of(src) for src in entry.sources if src.endswith(".py")}
     for test in entry.tests:
-        if not test.startswith("tests/unit_tests/determinism/kernels/") or not sources:
+        is_replay_module = test.startswith("tests/unit_tests/determinism/kernels/") or (
+            test.startswith("tests/unit_tests/context_parallel/runtime/")
+            and test.endswith("_replay.py")
+        )
+        if not is_replay_module or not sources:
             continue
         imported = _imported_modules(REPO_ROOT / test)
         assert any(
@@ -130,6 +134,22 @@ def test_ci_tool_flags_unregistered_kernel_file(tmp_path):
         ["megatron/core/new_kernel.py"], manifest, labels=set(), repo_root=tmp_path
     )
     assert violations and "not registered" in violations[0]
+
+
+def test_deprecated_forwarders_in_kernel_directories_hold_no_kernel(tmp_path):
+    """A moved kernel's old path only forwards; the kernel is registered at its new path."""
+    path = f"{manifest.KERNEL_DIRECTORIES[0]}/moved_kernel.py"
+    forwarder = tmp_path / path
+    forwarder.parent.mkdir(parents=True)
+    forwarder.write_text(
+        '"""Deprecated import path; use ``megatron.core.ops.moved_kernel``."""\n\n'
+        "from megatron.core.ops._compat import deprecated_module\n\n"
+        '__getattr__, __dir__ = deprecated_module(__name__, "megatron.core.ops.moved_kernel")\n'
+    )
+    assert coverage.is_kernel_bearing(path, manifest, tmp_path) == ""
+    # Code beside the forwarding call keeps the directory rule.
+    forwarder.write_text(forwarder.read_text() + "\n\ndef fused(x):\n    return x\n")
+    assert coverage.is_kernel_bearing(path, manifest, tmp_path) == "lives in a kernel directory"
 
 
 def test_dispatch_entries_name_their_kernels():
