@@ -82,41 +82,19 @@ Megatron-LM/
 
 # Performance Benchmarking
 
-The [NVIDIA Megatron Bridge Performance Summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html) publishes training throughput, system configurations, parallelism settings, and links to [performance recipes and reproduction instructions](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/scripts/performance). Use the container and matching code version specified by those instructions when reproducing a result.
+Keep [Megatron](https://github.com/NVIDIA/Megatron-LM/releases) up to date to benefit from continued improvements in training performance and optimized recipes.
 
 ## DeepSeek-V3 performance on Blackwell
 
-Keep [Megatron Core](https://github.com/NVIDIA/Megatron-LM/releases) and [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge/releases) up to date to capture cumulative improvements in training performance and [recipes](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html). Published DeepSeek-V3 model TFLOP/s/GPU improved **2.1× on GB200** (606 in NeMo 25.07 to 1,277 in 26.08.01) and **1.5× on GB300** (1,088 in 25.11 to 1,636 in 26.08.01).
+Successive Megatron versions have improved published DeepSeek-V3 model TFLOP/s/GPU **2.1× on GB200** and **1.5× on GB300**, using 256 GPUs and sequence length 4,096.
 
-![DeepSeek-V3 model TFLOP/s/GPU across selected NeMo releases: 2.1× on GB200, from 606 in July 2025 to 1,277 in August 2026, and 1.5× on GB300, from 1,088 in November 2025 to 1,636 in August 2026](images/deepseek_v3_blackwell_performance.svg)
+![DeepSeek-V3 performance across Megatron updates: 2.1× model TFLOP/s/GPU on GB200 and 1.5× on GB300](images/deepseek_v3_blackwell_performance.svg)
 
-All runs use **256 GPUs and sequence length 4,096**. These are published recipe results: 25.07 uses FP8 and global batch size 2,048; 25.11 onward uses MXFP8 and batch size 4,096. Parallelism, microbatch settings, and model options also vary. The gains reflect the evolving training stack and recipes; individual releases can show small decreases.
-
-<details>
-<summary>Benchmark data and sources</summary>
-
-Model TFLOP/s/GPU from the [NeMo 25.07 summary](https://docs.nvidia.com/nemo-framework/user-guide/25.07/performance/performance-summary.html) and Megatron Bridge 0.7.0 [summary](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html) and [archive](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html). Labels identify NeMo container releases; 25.11 calls MXFP8 "FP8-MX". A dash indicates no plotted result.
-
-The 25.07 page does not specify token dropping. From 25.11 onward, benchmarks force-balance experts and drop no tokens. The 25.11 runs exclude multi-token prediction (MTP); later tables do not specify MTP. The 25.09 result uses token dropping and is omitted.
-
-| NeMo container | DGX-GB200 | DGX-GB300 |
-| --- | ---: | ---: |
-| [25.07](https://docs.nvidia.com/nemo-framework/user-guide/25.07/performance/performance-summary.html#pre-training-performance) | 606 | — |
-| [25.11](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id62) | 1,003 | 1,088 |
-| [26.02](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id54) | 1,028 | 1,199 |
-| [26.02.01](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id44) | 1,046 | 1,219 |
-| [26.04](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id33) | 1,090 | 1,290 |
-| [26.04.01](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id21) | 1,106 | 1,298 |
-| [26.06](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id12) | 1,292 | 1,648 |
-| [26.06.01](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#id2) | 1,280 | 1,640 |
-| [26.08](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary-archive.html#nemo-container) | 1,276 | 1,635 |
-| [26.08.01](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html#nemo-container) | 1,277 | 1,636 |
-
-</details>
+See the [performance summary](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html) for the full batch sizes and parallelism configurations, and get the [NGC container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nemo/26.08.01/tags).
 
 ## Selected training results
 
-Selected results from the **26.08.01 NeMo container** (August 2026):
+Selected results from published Megatron training recipes:
 
 | Model | System | GPUs | Precision | Sequence length | Tokens/s/GPU | Model TFLOPs/s/GPU |
 | --- | --- | ---: | --- | ---: | ---: | ---: |
@@ -125,7 +103,7 @@ Selected results from the **26.08.01 NeMo container** (August 2026):
 | Qwen3-235B-A22B | DGX-GB300 | 256 | MXFP8 | 4,096 | 8,832 | 1,306 |
 | Nemotron 3 Ultra | DGX-GB300 | 256 | NVFP4 | 8,192 | 3,744 | 1,348 |
 
-See the summary for the full batch sizes and parallelism configurations. MoE benchmarks use force-balanced expert routing and do not drop tokens. These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
+MoE benchmarks use force-balanced expert routing and do not drop tokens. These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
 
 # Roadmaps
 
