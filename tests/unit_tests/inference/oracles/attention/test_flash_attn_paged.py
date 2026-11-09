@@ -47,12 +47,19 @@ on Hopper and Blackwell); prefill/mixed and decode-only; page size 256 (FA2's on
 4097`` in one batch (rows of different lengths, the last crossing split-KV chunks); chunked
 prefill continuing across a page boundary; decode with ``S`` in 1, 2, 4 (MTP); GQA 1, 4, 8;
 head dim 64 and 128; window ``P-1``, ``P``, ``P+1``; softcap; learnable sink; zero-length padding
-requests; FA4 ``max_seqlen_k`` at the block-table capacity (as CUDA graphs pass it); FA3/FA4
-batch-invariant mode. Factors combined pairwise. Decode whose packed query rows ``S * H / Hk``
-(FA3/FA4 pack a KV head's query heads with the request's tokens into the rows of one M tile) sit
-below, at and past the 128-row M tile and past FA4's two-stage 256-row tile on SM100, where FA4
-sizes its schedule from ``max_seqlen_q * H / Hk`` (one tile per request when that fits):
-``test_decode_query_rows_cross_the_m_tile``.
+requests; FA3 (prefill) and FA4 ``max_seqlen_k`` at the block-table capacity (as CUDA graphs
+pass it); FA3/FA4 batch-invariant mode. Factors combined pairwise. Decode whose packed query
+rows ``S * H / Hk`` (FA3/FA4 pack a KV head's query heads with the request's tokens into the
+rows of one M tile) sit below, at and past the 128-row M tile and past FA4's two-stage 256-row
+tile on SM100, where FA4 sizes its schedule from ``max_seqlen_q * H / Hk`` (one tile per request
+when that fits):
+``test_decode_query_rows_cross_the_m_tile``. Batch-invariant decode with token-only padding rows
+past the requests' tokens (CUDA-graph buckets pad the token count): the call site passes only
+the requests' rows to the kernel and returns zero rows for the padding
+(``test_batch_invariant_decode_zeroes_token_padding``). Production geometry: Llama-3.1-8B's 32
+query and 8 KV heads of 128 on 256-token pages (the context's default), a 64-request decode
+step over contexts up to 8192 tokens and a prefill step with a 1024-token chunk over a
+3072-token prefix (``test_production_geometry_matches_reference``).
 
 Open PRs (written against main):
 * #8584 (n2): on main, FA4 on Hopper asks for split-KV (``num_splits=0``), which FA4's SM90
@@ -290,7 +297,7 @@ def _cases(version: int, phase: str):
     }
     if phase == "decode":
         factors["tokens"] = [1, 2, 4]
-    if version == 4:
+    if version in (3, 4):  # FA3's prefill wrapper and FA4 both take max_seqlen_k
         factors["capacity_max_seqlen_k"] = [False, True]
     if version in (3, 4):
         factors["batch_invariant"] = [False, True]
@@ -538,6 +545,135 @@ def test_decode_query_rows_cross_the_m_tile(version, batch_invariant, tokens):
         sink=None,
         window=None,
         what=f"FA{version} decode, {tokens} tokens x {M_TILE_HEADS} query heads per KV head",
+    )
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("tokens", [1, 2], ids=["tokens=1", "tokens=2"])
+@pytest.mark.parametrize(
+    "version", [pytest.param(v, id=f"fa{v}", marks=_version_marks(v)) for v in (3, 4)]
+)
+def test_batch_invariant_decode_zeroes_token_padding(version, tokens):
+    """Batch-invariant decode whose q has token-only padding rows past the ``R * S`` rows the
+    metadata describes (a CUDA-graph bucket's token count): the requests' rows match the
+    reference and are bitwise the rows of the unpadded call, and every padding row is zero."""
+    _require_flash(version)
+    page, kv_heads, head_dim, pad_rows = FA_PAGE_SIZES[version][1], 2, 128, 5
+    module = _attention(version, kv_heads=kv_heads, head_dim=head_dim, batch_invariant=True)
+    requests = _decode_requests(page, tokens)
+    g = ou.make_generator(device="cuda")
+    q_lens = [s for s, _ in requests] + [0]  # and one padding request
+    kv_lens = [n for _, n in requests] + [0]
+    batch = ar.make_paged_batch(
+        q_lens, kv_lens, page_size=page, kv_heads=kv_heads, head_dim=head_dim, generator=g
+    )
+    rows = len(q_lens) * tokens  # the metadata's rows (padding request included)
+    live = sum(q_lens)
+    q = ou.poisoned_empty((rows + pad_rows, 1, HEADS, head_dim), torch.bfloat16)
+    q[:live] = torch.randn(live, 1, HEADS, head_dim, device="cuda", generator=g).to(q.dtype)
+    q_before = q.clone()
+    args = (
+        batch.k,
+        batch.v,
+        tokens,
+        batch.block_table.shape[1] * page,
+        batch.cu(q_lens),
+        batch.cu(kv_lens),
+        batch.int_tensor(kv_lens),
+        batch.block_table,
+        True,
+    )
+    with torch.no_grad():
+        padded = module.flash_decode_and_prefill(q, *args)
+        unpadded = module.flash_decode_and_prefill(q[:rows].clone(), *args)
+    torch.cuda.synchronize()
+    batch.check_pool_unchanged()
+    ou.assert_exact(q, q_before, what="q (read-only)")
+    assert padded.shape == (rows + pad_rows, 1, HEADS, head_dim), f"shape {tuple(padded.shape)}"
+    ou.assert_exact(padded[rows:], torch.zeros_like(padded[rows:]), what="token padding rows")
+    ou.assert_exact(padded[:live], unpadded[:live], what="request rows, padded vs unpadded q")
+    _check(
+        padded,
+        q,
+        batch,
+        live,
+        head_dim=head_dim,
+        softcap=None,
+        sink=None,
+        window=None,
+        what=f"FA{version} batch-invariant decode with {pad_rows} token padding rows",
+    )
+
+
+# Llama-3.1-8B attention on the dynamic context's default 256-token pages.
+PRODUCTION = dict(heads=32, kv_heads=8, head_dim=128, page=256)
+PRODUCTION_DECODE_LENGTHS = [1, 255, 256, 257, 4095, 4096, 8191, 8192]
+
+
+def _production_cases():
+    params = []
+    for tag, version, batch_invariant in (
+        ("fa2", 2, False),
+        ("fa3", 3, False),
+        ("fa4", 4, False),
+        ("fa4bi", 4, True),
+    ):
+        for phase in ("prefill", "decode"):
+            params.append(
+                pytest.param(
+                    version,
+                    batch_invariant,
+                    phase,
+                    id=f"{tag}-{phase}",
+                    marks=_version_marks(version),
+                )
+            )
+    return params
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("version, batch_invariant, phase", _production_cases())
+def test_production_geometry_matches_reference(version, batch_invariant, phase):
+    """Llama-3.1-8B's attention (32 query and 8 KV heads of 128) on 256-token pages: a decode
+    step of 64 requests over contexts up to 8192 tokens, and a prefill step with a 1024-token
+    chunk over a 3072-token prefix, three short prompts and three decode rows."""
+    _require_flash(version)
+    p = PRODUCTION
+    module = _attention(
+        version,
+        kv_heads=p["kv_heads"],
+        head_dim=p["head_dim"],
+        batch_invariant=batch_invariant,
+        heads=p["heads"],
+    )
+    if phase == "decode":
+        g = torch.Generator().manual_seed(ou.DEFAULT_SEED)
+        spread = torch.randint(1, 8193, (64 - len(PRODUCTION_DECODE_LENGTHS),), generator=g)
+        requests = [(1, n) for n in PRODUCTION_DECODE_LENGTHS + spread.tolist()]
+    else:
+        requests = [(1024, 4096), (255, 255), (256, 256), (257, 257), (1, 1), (1, 2048)]
+        requests.append((1, 8192))
+    out, q, batch, live = _run(
+        module,
+        phase=phase,
+        requests=requests,
+        padding=2,
+        page=p["page"],
+        kv_heads=p["kv_heads"],
+        head_dim=p["head_dim"],
+        capacity_max_seqlen_k=version != 2,
+        heads=p["heads"],
+    )
+    _check(
+        out,
+        q,
+        batch,
+        live,
+        head_dim=p["head_dim"],
+        softcap=None,
+        sink=None,
+        window=None,
+        what=f"FA{version}{' BI' if batch_invariant else ''} {phase}, Llama-3.1-8B geometry",
     )
 
 
