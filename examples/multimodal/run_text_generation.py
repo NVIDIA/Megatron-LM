@@ -192,7 +192,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.pixel_shuffle,
         args.use_tile_tags,
         args.max_num_tiles,
-        args.tokenizer_prompt_format,
+        cfg.tokenizer.tokenizer_prompt_format,
     )
 
     if args.use_mcore_inference:
@@ -201,7 +201,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
             fp32_residual_connection=args.fp32_residual_connection,
             params_dtype=args.params_dtype,
-            padded_vocab_size=args.padded_vocab_size,
+            padded_vocab_size=cfg.tokenizer.padded_vocab_size,
         )
         inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
         tokenizer = get_tokenizer()
@@ -300,7 +300,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     raise NotImplementedError("no output name defined for", config.task)
 
                 prompt, generated = get_prompt_and_generated(
-                    generation, args.tokenizer_prompt_format
+                    generation, cfg.tokenizer.tokenizer_prompt_format
                 )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
@@ -849,8 +849,12 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron(training=False)
 
     args = get_args()
