@@ -28,6 +28,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -40,6 +43,9 @@ jobs:
 
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern
+
+      - name: Check versioned nightly content
+        run: python3 fern/scripts/sync_versions.py --check
 
       - name: Validate Fern configuration
         working-directory: ./fern

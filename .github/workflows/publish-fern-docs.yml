@@ -37,6 +37,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 concurrency:
   group: fern-publish
   cancel-in-progress: true
