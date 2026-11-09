@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Opt-in check that inference threads are bound to GPU-local CPUs."""
+"""Check that inference threads are bound to GPU-local CPUs."""
 
 import logging
 import os
+import platform
 import threading
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -35,11 +36,19 @@ def _gpu_local_cpus() -> Optional[set[int]]:
         cpulist = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
     except OSError:  # No sysfs, e.g. non-Linux or a masked /sys.
         return None
+    if not cpulist:  # A CPU-less node, e.g. GPU memory exposed as a NUMA node.
+        return None
     cpus = set()
     for part in cpulist.split(","):
         lo, _, hi = part.partition("-")
         cpus.update(range(int(lo), int(hi or lo) + 1))
     return cpus
+
+
+def cpu_affinity_check_enabled(setting: Optional[bool]) -> bool:
+    """Resolve the config setting. None enables the check only on Grace (aarch64) hosts, which
+    have one NUMA node per socket; x86 hosts may split sockets (SNC/NPS) and must opt in."""
+    return platform.machine() == "aarch64" if setting is None else setting
 
 
 def _check_threads(

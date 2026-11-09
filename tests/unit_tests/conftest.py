@@ -38,7 +38,7 @@ def pytest_configure(config):
 
 @pytest.fixture(autouse=True)
 def _skip_inference_cpu_affinity_check(monkeypatch):
-    """Unit-test launchers do not bind CPUs, so skip the default-on inference affinity check."""
+    """Unit-test launchers do not bind CPUs, so skip the inference CPU affinity check."""
     monkeypatch.setattr("megatron.core.inference.cpu_affinity._gpu_local_cpus", lambda: None)
 
 

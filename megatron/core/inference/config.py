@@ -496,10 +496,11 @@ class InferenceConfig:
     NOTE: Must remain mutually exclusive with the `TransformerConfig`.
     """
 
-    require_gpu_local_cpu_affinity: bool = True
+    require_gpu_local_cpu_affinity: Optional[bool] = None
     """Raise at dynamic engine init if the engine thread may run on non-GPU-local CPUs, and
-    warn about other such threads after warmup. Skipped where the GPU's NUMA node is unknown.
-    Disable with --no-require-gpu-local-cpu-affinity."""
+    warn about other such threads after warmup. None enables it on Grace (aarch64) hosts only.
+    Skipped where the GPU's NUMA node is unknown. Disable with
+    --no-require-gpu-local-cpu-affinity."""
 
     # =================================
     # KV cache and Mamba states config

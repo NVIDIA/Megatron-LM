@@ -294,9 +294,9 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
-    require_gpu_local_cpu_affinity: bool = True
-    """Check that inference ranks are bound to GPU-local CPUs. Disable with
-    --no-require-gpu-local-cpu-affinity."""
+    require_gpu_local_cpu_affinity: bool | None = None
+    """Check that inference ranks are bound to GPU-local CPUs. None enables it on Grace
+    (aarch64) hosts only. Disable with --no-require-gpu-local-cpu-affinity."""
 
     def validate(self) -> None:
         """Check the KV-cache suspend/resume policy before an engine is built from it."""

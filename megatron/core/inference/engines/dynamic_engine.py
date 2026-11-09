@@ -37,7 +37,10 @@ from megatron.core.inference.contexts.dynamic_context import (
     PromptPreparationError,
     TokenOverflowError,
 )
-from megatron.core.inference.cpu_affinity import validate_inference_cpu_affinity
+from megatron.core.inference.cpu_affinity import (
+    cpu_affinity_check_enabled,
+    validate_inference_cpu_affinity,
+)
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -533,7 +536,10 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
 
-        if inference_config.require_gpu_local_cpu_affinity:
+        check_cpu_affinity = cpu_affinity_check_enabled(
+            inference_config.require_gpu_local_cpu_affinity
+        )
+        if check_cpu_affinity:
             validate_inference_cpu_affinity()
 
         if inference_config.pg_collection is not None:
@@ -634,7 +640,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
-        if inference_config.require_gpu_local_cpu_affinity:
+        if check_cpu_affinity:
             # Library threads may set their own affinity, so only warn for those.
             validate_inference_cpu_affinity(all_threads=True, warn_for_helper_threads=True)
 
