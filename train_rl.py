@@ -42,7 +42,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.config import PosttrainConfigContainer, RLConfig, RunConfigRecord
+from megatron.training.config import AlgorithmConfigContainer, RLConfig, RunConfigRecord
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
@@ -443,19 +443,19 @@ if __name__ == "__main__":
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    # The run's record: the pretrain container (the run config the loop reads), the rollout
+    # The run's record: the training container (the run config the loop reads), the rollout
     # engine's deployment and the RL section, under the record type every process writes.
     # finalize_rl_run validates the RL section against the run, finalizes the deployment and
     # applies the RL gradient-buffer layout to the run's DDP config before initialize_megatron
-    # finalizes the pretrain container.
+    # finalizes the training container.
     record = RunConfigRecord(
-        pretrain=full_config,
+        training=full_config,
         inference=rollout_inference_container_from_args(args, full_config),
-        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
     finalize_rl_run(record)
     set_rl_run_config(record)
-    rl_cfg = record.posttrain.rl
+    rl_cfg = record.algorithm.rl
     inference_container = record.inference
     assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
     rl_model_provider = partial(model_provider, _model_builder)

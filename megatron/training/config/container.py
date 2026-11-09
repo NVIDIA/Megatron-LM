@@ -912,38 +912,38 @@ class InferenceConfigContainer(ConfigContainerBase):
 
 
 @dataclass(kw_only=True)
-class PosttrainConfigContainer(ConfigContainerBase):
-    """Top-level container for what a post-training run does on top of its base recipe."""
+class AlgorithmConfigContainer(ConfigContainerBase):
+    """Top-level container for the algorithm sections a run adds on top of `training`."""
 
     rl: RLConfig | None = None
-    """The RL loop's section; `None` for a post-training run without RL."""
+    """The RL loop's section; `None` for a run without RL."""
 
 
 @dataclass(kw_only=True)
 class RunConfigRecord(ConfigContainerBase):
     """The configuration record of a run (`run_config.yaml`).
 
-    A training run records `pretrain`, an inference run records `inference`,
-    an RL run records `pretrain`, `inference`, and `posttrain`.
+    A training run records `training`, an inference run records `inference`,
+    an RL run records `training`, `inference`, and `algorithm`.
 
     Records written before this type, a container serialized flat, still load through
     `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
     """
 
-    pretrain: PretrainConfigContainer | None = None
+    training: PretrainConfigContainer | None = None
     """The training sections; for a training or RL run, the run config the loop reads."""
 
     inference: InferenceConfigContainer | None = None
     """An inference or converter process's sections, or an RL run's rollout engine deployment."""
 
-    posttrain: PosttrainConfigContainer | None = None
-    """What a post-training run adds on top of `pretrain` (the RL section)."""
+    algorithm: AlgorithmConfigContainer | None = None
+    """The algorithm sections a run adds on top of `training` (the RL section)."""
 
     @classmethod
     def wrap(cls, run_config: ConfigContainerBase) -> ConfigContainerBase:
-        """Wrap a lone run config under the member its type names; return other types as is."""
+        """Wrap a lone run config under its record member; return other types as is."""
         if isinstance(run_config, PretrainConfigContainer):
-            return cls(pretrain=run_config)
+            return cls(training=run_config)
         if isinstance(run_config, InferenceConfigContainer):
             return cls(inference=run_config)
         return run_config
@@ -953,7 +953,7 @@ class RunConfigRecord(ConfigContainerBase):
         own directory and format) reach the member that is the run config."""
         document = {key: value for key, value in super().to_dict().items() if value is not None}
         if section_overrides:
-            owner = "pretrain" if self.pretrain is not None else "inference"
+            owner = "training" if self.training is not None else "inference"
             member = getattr(self, owner)
             if member is None:
                 raise ValueError("RunConfigRecord has no run config member to apply overrides to")

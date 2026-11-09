@@ -71,8 +71,8 @@ def _model_and_states(ckpt_format):
 def _assert_saved_config(ckpt_dir, run_config, checkpoint):
     run_config_filename = get_checkpoint_run_config_filename(str(ckpt_dir))
     assert os.path.exists(run_config_filename)
-    # The record names the run's containers as members: a training run's sections sit under pretrain.
-    loaded_config = read_run_config(run_config_filename)["pretrain"]
+    # The record names the run's containers as members: a training run's sections sit under training.
+    loaded_config = read_run_config(run_config_filename)["training"]
     assert loaded_config["train"]["global_batch_size"] == 8
     # The saved checkpoint section describes the policy of this save.
     assert loaded_config["checkpoint"] == serialize_value(checkpoint)
@@ -206,7 +206,7 @@ def test_save_with_explicit_values_records_the_policy_of_the_save(
 
         loaded = read_run_config(
             get_checkpoint_run_config_filename(str(save_dir / "converted" / "iter_0000123"))
-        )["pretrain"]
+        )["training"]
         assert loaded["checkpoint"] == {
             **serialize_value(registered),
             "ckpt_format": "torch",

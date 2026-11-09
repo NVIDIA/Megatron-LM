@@ -12,10 +12,10 @@ from megatron.core.transformer import TransformerConfig
 from megatron.rl.config import finalize_rl_run, validate_rl_run
 from megatron.training import global_vars
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
-    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -63,14 +63,14 @@ def test_validation_is_read_only_and_finalization_runs_once(
         # validate_rl_run checks the RL section; finalize_rl_run applies its DDP layout. The
         # deployment shares the training model and the run's RNG section, as the entry point's.
         rl_run = RunConfigRecord(
-            pretrain=cfg,
+            training=cfg,
             inference=InferenceConfigContainer(
                 model=cfg.model,
                 checkpoint=CheckpointConfig(),
                 inference=InferenceSetupConfig(),
                 rng=cfg.rng,
             ),
-            posttrain=PosttrainConfigContainer(
+            algorithm=AlgorithmConfigContainer(
                 rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
             ),
         )
@@ -216,11 +216,11 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
     rl_run = RunConfigRecord(
-        pretrain=run_config,
+        training=run_config,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
-        posttrain=PosttrainConfigContainer(
+        algorithm=AlgorithmConfigContainer(
             rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
         ),
     )

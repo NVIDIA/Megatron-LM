@@ -268,7 +268,7 @@ def run_config_sections(run_config: Optional[dict[str, Any]]) -> Optional[dict[s
     if isinstance(run_config, dict) and str(run_config.get("_target_", "")).endswith(
         "." + RUN_CONFIG_RECORD_TYPE
     ):
-        return run_config.get("pretrain")
+        return run_config.get("training")
     return run_config
 
 

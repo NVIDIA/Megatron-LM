@@ -43,7 +43,7 @@ def test_run_config_lifecycle(monkeypatch, cleanup):
     assert global_vars.get_run_config() is config
     with pytest.raises(AssertionError, match="run config is already initialized"):
         global_vars.set_run_config(SimpleNamespace(profiling=ProfilingConfig()))
-    record = SimpleNamespace(pretrain=config)
+    record = SimpleNamespace(training=config)
     global_vars.set_run_config_record(record)
     with pytest.raises(AssertionError, match="run config record is already initialized"):
         global_vars.set_run_config_record(record)

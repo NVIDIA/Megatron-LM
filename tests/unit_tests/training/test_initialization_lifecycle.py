@@ -1919,8 +1919,8 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     register.assert_called_once()
     record = register.call_args.args[0]
     assert isinstance(record, RunConfigRecord)
-    assert record.pretrain is cfg and record.inference is deployment
-    assert record.posttrain.rl is rl_section
+    assert record.training is cfg and record.inference is deployment
+    assert record.algorithm.rl is rl_section
     assert deployment._finalized  # the entrypoint finalized the record
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()

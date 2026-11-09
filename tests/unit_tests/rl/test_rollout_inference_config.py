@@ -22,8 +22,8 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     InferenceConfigContainer,
-    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
     TokenizerConfig,
@@ -140,7 +140,7 @@ def test_weight_placement_is_the_rl_sections():
         True,
     )
     run = RunConfigRecord(
-        pretrain=pretrain, inference=deployment, posttrain=PosttrainConfigContainer(rl=rl)
+        training=pretrain, inference=deployment, algorithm=AlgorithmConfigContainer(rl=rl)
     )
     with pytest.raises(ValueError, match="requires a separate inference model"):
         validate_rl_run(run)
@@ -153,9 +153,9 @@ def test_weight_placement_is_the_rl_sections():
     )
     validate_rl_run(
         RunConfigRecord(
-            pretrain=pretrain,
+            training=pretrain,
             inference=deployment,
-            posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+            algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
         )
     )
 

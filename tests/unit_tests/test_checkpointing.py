@@ -1065,7 +1065,7 @@ def test_save_checkpoint(
         with open(ckpt_dir / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(profiling):
-            assert saved_config["pretrain"]["profiling"][field.name] == getattr(
+            assert saved_config["training"]["profiling"][field.name] == getattr(
                 profiling, field.name
             )
         assert args.profile is False and args.profile_ranks == [99]
@@ -1161,10 +1161,10 @@ def test_load_checkpoint(
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
-            assert saved_config["pretrain"]["rng"][field.name] == getattr(rng_config, field.name)
+            assert saved_config["training"]["rng"][field.name] == getattr(rng_config, field.name)
         restored_config = RunConfigRecord.from_yaml(
             ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
-        ).pretrain
+        ).training
         assert type(restored_config.model) is model_cls
         # The shared YAML comes from rank 0; distributed rank fields differ on other ranks.
         assert restored_config.to_dict()["model"] == run_config.to_dict()["model"]
@@ -1767,7 +1767,7 @@ def test_the_saved_section_decides_what_a_resume_requests(
             elif section_says_rng is False:
                 with open(config_filename) as handle:
                     saved = yaml.safe_load(handle)
-                saved["pretrain"]["checkpoint"]["save_rng"] = False
+                saved["training"]["checkpoint"]["save_rng"] = False
                 with open(config_filename, "w") as handle:
                     yaml.safe_dump(saved, handle)
         torch.distributed.barrier()
