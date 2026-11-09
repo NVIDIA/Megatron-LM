@@ -5096,6 +5096,15 @@ class MLATransformerConfig(TransformerConfig):
     128 (otherwise the use_fused_mla_kv_rope_quant path runs); not combined with
     use_fused_mla_q_uproj, whose query is already quantized."""
 
+    use_fused_mla_up_proj_grad_quant: bool = False
+    """With use_fused_mla_qkv_rope_quant: the query RoPE backward and the key/value split backward
+    write the gradients of the query and key/value up-projection outputs already quantized to
+    MXFP8 (row-wise and column-wise, GEMM-swizzled scales), which the projections' backward uses
+    as its grad_output, instead of writing BF16 gradients that the projections then quantize.
+    Bitwise identical. Applies when both projections are Transformer Engine linears whose backward
+    quantizes grad_output to MXFP8 E4M3 (an MXFP8 recipe with fp8_format E4M3); otherwise the
+    use_fused_mla_qkv_rope_quant path runs. Requires use_fused_mla_qkv_rope_quant=True."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -5206,6 +5215,12 @@ class MLATransformerConfig(TransformerConfig):
             raise ValueError(
                 "use_fused_mla_qkv_rope_quant extends use_fused_mla_kv_rope_quant and requires "
                 "use_fused_mla_kv_rope_quant=True."
+            )
+
+        if self.use_fused_mla_up_proj_grad_quant and not self.use_fused_mla_qkv_rope_quant:
+            raise ValueError(
+                "use_fused_mla_up_proj_grad_quant extends use_fused_mla_qkv_rope_quant and "
+                "requires use_fused_mla_qkv_rope_quant=True."
             )
 
         if self.attention_output_gate:

@@ -258,7 +258,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
-        notes="Elementwise rotations under timing-based triton.autotune; fwd+bwd replay in sbhd and thd.",
+        notes="Elementwise rotations under timing-based triton.autotune; fwd+bwd replay in sbhd and thd. "
+        "The k_pos_emb-gradient-only launch of the key/value split backward "
+        "(fused_mla_rope_kv_split_emb_grad) is replayed too, and matches the full backward bit for "
+        "bit at each BLOCK_H (it shares the autotuning key).",
     ),
     KernelEntry(
         name="fused_mhc_kernels",
@@ -846,7 +849,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py, as are TE's query RoPE + MXFP8 kernel, the key/value kernel writing "
         "attention's scale layout and the in-place query RoPE backward "
-        "(use_fused_mla_qkv_rope_quant). "
+        "(use_fused_mla_qkv_rope_quant), and the RoPE backward kernels writing the up-projection "
+        "gradients in MXFP8 (use_fused_mla_up_proj_grad_quant). "
         "The TE attention replay there also covers the config-derived "
         "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
         "GEMM path and mxfp8_quantize_only are not replayed.",

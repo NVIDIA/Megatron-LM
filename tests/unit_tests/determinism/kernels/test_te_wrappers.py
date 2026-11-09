@@ -1130,6 +1130,47 @@ def test_te_fused_mla_qkv_rope_mxfp8_attn_layout_replays():
     )
 
 
+def test_te_fused_mla_rope_backward_mxfp8_replays():
+    """The query RoPE backward and the key/value split backward that write the up-projection
+    gradients in MXFP8, which MLA dispatches with use_fused_mla_up_proj_grad_quant."""
+    from megatron.core.transformer import multi_latent_attention as mla
+
+    if not _IS_BLACKWELL or mla.fused_mla_q_rope_backward_mxfp8 is None:
+        pytest.skip("needs Transformer Engine's fused_mla_q_rope_backward_mxfp8 on SM100+")
+    seeded()
+    s, b, h = 2048, 2, 16
+    dq = torch.randn(s, b, h, 192, device="cuda", dtype=torch.bfloat16)
+    dk = torch.randn(s, b, h, 192, device="cuda", dtype=torch.bfloat16)
+    dv = torch.randn(s, b, h, 128, device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    def fn(dq, dk, dv, cos, sin):
+        grads = (
+            mla.fused_mla_q_rope_backward_mxfp8(dq, cos, sin),
+            mla.fused_mla_kv_split_backward_mxfp8(dk, dv, 128),
+        )
+        return tuple(
+            getattr(t, name)
+            for t in grads
+            for name in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            )
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (dq, dk, dv, cos, sin),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="TE fused MLA RoPE backward + MXFP8",
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_te_quantile_balancing_histogram_replays(dtype):
     """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
