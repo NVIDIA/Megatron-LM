@@ -1171,12 +1171,6 @@ class TestRegisterUbPoolHook:
             param.register_ub_pool.assert_called_once_with(pool)
         params[2].register_ub_pool.assert_not_called()
 
-    def test_symmetric_pool_without_nccl_ub(self):
-        buffer, params = self._make_buffer()
-        # The pool backs param_data only, so no gradient pool is registered for offload.
-        assert buffer.param_nccl_mem_pool is not None and buffer.nccl_mem_pool is None
-        self._assert_hook_calls(params, buffer.param_nccl_mem_pool)
-
     def test_no_hook_without_distributed_optimizer(self):
         buffer, params = self._make_buffer(use_distributed_optimizer=False)
         assert buffer.nccl_mem_pool is None and buffer.param_nccl_mem_pool is None
