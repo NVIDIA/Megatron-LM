@@ -245,8 +245,7 @@ class TestLifecycleGuards:
         llm._loop_manager.start()
 
         async def call_on_runtime_loop():
-            result = getattr(llm, method)()
-            if asyncio.iscoroutine(result):
+            if asyncio.iscoroutine(result := getattr(llm, method)()):
                 await result
 
         try:
