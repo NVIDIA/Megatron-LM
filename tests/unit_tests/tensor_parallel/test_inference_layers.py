@@ -127,7 +127,7 @@ def _forward(module, x: torch.Tensor, *, train: bool = False, inference_mode: bo
     try:
         mode = InferenceMode.active() if inference_mode else contextlib.nullcontext()
         with torch.no_grad(), mode:
-            out = module(hidden_states=x.clone(), attention_mask=None)
+            out = module(x.clone(), attention_mask=None)
     finally:
         module.eval()
     if isinstance(out, tuple):  # TransformerLayer returns (hidden_states, context)

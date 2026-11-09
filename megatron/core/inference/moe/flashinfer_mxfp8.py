@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -309,6 +309,37 @@ def prepare_routed_mxfp8_weights(
         padded_rows=padded_rows,
         padded_cols=padded_cols,
     )
+
+
+def attach_routed_mxfp8_writeback(
+    weight: MXFP8Tensor, routed: FlashInferRoutedMXFP8Weight, expert: int
+) -> None:
+    """Make an expert's canonical MXFP8 weight write through to its routed slot.
+
+    Refit's quantize_/copy_ then requantizes with the canonical kernel and repacks into the
+    routed stack in place (same bytes, same CUDA-graph addresses), so the canonical storage is
+    released and replaced by broadcast placeholders: only the routed copy stays resident.
+
+    After this call weight.data and weight.scale no longer hold the weights: reading them
+    (dequantize, torch.stack, .contiguous(), ...) silently returns one uninitialized element
+    broadcast to the full shape. Read the routed stack instead.
+    """
+    if weight.writeback is not None:
+        raise RuntimeError("expert weight already writes through; its storage was released")
+    slot = replace(
+        routed, data=routed.data[expert : expert + 1], scale=routed.scale[expert : expert + 1]
+    )
+
+    def writeback(value: torch.Tensor) -> None:
+        canonical = MXFP8Tensor.from_bf16(value, backend="triton")
+        stacked = MXFP8Tensor(
+            data=canonical.data[None], scale=canonical.scale[None], backend="triton"
+        )
+        prepare_routed_mxfp8_weights(stacked, out=slot)
+
+    weight.data = torch.empty(1, dtype=weight.data.dtype, device=weight.device).expand(weight.shape)
+    weight.scale = weight.scale.new_empty(1).expand(weight.scale.shape)
+    weight.writeback = writeback
 
 
 def pack_routed_mxfp8_routing(
