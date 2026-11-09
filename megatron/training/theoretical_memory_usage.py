@@ -4,6 +4,9 @@
 
 
 import math
+
+from megatron.training.config.compat import data_sequence_length
+
 from .utils import is_hybrid_model, print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
@@ -312,9 +315,10 @@ def compute_activation_memory(cfg, args, num_microbatches, verbose=False, *, mic
 
     # TODO: This function needs to take into account query_projection_size potentially being
     # different from hidden_size.
+    sequence_length = data_sequence_length(cfg, args)
 
     # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * micro_batch_size * args.hidden_size) * (
+    activation_memory = (sequence_length * micro_batch_size * args.hidden_size) * (
         18 + (4 * (args.ffn_hidden_size / args.hidden_size))
     )
     if verbose:
@@ -328,11 +332,11 @@ def compute_activation_memory(cfg, args, num_microbatches, verbose=False, *, mic
 
     # Input to embedding (pp_size microbatches in flight).
     activation_memory += (
-        8 * args.seq_length * micro_batch_size * args.pipeline_model_parallel_size
+        8 * sequence_length * micro_batch_size * args.pipeline_model_parallel_size
     )
     # Dropout in embedding layer (pp_size microbatches in flight).
     activation_memory += (
-        args.seq_length
+        sequence_length
         * micro_batch_size
         * args.hidden_size
         * args.pipeline_model_parallel_size
@@ -368,7 +372,7 @@ def compute_activation_memory(cfg, args, num_microbatches, verbose=False, *, mic
     if args.pipeline_model_parallel_size == 1:
         # Inputs to output layer and CE loss.
         activation_memory += (
-            args.seq_length
+            sequence_length
             * micro_batch_size
             * args.hidden_size
             * 4
@@ -381,9 +385,10 @@ def compute_activation_memory(cfg, args, num_microbatches, verbose=False, *, mic
 
 def compute_activation_memory_without_sp(cfg, args, num_microbatches, verbose=False, *, micro_batch_size):
     """Compute activation memory without sequence parallelism"""
+    sequence_length = data_sequence_length(cfg, args)
 
     # 4. Compute per-layer memory
-    per_layer_memory = args.seq_length * micro_batch_size * args.hidden_size * (10 + (24 / args.tensor_model_parallel_size))
+    per_layer_memory = sequence_length * micro_batch_size * args.hidden_size * (10 + (24 / args.tensor_model_parallel_size))
 
     if verbose:
         print(
@@ -397,11 +402,11 @@ def compute_activation_memory_without_sp(cfg, args, num_microbatches, verbose=Fa
     # 6. Add embedding activations
     # Input to embedding (pp_size microbatches in flight)
     total_activation_memory += (
-        8 * args.seq_length * micro_batch_size * args.pipeline_model_parallel_size
+        8 * sequence_length * micro_batch_size * args.pipeline_model_parallel_size
     )
     # Dropout in embedding layer (pp_size microbatches in flight)
     total_activation_memory += (
-        args.seq_length
+        sequence_length
         * micro_batch_size
         * args.hidden_size
         * args.pipeline_model_parallel_size
@@ -437,12 +442,12 @@ def compute_activation_memory_without_sp(cfg, args, num_microbatches, verbose=Fa
     # 8. Add output layer memory if needed
     if args.pipeline_model_parallel_size == 1:
         # Logits calculation
-        logits_size = args.seq_length * micro_batch_size * cfg.tokenizer.padded_vocab_size
+        logits_size = sequence_length * micro_batch_size * cfg.tokenizer.padded_vocab_size
         # The output projection is partitioned across TP
         logits_size /= args.tensor_model_parallel_size
 
         # Outputs from final layer norm
-        final_ln_output = args.seq_length * micro_batch_size * args.hidden_size
+        final_ln_output = sequence_length * micro_batch_size * args.hidden_size
 
         total_activation_memory += (logits_size + final_ln_output) * 2  # multiply by 2 for bytes
 

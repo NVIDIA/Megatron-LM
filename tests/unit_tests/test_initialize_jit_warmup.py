@@ -20,6 +20,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.training.initialize import _warmup_jit_function
 
 
@@ -178,3 +179,44 @@ def test_dropout_warmup_and_geglu_cat(mock_get_args, mock_dropout, mock_rand, _c
     assert input_arg.shape[1] == 2  # Batch size comes from cfg.train, not the legacy args.
     assert mock_dropout.call_count == 10  # unconditional for RNG parity
     assert mock_rand.call_count == 5
+
+
+@pytest.mark.parametrize("legacy_length", [64, None])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_warmup_shapes_use_dataset_length(run_config, legacy_length, sequence_parallel):
+    """Sample length determines the same five RNG draws, not position/packing capacity."""
+    run_config.data.dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    run_config.model = SimpleNamespace(seq_length=128)
+    args = _args(
+        seq_length=legacy_length,
+        sequence_parallel=sequence_parallel,
+        tensor_model_parallel_size=2,
+        context_parallel_size=2,
+        max_seqlen_per_dp_cp_rank=256,
+        use_te_activation_func=True,
+    )
+    if legacy_length is None:
+        del args.seq_length
+    with (
+        mock.patch("megatron.training.initialize.get_args", return_value=args),
+        mock.patch("megatron.training.initialize.torch.rand", side_effect=_fake_rand) as rand,
+        mock.patch("megatron.training.initialize.bias_dropout_add_fused_train") as dropout,
+        mock.patch("megatron.training.initialize.torch.cuda.empty_cache"),
+    ):
+        _warmup_jit_function(tp_size=2)
+
+    dropout_length = 4 if sequence_parallel else 8
+    assert [call.args for call in rand.call_args_list] == [
+        (32,),
+        ((8, 2, 32),),
+        ((dropout_length, 2, 32),),
+        ((dropout_length, 2, 32),),
+        (32,),
+    ]
+    assert dropout.call_count == 10
