@@ -4,13 +4,11 @@ import asyncio
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import Optional
 
+from megatron.core.inference.inference_client import abort_requests
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
-
-if TYPE_CHECKING:
-    from megatron.core.inference.inference_client import InferenceClient
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +24,6 @@ def generation_finish_reason(result: dict) -> str:
     requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
     generated = len(result.get("generated_tokens") or [])
     return "length" if requested is not None and generated >= requested else "stop"
-
-
-def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
-    """Tell the coordinator to stop generating the given requests.
-
-    Args:
-        client: The InferenceClient the requests were submitted through.
-        request_ids: Ids from add_request_with_id.
-        reason: Logged so the abort can be told apart from a normal completion.
-    """
-    for request_id in request_ids:
-        try:
-            client.abort_request(request_id)
-        except Exception:  # pylint: disable=broad-except
-            logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
-        else:
-            logger.debug("Aborted request %s (%s)", request_id, reason)
 
 
 def validate_offload_params(offload_params) -> Optional[str]:

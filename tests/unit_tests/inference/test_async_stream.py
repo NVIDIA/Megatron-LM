@@ -67,24 +67,15 @@ class TestAsyncStream:
             await gen.aclose()
         assert called == [True]
 
-    async def test_cancelled_consumer_invokes_cancel_callback(self):
-        """Task cancellation while waiting for the next item must abort remote work."""
+    @pytest.mark.parametrize("via_generator", [True, False], ids=["generator", "direct"])
+    async def test_cancelled_consumer_invokes_cancel_callback(self, via_generator):
+        """Task cancellation while waiting for the next item must abort remote work.
+
+        The client returns AsyncStream itself, so direct iteration owns cancellation too.
+        """
         called = []
         s = AsyncStream(request_id=1, cancel=lambda: called.append(True))
-        task = asyncio.create_task(anext(s.generator()))
-        await asyncio.sleep(0)
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-        assert called == [True]
-
-    async def test_cancelled_direct_iterator_invokes_cancel_callback(self):
-        """The client returns AsyncStream itself, so direct iteration owns cancellation too."""
-        called = []
-        s = AsyncStream(request_id=1, cancel=lambda: called.append(True))
-        task = asyncio.create_task(anext(s))
+        task = asyncio.create_task(anext(s.generator() if via_generator else s))
         await asyncio.sleep(0)
 
         task.cancel()

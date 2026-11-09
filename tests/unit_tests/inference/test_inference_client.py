@@ -500,11 +500,17 @@ async def test_fire_and_forget_abort_after_unsafe_terminal_error():
     # retains this ownership marker until an abort acknowledgement arrives.
     client.completion_futures.pop(request_id)
     socket.send.reset_mock()
+    # Only a sent abort is recorded, so one whose send failed is retried.
+    socket.send.side_effect = [RuntimeError("send failed"), None]
+    with pytest.raises(RuntimeError, match="send failed"):
+        client.abort_request(request_id)
+    assert request_id not in client.aborted_request_ids
 
     client.abort_request(request_id)
 
     payload = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
     assert payload == [Headers.ABORT_REQUEST.value, request_id]
+    assert request_id in client.aborted_request_ids
     future.cancel()
 
 

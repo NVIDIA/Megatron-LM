@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 import torch
 
@@ -35,6 +35,8 @@ try:
 except:
     HAVE_MSGPACK = False
 
+logger = logging.getLogger(__name__)
+
 
 class InferenceRequestError(RuntimeError):
     """Terminal request failure reported by the inference coordinator."""
@@ -46,6 +48,23 @@ class InferenceRequestError(RuntimeError):
 
 class InferenceRequestAborted(InferenceRequestError):
     """The local consumer cancelled; remote source-safety still requires an ACK."""
+
+
+def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
+    """Tell the coordinator to stop generating the given requests.
+
+    Args:
+        client: The InferenceClient the requests were submitted through.
+        request_ids: Ids from add_request_with_id.
+        reason: Logged so the abort can be told apart from a normal completion.
+    """
+    for request_id in request_ids:
+        try:
+            client.abort_request(request_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
+        else:
+            logger.debug("Aborted request %s (%s)", request_id, reason)
 
 
 class InferenceClient:
@@ -463,9 +482,10 @@ class InferenceClient:
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
-        self.aborted_request_ids.add(request_id)
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        # Mark only a sent abort, so a failed send can be retried.
+        self.aborted_request_ids.add(request_id)
 
     def _new_abort_future(self, request_id: int) -> asyncio.Future:
         """Create a future for the request's source-safety acknowledgement."""

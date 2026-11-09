@@ -522,6 +522,8 @@ class _MegatronLLMBase:
             # coroutine runs on that same loop, so ``asyncio.gather`` over the
             # returned futures is safe.
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            from megatron.core.inference.inference_client import abort_requests
+
             request_ids = []
             futures = []
             try:
@@ -534,13 +536,9 @@ class _MegatronLLMBase:
                 return list(await asyncio.gather(*futures))
             except BaseException:
                 # Cancellation and one failed batch member must not strand any
-                # sibling in the remote scheduler. Preserve the original error
-                # if an already-unwinding abort send also fails.
-                for request_id in request_ids:
-                    try:
-                        self._coord_runtime.client.abort_request(request_id)
-                    except Exception:  # pylint: disable=broad-except
-                        pass
+                # sibling in the remote scheduler. abort_requests logs a failed
+                # abort send instead of raising, which preserves the original error.
+                abort_requests(self._coord_runtime.client, request_ids, "batch generation stopped")
                 raise
         if any(multi_modal_data_list):
             raise ValueError("multi_modal_data is only supported with use_coordinator=True.")

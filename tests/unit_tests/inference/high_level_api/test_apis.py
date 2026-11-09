@@ -154,8 +154,9 @@ class TestLifecycleGuards:
         request.finalize_text.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cancelled_coordinator_generation_aborts_every_submitted_request(self):
-        """Cancelling a batch must not leave any sibling generating remotely."""
+    @pytest.mark.parametrize("outcome", ["cancelled", "failed"])
+    async def test_interrupted_coordinator_generation_aborts_every_submitted_request(self, outcome):
+        """Neither cancelling a batch nor one member failing midway may leave a sibling running."""
         llm = _make_worker_instance(MegatronAsyncLLM)
         llm._is_primary_rank = True
         futures = [asyncio.get_running_loop().create_future() for _ in range(2)]
@@ -179,8 +180,11 @@ class TestLifecycleGuards:
         task = asyncio.create_task(llm._generate_impl(["a", "b"], MagicMock()))
         await asyncio.sleep(0)
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        if outcome == "cancelled":
+            task.cancel()
+        else:
+            futures[1].set_exception(ValueError("test"))
+        with pytest.raises(asyncio.CancelledError if outcome == "cancelled" else ValueError):
             await task
 
         assert client.aborted == [40, 41]
