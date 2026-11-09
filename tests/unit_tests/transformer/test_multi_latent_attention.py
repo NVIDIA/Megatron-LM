@@ -17,9 +17,11 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_submodules,
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
