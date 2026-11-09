@@ -3,6 +3,7 @@
 import inspect
 import multiprocessing as mp
 import os
+import socket
 from multiprocessing.connection import Connection
 from types import SimpleNamespace
 
@@ -90,6 +91,8 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
     monkeypatch.setattr(
         text_generation_server, "_bind_reuseport_socket", lambda _port, _host: FakeListener()
     )
+    # Hypercorn gets a duplicate of the listener's descriptor (19 is not a real one here).
+    monkeypatch.setattr(text_generation_server.os, "dup", lambda fd: fd + 100)
 
     ready_reader, ready_writer = mp.Pipe(duplex=False)
     await text_generation_server._run_text_gen_server(
@@ -111,12 +114,68 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
     )
     assert app.blueprints == ["completion-blueprint", "chat-blueprint"]
     assert served[0][0] is app
-    assert served[0][1].bind == ["fd://19"]
+    assert served[0][1].bind == ["fd://119"]
     assert len(closed_sockets) == 1, "the listener must be released once serve() returns"
     assert clients[0].address == "coordinator:1234"
     assert clients[0].deserialize is False
     assert clients[0].started is True
     assert clients[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_server_and_hypercorn_each_close_their_own_listener_descriptor(monkeypatch):
+    """Hypercorn closes the socket it builds from an fd:// bind; the server must not close the
+    same descriptor a second time (that raised EBADF, or could close an unrelated file)."""
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    class FakeApp:
+        def __init__(self, _name):
+            self.config = {}
+
+        def register_blueprint(self, blueprint):
+            pass
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    hypercorn_fds = []
+
+    async def hypercorn_like_serve(app, config):
+        # What hypercorn does with an fd:// bind: wrap the descriptor, serve, close it.
+        fd = int(config.bind[0][len("fd://") :])
+        hypercorn_fds.append(fd)
+        socket.socket(fileno=fd).close()
+
+    monkeypatch.setattr(text_generation_server, "HAS_BACKEND", True)
+    monkeypatch.setattr(text_generation_server, "InferenceClient", FakeClient)
+    monkeypatch.setattr(text_generation_server, "Quart", FakeApp, raising=False)
+    monkeypatch.setattr(
+        text_generation_server, "Config", lambda: SimpleNamespace(bind=None), raising=False
+    )
+    monkeypatch.setattr(text_generation_server, "serve", hypercorn_like_serve, raising=False)
+    monkeypatch.setattr(text_generation_server.endpoints, "__all__", [])
+    monkeypatch.setattr(
+        text_generation_server, "_bind_reuseport_socket", lambda _port, _host: listener
+    )
+
+    try:
+        own_fd = listener.fileno()
+        await text_generation_server._run_text_gen_server(
+            "coordinator:1234", tokenizer=object(), rank=0, server_port=0, hostname="127.0.0.1"
+        )
+    finally:
+        listener.close()
+
+    assert hypercorn_fds and hypercorn_fds[0] != own_fd
+    assert listener.fileno() == -1, "the server must close its own listener"
 
 
 def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):

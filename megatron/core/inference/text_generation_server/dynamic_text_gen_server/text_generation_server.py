@@ -4,6 +4,7 @@ import asyncio
 import copy
 import logging
 import multiprocessing as mp
+import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -148,7 +149,9 @@ async def _run_text_gen_server(
         # Listen now so connections queue in the kernel from this point on;
         # hypercorn re-issues listen() on the fd when it starts accepting.
         own_socket.listen(config.backlog)
-        config.bind = [f"fd://{own_socket.fileno()}"]
+        # Hypercorn wraps an fd:// bind in a socket object of its own and closes it when
+        # serve() returns. Give it a duplicate so that each owner closes its own descriptor.
+        config.bind = [f"fd://{os.dup(own_socket.fileno())}"]
         if ready_conn is not None:
             ready_conn.send(True)
             ready_conn.close()
