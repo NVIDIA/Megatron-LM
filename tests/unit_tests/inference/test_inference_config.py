@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     ImageProcessingConfig,
@@ -298,6 +299,28 @@ class TestInferenceConfig:
 
         assert inference_config.async_sched_mode == expected
 
+    def test_gc_mode_flag_reaches_runtime_config(self):
+        """Ensure --inference-gc-mode defaults to freeze_overlap, maps onto InferenceConfig and
+        is validated."""
+        assert InferenceConfig().gc_mode == "freeze_overlap"
+        with pytest.raises(ValueError, match="Unsupported gc_mode"):
+            InferenceConfig(gc_mode="disable")
+        parser = _add_inference_args(ArgumentParser())
+        assert parser.parse_args([]).inference_gc_mode == "freeze_overlap"
+        args = parser.parse_args(["--inference-gc-mode", "freeze"])
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+        )
+        setup_config = InferenceSetupConfig(inference_gc_mode=args.inference_gc_mode)
+
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
+
+        assert inference_config.gc_mode == "freeze"
+
     def test_inference_setup_config_maps_disaggregation_fields(self):
         """Ensure declarative inference config maps disaggregation fields."""
         model = SimpleNamespace(
@@ -580,3 +603,84 @@ class TestSSMChunkAlignment:
             mamba_chunk_size=64,
         )
         assert config.ssm_chunk_alignment == 64
+
+
+def test_shortcut_overlap_model_validation():
+    model_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        moe_shortcut_connection=True,
+        expert_tensor_parallel_size=1,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        inference_grouped_gemm_backend="vllm",
+        inference_moe_token_dispatcher_type="nvls",
+        activation_func=squared_relu,
+    )
+    config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
+    for backend in InferenceGroupedGemmBackend:
+        for mxfp8 in (False, True):
+            candidate = dataclasses.replace(
+                model_config,
+                inference_grouped_gemm_backend=backend,
+                fp8="hybrid" if mxfp8 else None,
+                fp8_recipe="mxfp8" if mxfp8 else "delayed",
+                fp8_param=mxfp8,
+            )
+            if mxfp8:
+                with pytest.raises(ValueError, match="requires further testing"):
+                    config.validate_shortcut_moe_model(candidate)
+            else:
+                config.validate_shortcut_moe_model(candidate)
+    model_config.fp8 = "e4m3"
+    with pytest.raises(ValueError, match="requires further testing"):
+        config.validate_shortcut_moe_model(model_config)
+
+
+def test_shortcut_overlap_setup_validation():
+    assert not InferenceSetupConfig().inference_shortcut_moe_overlap
+    InferenceSetupConfig(
+        inference_shortcut_moe_overlap=True, inference_dynamic_batching=True
+    ).validate()
+    for overrides in (
+        {"inference_dynamic_batching": False},
+        {"use_legacy_static_engine": True},
+        {"num_speculative_tokens": 1},
+    ):
+        settings = dict(inference_shortcut_moe_overlap=True, inference_dynamic_batching=True)
+        settings.update(overrides)
+        with pytest.raises(ValueError, match="Shortcut MoE overlap"):
+            InferenceSetupConfig(**settings).validate()
+
+
+def test_shortcut_overlap_cli_and_runtime_config():
+    parser = ArgumentParser()
+    _add_inference_args(parser)
+    for flags, expected in (
+        ([], False),
+        (["--inference-shortcut-moe-overlap"], True),
+        (["--inference-shortcut-moe-overlap", "--no-inference-shortcut-moe-overlap"], False),
+    ):
+        args = parser.parse_args(flags)
+        setup = InferenceSetupConfig(
+            inference_shortcut_moe_overlap=args.inference_shortcut_moe_overlap,
+            inference_dynamic_batching=True,
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+            position_embedding_type="none",
+            max_sequence_length=256,
+            pg_collection=None,
+            modules=lambda: [],
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        runtime = setup.to_inference_config(model, verbose=False)
+        assert runtime.inference_shortcut_moe_overlap is expected
