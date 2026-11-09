@@ -387,6 +387,11 @@ class InferenceSetupConfig:
         self.validate()
 
         model_config = get_attr_wrapped_model(model, "config")
+        _check_flash_attention_2_limits(
+            model_config,
+            getattr(get_attr_wrapped_model(model, "decoder"), "layer_type_list", None),
+            self.inference_dynamic_batching_block_size,
+        )
         enable_cuda_graphs = model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.none
 
         # Effective max sequence length depends on the model's position embedding type.
@@ -488,4 +493,52 @@ class InferenceSetupConfig:
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
             gc_mode=self.inference_gc_mode,
+        )
+
+
+def _check_flash_attention_2_limits(
+    model_config: Any, layer_type_list: Any, block_size_tokens: int
+) -> None:
+    """Reject KV-cache block and head sizes that FlashAttention-2 cannot run.
+
+    Dynamic inference runs self-attention through FlashAttention-2 when neither FlashAttention-3
+    nor FlashAttention-4 is installed, or when ``flash_attention_version`` is 2 (see
+    ``Attention._resolve_flash_version``). Its paged KV cache needs blocks of a multiple of 256
+    tokens, and it supports head sizes up to 256. Without this check the first forward pass of
+    the engine fails inside the kernel.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.transformer import attention
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    # MLA and the experimental attention variants run other kernels; Flash MLA's own block
+    # size is checked by the dynamic inference context.
+    if isinstance(model_config, MLATransformerConfig):
+        return
+    if getattr(model_config, "experimental_attention_variant", None) is not None:
+        return
+    if layer_type_list is not None and Symbols.ATTENTION not in layer_type_list:
+        return
+
+    version = getattr(model_config, "flash_attention_version", None)
+    if version is None:
+        if attention.HAVE_FA3 or attention.HAVE_FA4:
+            return
+        reason = "FlashAttention-3 and -4 are not installed"
+    elif version == 2:
+        reason = "flash_attention_version is 2"
+    else:
+        return
+
+    if block_size_tokens % 256 != 0:
+        raise ValueError(
+            f"--inference-dynamic-batching-block-size ({block_size_tokens}) must be a multiple "
+            f"of 256: dynamic inference runs attention with FlashAttention-2 ({reason}), whose "
+            "paged KV cache needs blocks of a multiple of 256 tokens."
+        )
+    kv_channels = getattr(model_config, "kv_channels", None)
+    if kv_channels is not None and kv_channels > 256:
+        raise ValueError(
+            f"kv_channels ({kv_channels}) is too large for dynamic inference: attention runs "
+            f"with FlashAttention-2 ({reason}), which supports head sizes up to 256."
         )

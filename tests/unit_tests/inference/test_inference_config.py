@@ -442,6 +442,73 @@ class TestInferenceConfig:
             assert inference_config.static_kv_memory_pointers is True
             assert inference_config.num_cuda_graphs == expected_num_cuda_graphs
 
+    @staticmethod
+    def _attention_model(**config_overrides):
+        config = dict(
+            inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+            kv_channels=64,
+            flash_attention_version=None,
+            experimental_attention_variant=None,
+        )
+        config.update(config_overrides)
+        return SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(**config),
+        )
+
+    @pytest.mark.parametrize(
+        "block_size, kv_channels, match",
+        [
+            (256, 64, None),
+            (512, 256, None),
+            (128, 64, "must be a multiple of 256"),
+            (1321, 64, "must be a multiple of 256"),
+            (256, 264, "supports head sizes up to 256"),
+        ],
+    )
+    def test_flash_attention_2_limits(self, monkeypatch, block_size, kv_channels, match):
+        """FlashAttention-2's paged KV cache needs blocks of a multiple of 256 tokens, and its
+        kernels support head sizes up to 256; both are rejected before an engine is built."""
+        from megatron.core.transformer import attention
+
+        monkeypatch.setattr(attention, "HAVE_FA3", False)
+        monkeypatch.setattr(attention, "HAVE_FA4", False)
+        setup_config = InferenceSetupConfig(inference_dynamic_batching_block_size=block_size)
+        model = self._attention_model(kv_channels=kv_channels)
+        with pytest.raises(ValueError, match=match) if match else nullcontext():
+            setup_config.to_inference_config(model=model, verbose=False)
+
+    @pytest.mark.parametrize(
+        "flash_attention_version, have_fa3, config_overrides, rejected",
+        [
+            (None, True, {}, False),
+            (3, True, {}, False),
+            (2, True, {}, True),
+            (None, False, {"experimental_attention_variant": "dsa"}, False),
+        ],
+    )
+    def test_flash_attention_2_limits_follow_the_selected_kernel(
+        self, monkeypatch, flash_attention_version, have_fa3, config_overrides, rejected
+    ):
+        """Only attention that runs FlashAttention-2 is held to its block-size limit."""
+        from megatron.core.transformer import attention
+
+        monkeypatch.setattr(attention, "HAVE_FA3", have_fa3)
+        monkeypatch.setattr(attention, "HAVE_FA4", False)
+        setup_config = InferenceSetupConfig(inference_dynamic_batching_block_size=128)
+        model = self._attention_model(
+            flash_attention_version=flash_attention_version, **config_overrides
+        )
+        with (
+            pytest.raises(ValueError, match="must be a multiple of 256")
+            if rejected
+            else nullcontext()
+        ):
+            setup_config.to_inference_config(model=model, verbose=False)
+
     @pytest.mark.parametrize(
         "kwargs, saver_installed, match",
         [
