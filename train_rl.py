@@ -2,6 +2,7 @@
 
 import inspect
 import os
+import traceback
 from contextlib import nullcontext
 from functools import partial
 
@@ -23,6 +24,7 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
     next_rollout_iterator,
+    rl_exit_code,
     rl_inference_interface_shutdown,
 )
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
@@ -481,6 +483,12 @@ if __name__ == "__main__":
                 RLCheckpointCallback(),
             ],
         )
-    # RL owns the inference-interface shutdown.
-    finally:
-        rl_inference_interface_shutdown()
+    except BaseException as e:
+        # RL owns the inference-interface shutdown, and it ends the process with os._exit(), so
+        # this exception would never reach the interpreter: print it and exit with its status.
+        exit_code = rl_exit_code(e)
+        if exit_code != 0:
+            traceback.print_exc()
+        rl_inference_interface_shutdown(exit_code=exit_code)
+        raise
+    rl_inference_interface_shutdown()

@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
@@ -3377,29 +3378,50 @@ def megatron_rl_inference_mode(
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 
 
-def rl_inference_interface_shutdown():
+def rl_exit_code(exc: Optional[BaseException]) -> int:
+    """Exit status for an RL run that ended with ``exc`` (``None`` when it returned normally)."""
+    if exc is None:
+        return 0
+    if isinstance(exc, SystemExit):
+        if exc.code is None:
+            return 0
+        return exc.code if isinstance(exc.code, int) else 1
+    return 1
+
+
+def rl_inference_interface_shutdown(exit_code: int = 0):
+    """Shut down the RL inference interface and end the process with ``os._exit(exit_code)``.
+
+    A failure during the shutdown itself is logged and turns a zero ``exit_code`` into 1.
+    """
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
     global _ROLLOUT_PIPELINE
 
-    if _ROLLOUT_GENERATOR is not None:
-        loop = get_asyncio_loop()
-        loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
-        _ROLLOUT_GENERATOR = None
-    _ROLLOUT_PIPELINE = None
+    try:
+        if _ROLLOUT_GENERATOR is not None:
+            loop = get_asyncio_loop()
+            loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
+            _ROLLOUT_GENERATOR = None
+        _ROLLOUT_PIPELINE = None
 
-    if _INFERENCE_INTERFACE is not None:
-        loop = get_asyncio_loop()
-        loop.run_until_complete(_INFERENCE_INTERFACE.kill())
-        _INFERENCE_INTERFACE = None
-    else:
-        logger.warning("No inference interface to shutdown. This should not happen.")
+        if _INFERENCE_INTERFACE is not None:
+            loop = get_asyncio_loop()
+            loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+            _INFERENCE_INTERFACE = None
+        else:
+            logger.warning("No inference interface to shutdown. This should not happen.")
+    except BaseException:
+        logger.exception("RL inference interface shutdown failed.")
+        exit_code = exit_code or 1
 
     # TODO(rkirby): This is a hack to hard exit. There is a bug that is preventing us from using sys.exit(0).
     # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
     # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
-    import os
-    os._exit(0)
+    # os._exit() skips the interpreter's own flush of the standard streams.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
 
 
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:

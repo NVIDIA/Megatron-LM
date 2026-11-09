@@ -3022,3 +3022,52 @@ def _ledger_record(epoch, num_evictions=0):
     return FinishedRequestRecord(
         policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
     )
+
+
+class _ExitCalled(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _raise_exit_called(code):
+    raise _ExitCalled(code)
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (None, 0),
+        (SystemExit(), 0),
+        (SystemExit(0), 0),
+        (SystemExit(3), 3),
+        (SystemExit("message"), 1),
+        (AssertionError("boom"), 1),
+        (KeyboardInterrupt(), 1),
+    ],
+)
+def test_rl_exit_code(exc, expected):
+    assert rl_utils.rl_exit_code(exc) == expected
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 3])
+def test_rl_inference_interface_shutdown_exits_with_the_given_status(monkeypatch, exit_code):
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+    monkeypatch.setattr(rl_utils, "_INFERENCE_INTERFACE", None)
+    monkeypatch.setattr(rl_utils.os, "_exit", _raise_exit_called)
+    with pytest.raises(_ExitCalled) as exited:
+        rl_utils.rl_inference_interface_shutdown(exit_code=exit_code)
+    assert exited.value.code == exit_code
+
+
+@pytest.mark.parametrize("exit_code, expected", [(0, 1), (2, 2)])
+def test_rl_inference_interface_shutdown_failure_is_not_a_success(monkeypatch, exit_code, expected):
+    async def _aclose():
+        raise RuntimeError("aclose(): asynchronous generator is already running")
+
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", SimpleNamespace(aclose=_aclose))
+    monkeypatch.setattr(rl_utils, "_INFERENCE_INTERFACE", None)
+    monkeypatch.setattr(rl_utils.os, "_exit", _raise_exit_called)
+    with pytest.raises(_ExitCalled) as exited:
+        rl_utils.rl_inference_interface_shutdown(exit_code=exit_code)
+    assert exited.value.code == expected
