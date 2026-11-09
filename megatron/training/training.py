@@ -1830,6 +1830,14 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    # The RL loop is driven by train_rl.py through next_train_iterator; without that hook,
+    # --perform-rl-step would be ignored and the run would pretrain instead.
+    if cfg_container.rl.perform_rl_step and next_train_iterator is None:
+        raise ValueError(
+            "--perform-rl-step is only supported by train_rl.py; this entry point does not run "
+            "the RL loop."
+        )
+
     cfg_container.validate()
 
     callback_manager = normalize_callbacks(callbacks)

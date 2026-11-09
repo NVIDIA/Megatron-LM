@@ -545,3 +545,16 @@ def test_model_setup_uses_owned_ddp_config(
         training.setup_model_and_optimizer(
             Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )
+
+
+def test_pretrain_rejects_rl_step_without_the_rl_loop(monkeypatch, run_config):
+    """--perform-rl-step needs train_rl.py's data hook; other entry points must not ignore it."""
+    from megatron.training import training
+
+    initialize = Mock(side_effect=AssertionError("reached initialization"))
+    monkeypatch.setattr(training, "initialize_megatron", initialize)
+    monkeypatch.setattr(training.ft_integration, "setup", Mock())
+    run_config.rl.perform_rl_step = True
+    with pytest.raises(ValueError, match="only supported by train_rl.py"):
+        training.pretrain(run_config, Mock(), None, Mock())
+    initialize.assert_not_called()
