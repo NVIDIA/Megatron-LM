@@ -697,8 +697,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.expert_model_parallel_size > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
-        # Set by setup_kv_transfer. Only disaggregated handoffs hold recurrent-state
-        # slots outside request rows; otherwise every live slot belongs to a row.
+        # Set by setup_kv_transfer. Disaggregated handoffs can hold recurrent-state
+        # slots outside request rows, so admission must not assume one slot per row.
         self.kv_transfer_enabled = False
         reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
@@ -3690,13 +3690,18 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # decode peer has read it, and a decode engine reserves a slot for each
         # incoming handoff before that request is admitted. A free row therefore does
         # not imply a free slot, and add_request would fail mid-allocation without
-        # this check. Without KV transfer, slots and rows must stay one-to-one.
+        # this check. Without KV transfer, the only slot held outside the counted rows
+        # is a chunked prefill request's between chunks: update_requests hides its row
+        # past total_request_count until the next chunk re-adds it, but keeps its slot.
         if self.is_hybrid_model:
             has_free_mamba_slot = self.mamba_metadata.mamba_state_free_slot_count > 0
             if not self.kv_transfer_enabled and request_can_be_added:
-                assert has_free_mamba_slot, (
+                assert has_free_mamba_slot or (
+                    self.chunked_prefill_request_id != -1
+                    and self.get_index_of_chunked_prefill_request(safe=True) == -1
+                ), (
                     "A free request row has no free Mamba state slot, but only KV transfer "
-                    "may hold slots outside request rows"
+                    "or a hidden chunked prefill request may hold slots outside request rows"
                 )
             request_can_be_added &= has_free_mamba_slot
 
