@@ -186,7 +186,13 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
    - `@pytest.mark.experimental` — `latest` tag only
 4. Verify locally (see Running Unit Tests Locally above).
 5. If the test needs a dedicated CI bucket, add an entry to
-   `tests/test_utils/recipes/h100/unit-tests.yaml`.
+   `tests/test_utils/recipes/h100/unit-tests.yaml`. Normally, add the test to an
+   existing group in `tests/unit_tests/ci_buckets.yaml` instead. Bucket IDs retain
+   their historical recipe names; their ordered file lists can span multiple
+   directories. Full execution and Testmon resolve those same lists. Files not
+   assigned to a dedicated group run in the catch-all bucket with the usual
+   platform marker filtering. Directory moves alone must preserve bucket
+   membership and launch settings.
 6. If the change adds or modifies a GPU kernel (Triton, `jit_fuser` /
    `torch.compile`, CUDA extension, TE or external-library dispatch, or a
    scatter/index accumulation), add or update its bit-exact replay test under

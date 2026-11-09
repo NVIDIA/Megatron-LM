@@ -86,8 +86,15 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
+def _bucket_conftests(root: Path, bucket: str, targets: list[str] | None = None) -> set[Path]:
     """Select ancestor conftests and descendants of a bucket's collection directory."""
+    if targets is not None:
+        return {
+            parent / "conftest.py"
+            for target in targets
+            for parent in (root / target).parents
+            if parent.is_relative_to(root) and (parent / "conftest.py").is_file()
+        }
     bucket_path = Path(bucket)
     directory = root / bucket_path
     recursive = directory.is_dir()
@@ -120,11 +127,18 @@ def cache_identity(
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
+    targets = None
+    if (root / "tests/unit_tests/ci_buckets.yaml").is_file():
+        from find_test_cases import resolve_bucket
+
+        targets = resolve_bucket(bucket, recipe_platform, root)
     paths = {root / path for path in COMPATIBILITY_FILES}
+    if targets is not None:
+        paths.add(root / "tests/unit_tests/find_test_cases.py")
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )
-    paths.update(_bucket_conftests(root, bucket))
+    paths.update(_bucket_conftests(root, bucket, targets))
     inputs = {str(path.relative_to(root)): _digest(path) for path in sorted(paths)}
     contract = {
         "schema": SCHEMA,
@@ -135,6 +149,10 @@ def cache_identity(
         "tag": "latest",
         "inputs": inputs,
     }
+    if targets is not None:
+        # Only this bucket's ordered membership affects its compatibility;
+        # unrelated entries in the shared manifest can change independently.
+        contract["targets"] = targets
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
     return {
         "compatibility": contract,

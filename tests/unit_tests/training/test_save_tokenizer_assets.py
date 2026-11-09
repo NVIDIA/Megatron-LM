@@ -9,6 +9,10 @@ from unittest.mock import Mock, mock_open, patch
 import pytest
 
 from megatron.training.checkpointing import save_tokenizer_assets
+from tests.unit_tests.core.dist_checkpointing.conftest import (  # noqa: F401
+    checkpoint_run_config,
+    disable_msc,
+)
 
 
 class TestSaveTokenizerAssets:

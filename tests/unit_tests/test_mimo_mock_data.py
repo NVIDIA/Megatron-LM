@@ -10,6 +10,7 @@ import torch
 
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from megatron.core.packed_seq_params import PackedSeqParams
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 
 
 def _group(rank=0, size=1):

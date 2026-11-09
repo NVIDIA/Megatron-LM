@@ -22,6 +22,7 @@ from examples.mimo.training.grad_sync import (
     reset_modality_participation,
 )
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 from tests.unit_tests.core.models.mimo.test_mimo_1f1b_schedule import (
     create_hypercomm_grid,
     destroy_all_grids,

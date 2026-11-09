@@ -15,6 +15,7 @@ from examples.mimo.training.args import (
 )
 from examples.mimo.utils.hetero import get_language_batch_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 
 WORLD_SIZE_8 = 8
 OLD_GRID_FLAGS = (

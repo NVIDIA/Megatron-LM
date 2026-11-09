@@ -49,12 +49,12 @@ spec:
     # GTP scales to any world size; the test fixtures don't — most GTP cases
     # pytest.skip unless world_size==4 exactly (a few also run at 8, see
     # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
-    if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" || "$BUCKET" == "tests/unit_tests/core/tensor_parallel/test_*gtp*.py" ]]; then
+    if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
-    elif [[ "$BUCKET" == "tests/unit_tests/core/inference/engines/test_batch_invariant_handoff.py" ]]; then
+    elif [[ "$BUCKET" == "tests/unit_tests/inference/engines/test_batch_invariant_handoff.py" ]]; then
         # One prefill worker and one decode worker exchange a real NIXL handoff.
         export GPUS_PER_NODE=2
-    elif [[ "$BUCKET" =~ ^tests/unit_tests/core/inference/(test_coordinator_(execution|media|sampling|schedule)_pairwise|engines/test_batch_invariant_coordinator)\.py$ ]]; then
+    elif [[ "$BUCKET" =~ ^tests/unit_tests/inference/(test_coordinator_(execution|media|sampling|schedule)_pairwise|engines/test_batch_invariant_coordinator)\.py$ ]]; then
         # These owner-selection schedules are written for exactly two DP replicas.
         export GPUS_PER_NODE=2
     fi
@@ -66,11 +66,11 @@ spec:
     fi
 
     case "$BUCKET" in
-      tests/unit_tests/core/inference/test_batch_invariant_fp8.py)
+      tests/unit_tests/inference/test_batch_invariant_fp8.py)
         bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
           h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
         ;;
-      tests/unit_tests/core/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/core/inference/test_disagg_transfer_pairwise.py)
+      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
         bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
           "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
         ;;
@@ -94,19 +94,20 @@ spec:
     else
         echo "No unit-test coverage data was produced; skipping coverage export."
     fi
-# Legacy selectors refer to the historical test checkout. Latest selectors
-# mirror megatron/ and keep specialized tests in their own CI jobs.
+
+# Bucket IDs retain the main CI groups. Latest test paths are resolved through
+# tests/unit_tests/ci_buckets.yaml; legacy checkouts retain their original paths.
 products:
-  # Runtime CP keeps its dev-only job; the ordinary context-parallel tests below
-  # are excluded from this bucket and retain LTS coverage.
-  - test_case: [tests/unit_tests/core/context_parallel/**/*.py]
+  # Runtime topology regressions run separately from the broad SSM/transformer buckets.
+  - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/test_batch_invariant_handoff.py]
+  # Run the two-worker handoff separately; the broad inference bucket excludes it.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_handoff.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -114,7 +115,8 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/test_batch_invariant_coordinator.py]
+  # Two-replica coordinator schedules; the broad inference bucket excludes them.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_coordinator.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -122,7 +124,7 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_coordinator_execution_pairwise.py]
+  - test_case: [tests/unit_tests/inference/test_coordinator_execution_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -130,7 +132,7 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_coordinator_media_pairwise.py]
+  - test_case: [tests/unit_tests/inference/test_coordinator_media_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -138,7 +140,7 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_coordinator_sampling_pairwise.py]
+  - test_case: [tests/unit_tests/inference/test_coordinator_sampling_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -146,7 +148,7 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_coordinator_schedule_pairwise.py]
+  - test_case: [tests/unit_tests/inference/test_coordinator_schedule_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -154,101 +156,15 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_batch_invariant_fp8.py]
+  # This file runs in isolated one-rank processes; other buckets exclude it.
+  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ops/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/inference/engines/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/test_disagg_coordinator_pairwise.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_disagg_transfer_pairwise.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net2.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gdn_gated_output_norm_fusion.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/tensor_parallel/test_*gtp*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  # These tests retain both environments instead of joining the runtime CP job.
-  - test_case: [tests/unit_tests/core/context_parallel/test_layout.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  # These ordinary tensor-parallel tests match the GTP glob but retain their
-  # original eight-rank jobs rather than the four-rank GTP job.
-  - test_case: [tests/unit_tests/core/tensor_parallel/test_gtp_fp32_accumulation_reduce_scatter.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/tensor_parallel/test_gtp_parallel_layout.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/inference/integrations/dynamo/**/*.py]
+  - test_case: [tests/unit_tests/ops/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -265,116 +181,39 @@ products:
   - test_case: [tests/unit_tests/test_fp8_param.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/test_fp8_param.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/pipeline_parallel/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/models/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/models/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/data/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/datasets/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/training/datasets/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_get_batch.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_prepare_cache.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_preprocess_data.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_preprocess_data_fast.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_preprocess_mmdata.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/dist_checkpointing/test_optimizer.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_optimizer.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_layer_wise_optimizer_common_state_dict.py]
+  - test_case: [tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer_common_state_dict.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -384,81 +223,25 @@ products:
   - test_case: [tests/unit_tests/dist_checkpointing/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/dist_checkpointing/models/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_bert_model.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_gpt_hybrid_interop.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_gpt_model.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_mamba.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_mlp_glu.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_t5_model.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/dist_checkpointing/models/test_moe_experts.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/dist_checkpointing/test_moe_experts.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/experimental_attention_variant/test_dsa_tilelang_kernels.py]
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsa_tilelang_kernels.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -468,39 +251,47 @@ products:
   - test_case: [tests/unit_tests/transformer/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/**/*.py]
+  # Engine tests run apart from the rest of inference so each job fits the CI time limit.
+  - test_case: [tests/unit_tests/inference/engines/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/test_dynamic_engine.py]
+  - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine_parallel_and_chunked_prefill.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/engines/test_dynamic_engine_parallel_and_chunked_prefill.py]
+  - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/test_hybrid_moe.py]
+  - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -510,14 +301,7 @@ products:
   - test_case: [tests/unit_tests/inference/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/inference/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
@@ -538,46 +322,53 @@ products:
   - test_case: [tests/unit_tests/resharding/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/resharding/**/*.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net2.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net_recompute.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_recompute.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net_padding.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_padding.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net_parallel.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_parallel.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gated_delta_net2_parallel.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net2_parallel.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/test_gdp_dynamic_inference.py]
+  - test_case: [tests/unit_tests/ssm/test_gdp_dynamic_inference.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -587,18 +378,11 @@ products:
   - test_case: [tests/unit_tests/ssm/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/ssm/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/moe/test_token_dispatcher_capacity.py]
+  - test_case: [tests/unit_tests/transformer/moe/test_token_dispatcher_capacity.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -608,32 +392,25 @@ products:
   - test_case: [tests/unit_tests/transformer/moe/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/moe/**/*.py]
+  - test_case: [tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_fully_shard.py]
+  - test_case: [tests/unit_tests/distributed/mfsdp_v1/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/distributed/mfsdp_v1/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/distributed/mfsdp_v2/**/*.py]
+  - test_case: [tests/unit_tests/distributed/mfsdp_v2/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -643,69 +420,36 @@ products:
   - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_cuda_graphed_schedule_chunk_1f1b.py]
+  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
     products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/determinism/correctness/**/*.py]
+    products:
+      # tag: [latest] only — this directory is new in this PR, so legacy
+      # CI refs (/opt/megatron-lm-legacy/) don't have the path yet.
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_delay_wgrad_compute.py]
+  - test_case: [tests/unit_tests/determinism/kernels/**/*.py]
     products:
+      # Operator-level bit-exact kernel tests. tag: [latest] only for the same
+      # reason as correctness/ above.
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_fsdp_1f1b_overlap.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_schedule_chunk_1f1b.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_schedule_layer_1f1b.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/pipeline_parallel/test_schedule_quantization_context.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/determinism/correctness/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/determinism/kernels/**/*.py]
-    products:
-      # Operator-level bit-exact kernel tests. Legacy test checkouts do not
-      # contain this directory.
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  # core/determinism/perf is in its own dedicated recipe (determinism-perf.yaml) —
+  # determinism/perf is in its own dedicated recipe (determinism-perf.yaml) —
   # the perf bucket wraps pytest in nsys for per-NVTX-range attribution and
   # can't share the generic ``run_ci_test.sh`` invocation used here.
   - test_case: [tests/unit_tests/**/*.py]
@@ -718,28 +462,14 @@ products:
   - test_case: [tests/unit_tests/transformer/test_multi_latent_attention.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/test_multi_latent_attention.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/test_multi_token_prediction.py]
     products:
       - environment: [lts, dev]
-        tag: [legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/core/transformer/test_multi_token_prediction.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]

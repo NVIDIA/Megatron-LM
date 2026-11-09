@@ -32,6 +32,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.global_vars import get_run_config
 from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("run_config")
 

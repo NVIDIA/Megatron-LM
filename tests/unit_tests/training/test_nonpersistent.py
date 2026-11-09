@@ -19,6 +19,10 @@ from tests.unit_tests.core.dist_checkpointing import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
+from tests.unit_tests.core.dist_checkpointing.conftest import (  # noqa: F401
+    checkpoint_run_config,
+    disable_msc,
+)
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 

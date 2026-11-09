@@ -10,6 +10,7 @@ import torch
 from examples.mimo.training.batch import move_batch_to_cuda
 from examples.mimo.training.step import loss_func
 from megatron.core.packed_seq_params import PackedSeqParams
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 
 
 def test_loss_func_returns_int_num_tokens_three_tuple():

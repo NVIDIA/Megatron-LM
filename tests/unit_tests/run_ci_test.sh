@@ -138,19 +138,22 @@ export BUCKET
 # variable while newer helpers exclude buckets from the other suite version.
 export UNIT_TEST_TAG="$TAG"
 IGNORE_ARGS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
-
-# Testmon invokes pytest through an argument array, so expand file globs here
-# instead of relying on the shell expansion used by the full test command.
-TEST_TARGET=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-TEST_TARGETS=("$TEST_TARGET")
-if [[ "$TEST_TARGET" == *'*'* ]]; then
-    mapfile -t TEST_TARGETS < <(compgen -G "$TEST_TARGET" | LC_ALL=C sort)
-    if [[ "${#TEST_TARGETS[@]}" -eq 0 ]]; then
-        TEST_TARGETS=("$TEST_TARGET")
+if [[ "$TAG" == "latest" ]]; then
+    # Resolve exclusions before passing explicit files to pytest: --ignore does
+    # not suppress a file also supplied as a positional collection target.
+    TARGET_LIST=$(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM" --targets)
+    if [[ -z "$TARGET_LIST" ]]; then
+        echo "No test files selected for $BUCKET on $PLATFORM" >&2
+        exit 1
     fi
+    mapfile -t TEST_TARGETS <<< "$TARGET_LIST"
+else
+    # Historical checkouts use their own directory selectors and helper API.
+    IGNORE_LIST=$(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
+    done <<< "$IGNORE_LIST"
+    TEST_TARGETS=("${BUCKET%/\*\*/\*.py}")
 fi
 
 echo "------ARGUMENTS for SLURM ---"
@@ -176,10 +179,9 @@ export ONE_LOGGER_JOB_CATEGORY=test
 # contain no matching tests; treat pytest's "no tests collected" (exit 5) as a
 # pass there instead of aborting the job under `set -e`.
 run_test_cmd() {
-    local cmd="$1"
     local rc=0
     set +e
-    eval "$cmd"
+    "$@"
     rc=$?
     set -e
     if [[ "$rc" -eq 5 && "$PLATFORM" == "gb200" ]]; then
@@ -194,24 +196,21 @@ run_test_cmd() {
 run_full_tests() {
     for i in $(seq $UNIT_TEST_REPEAT); do
         echo "Running prod test suite."
-        CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
             -m coverage run \
             --data-file=.coverage.unit_tests \
             --source=megatron/core \
             -m pytest \
             -vs \
-            ${IGNORE_ARGS[@]} \
-            -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-        run_test_cmd "$CMD"
+            "${IGNORE_ARGS[@]}" \
+            -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
 
         if [[ "$TAG" == "latest" ]]; then
-            CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
+            run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" -m pytest \
                 -vs \
                 --experimental \
-                 ${IGNORE_ARGS[@]} \
-                -m "'experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-
-            run_test_cmd "$CMD"
+                "${IGNORE_ARGS[@]}" \
+                -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
         fi
 
     done

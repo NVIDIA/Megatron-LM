@@ -21,6 +21,7 @@ from examples.mimo.training.encoder_prefetch import (
     validate_encoder_prefetch_args,
 )
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 
 ENCODER = "clip_encoder"
 

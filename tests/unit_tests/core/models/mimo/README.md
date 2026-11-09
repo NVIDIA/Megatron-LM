@@ -34,8 +34,9 @@ or `--no-barrier-with-level-1-timing` for non-colocated training until timers ar
 propagated to all module configs. Encoder-side and hierarchical CP are outside
 this example's supported scope.
 
-`test_mimo_hetero_grid_args.py`, `test_mimo_mock_data.py`, and
-`test_nemotron_moe_vlm_provider.py` cover the example's CP configuration and
-replicated inputs. `test_mimo_noncolocated_cp_correctness.py` provides the existing
+`tests/unit_tests/test_mimo_hetero_grid_args.py`,
+`tests/unit_tests/test_mimo_mock_data.py`, and
+`tests/unit_tests/test_nemotron_moe_vlm_provider.py` cover the example's CP
+configuration and replicated inputs. `test_mimo_noncolocated_cp_correctness.py` provides the existing
 8-GPU CP2-versus-CP1 encoder-gradient oracle; it does not by itself validate the
 full example's training entrypoint.

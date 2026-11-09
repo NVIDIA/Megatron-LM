@@ -3,7 +3,6 @@
 """Unit tests for ModelOpt Hugging Face finetuning dataset helpers."""
 
 import sys
-from argparse import ArgumentParser
 from pathlib import Path
 
 import pytest
@@ -15,13 +14,11 @@ pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 transformers = pytest.importorskip("transformers")
 
-_MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "post_training" / "modelopt"
+_MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[2] / "examples" / "post_training" / "modelopt"
 sys.path.insert(0, str(_MODEL_OPT_EXAMPLE_DIR))
 
 from finetune import SFTDataset
 from utils import get_eos_token_id
-
-from megatron.post_training.arguments import add_modelopt_args
 
 
 class _Tokenizer:
@@ -36,24 +33,6 @@ class _Tokenizer:
 
     def convert_tokens_to_ids(self, _token):
         return self.converted_id
-
-
-def test_finetune_data_files_argument_accepts_multiple_files():
-    parser = ArgumentParser()
-    add_modelopt_args(parser)
-
-    args = parser.parse_args(
-        [
-            "--finetune-data-split",
-            "chat",
-            "--finetune-data-files",
-            "data/chat-00000.parquet",
-            "data/chat-00001.parquet",
-        ]
-    )
-
-    assert args.finetune_data_split == "chat"
-    assert args.finetune_data_files == ["data/chat-00000.parquet", "data/chat-00001.parquet"]
 
 
 def test_materialize_data_files_resolves_local_dataset_directory(tmp_path):

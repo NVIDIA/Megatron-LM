@@ -24,6 +24,7 @@ from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import unwrap_model
+from tests.unit_tests.core.models.mimo.conftest import mimo_run_config  # noqa: F401
 from tests.unit_tests.core.models.mimo.test_mimo_1f1b_schedule import (
     get_language_model_spec,
     get_vision_submodules_spec,
