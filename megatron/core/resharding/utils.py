@@ -200,6 +200,8 @@ def _get_rank_in_group(global_rank: int, group_ranks: list[int]) -> int:
 
 
 _EXPERT_PARAM_RE = re.compile(r"^(weight|bias)(\d+)$")
+# SequentialMLP keeps one module per local expert: "...experts.local_experts.<K>.linear_fc1.weight".
+_SEQUENTIAL_EXPERT_RE = re.compile(r"(^|\.)local_experts\.(\d+)(?=\.)")
 
 
 def _detect_expert_index_from_param_name(param_name: str) -> Optional[int]:
@@ -215,7 +217,8 @@ def assign_ep_resolved_name_inplace(
     meta: ParameterMetadata, *, base_name: str | None = None
 ) -> None:
     """
-    EP-only canonicalization for per-expert parameters.
+    EP-only canonicalization for per-expert parameters (TEGroupedMLP's "weightK"/"biasK" and
+    SequentialMLP's "local_experts.K").
 
     Under Expert Parallelism (EP), each rank owns a subset of experts with local indices
     (e.g., rank 1 has "weight0" locally, but it's actually global expert 4). The raw param
@@ -234,6 +237,9 @@ def assign_ep_resolved_name_inplace(
         return
 
     local_idx = _detect_expert_index_from_param_name(base)
+    sequential_match = _SEQUENTIAL_EXPERT_RE.search(base) if local_idx is None else None
+    if sequential_match is not None:
+        local_idx = int(sequential_match.group(2))
     if local_idx is None:
         # Fused experts tensor: leave name as-is; TP planner will handle slicing
         return
@@ -243,6 +249,12 @@ def assign_ep_resolved_name_inplace(
     experts_per_rank = meta.num_experts // ep_size
     global_idx = ep_local_rank * experts_per_rank + local_idx
     meta.global_expert_index = global_idx
+
+    if sequential_match is not None:
+        # Replace the module index in "local_experts.K" with global_idx
+        start, end = sequential_match.span(2)
+        meta.resolved_name = f"{base[:start]}{global_idx}{base[end:]}"
+        return
 
     # Replace trailing integer in "weightK"/"biasK" with global_idx
     new_parts = []

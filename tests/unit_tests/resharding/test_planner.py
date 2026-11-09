@@ -24,7 +24,11 @@ from megatron.core.resharding.planner import (
     index_metadata_rosters,
 )
 from megatron.core.resharding.shard_planner import plan_sharded_transfer
-from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor
+from megatron.core.resharding.utils import (
+    ParameterMetadata,
+    ShardingDescriptor,
+    assign_ep_resolved_name_inplace,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1204,3 +1208,47 @@ class TestDefaultParameterCap:
             self._rosters(4), execution_batch_bytes=64
         )  # two 32-byte params per batch
         assert {plan.num_batches for plan in plans.values()} == {2}
+
+
+@pytest.mark.parametrize(
+    "name, owner_rank, resolved_name, global_expert_index",
+    [
+        # TEGroupedMLP: rank 1 of EP 2 holds global experts 2 and 3 as weight0 / weight1.
+        (
+            "decoder.layers.0.mlp.experts.linear_fc1.weight1",
+            1,
+            "decoder.layers.0.mlp.experts.linear_fc1.weight3",
+            3,
+        ),
+        # SequentialMLP: the same experts are local_experts.0 / local_experts.1.
+        (
+            "decoder.layers.0.mlp.experts.local_experts.1.linear_fc1.weight",
+            1,
+            "decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+            3,
+        ),
+        (
+            "decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.bias",
+            0,
+            "decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.bias",
+            0,
+        ),
+        # Fused expert tensors keep their name.
+        (
+            "decoder.layers.0.mlp.experts.linear_fc1.weight",
+            1,
+            "decoder.layers.0.mlp.experts.linear_fc1.weight",
+            None,
+        ),
+    ],
+)
+def test_ep_resolved_name_uses_global_expert_index(
+    name, owner_rank, resolved_name, global_expert_index
+):
+    """Expert names are matched across models by global index, for every expert layout."""
+    meta = _meta(name=name, owner_rank=owner_rank, ep_ranks=[0, 1])
+    meta.is_ep = True
+    meta.num_experts = 4
+    assign_ep_resolved_name_inplace(meta)
+    assert meta.resolved_name == resolved_name
+    assert meta.global_expert_index == global_expert_index
