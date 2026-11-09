@@ -45,7 +45,6 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 try:
@@ -2293,7 +2292,6 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
     has_cu_seqlens: bool,
@@ -2354,7 +2352,7 @@ def get_batch_on_this_tp_rank(
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
         every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+        'max_seqlen', 'local_cp_size', and 'dynamic_cp_group'.
     """
 
     def _broadcast(item):
@@ -2570,7 +2568,7 @@ def get_batch_on_this_tp_rank(
             'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
-            'hybrid_cp_group': None,
+            'dynamic_cp_group': None,
         }
 
     return batch
@@ -2677,7 +2675,7 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
         'dataset_id',
         'max_seqlen',
         'local_cp_size',
-        'hybrid_cp_group',
+        'dynamic_cp_group',
     )
 
     if cp_size > 1:
@@ -2809,7 +2807,7 @@ def _resolve_dynamic_cp_group_for_batch(
     else:
         local_cp_size = int(local_cp_size)
 
-    runtime_cp_group = batch.get('hybrid_cp_group')
+    runtime_cp_group = batch.get('dynamic_cp_group')
     if runtime_cp_group is None:
         if dynamic_cp_group_func is None:
             raise ValueError("dynamic_cp_group_func is required to resolve the dynamic CP group")
@@ -2822,11 +2820,10 @@ def _resolve_dynamic_cp_group_for_batch(
             "Dynamic CP group size does not match local_cp_size: "
             f"group has {runtime_cp_size} ranks, metadata requests {local_cp_size}."
         )
-    batch['hybrid_cp_group'] = runtime_cp_group
+    batch['dynamic_cp_group'] = runtime_cp_group
     return runtime_cp_group
 
 
-@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     dynamic_cp: bool,

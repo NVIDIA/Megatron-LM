@@ -454,6 +454,45 @@ def test_require_sm_skips_or_fails(monkeypatch):
         ou.require_sm(ou.BLACKWELL)
 
 
+def test_use_local_rank_device(monkeypatch):
+    chosen = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "set_device", chosen.append)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) == 3
+    assert ou.use_local_rank_device({"LOCAL_RANK": "11"}) == 3  # more ranks than GPUs: wrap
+    assert ou.use_local_rank_device({}) is None  # not under torch.distributed.run
+    assert chosen == [3, 3]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) is None
+    assert chosen == [3, 3]
+
+
+def test_installed_version():
+    assert ou.installed_version("pytest") is not None
+    assert ou.installed_version("no-such-distribution-for-oracles") is None
+
+
+def test_xfail_upstream_is_strict_and_bounded_by_version(monkeypatch):
+    def mark_for(installed):
+        monkeypatch.setattr(ou, "installed_version", lambda _: installed and ou.Version(installed))
+        return ou.xfail_upstream(
+            "X-N1", "pkg", fixed_after="0.7.2.post1", reason="audit/x.diff", raises=AssertionError
+        ).mark
+
+    for installed, expected in (("0.7.2", True), ("0.7.2.post1", True), ("0.7.3", False)):
+        mark = mark_for(installed)
+        assert mark.name == "xfail" and mark.args == (expected,)
+        assert mark.kwargs["strict"] is True and mark.kwargs["raises"] is AssertionError
+        assert mark.kwargs["reason"] == "X-N1, upstream in pkg <= 0.7.2.post1: audit/x.diff"
+    assert mark_for(None).args == (False,)  # not installed: the test's own check decides
+
+
+def test_drain_cuda_launch_error_without_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ou.drain_cuda_launch_error() is None
+
+
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
 def test_requires_sm_marker_runs_on_blackwell_only():
