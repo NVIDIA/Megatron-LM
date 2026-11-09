@@ -963,9 +963,13 @@ def _move_weight_to_symm_pool(param, gtp_remat_group):
                 rowwise=param._rowwise_data is not None,
                 columnwise=param._columnwise_data is not None,
             )
-            with gtp_symm_pool_ctx(gtp_remat_group):
-                pooled = quantizer.make_empty(param.shape, dtype=param.dtype, device=param.device)
-            quantizer.set_usage(rowwise=saved_usage[0], columnwise=saved_usage[1])
+            try:
+                with gtp_symm_pool_ctx(gtp_remat_group):
+                    pooled = quantizer.make_empty(
+                        param.shape, dtype=param.dtype, device=param.device
+                    )
+            finally:
+                quantizer.set_usage(rowwise=saved_usage[0], columnwise=saved_usage[1])
             pooled.copy_from_storage(param)
         else:
             with gtp_symm_pool_ctx(gtp_remat_group):
