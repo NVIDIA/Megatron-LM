@@ -207,6 +207,43 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     ) == (True, True, True, False)
 
 
+class _FakeDecoderOnlyModelChunk(torch.nn.Module):
+    """A model that exposes a decoder but has no MTP attributes, like LLaVAModel."""
+
+    def __init__(self, config, decoder_moe):
+        super().__init__()
+        self.config = config
+        self.decoder = _FakeStack(_FakeTransformerLayer(decoder_moe))
+
+
+def test_runner_accepts_model_without_mtp_process(monkeypatch):
+    """Models without an mtp_process attribute are tracked through their decoder only."""
+    monkeypatch.setattr(
+        "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
+        _FakeMTPPredictionLayer,
+    )
+    monkeypatch.setattr(
+        PagedStashManager,
+        'STASH_MGR',
+        SimpleNamespace(overflow=None, host_spill=None, release_stash_buffers=lambda: None),
+    )
+    training_config = _config(True)
+    model_config = _config(True)
+    decoder_moe = _FakeMoELayer(model_config)
+    model = _FakeDecoderOnlyModelChunk(model_config, decoder_moe)
+    assert not hasattr(model, "mtp_process")
+
+    runner = PagedStashRunner(
+        config=training_config,
+        copy_main_params=False,
+        model=[model],
+        optimizer=None,
+        forward_backward_func=lambda **_: None,
+    )
+
+    assert runner.moe_layers == [decoder_moe]
+
+
 def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
     class _DistributedOptimizer:
 

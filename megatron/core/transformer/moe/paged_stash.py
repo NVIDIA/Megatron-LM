@@ -1106,7 +1106,9 @@ class PagedStashRunner:
                     and hasattr(mlp.token_dispatcher, 'check_over_budget')
                 ):
                     self.moe_layers.append(mlp)
-            if model_with_decoder.mtp_process:
+            # Only GPT-style models have MTP layers; others (e.g. LLaVAModel) expose just a
+            # decoder and have no mtp_process attribute.
+            if getattr(model_with_decoder, "mtp_process", False):
                 for layer in model_with_decoder.mtp.layers:
                     transformer_layer = (
                         layer.mtp_model_layer
