@@ -116,6 +116,28 @@ def model_provider(
     )
     args.decoder_seq_length = decoder_seq_len + mp_padding_needed
 
+    if args.fp8 or args.fp4:
+        # The vision encoder always runs on all patches plus the class token.
+        num_vision_encoder_tokens = get_num_image_embeddings(
+            args.img_h,
+            args.img_w,
+            args.patch_dim,
+            vision_model_type,
+            False,
+            class_token_len=1,
+            pixel_shuffle=False,
+            use_tile_tags=False,
+        )
+        # Without padding for SP/CP, the language model sees decoder_seq_len tokens per sample.
+        unpadded_decoder = mp_padding_needed == 0 and args.context_parallel_size == 1
+        check_quantized_gemm_alignment(
+            num_vision_encoder_tokens,
+            decoder_seq_len if unpadded_decoder else None,
+            args.micro_batch_size,
+            fp8_recipe=args.fp8_recipe if args.fp8 else None,
+            fp4_recipe=args.fp4_recipe if args.fp4 else None,
+        )
+
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
@@ -243,6 +265,50 @@ def model_provider(
     )
 
     return model
+
+
+def check_quantized_gemm_alignment(
+    num_vision_tokens, num_decoder_tokens, micro_batch_size, fp8_recipe=None, fp4_recipe=None
+):
+    """Check that the FP8/FP4 GEMMs get a supported number of tokens per micro-batch.
+
+    This script does not pad the vision encoder's sequence, nor the language model's sequence
+    unless sequence or context parallelism needs it. Transformer Engine's quantized GEMMs need
+    the number of rows (tokens x micro-batch size) to be a multiple of the recipe's alignment, and
+    otherwise fail in the first forward pass.
+
+    Args:
+        num_vision_tokens (int): Vision encoder tokens per image (patches and class token).
+        num_decoder_tokens (int): Language model tokens per sample, or None to skip the check.
+        micro_batch_size (int): Micro-batch size.
+        fp8_recipe (str): FP8 recipe, or None if FP8 is off.
+        fp4_recipe (str): FP4 recipe, or None if FP4 is off.
+    """
+    if fp4_recipe is not None:
+        recipe, alignment = f"FP4 recipe {fp4_recipe}", 32
+    elif fp8_recipe in ("delayed", "tensorwise"):
+        recipe, alignment = f"FP8 recipe {fp8_recipe}", 8
+    elif fp8_recipe == "blockwise":
+        recipe, alignment = f"FP8 recipe {fp8_recipe}", 16
+    elif fp8_recipe == "mxfp8":
+        recipe, alignment = f"FP8 recipe {fp8_recipe}", 32
+    else:
+        return
+
+    for name, num_tokens in (
+        ("vision encoder", num_vision_tokens),
+        ("language model", num_decoder_tokens),
+    ):
+        if num_tokens is None:
+            continue
+        num_rows = num_tokens * micro_batch_size
+        if num_rows % alignment != 0:
+            raise ValueError(
+                f"The {recipe} needs the tokens per micro-batch to be a multiple of {alignment}, "
+                f"but the {name} gets {num_tokens} tokens x micro-batch size {micro_batch_size} = "
+                f"{num_rows}. Change --micro-batch-size, or the image and text lengths "
+                f"(--img-h, --img-w, --patch-dim, --dataloader-seq-length)."
+            )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
