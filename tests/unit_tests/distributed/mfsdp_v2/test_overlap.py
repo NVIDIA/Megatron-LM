@@ -13,6 +13,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradSyncMode,
     Placements,
     RuntimePolicy,
     SchedulePolicy,
@@ -161,7 +162,14 @@ def test_overlaps_communication_and_compute(
         """Run one optimizer step consuming two microbatches."""
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with finalize_gradients(context, enabled=microbatch_index == 1):
+            with finalize_gradients(
+                context,
+                mode=(
+                    GradSyncMode.REDUCE_OUTER_AND_WAIT
+                    if microbatch_index == 1
+                    else GradSyncMode.SKIP_OUTER
+                ),
+            ):
                 model(x).sum().backward()
         optimizer.step()
 
@@ -291,7 +299,14 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     def train_one_step() -> None:
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with finalize_gradients(context, enabled=microbatch_index == 1):
+            with finalize_gradients(
+                context,
+                mode=(
+                    GradSyncMode.REDUCE_OUTER_AND_WAIT
+                    if microbatch_index == 1
+                    else GradSyncMode.SKIP_OUTER
+                ),
+            ):
                 model(x).sum().backward()
         optimizer.step()
 

@@ -15,6 +15,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradSyncMode,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -288,14 +289,14 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
         )
 
 
-def test_rejects_shared_context_without_caller_managed_grad_sync(
+def test_rejects_shared_context_with_automatic_grad_wait(
     process_group_collection, distributed_setup
 ):
     """The adapter rejects an incompatible shared context before sharding the model."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
-        with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
+        with pytest.raises(ValueError, match="grad_sync_mode=GradSyncMode.REDUCE_OUTER"):
             FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -307,7 +308,7 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
                 module=layer,
                 pg_collection=process_group_collection,
             )
-        assert not context.caller_managed_grad_sync
+        assert context.grad_sync_mode is GradSyncMode.REDUCE_OUTER_AND_WAIT
         assert not isinstance(layer, FsdpModule)
 
 

@@ -17,6 +17,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradSyncMode,
     Placements,
     SchedulePolicy,
     finalize_gradients,
@@ -238,7 +239,14 @@ def _check_mxfp8_mlp_matches_reference(
             optimizer.zero_grad(set_to_none=True)
             for index, (x, target) in enumerate(zip(step_inputs, step_targets)):
                 # HSDP/HFSDP reduce gradients across DP-outer only on the last microbatch.
-                with finalize_gradients(context, enabled=index == num_microbatches - 1):
+                with finalize_gradients(
+                    context,
+                    mode=(
+                        GradSyncMode.REDUCE_OUTER_AND_WAIT
+                        if index == num_microbatches - 1
+                        else GradSyncMode.SKIP_OUTER
+                    ),
+                ):
                     with te.autocast(recipe=recipe):
                         output = model(x)
                     loss = (output.float() - target.float()).square().mean()

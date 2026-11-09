@@ -19,6 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradSyncMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
@@ -229,7 +230,14 @@ def test_fully_shard_sgd_losses_match_baseline(
             optimizer.zero_grad()
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with finalize_gradients(context, enabled=microbatch_index == num_microbatches - 1):
+                with finalize_gradients(
+                    context,
+                    mode=(
+                        GradSyncMode.REDUCE_OUTER_AND_WAIT
+                        if microbatch_index == num_microbatches - 1
+                        else GradSyncMode.SKIP_OUTER
+                    ),
+                ):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     losses.append(loss.detach())
                     logger.debug(
@@ -442,7 +450,10 @@ def test_losses_match_baseline(
             optimizer.zero_grad(set_to_none=set_to_none)
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
-                with finalize_gradients(context, enabled=is_last):
+                with finalize_gradients(
+                    context,
+                    mode=GradSyncMode.REDUCE_OUTER_AND_WAIT if is_last else GradSyncMode.SKIP_OUTER,
+                ):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
@@ -497,7 +508,10 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with finalize_gradients(context, enabled=is_last):
+            with finalize_gradients(
+                context,
+                mode=GradSyncMode.REDUCE_OUTER_AND_WAIT if is_last else GradSyncMode.SKIP_OUTER,
+            ):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -561,7 +575,10 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with finalize_gradients(context, enabled=is_last):
+            with finalize_gradients(
+                context,
+                mode=GradSyncMode.REDUCE_OUTER_AND_WAIT if is_last else GradSyncMode.SKIP_OUTER,
+            ):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -602,7 +619,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
-    with finalize_gradients(context, enabled=False):
+    with finalize_gradients(context, mode=GradSyncMode.SKIP_OUTER):
         model(x).sum().backward()
     model(x).sum().backward()
 
@@ -886,7 +903,14 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
         for _ in range(5):
             optimizer.zero_grad()
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with finalize_gradients(context, enabled=microbatch_index == num_microbatches - 1):
+                with finalize_gradients(
+                    context,
+                    mode=(
+                        GradSyncMode.REDUCE_OUTER_AND_WAIT
+                        if microbatch_index == num_microbatches - 1
+                        else GradSyncMode.SKIP_OUTER
+                    ),
+                ):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     losses.append(loss.detach())
                     (loss / num_microbatches).backward()

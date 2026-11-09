@@ -41,6 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .runtime_policy import GradSyncMode
 from .schedule_policy import SchedulePolicy
 
 
@@ -218,9 +219,10 @@ class FsdpModule:
                         "Transformer Engine does not accumulate their gradients. See "
                         "https://github.com/NVIDIA/TransformerEngine/issues/3437"
                     )
-                if not self.context.caller_managed_grad_sync:
+                if self.context.grad_sync_mode is GradSyncMode.REDUCE_OUTER_AND_WAIT:
                     raise ValueError(
-                        "Delayed weight gradients require caller_managed_grad_sync=True."
+                        "Delayed weight gradients require grad_sync_mode=GradSyncMode.REDUCE_OUTER "
+                        "or GradSyncMode.SKIP_OUTER and an explicit finish_grad_sync() call."
                     )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
@@ -466,7 +468,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if not context.finalize_gradients:
+                if context.grad_sync_mode is GradSyncMode.SKIP_OUTER:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the

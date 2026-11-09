@@ -28,6 +28,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .module import FsdpModule
 from .placement import ShardLayout
+from .runtime_policy import GradSyncMode
 from .schedule_policy import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
@@ -194,29 +195,31 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 
 
 @contextmanager
-def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[None]:
-    """Control whether backward finalizes accumulated gradients in this context.
+def finalize_gradients(
+    context: FsdpContext, mode: GradSyncMode = GradSyncMode.REDUCE_OUTER_AND_WAIT
+) -> Iterator[None]:
+    """Scope outer reduction and completion-wait behavior for backward calls.
 
-    When enabled, backward launches DP-outer reductions and automatically waits
-    for gradient reductions unless the caller manages that wait. When disabled,
-    inner reductions and weight cleanup still run, but outer reductions and the
-    automatic completion wait are deferred.
+    Use SKIP_OUTER while accumulating gradients across backward calls. For the last
+    backward before the optimizer step, use REDUCE_OUTER_AND_WAIT for automatic
+    completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
+    including backward_dw(). Inner reduction and weight cleanup run in every mode.
 
-    Wrap both forward and backward. This scope only changes the finalization
-    setting; entering or exiting it does not launch reductions or wait for them.
+    Wrap both forward and backward. The scope itself does not launch reductions
+    or wait on entry or exit.
 
     Args:
-        context: FSDP context whose modules should use this finalization setting.
-        enabled: Whether backward should finalize gradients. Defaults to True.
+        context: FSDP context whose backward calls should use this mode.
+        mode: Outer reduction and completion-wait behavior within the scope.
     """
     context.ensure_finalized()
-    previous_state = context.finalize_gradients
-    context.finalize_gradients = enabled
+    previous_mode = context.grad_sync_mode
+    context.grad_sync_mode = mode
 
     try:
         yield
     finally:
-        context.finalize_gradients = previous_state
+        context.grad_sync_mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

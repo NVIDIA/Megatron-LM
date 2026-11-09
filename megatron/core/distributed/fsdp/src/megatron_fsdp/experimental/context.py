@@ -22,7 +22,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import PrefetchOrder, RuntimePolicy
+from .runtime_policy import GradSyncMode, PrefetchOrder, RuntimePolicy
 
 
 class FsdpContext:
@@ -32,11 +32,9 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # Whether backward should finalize accumulated gradients, including DP-outer
-    # reduction for HSDP/HFSDP. Scoped by finalize_gradients().
-    finalize_gradients: bool
+    # Outer reduction and completion-wait behavior, scoped by finalize_gradients().
+    grad_sync_mode: GradSyncMode
     use_symmetric_memory: bool
-    caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
@@ -74,9 +72,8 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self.finalize_gradients = True
+        self.grad_sync_mode = runtime_policy.grad_sync_mode
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
@@ -181,11 +178,14 @@ class FsdpContext:
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
-        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+        if (
+            self.grad_sync_mode is not GradSyncMode.REDUCE_OUTER_AND_WAIT
+            or self._post_backward_hook_registered
+        ):
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use FsdpContext(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "Use RuntimePolicy(grad_sync_mode=GradSyncMode.REDUCE_OUTER) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
@@ -197,6 +197,8 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        # TODO: Support SKIP_OUTER even on the last microbatch by launching pending
+        # outer reductions here before waiting, instead of requiring backward to launch them.
         # A backward prefetch may gather a frozen module that never runs backward.
         # Restore bindings and clear its gather state so the next iteration
         # materializes fresh weights. All backward work, including delayed wgrad,
@@ -215,7 +217,7 @@ class FsdpContext:
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.finalize_gradients:
+        if self.grad_sync_mode is GradSyncMode.REDUCE_OUTER_AND_WAIT:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 

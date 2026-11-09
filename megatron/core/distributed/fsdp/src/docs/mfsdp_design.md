@@ -275,7 +275,7 @@ context = FsdpContext(
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
         overlap_allgather_reduction=False,
-        caller_managed_grad_sync=True,
+        grad_sync_mode=GradSyncMode.REDUCE_OUTER,
     ),
 )
 with fully_shard_context(context):
@@ -283,22 +283,26 @@ with fully_shard_context(context):
 ```
 
 `device` and the construction-only `parameter_to_owner` map remain separate
-`FsdpContext` arguments. Runtime-policy flags default to `False`, except
-`overlap_allgather_reduction`, which defaults to `True`. When the caller manages
-gradient synchronization, call `context.finish_grad_sync()` after all backward
-work and before consuming gradients.
+`FsdpContext` arguments. The default `grad_sync_mode` is
+`GradSyncMode.REDUCE_OUTER_AND_WAIT`. Runtime-policy booleans default to `False`,
+except `overlap_allgather_reduction`, which defaults to `True`. With
+`GradSyncMode.REDUCE_OUTER`, call `context.finish_grad_sync()` after all backward
+work, including `backward_dw()`, and before the optimizer step.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
   `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
   and static forward and backward prefetch orders.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
-- Gradient finalization is enabled by default. Use
-  `with finalize_gradients(context, enabled=False):` around forward and backward
-  to defer DP-outer reduction and the automatic completion wait. Enable finalization
-  during the last backward call before the optimizer step. This launches deferred
-  outer reductions and enables the automatic wait for gradient reductions. The
-  scope itself does not launch reductions on entry or exit.
+- Scope the gradient synchronization mode with
+  `with finalize_gradients(context, mode=GradSyncMode.SKIP_OUTER):` around forward
+  and backward. `SKIP_OUTER` skips outer reduction and the automatic wait during
+  accumulation; inner reduction and weight cleanup still run. On the last backward
+  before the optimizer step, `REDUCE_OUTER` launches outer reduction and leaves the
+  completion wait to the caller. `REDUCE_OUTER_AND_WAIT` also waits for all gradient
+  reductions at autograd completion. The scope restores the previous mode on exit
+  and does not itself launch reductions or wait. `finish_grad_sync()` only waits
+  for submitted reductions; it does not launch skipped outer reductions.
 - An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
 
 ### FsdpModule
