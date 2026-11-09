@@ -95,15 +95,17 @@ def _setup_model(
         single_weight=single_weight,
         gradient_accumulation_fusion=False,
         use_transformer_engine_op_fuser=use_op_fuser,
+        model_overrides=dict(
+            add_bias_linear=True,
+            add_qkv_bias=True,
+            swiglu=gated,
+            bias_gelu_fusion=False,
+            bias_swiglu_fusion=False,
+            bias_dropout_fusion=False,
+            moe_single_grouped_bias=single_bias,
+            moe_mlp_glu_interleave_size=interleave,
+        ),
     )
-    args.add_bias_linear = True
-    args.add_qkv_bias = True
-    args.swiglu = gated
-    args.bias_gelu_fusion = False
-    args.bias_swiglu_fusion = False
-    args.bias_dropout_fusion = False
-    args.moe_single_grouped_bias = single_bias
-    args.moe_mlp_glu_interleave_size = interleave
     args.save = directory
     args.load = directory if load else None
     args.ckpt_format = "torch_dist"

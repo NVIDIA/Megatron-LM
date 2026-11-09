@@ -124,6 +124,39 @@ def test_mixer_rmsnorm_gamma_replays(mixer_type):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("clamp_value", [None, 2.0])
+def test_gdp_gating_replays(clamp_value):
+    """GDP's beta and log-decay gating, with and without the optional decay clamp."""
+    from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+    from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+    from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+    if not HAVE_GDP_DEPS:
+        pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config([])
+        config.gdp_g_clamp_value = clamp_value
+        mixer = build_gdp(config)
+        runtime_cp = mixer._resolve_runtime_cp(None)
+        width = runtime_cp.nheads * (mixer.num_householder + 1)
+        # Wide logits so some decays fall below the clamp and its gradient mask is exercised.
+        ba = (8 * torch.randn(2, 4096, width, device="cuda")).to(torch.bfloat16)
+        ba.requires_grad_(True)
+        assert_replays_bit_exact(
+            lambda ba: mixer._compute_gating(ba, runtime_cp=runtime_cp),
+            (ba,),
+            replays=3,
+            contention=True,
+            what=f"GDP gating (clamp {clamp_value})",
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_mamba_chunk_scan_combined_varlen_replays():
     from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
