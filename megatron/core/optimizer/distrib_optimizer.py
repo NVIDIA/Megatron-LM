@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
+from megatron.core.fusions.fused_float_upcast import upcast_storage_range_to_fp32
 from megatron.core.utils import get_model_config, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
@@ -3172,9 +3173,85 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             copy_group_grads(self.model_float16_groups, self.shard_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+        elif getattr(self.config, "fused_main_grad_copy", False):
+            self._copy_model_grads_to_main_grads_by_run()
         else:
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    # Largest gap, in elements, between two gradient shards converted by one kernel.
+    _MAX_RUN_GAP = 65536
+
+    def _main_grad_copy_runs(self):
+        """Group this rank's gradient shards into runs of nearby shards of one grad buffer.
+
+        Returns a list of ``(model_param, start, end, members)``. ``start`` and ``end`` are
+        element offsets into the storage of ``model_param.main_grad``, and ``members`` lists
+        ``(shard_main_param, start, numel)`` for the shards in the run. BF16 and FP16 shards up
+        to ``_MAX_RUN_GAP`` elements apart join one run, so normally each bucket's shard is one
+        run. Other gradients form one run per parameter.
+        """
+        entries = []
+        for model_groups, shard_main_groups in (
+            (self.model_float16_groups, self.shard_fp32_from_float16_groups),
+            (self.model_fp32_groups, self.shard_fp32_groups),
+        ):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range = self._get_model_param_range_map(model_param)["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    model_grad = model_param.main_grad
+                    assert model_grad.is_contiguous()
+                    entries.append(
+                        (
+                            model_grad.untyped_storage().data_ptr(),
+                            str(model_grad.dtype),
+                            model_grad.storage_offset() + param_range.start,
+                            param_range.size,
+                            model_param,
+                            shard_main_param,
+                        )
+                    )
+        entries.sort(key=lambda e: e[:3])
+        runs = []
+        last_key = None
+        for storage, dtype, start, numel, model_param, shard_main_param in entries:
+            groupable = model_param.main_grad.dtype in (torch.bfloat16, torch.float16)
+            if (
+                groupable
+                and last_key == (storage, dtype)
+                and 0 <= start - runs[-1][2] <= self._MAX_RUN_GAP
+            ):
+                runs[-1][2] = start + numel
+                runs[-1][3].append((shard_main_param, start, numel))
+            else:
+                runs.append([model_param, start, start + numel, [(shard_main_param, start, numel)]])
+            last_key = (storage, dtype) if groupable else None
+        return [tuple(run) for run in runs]
+
+    def _copy_model_grads_to_main_grads_by_run(self):
+        """Same FP32 main grads as ``shard_main_param.grad = shard_model_grad.float()``, with
+        one vectorized conversion per run of nearby gradient shards (see
+        ``_main_grad_copy_runs``) instead of one cast kernel per parameter. Each main grad is a
+        view of its run's FP32 tensor. The conversion is exact, so the values are identical."""
+        runs = getattr(self, "_main_grad_runs", None)
+        if runs is None or any(
+            model_param.main_grad.untyped_storage().data_ptr() != storage
+            for model_param, _, _, _, storage in runs
+        ):
+            runs = [
+                (*run, run[0].main_grad.untyped_storage().data_ptr())
+                for run in self._main_grad_copy_runs()
+            ]
+            self._main_grad_runs = runs
+        for model_param, start, end, members, _ in runs:
+            grad = model_param.main_grad
+            if grad.dtype in (torch.bfloat16, torch.float16):
+                flat = upcast_storage_range_to_fp32(grad, start, end)
+            else:
+                flat = grad.as_strided((end - start,), (1,), start).float()
+            for shard_main_param, shard_start, numel in members:
+                shard_main_param.grad = flat[shard_start - start : shard_start - start + numel]
 
     def _copy_main_params_to_model_params(self):
         """
