@@ -124,6 +124,11 @@ class FsdpContext:
         )
 
     @property
+    def gradient_finalization_mode(self) -> GradientFinalizationMode:
+        """Active mode, controlled by ``finalize_gradients()``."""
+        return self._gradient_finalization_mode
+
+    @property
     def is_finalized(self) -> bool:
         """Whether construction has completed for this context."""
         return self._is_finalized

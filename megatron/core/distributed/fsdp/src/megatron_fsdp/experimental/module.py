@@ -230,6 +230,13 @@ class FsdpModule:
                 continue
             yield from group.fsdp_parameters
 
+    def _has_delayed_weight_gradients(self) -> bool:
+        """Whether any owned trainable parameter computes its gradient in backward_dw()."""
+        return any(
+            getattr(parameter.unsharded, "skip_backward_post_hook", False)
+            for parameter in self._trainable_fsdp_parameters()
+        )
+
     @staticmethod
     def _pre_load_state_dict(
         _module: nn.Module,
@@ -407,12 +414,9 @@ class FsdpModule:
             # A shared invocation may still be awaiting the final callback.
             return
         if (
-            self.context._gradient_finalization_mode
+            self.context.gradient_finalization_mode
             is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-            and any(
-                getattr(parameter.unsharded, "skip_backward_post_hook", False)
-                for parameter in self._trainable_fsdp_parameters()
-            )
+            and self._has_delayed_weight_gradients()
         ):
             raise RuntimeError(
                 "Delayed weight gradients require "
@@ -476,7 +480,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if context._gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
+                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
