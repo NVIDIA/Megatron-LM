@@ -1964,12 +1964,19 @@ class DynamicInferenceEngineTestBase:
         test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
         if test_config.start_suspended:
-            # Nothing weight-dependent may have run yet; the first resume() is what captures.
-            assert env.engine.state == EngineState.SUSPENDED
-            assert env.engine.capture_stats is None
-            assert not env.engine.context.is_tensor_state_allocated
-            env.engine.resume()
-            assert env.engine.state == EngineState.RUNNING
+            # Nothing weight-dependent may have run yet: the first resume() captures and enters
+            # gc_mode. The events match a pause() then suspend(), so pause/stop return before it.
+            engine = env.engine
+            assert engine.state == EngineState.SUSPENDED
+            assert engine.capture_stats is None
+            assert not engine.context.is_tensor_state_allocated
+            assert not engine._in_custom_gc_mode
+            assert not engine._state_events[EngineState.RUNNING].is_set()
+            assert engine._state_events[EngineState.PAUSED].is_set()
+            assert engine._state_events[EngineState.SUSPENDED].is_set()
+            engine.resume()
+            assert engine.state == EngineState.RUNNING
+            assert engine._in_custom_gc_mode == (test_config.gc_mode != "default")
 
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
@@ -4405,27 +4412,33 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "recompute"])
     @torch.inference_mode()
     def test_start_suspended(self, kv_cache_management_mode: str) -> None:
-        """Deferred capture happens on the first resume() and only there."""
-        env = self._run_test(
-            num_tokens_to_generate=16,
-            num_cuda_graphs=1,
-            force_build_cuda_graphs=True,
-            context_max_requests=128,
-            use_cuda_graphs_for_non_decode_steps=False,
-            kv_cache_management_mode=kv_cache_management_mode,
-            static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
-            start_suspended=True,
-        )
-        first_capture = env.engine.capture_stats
-        assert first_capture is not None
-        for request in env.requests:
-            assert request.status == Status.COMPLETED
+        """Deferred capture and gc_mode entry happen on the first resume() and only there."""
+        try:
+            env = self._run_test(
+                num_tokens_to_generate=16,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                use_cuda_graphs_for_non_decode_steps=False,
+                kv_cache_management_mode=kv_cache_management_mode,
+                static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
+                start_suspended=True,
+                gc_mode="freeze",
+            )
+            first_capture = env.engine.capture_stats
+            assert first_capture is not None
+            for request in env.requests:
+                assert request.status == Status.COMPLETED
 
-        # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
-        env.engine.suspend()
-        env.engine.resume()
-        kept = env.engine.capture_stats is first_capture
-        assert kept == (kv_cache_management_mode == "persist")
+            # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
+            env.engine.suspend()
+            assert not env.engine._in_custom_gc_mode
+            env.engine.resume()
+            assert env.engine._in_custom_gc_mode
+            kept = env.engine.capture_stats is first_capture
+            assert kept == (kv_cache_management_mode == "persist")
+        finally:
+            gc.unfreeze()
 
     @pytest.mark.internal
     @pytest.mark.skipif(

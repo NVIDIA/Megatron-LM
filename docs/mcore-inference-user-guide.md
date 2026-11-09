@@ -487,7 +487,7 @@ used fields:
 | `materialize_only_last_token_logits` | Set `False` when returning *prompt* log-probs |
 | `mamba_inference_state_config`, `mamba_memory_ratio` | Hybrid, Mamba, GDN, or GDP model state. The state config also carries the conv and SSM state dtypes |
 | `kv_cache_management_mode`, `unified_memory_level`, `static_kv_memory_pointers` | Suspend or resume memory handling (`persist` / `offload` / `recompute`). `static_kv_memory_pointers` keeps captured CUDA graphs valid across a suspend/resume cycle so they do not need recapture |
-| `start_suspended` | Construct the engine `SUSPENDED` instead of `RUNNING`, so it can be built before its weights are in place; the first `resume()` allocates the buffers and captures the CUDA graphs. Coordinator mode only. Refer to [Lifecycle Controls](#lifecycle-controls) |
+| `start_suspended` | Construct the engine `SUSPENDED` instead of `RUNNING`, so it can be built before its weights are in place; CUDA-graph capture waits for the first `resume()`, while the inference-state buffers are allocated at construction and follow `kv_cache_management_mode`. Coordinator mode only. Refer to [Lifecycle Controls](#lifecycle-controls) |
 | `offset_sampling_seed_by_dp_rank` | Give each DP rank a distinct sampling seed (default `True`), so the same prompt routed to different replicas produces different samples |
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
@@ -564,8 +564,10 @@ refit call itself.
 
 `InferenceConfig(start_suspended=True)` builds the engine in the `SUSPENDED`
 state. The coordinator, the engine loop, and the `serve()` frontends come up
-immediately and submitted requests are queued rather than failed, while buffer
-allocation and CUDA-graph capture wait for the first `resume()`. Use it when the
+immediately and submitted requests are queued rather than failed, while
+CUDA-graph capture waits for the first `resume()`. The inference-state buffers
+are allocated at construction and are then held or released according to
+`kv_cache_management_mode`, as after a regular `suspend()`. Use it when the
 weights the engine will run with are not in place at construction, for example
 an RL rollout engine that receives them through a refit:
 
@@ -579,13 +581,14 @@ llm = MegatronAsyncLLM(
 )
 await llm.serve(ServeConfig(port=5000), blocking=False)  # the endpoint answers from here on
 load_weights_in_place(model)                             # e.g. the first refit
-await llm.resume()                                       # allocate buffers, capture CUDA graphs
+await llm.resume()                                       # capture CUDA graphs
 await llm.unpause()                                      # start serving
 ```
 
 Call `resume()` and then `unpause()` once the weights are in place; until then
-submitted requests wait. Coordinator mode only: direct mode has no `resume()`,
-so `start_suspended` raises `ValueError` at `__init__`.
+submitted requests wait, and `pause()` and `shutdown()` behave as on a regularly
+suspended engine. Coordinator mode only: direct mode has no `resume()`, so
+`start_suspended` raises `ValueError` at `__init__`.
 
 ---
 

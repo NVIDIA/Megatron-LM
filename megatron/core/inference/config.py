@@ -574,9 +574,10 @@ class InferenceConfig:
 
     start_suspended: bool = False
     """
-    Construct the engine in the `SUSPENDED` state instead of `RUNNING`.
-    Allow for the engine to be constructed without model weights by deferring all such
-    functionality until after the first `resume()`.
+    Construct the engine in the `SUSPENDED` state instead of `RUNNING`, so it can be built
+    before its weights are in place. CUDA-graph capture waits for the first `resume()`.
+    The inference-state buffers are still allocated at construction and are then held or
+    released according to `kv_cache_management_mode`, as after a regular `suspend()`.
     """
 
     # =================================
