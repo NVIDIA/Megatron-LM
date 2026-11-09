@@ -2920,7 +2920,8 @@ class GTPWeightCache:
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
         Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays.
+        so every CUDA-graph ticket retains a stable address across replays. Other tickets keep
+        ``slot.buf`` too, except eager reduce-scatter outputs (see below).
         """
         slot = self._slots[ticket]
         if slot.buf is None:
@@ -2933,6 +2934,12 @@ class GTPWeightCache:
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
+        if slot.reduce_scatter:
+            # Another same-key ticket may pop this buffer for an async RS that stays pending
+            # until a later deferred add (MTP's repeated layer keeps one pending across a whole
+            # depth). Writing it through this ticket's kept reference would overwrite that
+            # result, so the next RS on this ticket checks a buffer out of the pool again.
+            slot.buf = None
 
     def clear(self):
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
