@@ -1109,6 +1109,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
         ctx = self._mctx(max_requests=1, rounder=1)
+        # setup_kv_transfer(role="prefill") enables transfer and handoff pinning.
+        ctx.kv_transfer_enabled = True
         ctx.kv_block_allocator.enable_handoff_pinning = True
         slot = ctx.mamba_metadata.allocate_slot()
         assert slot is not None
@@ -1139,6 +1141,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         as proof of a free recurrent-state slot; otherwise add_request raises.
         """
         ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        # setup_kv_transfer(role="decode") enables transfer without handoff pinning.
+        ctx.kv_transfer_enabled = True
         assert not ctx.kv_block_allocator.enable_handoff_pinning
         reserved_slots = [ctx.mamba_metadata.allocate_slot() for _ in range(ctx.max_requests)]
         assert None not in reserved_slots
@@ -1155,6 +1159,23 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         request_available, _, _ = ctx.check_availability(request)
 
         assert request_available
+
+    @pytest.mark.internal
+    def test_hybrid_admission_asserts_slot_per_row_without_kv_transfer(self):
+        """Without KV transfer, a free request row must imply a free recurrent-state slot."""
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        assert not ctx.kv_transfer_enabled
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+        for _ in range(ctx.max_requests):
+            assert ctx.mamba_metadata.allocate_slot() is not None
+
+        with pytest.raises(AssertionError, match="only KV transfer"):
+            ctx.check_availability(request)
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
