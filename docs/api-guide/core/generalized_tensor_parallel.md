@@ -440,6 +440,9 @@ it** — a different collective over a different process group, so enable either
   symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
+- **NVFP4 backward all-gather is not symmetric yet.** TE gathers NVFP4 columnwise (backward)
+  data into its own temporary buffers before reordering it, so that gather runs outside the
+  pool. The NVFP4 forward gather and the BF16/MXFP8 gathers use the pool.
 - **Pool allocator.** The GTP pools use a VMM allocator when available, falling back to
   `ncclMemAlloc`. Under `ag`, the DDP param buffer uses the same allocator choice when
   `--use-nccl-ub` is off; with `--use-nccl-ub` it keeps DDP's own NCCL pool, which is then
