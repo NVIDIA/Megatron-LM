@@ -480,6 +480,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
@@ -867,10 +869,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         logits, _ = self.output_layer(
             hidden_states,
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
+            output_dtype=torch.float32 if emit_fp32 else None,
             # The sequence-parallel gather above synchronized the TP group, as the output
             # layer's own input gather does otherwise, so the logits gather needs no barrier.
             inference_tp_ag_barrier=not sequence_parallel_override,
@@ -878,6 +883,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if in_inference_mode:
+            logits = logits.float()
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None

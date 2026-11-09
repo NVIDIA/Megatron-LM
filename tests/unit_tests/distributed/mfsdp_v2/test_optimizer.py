@@ -10,6 +10,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -43,7 +44,7 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(2026)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -70,7 +71,7 @@ def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
     mixed_precision_policy = MixedPrecisionPolicy(
         main_params_dtype=torch.float32, main_grads_dtype=torch.bfloat16
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model.fc1,
             mesh=mesh,
@@ -136,7 +137,7 @@ def test_next_forward_uses_optimizer_updated_weights(
     nn.init.ones_(model.weight)
     nn.init.zeros_(model.bias)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model,
             mesh=mesh,
@@ -170,7 +171,7 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
