@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# License for these changes: BSD-3-Clause.
 
 import logging
 import math
@@ -715,7 +716,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "gdp_norm_out", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
     "dsa_indexer_k", "dsa_selected_scores".
     default: ["core_attn"].
@@ -731,6 +732,8 @@ class TransformerConfig(ModelParallelConfig):
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
     "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
+    "gdp_norm_out": recompute GDP gated output normalization and layouts. Requires
+            gdp_in_proj, eager unquantized TP1/CP1, and no activation offloading or dynamic CP.
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
@@ -749,8 +752,9 @@ class TransformerConfig(ModelParallelConfig):
             instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
             sparse KL objective materializes these, so this has no effect without
             dsa_indexer_use_sparse_loss.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv",
+    "gdp_norm_out", "mhc", "shortcut_pre_mlp_layernorm", and "residual_stream" use
+    output-discarding checkpointing;
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
@@ -3136,6 +3140,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
+                    "gdp_norm_out",
                     "mhc",
                     "shortcut_pre_mlp_layernorm",
                     "residual_stream",
@@ -3147,6 +3152,21 @@ class TransformerConfig(ModelParallelConfig):
                 assert not invalid_modules, (
                     f"Invalid choices for recompute_modules: {invalid_modules}. "
                     f"Allowed modules are: {allowed_modules}"
+                )
+
+            if "gdp_norm_out" in self.recompute_modules and (
+                "gdp_in_proj" not in self.recompute_modules
+                or self.tensor_model_parallel_size != 1
+                or self.context_parallel_size != 1
+                or self.dynamic_context_parallel
+                or self.fp8
+                or self.fp4
+                or self.fine_grained_activation_offloading
+                or self.cuda_graph_impl not in (None, "none")
+            ):
+                raise ValueError(
+                    "gdp_norm_out requires gdp_in_proj, eager unquantized TP1/CP1, "
+                    "and no activation offloading or dynamic CP."
                 )
 
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:

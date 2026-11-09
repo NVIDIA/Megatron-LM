@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# License for these changes: BSD-3-Clause.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -354,6 +355,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             and "gdp_qkv" in self.config.recompute_modules
         )
 
+        self.recompute_norm_out = (
+            self.config.recompute_granularity == "selective"
+            and "gdp_norm_out" in self.config.recompute_modules
+        )
+        if self.recompute_norm_out and (
+            self.pg_collection.tp.size() != 1 or self.pg_collection.cp.size() != 1
+        ):
+            raise ValueError("gdp_norm_out requires singleton TP and CP process groups.")
+
         self.offload_gdp_qkv = (
             self.config.fine_grained_activation_offloading
             and "gdp_qkv" in self.config.offload_modules
@@ -534,6 +544,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
+    def supports_two_stage_attention(self) -> bool:
+        """Output-norm replay needs the atomic output-projection boundary."""
+        return not self.recompute_norm_out
+
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states,
@@ -542,6 +556,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """Run the training pre-attention and core-attention stage."""
+        if self.recompute_norm_out:
+            raise ValueError("gdp_norm_out requires the atomic GDP forward path.")
         return self._gdp_chunk_forward(
             hidden_states,
             packed_seq_params=packed_seq_params,
@@ -550,7 +566,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
     def forward_post_core_attn(self, y):
         """Apply GDP's output projection to a recurrence output."""
-        return self.out_proj(y)
+        output, bias = self.out_proj(y)
+        if self.recompute_norm_out and self.training and torch.is_grad_enabled():
+            # Restore the norm's gate first. Each bound hook retains the checkpoint
+            # for this microbatch even if another forward runs before backward.
+            self.norm_out_in_proj_checkpoint.discard_output_and_register_recompute(output)
+            self.norm_out_checkpoint.discard_output_and_register_recompute(output)
+        return output, bias
 
     def _make_headwise_cp_helper(
         self, cp_group: torch.distributed.ProcessGroup
@@ -668,6 +690,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             runtime_cp=runtime_cp,
         )
+        if (
+            self.recompute_norm_out
+            and self.training
+            and torch.is_grad_enabled()
+            and inference_context is None
+        ):
+            return self.forward_post_core_attn(y)
         return self.out_proj(y)
 
     def _packed_metadata(
@@ -818,16 +847,37 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         if self.recompute_qkv:
             qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
 
-        y = self._postprocess(
-            core_attn_out, z, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
+        recompute_norm_out = (
+            self.recompute_norm_out
+            and self.training
+            and torch.is_grad_enabled()
+            and conv_state is None
+            and ssm_state is None
         )
+        if recompute_norm_out:
+            if runtime_cp.group.size() != 1:
+                raise ValueError("gdp_norm_out requires singleton runtime CP.")
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            y = self.norm_out_checkpoint.checkpoint(
+                partial(
+                    self._postprocess, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
+                ),
+                core_attn_out,
+                z,
+            )
+        else:
+            y = self._postprocess(
+                core_attn_out, z, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
+            )
 
         # Commit the offload group downstream of core_attn_out: the commit node's
         # backward, which waits on the reload event, then runs before the recompute
         # hook on core_attn_out unpacks the saved conv input.
         y = qkv_manager.group_offload(y, forced_released_tensors=[])
 
-        if self.recompute_in_proj:
+        if recompute_norm_out:
+            self.norm_out_in_proj_checkpoint = in_proj_checkpoint
+        elif self.recompute_in_proj:
             # Hook on the mixer output so the recompute runs at the very start of this
             # mixer's backward: z is needed by the output norm, and VKQ is needed by the
             # causal conv backward or by the QKV recompute hook on core_attn_out, all of
