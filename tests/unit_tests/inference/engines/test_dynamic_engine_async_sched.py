@@ -1298,6 +1298,8 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         original_mtp_rewind = controller._run_async_sched_mtp_rewind
 
         def traced_mtp_rewind(sample_result):
+            # The original rewind waits for the asynchronous copy of the acceptance counts.
+            result = original_mtp_rewind(sample_result)
             counts = sample_result.accepted_counts_cpu_view
             decode_count = context.num_decode_requests
             if counts is not None and decode_count > 0:
@@ -1308,7 +1310,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                     (controller.num_speculative_tokens - accepted).sum()
                 )
             runtime["mtp-rewind-calls"] += 1
-            return original_mtp_rewind(sample_result)
+            return result
 
         controller._run_async_sched_mtp_rewind = traced_mtp_rewind
 

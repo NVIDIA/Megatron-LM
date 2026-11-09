@@ -1641,7 +1641,7 @@ class DynamicInferenceEngineTestBase:
 
     @classmethod
     @torch.inference_mode()
-    def _build_test_env(cls, test_config, engine_cls=DynamicInferenceEngine):
+    def _build_test_env(cls, test_config, engine_cls=None):
         clear_nvte_env_vars()
         set_rounder(4)
 
@@ -1956,6 +1956,8 @@ class DynamicInferenceEngineTestBase:
         delete_cuda_graphs()
 
         # Inference engine.
+        # Resolve the default at call time so real_engine's patch of this module applies.
+        engine_cls = engine_cls or DynamicInferenceEngine
         engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
