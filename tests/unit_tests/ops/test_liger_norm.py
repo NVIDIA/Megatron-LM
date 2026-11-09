@@ -11,6 +11,8 @@ import torch
 from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
 from megatron.core.models.backends import LocalSpecProvider, get_backend, get_backend_from_config
 from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
+from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 def _norm_type():
@@ -118,6 +120,7 @@ def test_norm_interface_and_checkpoint(zero_centered, sequence_parallel):
     norm = _norm_type()(config=config, hidden_size=128, eps=1e-6)
     assert norm.returns_residual is False
     assert norm.weight.sequence_parallel is sequence_parallel
+    assert norm.weight.is_rmsnorm_weight
     assert list(norm.state_dict()) == ["weight"]
     torch.testing.assert_close(
         norm.weight, torch.full_like(norm.weight, 0.0 if zero_centered else 1.0)
@@ -125,6 +128,32 @@ def test_norm_interface_and_checkpoint(zero_centered, sequence_parallel):
     restored = _norm_type()(config=config, hidden_size=128, eps=1e-6)
     restored.load_state_dict(norm.state_dict(), strict=True)
     torch.testing.assert_close(norm.weight, restored.weight)
+
+
+@pytest.mark.parametrize(
+    "multiplier,apply_wd_to_qk_layernorm,expected",
+    [(None, False, (0.0, 0.0)), (None, True, (0.0, 1.0)), (0.5, True, (0.5, 0.5))],
+)
+def test_rmsnorm_weight_decay_policy(monkeypatch, multiplier, apply_wd_to_qk_layernorm, expected):
+    norm_type = _norm_type()
+    model = torch.nn.Module()
+    model.input_layernorm = norm_type(config=_config(), hidden_size=4)
+    model.q_layernorm = norm_type(config=_config(), hidden_size=4)
+    config = OptimizerConfig(
+        lr=0.1,
+        rmsnorm_weight_decay_mult=multiplier,
+        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **_: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, keys, **_: output.__setitem__(0, keys),
+    )
+    groups = _get_param_groups([model], config, get_standard_config_overrides(config))
+    decay = {id(param): group["wd_mult"] for group in groups for param in group["params"]}
+    assert decay[id(model.input_layernorm.weight)] == expected[0]
+    assert decay[id(model.q_layernorm.weight)] == expected[1]
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
