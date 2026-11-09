@@ -28,13 +28,14 @@ reported apart. Not covered: blocks whose amax is below about ``2**-100``. There
 scale nears the E8M0 floor (``2**-127``) and elements fall below FP32's normal range, where a
 flush-to-zero implementation differs from the exact spec; hidden states never get there.
 
-Structure (FlashInfer ``invokeMxFP8Quantization``): 16 elements per thread, 4 threads per scale;
-the "two-load" kernel when ``Hp / 16`` is a multiple of 64 (``Hp % 1024 == 0``), else 128-thread
-blocks (2048 columns per pass); a grid-stride loop over rows (grid = min(rows, SMs x blocks per
-SM)). Inputs cover both kernels, column counts around 32, 1024 and 2048, rows around 128 (the
-swizzled layout's row tile), rows beyond one grid pass, production sizes (H = 2688, 4096,
-7168), and (opt-in ``large``) element offsets past 2**31. Hardware: Blackwell (FlashInfer's
-quantizer is SM100-only).
+Structure (FlashInfer 0.7.2.post1 ``invokeMxFP8Quantization``): 16 elements per thread, 2 threads
+per scale; 128-thread blocks (2048 columns per pass) and a grid-stride loop over rows (grid =
+min(rows, 16 blocks per SM)). The "two-load" variant (``Hp % 1024 == 0``) is selected only on
+devices with at most 1024 resident threads per SM (SM107), not on GB200; the 1024/2048 widths
+stay as boundaries of the 2048-column pass. Inputs cover column counts around 32, 1024 and 2048,
+rows around 128 (the swizzled layout's row tile), rows beyond one grid pass, production sizes
+(H = 2688, 4096, 7168), and (opt-in ``large``) element offsets past 2**31. Hardware: Blackwell
+(FlashInfer's quantizer is SM100-only).
 """
 
 import pytest
