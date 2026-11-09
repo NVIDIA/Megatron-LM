@@ -890,10 +890,12 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         h_res = torch.randn(8, 2, 4, 4, requires_grad=True)
         h_post = torch.randn(8, 2, 4, requires_grad=True)
         router_output = [torch.randn(8, 2, 32), torch.randn(16, 4)]
-        captured = layer._pack_mlp_cuda_graph_state(router_output, residual, (h_res, h_post))
-        replay_residual, (replay_h_res, replay_h_post) = layer._unpack_mlp_cuda_graph_state(
-            captured
+        captured = layer._pack_mlp_cuda_graph_state(
+            router_output, residual, (residual, h_res, h_post)
         )
+        replay_residual, replay_state = layer._unpack_mlp_cuda_graph_state(captured)
+        state_residual, replay_h_res, replay_h_post = replay_state
+        assert state_residual is replay_residual
         assert all(actual is expected for actual, expected in zip(captured, router_output))
         (replay_residual.sum() + replay_h_res.sum() + replay_h_post.sum()).backward()
         assert residual.grad is not None and h_res.grad is not None and h_post.grad is not None

@@ -27,14 +27,18 @@ DeepEP), and torch ops with a non-deterministic accumulation (``scatter_add_``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 # PR label that lets a kernel change merge without touching its determinism test
 # (refactors, comment-only edits). Maintainers create it once in the repository.
 EXEMPT_LABEL = "determinism-exempt"
 
-# Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
+# Directories whose every ``.py`` file must be registered, except ``__init__.py`` and a deprecated
+# import path left by a move, which only forwards to the module that now holds the kernel.
+# ``megatron/core/ops`` is not one: its families keep operation modules (such as the norm
+# modules) beside their kernels. Its kernel files are registered below by path, and new ones are
+# found by ``KERNEL_CONTENT_PATTERNS``.
 KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
@@ -128,10 +132,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
+        tests=(
+            K + "test_fused_activations.py",
+            R + 'test_activation_replay.py',
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
-        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients. "
+        "Direct marker calls replay values and gradients in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="fused_bias_gelu",
@@ -157,7 +166,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
-            "megatron/core/transformer/torch_norm.py",
+            "megatron/core/ops/norm/torch_norm.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
@@ -177,7 +186,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
-        sources=("megatron/core/fusions/fused_cross_entropy.py",),
+        sources=("megatron/core/ops/loss/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
@@ -257,7 +266,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/fusions/test_fused_mhc_kernels.py",
+        ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
@@ -272,7 +284,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="fused_layer_norm",
-        sources=("megatron/core/fusions/fused_layer_norm.py",),
+        sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="cuda-ext",
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
@@ -301,7 +313,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
-        sources=("megatron/core/tensor_parallel/cross_entropy.py",),
+        sources=("megatron/core/ops/loss/cross_entropy.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="torch-op",
     ),
@@ -370,7 +382,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
+        "the default atomic branch is a negative control.",
     ),
     KernelEntry(
         name="mok_route_adapter",
@@ -398,9 +412,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            "tests/unit_tests/transformer/moe/test_aux_loss.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
+        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
@@ -1009,6 +1026,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
+    KernelEntry(
+        name="dsa_triton_inference",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
+        ),
+        kind="triton",
+        training_path=False,
+        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
+        "Native DSA decode does not support deterministic mode and rejects it before top-k "
+        "execution; this path has no bit-exact replay guarantee.",
+        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
+        "numerical parity coverage in "
+        "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
+        "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

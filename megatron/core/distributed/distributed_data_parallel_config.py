@@ -17,7 +17,11 @@ class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
-    """If true, reduce grads in fp32."""
+    """If true, accumulate and reduce grads in fp32 with DDP. With Megatron-FSDP,
+    explicitly set megatron_fsdp_main_grads_dtype to torch.float32 and
+    megatron_fsdp_grad_comm_dtype to torch.float32 or None (inherit main grads).
+    This flag validates those MFSDP settings; it does not override them.
+    """
 
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
@@ -344,6 +348,22 @@ class DistributedDataParallelConfig:
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
+                )
+        if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
+            if self.megatron_fsdp_main_grads_dtype != torch.float32:
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_main_grads_dtype=torch.float32 for FP32 accumulation. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
+                )
+            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
+                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
