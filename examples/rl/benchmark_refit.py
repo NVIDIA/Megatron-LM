@@ -37,7 +37,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.config import PosttrainConfigContainer, RLConfig, RunConfigRecord
+from megatron.training.config import AlgorithmConfigContainer, RLConfig, RunConfigRecord
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import is_hybrid_model
@@ -186,7 +186,7 @@ def print_results(timings):
         max_time = max(timings)
 
         result = {
-            'backend': cfg.posttrain.rl.refit_method,
+            'backend': cfg.algorithm.rl.refit_method,
             'mode': args.refit_mode,
             'world_size': torch.distributed.get_world_size(),
             'source_tp': args.tensor_model_parallel_size,
@@ -288,10 +288,10 @@ def benchmark_collocated():
     torch.distributed.barrier()
 
     # Create refit service
-    print_rank_0(f"Creating {cfg.posttrain.rl.refit_method} service...")
+    print_rank_0(f"Creating {cfg.algorithm.rl.refit_method} service...")
     refit_service = create_refit_service(
-        cfg.posttrain.rl.refit_method,
-        execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
+        cfg.algorithm.rl.refit_method,
+        execution_batch_bytes=cfg.algorithm.rl.refit_execution_batch_bytes,
     )
     print_rank_0("Service created.\n")
 
@@ -302,7 +302,7 @@ def benchmark_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
-            execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
+            execution_batch_bytes=cfg.algorithm.rl.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:
@@ -330,7 +330,7 @@ def benchmark_non_collocated():
     dst_world = dst_tp * dst_pp * dst_ep
 
     required_size = src_world + dst_world
-    if cfg.posttrain.rl.refit_method == 'nccl_m2n' and world_size != required_size:
+    if cfg.algorithm.rl.refit_method == 'nccl_m2n' and world_size != required_size:
         raise ValueError(
             f"NCCL M2N requires exactly {required_size} source and destination GPUs, "
             f"got {world_size}"
@@ -404,10 +404,10 @@ def benchmark_non_collocated():
     torch.distributed.barrier()
 
     # Create refit service
-    print_rank_0(f"Creating {cfg.posttrain.rl.refit_method} service...")
+    print_rank_0(f"Creating {cfg.algorithm.rl.refit_method} service...")
     refit_service = create_refit_service(
-        cfg.posttrain.rl.refit_method,
-        execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
+        cfg.algorithm.rl.refit_method,
+        execution_batch_bytes=cfg.algorithm.rl.refit_execution_batch_bytes,
     )
     print_rank_0("Service created.\n")
 
@@ -418,7 +418,7 @@ def benchmark_non_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
-            execution_batch_bytes=cfg.posttrain.rl.refit_execution_batch_bytes,
+            execution_batch_bytes=cfg.algorithm.rl.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:
@@ -440,7 +440,7 @@ def main():
         ignore_unknown_args=False,
     )
     # The RL run config, composed as train_rl.py composes it:
-    # the pretrain sections (the benchmark builds its models so they carry no model config),
+    # the training sections (the benchmark builds its models so they carry no model config),
     # the destination deployment described like the RL loop's rollout engine, and the RL section.
     pretrain_container = pretrain_cfg_container_from_args(args)
     set_run_config(pretrain_container)
@@ -448,11 +448,11 @@ def main():
         hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
     )
     record = RunConfigRecord(
-        pretrain=pretrain_container,
+        training=pretrain_container,
         inference=rollout_inference_container_from_args(
             args, pretrain_container, model_cfg=model_cfg
         ),
-        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
     finalize_rl_run(record)
     set_rl_run_config(record)
@@ -463,7 +463,7 @@ def main():
     args = get_args()
     cfg = get_rl_run_config()
 
-    if cfg.posttrain.rl.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
+    if cfg.algorithm.rl.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
         raise ValueError("NCCL M2N supports only non-collocated refit")
 
     # Set default vocab size if not provided (the tokenizer section is the run config's)

@@ -17,10 +17,10 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
-    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -73,11 +73,11 @@ def _set_minimal_args():
     set_global_variables(args, pretrain, build_tokenizer=False)
     set_rl_run_config(
         RunConfigRecord(
-            pretrain=pretrain,
+            training=pretrain,
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
-            posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+            algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
         )
     )
 

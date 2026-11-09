@@ -69,10 +69,10 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.callbacks import CallbackContext
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
-    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
 )
@@ -90,11 +90,11 @@ VOCAB = 768
 def _rl_run_config(args, pretrain):
     """The RL run's record for a colocated run whose engine shares the training model."""
     return RunConfigRecord(
-        pretrain=pretrain,
+        training=pretrain,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
-        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
 
 
@@ -825,10 +825,10 @@ class TestRLUtils:
         pretrain = pretrain_cfg_container_from_args(args)
         rl_run = _rl_run_config(args, pretrain)
         assert not pretrain.ddp.grad_buffer_offload
-        rl_run.posttrain.rl.rl_offload_optimizer_during_inference = False
+        rl_run.algorithm.rl.rl_offload_optimizer_during_inference = False
         validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
-        rl_run.posttrain.rl.rl_offload_optimizer_during_inference = True
+        rl_run.algorithm.rl.rl_offload_optimizer_during_inference = True
         validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
         finalize_rl_run(rl_run)
