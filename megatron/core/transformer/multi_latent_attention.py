@@ -90,6 +90,16 @@ if HAVE_TE:
     except ImportError:
         # Older TE lacks the fused MLA key/value split + RoPE + MXFP8 quantize kernel.
         fused_mla_kv_rope_mxfp8 = None
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            fused_mla_q_rope_backward_,
+            fused_mla_q_rope_mxfp8,
+        )
+    except ImportError:
+        # Older TE lacks the query RoPE + MXFP8 kernel and the kernels writing the attention
+        # scale layout (fused_mla_kv_rope_mxfp8's transpose_swizzle_scales).
+        fused_mla_q_rope_mxfp8 = None
+        fused_mla_q_rope_backward_ = None
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
@@ -116,10 +126,12 @@ else:
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
         fused_mla_kv_rope_mxfp8,
+        fused_mla_q_rope_mxfp8,
+        fused_mla_q_rope_backward_,
         FP8GlobalStateManager,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None,) * 17
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -166,9 +178,18 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim):
-        """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
-        key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
+    def forward(
+        ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, transpose_swizzle_scales=False
+    ):
+        """Split kv, apply RoPE to k_pos_emb and quantize key and value. With
+        transpose_swizzle_scales, the scales are written in attention's layout (as
+        mxfp8_transpose_swizzle would leave them)."""
+        if transpose_swizzle_scales:
+            key, value = fused_mla_kv_rope_mxfp8(
+                kv, k_pos_emb, cos, sin, v_dim, transpose_swizzle_scales=True
+            )
+        else:
+            key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
         ctx.save_for_backward(cos, sin)
         ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
         ctx.cu_seqlens_kv, ctx.cp_rank, ctx.cp_size = None, 0, 1
@@ -179,7 +200,30 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     def backward(ctx, dk, dv):
         """Attention returns bf16 key and value gradients"""
         d_kv, d_emb = _FusedMLARoPEKVSplit.backward(ctx, dk, dv)[:2]
-        return d_kv, d_emb, None, None, None, None, None
+        return d_kv, d_emb, None, None, None, None, None, None
+
+
+class _FusedQRoPEQuantForFusedAttn(torch.autograd.Function):
+    """Apply RoPE to the query and quantize it to MXFP8 in one TE kernel, with the scales in
+    attention's layout.
+
+    The output is that of _QuantizeQueryForFusedAttn(fused_apply_mla_rope_for_q(q)) after
+    mxfp8_transpose_swizzle. The backward is the query RoPE backward of
+    fused_apply_mla_rope_for_q (same BF16 operations), in place on the query gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, q, cos, sin):
+        """Apply RoPE to the query and quantize it"""
+        query = fused_mla_q_rope_mxfp8(q, cos, sin)
+        ctx.save_for_backward(cos, sin)
+        return query
+
+    @staticmethod
+    def backward(ctx, dq):
+        """Attention returns a bf16 query gradient"""
+        cos, sin = ctx.saved_tensors
+        return fused_mla_q_rope_backward_(dq.contiguous(), cos, sin), None, None
 
 
 def _is_mxfp8_attention_active() -> bool:
@@ -328,6 +372,15 @@ class MultiLatentAttention(Attention):
             and self.config.qk_head_dim == 128
             and self.config.qk_pos_emb_head_dim == 64
             and self.config.v_head_dim == 128
+        )
+        # On top of the key/value kernel: the query RoPE and quantization in one TE kernel, and
+        # both kernels writing the scales in attention's layout (no separate scale permute and
+        # swizzle).
+        self._use_fused_qkv_rope_quant = (
+            self._use_fused_kv_rope_quant
+            and getattr(self.config, "use_fused_mla_qkv_rope_quant", False)
+            and fused_mla_q_rope_mxfp8 is not None
+            and self.config.qk_head_dim + self.config.qk_pos_emb_head_dim == 192
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
@@ -1126,6 +1179,31 @@ class MLASelfAttention(MultiLatentAttention):
                 and k_pos_emb.dtype == torch.bfloat16
                 and _is_mxfp8_attention_active()
             )
+            use_fused_qkv_rope_quant = (
+                use_fused_kv_rope_quant
+                and self._use_fused_qkv_rope_quant
+                and not use_fused_q_uproj
+                and q.dtype == torch.bfloat16
+                and rotary_pos_cos.dtype == torch.bfloat16
+                and rotary_pos_sin.dtype == torch.bfloat16
+            )
+            if use_fused_qkv_rope_quant:
+                # One kernel each for q and for k/v: RoPE, MXFP8 quantization and the scales in
+                # attention's layout. Same MXFP8 q/k/v as the branch below.
+                quantized_query = _FusedQRoPEQuantForFusedAttn.apply(
+                    q, rotary_pos_cos, rotary_pos_sin
+                )
+                key, value = _FusedKVRoPEQuantForFusedAttn.apply(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                    True,
+                )
+                return quantized_query, key, value
             if use_fused_kv_rope_quant:
                 # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
                 # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.

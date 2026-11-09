@@ -5086,6 +5086,16 @@ class MLATransformerConfig(TransformerConfig):
     above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
     NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
 
+    use_fused_mla_qkv_rope_quant: bool = False
+    """With use_fused_mla_kv_rope_quant: also apply RoPE to the query and quantize it in one
+    Transformer Engine kernel, and have the query and key/value kernels write the MXFP8 scales in
+    the layout attention consumes (BHSD-permuted, GEMM-swizzled), so that the separate scale
+    permute and swizzle (mxfp8_transpose_swizzle) does not run. The query RoPE backward is a TE
+    kernel with the same BF16 operations as the Triton one. Bitwise identical. Requires
+    use_fused_mla_kv_rope_quant=True, BF16 RoPE tables and a sequence length that is a multiple of
+    128 (otherwise the use_fused_mla_kv_rope_quant path runs); not combined with
+    use_fused_mla_q_uproj, whose query is already quantized."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -5190,6 +5200,12 @@ class MLATransformerConfig(TransformerConfig):
                 "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
                 "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
                 "dropout."
+            )
+
+        if self.use_fused_mla_qkv_rope_quant and not self.use_fused_mla_kv_rope_quant:
+            raise ValueError(
+                "use_fused_mla_qkv_rope_quant extends use_fused_mla_kv_rope_quant and requires "
+                "use_fused_mla_kv_rope_quant=True."
             )
 
         if self.attention_output_gate:
