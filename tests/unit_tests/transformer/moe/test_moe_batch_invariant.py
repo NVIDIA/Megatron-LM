@@ -372,6 +372,7 @@ def test_te_grouped_linear_grouped_tensor_path_matches_legacy_kernels(
     from transformer_engine.pytorch.module.grouped_linear import (
         is_module_grouped_tensor_path_supported,
     )
+    from transformer_engine.pytorch.tensor import GroupedTensorStorage
 
     from megatron.core.extensions.transformer_engine import (
         _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
@@ -390,6 +391,12 @@ def test_te_grouped_linear_grouped_tensor_path_matches_legacy_kernels(
     splits = options.pop("splits")
     bias = options.pop("bias", False)
     fused_wgrad = options.get("gradient_accumulation_fusion", False)
+    single = options.get("moe_single_grouped_weight", False)
+    single_bias = options.get("moe_single_grouped_bias", False)
+    if single:
+        # TE ignores single_grouped_weight/bias (falling back to per-expert parameters,
+        # with a warning) unless this variable is set.
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     E, k, n, total = len(splits), 512, 256, sum(splits)
     config = TransformerConfig(
         num_layers=1,
@@ -424,13 +431,23 @@ def test_te_grouped_linear_grouped_tensor_path_matches_legacy_kernels(
         skip_bias_add=False,
         is_expert=True,
     ).cuda()
-    single = options.get("moe_single_grouped_weight", False)
-    weight_params = [module.weight] if single else [getattr(module, f"weight{i}") for i in range(E)]
+    # The module holds the parameter layout the variant names.
+    assert module.single_grouped_weight == single
+    assert module.single_grouped_bias == single_bias
+    if single:
+        assert isinstance(module.weight, GroupedTensorStorage)
+        assert all(getattr(module, f"weight{i}") is None for i in range(E))
+        weight_params = [module.weight]
+    else:
+        weight_params = [getattr(module, f"weight{i}") for i in range(E)]
+    if single_bias:
+        assert isinstance(module.bias, GroupedTensorStorage)
+        assert all(getattr(module, f"bias{i}") is None for i in range(E))
     torch.manual_seed(3)
     if bias:
         bias_values = (torch.randn(E, n, device="cuda") * 0.1).to(torch.bfloat16)
         with torch.no_grad():
-            if options.get("moe_single_grouped_bias", False):
+            if single_bias:
                 _param_data(module.bias).view(E, n).copy_(bias_values)
             else:
                 for i in range(E):
@@ -451,11 +468,26 @@ def test_te_grouped_linear_grouped_tensor_path_matches_legacy_kernels(
         expected_out = expected_out + bias_values[groups]
     _forbid_te_grouped_gemms(monkeypatch)
     calls = _count_deepgemm_grouped_gemms(monkeypatch)
+    # Record which GroupedTensor operands the adapter unpacks.
+    roles = []
+
+    def grouped_tensor_data(t, role, *args, _orig=bik._grouped_tensor_data, **kwargs):
+        roles.append(role)
+        return _orig(t, role, *args, **kwargs)
+
+    monkeypatch.setattr(bik, "_grouped_tensor_data", grouped_tensor_data)
     x_i = x.clone().requires_grad_(True)
     with set_batch_invariant_mode(True, backend=backend):
         out, _ = module(x_i, torch.tensor(splits, device="cuda", dtype=torch.int64))
         out.backward(dy)
     assert calls["m_grouped"] >= 2 and calls["k_grouped"] >= 1, calls
+    # A single grouped weight reaches the adapter as a GroupedTensor in forward and dgrad,
+    # and its gradient (or fp32 main_grad) as a GroupedTensor in wgrad; discrete weights
+    # and their gradients reach it as lists.
+    if single:
+        assert roles.count("weight") == 2 and roles.count("weight gradient") == 1, roles
+    else:
+        assert "weight" not in roles and "weight gradient" not in roles, roles
     assert torch.equal(out, expected_out)
     assert torch.equal(x_i.grad, expected_dx)
     if fused_wgrad:
