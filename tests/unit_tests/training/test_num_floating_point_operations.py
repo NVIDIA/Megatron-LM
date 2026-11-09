@@ -14,6 +14,7 @@ from megatron.training.training import num_floating_point_operations
 def _make_config(transformer_cls=TransformerConfig, **overrides):
     kwargs = dict(
         attention_output_gate=True,
+        deterministic_mode=False,
         experimental_attention_variant="gdn",
         ffn_hidden_size=16,
         hidden_size=8,

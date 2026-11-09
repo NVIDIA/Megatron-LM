@@ -1199,6 +1199,8 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_suppo
         moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
         moe_aux_loss_coeff=0 if quantile else 1e-4,
         moe_router_fusion=mode in ("fused", "hash-fused"),
+        # The installed TE may lack deterministic fused aux loss; not under test here.
+        deterministic_mode=False,
         moe_num_hash_layers=int(hash_routing),
         hash_moe_vocab_size=512 if hash_routing else None,
     )

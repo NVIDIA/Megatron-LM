@@ -1326,6 +1326,7 @@ def test_dataset_helpers_use_registered_model(
         tensor_model_parallel_size=2,
         sequence_parallel=True,
         context_parallel_size=2,
+        deterministic_mode=False,
         dynamic_context_parallel=sequence_packing_scheduler == "default_dynamic_cp",
         sequence_packing_scheduler=sequence_packing_scheduler,
         max_seqlen_per_dp_cp_rank=32,
