@@ -259,13 +259,16 @@ def test_te_linear_dispatch(backend, monkeypatch):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_tn_rows_do_not_depend_on_tokens(backend):
-    """Five probe rows of B among 5 ... 4096 tokens (start, odd middle offset, end), K = N = 4096:
-    the same TN bits everywhere. Fails on main for deepgemm (#8867)."""
+    """Five probe rows of B among 5 ... 8192 tokens (start, odd middle offset, end), K = N = 4096:
+    the same TN bits everywhere. Fails on main for deepgemm (#8867): at the pin DeepGEMM forwards
+    to cuBLASLt's heuristic algorithm, which on H100 changes between M = 15 and M = 8192 at this
+    shape (`test_deepgemm_dense.py`, pdx 7986825). Up to 4096 tokens it did not (pdx 7986825), so
+    8192 is in the list."""
     a = bf16((4096, 4096), 11, scale=1 / 64)
-    probe, filler = bf16((5, 4096), 12), bf16((4096, 4096), 13)
+    probe, filler = bf16((5, 4096), 12), bf16((8192, 4096), 13)
     with torch.no_grad(), bi_mode(backend):
         base = te_gemm(a, probe, out_dtype=torch.bfloat16, layout="TN")[0]
-        for tokens in (5, 6, 129, 1000, 4096):
+        for tokens in (5, 6, 15, 129, 1000, 4096, 8192):
             for start in sorted({0, min((tokens - 5) // 2 | 1, tokens - 5), tokens - 5}):
                 b = filler[:tokens].clone()
                 b[start : start + 5] = probe

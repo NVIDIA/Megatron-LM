@@ -303,15 +303,17 @@ def _probe_rows_equal(fn, probe, filler, sizes, what):
 
 
 def check_rows_do_not_depend_on_tokens(kind, backend):
-    """TP 1: four probe tokens among 4 ... 4096 tokens give the same bits."""
+    """TP 1: four probe tokens among 4 ... 8192 tokens give the same bits. 8192 tokens is where
+    cuBLASLt, which DeepGEMM forwards to on main, changes algorithm at K = N = 4096 on H100
+    (`test_deepgemm_dense.py`, pdx 7986825); up to 4096 it did not."""
     config = make_config(1, 4096)
     layer, _, _ = build(kind, config, 4096, 4096)
-    probe, filler = cpu_bf16((4, 1, 4096), seed=21), cpu_bf16((4096, 1, 4096), seed=22)
+    probe, filler = cpu_bf16((4, 1, 4096), seed=21), cpu_bf16((8192, 1, 4096), seed=22)
     _probe_rows_equal(
         lambda x: run_layer(layer, x, backend),
         probe,
         filler,
-        (4, 5, 33, 1000, 4096),
+        (4, 5, 15, 33, 1000, 4096, 8192),
         f"{kind} {backend}",
     )
 

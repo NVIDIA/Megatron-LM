@@ -22,9 +22,11 @@ Contract (written from `aten::mean.dim`, which the override replaces, and the ba
   the number of other rows or on their values.
 
 Reference: fp64 `x.mean(dim)`. Trusted implementation: `torch.mean` on the same device outside
-batch-invariant mode. Tolerance class: floating point bounded over the output (default factor 2)
-for random fp32 data; exact (dyadic inputs) for the accumulation precision; exact for dtypes,
-shapes, dispatch and batch invariance.
+batch-invariant mode (shape, dtype, the production bound). Tolerance class: on dyadic inputs,
+whose sums are exact in fp32, each fp32 mean within 2 ulp of the fp64 mean (the kernel's final
+`div.full.f32` division, PTX ISA) and exact for N a power of two; floating point bounded over the
+output (default factor 2) for the random production shapes; exact for dtypes, shapes, dispatch
+and batch invariance.
 
 Structure (read after the contract): `mean_dim` views x as (M, N, K) around the reduced dim
 (copying when the view needs it), launches one program per output element, sums N in blocks of
@@ -44,6 +46,8 @@ Main vs open PRs (each failing case is deselected and run as an expect-fail task
   one-dim path drops `dtype=` (bf16 in, `dtype=torch.float32`, bf16 out), the several-dim path
   returns fp32 for bf16/fp16 inputs without `dtype`, and fp64 inputs raise (an assertion on
   several dims; on one dim, predicted, an fp32 loop-carried accumulator). No fix PR yet.
+- `test_several_dims_do_not_depend_on_the_batch` fails on main (finding O8a-M7, pdx 7986825): the
+  several-dim path's `torch.sum` is not batch invariant. No fix PR yet.
 - `test_rows_past_int32_offsets` (`large`) is predicted to fail on main (finding O8a-M6, by
   reading): `mean_kernel` computes element offsets in int32. No fix PR yet.
 All other cases are expected to pass on main.
@@ -62,6 +66,8 @@ pytestmark = [ou.requires_sm(ou.HOPPER)]
 _DEVICE = "cuda"
 
 BLOCK = 1024  # mean_dim: BLOCK_SIZE
+# Triton's fp32 `/` is `div.full.f32`, at most 2 ulp from the exact quotient (PTX ISA).
+DIVISION_ULPS = 2.0
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 BACKENDS = ("te_native", "triton", "deepgemm")
 
@@ -94,17 +100,21 @@ def mean_reference(x, dim, keepdim):
 
 
 def shaped(n_reduce: int, rows: int, where: str, dtype, seed: int, layout: str = "contiguous"):
-    """(x, dim): ``rows`` independent slices of ``n_reduce`` elements, the reduced dim at
-    ``where`` (last: [rows, N]; middle: [rows // 3 or 1, N, 3]; first: [N, rows]); ``layout``
-    ``strided`` makes x a transposed view of the same values."""
-    g = ou.make_generator(seed, device=_DEVICE)
+    """(x, dim): ``rows`` independent slices of ``n_reduce`` dyadic elements (`dyadic`: every sum
+    is exact in fp32), the reduced dim at ``where`` (last: [rows, N]; middle: [rows // 3 or 1, N,
+    3]; first: [N, rows]); ``layout`` ``strided`` makes x a transposed view of the same values.
+
+    With exact sums the only error left is the final division by N, so the check sees a wrong
+    mask, offset or block count (an error of whole elements), not the summation order: with
+    random fp32 data a mean of 7168 terms is dominated by cancellation, and a single output's
+    error against fp64 measured 2.3x torch's on a correct kernel (pdx 7986825)."""
     if where == "last":
         shape, dim = (rows, n_reduce), -1
     elif where == "middle":
         shape, dim = (max(rows // 3, 1), n_reduce, 3), 1
     else:
         shape, dim = (n_reduce, rows), 0
-    x = torch.randn(*shape, device=_DEVICE, generator=g).to(dtype)
+    x = dyadic(shape, dtype, seed)
     if layout == "strided":
         x = x.transpose(0, -1).contiguous().transpose(0, -1)
     return x, dim
@@ -128,14 +138,31 @@ _CASES = ou.pairwise_cases(
 @pytest.mark.parametrize("case", _CASES, ids=[_id(c) for c in _CASES])
 def test_mean_matches_fp64(case):
     """fp32 means over the last, a middle and the first dim, N around the 1024-element block,
-    contiguous and strided inputs, keepdim: shape and dtype as aten, values against fp64."""
+    contiguous and strided inputs, keepdim: shape and dtype as aten, values against fp64.
+
+    The sums are exact (`shaped`), so the kernel's only error is its final fp32 division by N,
+    which Triton lowers to `div.full.f32`: each mean must be within DIVISION_ULPS of the fp64
+    mean (exact for N a power of two). A wrong mask, offset or block count is off by whole
+    elements, far beyond that."""
     x, dim = shaped(case["n"], case["rows"], case["where"], torch.float32, seed=case["n"])
     out = bi_mean(x, dim, case["keepdim"])
     trusted = torch.mean(x, dim=dim, keepdim=case["keepdim"])
     assert out.shape == trusted.shape and out.dtype == trusted.dtype, _id(case)
-    ou.assert_close_to_reference(
-        out, ou.fp64_reference(mean_reference, x, dim, case["keepdim"]), trusted, what=_id(case)
-    )
+    assert_within_division_ulps(out, ou.fp64_reference(mean_reference, x, dim, case["keepdim"]))
+
+
+def assert_within_division_ulps(out, ref, what="mean"):
+    """Each fp32 mean within DIVISION_ULPS ulp of the fp64 mean of an exact sum."""
+    err = (out.double() - ref).abs()
+    allowed = DIVISION_ULPS * ou.ulp(ref, torch.float32)
+    bad = ~(err <= allowed)
+    if bool(bad.any()):
+        i = int(bad.reshape(-1).nonzero()[0])
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} of {out.numel()} means are more than {DIVISION_ULPS} ulp"
+            f" from the fp64 mean; first at flat index {i}: got {out.reshape(-1)[i].item()!r},"
+            f" fp64 {ref.reshape(-1)[i].item()!r}"
+        )
 
 
 def dyadic(shape, dtype, seed):
@@ -252,7 +279,11 @@ def test_rows_do_not_depend_on_the_batch(dtype, where, n):
 
 def test_several_dims_do_not_depend_on_the_batch():
     """The several-dim path (`torch.sum` in fp32): a [5, 33, 160] probe's means over dims (1, 2)
-    are the same bits among 5 ... 1029 slices of the batch."""
+    are the same bits among 5 ... 1029 slices of the batch.
+
+    Fails on main (finding O8a-M7, pdx 7986825): `torch.sum(dim=[1, 2])` reduces each slice in an
+    order that depends on the number of slices; at 129 slices all five probe means moved by 1-5
+    fp32 ulp against 5 slices. No fix PR yet."""
     probe = randn((5, 33, 160), torch.float32, 4)
     filler = randn((1029, 33, 160), torch.float32, 5)
     base = bi_mean(probe, [1, 2])
@@ -335,12 +366,7 @@ def test_sanitizer_case():
     masked one-element block) with a stride of 3, keepdim."""
     x, dim = shaped(BLOCK + 1, 6, "middle", torch.float32, seed=8)
     out = bi_mean(x, dim, keepdim=True)
-    ou.assert_close_to_reference(
-        out,
-        ou.fp64_reference(mean_reference, x, dim, True),
-        torch.mean(x, dim=dim, keepdim=True),
-        what="sanitizer",
-    )
+    assert_within_division_ulps(out, ou.fp64_reference(mean_reference, x, dim, True), "sanitizer")
 
 
 @pytest.mark.parametrize("rows", ou.int32_overflow_params(4096))

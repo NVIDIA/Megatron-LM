@@ -674,7 +674,8 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
                 for layer in block.layers:
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, pool=pool):
-                        h, _ = layer(hidden_states=h, attention_mask=None)
+                        # hidden_states is positional-only since #8523.
+                        h, _ = layer(h, attention_mask=None)
                     graphs.append(graph)
                     captured.append(graph)
                     outs.append(h)
@@ -740,7 +741,7 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
     replayed from per-layer graphs, or from block graphs) the decoder's output is its input.
     The decoder's final norm is removed so its output is the stream; hooks on the embedding
     (which also NaN-poisons the buffer) and the output layer, which run eagerly around graphed
-    decoders, compare the two. With `full_iteration_capacity` the buffer holds 64 tokens, so the
+    decoders, compare the two on the step's active tokens (padding rows are unspecified). With `full_iteration_capacity` the buffer holds 64 tokens, so the
     small (decode) graphs fuse and the larger (mixed) ones do not (fails on main, #8561).
 
     The graphed cases (`local`, `full_iteration`, `full_iteration_capacity`) fail on main before
@@ -805,8 +806,15 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
     def before_output_layer(module, args):
         if torch.cuda.is_current_stream_capturing() or not inputs:
             return
+        # Only the step's active tokens: the rows that pad the step to its token bucket (and
+        # this rank's sequence-parallel shard of them) carry unspecified attention outputs, and
+        # a zero projection maps a non-finite one to NaN (pdx 7986825: rank 1's padding rows).
+        out, expected = args[0], inputs.pop()
+        local = out.shape[0]
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        live = min(max(context.active_token_count - rank * local, 0), local)
         _check_exact(
-            args[0], inputs.pop(), f"decoder output, forward {counts['forwards']}", problems
+            out[:live], expected[:live], f"decoder output, forward {counts['forwards']}", problems
         )
         counts["forwards"] += 1
 
@@ -913,8 +921,11 @@ def test_mtp_inner_layer_keeps_the_residual(case, parallel, depth, monkeypatch):
     inner = mtp.mtp_model_layer
     zero_projections_([inner])
     seen = {}
+    # Since #8523 the MTP layer passes hidden_states positionally (positional-only).
     inner.register_forward_pre_hook(
-        lambda m, args, kwargs: seen.__setitem__("in", kwargs["hidden_states"].detach().clone()),
+        lambda m, args, kwargs: seen.__setitem__(
+            "in", (args[0] if args else kwargs["hidden_states"]).detach().clone()
+        ),
         with_kwargs=True,
     )
     inner.register_forward_hook(

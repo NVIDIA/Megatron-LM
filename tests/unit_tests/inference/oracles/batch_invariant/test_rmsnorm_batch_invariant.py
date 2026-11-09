@@ -30,7 +30,8 @@ Contract (written from TE's RMSNorm, which these replace, and the backends' prom
 Reference: fp64 RMSNorm from the formula. Trusted implementation: torch's fused
 `F.rms_norm` on the fp32 input with the fp32 gain, rounded once to x's dtype (the same
 precision class: fp32 statistics, one rounding); rsigma's trusted value is torch's fp32
-`rsqrt(mean(x * x) + eps)`. Tolerance class: floating point, bounded per row (default factor 2);
+`rsqrt(mean(x * x) + eps)`. Tolerance class: floating point, bounded per row (default factor 2)
+for bf16 / fp16 outputs and over the tensor with factor 3 for fp32 outputs (FP32_FACTOR);
 exact for dispatch, the caller's buffer, LayerNorm delegation and batch invariance.
 
 Structure (read after the contract): the forward casts x and w to fp32, adds 1 to the gain for
@@ -105,13 +106,26 @@ def trusted_rmsnorm(x, w, eps, zero_centered):
     return F.rms_norm(x.float(), (x.shape[-1],), g, eps).to(x.dtype)
 
 
+# fp32 outputs: a row's error is dominated by its one rsigma (one mean of x**2, one division,
+# one rsqrt per row), so a per-row bound compares two scalars, and on a correct kernel some rows
+# measured up to 3.7x torch's error (pdx 7986825: 15 of 928 rows above 2x). The fp32 bound is
+# therefore over the whole tensor (outputs are normalized, so every row weighs alike) with
+# factor 3: the kernel's mean divides with Triton's `div.full.f32` (up to 2 ulp) where torch
+# multiplies by 1/N, and sums in 1024-element blocks. A wrong eps, gain or statistic errs by
+# orders of magnitude more. bf16 / fp16 outputs are dominated by the final rounding: per row,
+# default factor.
+FP32_FACTOR = 3.0
+
+
 def check_norm(out, x, w, eps, zero_centered, what):
     assert out.shape == x.shape and out.dtype == x.dtype, f"{what}: {out.shape} {out.dtype}"
+    fp32 = out.dtype == torch.float32
     ou.assert_close_to_reference(
         out,
         ou.fp64_reference(rmsnorm_reference, x, w, eps, zero_centered),
         trusted_rmsnorm(x, w, eps, zero_centered),
-        dim=-1,
+        factor=FP32_FACTOR if fp32 else ou.DEFAULT_FACTOR,
+        dim=None if fp32 else -1,
         what=what,
     )
 

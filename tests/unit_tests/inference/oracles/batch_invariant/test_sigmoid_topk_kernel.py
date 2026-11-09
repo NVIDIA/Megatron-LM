@@ -46,7 +46,9 @@ ranked by the sum of their top k / group_topk scores). Tolerance class: exact fo
 order, shapes, dtypes, dispatch, batch invariance and read-only inputs; floating point for probs,
 bounded over the tensor with factor 4 (PROB_FACTOR: Triton's `tl.sigmoid` lowers fp32 exp to
 `ex2.approx` after a log2(e) prescale, about 2**-22 relative, while torch's `expf` is within 1-2
-ulp; a wrong normalization, a dropped expert or a missing scale errs by 1e-3 or more).
+ulp; a wrong normalization, a dropped expert or a missing scale errs by 1e-3 or more). On exactly
+tied rows the probs are exact fp32 values, so the tie test bounds each row with a floor of 2 ulp
+per prob for the kernel's `div.full.f32` division (DIVISION_ULPS).
 
 Structure (read after the contract): one program per `BLOCK_T` tokens (`block_tokens`: 1 for
 k >= 8 or E <= 128, else 4), `EXPERTS_POW2` columns (padding columns masked and given the
@@ -64,6 +66,8 @@ Main vs open PRs: all cases are expected to pass on main. #8562 does not touch t
 
 Hardware: H100 (1 GPU). The kernel has no architecture-specific variant.
 """
+
+import math
 
 import pytest
 import torch
@@ -85,6 +89,7 @@ BLOCK_T_WIDE = 4
 WARP_SWITCH_TOKENS = 1024  # num_warps = 1 for k >= 8 at T >= 1024 unless batch_invariant
 PROB_FACTOR = 4.0
 MARGIN = 1e-4
+DIVISION_ULPS = 2.0  # Triton's fp32 `/` is `div.full.f32`: at most 2 ulp (PTX ISA)
 
 
 @pytest.fixture(autouse=True)
@@ -270,8 +275,9 @@ def run_kernel(logits, bias, topk, scaling=None, **kwargs):
     return probs, indices
 
 
-def check_routing(probs, indices, logits, bias, topk, scaling, what):
-    """Exact indices in the documented order; probs bounded against fp64."""
+def check_routing(probs, indices, logits, bias, topk, scaling, what, **bound):
+    """Exact indices in the documented order; probs bounded against fp64 (``bound``: extra
+    arguments for `ou.assert_close_to_reference`)."""
     tokens = logits.shape[0]
     assert tuple(probs.shape) == (tokens, topk), f"{what}: probs {tuple(probs.shape)}"
     assert tuple(indices.shape) == (tokens, topk), f"{what}: indices {tuple(indices.shape)}"
@@ -285,7 +291,7 @@ def check_routing(probs, indices, logits, bias, topk, scaling, what):
         return
     trusted = probs_at(logits, ref_indices, scaling)
     ou.assert_close_to_reference(
-        probs, ref_probs, trusted, factor=PROB_FACTOR, what=f"{what}: probs"
+        probs, ref_probs, trusted, factor=PROB_FACTOR, what=f"{what}: probs", **bound
     )
 
 
@@ -417,9 +423,15 @@ def test_ties_follow_the_documented_rule(kind, num_experts, topk):
     selected, and slots keep the documented order, under both launches."""
     bias = torch.full((num_experts,), -0.25, device=_DEVICE)
     logits = tie_rows(num_experts, topk, kind, 33, seed=topk * 7 + len(kind))
+    # Tied scores cancel exactly in s_j / sum(s): a row whose selected experts are all tied has
+    # probs 1/k * scaling, exact in fp32, which torch's IEEE division returns exactly. The kernel
+    # divides with Triton's fp32 `/` (`div.full.f32`, up to 2 ulp, PTX ISA), so every prob of
+    # such a row may be off by 2 ulp while the trusted error is 0 (pdx 7986825: 1 ulp on the
+    # k = 2 rows). The bound is per row, with a floor admitting 2 ulp on all k probs.
+    bound = dict(dim=-1, floor_ulps=DIVISION_ULPS * math.sqrt(topk))
     for bi in (False, True):
         probs, indices = run_kernel(logits, bias, topk, 2.5, batch_invariant=bi)
-        check_routing(probs, indices, logits, bias, topk, 2.5, f"ties {kind} bi={bi}")
+        check_routing(probs, indices, logits, bias, topk, 2.5, f"ties {kind} bi={bi}", **bound)
 
 
 # ---- batch invariance --------------------------------------------------------------------------

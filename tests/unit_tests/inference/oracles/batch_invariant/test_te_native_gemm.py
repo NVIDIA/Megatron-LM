@@ -25,7 +25,8 @@ Contract (written from the backend's documentation in `enable_batch_invariant_mo
 Reference: fp64 `x @ w^T (+ bias)` for the probe rows. Trusted implementation: the same call in
 the test process outside batch-invariant mode (cuBLAS(Lt) with its default workspace). Tolerance
 class: bit-exact for batch invariance and the pinned state; floating point per row (default
-factor 2) for the values.
+factor 2) for bf16 values; exact on integer inputs for every entry (the fp32-output router GEMM
+is checked only this way: its summation order is what the starvation changes).
 
 Structure (read after the contract): the environment pin acts on cuBLAS(Lt) handles created
 after it, so batch invariance is checked in a fresh process (`_CHILD`) that enables the backend
@@ -36,10 +37,11 @@ rows at the start, an odd middle offset and the end. Shapes: the attention proje
 split-K is most attractive to a heuristic), and the router (7168 -> 256, 4096 -> 128, fp32
 output).
 
-Main vs open PRs: expected to pass on main by the backend's documentation; no open PR changes it.
-Step 3 (family 08 audit) flagged that PyTorch's non-Lt cuBLAS path may size its workspace from
-`CUBLAS_WORKSPACE_CONFIG` rather than `CUBLASLT_WORKSPACE_SIZE`, which `test_gemms_are_batch_
-invariant[aten_mm|aten_addmm]` would show as a finding.
+Main vs open PRs: `test_gemms_are_batch_invariant[aten_mm]` fails on main (finding O8a-M8, pdx
+7986825): a bias-free aten mm is not batch invariant under te_native on H100, as the family 08
+audit suspected (PyTorch's non-Lt cuBLAS path may size its workspace from
+`CUBLAS_WORKSPACE_CONFIG`, not `CUBLASLT_WORKSPACE_SIZE`; by reading). The other entries pass. No
+open PR changes it.
 
 Hardware: H100 (1 GPU), with Transformer Engine.
 """
@@ -98,6 +100,13 @@ def _case_tensors(k, n, seed):
     return w, bias, probe
 
 
+def _integers(shape, seed):
+    """Integers in [-7, 7] (identical in the child): every product and every sum over K <= 14336
+    is an integer below 2**20, exact in fp32 in any summation order."""
+    g = ou.make_generator(seed)
+    return torch.randint(-7, 8, shape, generator=g).to(torch.bfloat16)
+
+
 # The child process: enables te_native before any GEMM, then runs one entry point. It receives
 # the entry, the device, the output path and the cases as arguments, and regenerates the inputs
 # from their seeds with the same CPU generator as `_tensor`.
@@ -123,6 +132,12 @@ def tensor(shape, seed, scale=1.0):
     g = torch.Generator()
     g.manual_seed(seed)
     return (torch.randn(*shape, generator=g) * scale).to(torch.bfloat16).cuda()
+
+
+def integers(shape, seed):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.randint(-7, 8, shape, generator=g).to(torch.bfloat16).cuda()
 
 
 def starts(m):
@@ -157,6 +172,12 @@ with torch.no_grad():
                 x[start : start + p] = probe[:p]
                 rows[f"{m}:{start}"] = run(x)[start : start + p].cpu()
         results[case["name"]] = rows
+        # Exact values: small integers, whose products and sums are exact in fp32 in any order.
+        w = integers((n, k), seed + 4)
+        bias = integers((n,), seed + 5)
+        if entry == "te_linear":
+            module.weight.copy_(w)
+        results[case["name"] + ":exact"] = run(integers((spec["probe_rows"], k), seed + 6)).cpu()
 bik.disable_batch_invariant_mode()
 torch.save({"status": status, "results": results}, out_path)
 """
@@ -223,7 +244,14 @@ def _trusted(entry, probe, w, bias):
 def test_gemms_are_batch_invariant(entry, tmp_path):
     """In a process that enabled te_native before its first GEMM: four probe rows give the same
     bits at every M and position, for each shape; the workspace is pinned; the probe rows'
-    values are right against fp64."""
+    values are right against fp64 (bf16 outputs bounded per row by the same call outside the
+    mode), and on integer inputs every output is exact (fp32 sums of integers are exact in any
+    order; rounded once to bf16).
+
+    `[aten_mm]` fails on main (finding O8a-M8, pdx 7986825): `torch.matmul(x, w.t())` without a
+    bias, the inference-optimized linears' GEMM, changes bits with M (26 of 16384 elements at
+    M = 17 vs 4, K = N = 4096) although `aten_addmm`, `te_linear` and the router GEMM stay
+    invariant. No fix PR yet."""
     spec, got = _run_child(entry, tmp_path / f"{entry}.pt")
     status = got["status"]
     assert status["env"] == "0", f"CUBLASLT_WORKSPACE_SIZE is {status['env']!r} in the child"
@@ -234,14 +262,27 @@ def test_gemms_are_batch_invariant(entry, tmp_path):
         for key, out in rows.items():
             where = "M={} start={}".format(*key.split(":"))
             ou.assert_exact(out, base[: out.shape[0]], what=f"{entry} {case['name']} {where}")
-        w, bias, probe = (t.to(_DEVICE) for t in _case_tensors(case["k"], case["n"], case["seed"]))
+        k, n, seed = case["k"], case["n"], case["seed"]
+        w, bias, probe = (t.to(_DEVICE) for t in _case_tensors(k, n, seed))
         use_bias = bias if entry == "aten_addmm" else None
-        ou.assert_close_to_reference(
-            base.to(_DEVICE),
-            ou.fp64_reference(gemm_reference, probe, w, use_bias),
-            _trusted(entry, probe, w, use_bias),
-            dim=-1,
-            what=f"{entry} {case['name']} values",
+        if base.dtype != torch.float32:
+            # A bf16 output is dominated by its one rounding. An fp32 output over K = 7168 is
+            # dominated by the summation order, which the starved workspace changes (no split-K):
+            # it measured 6.7x the full-workspace cuBLASLt error on a correct GEMM (pdx 7986825),
+            # so fp32 values are checked only exactly, on the integer inputs below.
+            ou.assert_close_to_reference(
+                base.to(_DEVICE),
+                ou.fp64_reference(gemm_reference, probe, w, use_bias),
+                _trusted(entry, probe, w, use_bias),
+                dim=-1,
+                what=f"{entry} {case['name']} values",
+            )
+        w_int, x_int = _integers((n, k), seed + 4).to(_DEVICE), _integers((PROBE_ROWS, k), seed + 6)
+        bias_int = _integers((n,), seed + 5).to(_DEVICE) if entry == "aten_addmm" else None
+        exact = got["results"][case["name"] + ":exact"]
+        ref = ou.fp64_reference(gemm_reference, x_int.to(_DEVICE), w_int, bias_int)
+        ou.assert_exact(
+            exact.to(_DEVICE), ref.to(exact.dtype), what=f"{entry} {case['name']} exact"
         )
 
 
