@@ -9,6 +9,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
+from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from einops import rearrange
@@ -198,6 +199,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         super().__init__()
 
         self.args = get_args()
+        self.cfg = get_run_config()
 
         self.tokenizer = get_tokenizer()
         self.manual_prompts = {}
@@ -232,7 +234,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
             max_num_tiles=self.args.max_num_tiles,
-            tokenizer_type=self.args.tokenizer_prompt_format,
+            tokenizer_type=self.cfg.tokenizer.tokenizer_prompt_format,
         )
 
         # Create a partial function with all the self.args parameters pre-filled
@@ -246,7 +248,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
             max_num_tiles=self.args.max_num_tiles,
-            tokenizer_type=self.args.tokenizer_prompt_format,
+            tokenizer_type=self.cfg.tokenizer.tokenizer_prompt_format,
         )
 
         self.txt_to_token_dict = {}
