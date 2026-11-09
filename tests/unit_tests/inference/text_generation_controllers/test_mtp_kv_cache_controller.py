@@ -1545,6 +1545,7 @@ class TestExpertParallelForwardParity:
         context.num_last_token_logits = 1
         context.has_vlm_data = False
         controller._enable_cuda_graph = False
+        controller._overlap_gc = False
         controller._select_async_sched_routing_buffer = lambda: None
         controller.inference_wrapped_model.run_one_forward_step = lambda inference_input: (
             torch.zeros((1, 1, VOCAB_SIZE), device=DEVICE)
