@@ -762,11 +762,51 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 **Rule of thumb:** any change that creates/replaces params at runtime, makes forward order data-dependent, runs GTP_remat concurrently, or builds multiple GTP models per process must be checked against the table above. When in doubt, exclude the affected weights so they fall back to synchronous, chain-free all-gather.
 
+#### Explicit chain registration
+
+**One API selects which GTP-sharded weights prefetch one another:**
+`register_prefetch_chain(name, weights)`.
+
+![GTP prefetch-chain registration overview](../../images/generalized_tensor_parallel/gtp_prefetch_chain_api.png)
+
+**Production defaults require no user calls.** After DDP wrapping,
+`classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
+chains per process group, preserving explicit overrides and skipping replicated weights.
+Both Mamba projections stay in the dense chain.
+
+For a custom chain, register after parameter wrapping and before classification/warmup:
+
+```python
+from megatron.core.tensor_parallel.gtp_api import (
+    classify_gtp_remat_chains,
+    is_gtp_param,
+    register_prefetch_chain,
+)
+
+# attention_candidates is supplied by the model integration; skip unsharded weights.
+register_prefetch_chain("attention", [w for w in attention_candidates if is_gtp_param(w)])
+classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
+```
+
+- **Membership and order:** warmup learns execution links; registration order does not
+  set prefetch order. Recompute-forward can visit a subset in a different order, within
+  the same registered chain boundaries.
+- **Grouped experts:** pass `weight0` to include the entire local-expert projection.
+  Coalescing is preserved. Empty selections are valid; conflicting assignments,
+  replicated weights, mixed dense/grouped weights, and mixed process groups are rejected.
+- **Runtime mapping:** classification splits captured/eager scopes. Chains can share
+  communication streams but maintain separate temporary weight buffers; more chains
+  can increase memory use. Built-in and registered chains use one metadata table for
+  grouped/captured queries; runtime behavior does not infer these properties from chain names.
+
+Use the same registration on every participating rank. The API requires existing
+GTP operator integration; it does not enable sharding or add support to new operators.
+
 #### Grouped-expert chains (one-block-ahead)
 
 *Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one for FC1 and one for FC2 — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
 
-*Design.* In eager and CUDA-graph modes, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_{graphed,ungraphed}` / `GTP_remat_grouped_fc2_{graphed,ungraphed}`) instead of sharing the general chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
+*Design.* In eager and CUDA-graph modes, `linear_fc1` and `linear_fc2` each get their own homogeneous chain instead of sharing the general chain. Standard initialization assigns `GTP_registered_default_expert_fc1_{graphed,ungraphed}` / `GTP_registered_default_expert_fc2_{graphed,ungraphed}`; explicit registrations or default-name collisions can change the logical-name component. The low-level unregistered classifier retains `GTP_remat_grouped_fc1_{graphed,ungraphed}` / `GTP_remat_grouped_fc2_{graphed,ungraphed}`. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
 
 *Result.* The win is **resource overlap**, not faster compute and not a faster network:
 
