@@ -12,7 +12,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     GradientFinalizationMode,
     Placements,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
 )
@@ -266,13 +265,12 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
         pack_hook=lambda tensor: tensor, unpack_hook=unpack
     ):
         for is_last in (False, True):
-            with finalize_gradients(
-                context,
+            with context.finalize_gradients(
                 mode=(
                     GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
                     if is_last
                     else GradientFinalizationMode.SKIP_OUTER
-                ),
+                )
             ):
                 model(torch.ones(2, 4, device=device)).sum().backward()
             assert frozen_weight.untyped_storage().nbytes() == 0

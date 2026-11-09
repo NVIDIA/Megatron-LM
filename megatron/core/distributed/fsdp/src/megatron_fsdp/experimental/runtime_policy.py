@@ -60,7 +60,7 @@ class RuntimePolicy:
     )
     """Set the context's initial outer-reduction and completion-wait behavior.
 
-    ``finalize_gradients()`` temporarily overrides the context's active mode without
+    ``FsdpContext.finalize_gradients()`` temporarily overrides the active mode without
     modifying this policy. Use ``REDUCE_OUTER`` when the caller waits with
     ``finish_grad_sync()`` after all backward work, including delayed weight gradients.
     """

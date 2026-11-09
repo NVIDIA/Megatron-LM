@@ -21,7 +21,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     GradientFinalizationMode,
     Placements,
     RuntimePolicy,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -305,13 +304,12 @@ def test_local_accumulation_matches_reference(
         for _ in range(5):
             optimizer.zero_grad(set_to_none=set_to_none)
             for index, (inputs, targets) in enumerate(microbatches):
-                with finalize_gradients(
-                    context,
+                with context.finalize_gradients(
                     mode=(
                         gradient_finalization_mode
                         if index == num_microbatches - 1
                         else GradientFinalizationMode.SKIP_OUTER
-                    ),
+                    )
                 ):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
                     losses.append(loss.detach())
@@ -367,13 +365,12 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
     inputs = torch.randn(3, 1, 4096, device=setup.device, dtype=torch.bfloat16, generator=generator)
     expected = torch.zeros(8, 4096, device=setup.device)
     for index, x in enumerate(inputs):
-        with finalize_gradients(
-            context,
+        with context.finalize_gradients(
             mode=(
                 GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
                 if index == len(inputs) - 1
                 else GradientFinalizationMode.SKIP_OUTER
-            ),
+            )
         ):
             model(x).float().sum().backward()
         context.finish_grad_sync()

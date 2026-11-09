@@ -23,7 +23,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
 )
@@ -287,7 +286,7 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
 
-    with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):
+    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
 
@@ -447,7 +446,7 @@ def test_finalize_gradients_restores_mode(distributed_setup, mode):
 
     with (
         pytest.raises(RuntimeError, match="backward failed"),
-        finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER),
+        context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER),
     ):
         assert context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER
         raise RuntimeError("backward failed")

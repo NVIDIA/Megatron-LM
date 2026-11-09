@@ -17,7 +17,7 @@
 from .checkpoint import load_checkpoint, save_checkpoint
 from .context import FsdpContext
 from .dbuffer import DBuffer
-from .fully_shard import Placements, finalize_gradients, fully_shard, fully_shard_context
+from .fully_shard import Placements, fully_shard, fully_shard_context
 from .optimizer import fully_shard_optimizer, init_optimizer_state
 from .placement import ShardLayout
 from .runtime_policy import PrefetchOrder, GradientFinalizationMode, RuntimePolicy
@@ -32,7 +32,6 @@ __all__ = [
     "RuntimePolicy",
     "SchedulePolicy",
     "ShardLayout",
-    "finalize_gradients",
     "fully_shard",
     "fully_shard_context",
     "fully_shard_optimizer",

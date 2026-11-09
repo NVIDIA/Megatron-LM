@@ -15,7 +15,8 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from weakref import WeakKeyDictionary
 
 import torch
@@ -176,6 +177,32 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    @contextmanager
+    def finalize_gradients(
+        self, mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    ) -> Iterator[None]:
+        """Scope outer reduction and completion-wait behavior for backward calls.
+
+        Use SKIP_OUTER while accumulating gradients across backward calls. For the last
+        backward before the optimizer step, use REDUCE_OUTER_AND_WAIT for automatic
+        completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
+        including backward_dw(). Inner reduction and weight cleanup run in every mode.
+
+        Wrap both forward and backward. The scope itself does not launch reductions
+        or wait on entry or exit.
+
+        Args:
+            mode: Outer reduction and completion-wait behavior within the scope.
+        """
+        self.ensure_finalized()
+        previous_mode = self.gradient_finalization_mode
+        self.gradient_finalization_mode = mode
+
+        try:
+            yield
+        finally:
+            self.gradient_finalization_mode = previous_mode
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""

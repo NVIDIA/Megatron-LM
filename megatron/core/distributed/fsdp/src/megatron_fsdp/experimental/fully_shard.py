@@ -28,7 +28,6 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .module import FsdpModule
 from .placement import ShardLayout
-from .runtime_policy import GradientFinalizationMode
 from .schedule_policy import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
@@ -192,35 +191,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if dim_names is None or axis not in dim_names:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
-
-
-@contextmanager
-def finalize_gradients(
-    context: FsdpContext,
-    mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT,
-) -> Iterator[None]:
-    """Scope outer reduction and completion-wait behavior for backward calls.
-
-    Use SKIP_OUTER while accumulating gradients across backward calls. For the last
-    backward before the optimizer step, use REDUCE_OUTER_AND_WAIT for automatic
-    completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
-    including backward_dw(). Inner reduction and weight cleanup run in every mode.
-
-    Wrap both forward and backward. The scope itself does not launch reductions
-    or wait on entry or exit.
-
-    Args:
-        context: FSDP context whose backward calls should use this mode.
-        mode: Outer reduction and completion-wait behavior within the scope.
-    """
-    context.ensure_finalized()
-    previous_mode = context.gradient_finalization_mode
-    context.gradient_finalization_mode = mode
-
-    try:
-        yield
-    finally:
-        context.gradient_finalization_mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

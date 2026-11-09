@@ -295,7 +295,7 @@ work, including `backward_dw()`, and before the optimizer step.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
 - Scope the gradient synchronization mode with
-  `with finalize_gradients(context, mode=GradientFinalizationMode.SKIP_OUTER):` around forward
+  `with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):` around forward
   and backward. `SKIP_OUTER` skips outer reduction and the automatic wait during
   accumulation; inner reduction and weight cleanup still run. On the last backward
   before the optimizer step, `REDUCE_OUTER` launches outer reduction and leaves the
