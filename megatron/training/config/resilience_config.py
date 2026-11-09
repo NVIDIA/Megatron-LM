@@ -17,7 +17,10 @@ class FaultToleranceConfig:
     """Interval in training iterations between autoresume termination checks."""
 
     enable_ft_package: bool = False
-    """Enable the Fault Tolerance package. Launch the workload with ft_launcher."""
+    """Enable NVIDIA Resiliency Extension (NVRx) fault-tolerance monitoring.
+
+    Requires nvidia-resiliency-ext and launching the workload with ft_launcher.
+    """
 
     calc_ft_timeouts: bool = False
     """Automatically compute FT timeouts from observed intervals."""

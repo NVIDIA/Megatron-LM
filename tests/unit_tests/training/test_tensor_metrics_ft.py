@@ -119,7 +119,12 @@ def test_fault_tolerance_setup_uses_config(
     saved_timeouts = {"section_timeouts": {"setup": 123, "step": 45}}
     (tmp_path / "ft_state.json").write_text(json.dumps(saved_timeouts))
 
-    ft_integration.setup()
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    ft_integration.setup(
+        run_config.fault_tolerance,
+        checkpoint_dir=run_config.checkpoint.save,
+        async_save=run_config.checkpoint.async_save,
+    )
 
     if not enabled:
         client_factory.assert_not_called()
