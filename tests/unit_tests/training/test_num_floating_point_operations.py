@@ -2,22 +2,21 @@
 
 """FLOPs must use the decoder's final attention type for every MTP depth."""
 
-from types import SimpleNamespace
-
 import pytest
+import torch
 
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import num_floating_point_operations
 
 
-def _make_args(**overrides):
-    args = SimpleNamespace(
+def _make_config(transformer_cls=TransformerConfig, **overrides):
+    kwargs = dict(
         attention_output_gate=True,
-        decoder_seq_length=None,
         experimental_attention_variant="gdn",
         ffn_hidden_size=16,
-        group_query_attention=True,
         hidden_size=8,
-        hybrid_layer_pattern=None,
         kv_channels=4,
         linear_attention_freq=4,
         linear_conv_kernel_dim=4,
@@ -33,17 +32,14 @@ def _make_args(**overrides):
         mtp_num_layers=None,
         multi_latent_attention=False,
         num_attention_heads=2,
-        num_experts=4,
+        num_moe_experts=4,
         num_layers=40,
         num_query_groups=1,
-        padded_vocab_size=32,
-        seq_length=8,
-        swiglu=True,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
     )
-    for name, value in overrides.items():
-        setattr(args, name, value)
-    cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=args.padded_vocab_size))
-    return args, cfg
+    kwargs.update(overrides)
+    return GPTModelConfig(transformer=transformer_cls(**kwargs), vocab_size=32, seq_length=64)
 
 
 def _expected_flops(tokens, squared_lengths, layer_counts, mtp_depth):
@@ -105,7 +101,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 ):
     pattern = [1, 1, 1, 0] * 10 if num_layers == 40 else [1, 1, 1]
     original_pattern = pattern.copy()
-    args, cfg = _make_args(
+    config = _make_config(
         num_layers=num_layers,
         mtp_num_layers=mtp_depth,
         linear_attention_freq=4 if pattern_form == "int" else pattern,
@@ -113,14 +109,14 @@ def test_mtp_repeats_final_decoder_attention_type(
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
 
-    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
+    actual = num_floating_point_operations(config, batch_size=3, sequence_length=8, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, expected_counts, mtp_depth or 0)
     # Keep T fixed and change only Q to isolate the number of full-attention layers.
     merged = num_floating_point_operations(
-        args,
-        cfg,
+        config,
         batch_size=3,
+        sequence_length=8,
         total_real_tokens_in_batch=tokens,
         seqlen_squared_sum_in_batch=tokens**2,
     )
@@ -132,16 +128,111 @@ def test_mtp_repeats_final_decoder_attention_type(
 @pytest.mark.parametrize("layout", ["bshd", "thd"])
 @pytest.mark.parametrize("mtp_depth", [None, 0, 1, 2])
 def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
-    args, cfg = _make_args(
+    config = _make_config(
         experimental_attention_variant=None,
         linear_attention_freq=None,
         num_layers=3,
-        num_experts=None,
+        num_moe_experts=None,
         mtp_num_layers=mtp_depth,
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
     depth = mtp_depth or 0
 
-    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
+    actual = num_floating_point_operations(config, batch_size=3, sequence_length=8, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)
+
+
+def _make_dsv4_config(pattern, **overrides):
+    """A small HybridModel whose FLOPs have independently calculated coefficients."""
+    kwargs = dict(
+        attention_output_gate=False,
+        experimental_attention_variant=None,
+        num_layers=len(pattern.split('/')[0].replace('|', '')),
+        moe_layer_freq=1,
+        multi_latent_attention=True,
+        num_query_groups=2,
+        apply_rope_fusion=False,
+        q_lora_rank=2,
+        # DSv4 uses v_head_dim even when the stack config retains the MLA default.
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=8,
+        output_projection_groups=2,
+        output_projection_lora_rank=3,
+        csa_window_size=2,
+        csa_dense_mode=False,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=4,
+        dsa_indexer_topk=2,
+        mamba_state_dim=4,
+        mamba_head_dim=2,
+        mamba_num_groups=1,
+        mamba_num_heads=2,
+        gdp_num_householder=1,
+    )
+    kwargs.update(overrides)
+    config = _make_config(transformer_cls=MLATransformerConfig, **kwargs)
+    return HybridModelConfig(
+        transformer=config.transformer, hybrid_layer_pattern=pattern, vocab_size=32, seq_length=256
+    )
+
+
+@pytest.mark.parametrize('symbol', ['W', 'C', 'H'])
+@pytest.mark.parametrize('packed', [False, True])
+def test_dsv4_attention_flops_use_pattern_and_real_token_statistics(symbol, packed):
+    config = _make_dsv4_config(symbol)
+    transformer = config.transformer
+    # BSHD: two L=256 sequences. Packed: L=128 and L=384 in a padded allocation.
+    tokens = 512
+    squared_lengths = 128**2 + 384**2 if packed else 2 * 256**2
+    stats = (
+        dict(total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=squared_lengths)
+        if packed
+        else {}
+    )
+    if symbol != 'C':
+        transformer.dsa_indexer_n_heads = transformer.dsa_indexer_head_dim = (
+            transformer.dsa_indexer_topk
+        ) = None
+    # Per-layer projection coefficient is 218 MACs; window is 64. C adds
+    # compressor/indexer coefficients 256/160 and a capped sparse core. H adds
+    # compressor coefficient 128 and a 1/128 compressed-attention core.
+    coefficients = {'W': (1692, 0), 'C': (4572, 12), 'H': (2460, 0.75)}
+    token_coefficient, core_coefficient = coefficients[symbol]
+    expected = (token_coefficient + 1536) * tokens + core_coefficient * squared_lengths
+    if symbol == 'C':
+        expected -= 1536 * tokens**2 / squared_lengths
+    before = vars(transformer).copy()
+    assert num_floating_point_operations(config, batch_size=2, sequence_length=256, **stats) == int(
+        expected
+    )
+    assert vars(transformer) == before
+    if packed:
+        assert num_floating_point_operations(
+            config, batch_size=32, sequence_length=2048, **stats
+        ) == int(expected)
+
+
+def test_dsv4_flops_count_repeated_mtp_attention_and_projection():
+    config = _make_dsv4_config('W-E/C-/C-', mtp_num_layers=None)
+    tokens, squared_lengths = 512, 2 * 256**2
+    # Pattern: W + 2*C + 3*dense MLP + 1*MoE; two MTP norms/projections,
+    # three logits projections. The actual repeated pattern owns MTP depth.
+    expected = 27636 * tokens + 24 * squared_lengths - 3072 * tokens**2 / squared_lengths
+    assert num_floating_point_operations(config, batch_size=2, sequence_length=256) == int(expected)
+    assert config.transformer.mtp_num_layers is None
+
+
+def test_dsv4_dense_csa_flops_do_not_require_an_indexer():
+    config = _make_dsv4_config(
+        'C',
+        csa_dense_mode=True,
+        dsa_indexer_n_heads=None,
+        dsa_indexer_head_dim=None,
+        dsa_indexer_topk=None,
+    )
+    # Dense ratio-4 CSA: projections/window/compressor=538 MACs per token,
+    # plus the full compressed attention core; logits add1536 FLOPs per token.
+    expected = (6 * 538 + 1536) * 512 + 24 * (2 * 256**2)
+    assert num_floating_point_operations(config, batch_size=2, sequence_length=256) == expected
