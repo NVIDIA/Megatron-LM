@@ -16,7 +16,6 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -581,7 +580,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_dataloaders_provider,
-        ModelType.encoder_or_decoder,
         forward_step,
         model_provider,
         process_non_loss_data_func=write_online_eval_to_tensorboard,

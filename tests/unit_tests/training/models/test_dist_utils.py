@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
@@ -105,7 +104,7 @@ class TestToEmptyIfMetaDevice:
 
 
 class TestBuildVirtualPipelineStages:
-    """build_virtual_pipeline_stages() builds one stage without VP or multiple stages with VP, setting model_type on each."""
+    """Build one stage without VP or multiple stages with VP."""
 
     @patch("megatron.core.pipeline_parallel.utils.is_pp_last_stage", return_value=True)
     @patch("megatron.core.pipeline_parallel.utils.is_pp_first_stage", return_value=True)
@@ -154,18 +153,6 @@ class TestBuildVirtualPipelineStages:
         build_virtual_pipeline_stages(build_fn, pg, vp_size=3)
         vp_stage_args = [c.kwargs["vp_stage"] for c in build_fn.call_args_list]
         assert vp_stage_args == [0, 1, 2]
-
-    @patch("megatron.core.pipeline_parallel.utils.is_pp_last_stage", return_value=True)
-    @patch("megatron.core.pipeline_parallel.utils.is_pp_first_stage", return_value=True)
-    @patch("megatron.core.pipeline_parallel.utils.is_vp_last_stage", return_value=True)
-    @patch("megatron.core.pipeline_parallel.utils.is_vp_first_stage", return_value=True)
-    def test_model_type_set_on_every_stage(self, *_):
-        pg = _make_pg()
-        pg.pp.size.return_value = 2
-        build_fn = Mock(return_value=Mock())
-        result = build_virtual_pipeline_stages(build_fn, pg, vp_size=3)
-        for model in result:
-            assert model.model_type == ModelType.encoder_or_decoder
 
     @patch("megatron.core.pipeline_parallel.utils.is_pp_last_stage", return_value=True)
     @patch("megatron.core.pipeline_parallel.utils.is_pp_first_stage", return_value=True)
@@ -957,10 +944,7 @@ class TestUnimodalBuildDistributedModels:
                 build_fn, self.transformer_config, self.pg, wrap_with_ddp=False
             )
             mocks["bvps"].assert_called_once_with(
-                build_fn,
-                self.pg,
-                self.transformer_config.virtual_pipeline_model_parallel_size,
-                ModelType.encoder_or_decoder,
+                build_fn, self.pg, self.transformer_config.virtual_pipeline_model_parallel_size
             )
         finally:
             self._stop_patches()

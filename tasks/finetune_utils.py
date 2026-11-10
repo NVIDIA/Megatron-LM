@@ -8,7 +8,6 @@ from functools import partial
 import torch
 
 from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import get_num_microbatches, update_num_microbatches
 from megatron.training import get_args, get_timers, get_train_state, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -244,7 +243,6 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
 
 
 def finetune(train_valid_datasets_provider, model_provider,
-             model_type=ModelType.encoder_or_decoder,
              forward_step=_cross_entropy_forward_step,
              end_of_epoch_callback_provider=None,
              task_collate_fn=None):
@@ -272,7 +270,7 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for

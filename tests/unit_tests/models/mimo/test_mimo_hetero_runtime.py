@@ -16,7 +16,6 @@ from examples.mimo.training.runtime import (
 )
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
@@ -330,7 +329,6 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
 
     def pre_hook(model_list):
         assert model_list == [original_model]
-        assert original_model.model_type == ModelType.encoder_or_decoder
         events.append("pre")
         return [pre_replacement]
 

@@ -40,7 +40,6 @@ from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
 
-from megatron.core.enums import ModelType
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -313,7 +312,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        ModelType.encoder_or_decoder,
         forward_step,
         model_provider,
     )

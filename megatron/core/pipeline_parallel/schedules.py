@@ -31,7 +31,6 @@ from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
     get_model_config,
-    get_model_type,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -781,8 +780,6 @@ def forward_backward_no_pipelining(
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
-    model_type = get_model_type(model)
-
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
@@ -1052,7 +1049,6 @@ def forward_backward_pipelining_with_interleaving(
         cp_size = cp_group.size()
 
     elif p2p_communicator is not None and pg_collection is not None:
-        model_type = get_model_type(model[0])
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
@@ -1172,8 +1168,6 @@ def forward_backward_pipelining_with_interleaving(
         msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
         msg += 'and reduces throughput.'
         raise RuntimeError(msg)
-
-    model_type = get_model_type(model[0])
 
     tensor_shape = [seq_length, micro_batch_size, _get_pipeline_hidden_size(config)]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
