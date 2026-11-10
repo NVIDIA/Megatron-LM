@@ -23,7 +23,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 from tools import check_process_group_usage
 
 pytestmark = pytest.mark.skipif(
@@ -83,6 +83,10 @@ def _group(ranks_per_group):
     return group
 
 
+# The collections that _collection() built on this rank, until the teardown destroys their groups.
+_COLLECTIONS = []
+
+
 def _collection(gtp_remat_size=1, expt_gtp_remat_size=1):
     """Collection with TP=1, dp_cp over every rank, and GTP groups of the given sizes."""
     world_size = dist.get_world_size()
@@ -90,13 +94,15 @@ def _collection(gtp_remat_size=1, expt_gtp_remat_size=1):
     def blocks(size):
         return [list(range(start, start + size)) for start in range(0, world_size, size)]
 
-    return ProcessGroupCollection(
+    pg_collection = ProcessGroupCollection(
         tp=_group(blocks(1)),
         expt_tp=_group(blocks(1)),
         dp_cp=_group(blocks(world_size)),
         gtp_remat=_group(blocks(gtp_remat_size)),
         expt_gtp_remat=_group(blocks(expt_gtp_remat_size)),
     )
+    _COLLECTIONS.append(pg_collection)
+    return pg_collection
 
 
 def _wrap(config, pg_collection=None):
@@ -120,6 +126,8 @@ def _wrap(config, pg_collection=None):
 
 class TestMegatronFSDPV1GTPWeightRemat:
     def teardown_method(self, method):
+        while _COLLECTIONS:
+            destroy_test_pg_collection(_COLLECTIONS.pop())
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
@@ -171,6 +179,7 @@ class TestMegatronFSDPV1GTPWeightRemat:
 
         with _forbid_global_process_groups():
             fsdp = _wrap(config, pg_collection)
+        fsdp.stop_communication()
 
         assert dist.get_process_group_ranks(fsdp.megatron_fsdp_dist_index.get_dp_group()) == list(
             range(dist.get_world_size())

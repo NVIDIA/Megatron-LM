@@ -202,11 +202,27 @@ def _forbid_global_groups():
         yield
 
 
+# The process groups that the helpers below created on this rank, until
+# _destroy_created_groups() destroys them.
+_CREATED_GROUPS = []
+
+
+def _destroy_created_groups():
+    """Destroy the groups in _CREATED_GROUPS; call on every rank."""
+    if not _CREATED_GROUPS:
+        return
+    # Every rank finishes its collectives before any communicator goes away.
+    torch.cuda.synchronize()
+    dist.barrier()
+    while _CREATED_GROUPS:
+        dist.destroy_process_group(_CREATED_GROUPS.pop())
+
+
 def _pipeline_pg_collection():
     """Groups of a TP=1 x DP x PP=4 grid, built without parallel_state.
 
     The word embeddings live on the first and last stage and the position embeddings on the first
-    stage; ranks outside those groups hold None.
+    stage; ranks outside those groups hold None. _destroy_created_groups() destroys the groups.
     """
     grid = HyperCommGrid(
         [1, dist.get_world_size() // _PIPELINE_SIZE, _PIPELINE_SIZE], ["tp", "dp", "pp"]
@@ -227,6 +243,8 @@ def _pipeline_pg_collection():
             pg_collection.embd = embd
         if dist.get_rank() == stage_ranks[0]:
             pg_collection.pos_embd = pos_embd
+    # Tests remove and replace fields of the collection, so the groups are recorded here.
+    _CREATED_GROUPS.extend(group for group in vars(pg_collection).values() if group is not None)
     return pg_collection
 
 
@@ -323,6 +341,7 @@ class TestFinalizeModelGradsProcessGroups:
         parallel_state.destroy_model_parallel()
 
     def teardown_method(self, method):
+        _destroy_created_groups()
         Utils.destroy_model_parallel()
 
     def test_reads_no_global_groups(self):
