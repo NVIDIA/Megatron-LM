@@ -21,6 +21,7 @@ from typing import Sequence
 
 import torch
 
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -28,13 +29,23 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.moe.shared_experts import (
+    SharedExpertMLP,
+    set_tensor_grad_fn_sequence_sr,
+)
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import (
+    DeferredWrite,
+    ShortcutAddWideResidualWriteReadNorm,
+    StreamwiseSigmoidWideResidualRead,
+    WriteReadNorm,
+    mxfp8_consumer,
+    seam_connections,
+)
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -191,9 +202,33 @@ class ShortcutMoEBlock(MegatronModule):
                 "A ShortcutMoE pair must agree on whether it carries a wide residual stream."
             )
 
+        # Fused seams: every block but one starting the stack applies the pending write with its
+        # compute and shortcut reads and norms in one kernel (ShortcutAddWideResidualWriteReadNorm,
+        # which owns the shortcut norm's weight under its unfused checkpoint key), and defers its
+        # MoE write (the shortcut add) to the next layer's read unless it ends the stack.
+        self.fuses_residual_seams = bool(
+            self.config.moe_shortcut_wide_residual_norm_fusion and not self.is_mtp_layer
+        )
+        self.fused_shortcut_read = self.fuses_residual_seams and isinstance(
+            seam_connections(compute_layer)[0], WriteReadNorm
+        )
+        self.defers_shortcut_add = self.fuses_residual_seams and isinstance(
+            moe_layer.residual_write_mlp, DeferredWrite
+        )
+        self.sharded_state_dict_keys_map = (
+            {"shortcut_residual_read.weight": "shortcut_pre_mlp_layernorm.weight"}
+            if self.fused_shortcut_read
+            else {}
+        )
+
         self.shortcut_residual_read = None
         if moe_layer.config.wide_residual is not None and not self.is_mtp_layer:
-            self.shortcut_residual_read = StreamwiseSigmoidWideResidualRead(
+            shortcut_read = (
+                ShortcutAddWideResidualWriteReadNorm
+                if self.fused_shortcut_read
+                else StreamwiseSigmoidWideResidualRead
+            )
+            self.shortcut_residual_read = shortcut_read(
                 config=moe_layer.config,
                 layer_number=moe_layer.layer_number,
                 branch_name="shortcut_routed",
@@ -217,14 +252,34 @@ class ShortcutMoEBlock(MegatronModule):
                     "The shortcut predecessor and routed read must carry the same "
                     "residual-stream width."
                 )
+        if self.fuses_residual_seams:
+            # The stack has linked the layer-to-layer seams (link_residual_seams). The shared
+            # expert's first Linear may take the MoE read as MXFP8 if it alone consumes it (a
+            # custom forward or the shared-expert gate would also use it), and the two-reader
+            # shortcut seam applies the write handed to the compute read.
+            shared = getattr(moe_layer.mlp, "shared_experts", None)
+            exclusive = (
+                shared is not None
+                and type(shared).forward is SharedExpertMLP.forward
+                and not shared.use_shared_expert_gate
+            )
+            moe_layer.residual_read_mlp.consumer = mxfp8_consumer(
+                shared.linear_fc1 if exclusive else None, moe_layer.config
+            )
+            if self.fused_shortcut_read:
+                self.shortcut_residual_read.link(seam_connections(compute_layer)[0])
 
         shortcut_norm_spec = TENorm
-        self.shortcut_pre_mlp_layernorm = build_module(
-            shortcut_norm_spec,
-            config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
-            has_residual=False,
+        self.shortcut_pre_mlp_layernorm = (
+            IdentityOp()  # owned by the fused shortcut read
+            if self.fused_shortcut_read
+            else build_module(
+                shortcut_norm_spec,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                has_residual=False,
+            )
         )
         self.shortcut_post_norm = (
             build_module(
@@ -243,6 +298,19 @@ class ShortcutMoEBlock(MegatronModule):
         """Create synchronization state before inference CUDA graph capture."""
         if self.route_ready_event is None:
             self.route_ready_event = torch.cuda.Event()
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """The block's sharded state, with fused parameters under their unfused keys."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.sharded_state_dict_keys_map:
+            apply_prefix_mapping(
+                sharded_state_dict,
+                {
+                    f"{prefix}{k}": f"{prefix}{v}"
+                    for k, v in self.sharded_state_dict_keys_map.items()
+                },
+            )
+        return sharded_state_dict
 
     def _read_shortcut_hidden(
         self,
@@ -329,6 +397,16 @@ class ShortcutMoEBlock(MegatronModule):
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
+        if self.defers_shortcut_add:
+            # The next read's seam kernel applies the shortcut add of routed and shared.
+            routed = self.moe_layer.mlp.postprocess(combined_output, None)
+            return self.moe_layer.residual_write_mlp(
+                (routed, None),
+                state=mlp_state,
+                shared=shared_expert_output,
+                dropout_probability=0.0,
+                training=self.training,
+            )
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
@@ -572,7 +650,20 @@ class ShortcutMoEBlock(MegatronModule):
         In inference the paired layer runs its ordinary forward instead of the two-stage split,
         which never updates KV-cache or recurrent state, and communication stays on the current
         stream.
+
+        With fused seams the previous layer may have handed its write to this block's compute read;
+        ``hidden_states`` is then only the unwritten residual.
         """
+        if self.fuses_residual_seams and (
+            packed_seq_params is not None or padding_mask is not None
+        ):
+            raise ValueError(
+                "shortcut kernel fusion does not support packed sequences or padding masks"
+            )
+        if self.fused_shortcut_read:
+            # One kernel applies the pending write with the compute and shortcut reads and norms.
+            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+                hidden_states, shortcut_input = apply_module(self.shortcut_residual_read)()
 
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
@@ -634,9 +725,13 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            moe_hidden_states = self._read_shortcut_hidden(
-                moe_hidden_states, recompute_context=attn_recompute_context
-            )
+            if self.fused_shortcut_read:
+                # Already read and normed (the block's shortcut norm is then an identity).
+                moe_hidden_states = shortcut_input
+            else:
+                moe_hidden_states = self._read_shortcut_hidden(
+                    moe_hidden_states, recompute_context=attn_recompute_context
+                )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
                 padding_mask=moe_padding_mask,

@@ -62,6 +62,7 @@ from megatron.core.transformer.utils import (
 from megatron.core.transformer.wide_residual import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
+    link_residual_seams,
     wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
@@ -88,6 +89,10 @@ class HybridStackSubmodules:
     moe_layer: ModuleSpec | type | None = None
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
+    # Submodules for the stack's first and last layers, if they differ (e.g. fused residual seams:
+    # the first layer has no predecessor write to apply, the last no successor read to defer to).
+    first_layer_submodules: "HybridStackSubmodules | None" = None
+    last_layer_submodules: "HybridStackSubmodules | None" = None
 
 
 class HybridStack(MegatronModule):
@@ -222,7 +227,13 @@ class HybridStack(MegatronModule):
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+        stack_submodules = submodules
         for i, layer_config in enumerate(self.layer_config_list):
+            submodules = (
+                (i == 0 and stack_submodules.first_layer_submodules)
+                or (i == len(self.layer_config_list) - 1 and stack_submodules.last_layer_submodules)
+                or stack_submodules
+            )
             layer_number = i + 1 + pp_layer_offset
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
@@ -410,6 +421,10 @@ class HybridStack(MegatronModule):
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
 
+        if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
+            # Fused residual seams (before shortcut grouping, which adds each block's own): link
+            # each deferred write to the next physical layer's fused read.
+            link_residual_seams(self.layers)
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
