@@ -72,6 +72,30 @@ def test_resolve_rejects_a_collection_without_a_required_group(missing, explicit
         resolve_distillation_process_groups(pg_collection, "LogitsSaverHooks")
 
 
+@pytest.mark.parametrize("wrappers", [0, 2])
+@pytest.mark.parametrize("carries_collection", [True, False])
+def test_loss_func_builds_the_kd_loss_on_the_model_collection(
+    monkeypatch, wrappers, carries_collection
+):
+    pg_collection = ProcessGroupCollection()
+    model = SimpleNamespace(training=False)
+    if carries_collection:
+        model.pg_collection = pg_collection
+    for _ in range(wrappers):
+        model = SimpleNamespace(training=False, module=model)
+    built = []
+    monkeypatch.setattr(
+        cached_logits_loss,
+        "CachedLogitsKDLoss",
+        lambda **kwargs: built.append(kwargs["pg_collection"]),
+    )
+
+    LossFuncCallable(logprobs_dir="unused")(torch.ones(2, 3), torch.zeros(2, 3), model)
+
+    # A model that carries no collection leaves the loss on the global groups.
+    assert [id(groups) for groups in built] == [id(pg_collection if carries_collection else None)]
+
+
 # ---------------------------------------------------------------------------
 # Distributed: a model grid unlike the global one
 # ---------------------------------------------------------------------------
