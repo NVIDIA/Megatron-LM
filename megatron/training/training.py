@@ -3163,8 +3163,8 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            # A collection carries no Gloo groups, so get_megatron_optimizer accepts one only
-            # without them; with Gloo groups it builds all of its groups from parallel_state.
+            # Without Gloo groups the optimizer takes its groups from the collection. With them
+            # it still builds every group, the Gloo ones included, from parallel_state.
             pg_collection=None if cfg.dist.use_gloo_process_groups else pg_collection,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
