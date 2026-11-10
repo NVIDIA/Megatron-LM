@@ -18,12 +18,10 @@ import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.pipeline_parallel import schedules
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -108,46 +106,3 @@ class TestMfsdpV2PipelineSharedContext:
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
-
-    def test_no_pipeline_gradient_modes(self, distributed_setup, monkeypatch):
-        """The scheduler scopes intermediate and final MFSDP backwards separately."""
-        device = distributed_setup.device
-        wrapped_chunks = wrap_model_chunks_with_ddp(
-            [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16)],
-            _compute_config(),
-            _mfsdp_v2_ddp_config(),
-            DP=FullyShardedDataParallel,
-            pg_collection=self.pg_collection,
-            disable_bucketing_per_chunk=[False],
-        )
-        first_context = wrapped_chunks[0].module.context
-        modes = []
-
-        def forward_step(*_args, **_kwargs):
-            output = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
-            for chunk in wrapped_chunks:
-                output = chunk(output)
-            return output.sum(), torch.zeros((), device=device, dtype=torch.int)
-
-        def backward_step(_input, output, _grad, _config):
-            modes.append(first_context.gradient_finalization_mode)
-            output.backward()
-
-        monkeypatch.setattr(schedules, "forward_step", forward_step)
-        monkeypatch.setattr(schedules, "backward_step", backward_step)
-        monkeypatch.setattr(schedules, "get_model_type", lambda _model: None)
-        schedules.forward_backward_no_pipelining(
-            forward_step_func=None,
-            data_iterator=None,
-            model=wrapped_chunks[0],
-            num_microbatches=2,
-            seq_length=2,
-            micro_batch_size=2,
-            pg_collection=self.pg_collection,
-        )
-        assert modes == [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
-        assert (
-            first_context.gradient_finalization_mode
-            is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-        )
-        first_context.finish_grad_sync()

@@ -9,8 +9,6 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -779,13 +777,9 @@ def forward_backward_no_pipelining(
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
-    if isinstance(model, FullyShardedDataParallelV2):
-        context = model.module.context
-        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
-        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
-    else:
-        no_sync_func = config.no_sync_func or contextlib.nullcontext
-        sync_func = contextlib.nullcontext
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
 
     model_type = get_model_type(model)
 
@@ -809,7 +803,6 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
-            sync_func=sync_func,
         )
     else:
         with no_sync_func():
@@ -837,29 +830,29 @@ def forward_backward_no_pipelining(
                     # and triggering PyTorch's "AccumulateGrad node's stream does
                     # not match" warning. See issue #4124.
                     del output_tensor
-        with sync_func():
-            # Enable outer reduction for the final microbatch.
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                pg_collection.cp.size(),
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(
-                    first_val_step, forward_only, num_microbatches == 1
-                ),
-                current_microbatch=num_microbatches - 1,
-            )
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            pg_collection.cp.size(),
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, num_microbatches == 1
+            ),
+            current_microbatch=num_microbatches - 1,
+        )
 
-            total_num_tokens += num_tokens
+        total_num_tokens += num_tokens
 
-            if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                del output_tensor
+        if not forward_only:
+            backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -1098,22 +1091,18 @@ def forward_backward_pipelining_with_interleaving(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     # Disable async grad reductions
-    if isinstance(model[0], FullyShardedDataParallelV2):
-        context = model[0].module.context
-        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
-        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
-    else:
-        no_sync_func = config.no_sync_func or contextlib.nullcontext
-        sync_func = contextlib.nullcontext
-        if isinstance(no_sync_func, list):
+    no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
 
-            def multi_no_sync():
-                stack = contextlib.ExitStack()
-                for chunk_no_sync in config.no_sync_func:
-                    stack.enter_context(chunk_no_sync())
-                return stack
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
 
-            no_sync_func = multi_no_sync
+        no_sync_func = multi_no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
     no_sync_context = None
 
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
@@ -1469,10 +1458,7 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        with sync_func() if no_sync_context is None else contextlib.nullcontext():
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -1509,13 +1495,6 @@ def forward_backward_pipelining_with_interleaving(
                 collect_non_loss_data,
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
                 b_virtual_microbatch_id=b_virtual_microbatch_id,
-                sync_func=(
-                    sync_func
-                    if b_virtual_microbatch_id is not None
-                    and is_last_microbatch_for_model_chunk(b_virtual_microbatch_id)
-                    and config.grad_sync_func is None
-                    else contextlib.nullcontext
-                ),
                 pre_forward=pre_forward,
                 pre_backward=pre_backward,
                 post_forward=post_forward,
@@ -2096,10 +2075,9 @@ def forward_backward_pipelining_with_interleaving(
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        with sync_func():
-            finish_embedding_wgrad_compute(
-                config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
-            )
+        finish_embedding_wgrad_compute(
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
+        )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
@@ -2125,7 +2103,6 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
-    enable_grad_sync()
     return forward_data_store
 
 
@@ -2292,13 +2269,9 @@ def forward_backward_pipelining_without_interleaving(
         paged_stash_reset(enabled=not forward_only, config=config)
 
     # Disable async grad reductions
-    if isinstance(model, FullyShardedDataParallelV2):
-        context = model.module.context
-        no_sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.SKIP_OUTER)
-        sync_func = partial(context.finalize_gradients, mode=GradientFinalizationMode.REDUCE_OUTER)
-    else:
-        no_sync_func = config.no_sync_func or contextlib.nullcontext
-        sync_func = contextlib.nullcontext
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
     no_sync_context = None
 
     def disable_grad_sync():
@@ -2493,10 +2466,9 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
-            with sync_func() if no_sync_context is None else contextlib.nullcontext():
-                input_tensor_grad = backward_func(
-                    input_tensor, output_tensor, output_tensor_grad, config
-                )
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
 
             if last_iteration:
                 input_tensor = None
@@ -2531,10 +2503,9 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            with sync_func() if no_sync_context is None else contextlib.nullcontext():
-                input_tensor_grad = backward_func(
-                    input_tensor, output_tensor, output_tensor_grad, config
-                )
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
@@ -2548,10 +2519,9 @@ def forward_backward_pipelining_without_interleaving(
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        with sync_func():
-            finish_embedding_wgrad_compute(
-                config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
-            )
+        finish_embedding_wgrad_compute(
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
+        )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
@@ -2572,5 +2542,4 @@ def forward_backward_pipelining_without_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
-    enable_grad_sync()
     return forward_data_store
