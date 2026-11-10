@@ -3,7 +3,7 @@
 """Oracle for ``flashinfer.rope.apply_rope_with_cos_sin_cache`` at Megatron's call site.
 
 Call site: ``DynamicInferenceContext.apply_fused_qk_rotary_emb``
-(``megatron/core/inference/contexts/dynamic_context.py:2192-2241``), called by
+(``megatron/core/inference/contexts/dynamic_context.py:2335-2384``), called by
 ``Attention._adjust_key_value_for_inference`` (``transformer/attention.py:726-729``) when
 ``use_flashinfer_fused_rope`` is on. The cache is ``GPTModel``'s
 ``torch.cat(RotaryEmbedding.get_cos_sin(L), -1)``: fp32 ``[L, R]``, the cosines of the ``R/2``
