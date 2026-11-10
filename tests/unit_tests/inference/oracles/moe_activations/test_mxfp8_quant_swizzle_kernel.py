@@ -34,7 +34,11 @@ in registers, ``BLOCK_K = next_pow2(K)`` with ``BLOCK_GROUPS = BLOCK_K / 32`` bl
 ``K / 32`` are real; scale tiles of 128 rows by 4 columns. Covered: K around powers of two and
 with 1-3 padded scale columns, production widths; M around the 128-row tile; the three input
 dtypes; random, wide-range, round-up-tie and E4M3-midpoint, and zero/sign-of-zero inputs; reused
-storage; the ``scaled_mm`` consumer (Blackwell); row offsets past 2**31 (``large``).
+storage; non-contiguous and unaligned inputs through each entry point (#8357); the ``scaled_mm``
+consumer (Blackwell); row offsets past 2**31 (``large``). Blocks with ``amax / 448`` at most
+2**-127 (finding O2-N1, which fails on main) are #8956's regression test
+``TestMxfp8Quantize::test_tiny_groups_take_the_smallest_scale``
+(``tests/unit_tests/inference/test_mxfp8_utils.py``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -126,8 +130,10 @@ def test_mxfp8_tensor_entry_points():
 def test_strided_input_is_quantized_or_rejected():
     """A strided [M, K] view is quantized by its values, or rejected; never misread.
 
-    Fails on main: ``mxfp8_quantize`` does not check contiguity and its kernel addresses row r
-    at ``r * K``, so a transposed view quantizes the wrong elements (suspected finding O2-N2).
+    Finding O2-N2: before #8357 (merged into main 2026-11-07), ``mxfp8_quantize`` did not check
+    contiguity and its kernel addresses row r at ``r * K``, so a transposed view quantized the
+    wrong elements. ``mxfp8_quantize_into`` now copies a non-contiguous input to contiguous
+    storage first, so this passes on main (``test_non_contiguous_inputs`` covers more layouts).
     """
     g = ou.make_generator()
     base = mx.mx_inputs(256, 128, torch.bfloat16, "wide", g).to(DEVICE)
@@ -140,29 +146,41 @@ def test_strided_input_is_quantized_or_rejected():
     mx.assert_matches_spec(data, scale, x.contiguous(), what="strided input")
 
 
-TINY_AMAX = (448.0 * 2.0**-127, 2.0**-126, 2.0**-127, 2.0**-130, 2.0**-133)
+ENTRY_POINTS = ("mxfp8_quantize", "mxfp8_quantize_into", "from_bf16")
+INPUT_LAYOUTS = mx.STRIDED_LAYOUTS + ("offset",)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_tiny_blocks_take_the_smallest_scale(dtype):
-    """Blocks whose ``amax / 448`` is at most 2**-127 take E8M0's smallest scale, 0x00
-    (2**-127): it is the smallest power of two with ``amax / X <= 448``.
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+@pytest.mark.parametrize("layout", INPUT_LAYOUTS)
+def test_non_contiguous_inputs(layout, entry):
+    """Every entry point quantizes a non-contiguous view (transpose, column slice, row step,
+    column step, broadcast row) by its values, and a contiguous view at an unaligned offset too;
+    the input is not modified and nothing outside the outputs is written (#8357)."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
-    Fails on main (suspected finding O2-N1): the kernel rounds ``amax / 448`` up by adding
-    0x7FFFFF to its fp32 bits, which for an fp32 subnormal quotient yields 2**-126 (byte 0x01).
-    The codes then differ too (half the spec's), although both encodings decode to nearly the
-    same values. A round-up E8M0 conversion such as ``cvt.rp.satfinite.ue8m0x2.f32`` gives 0x00
-    (recalled from the PTX semantics, not run here).
-    """
-    rows = len(TINY_AMAX)
-    x = torch.zeros(rows, 64, dtype=torch.float64)
-    for r, amax in enumerate(TINY_AMAX):
-        x[r, 0] = amax
-        x[r, 1:32] = torch.linspace(-amax, amax, 31, dtype=torch.float64)
-        x[r, 32:] = 1.5  # an ordinary block next to it
-    x = x.to(dtype).to(DEVICE)
-    data, scale = quantize_guarded(x)
-    mx.assert_matches_spec(data, scale, x, what=f"tiny blocks, {dtype}")
+    dtype = DTYPES[(INPUT_LAYOUTS.index(layout) + ENTRY_POINTS.index(entry)) % len(DTYPES)]
+    rows, width = 128, 160
+    x = mx.input_view(layout, rows, width, dtype, ou.make_generator(), DEVICE)
+    assert x.is_contiguous() == (layout == "offset")
+    before = x.clone()
+    what = f"{layout} {str(dtype)[6:]} view through {entry}"
+    if entry == "mxfp8_quantize":
+        data, scale = quantize_guarded(x)
+    elif entry == "mxfp8_quantize_into":
+        data_buf = ou.guarded_empty((rows, width), torch.float8_e4m3fn, DEVICE)
+        scale_buf = ou.guarded_empty((mx.scale_bytes(rows, width),), torch.uint8, DEVICE)
+        scale_buf.tensor.fill_(0xA7)
+        with _common.launcher_on_cpu():
+            mq.mxfp8_quantize_into(x, data_buf.tensor, scale_buf.tensor)
+        ou.check_guards(data=data_buf, scale=scale_buf)
+        data, scale = data_buf.tensor, scale_buf.tensor
+    else:
+        with _common.launcher_on_cpu():
+            t = MXFP8Tensor.from_bf16(x, backend="triton")
+        assert t.dtype == dtype
+        data, scale = t.data, t.scale
+    ou.assert_exact(x, before, what=f"{what}: x is read-only")
+    mx.assert_matches_spec(data, scale, before.contiguous(), what=what)
 
 
 def test_special_values():

@@ -39,7 +39,8 @@ rows; ``ZERO_PADDING`` is a compile-time variant (production passes False; the B
 callers of the sibling kernels pass True); int64 row offsets. Covered: both ``ZERO_PADDING``
 variants; N around the 1024 tile cap and inside one tile (masked tails), production widths;
 M and ``n_used`` around the 512-program grid; padding at program starts and wraps; int32 and
-int64 maps; CUDA-graph replay with a changed ``n_used``; offsets past 2**31 (``large``).
+int64 maps holding token indices in expert-grouped order (not the identity, as in production);
+CUDA-graph replay with a changed ``n_used``; offsets past 2**31 (``large``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``): the torch-backend BF16 and MXFP8 SwiGLU experts
 run this kernel on both.

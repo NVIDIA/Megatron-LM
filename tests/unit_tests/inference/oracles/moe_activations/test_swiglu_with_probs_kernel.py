@@ -11,9 +11,11 @@ kernel):
   ``out[r, c] = silu(x[r, c]) * x[r, N + c] * probs[r]`` (gate first), in fp32 with one bf16
   rounding, and **bitwise equal to training's fused ``weighted_swiglu(x, probs[:, None])``**
   (``torch.compile``, the op batch-invariant training runs).
-* **Inputs:** ``x`` [M, 2N] bf16 contiguous; ``permutation_map`` [M] int (-1 = padding);
-  ``n_used`` 1-element device int32; ``probs`` [M] fp32 routing probabilities;
-  ``zero_padding`` (True on the MXFP8 path, whose quantizer and GEMM read padding rows).
+* **Inputs:** ``x`` [M, 2N] bf16 contiguous; ``permutation_map`` [M] int, the original token
+  of each row (-1 = padding); ``n_used`` 1-element device int32; ``probs`` [M] fp32 routing
+  probabilities of the permuted rows (the call site passes ``permuted_probs``: ``probs[r]``
+  belongs to row ``r``, not to token ``permutation_map[r]``); ``zero_padding`` (True on the
+  MXFP8 path, whose quantizer and GEMM read padding rows).
 * **Outputs:** a new [M, N] bf16 tensor. Padding rows below ``n_used``: +0.0 with
   ``zero_padding``, untouched otherwise. Rows ``>= n_used``: untouched. ``x`` and ``probs``
   are not modified.
@@ -26,7 +28,9 @@ PR #8566's GLU options and gated squared ReLU are covered by ``test_glu_options.
 branch stacked on that PR).
 
 Structure: ``BLOCK_SIZE = min(next_pow2(N), 1024)``; ``NUM_BLOCKS = min(M, 512)`` persistent
-programs over ``min(n_used, M)`` rows; ``ZERO_PADDING`` compile-time variant.
+programs over ``min(n_used, M)`` rows; ``ZERO_PADDING`` compile-time variant. The maps hold
+token indices in expert-grouped order with repeats (``_glu.expert_grouped_token_indices``), as
+in production, so a probability (or input) read through the map instead of by the row shows.
 """
 
 import pytest

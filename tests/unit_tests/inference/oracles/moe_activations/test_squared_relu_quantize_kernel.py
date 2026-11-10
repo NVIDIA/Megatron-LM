@@ -30,7 +30,14 @@ spec; written before reading the kernel):
 Structure: persistent grid ``NUM_BLOCKS = min(M, 512)`` over rows; the whole row in registers,
 ``BLOCK_K = next_pow2(K)`` with ``K / 32`` real groups; ``CLAMP`` compile-time variant. Covered:
 both ``CLAMP`` variants, K around powers of two and with padded scale columns, production
-widths, M and ``n_used`` around the grid and the 128-row tile, padding layouts.
+widths and a production buffer, M and ``n_used`` around the grid and the 128-row tile, padding
+layouts, CUDA-graph replay with changing ``n_used``, row offsets past 2**31 (``large``). Cases
+that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_mxfp8_utils.py``: NaN propagation (finding O2-N3) in #8955's
+``test_squared_relu_and_quantize_mxfp8_propagates_nan``; blocks with activation amax at most
+``448 * 2**-127`` (O2-N1) and a strided ``x`` (O2-N2) in #8956's
+``TestSquaredReluAndQuantizeMxfp8::test_tiny_groups_take_the_smallest_scale`` and
+``test_rejects_strided_input``.
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -163,18 +170,15 @@ def test_mxfp8_boundaries(clamp):
 
 @pytest.mark.parametrize("clamp", [None, 8.0])
 def test_special_values(clamp):
-    """NaN propagates through the squared ReLU and decodes to NaN; +inf decodes to NaN or
-    saturates; -inf gives 0; blocks without them are unaffected.
+    """+inf decodes to NaN or saturates; -inf gives 0; blocks without them are unaffected.
 
-    Fails on main (suspected finding O2-N3): the ReLU is ``tl.maximum(x, 0.0)`` with Triton's
-    default ``propagate_nan=NONE``, which lowers to ``maxnumf`` and returns 0 for a NaN input
-    (the interpreter's ``np.fmax`` does the same), so an upstream NaN is quantized to 0 instead
-    of surfacing as training's ``relu(NaN) = NaN`` would.
+    A NaN input (finding O2-N3: it decodes to 0 on main) is #8955's regression test
+    ``test_squared_relu_and_quantize_mxfp8_propagates_nan``.
     """
     rows, width = 4, 160
     g = ou.make_generator()
     x = torch.randn(rows, width, generator=g).to(torch.bfloat16)
-    special = [(0, 3, float("nan")), (1, 40, float("inf")), (2, 70, float("-inf"))]
+    special = [(1, 40, float("inf")), (2, 70, float("-inf"))]
     for r, c, v in special:
         x[r, c] = v
     x = x.to(DEVICE)
@@ -182,8 +186,8 @@ def test_special_values(clamp):
     t = run_fused(x, perm, _common.device_scalar(rows), clamp)
     scales, _ = mx.unswizzle(t.scale.cpu(), rows, width // mx.BLOCK)
     codes = t.data.cpu().view(torch.uint8)
-    # NaN blocks, and +inf blocks unless the clamp maps +inf to s (tanh saturates).
-    bad = {(r, c // mx.BLOCK) for r, c, v in special if v != v or (v > 0 and clamp is None)}
+    # +inf blocks, unless the clamp maps +inf to s (tanh saturates).
+    bad = {(r, c // mx.BLOCK) for r, c, v in special if v > 0 and clamp is None}
     for r in range(rows):
         for b in range(width // mx.BLOCK):
             if (r, b) in bad:
@@ -197,8 +201,6 @@ def test_special_values(clamp):
                 what=f"block {r},{b}",
             )
     decoded = mx.dequantize(codes, scales)
-    nan_value = decoded[0, 3].item()
-    assert nan_value != nan_value, f"relu(NaN)**2 decodes to {nan_value}, not NaN"
     inf_value = decoded[1, 40].item()
     sat = 448.0 * mx.e8m0_decode(scales[1, 40 // mx.BLOCK]).item()
     if clamp is None:
@@ -213,3 +215,55 @@ def test_sanitizer_small():
     perm = _glu.permutation_map(130, "runs", torch.int32, g, DEVICE)
     t = run_fused(x, perm, _common.device_scalar(100), 8.0)
     check(t, x, perm, 100, 8.0, "sanitizer case")
+
+
+@pytest.mark.parametrize("clamp", [None, 10.0])
+def test_production_buffer(clamp):
+    """A production buffer: 8192 expert-grouped rows of the nanov3 expert width (1856), 6016
+    used (a multiple of the 128-row MXFP8 alignment), 10% alignment padding."""
+    g = ou.make_generator(device=DEVICE)
+    rows, width, n_used = 8192, 1856, 6016
+    scale = 4.0 if clamp is None else 1.5 * clamp
+    x = (torch.randn(rows, width, generator=g, device=DEVICE) * scale).to(torch.bfloat16)
+    perm = _glu.permutation_map(rows, "random", torch.int32, g, DEVICE)
+    t = run_fused(x, perm, _common.device_scalar(n_used), clamp)
+    check(t, x, perm, n_used, clamp, f"production buffer, clamp {clamp}")
+
+
+@_common.needs_cuda
+def test_cuda_graph_replay_follows_device_count():
+    """Captured once, replayed with other ``n_used`` values: the data is poisoned and the scales
+    zeroed before each replay, and rows past each count and padding rows must stay so."""
+    g = ou.make_generator(device=DEVICE)
+    rows, width, clamp = 2 * PROGRAMS_CAP, 160, 8.0
+    x = (torch.randn(rows, width, generator=g, device=DEVICE) * 12).to(torch.bfloat16)
+    perm = _glu.permutation_map(rows, "program-stride", torch.int32, g, DEVICE)
+    n_used = _common.device_scalar(rows)
+    activations.squared_relu_and_quantize_mxfp8(x, perm, n_used, clamp_scale=clamp)  # compile
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        t = activations.squared_relu_and_quantize_mxfp8(x, perm, n_used, clamp_scale=clamp)
+    for count in (1, PROGRAMS_CAP + 1, 0, rows, PROGRAMS_CAP - 1):
+        ou.poison_(t.data)
+        t.scale.view(torch.uint8).zero_()
+        n_used.fill_(count)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(t, x, perm, count, clamp, f"replay with n_used={count}")
+
+
+@pytest.mark.parametrize("rows", ou.int32_overflow_params(2688))
+def test_offsets_past_int32(rows):
+    """Row offsets ``row * K`` reach 2**31 at a production width: rows around the crossing and
+    the last rows."""
+    width = 2688
+    ou.require_free_memory(rows * width * 3 + 2**30)
+    x = torch.ones(rows, width, dtype=torch.bfloat16, device=DEVICE)
+    probe = sorted({0, 2**31 // width - 1, min(2**31 // width, rows - 1), rows - 2, rows - 1})
+    g = ou.make_generator(device=DEVICE)
+    x[probe] = (torch.randn(len(probe), width, generator=g, device=DEVICE) * 4).to(torch.bfloat16)
+    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
+    t = activations.squared_relu_and_quantize_mxfp8(x, perm, _common.device_scalar(rows))
+    scales, _ = mx.unswizzle(t.scale.cpu(), rows, width // mx.BLOCK)
+    assert_quantized_activation(t.data[probe], scales[probe], x[probe], None, what=f"rows {probe}")
