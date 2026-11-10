@@ -6833,6 +6833,49 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_abort_of_queued_request_ends_it_without_admission(self):
+        """An abort of a request still in the queue ends it at once.
+
+        The coordinator acknowledges the abort as source-safe, so the engine must not then
+        admit the request and prefill a prompt whose output nobody reads.
+        """
+        env = self._build_test_env(DynamicEngineTestConfig(num_requests=2))
+        engine = env.engine
+        first, queued = env.requests[0], env.requests[1]
+        futures = [engine._add_request(request) for request in (first, queued)]
+        assert list(engine.waiting_request_ids) == [first.request_id, queued.request_id]
+
+        engine.use_coordinator = engine.is_mp_coordinator = True
+        socket = engine.socket_for_receiving_requests = mock.Mock()
+        socket.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.ABORT_REQUEST.value, queued.request_id], use_bin_type=True)],
+            dynamic_engine_coordinator.zmq.Again,
+        ]
+        engine.model_parallel_publisher_socket = mock.Mock()
+        engine.schedule_requests()
+
+        acknowledged = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
+        assert acknowledged == [Headers.REQUEST_ABORTED.value, queued.request_id, True]
+        assert list(engine.waiting_request_ids) == [first.request_id]
+        assert queued.request_id not in engine.requests
+        finished = futures[1].result()
+        assert finished.status == Status.COMPLETED and finished.generated_tokens == []
+        replies = [call.args[0] for call in socket.send_multipart.call_args_list]
+        replied = [[entry[0] for entry in msgpack.unpackb(f[0], raw=False)[1]] for f in replies]
+        assert replied == [[queued.request_id]]
+
+        # The other request runs alone; the aborted one never enters the context.
+        while not futures[0].done():
+            engine.step_modern()
+            rows = engine.context.request_ids[: engine.context.total_request_count].tolist()
+            assert queued.request_id not in rows
+        assert futures[0].result().status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
     @torch.inference_mode()
     def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
