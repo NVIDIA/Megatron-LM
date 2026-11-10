@@ -42,11 +42,13 @@ turn; chunk boundaries from `delta_rule.STAGE_PACKS`. Production: GDP 800m (32 h
 GDN (32 heads, K = V = 128, M 1) on a 4096-token pack with fp32 caches and fp32 chunk states.
 
 Memory: a direct launch into guarded NaN-poisoned h, v_new and cache (unmapped slots and padding rows
-poisoned); `sanitizer` on a small case. int32: the chunk-state offset (chunk_offsets[n] * H + h) * K * V
-and the row offsets bos * H * K / V are int32 products; `test_chunk_state_offsets_past_int32` (`large`)
-puts a sequence's chunk states past 2^31 elements. Suspected finding O7b-M2 (by reading, see the packet
-file): expected to fail on main there; a prefill step reaches it at chunk rows x H x K x V >= 2^31, e.g.
-262144 tokens at the GDN default shape (H 32, K = V = 128).
+poisoned); `sanitizer` on a small case. int32: on main the chunk-state offset
+(chunk_offsets[n] * H + h) * K * V and the row offsets bos * H * K / V are int32 products, so chunk
+states at or past 2^31 elements are addressed wrongly (finding O7b-M2); a prefill step reaches it at chunk
+rows x H x K x V >= 2^31, e.g. 262144 tokens at the GDN default shape (H 32, K = V = 128). #9315
+(fix/gdp-chunk-int64-offsets) forms them in int64 and carries those cases as its regression tests
+(tests/unit_tests/ssm/ops/gdp/test_chunk_offsets.py, `test_chunk_states_past_int32_offsets`);
+`test_chunk_state_offsets_past_int32` (`large`) puts a sequence's chunk states just below 2^31 elements.
 """
 
 import pytest
@@ -435,14 +437,14 @@ ROW_ELEMS = 256 * 256
     "rows_before",
     [
         pytest.param(2**31 // ROW_ELEMS - 1, id="base-fits", marks=pytest.mark.large),
-        pytest.param(2**31 // ROW_ELEMS, id="base-at-2^31", marks=pytest.mark.large),
+        # A base at 2^31 fails on main (O7b-M2): #9315's test_chunk_states_past_int32_offsets[states].
     ],
 )
 def test_chunk_state_offsets_past_int32(rows_before):
     """A sequence whose chunk states start at row `rows_before` of h (H 1, K = V = 256: 65536 elements a
     row), after a sequence of zeros `rows_before` chunks long: its base offset (chunk_offsets[n] * H + h)
-    * K * V is just below 2^31 elements, or exactly 2^31. The contract holds at any offset;
-    `[base-at-2^31]` is expected to fail on main (suspected O7b-M2: the offset is an int32 product).
+    * K * V is just below 2^31 elements. A base at exactly 2^31 fails on main (O7b-M2: the offset is an
+    int32 product) and is #9315's regression case.
     """
     K = V = 256
     L_a, L_b = rows_before * CHUNK, CHUNK + 1

@@ -34,10 +34,12 @@ K 128, V 64, M 3) and GDN (32 heads, K = V = 128) on a 4096-token pack.
 
 Memory: a direct launch into a guarded NaN-poisoned o: rows outside every sequence stay poisoned; NaN in
 the tail tokens' inputs and the padded h rows must not reach owned rows; `sanitizer` on a small case.
-int32: h's row offset is int64, but the q/k/v/o base offsets (bos * [M *] H + h) * K / V are int32
-products; `test_key_offsets_past_int32` (`large`) starts a sequence where bos * M * H * K crosses 2^31.
-Suspected finding O7b-M2 (by reading): expected to fail on main there; a GDP 800m prefill step (M 3, 32
-heads, K 128) reaches it at 174763 tokens.
+int32: h's row offset is int64, but on main the q/k/v/o base offsets (bos * [M *] H + h) * K / V are int32
+products, so a sequence whose keys start past 2^31 elements reads wrapped offsets (finding O7b-M2); a
+GDP 800m prefill step (M 3, 32 heads, K 128) reaches it at 174763 tokens. #9315
+(fix/gdp-chunk-int64-offsets) forms them in int64 and carries those cases as its regression tests
+(tests/unit_tests/ssm/ops/gdp/test_chunk_offsets.py, `test_outputs_past_int32_offsets`);
+`test_key_offsets_past_int32` (`large`) starts a sequence just below it.
 """
 
 import pytest
@@ -280,13 +282,13 @@ KEY_ROW = LARGE_M * LARGE_K
     "bos",
     [
         pytest.param((2**31 - 1) // KEY_ROW, id="base-fits", marks=pytest.mark.large),
-        pytest.param(-(-(2**31) // KEY_ROW), id="base-past-2^31", marks=pytest.mark.large),
+        # A base past 2^31 fails on main (O7b-M2): #9315's test_outputs_past_int32_offsets.
     ],
 )
 def test_key_offsets_past_int32(bos):
     """A 65-token sequence starting at token `bos`, after a sequence of zeros: its k/v base offset
-    bos * M * H * K is just below or just past 2^31 elements (H 1, K = V = 256, M 3). The contract holds
-    at any offset; `[base-past-2^31]` is expected to fail on main (suspected O7b-M2)."""
+    bos * M * H * K is just below 2^31 elements (H 1, K = V = 256, M 3). A base past 2^31 fails on main
+    (O7b-M2) and is #9315's regression case."""
     K = V = LARGE_K
     M = LARGE_M
     L_b = CHUNK + 1

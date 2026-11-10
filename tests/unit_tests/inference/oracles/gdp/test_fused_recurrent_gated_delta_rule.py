@@ -55,14 +55,15 @@ int32: dynamic slot offsets are int64 by design; `test_state_offsets_past_int32`
 at a slot whose state and snapshot offsets cross 2^31 elements. Not covered: the static (no-index) path's
 `i_nh * K * V` offset at 2^31 (a static batch of thousands of requests, not realistic).
 
-Suspected finding O7b-M1 (GDN decode, no fix PR): with `A_log` the kernel forms softplus as
-log(1 + exp(x)) in fp32 (inline PTX `ex2.approx`/`lg2.approx` on NVIDIA, `tl.math.log(1 + tl.math.exp(x))`
-elsewhere), whose absolute error of ~2^-24 is a relative error of ~1e-4 at production gate arguments
-(x = a + dt_bias ~ -7); exp(A_log) up to 16 carries it into the decay. GDN prefill forms the same gate with
-torch's softplus. With an fp32 state that is 9.5-11.7x torch's fp32 state error on H100 (pdx 7987035; ~8x
-in the Triton interpreter), so `test_gdn_decode_fp32_state` and `test_production_decode_shapes[gdn-fp32_state]` are
-expected to fail on main on the state check; their outputs (bf16) and every bf16-state case pass. It is the
-GDN analog of O7-N1 (Mamba decode softplus).
+Finding O7b-M1 (GDN decode): on main, with `A_log` the kernel forms softplus as log(1 + exp(x)) in fp32
+(inline PTX `ex2.approx`/`lg2.approx` on NVIDIA, `tl.math.log(1 + tl.math.exp(x))` elsewhere), whose
+absolute error of ~2^-24 is a relative error of ~1e-4 at production gate arguments (x = a + dt_bias ~ -7);
+exp(A_log) up to 16 carries it into the decay. GDN prefill forms the same gate with torch's softplus. With
+an fp32 state that is 9.5-11.7x torch's fp32 state error on H100 (pdx 7987035; ~8x in the Triton
+interpreter); bf16 outputs and bf16 states pass. It is the GDN analog of O7-N1 (Mamba decode softplus).
+#8960 (fix/mamba-decode-softplus) computes it as log1p(exp(x)) and carries the GDN fp32-state cases as its
+regression tests (tests/unit_tests/ssm/ops/gdp/test_fused_recurrent_gate.py, `TestGDNDecodeGate`), so this
+module runs GDN decode with a bf16 state only.
 """
 
 from dataclasses import dataclass, field, replace
@@ -96,7 +97,7 @@ large carried state dominates the step's update, that approximation sets the fp3
 2.08x the trusted rms error on H100 (pdx 7987035), every other fp32-state case <= 2x. In the Triton
 interpreter (IEEE exp) the same case measures 1.6x, and 3.1-3.7x with a 1-ulp-rms error injected into
 exp (1.3-1.75x into sqrt and division instead). Wiring errors are O(1); O7b-M1's softplus error measured
-9.5-11.7x on H100, so its cases still fail at this factor."""
+9.5-11.7x on H100, well above this factor."""
 
 
 @dataclass
@@ -412,28 +413,6 @@ def test_gdn_decode_matches_fp64(case):
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize(
-    "case",
-    _params(
-        [
-            ("H2-HV4-K128-V128", Case(mode="gdn", M=1, S=1, H=2, HV=4, K=128, V=128, state="fp32")),
-            (
-                "H1-HV8-K64-V9-nol2",
-                Case(mode="gdn", M=1, S=1, H=1, HV=8, K=64, V=9, l2norm=False, state="fp32"),
-            ),
-        ]
-    ),
-)
-def test_gdn_decode_fp32_state(case):
-    """GDN decode with an fp32 state (`--mamba-inference-ssm-states-dtype fp32`, used by the functional tests).
-
-    Expected to fail on main at the final-state check: suspected finding O7b-M1 (the in-kernel softplus's
-    absolute error, see the module docstring). The bf16 output is checked first and passes.
-    """
-    run_decode(case)
-
-
-@ou.requires_sm(ou.HOPPER)
 @pytest.mark.parametrize("x", [19.5, 20.0, 20.5, 90.0, 1000.0], ids=lambda x: f"x{x:g}")
 def test_gdn_gate_saturates_above_20(x):
     """The in-kernel softplus is the identity above 20, so a large gate argument decays by exp(-A x), not
@@ -632,8 +611,8 @@ PRODUCTION = {
     ),
     "gdp-S1-bf16_state": Case(mode="gdp", M=3, S=1, H=32, HV=32, K=128, V=64, state="bf16"),
     # GDN: TransformerConfig defaults (Qwen3-Next): 16 key heads, 32 value heads, K = V = 128.
+    # Its fp32 state fails on main (O7b-M1): #8960's TestGDNDecodeGate checks this shape with it.
     "gdn-bf16_state": Case(mode="gdn", M=1, S=1, H=16, HV=32, K=128, V=128, state="bf16"),
-    "gdn-fp32_state": Case(mode="gdn", M=1, S=1, H=16, HV=32, K=128, V=128, state="fp32"),
 }
 
 
@@ -646,8 +625,7 @@ def _production_rows(n_live=64, n_pad=8, slots=96):
 @ou.requires_sm(ou.HOPPER)
 @pytest.mark.parametrize("name", list(PRODUCTION))
 def test_production_decode_shapes(name):
-    """Production decode batches: 64 requests (and 8 padding rows) at the GDP 800m and GDN default shapes.
-    `[gdn-fp32_state]` is expected to fail on main at the state check (O7b-M1)."""
+    """Production decode batches: 64 requests (and 8 padding rows) at the GDP 800m and GDN default shapes."""
     rows, slots = _production_rows()
     run_decode(replace(PRODUCTION[name], rows=rows, slot_count=slots))
 
