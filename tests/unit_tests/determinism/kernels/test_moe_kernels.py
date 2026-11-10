@@ -2053,3 +2053,27 @@ def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
         grad_outputs={"out": grad},
         what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
     )
+
+
+@pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
+def test_ep_invariant_tree_replays(weighted):
+    """moe_ep_invariant_combine's training tree (forward, row and probability gradients)
+    replays bit-exactly, with missing routes and three-expert leaves (96 experts)."""
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    seeded()
+    tokens, experts, topk, hidden = 4096, 96, 6, 256
+    cols = torch.rand(tokens, experts, device="cuda").topk(topk, 1).indices
+    slot_rows = torch.arange(tokens * topk, device="cuda").view(tokens, topk)
+    slot_rows[::5, 0] = -1
+    rows = torch.randn(
+        tokens * topk, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    if weighted:
+        probs = torch.rand(tokens, experts, device="cuda", requires_grad=True)
+        fn, inputs = (lambda r, p: eic.tree_combine(r, slot_rows, cols, experts, p)), (rows, probs)
+    else:
+        fn, inputs = (lambda r: eic.tree_combine(r, slot_rows, cols, experts)), (rows,)
+    assert_replays_bit_exact(
+        fn, inputs, replays=3, contention=True, what=f"EP-invariant tree, weighted={weighted}"
+    )
