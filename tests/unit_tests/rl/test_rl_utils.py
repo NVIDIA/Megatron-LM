@@ -106,6 +106,7 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         pass
 
 
+@pytest.mark.parametrize("data_parallel_fields", [("dp_gtp_remat", "dp"), ("dp",)])
 @pytest.mark.parametrize(
     "skip_train, rollout_only, optimizer",
     [
@@ -115,18 +116,24 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         (True, False, None),
     ],
 )
-def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
+def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer, data_parallel_fields):
     """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
     loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
-    the run eval-only."""
+    the run eval-only. The calculator gets the size of the model's dp_gtp_remat group, or of dp
+    for a collection that predates that field."""
     calls = []
     args = SimpleNamespace()
     run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
-    # The inference model's default sizes and the calculator come from the model's groups.
-    pg_collection = SimpleNamespace(dp_gtp_remat=SimpleNamespace(size=lambda: 4), dp=None)
+    # The inference model's default sizes and the calculator come from the model's groups. The
+    # group that sizes the calculator has 4 ranks; dp has 2 when dp_gtp_remat is set as well.
+    sized_by, *others = data_parallel_fields
+    pg_collection = ProcessGroupCollection(
+        **{sized_by: SimpleNamespace(size=lambda: 4)},
+        **{field: SimpleNamespace(size=lambda: 2) for field in others},
+    )
     monkeypatch.setattr(
         training_setup,
         "get_attr_wrapped_model",
