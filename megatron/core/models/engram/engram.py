@@ -37,6 +37,7 @@ from .cp_layout import (
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .symmetric_lookup import select_engram_lookup
 from .table_sharding import ENGRAM_PARAMETER_DOMAIN, resolve_engram_groups, tag_engram_tables
 
 logger = logging.getLogger(__name__)
@@ -338,6 +339,9 @@ class Engram(MegatronModule):
         row_group, replica_group, parameter_domain = resolve_engram_groups(
             pg_collection, engram_config
         )
+        # The lookup is chosen once, before any table is allocated: the symmetric backend
+        # checks its libraries here, so a missing one fails before a parameter exists.
+        make_lookup = select_engram_lookup(engram_config, row_group)
         self.embedding = EPShardedMultiTableEmbedding(
             config=config,
             table_sizes=table_sizes,
@@ -352,6 +356,10 @@ class Engram(MegatronModule):
         if engram_config.freeze_embedding:
             for table in self.embedding.tables:
                 table.weight.requires_grad_(False)
+        # The embedding's own call (NCCL all-to-alls) or a SymmetricEngramLookup bound to it:
+        # a bound method or a plain object, never a submodule, so the state dict keeps only the
+        # embedding's keys.
+        self._lookup = make_lookup(self.embedding)
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         # Official Qwen PLE layout: one fused key projection over all residual streams, one
         # shared value projection, and one group RMSNorm per role. This is mathematically
@@ -620,7 +628,7 @@ class Engram(MegatronModule):
         message = "engram.lookup"
         nvtx_range_push(message)
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            memory = self._lookup(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
         streams = hidden_states.view(

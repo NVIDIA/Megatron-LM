@@ -18,7 +18,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -35,6 +35,9 @@ TOKENIZER_MAP_VERSION = 1
 _MOE_CAPTURE_MODULES = frozenset(
     (CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
 )
+
+# Values of EngramConfig.communication_backend once resolved.
+COMMUNICATION_BACKENDS = ("symmetric", "nccl")
 
 
 def is_prime(value: int) -> bool:
@@ -300,6 +303,22 @@ class EngramConfig:
     parallel sizes of 1 and no GTP weight remat. None shards the rows over the expert-parallel
     group and replicates them over expert data parallelism."""
 
+    communication_backend: Literal["symmetric", "nccl"] | None = None
+    """How the rows are looked up across the ranks they are sharded over. 'nccl' runs NCCL
+    all-to-alls over the row group. 'symmetric' reads the rows through the CuTe DSL / NCCL4Py
+    device transport (loads from registered table windows inside an NVLink domain, GIN across
+    domains) and adds the gradients, row-sparse, into main_grad; it needs parallel_size, CUDA,
+    Triton, nvidia-cutlass-dsl >= 4.8.1, nccl4py >= 0.6.0 with a matching NCCL runtime and
+    device bitcode, and table storage that NCCL can register
+    (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). None resolves to 'symmetric' when
+    parallel_size is above 1 and to 'nccl' otherwise: one rank per row group owns every row, and
+    both backends then look the rows up locally. The expert-parallel layout supports only
+    'nccl'."""
+
+    symmetric_workspace_mb: int = 64
+    """Size in MiB of the workspace window the symmetric transport of each row group registers on
+    every rank: the staging and receive slots of its exchanges and their completion flags."""
+
     variant_spec: EngramVariant = field(init=False, repr=False)
     """Conventions of the selected variant, resolved from variant."""
 
@@ -320,6 +339,7 @@ class EngramConfig:
         self.layer_ids = tuple(self.layer_ids)
         self.variant_spec = resolve_variant(self.variant)
         self._validate_values()
+        self._resolve_communication_backend()
         if self.variant_spec.uses_tokenizer_artifact:
             self._load_tokenizer_map()
             self.table_sizes_by_layer = allocate_table_sizes(
@@ -365,6 +385,8 @@ class EngramConfig:
             embedding_weight_decay=args.engram_embedding_weight_decay,
             freeze_embedding=getattr(args, "engram_freeze_embedding", False),
             parallel_size=getattr(args, "engram_parallel_size", None),
+            communication_backend=getattr(args, "engram_communication_backend", None),
+            symmetric_workspace_mb=getattr(args, "engram_symmetric_workspace_mb", 64),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(
@@ -477,6 +499,40 @@ class EngramConfig:
             raise ValueError(
                 f"The {self.variant} variant uses one shared ngram_vocab_size_base; every "
                 f"engram_vocab_sizes value must be equal, got {self.global_vocab_sizes}."
+            )
+
+    def _resolve_communication_backend(self) -> None:
+        """Resolve communication_backend in place and reject the unsupported combinations."""
+        sharded = self.parallel_size is not None
+        if self.communication_backend is None:
+            # A single-rank row group looks its rows up locally with either backend, so the
+            # default asks nothing of the symmetric transport's toolchain there.
+            self.communication_backend = (
+                "symmetric" if sharded and self.parallel_size > 1 else "nccl"
+            )
+        elif self.communication_backend not in COMMUNICATION_BACKENDS:
+            raise ValueError(
+                f"engram_communication_backend must be one of {COMMUNICATION_BACKENDS} or None, "
+                f"got {self.communication_backend!r}."
+            )
+        if type(self.symmetric_workspace_mb) is not int or self.symmetric_workspace_mb <= 0:
+            raise ValueError(
+                "engram_symmetric_workspace_mb must be a positive integer, got "
+                f"{self.symmetric_workspace_mb!r}."
+            )
+        if self.communication_backend != "symmetric":
+            return
+        if not sharded:
+            # The expert-parallel layout keeps PR 8225's NCCL lookup; parallel_size = size(EP)
+            # reproduces its row groups with the symmetric transport.
+            raise ValueError(
+                "engram_communication_backend='symmetric' requires engram_parallel_size: the "
+                "expert-parallel table layout looks its rows up with NCCL all-to-alls only."
+            )
+        if not torch.cuda.is_available():
+            raise ValueError(
+                "engram_communication_backend='symmetric' reads the tables through CUDA device "
+                "windows and needs CUDA; use 'nccl' without it."
             )
 
     def _load_tokenizer_map(self) -> None:

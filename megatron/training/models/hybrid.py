@@ -12,6 +12,7 @@ from megatron.core.models.engram import (
     EngramConfig,
     apply_engram_to_hybrid_stack_spec,
     initialize_engram_parallel_state,
+    initialize_engram_transports,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -298,6 +299,10 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
+        # Collective over every rank as well, once DDP holds the tables in its buffers: creates
+        # the symmetric transport of each row group with Engram tables and registers their
+        # storage. Returns at once for NCCL lookups.
+        initialize_engram_transports(model_list, pg_collection, self._model_config.engram_config)
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
         _model = composed_post_wrap_hook(model_list)

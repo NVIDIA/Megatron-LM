@@ -14,6 +14,12 @@ every gradient is a small dyadic constant: the layouts must then agree bit for b
 table gradients and parameters. Clipping is disabled in that comparison because the global
 gradient norm is a sum of per-rank partial norms whose rounding depends on how rows are
 partitioned; the norm itself is compared to fp32 round-off, and a clipped run to a tolerance.
+
+The cases look rows up with NCCL all-to-alls (``communication_backend='nccl'``). The bitwise
+training comparison also runs the sharded layouts with the symmetric transport, whose backward
+adds the table gradients row-sparse into DDP's ``main_grad``; that parametrization needs the
+transport's libraries (CuTe DSL >= 4.8.1, nccl4py >= 0.6.0 with a matching NCCL runtime and
+device bitcode, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True) and skips without them.
 """
 
 import os
@@ -30,6 +36,10 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.engram.config import EngramConfig
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
+from megatron.core.models.engram.symmetric_lookup import (
+    initialize_engram_transports,
+    select_engram_lookup,
+)
 from megatron.core.models.engram.table_sharding import (
     ENGRAM_PARAMETER_DOMAIN,
     initialize_engram_parallel_state,
@@ -50,6 +60,8 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
 from tests.unit_tests.test_utilities import Utils
+
+from ._test_utils import closing_symmetric_transports, symmetric_transport_or_skip
 
 WORLD_SIZE = 4
 EP_SIZE = 2
@@ -81,8 +93,11 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _engram_config(parallel_size=None):
-    """A small configuration; the qwen variant needs no tokenizer artifact."""
+def _engram_config(parallel_size=None, communication_backend="nccl"):
+    """A small configuration; the qwen variant needs no tokenizer artifact.
+
+    The NCCL lookup unless a case names the symmetric backend, the sharded layout's default.
+    """
     return EngramConfig(
         global_vocab_sizes=(11, 11),
         layer_ids=(1,),
@@ -95,13 +110,14 @@ def _engram_config(parallel_size=None):
         variant="qwen",
         unigram_vocab_size=32,
         parallel_size=parallel_size,
+        communication_backend=communication_backend,
     )
 
 
-def _pg_collection(parallel_size):
+def _pg_collection(parallel_size, backend="nccl"):
     """The MPU groups, with the Engram groups set up on every rank as the model builder does."""
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    initialize_engram_parallel_state(pg_collection, _engram_config(parallel_size))
+    initialize_engram_parallel_state(pg_collection, _engram_config(parallel_size, backend))
     return pg_collection
 
 
@@ -113,7 +129,7 @@ def _dyadic(shape, seed, scale=8.0):
 class _TableModel(torch.nn.Module):
     """Engram tables plus a replicated dense projection; the loss is linear in both."""
 
-    def __init__(self, parallel_size, pg_collection):
+    def __init__(self, parallel_size, pg_collection, backend="nccl"):
         super().__init__()
         config = SimpleNamespace(
             use_cpu_initialization=False,
@@ -122,9 +138,9 @@ class _TableModel(torch.nn.Module):
             sequence_parallel=False,
             deterministic_mode=False,
         )
-        row_group, replica_group, domain = resolve_engram_groups(
-            pg_collection, _engram_config(parallel_size)
-        )
+        engram_config = _engram_config(parallel_size, backend)
+        row_group, replica_group, domain = resolve_engram_groups(pg_collection, engram_config)
+        make_lookup = select_engram_lookup(engram_config, row_group)
         self.embedding = EPShardedMultiTableEmbedding(
             config=config,
             table_sizes=TABLE_SIZES,
@@ -136,6 +152,8 @@ class _TableModel(torch.nn.Module):
         )
         if domain == ENGRAM_PARAMETER_DOMAIN:
             tag_engram_tables(self.embedding)
+        # What the Engram layer calls: the embedding itself, or the symmetric lookup bound to it.
+        self.lookup = make_lookup(self.embedding)
         self.proj = torch.nn.Linear(
             DENSE_IN, DENSE_OUT, bias=False, dtype=torch.bfloat16, device="cuda"
         )
@@ -148,7 +166,7 @@ class _TableModel(torch.nn.Module):
             self.bias.copy_(_dyadic((DENSE_OUT,), seed=101))
 
     def forward(self, hash_ids, dense_input, table_coefficients, dense_coefficients):
-        rows = self.embedding(hash_ids)
+        rows = self.lookup(hash_ids)
         dense = self.proj(dense_input) + self.bias
         return (rows.float() * table_coefficients).sum() + (
             dense.float() * dense_coefficients
@@ -164,12 +182,19 @@ class _TableModel(torch.nn.Module):
         return state
 
 
-def _build(parallel_size, recipe="adam", clip_grad=NO_CLIP, overlap=False, **optimizer_kwargs):
+def _build(
+    parallel_size,
+    recipe="adam",
+    clip_grad=NO_CLIP,
+    overlap=False,
+    backend="nccl",
+    **optimizer_kwargs,
+):
     """The tiny model of one table layout (None is the EP layout) with DDP and its optimizer."""
     from megatron.training.training import wrap_model_chunks_with_ddp
 
-    pg_collection = _pg_collection(parallel_size)
-    model = _TableModel(parallel_size, pg_collection)
+    pg_collection = _pg_collection(parallel_size, backend)
+    model = _TableModel(parallel_size, pg_collection, backend)
     muon = recipe == "muon"
     model = wrap_model_chunks_with_ddp(
         [model],
@@ -180,6 +205,8 @@ def _build(parallel_size, recipe="adam", clip_grad=NO_CLIP, overlap=False, **opt
         use_layer_wise_distributed_optimizer=muon,
         pg_collection=pg_collection,
     )[0]
+    # Once DDP holds the tables in its buffers, as the model builder does; a no-op for NCCL.
+    initialize_engram_transports([model], pg_collection, _engram_config(parallel_size, backend))
     config = OptimizerConfig(
         optimizer=recipe,
         lr=LR,
@@ -331,14 +358,28 @@ def test_optimizer_routing_and_engram_overrides(recipe):
             assert group["weight_decay"] == 0.0
 
 
+@pytest.mark.parametrize("backend", ["nccl", pytest.param("symmetric", marks=pytest.mark.internal)])
 @pytest.mark.parametrize("parallel_size", SHARDED_SIZES)
 @pytest.mark.parametrize("recipe", ["adam", "muon"])
 @pytest.mark.parametrize("overlap", [False, True], ids=["sync", "overlap"])
-def test_training_matches_ep_layout_bitwise(parallel_size, recipe, overlap):
+def test_training_matches_ep_layout_bitwise(backend, parallel_size, recipe, overlap):
+    """The sharded layout, with either backend, trains bit for bit like the EP layout's NCCL
+    lookup: with dyadic inputs, every sum is exact in any order."""
+    if backend == "symmetric":
+        symmetric_transport_or_skip()
+    with closing_symmetric_transports():
+        _check_training_matches_ep_layout(backend, parallel_size, recipe, overlap)
+
+
+def _check_training_matches_ep_layout(backend, parallel_size, recipe, overlap):
     runs = {}
-    for layout in (None, parallel_size):
+    for layout, layout_backend in ((None, "nccl"), (parallel_size, backend)):
         torch.manual_seed(0)
-        model, optimizer, scheduler = _build(layout, recipe, overlap=overlap)
+        model, optimizer, scheduler = _build(
+            layout, recipe, overlap=overlap, backend=layout_backend
+        )
+        if layout_backend == "symmetric":
+            assert all(hasattr(table.weight, "main_grad") for table in _tables(model))
         losses, grad_norms, unsynced = [], [], []
         for step in range(3):
             loss, grad_norm, step_unsynced = _iteration(

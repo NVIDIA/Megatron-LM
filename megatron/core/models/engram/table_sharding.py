@@ -18,7 +18,10 @@ every EP group is a contiguous block of it. ``P = size(dp_cp)`` then gives every
 owner, and ``P = size(EP)`` reproduces the EP layout's row ranges, initialization seeds and
 checkpoint shards.
 
-Both layouts look rows up with NCCL all-to-alls over the row group.
+The EP layout looks rows up with NCCL all-to-alls over the row group. The sharded layout uses
+the symmetric device transport by default when ``parallel_size`` is above 1
+(``EngramConfig.communication_backend``, see ``symmetric_lookup``), or the same NCCL
+all-to-alls as a numerical reference.
 :func:`initialize_engram_parallel_state` runs on every rank before any Engram layer is built;
 the Engram module then takes its groups from :func:`resolve_engram_groups`.
 """
@@ -27,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -35,7 +38,8 @@ from torch.distributed import ProcessGroup
 from megatron.core.process_groups_config import ProcessGroupCollection, create_row_parallel_groups
 from megatron.core.utils import get_pg_size, log_single_rank
 
-from .config import EngramConfig
+from . import symmetric_lookup
+from .config import COMMUNICATION_BACKENDS, EngramConfig
 from .distributed_embedding import EPShardedMultiTableEmbedding
 
 logger = logging.getLogger(__name__)
@@ -62,10 +66,15 @@ def initialize_engram_parallel_state(
 ) -> None:
     """Prepare the process groups of the Engram tables before the model is built.
 
-    Collective over the default group in the sharded layout: every rank calls it at the same
-    point, before it builds any Engram layer, including pipeline stages without one. Calling it
-    again, with the same collection or another one over the same dp_cp groups, creates no new
-    group.
+    Collective over the default group, except for the EP layout with the NCCL lookup, which
+    returns at once: every rank calls it at the same point, before it builds any Engram layer,
+    including pipeline stages without one. Calling it again, with the same collection or
+    another one over the same dp_cp groups, creates no new group.
+
+    With the symmetric backend (``engram_config.communication_backend``), every rank first
+    rejects a fake default process group and checks the transport's libraries (CuTe DSL,
+    NCCL4Py, the NCCL runtime and its device bitcode), and one gather over the default group
+    makes a failure on any rank raise on every rank, before any group or table exists.
 
     Sharded layout (``engram_config.parallel_size`` set): splits the dp_cp group of each stage
     into row groups of ``parallel_size`` ranks and the replica groups across them (a size that
@@ -75,22 +84,27 @@ def initialize_engram_parallel_state(
 
     No collective runs on a group this creates. NCCL creates a communicator at the first
     collective of a group, and DDP and the distributed optimizer skip the collectives of a
-    single-rank replica group, so that group never gets one.
+    single-rank replica group, so that group never gets one. The symmetric transport creates
+    its own communicator once the model is wrapped (``initialize_engram_transports``).
 
     Args:
         pg_collection (ProcessGroupCollection): The groups the model and DDP are built with;
             updated in place.
-        engram_config (EngramConfig, optional): The Engram configuration; None (no Engram) and
-            the EP layout return at once.
+        engram_config (EngramConfig, optional): The Engram configuration; None (no Engram)
+            returns at once.
         timeout (timedelta, optional): Timeout of the groups this creates. None gives them the
             timeout of the dp_cp group they split (``initialize_model_parallel`` sets it from
             ``distributed_timeout_minutes``), or the backend's default timeout when this torch
             does not expose it. Groups already created for the same dp_cp group and size are
             reused as they are.
     """
-    if engram_config is None or engram_config.parallel_size is None:
+    if engram_config is None:
         return
-    _initialize_row_groups(pg_collection, engram_config.parallel_size, timeout)
+    if _uses_symmetric_lookup(engram_config):
+        _reject_fake_process_group()
+        _require_symmetric_transport_on_every_rank()
+    if engram_config.parallel_size is not None:
+        _initialize_row_groups(pg_collection, engram_config.parallel_size, timeout)
 
 
 def resolve_engram_groups(
@@ -157,6 +171,67 @@ def clear_engram_parallel_state() -> None:
     new groups. Collections that already hold the groups keep their references.
     """
     _ROW_GROUPS.clear()
+
+
+def _uses_symmetric_lookup(engram_config: EngramConfig) -> bool:
+    """Whether the tables use the symmetric transport.
+
+    EngramConfig resolves and checks the backend when it is built; this repeats the checks
+    for a configuration changed afterwards, before any rank creates a group.
+    """
+    backend = engram_config.communication_backend
+    if backend not in COMMUNICATION_BACKENDS:
+        raise ValueError(
+            f"Engram communication_backend must be resolved to one of {COMMUNICATION_BACKENDS}, "
+            f"got {backend!r}."
+        )
+    if backend == "symmetric" and engram_config.parallel_size is None:
+        raise ValueError(
+            "The Engram symmetric backend requires parallel_size: the expert-parallel table "
+            "layout looks its rows up with NCCL all-to-alls only."
+        )
+    return backend == "symmetric"
+
+
+def _reject_fake_process_group() -> None:
+    """Reject the symmetric backend on a fake process group (memory estimation runs).
+
+    Its transport creates real NCCL communicators over the row group, whose ranks a fake group
+    never starts, so the first one would wait forever. Every rank has the same default backend
+    and raises alike.
+    """
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() == "fake":
+        raise ValueError(
+            "The Engram symmetric lookup creates NCCL communicators of its own and cannot run on "
+            "a fake process group; use communication_backend='nccl'."
+        )
+
+
+def _require_symmetric_transport_on_every_rank() -> None:
+    """Check the symmetric transport's libraries on every rank; a failure raises on all ranks.
+
+    The check is local, so the ranks of one job could disagree (nodes with different software,
+    say). One object gather over the default group shares every outcome before any rank enters
+    a collective that a failed rank would never join.
+    """
+    failure = None
+    try:
+        symmetric_lookup.require_symmetric_transport()
+    except Exception as exc:  # pylint: disable=broad-except
+        failure = exc
+    problem = None if failure is None else f"{type(failure).__name__}: {failure}"
+    problems = [problem]
+    if torch.distributed.is_initialized():
+        problems = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(problems, problem)
+    failed = [rank for rank, reported in enumerate(problems) if reported is not None]
+    if not failed:
+        return
+    reason = f"; on this rank: {problem}" if problem is not None else ""
+    raise ImportError(
+        f"The Engram symmetric lookup is unavailable on ranks {_format_ranks(failed)}{reason}. "
+        "communication_backend='nccl' looks the rows up with NCCL all-to-alls instead."
+    ) from failure
 
 
 def _initialize_row_groups(
@@ -239,3 +314,9 @@ def _check_sharded_layout(pg_collection: ProcessGroupCollection) -> None:
             "Engram parallel_size requires single-rank tp, expt_tp, gtp_remat and "
             f"expt_gtp_remat groups; {', '.join(unsupported)}."
         )
+
+
+def _format_ranks(ranks: Sequence[int]) -> str:
+    if len(ranks) <= 8:
+        return str(list(ranks))
+    return f"[{', '.join(map(str, ranks[:4]))}, ..., {ranks[-1]}] ({len(ranks)} ranks)"

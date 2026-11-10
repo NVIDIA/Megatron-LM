@@ -5,6 +5,7 @@
 from .config import EngramConfig
 from .engram import Engram
 from .layer_specs import apply_engram_to_hybrid_stack_spec
+from .symmetric_lookup import close_engram_transports, initialize_engram_transports
 from .table_sharding import initialize_engram_parallel_state
 from .variants import ENGRAM_VARIANTS, EngramVariant, resolve_variant
 
@@ -14,6 +15,8 @@ __all__ = [
     "EngramConfig",
     "EngramVariant",
     "apply_engram_to_hybrid_stack_spec",
+    "close_engram_transports",
     "initialize_engram_parallel_state",
+    "initialize_engram_transports",
     "resolve_variant",
 ]

@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
+from megatron.core.models.engram.symmetric_lookup import expandable_segments_enabled
 from megatron.core.models.engram.variants import DEEPSEEK_VARIANT_NAME, ENGRAM_VARIANTS
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
@@ -512,6 +513,74 @@ def _validate_engram_parallel_size(args):
         '--engram-parallel-size with --fake-process-group requires '
         '--pipeline-model-parallel-size 1: the fake group cannot exchange the dp_cp groups of '
         'the other pipeline stages that the Engram table groups are split from.'
+    )
+
+
+def _validate_engram_communication_backend(args):
+    """Resolve --engram-communication-backend and check what the symmetric transport needs.
+
+    The sharded table layout (--engram-parallel-size above 1) defaults to the symmetric
+    transport; one rank per row group and the expert-parallel layout default to NCCL, the
+    expert-parallel layout's only backend (see megatron/core/models/engram/symmetric_lookup.py).
+    The setups the transport cannot serve are checked first, then its CUDA and allocator needs.
+    Its libraries are checked on every rank before the model is built
+    (initialize_engram_parallel_state).
+    """
+    backend = getattr(args, 'engram_communication_backend', None)
+    if not getattr(args, 'engram_enabled', False):
+        assert (
+            backend is None
+        ), '--engram-communication-backend requires Engram (--engram-vocab-sizes).'
+        return
+    workspace_mb = getattr(args, 'engram_symmetric_workspace_mb', 64)
+    assert (
+        workspace_mb > 0
+    ), f'--engram-symmetric-workspace-mb must be positive, got {workspace_mb}.'
+    parallel_size = getattr(args, 'engram_parallel_size', None)
+    if backend is None:
+        # As EngramConfig resolves it: one rank per row group looks its rows up locally.
+        backend = 'symmetric' if parallel_size is not None and parallel_size > 1 else 'nccl'
+        args.engram_communication_backend = backend
+    if backend != 'symmetric':
+        return
+    assert parallel_size is not None, (
+        '--engram-communication-backend symmetric requires --engram-parallel-size: the '
+        'expert-parallel table layout looks its rows up with NCCL all-to-alls only. '
+        '--engram-parallel-size equal to the expert-parallel size reproduces its row groups.'
+    )
+    assert not getattr(args, 'fake_process_group', False), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) creates '
+        'NCCL communicators of its own and cannot run on a fake process group; pass '
+        '--engram-communication-backend nccl. The memory estimate then holds what the NCCL '
+        'lookup allocates, including the dense per-table gradient of its backward, which the '
+        'symmetric backend does not allocate.'
+    )
+    assert not getattr(args, 'moe_use_upcycling', False), (
+        'The Engram symmetric backend does not support --moe-use-upcycling: its transports '
+        'serve one model per process, and upcycling builds a second, dense one.'
+    )
+    for flag in ('disable_param_buffers_cpu_backup', 'disable_grad_buffers_cpu_backup'):
+        assert not getattr(args, flag, False), (
+            f'The Engram symmetric backend does not support --{flag.replace("_", "-")}: '
+            'torch_memory_saver remaps buffer pages at the same virtual addresses, which the '
+            'registered table windows cannot detect.'
+        )
+    assert not getattr(args, 'inprocess_restart', False), (
+        'The Engram symmetric backend does not support --inprocess-restart: its device kernels '
+        'spin-wait on their peers, and no in-process abort can stop them.'
+    )
+    assert torch.cuda.is_available(), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) needs '
+        'CUDA; pass --engram-communication-backend nccl without it.'
+    )
+    assert expandable_segments_enabled(os.environ), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) '
+        "registers the tables' parameter buffers as NCCL windows, which needs expandable-segment "
+        '(CUDA VMM) allocations: set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the '
+        'environment of every rank (PyTorch reads the first of PYTORCH_CUDA_ALLOC_CONF, '
+        'PYTORCH_HIP_ALLOC_CONF and PYTORCH_ALLOC_CONF that is set; under pyxis/enroot, values '
+        'from the image win unless srun passes them with --container-env), or pass '
+        '--engram-communication-backend nccl.'
     )
 
 
@@ -1746,6 +1815,7 @@ def validate_args(args, defaults={}):
 
     if getattr(args, "engram_parallel_size", None) is not None:
         _validate_engram_parallel_size(args)
+    _validate_engram_communication_backend(args)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3598,6 +3668,28 @@ def _add_engram_args(parser):
         'the expert-parallel group. Requires --use-distributed-optimizer (also with Muon), '
         'tensor and expert tensor parallel sizes of 1, no GTP, one distributed optimizer '
         'instance and a distributed checkpoint format.',
+    )
+    group.add_argument(
+        '--engram-communication-backend',
+        type=str,
+        choices=['symmetric', 'nccl'],
+        default=None,
+        help='How Engram looks table rows up across the ranks that shard them. symmetric, the '
+        'default with --engram-parallel-size above 1, reads them through the CuTe DSL / NCCL4Py '
+        'device transport (direct loads inside an NVLink domain, GIN across domains) and adds '
+        'row-sparse gradients to main_grad; it needs CUDA, Triton, nvidia-cutlass-dsl >= 4.8.1, '
+        'nccl4py >= 0.6.0 with a matching NCCL runtime and device bitcode, and '
+        'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, and does not run on a fake process '
+        'group. nccl runs NCCL all-to-alls; it is the default with --engram-parallel-size 1 '
+        '(rows are then looked up locally either way) and the only choice without '
+        '--engram-parallel-size.',
+    )
+    group.add_argument(
+        '--engram-symmetric-workspace-mb',
+        type=int,
+        default=64,
+        help='Size in MiB of the workspace that the Engram symmetric transport registers on '
+        'every rank: the staging and receive slots of its exchanges.',
     )
     return parser
 
