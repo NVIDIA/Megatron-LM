@@ -139,27 +139,51 @@ def test_gdn_selects_explicit_torch_backend():
     assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
 
 
-@pytest.mark.parametrize("backend", ["transformer_engine", "fla"])
-def test_gdn_rejects_nondeterministic_backend_in_deterministic_mode(backend):
+def test_gdn_rejects_nondeterministic_backend_in_deterministic_mode():
     """Deterministic mode must not silently replace the configured backend."""
-    gdn = _make_gdn_variant_stub(backend, deterministic_mode=True)
+    gdn = _make_gdn_variant_stub("fla", deterministic_mode=True)
 
-    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch'"):
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch' or"):
         GatedDeltaNet._setup_variant_attrs(gdn)
 
 
-@pytest.mark.parametrize("backend", ["transformer_engine", "fla"])
-def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode(backend):
+def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode():
     """Invalid deterministic GDN backend combinations fail during config construction."""
-    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch'"):
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch' or"):
         TransformerConfig(
             num_layers=1,
             hidden_size=128,
             num_attention_heads=2,
             experimental_attention_variant="gated_delta_net",
             deterministic_mode=True,
-            gdn_kernel_backend=backend,
+            gdn_kernel_backend="fla",
         )
+
+
+def test_gdn_accepts_te_backend_in_deterministic_mode(monkeypatch):
+    """The cuDNN fused kernel behind TE replays bit-exactly, so deterministic mode keeps it."""
+
+    class FakeTEGatedDeltaNetAttention:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
+    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", FakeTEGatedDeltaNetAttention)
+    gdn = _make_gdn_variant_stub("transformer_engine", deterministic_mode=True)
+
+    GatedDeltaNet._setup_variant_attrs(gdn)
+
+    assert gdn.gdn_backend == "transformer_engine"
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=2,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        deterministic_mode=True,
+        gdn_kernel_backend="transformer_engine",
+    )
+    assert config.gdn_kernel_backend == "transformer_engine"
 
 
 @pytest.mark.parametrize("backend", ["auto", "unsupported"])
@@ -1242,3 +1266,75 @@ class TestFusedThdAllToAll:
         back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
 
         assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"
+
+
+def test_te_gdn_deterministic_mode_replays_bit_exact():
+    """deterministic_mode keeps the TE fused kernel and the whole GDN layer replays bit-exactly."""
+    if not gdn_module.HAVE_TE_GDN:
+        pytest.skip("Transformer Engine GatedDeltaNetAttention is unavailable")
+    from tests.unit_tests.determinism.kernels.harness import (
+        assert_module_replays_bit_exact,
+        deterministic_algorithms,
+    )
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        config = TransformerConfig(
+            hidden_size=128,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=1,
+            linear_num_value_heads=2,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=2,
+            num_query_groups=2,
+            activation_func=F.silu,
+            bf16=True,
+            experimental_attention_variant="gated_delta_net",
+            gdn_kernel_backend="transformer_engine",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+            deterministic_mode=True,
+        )
+        submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+        gdn = (
+            GatedDeltaNet(
+                config,
+                submodules=submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        assert gdn.gdn_backend == "transformer_engine"
+        hidden_states = torch.randn(
+            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                gdn,
+                {"hidden_states": hidden_states, "attention_mask": None},
+                replays=3,
+                contention=True,
+                what="GatedDeltaNet (transformer_engine backend, deterministic_mode)",
+            )
+    finally:
+        Utils.destroy_model_parallel()

@@ -506,7 +506,8 @@ class TransformerConfig(ModelParallelConfig):
     gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
     """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
-    implementation and is required when deterministic mode is enabled."""
+    implementation. Deterministic mode accepts ``torch`` and ``transformer_engine`` (the
+    cuDNN fused kernel replays bit-exactly) and rejects ``fla``."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
@@ -2041,10 +2042,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
-            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+            if self.deterministic_mode and self.gdn_kernel_backend == "fla":
                 raise ValueError(
-                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
-                    "Gated DeltaNet."
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' or "
+                    "'transformer_engine' for Gated DeltaNet; the FLA kernel is not "
+                    "deterministic."
                 )
 
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern

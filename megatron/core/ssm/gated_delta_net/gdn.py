@@ -111,9 +111,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.num_householder = 1
 
         backend = self.config.gdn_kernel_backend
-        if self.config.deterministic_mode and backend != "torch":
+        if self.config.deterministic_mode and backend == "fla":
             raise ValueError(
-                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
+                "deterministic_mode=True requires gdn_kernel_backend='torch' or "
+                "'transformer_engine' for Gated DeltaNet; the FLA kernel is not deterministic."
             )
 
         if backend == "torch":

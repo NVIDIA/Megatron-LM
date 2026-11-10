@@ -927,6 +927,61 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="fla chunk_gated_delta_rule")
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["bshd", "thd"])
+def test_te_gated_delta_net_replays_fwd_bwd(packed):
+    """The fused path ``--deterministic-mode`` accepts for GDN: TE's GatedDeltaNetAttention over
+    the cuDNN frontend kernel, replayed under side-stream contention. Packed sequences go
+    through the ``thd`` layout the training mixer uses with ``cu_seqlens``."""
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
+
+    if not HAVE_TE_GDN:
+        pytest.skip("Transformer Engine GatedDeltaNetAttention is unavailable")
+    from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
+
+    seeded()
+    H, K, V = 16, 128, 128
+    if packed:
+        lengths = (2051, 3, 1024, 1018)
+        B, T = 1, sum(lengths)
+        cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]).int().cuda()
+    else:
+        B, T = 2, 2048
+        cu_seqlens = None
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
+    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    module = TEGatedDeltaNetAttention(
+        num_attention_heads=H, qk_head_dim=K, value_head_dim=V, layer_number=1
+    ).cuda()
+
+    def fn(q, k, v, g, beta):
+        # the same call ``GatedDeltaNet.forward_pre_attn_and_core_attn`` makes
+        o, _ = module(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens,
+        )
+        return o
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            fn,
+            (q, k, v, g, beta),
+            replays=4,
+            contention=True,
+            what=f"TE GatedDeltaNetAttention ({'thd' if packed else 'bshd'})",
+        )
+
+
 # --- Mamba mixer: the batch-invariant unfused training path (_static_prefill) ----------------
 
 
