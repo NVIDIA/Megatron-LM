@@ -1901,6 +1901,27 @@ def test_optimizer_gloo_group_must_mirror_a_replaced_dp_cp_group():
         )
 
 
+def test_optimizer_gloo_group_cannot_mirror_a_missing_dp_cp_group():
+    """A None data-parallel group is rejected instead of being compared as WORLD."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_chunks = [
+        SimpleNamespace(
+            ddp_config=SimpleNamespace(
+                use_distributed_optimizer=True, num_distributed_optimizer_instances=1
+            )
+        )
+    ]
+    # Here the Gloo mirror spans every rank, and torch resolves a None group to WORLD, so the
+    # rank comparison alone would accept it.
+    pg_collection.dp_cp = None
+
+    with pytest.raises(ValueError, match="pg_collection.intra_dp_cp_gloo mirrors, but it is None"):
+        ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection, model_chunks, use_gloo_process_groups=True
+        )
+
+
 class DenseAndExpertLinear(nn.Module):
     """One dense and one expert-parallel weight, as the optimizer factory sees an MoE layer."""
 
@@ -1965,6 +1986,44 @@ def test_get_megatron_optimizer_requires_gloo_groups_when_enabled():
         get_megatron_optimizer(
             optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
         )
+
+
+@pytest.mark.parametrize('with_experts', [False, True])
+def test_expert_gloo_group_required_only_with_expert_parameters(with_experts):
+    """A collection may omit the expert Gloo group when no parameter would use it."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # expt_dp stays set, as in any collection built from a full grid; only its Gloo mirror is
+    # missing.
+    pg_collection.intra_expt_dp_gloo = None
+    config = TransformerConfig(num_attention_heads=1, num_layers=1)
+    module = (
+        DenseAndExpertLinear(config)
+        if with_experts
+        else nn.Linear(16, 16, bias=False, device='cuda')
+    )
+    model = DistributedDataParallel(
+        config,
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        module,
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    if with_experts:
+        with pytest.raises(
+            ValueError, match="requires pg_collection.intra_expt_dp_gloo for the expert parameters"
+        ):
+            get_megatron_optimizer(
+                optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+            )
+        return
+
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+    )
+    (dense_optimizer,) = optimizer.chained_optimizers
+    assert dense_optimizer.data_parallel_group_gloo is pg_collection.intra_dp_cp_gloo
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
@@ -2141,15 +2200,17 @@ def test_float16_optimizer_rejects_unmatchable_main_params():
 
 
 def test_param_group_optimizer_requires_resolved_collection(mocker):
-    """The helpers below get_megatron_optimizer never resolve process groups themselves."""
-    mocker.patch('megatron.core.optimizer.FP32Optimizer')
+    """The helpers below get_megatron_optimizer never resolve process groups themselves, and
+    reject a missing collection before wrapping the optimizer."""
+    distributed_optimizer = mocker.patch('megatron.core.optimizer.DistributedOptimizer')
     param = torch.nn.Parameter(torch.zeros(2, device='cuda'))
     with pytest.raises(ValueError, match='pg_collection must be resolved'):
         _get_megatron_optimizer_based_on_param_groups(
-            OptimizerConfig(optimizer='sgd', lr=0.1),
+            OptimizerConfig(optimizer='sgd', lr=0.1, use_distributed_optimizer=True),
             model_chunks=[nn.Linear(2, 2)],
             param_groups=[{'params': [param]}],
         )
+    distributed_optimizer.assert_not_called()
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")

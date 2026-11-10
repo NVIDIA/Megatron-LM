@@ -1123,6 +1123,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
+    def _clamp_g(self, g: torch.Tensor) -> torch.Tensor:
+        """Optionally bound per-token log decay before any kernel prefix sums."""
+        if self.config.gdp_g_clamp_value is None:
+            return g
+        return g.clamp_min(-self.config.gdp_g_clamp_value)
+
     def _compute_gating(
         self, ba: torch.Tensor, *, runtime_cp: _GDPRuntimeCP
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1144,6 +1150,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             A_log = runtime_cp.helper.get_A_log()
             dt_bias = runtime_cp.helper.get_dt_bias()
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+
+        # Clamp out of place, so the caller's g and the zero-decay Householder copies
+        # stay unchanged.
+        g = self._clamp_g(g)
 
         if self.config.gdp_cutedsl_kernel:
             beta = rearrange(beta, "b l d -> (b l) d")
@@ -1297,6 +1307,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             head_dim=self.headdim,
             state_dim=self.d_state,
         )
+        # Match training/prefill. Zero-decay Householder copies remain zero.
+        g = self._clamp_g(g)
 
         # Forked recurrent kernel: reads and writes `ssm_state` in place at the
         # slots named by `batch_indices`, so there is no gather of the initial
@@ -1440,6 +1452,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             head_dim=self.headdim,
             state_dim=self.d_state,
         )
+        # Match training/decode. Zero-decay Householder copies remain zero.
+        g = self._clamp_g(g)
 
         # batch = 1 packed sequence of length T; householder folded into seq. The shapes
         # and the GQA expansion come from gdp_prefill_prepare above, which emits exactly
