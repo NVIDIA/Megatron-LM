@@ -22,6 +22,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import (
@@ -43,7 +44,6 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -81,14 +81,20 @@ _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET = 1 << 40
 
 def _initialize_hidden_state_mixing_rng_tracker(
     dp_group: Optional[torch.distributed.ProcessGroup],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[str]:
-    """Create one checkpointable hidden-state-mixing RNG stream per DP replica."""
+    """Create one checkpointable HSM RNG stream per distinct-data rank."""
     rng_tracker = tensor_parallel.get_cuda_rng_tracker()
     if not rng_tracker.is_initialized():
         return None
     if _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME not in rng_tracker.get_states():
+        # GTP is the innermost sub-axis of the full data-parallel rank. Its peers carry
+        # distinct microbatches, while TP/CP peers must retain a common HSM stream.
+        data_parallel_rank = get_pg_rank(dp_group) * get_pg_size(gtp_remat_group) + get_pg_rank(
+            gtp_remat_group
+        )
         seed = (
-            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + get_pg_rank(dp_group)
+            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + data_parallel_rank
         ) % (2**63 - 1)
         rng_tracker.add(_HIDDEN_STATE_MIXING_RNG_TRACKER_NAME, seed)
     return _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME
@@ -1371,7 +1377,14 @@ def process_mtp_loss(
                 num_tokens=num_tokens if config.calculate_per_token_loss else None,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
+        if config.calculate_per_token_loss and getattr(
+            config, "mtp_normalize_loss_by_main_tokens", False
+        ):
+            # Preserve the loss as a sum. Gradient finalization divides the accumulated main
+            # and MTP gradients once by the global main-loss token count, making the result
+            # invariant to rank and microbatch partitioning.
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss
+        elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
             # Use one main/MTP token ratio for this logical microbatch, independent
             # of its CP partition. Rolling and masking can leave different ratios
@@ -2535,7 +2548,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers. tp_cp and tp_dp_cp
             # are the FP8/FP4 amax reduction groups of the MTP layers.
             required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp'] + (
-                ['dp'] if self.config.mtp_hsm else []
+                ['dp', 'gtp_remat'] if self.config.mtp_hsm else []
             )
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
@@ -2544,8 +2557,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                 raise ValueError(
                     f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
                 )
-        if self.config.mtp_hsm and 'dp' not in vars(pg_collection):
-            raise ValueError("MultiTokenPredictionBlock with HSM requires a dp process group")
+        if self.config.mtp_hsm:
+            for group_name in ('dp', 'gtp_remat'):
+                if vars(pg_collection).get(group_name) is None:
+                    raise ValueError(
+                        f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
+                    )
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
@@ -2561,8 +2578,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
+        self.gtp_remat_group = pg_collection.gtp_remat if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
-            _initialize_hidden_state_mixing_rng_tracker(self.dp_group)
+            _initialize_hidden_state_mixing_rng_tracker(self.dp_group, self.gtp_remat_group)
             if self.config.mtp_hsm
             else None
         )
