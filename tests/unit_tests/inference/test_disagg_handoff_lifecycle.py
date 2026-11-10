@@ -464,6 +464,9 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
         assert engine._cg_admission_gating_active() == (role == "prefill")
         assert engine.context.config.cuda_graph_all_prefills
         assert engine.context.use_cuda_graphs_for_non_decode_steps
+        # Only a decode engine holds KV blocks for imports outside its request rows.
+        held_for_imports = getattr(engine.context, "kv_blocks_held_for_imports", None)
+        assert (held_for_imports == engine._pending_import_block_count) == (role == "decode")
         assert len(engine.context.cuda_graph_batch_dimensions_list) == 1
         engine.setup_kv_transfer(role)
 
@@ -734,6 +737,20 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert len(engine._ssm_transfer_agents["recurrent"].calls) == 1
     assert engine._pending_kv_imports[0].ssm.live_slot == 20
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 0
+
+
+def test_pending_import_blocks_count_until_the_import_ends(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    assert engine._pending_import_block_count() == 0
+    engine.add_request_with_kv_handoff(
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), {"resume_tokens": [99]}, [100]
+    )
+    pending = engine._pending_kv_imports[0]
+    # One prompt block and the first decode step's block.
+    assert pending.local_blocks == [10] and pending.continuation_blocks == [11]
+    assert engine._pending_import_block_count() == 2
+    engine._release_pending_kv_import(pending)
+    assert engine._pending_import_block_count() == 0
 
 
 @pytest.mark.parametrize("queued", [False, True])

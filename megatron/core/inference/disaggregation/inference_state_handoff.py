@@ -168,6 +168,17 @@ class InferenceStateHandoffMixin:
 
         return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
 
+    def _pending_import_block_count(self) -> int:
+        """KV blocks that started imports hold before they become requests.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
+        return sum(
+            len(pending.local_blocks) + len(pending.continuation_blocks)
+            for pending in self._pending_kv_imports
+        )
+
     @property
     def has_admittable_kv_import(self) -> bool:
         """Whether a completed import can be handled at the next admission point."""
@@ -316,6 +327,9 @@ class InferenceStateHandoffMixin:
             # this engine's admission gate so eviction recovery cannot wait for
             # a missing graph; existing captured graphs remain usable.
             self.cuda_graph_all_prefills = False
+            # Imports hold KV blocks outside request rows until admission, so a resident
+            # decode may pause behind them with no request active.
+            self.context.kv_blocks_held_for_imports = self._pending_import_block_count
         self._kv_transfer_role = role
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
