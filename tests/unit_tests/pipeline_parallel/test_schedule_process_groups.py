@@ -2,6 +2,7 @@
 
 """The schedules run on the caller's process groups, or warn once and use the global ones."""
 
+import inspect
 import warnings
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig, parallel_state, process_groups_config
 from megatron.core.enums import ModelType
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.pipeline_parallel import combined_1f1b
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
@@ -307,6 +309,91 @@ def test_forward_step_calc_loss_without_cp_size_and_last_stage_warns_once():
 def test_forward_step_calc_loss_takes_cp_size_and_last_stage_or_neither(stage, message):
     with _forbid_global_process_groups(), pytest.raises(ValueError, match=message):
         _calc_loss(**stage)
+
+
+def test_no_pipelining_passes_the_collection_cp_size_to_combined_1f1b(monkeypatch):
+    combined_schedule = schedule.combined_1f1b_schedule_for_no_pipelining
+    cp_group_sizes = []
+
+    def record_cp_group_size(*args, **kwargs):
+        arguments = inspect.signature(combined_schedule).bind(*args, **kwargs).arguments
+        cp_group_sizes.append(arguments["cp_group_size"])
+        return arguments["forward_data_store"], arguments["total_num_tokens"]
+
+    monkeypatch.setattr(schedule, "combined_1f1b_schedule_for_no_pipelining", record_cp_group_size)
+    config = ModelParallelConfig(overlap_moe_expert_parallel_comm=True)
+    with _forbid_global_process_groups():
+        schedule.forward_backward_no_pipelining(
+            forward_step_func=_forward_step_func,
+            data_iterator=iter(range(1)),
+            model=[_StageModel(config)],
+            num_microbatches=1,
+            seq_length=_SEQ_LENGTH,
+            micro_batch_size=_MICRO_BATCH_SIZE,
+            # A tensor-parallel size that differs from the context-parallel one.
+            pg_collection=ProcessGroupCollection(tp=_FakeGroup(), cp=_FakeGroup(size=2)),
+        )
+    assert cp_group_sizes == [2]
+
+
+def _run_interleaved_combined_1f1b(monkeypatch, **groups):
+    """Run the forward steps of both virtual chunks through the interleaved combined 1F1B
+    helper; return the CP size and last-stage flag that each combined step receives."""
+    received = []
+
+    def combined_step(*args, cp_group_size=None, is_last_stage=None, **kwargs):
+        received.append((cp_group_size, is_last_stage))
+        return None, None, None
+
+    monkeypatch.setattr(combined_1f1b, "combined_forward_backward_step", combined_step)
+    monkeypatch.setattr(combined_1f1b, "set_streams", lambda **kwargs: None)
+    # The stage helpers read a group's rank and size only once torch.distributed is initialized.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    config = SimpleNamespace(
+        high_priority_a2a_comm_stream=False, virtual_pipeline_model_parallel_size=2
+    )
+    for virtual_microbatch_id in range(2):
+        combined_1f1b.combined_1f1b_schedule_for_interleaved_pipelining(
+            config,
+            None,  # forward_step_func
+            [None, None],  # data_iterator
+            [None, None],  # model
+            1,  # num_microbatches
+            [],  # forward_data_store
+            lambda *args: None,  # forward_step_helper_preprocess
+            lambda *args: None,  # forward_step_helper_postprocess
+            None,  # backward_step_helper_preprocess
+            None,  # backward_step_helper_postprocess
+            lambda virtual_microbatch_id, forward: 0,  # get_microbatch_id_in_model_chunk
+            lambda virtual_microbatch_id, forward: virtual_microbatch_id,  # get_model_chunk_id
+            lambda cond: cond,  # check_first_val_step
+            lambda virtual_microbatch_id: True,  # is_first_microbatch_for_model_chunk
+            False,  # collect_non_loss_data
+            virtual_microbatch_id,  # f_virtual_microbatch_id, in its released positional slot
+            **groups,
+        )
+    return received
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_interleaved_combined_1f1b_takes_cp_size_and_last_stage_from_its_groups(
+    monkeypatch, pp_rank
+):
+    with _forbid_global_process_groups():
+        received = _run_interleaved_combined_1f1b(
+            monkeypatch, cp_group_size=2, pp_group=_FakeGroup(rank=pp_rank, size=2)
+        )
+    # Only the last virtual chunk on the last pipeline rank is the last stage.
+    assert received == [(2, False), (2, pp_rank == 1)]
+
+
+def test_interleaved_combined_1f1b_without_groups_leaves_the_stage_to_the_loss_step(monkeypatch):
+    with _forbid_global_process_groups():
+        # forward_step_calc_loss falls back to the global grid only when it gets neither value.
+        assert _run_interleaved_combined_1f1b(monkeypatch) == [(None, None), (None, None)]
+        for groups in ({"cp_group_size": 2}, {"pp_group": _FakeGroup(size=2)}):
+            with pytest.raises(ValueError, match="both cp_group_size and pp_group, or neither"):
+                _run_interleaved_combined_1f1b(monkeypatch, **groups)
 
 
 @requires_4_ranks
