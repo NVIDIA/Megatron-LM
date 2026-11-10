@@ -268,14 +268,29 @@ def test_collection_seed_offsets_use_full_data_parallel_group(monkeypatch, dp_ra
 
 
 @pytest.mark.parametrize(
-    "groups, dp_random",
-    [({"dp_gtp_remat": object()}, False), ({"pp": object(), "dp": object()}, True)],
+    "groups, dp_random", [({"dp_gtp_remat": object()}, False), ({"pp": object()}, True)]
 )
 def test_collection_seed_requires_its_offset_groups(monkeypatch, groups, dp_random):
-    """A collection without pp, or without dp_gtp_remat for DP-random init, is an error."""
+    """A collection without pp, or without a data-parallel group for DP-random init, is an error."""
     _forbid_global_process_groups(monkeypatch)
     with pytest.raises(ValueError, match="pg_collection must set pp"):
         initialize._set_random_seed(101, dp_random, pg_collection=ProcessGroupCollection(**groups))
+
+
+def test_collection_without_dp_gtp_remat_takes_the_seed_offset_from_dp(monkeypatch):
+    """A collection built without the GTP_remat groups keeps the DP offset of its dp group."""
+    pp, dp = object(), object()
+    ranks = {pp: 2, dp: 5}
+    monkeypatch.setattr(initialize, "get_pg_rank", lambda group: ranks[group])
+    _forbid_global_process_groups(monkeypatch)
+    python_seed, numpy_seed, torch_seed = Mock(), Mock(), Mock()
+    monkeypatch.setattr(initialize.random, "seed", python_seed)
+    monkeypatch.setattr(initialize.np.random, "seed", numpy_seed)
+    monkeypatch.setattr(initialize.torch, "manual_seed", torch_seed)
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 0)
+    initialize._set_random_seed(101, True, pg_collection=ProcessGroupCollection(pp=pp, dp=dp))
+    for seeded in (python_seed, numpy_seed, torch_seed):
+        seeded.assert_called_once_with(101 + 100 * 2 + 10 * 5)
 
 
 def test_initialization_seeds_from_the_model_collection(monkeypatch, run_config):
