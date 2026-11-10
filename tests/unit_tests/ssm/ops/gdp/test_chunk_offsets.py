@@ -39,11 +39,15 @@ CHUNK_H_LARGE = {
     # the initial-state row lead * K * V
     "initial-states": (256, 256, 2**31 // (256 * 256), "many"),
 }
+# name: (H, K, V, M, lead). The output kernel launches one program per chunk on grid axis 1,
+# which CUDA caps at 65535, so these use 32 heads to reach 2**31 in fewer chunks.
 CHUNK_O_LARGE = {
-    # the query and key base token lead * CHUNK_SIZE * K
-    "queries": (256, 16, 2**31 // (CHUNK_SIZE * 256)),
-    # the value and output base token lead * CHUNK_SIZE * V
-    "values": (32, 256, 2**31 // (CHUNK_SIZE * 256)),
+    # the query and key base token lead * CHUNK_SIZE * H * K (GDN's H and K)
+    "queries": (32, 128, 16, 1, 2**31 // (CHUNK_SIZE * 32 * 128)),
+    # the value and output base token lead * CHUNK_SIZE * H * V (GDN's H and V)
+    "values": (32, 16, 128, 1, 2**31 // (CHUNK_SIZE * 32 * 128)),
+    # GDP 800m's Householder-expanded keys, lead * CHUNK_SIZE * M * H * K past 2**31
+    "expanded-keys": (32, 128, 64, 3, -(-(2**31) // (CHUNK_SIZE * 3 * 32 * 128))),
 }
 
 
@@ -72,10 +76,10 @@ def _cu_seqlens(lengths):
     return cu.to(dtype=torch.int32, device="cuda")
 
 
-def _embed(x, tokens):
-    """``x`` (``[1, TAIL, ...]``) as the last ``TAIL`` tokens of zeros ``[1, tokens, ...]``."""
-    out = x.new_zeros(1, tokens, *x.shape[2:])
-    out[:, tokens - TAIL :] = x
+def _embed(x, rows):
+    """``x`` (``[1, n, ...]``) as the last ``n`` rows of zeros ``[1, rows, ...]``."""
+    out = x.new_zeros(1, rows, *x.shape[2:])
+    out[:, rows - x.shape[1] :] = x
     return out
 
 
@@ -121,20 +125,27 @@ def _run_chunk_h(K, V, lead, layout):
         assert torch.equal(a, e), f"{name} of the sequence after {lead} {layout} differ"
 
 
-def _run_chunk_o(K, V, lead):
+def _run_chunk_o(H, K, V, M, lead):
     g0 = torch.Generator(device="cuda").manual_seed(1234)
 
     def randn(*shape):
         return (torch.randn(*shape, generator=g0, device="cuda") * 0.1).bfloat16()
 
-    q, k, v = randn(1, TAIL, 1, K), randn(1, TAIL, 1, K), randn(1, TAIL, 1, V)
-    h = randn(1, 2, 1, K, V)
-    g = -torch.rand(1, TAIL, 1, generator=g0, device="cuda").mul(0.05)
+    q, k, v = randn(1, TAIL, H, K), randn(1, TAIL * M, H, K), randn(1, TAIL * M, H, V)
+    h = randn(1, 2, H, K, V)
+    g = -torch.rand(1, TAIL, H, generator=g0, device="cuda").mul(0.05)
     g[:, :CHUNK_SIZE] = g[:, :CHUNK_SIZE].cumsum(1)
 
     def run(q, k, v, h, g, lengths):
         o = chunk_gated_delta_product_fwd_o(
-            q=q, k=k, v=v, h=h, g=g, scale=K**-0.5, cu_seqlens=_cu_seqlens(lengths)
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            scale=K**-0.5,
+            cu_seqlens=_cu_seqlens(lengths),
+            num_householder=M,
         )
         return o[0, -TAIL:]
 
@@ -142,8 +153,9 @@ def _run_chunk_o(K, V, lead):
 
     lengths = _lengths(lead, "after")
     tokens = sum(lengths)
-    q, k, v, g = (_embed(x, tokens) for x in (q, k, v, g))
-    h = torch.cat([h.new_zeros(1, lead, 1, K, V), h], dim=1)  # the chunk states of the zeros
+    q, g = _embed(q, tokens), _embed(g, tokens)
+    k, v = _embed(k, tokens * M), _embed(v, tokens * M)
+    h = torch.cat([h.new_zeros(1, lead, H, K, V), h], dim=1)  # the chunk states of the zeros
     actual = run(q, k, v, h, g, lengths)
     assert torch.equal(actual, expected), f"outputs of the sequence after {lead} chunks differ"
 
@@ -154,9 +166,10 @@ def test_chunk_states_after_other_tokens(layout):
     _run_chunk_h(K=64, V=32, lead=3, layout=layout)
 
 
-def test_outputs_after_other_tokens():
+@pytest.mark.parametrize("M", [1, 3])
+def test_outputs_after_other_tokens(M):
     _requires_cuda()
-    _run_chunk_o(K=64, V=32, lead=3)
+    _run_chunk_o(H=2, K=64, V=32, M=M, lead=3)
 
 
 @pytest.mark.large
@@ -175,8 +188,9 @@ def test_chunk_states_past_int32_offsets(case):
 @pytest.mark.parametrize("case", list(CHUNK_O_LARGE))
 def test_outputs_past_int32_offsets(case):
     _requires_cuda()
-    K, V, lead = CHUNK_O_LARGE[case]
+    H, K, V, M, lead = CHUNK_O_LARGE[case]
     tokens = lead * CHUNK_SIZE + TAIL
     # bf16 q, k, v, o and chunk states, and temporaries.
-    _requires_free_memory(4 * tokens * (K + V) + 2 * (lead + 2) * K * V + (1 << 30))
-    _run_chunk_o(K, V, lead)
+    elements = tokens * H * (K + M * K + M * V + V) + (lead + 2) * H * K * V
+    _requires_free_memory(2 * elements + (1 << 30))
+    _run_chunk_o(H, K, V, M, lead)
