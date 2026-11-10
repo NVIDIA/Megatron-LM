@@ -259,6 +259,33 @@ def test_save_grads_writers(tmp_path, stand_in_ranks, expt_dp_rank, expt_dp_gtp_
     assert (tmp_path / "wgrads" / "iter_0000007" / "mp_rank_00.pth").exists() == writes
 
 
+@pytest.mark.parametrize(
+    "ep_size,data_parallel_groups,writes",
+    [
+        (1, dict(dp=_StandInGroup(1, 2)), False),
+        (1, dict(dp=_StandInGroup(0, 2)), True),
+        # The context-parallel peers of the first data-parallel rank hold the same file.
+        (1, dict(dp=_StandInGroup(0, 2), dp_cp=_StandInGroup(1, 4)), False),
+        (1, {}, True),
+        # The expert-parallel rank already separates the files of these ranks.
+        (2, dict(dp=_StandInGroup(1, 2)), True),
+    ],
+)
+def test_save_grads_writers_without_an_expert_data_parallel_group(
+    tmp_path, stand_in_ranks, ep_size, data_parallel_groups, writes
+):
+    """With expt_dp set to None and no expert parallelism, the data-parallel group elects."""
+    single = _StandInGroup(0, 1)
+    pg_collection = ProcessGroupCollection(
+        tp=single, pp=single, ep=_StandInGroup(0, ep_size), expt_dp=None, **data_parallel_groups
+    )
+    with _no_global_grid():
+        checkpointing.save_grads(str(tmp_path), {}, 7, "wgrads", pg_collection=pg_collection)
+
+    name = "mp_rank_00.pth" if ep_size == 1 else "mp_rank_00_000.pth"
+    assert (tmp_path / "wgrads" / "iter_0000007" / name).exists() == writes
+
+
 def test_save_grads_requires_the_groups_it_reads(tmp_path):
     single = _StandInGroup(0, 1)
     with pytest.raises(ValueError, match="save_grads requires pg_collection to set ep, expt_dp"):

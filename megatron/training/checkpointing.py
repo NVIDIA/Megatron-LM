@@ -853,8 +853,13 @@ def save_grads(
     Args:
         pg_collection: Process groups of the model whose state is saved. It must set ``tp``,
             ``pp``, ``ep`` and ``expt_dp``. The writers are the first ranks of
-            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. Omitting the
-            collection reads the global parallel grid, which is deprecated and warns.
+            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. A model
+            without expert parallelism may set ``expt_dp`` to None: its writers are then the
+            first ranks of its data-parallel group (``dp_cp_gtp_remat``, ``dp_cp``,
+            ``dp_gtp_remat`` or ``dp``, whichever is set first). With expert parallelism and
+            ``expt_dp`` set to None, every rank writes the file of its expert-parallel rank.
+            Omitting the collection reads the global parallel grid, which is deprecated and
+            warns.
     """
 
     print_rank_0(
@@ -873,7 +878,16 @@ def save_grads(
         tp_group, pp_group, ep_group, expt_dp_group = require_process_groups(
             pg_collection, ('tp', 'pp', 'ep', 'expt_dp'), owner='save_grads'
         )
-        expt_dp_rank = get_pg_rank(_first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group))
+        writer_group = _first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group)
+        if writer_group is None and get_pg_size(ep_group) == 1:
+            # Without expert parallelism, the replicas of a file are the data-parallel ranks.
+            writer_group = _first_group(
+                pg_collection.dp_cp_gtp_remat,
+                pg_collection.dp_cp,
+                pg_collection.dp_gtp_remat,
+                pg_collection.dp,
+            )
+        expt_dp_rank = get_pg_rank(writer_group)
         tp_rank = get_pg_rank(tp_group)
         pp_rank = get_pg_rank(pp_group)
         ep_rank = get_pg_rank(ep_group)
