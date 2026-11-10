@@ -62,6 +62,7 @@ class FakeDeepEPEvent:
         pass
 
     def current_stream_wait(self):
+        """Return immediately because fake allocations use the current stream."""
         pass
 
 
@@ -111,6 +112,7 @@ class FakeDeepEPBuffer:
         logger.info("Fake Flex memory buffer: %s", self.allocation_summary)
 
     def get_dispatch_layout(self, topk_idx, num_experts, **kwargs):
+        """Allocate synthetic routing metadata with the native layout shapes."""
         torch, group_size = self.torch, self.group_size
         tokens, topk = topk_idx.shape
         if num_experts < group_size or num_experts % group_size:
@@ -137,6 +139,7 @@ class FakeDeepEPBuffer:
         is_token_in_rank=None,
         **kwargs,
     ):
+        """Allocate balanced received assignments or replay a cached handle."""
         torch = self.torch
         if x.dtype != torch.bfloat16 or x.ndim != 2:
             raise ValueError("fake Flex dispatch requires a BF16 matrix")
@@ -200,6 +203,7 @@ class FakeDeepEPBuffer:
         return received, indices, probabilities, counts, handle, FakeDeepEPEvent()
 
     def combine(self, x, handle, topk_weights=None, **kwargs):
+        """Allocate source-shaped outputs and optional routing gradients."""
         if x.shape[0] != handle["receive_tokens"]:
             raise ValueError("fake Flex combine receive shape mismatch")
         output = x.new_zeros((handle["source_tokens"], x.shape[1]))
