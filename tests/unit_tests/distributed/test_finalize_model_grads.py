@@ -382,6 +382,39 @@ def _assert_router_state(chunk, expected):
     assert chunk.finish_grad_sync_calls == 1
 
 
+@pytest.mark.parametrize(
+    "config_kwargs", [_EXPERT_BIAS, _GLOBAL_BATCH_QB], ids=["expert-bias", "global-batch-qb"]
+)
+def test_without_collection_requires_global_tp_dp_cp_before_grad_sync(
+    config_kwargs, monkeypatch, fresh_fallback_warnings
+):
+    """A grid without the TP x DP x CP group fails like a collection without tp_dp_cp.
+
+    The global-batch quantile-balancing reduction skips a None group, so each rank would update
+    its routers from its own histograms.
+    """
+    # The shim stands in for a grid registered without tp_dp_cp. No other group is used before
+    # the check, so placeholders stand in for the groups that the grid has.
+    grid_groups = dict.fromkeys(_FALLBACK_FIELDS)
+    grid_groups.update(tp=object(), pp=object(), dp_cp_gtp_remat=object())
+    monkeypatch.setattr(
+        ProcessGroupCollection,
+        "use_mpu_process_groups",
+        lambda required_pgs=None: ProcessGroupCollection(
+            **{name: grid_groups[name] for name in required_pgs}
+        ),
+    )
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    model = _RouterExpertBiasModel(_stage_config(**config_kwargs), torch.tensor([1.0, 0.0]))
+
+    with (
+        pytest.warns(ProcessGroupFallbackWarning, match=_FALLBACK_WARNING),
+        pytest.raises(ValueError, match="tp_dp_cp"),
+    ):
+        finalize_model_grads([model])
+    assert model.finish_grad_sync_calls == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(
     Utils.world_size < _PIPELINE_SIZE or Utils.world_size % _PIPELINE_SIZE != 0,
