@@ -170,29 +170,34 @@ class TestExplicitCollection:
         # New communicators over the ranks of the global groups: a stray global read would hand
         # a module a group object that is not in this collection.
         grid = HyperCommGrid([2, 1, Utils.world_size // 4, 2], ["tp", "cp", "dp", "pp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"),
-            cp=grid.create_pg("cp"),
-            pp=grid.create_pg("pp"),
-            dp_cp=grid.create_pg(["dp", "cp"]),
-            hcp=None,
-            gtp_remat=None,
-            expt_gtp_remat=None,
-        )
-        _forbid_global_process_groups(monkeypatch)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", ProcessGroupFallbackWarning)
-            block = TransformerBlock(config, _layer_spec(), pg_collection=pg_collection)
-        assert block.pg_collection is pg_collection
-        assert block.tp_group is pg_collection.tp
-        assert _layer_numbers(block) == [
-            2 * pg_collection.pp.rank() + 1,
-            2 * pg_collection.pp.rank() + 2,
-        ]
-        for layer in block.layers:
-            assert layer.pg_collection is pg_collection
-            assert layer.self_attention.pg_collection is pg_collection
-            assert layer.mlp.tp_group is pg_collection.tp
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"),
+                cp=grid.create_pg("cp"),
+                pp=grid.create_pg("pp"),
+                dp_cp=grid.create_pg(["dp", "cp"]),
+                hcp=None,
+                gtp_remat=None,
+                expt_gtp_remat=None,
+            )
+            _forbid_global_process_groups(monkeypatch)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                block = TransformerBlock(config, _layer_spec(), pg_collection=pg_collection)
+            assert block.pg_collection is pg_collection
+            assert block.tp_group is pg_collection.tp
+            assert _layer_numbers(block) == [
+                2 * pg_collection.pp.rank() + 1,
+                2 * pg_collection.pp.rank() + 2,
+            ]
+            for layer in block.layers:
+                assert layer.pg_collection is pg_collection
+                assert layer.self_attention.pg_collection is pg_collection
+                assert layer.mlp.tp_group is pg_collection.tp
+        finally:
+            # Every rank finishes creating the groups before any communicator goes away.
+            torch.distributed.barrier()
+            grid.destroy()
 
 
 class TestDefaultCollection:
