@@ -249,7 +249,7 @@ def main(
 
     if (
         scope == "unit-tests"
-        and test_case == "tests/unit_tests/core/transformer/**/*.py"
+        and test_case == "tests/unit_tests/transformer/**/*.py"
         and environment == "dev"
         and tag == "latest"
         and platform == "dgx_h100"
