@@ -2699,11 +2699,13 @@ def _build_pg_collection_from_parallel_state(args, config=None):
         dp_cp_ag, expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=(config.expert_model_parallel_size > 1), timeout=timeout
         )
-        # create_all_gather_groups lays the expert ranks out in the default order, so check that
-        # each all-gather group spans the ranks of the group whose parameters it gathers.
+        # create_all_gather_groups mirrors the full data-parallel groups and lays the expert
+        # ranks out in the default order, so check that each all-gather group spans the ranks
+        # of the group Megatron-FSDP shards its parameters over: the intra-instance group,
+        # which is the full group with one distributed optimizer instance.
         for ag_group, group in (
-            (dp_cp_ag, pg_collection.dp_cp),
-            (expt_dp_ag, pg_collection.expt_dp),
+            (dp_cp_ag, pg_collection.intra_dp_cp),
+            (expt_dp_ag, pg_collection.intra_expt_dp),
         ):
             if ag_group is not None and (
                 torch.distributed.get_process_group_ranks(ag_group)
@@ -2711,8 +2713,9 @@ def _build_pg_collection_from_parallel_state(args, config=None):
             ):
                 raise ValueError(
                     "--create-all-gather-group built all-gather groups whose ranks differ from "
-                    "the data-parallel groups; with expert parallelism it supports only the "
-                    "default tp-cp-ep-dp-pp rank order."
+                    "the data-parallel groups Megatron-FSDP shards over. It does not support "
+                    "--num-distributed-optimizer-instances > 1, and with expert parallelism it "
+                    "supports only the default tp-cp-ep-dp-pp rank order."
                 )
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag

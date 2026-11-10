@@ -98,6 +98,16 @@ class TestTrainingPgCollection:
             training._build_pg_collection_from_parallel_state(args)
 
     @pytest.mark.usefixtures("run_config")
+    def test_all_gather_groups_reject_several_optimizer_instances(self):
+        # Megatron-FSDP then shards over the intra-instance group, which has half of the
+        # data-parallel ranks that the all-gather group spans.
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
+        args = SimpleNamespace(create_all_gather_group=True)
+
+        with pytest.raises(ValueError, match="--num-distributed-optimizer-instances > 1"):
+            training._build_pg_collection_from_parallel_state(args)
+
+    @pytest.mark.usefixtures("run_config")
     def test_get_model_wraps_ddp_with_the_given_collection(self, monkeypatch):
         Utils.initialize_model_parallel()
         args = init_basic_mock_args(parse_args(ignore_unknown_args=True), tp=1, pp=1, bf16=True)
