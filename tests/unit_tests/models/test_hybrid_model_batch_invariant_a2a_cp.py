@@ -39,8 +39,6 @@ try:
 except ImportError:
     HAVE_TEX = False
 
-pytestmark = pytest.mark.launch_on_gb200
-
 SEQ_LEN = 256
 PACKED_LENGTHS = [96, 40, 64, 56]  # multiples of 2 * CP for every CP size tested
 VOCAB_SIZE = 131072  # Nano's; at 128 the te_native output GEMM varies with the row count
@@ -287,6 +285,7 @@ class TestBatchInvariantA2AContextParallel:
     # Nano at TP1xCP4: 8 query heads per CP rank sharing a gathered K/V head; 16 Mamba heads.
     # TP2xCP2 (sequence parallel): small with 8 groups splits 4 K/V heads per TP rank across
     # CP; small with 2 groups and Nano have one K/V head per TP rank, gathered.
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize(
         "shape,num_query_groups,cp_size,tp_size",
         [("small", g, cp, 1) for g in (8, 2, 1) for cp in (2, 4)]
