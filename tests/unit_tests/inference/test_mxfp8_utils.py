@@ -409,6 +409,19 @@ class TestMxfp8Quantize:
                 assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8)), name
                 assert torch.equal(scale.view(torch.uint8), expected_scale.view(torch.uint8)), name
 
+    def test_strided_input_is_read_in_place(self):
+        """mxfp8_quantize_into reads a strided view through its strides, with no temporary copy."""
+        x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16).t()
+        data, scale = mxfp8_quantize(x.contiguous())
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated()
+
+        mxfp8_quantize_into(x, data, scale)
+
+        torch.cuda.synchronize()
+        assert torch.cuda.max_memory_allocated() == allocated
+
 
 # ──────────────────────────────────────────────────────────────────────
 # MXFP8Tensor
