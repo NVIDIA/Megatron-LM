@@ -974,7 +974,11 @@ def test_callbacks_construct_from_registered_model_config(
         dataset_builder = Mock()
         dataset_builder.return_value.build.return_value = (None, None, None)
         monkeypatch.setattr(provider, "BlendedMegatronDatasetBuilder", dataset_builder)
-        provider.train_valid_test_datasets_provider([1, 1, 1])
+        # The provider elects the rank that builds the datasets in the TP group it is given.
+        tp_group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+        provider.train_valid_test_datasets_provider(
+            [1, 1, 1], pg_collection=ProcessGroupCollection(tp=tp_group)
+        )
         assert dataset_config.call_args.kwargs["classification_head"] is binary_head
     else:
         assert build.call_args.kwargs["encoder_config"].num_layers == 2
