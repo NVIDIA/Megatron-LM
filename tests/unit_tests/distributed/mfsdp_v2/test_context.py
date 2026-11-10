@@ -119,7 +119,9 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
-    model(inputs).sum().backward()
+    # Recording ends after this microbatch even while outer reduction is skipped.
+    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
+        model(inputs).sum().backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
