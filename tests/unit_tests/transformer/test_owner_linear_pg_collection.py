@@ -32,6 +32,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
@@ -74,7 +75,6 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import (
     Utils,

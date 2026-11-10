@@ -142,7 +142,8 @@ replacement:
 
 | Deprecated functions | Replacement |
 |---|---|
-| Group accessors, such as `get_tensor_model_parallel_group()`, including the Gloo and dynamic context-parallel ones | The matching field of the model's `ProcessGroupCollection`, such as `pg_collection.tp` |
+| Group accessors, such as `get_tensor_model_parallel_group()`, including the dynamic context-parallel ones | The matching field of the model's `ProcessGroupCollection`, such as `pg_collection.tp` |
+| Gloo group accessors: `get_data_parallel_group_gloo()`, `get_expert_data_parallel_group_gloo()` | `pg_collection.intra_dp_cp_gloo` and `pg_collection.intra_expt_dp_gloo` for the partial data-parallel groups; the other Gloo groups have no field, so the caller passes them |
 | Rank, size and global-rank accessors, such as `get_tensor_model_parallel_rank()` and `get_pipeline_model_parallel_first_rank()` | `rank()` or `size()` of that field, `torch.distributed.get_global_rank(group, 0)`, or the `get_pp_*_rank(pp_group)` helpers in `megatron.core.pipeline_parallel.utils` |
 | Stage predicates: `is_pipeline_first_stage()`, `is_pipeline_last_stage()`, `is_rank_in_embedding_group()`, `is_rank_in_position_embedding_group()` | `is_pp_first_stage(pp_group)`, `is_pp_last_stage(pp_group)`, `is_vp_first_stage()` and `is_vp_last_stage()` in `megatron.core.pipeline_parallel.utils`; membership in `pg_collection.embd` or `pg_collection.pos_embd` |
 | Virtual-pipeline rank and size getters and setters | The `vp_stage` of the model chunk, passed explicitly, and the `virtual_pipeline_model_parallel_size` of the model's configuration |
@@ -238,7 +239,10 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   `megatron.energon`, stay ignored; `tests/unit_tests/test_parallel_state_accessor_uses.py`
   still checks the calls of the former in their source. A test that checks the warning uses
   `pytest.warns(ParallelStateDeprecationWarning)` on a call site that has not warned yet in the
-  same process.
+  same process. A call site that a test has reached under the ignore filter is recorded as well
+  and stays silent, so a test of a call site that other tests share, such as a line of a test
+  helper, first clears the record with
+  `monkeypatch.setattr(parallel_state, "_warned_accessor_call_sites", set())`.
 
 ### Handling CI Failures
 

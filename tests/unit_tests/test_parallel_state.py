@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from datetime import timedelta
 
 import pytest
@@ -689,16 +690,25 @@ def test_valid_dynamic_cp_group_sizes():
         ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
-def test_separate_all_gather_group(monkeypatch):
+@pytest.mark.parametrize("with_collection", [False, True])
+def test_separate_all_gather_group(monkeypatch, with_collection):
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     Utils.initialize_model_parallel(context_parallel_size=world_size)
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    # Without a collection, the deprecated form reads the global grid.
-    with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
-        dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    if with_collection:
+        # The form that training uses: the group mirrors the collection's, with no fallback.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(
+                for_expert_parallelism=False, pg_collection=ps.get_registered_process_groups()
+            )
+    else:
+        # Without a collection, the deprecated form reads the global grid.
+        with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
+            dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"

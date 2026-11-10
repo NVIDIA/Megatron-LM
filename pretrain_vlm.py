@@ -82,7 +82,7 @@ def model_provider(
     vision_model_type = "clip"
 
     if pg_collection is None:
-        # LLaVAModel requires an explicit process-group collection; training passes the run's
+        # Omitting the collection from LLaVAModel is deprecated; training passes the run's
         # groups, and direct callers that omit them get the global parallel grid.
         with global_process_group_fallback(
             "pretrain_vlm.model_provider", deprecated_in="0.21", removed_in="0.23"

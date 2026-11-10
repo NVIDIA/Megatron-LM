@@ -1182,7 +1182,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             expert_tp_group=self.expert_tp_group,
             gtp_group=self.gtp_group,
             expert_gtp_group=self.expert_gtp_group,
-            use_global_fallback=False,
+            use_global_fallback=not self.duplicate_filter_groups_from_collection,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

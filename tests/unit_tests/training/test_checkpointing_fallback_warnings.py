@@ -25,7 +25,7 @@ from megatron.training import training as training_mod
 from megatron.training.config import CheckpointConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_checkpointing import init_model_parallel
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 from tests.unit_tests.training.test_checkpointing_pg_collection import (
     _grid_unlike_the_global_one,
     _no_global_grid,
@@ -259,6 +259,33 @@ def test_save_grads_writers(tmp_path, stand_in_ranks, expt_dp_rank, expt_dp_gtp_
     assert (tmp_path / "wgrads" / "iter_0000007" / "mp_rank_00.pth").exists() == writes
 
 
+@pytest.mark.parametrize(
+    "ep_size,data_parallel_groups,writes",
+    [
+        (1, dict(dp=_StandInGroup(1, 2)), False),
+        (1, dict(dp=_StandInGroup(0, 2)), True),
+        # The context-parallel peers of the first data-parallel rank hold the same file.
+        (1, dict(dp=_StandInGroup(0, 2), dp_cp=_StandInGroup(1, 4)), False),
+        (1, {}, True),
+        # The expert-parallel rank already separates the files of these ranks.
+        (2, dict(dp=_StandInGroup(1, 2)), True),
+    ],
+)
+def test_save_grads_writers_without_an_expert_data_parallel_group(
+    tmp_path, stand_in_ranks, ep_size, data_parallel_groups, writes
+):
+    """With expt_dp set to None and no expert parallelism, the data-parallel group elects."""
+    single = _StandInGroup(0, 1)
+    pg_collection = ProcessGroupCollection(
+        tp=single, pp=single, ep=_StandInGroup(0, ep_size), expt_dp=None, **data_parallel_groups
+    )
+    with _no_global_grid():
+        checkpointing.save_grads(str(tmp_path), {}, 7, "wgrads", pg_collection=pg_collection)
+
+    name = "mp_rank_00.pth" if ep_size == 1 else "mp_rank_00_000.pth"
+    assert (tmp_path / "wgrads" / "iter_0000007" / name).exists() == writes
+
+
 def test_save_grads_requires_the_groups_it_reads(tmp_path):
     single = _StandInGroup(0, 1)
     with pytest.raises(ValueError, match="save_grads requires pg_collection to set ep, expt_dp"):
@@ -485,33 +512,37 @@ def test_train_step_debug_dumps_use_the_model_collection(monkeypatch, run_config
     run_config.checkpoint.save_wgrads_interval = 1
     _run_train_step(model=model, pg_collection=schedule_pg_collection)
 
-    assert dumps == {
-        "activations": model_pg_collection,
-        "dgrads": model_pg_collection,
-        "wgrads": model_pg_collection,
-    }
+    assert set(dumps) == {"activations", "dgrads", "wgrads"}
+    # By identity: two empty collections compare equal, also the schedule's and the model's.
+    assert all(dump is model_pg_collection for dump in dumps.values())
 
 
 @requires_four_rank_multiple
 def test_save_grads_on_model_grid(init_model_parallel, tmp_path_dist_ckpt):
     """Each tensor/pipeline shard of a grid unlike the global one is written once, by its name."""
     grid = _grid_unlike_the_global_one()
-    tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
-    state_dict = {"chunk": {"tp": torch.tensor(tp_rank), "pp": torch.tensor(pp_rank)}}
-    with TempNamedDir(tmp_path_dist_ckpt / "test_save_grads_on_model_grid", sync=True) as save_dir:
-        with _no_global_grid():
-            checkpointing.save_grads(str(save_dir), state_dict, 7, "wgrads", pg_collection=grid)
-        torch.distributed.barrier()
+    try:
+        tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
+        state_dict = {"chunk": {"tp": torch.tensor(tp_rank), "pp": torch.tensor(pp_rank)}}
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_save_grads_on_model_grid", sync=True
+        ) as save_dir:
+            with _no_global_grid():
+                checkpointing.save_grads(str(save_dir), state_dict, 7, "wgrads", pg_collection=grid)
+            torch.distributed.barrier()
 
-        iteration_dir = save_dir / "wgrads" / "iter_0000007"
-        assert sorted(os.listdir(iteration_dir)) == [
-            f"mp_rank_{t:02d}_{p:03d}.pth" for t in range(2) for p in range(2)
-        ]
-        for t in range(2):
-            for p in range(2):
-                saved = torch.load(iteration_dir / f"mp_rank_{t:02d}_{p:03d}.pth")
-                assert (saved["chunk"]["tp"].item(), saved["chunk"]["pp"].item()) == (t, p)
-        torch.distributed.barrier()
+            iteration_dir = save_dir / "wgrads" / "iter_0000007"
+            assert sorted(os.listdir(iteration_dir)) == [
+                f"mp_rank_{t:02d}_{p:03d}.pth" for t in range(2) for p in range(2)
+            ]
+            for t in range(2):
+                for p in range(2):
+                    saved = torch.load(iteration_dir / f"mp_rank_{t:02d}_{p:03d}.pth")
+                    assert (saved["chunk"]["tp"].item(), saved["chunk"]["pp"].item()) == (t, p)
+            torch.distributed.barrier()
+    finally:
+        # The model's groups go before the fixture tears the global grid down.
+        destroy_test_pg_collection(grid)
 
 
 @pytest.mark.skipif(

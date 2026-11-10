@@ -99,15 +99,23 @@ def loss_func(
         output_tensor (Tensor): The tensor with the losses
         model (GPTModel): The model (can be wrapped). Distillation losses split across
             tensor-parallel ranks are reduced over the ``tp`` group of its ``pg_collection``, and
-            the per-budget distillation report is gathered over its ``dp_gtp_remat`` group.
+            the per-budget distillation report is gathered over its ``dp_gtp_remat`` group. For
+            a model that carries no ``pg_collection``, a split loss falls back to the global
+            tensor-parallel group with a deprecation warning, and distillation raises
+            ``ValueError``, as it does for a collection without ``dp_gtp_remat``.
         selected_budget (float): The budget value used for this forward pass
     """
     args = get_args()
 
     # Unwrap for both Distillation and LANA
     model = unwrap_model(model)
-    pg_collection = get_attr_wrapped_model(model, "pg_collection")
-    tp_group = pg_collection.tp
+    try:
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    except RuntimeError:
+        # Compatibility for model classes that carry no collection: _mask_loss falls back to
+        # the global group, with a warning, when a loss needs it.
+        pg_collection = None
+    tp_group = None if pg_collection is None else pg_collection.tp
 
     # Standard lm loss
     out_mask_loss = _mask_loss(output_tensor, loss_mask, tp_group=tp_group)
@@ -157,7 +165,7 @@ def loss_func(
         loss = losses["kd_loss"] + param_loss_item
         # All-gather logits_loss across DP ranks so we can mask by selected_budget below. Every
         # rank of the group trains on distinct samples, so the GTP-inclusive group is used.
-        dp_group = pg_collection.dp_gtp_remat
+        dp_group = None if pg_collection is None else pg_collection.dp_gtp_remat
         if dp_group is None:
             raise ValueError(
                 "Flextron distillation loss requires pg_collection.dp_gtp_remat of the model."

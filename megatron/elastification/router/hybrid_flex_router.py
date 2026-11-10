@@ -47,11 +47,12 @@ class FlextronRouter(MegatronModule):
     Args:
         config: Transformer config of the model, with the Flextron router fields.
         pg_collection: Process groups of the model that the router belongs to. Its linear layers
-            are sharded over the ``tp`` group, and each shard starts from the weights of its
-            first replica in the ``pp`` and ``dp_cp`` groups. The Gumbel-softmax seeds and the
-            number of gradient-accumulation steps use the rank and size of the ``dp_gtp_remat``
-            group, whose ranks train on distinct samples. None falls back to the global process
-            groups with a deprecation warning.
+            are sharded over the ``tp`` group. Every rank starts from the router weights of the
+            model's first rank, which are broadcast over the ``tp``, ``pp`` and data-parallel
+            (``dp_cp_gtp_remat``, or ``dp_cp`` for a collection without it) groups. The
+            Gumbel-softmax seeds and the number of gradient-accumulation steps use the rank and
+            size of the ``dp_gtp_remat`` group, whose ranks train on distinct samples. None
+            falls back to the global process groups with a deprecation warning.
 
     Raises:
         ValueError: ``pg_collection`` does not set ``tp``, ``pp``, ``dp_cp`` or ``dp_gtp_remat``.
@@ -110,19 +111,28 @@ class FlextronRouter(MegatronModule):
         self.gumbel_base_seed = base_seed
 
     def _sync_router_weights(self):
-        """Copy each router shard from its first replica to the other replicas.
+        """Copy the router weights of the model's first rank to every rank of the model.
 
-        The linear layers are sharded over ``tp`` (and over ``gtp_remat`` when it is active), so
-        a shard is broadcast only among the ranks that hold the same shard: first over ``pp``,
-        whose stages each build a router, then over ``dp_cp``, the replica group of dense weights.
+        The weights are broadcast from the first rank of each group: over ``tp``, then over
+        ``pp``, whose stages each build a router, then over the data-parallel group that
+        includes the context-parallel and GTP-remat ranks. On a grid that is the product of
+        these axes, every rank ends up with the weights of the model's first rank, which is
+        global rank 0 on the standard grid. All shards of the linear layers therefore start
+        from the same values. The broadcasts stay inside the model's groups, so they never
+        reach a rank of another model in the job.
+
         Every rank of the model builds the same routers in the same order, so all members of
         each group enter the same broadcasts.
         """
         if not torch.distributed.is_initialized():
             return
 
-        for group in (self.pg_collection.pp, self.pg_collection.dp_cp):
-            # A group of one rank, or an axis that is off (None), has no other replica.
+        dp_cp_group = self.pg_collection.dp_cp_gtp_remat
+        if dp_cp_group is None:
+            # A collection without the GTP-remat-inclusive group has no GTP-remat axis.
+            dp_cp_group = self.pg_collection.dp_cp
+        for group in (self.pg_collection.tp, self.pg_collection.pp, dp_cp_group):
+            # A group of one rank, or an axis that is off (None), has no other rank.
             if get_pg_size(group) == 1:
                 continue
             source_rank = get_pg_src_rank(group)
