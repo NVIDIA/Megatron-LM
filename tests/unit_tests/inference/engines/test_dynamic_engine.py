@@ -5001,6 +5001,95 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    @pytest.mark.parametrize("keep_stop", [False, True])
+    @torch.inference_mode()
+    def test_recompute_suspend_keeps_prompt_scores_of_stopped_request(
+        self, async_sched_mode, keep_stop
+    ):
+        """A RECOMPUTE suspend while a chunked-prefill request waits to finish on a stop word
+        keeps its prompt log probs, even when the stop removed every generated token.
+
+        The request's first generated token is its one-token stop. Without
+        `detokenize_stop_sequence` the stop removes it, so the request has no generated token
+        while its finish is deferred to the next step, yet its prefill is complete.
+        """
+        vocab_size = DynamicEngineTestConfig.vocab_size
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=256,
+                context_block_size_tokens=8,
+                context_max_requests=4,
+                context_max_tokens=16,
+                enable_chunked_prefill=True,
+                materialize_only_last_token_logits=False,
+                async_sched_mode=async_sched_mode,
+                kv_cache_management_mode="recompute",
+                static_kv_memory_pointers=False,
+            )
+        )
+        engine = env.engine
+
+        def successor(tokens, positions):
+            return 1 + (tokens * 7 + positions * 13 + 5) % (vocab_size - 3)
+
+        def mock_forward(input_ids, position_ids, *args, **kwargs):
+            tokens, positions = input_ids[0].long(), position_ids[0].long()
+            logits = torch.zeros(
+                1, tokens.numel(), vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            logits[0].scatter_(1, successor(tokens, positions)[:, None], 8.0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+        # Each stop word is spelled as its token IDs joined by underscores.
+        engine.controller.tokenize_prompt = lambda tokenizer, text, add_BOS=False: [
+            int(token) for token in text.split("_")
+        ]
+        # Two chunks of the 16-token step budget.
+        prompt = [1 + (i * 11 + 3) % (vocab_size - 3) for i in range(20)]
+        first = int(successor(torch.tensor(prompt[-1]), torch.tensor(len(prompt) - 1)))
+        future = engine.add_request(
+            0,
+            prompt,
+            SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                stop_words=[str(first)],
+                detokenize_stop_sequence=keep_stop,
+            ),
+        )
+
+        # Step until the stop is detected; its finish waits for the next step.
+        for _ in range(8):
+            engine.step_modern()
+            if 0 in engine.stop_word_finished_request_ids:
+                break
+        request = engine.get_request(0)
+        assert 0 in engine.stop_word_finished_request_ids
+        assert request.generated_tokens == ([first] if keep_stop else [])
+        assert len(request.prompt_log_probs) == len(prompt) - 1
+
+        engine.suspend()
+        engine.resume()
+        for _ in range(8):
+            if future.done():
+                break
+            engine.step_modern()
+
+        finished = future.result()
+        assert finished.status == Status.COMPLETED
+        assert finished.generated_tokens == ([first] if keep_stop else [])
+        assert len(finished.prompt_log_probs) == len(prompt) - 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_generate_function(self, model_provider: str) -> None:
