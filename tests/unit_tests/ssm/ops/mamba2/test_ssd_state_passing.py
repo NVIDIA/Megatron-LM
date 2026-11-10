@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import inspect
 import unittest
 from unittest import mock
 
@@ -8,6 +9,7 @@ import torch
 
 try:
     import triton
+    from triton.runtime.autotuner import Autotuner
 
     from megatron.core.ssm.ops.mamba2 import ssd_state_passing
     from megatron.core.ssm.ops.mamba2.ssd_state_passing import _state_passing_fwd
@@ -92,7 +94,11 @@ class TestStatePassingFwd(unittest.TestCase):
     @contextlib.contextmanager
     def _timed_autotuning(self):
         """Time two BLOCK_SIZE candidates from a cold autotune cache, whatever the environment
-        pins, and check that the launch inside really benchmarked them."""
+        pins, and check that the launch inside really benchmarked them.
+
+        Triton's own ``Autotuner.run`` stands in for an installed ``megatron.core.tuning`` policy,
+        which would pin the kernel to one config.
+        """
         tuner = ssd_state_passing._state_passing_fwd_kernel
         candidates = [triton.Config({"BLOCK_SIZE": 64}), triton.Config({"BLOCK_SIZE": 128})]
         benchmarked = []
@@ -103,6 +109,7 @@ class TestStatePassingFwd(unittest.TestCase):
             return do_bench(kernel_call, quantiles=quantiles)
 
         with (
+            mock.patch.object(Autotuner, "run", inspect.unwrap(Autotuner.run)),
             mock.patch.object(tuner, "configs", candidates),
             mock.patch.object(tuner, "cache", {}),
             mock.patch.object(tuner, "cache_results", False, create=True),
