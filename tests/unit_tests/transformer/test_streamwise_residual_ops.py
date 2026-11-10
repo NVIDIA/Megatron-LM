@@ -8,8 +8,11 @@ import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.streamwise_residual_ops import (
+    _STREAMWISE_MAX_REDUCTION_BLOCK,
+    _STREAMWISE_MAX_STREAMS,
     HAVE_STREAMWISE_TRITON,
     _can_use_streamwise_triton,
+    _num_gradient_partials,
     _streamwise_backward_block_config,
     _streamwise_block_config,
     streamwise_read,
@@ -514,6 +517,22 @@ def test_tiles_are_powers_of_two_at_every_eligible_width(batch):
             assert block_width & (block_width - 1) == 0, (stream_width, config)
             # The column mask never skips more than half a tile.
             assert block_width < 2 * stream_width, (stream_width, config)
+
+
+def test_training_limits_keep_backward_offsets_below_int32():
+    """The backward kernels index rows in int32. The training limits cap the gradient
+    partials, which bounds ``rows * K * W`` by 2**31 at the largest K and every width."""
+
+    def accepted(batch, stream_width):
+        partials = _num_gradient_partials(batch, stream_width)
+        return 1 << (partials - 1).bit_length() <= _STREAMWISE_MAX_REDUCTION_BLOCK
+
+    for stream_width in range(64, 16385):
+        low, high = 1, 1 << 27
+        while low < high:  # the largest batch the training limits accept
+            middle = (low + high + 1) // 2
+            low, high = (middle, high) if accepted(middle, stream_width) else (low, middle - 1)
+        assert low * _STREAMWISE_MAX_STREAMS * stream_width <= 2**31, stream_width
 
 
 @pytest.mark.skipif(
@@ -1112,6 +1131,77 @@ def test_fused_cuda_widths_below_column_tile_match_reference(stream_width, mode)
         assert _relative_l2(fused_gradient, reference_gradient) <= (2.0e-5 if index < 2 else 5.0e-4)
     for gradient in fused_gradients[2:]:
         assert torch.count_nonzero(gradient[num_streams:]) == 0
+
+
+_INT32_FIT_ROWS = 2**31 // (2 * 8192)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+@pytest.mark.parametrize("op", ["read", "write"])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param(33, id="small"),
+        pytest.param(_INT32_FIT_ROWS, id="int32-fits", marks=pytest.mark.large),
+        pytest.param(_INT32_FIT_ROWS + 1, id="int32-crosses", marks=pytest.mark.large),
+    ],
+)
+def test_fused_forward_addresses_rows_past_int32_offsets(rows, op):
+    """Forward-only reads and writes reach rows whose element offsets pass 2**31.
+
+    With two 8192-wide streams, row 131,072 of the full-width stream starts at element 2**31.
+    Inference lifts the training limits, so a batch of any size runs the fused kernels. The
+    rows on both sides of the limit and the last row are checked against the reference.
+    """
+
+    num_streams, stream_width = 2, 8192
+    row_elems = num_streams * stream_width
+    needed = 3 * rows * row_elems * torch.bfloat16.itemsize + (1 << 30)
+    if torch.cuda.mem_get_info()[0] < needed:
+        pytest.skip(f"needs {needed / 2**30:.1f} GiB of free device memory")
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    residual = torch.randn(
+        rows, row_elems, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    update = torch.randn(
+        rows, stream_width, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    read_logits = _padded_logits(torch.tensor([-0.8, -0.6], device="cuda"))
+    write_logits = _padded_logits(torch.tensor([-0.01, 0.01], device="cuda"))
+    retention_logits = _padded_logits(torch.tensor([4.8, 5.0], device="cuda"))
+    first_past = 2**31 // row_elems
+    sample = sorted({0, 1, first_past - 1, first_past, rows - 1} & set(range(rows)))
+
+    with InferenceMode.active(), torch.inference_mode():
+        if op == "read":
+            output = streamwise_sigmoid_read(residual, read_logits, num_streams)
+        else:
+            output = streamwise_sigmoid_writeback(
+                residual,
+                update,
+                write_logits,
+                num_streams,
+                retention_logits=retention_logits,
+                retention_max_forget=0.2,
+            )
+        actual = output[sample].clone()
+    del output
+
+    if op == "read":
+        reference = _reference_read(
+            residual[sample], torch.sigmoid(read_logits[:num_streams].float())
+        )
+    else:
+        reference = _reference_writeback(
+            residual[sample],
+            update[sample],
+            2.0 * torch.sigmoid(write_logits[:num_streams].float()),
+            1.0 - 0.2 * torch.sigmoid(-retention_logits[:num_streams].float()),
+        )
+    torch.testing.assert_close(actual, reference.detach())
 
 
 @pytest.mark.skipif(

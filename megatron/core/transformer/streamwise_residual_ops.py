@@ -240,7 +240,9 @@ if HAVE_STREAMWISE_TRITON:
 
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
-        offsets_batch = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+        # Row offsets are int64: row * NUM_STREAMS * STREAM_WIDTH passes 2**31 for a large
+        # forward-only batch, e.g. 65,536 tokens of four 8192-wide streams.
+        offsets_batch = pid_batch.to(tl.int64) * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
         offsets_width = pid_width * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
         mask = (offsets_batch[:, None] < BATCH) & (offsets_width[None, :] < STREAM_WIDTH)
         output = tl.zeros((BLOCK_BATCH, BLOCK_WIDTH), tl.float32)
@@ -279,6 +281,8 @@ if HAVE_STREAMWISE_TRITON:
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
         partial_index = pid_batch * NUM_WIDTH_BLOCKS + pid_width
+        # Row offsets stay int32: backward runs only under the training limits, whose cap on
+        # gradient partials keeps rows * STREAM_WIDTH <= 2**27, and NUM_STREAMS <= 16.
         offsets_batch = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
         offsets_width = pid_width * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
         mask = (offsets_batch[:, None] < BATCH) & (offsets_width[None, :] < STREAM_WIDTH)
@@ -322,7 +326,8 @@ if HAVE_STREAMWISE_TRITON:
 
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
-        offsets_batch = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+        # Row offsets are int64, as in the read.
+        offsets_batch = pid_batch.to(tl.int64) * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
         offsets_width = pid_width * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
         mask = (offsets_batch[:, None] < BATCH) & (offsets_width[None, :] < STREAM_WIDTH)
         update = tl.load(
@@ -375,6 +380,8 @@ if HAVE_STREAMWISE_TRITON:
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
         partial_index = pid_batch * NUM_WIDTH_BLOCKS + pid_width
+        # Row offsets stay int32: backward runs only under the training limits, whose cap on
+        # gradient partials keeps rows * STREAM_WIDTH <= 2**27, and NUM_STREAMS <= 16.
         offsets_batch = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
         offsets_width = pid_width * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
         mask = (offsets_batch[:, None] < BATCH) & (offsets_width[None, :] < STREAM_WIDTH)
