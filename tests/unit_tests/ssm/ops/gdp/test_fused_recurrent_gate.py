@@ -62,12 +62,13 @@ def _activations(n, H, HV, K, V, device="cuda"):
 
 def _gdn_decode_state(k, v, a, b, A_log, dt_bias, state):
     """The state after one GDN decode step, in the dtype of the inputs: k [n, H, K];
-    v [n, HV, V]; a, b [n, HV]; A_log, dt_bias [HV]; state [n, HV, K, V]."""
+    v [n, HV, V]; a, b [n, HV]; A_log, dt_bias [HV]; state [n, HV, K, V]. Elementwise ops and
+    sums only, so no TF32 GEMM can stand in for the fp32 math."""
     k = k.repeat_interleave(v.shape[1] // k.shape[1], dim=1)
     k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
     g = -A_log.exp() * F.softplus(a + dt_bias)
     state = state * g.exp()[..., None, None]
-    u = torch.sigmoid(b)[..., None] * (v - torch.einsum("nhkv,nhk->nhv", state, k))
+    u = torch.sigmoid(b)[..., None] * (v - (state * k[..., None]).sum(-2))
     return state + k[..., None] * u[..., None, :]
 
 
@@ -128,8 +129,8 @@ class TestGDNDecodeGate:
         At exp(A_log) = 16, the steepest decay rate GDN initializes, and softplus(a + dt_bias)
         between about 5e-4 and 4e-3, exp(g) must be within 4 eps: libdevice's exp and log1p
         are within 2 and 1 ulp, the kernel's `exp` (ex2.approx) within 2 ulp, and |g| < 0.07
-        keeps g's own error below an eps of exp(g). `log(1 + exp(x))` was off by about 1e-4
-        relative in softplus here, several eps in exp(g).
+        keeps g's own error below an eps of exp(g). The inline-PTX `log(1 + exp(x))` left
+        exp(g) up to 15 eps off here on H100.
         """
         torch.manual_seed(0)
         n, H = 64, 8
