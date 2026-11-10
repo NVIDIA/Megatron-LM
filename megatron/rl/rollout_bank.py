@@ -451,6 +451,10 @@ class RolloutBank:
         existing group during compaction.
         """
         with self._lock:
+            if self._seg_dir is None and self._collection_iter is not None:
+                # A checkpoint or recovery published a new generation since the
+                # collection was selected; reopen its segment there.
+                self.set_collection(self._collection_iter)
             assert self._seg_dir is not None, "set_collection() must be called before append()"
             current_seg = _segment_name(self._collection_iter)
             if uid is None:
@@ -841,8 +845,10 @@ class RolloutBank:
         tracks the checkpoint. Markers at or before ``iteration`` and their groups
         are reclaimed. Each surviving marker newer than the checkpoint is copied
         once so delayed asynchronous checkpoint finalization remains correct. The
-        writer remains closed until the next ``set_collection()`` call selects the
-        current rollout collection.
+        current rollout collection stays selected: the pipeline can complete a group
+        whenever the event loop runs, which may be before the next
+        ``set_collection()`` call, and ``append()`` reopens the collection's segment
+        in the new generation.
         """
         with self._lock:
             survivors, markers = self._restore_state(iteration)
@@ -917,7 +923,7 @@ class RolloutBank:
         # manifest flip is durable. It is safe to reclaim only afterward.
         _rmtree(os.path.join(self._generations_dir, old_generation))
         _fsync_directory(self._generations_dir)
-        self._collection_iter = None
+        # Keep the current collection selected; append() reopens its segment.
         self._seg_dir = None
 
     def _write_markers(self, generation_dir: str, markers: dict[str, int]) -> None:
