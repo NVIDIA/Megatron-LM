@@ -271,12 +271,16 @@ def _permute_tokens_kernel(
     BLOCK_H: tl.constexpr,  # tile size for copying hidden_dim
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
     HAS_INVERSE: tl.constexpr,  # whether to write inverse_map_ptr
+    SCALE_BY_PROB: tl.constexpr,  # moe_apply_probs_on_input: scale rows, emit unit probs
 ):
     """Permute tokens into expert-grouped order.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
     valid_tokens gates which pairs are actually processed — required for CUDA graph
     compatibility since the grid size never changes across steps.
+    With SCALE_BY_PROB, each row is multiplied by its routing probability and rounded
+    to the input dtype, as training scales the expert input, and its permuted
+    probability becomes 1 so that nothing downstream applies it again.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -293,16 +297,18 @@ def _permute_tokens_kernel(
             if lid >= 0 and lid < num_local_experts:
                 # Atomically claim a position within this expert's aligned block
                 pos = tl.atomic_add(counters_ptr + lid, 1)
+                prob = tl.load(probs_ptr + tok * topk + k)
                 # Copy hidden state row
                 for h in tl.range(0, hidden_dim, BLOCK_H):
                     o = h + tl.arange(0, BLOCK_H)
                     m = o < hidden_dim
-                    tl.store(
-                        out_hidden_ptr + pos.to(tl.int64) * hidden_dim + o,
-                        tl.load(hidden_ptr + tok.to(tl.int64) * hidden_dim + o, mask=m),
-                        mask=m,
-                    )
-                tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+                    x = tl.load(hidden_ptr + tok.to(tl.int64) * hidden_dim + o, mask=m)
+                    if SCALE_BY_PROB:
+                        x = (x * prob).to(x.dtype)
+                    tl.store(out_hidden_ptr + pos.to(tl.int64) * hidden_dim + o, x, mask=m)
+                if SCALE_BY_PROB:
+                    prob = 1.0
+                tl.store(out_probs_ptr + pos, prob)
                 # Record source token index for unpermute
                 tl.store(out_src_idx_ptr + pos, tok)
                 if HAS_INVERSE:
@@ -344,6 +350,7 @@ def permute_tokens(
     return_batch_invariant_inverse_map: bool = False,
     row_alignment: int = 1,
     zero_padding: bool = False,
+    scale_by_probs: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -366,6 +373,9 @@ def permute_tokens(
         zero_padding: explicitly zero alignment-padding rows inside the used prefix.
             Rows beyond the used prefix remain undefined. This is required by grouped
             GEMM backends that consume padding values rather than masking them.
+        scale_by_probs: moe_apply_probs_on_input. Multiply each permuted row by its
+            routing probability, rounded to the input dtype as in training, and return
+            unit permuted probabilities so that the probability is applied only once.
 
     Returns:
         By default, returns the original 4-tuple:
@@ -442,6 +452,7 @@ def permute_tokens(
         BLOCK_H=BLOCK_H,
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
+        SCALE_BY_PROB=scale_by_probs,
     )
     if zero_padding:
         zero_blocks = min(output_size, 512)
@@ -629,12 +640,15 @@ def _permute_quantize_mxfp8_kernel(
     BLOCK_GROUPS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
     HAS_INVERSE: tl.constexpr,
+    SCALE_BY_PROB: tl.constexpr,  # moe_apply_probs_on_input: scale rows, emit unit probs
 ):
     """Fused permute + MXFP8 quantize + swizzle in one kernel.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
     valid_tokens gates which pairs are actually processed — required for CUDA graph
     compatibility since the grid size never changes across steps.
+    SCALE_BY_PROB scales each row by its routing probability (rounded to the input
+    dtype before quantization) and emits unit probabilities, as in _permute_tokens_kernel.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -650,13 +664,15 @@ def _permute_quantize_mxfp8_kernel(
             lid = eid - local_expert_start
             if lid >= 0 and lid < num_local_experts:
                 pos = tl.atomic_add(counters_ptr + lid, 1)
+                prob = tl.load(probs_ptr + tok * topk + k)
 
                 # Load full row from source token
                 offs = tl.arange(0, BLOCK_K)
                 mask = offs < K
-                x = tl.load(hidden_ptr + tok.to(tl.int64) * K + offs, mask=mask, other=0.0).to(
-                    tl.float32
-                )
+                x = tl.load(hidden_ptr + tok.to(tl.int64) * K + offs, mask=mask, other=0.0)
+                if SCALE_BY_PROB:
+                    x = (x * prob).to(x.dtype)
+                x = x.to(tl.float32)
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
@@ -692,7 +708,9 @@ def _permute_quantize_mxfp8_kernel(
                 tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
                 # Store prob and source index
-                tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+                if SCALE_BY_PROB:
+                    prob = 1.0
+                tl.store(out_probs_ptr + pos, prob)
                 tl.store(out_src_idx_ptr + pos, tok)
                 if HAS_INVERSE:
                     tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
@@ -708,6 +726,7 @@ def permute_and_quantize_mxfp8(
     alignment: int = 128,
     return_batch_invariant_inverse_map: bool = False,
     zero_padding: bool = False,
+    scale_by_probs: bool = False,
 ) -> tuple:
     """Fused permute + MXFP8 quantize + swizzle.
 
@@ -729,6 +748,9 @@ def permute_and_quantize_mxfp8(
             batch-invariant unpermute to the returned tuple.
         zero_padding: initialize alignment-padding rows to MXFP8 zero. This is required
             by grouped GEMM backends that consume padding values rather than masking them.
+        scale_by_probs: moe_apply_probs_on_input. Scale each row by its routing
+            probability before quantizing it and return unit probabilities, as in
+            permute_tokens.
 
     Returns:
         By default, returns the original 4-tuple:
@@ -814,6 +836,7 @@ def permute_and_quantize_mxfp8(
         BLOCK_GROUPS=BLOCK_GROUPS,
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
+        SCALE_BY_PROB=scale_by_probs,
     )
     if zero_padding:
         # MXFP8 zero is the all-zero byte; padding rows keep their zero scales.
