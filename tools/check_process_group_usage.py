@@ -630,18 +630,19 @@ def _violations_in(path: pathlib.Path):
             if found is not None:
                 return found
             # A star import binds the public names of its module; follow only those the check
-            # counts or follows, so that builtins such as getattr keep their meaning. A later
-            # star import adds its names and leaves those of an earlier one bound: try the
-            # modules of all that precede the reference, the most recent first, then those of
-            # the enclosing scopes.
+            # counts or follows, and the fallback warning and block that make a read warned, so
+            # that builtins such as getattr keep their meaning. A later star import adds its
+            # names and leaves those of an earlier one bound: try the modules of all that
+            # precede the reference, the most recent first, then those of the enclosing scopes.
             while scope is not None and not name.startswith("_"):
                 for start, module in sorted(scope.events.get(STAR, []), reverse=True):
                     path = f"{module}.{name}"
+                    followed = path in ALIAS_TARGETS or path in (FALLBACK_WARNING, FALLBACK_BLOCK)
                     # megatron.core.__all__ exports parallel_state but not mpu.
                     if (
                         (position is None or start < position)
                         and (module, name) != ("megatron.core", "mpu")
-                        and (_classify(path) or path in ALIAS_TARGETS)
+                        and (_classify(path) or followed)
                     ):
                         return path
                 scope, position = scope.parent, None

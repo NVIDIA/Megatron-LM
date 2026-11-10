@@ -464,6 +464,14 @@ class TestDetection(unittest.TestCase):
         for case, body in cases.items():
             with self.subTest(case=case):
                 self.assertEqual(self.hits(IMPORT + WARN_IMPORT + body), [WARNED_HIT])
+        # A star import binds the warning and the block too.
+        star = "from megatron.core.process_groups_config import *\n"
+        for body in (
+            f"def f():\n    {WARN}\n    {CALL}\n",
+            f"def f():\n    with global_process_group_fallback('f'):\n        {CALL}\n",
+        ):
+            with self.subTest(case="through a star import", body=body):
+                self.assertEqual(self.hits(IMPORT + star + body), [WARNED_HIT])
 
     def test_reads_that_no_fallback_warning_dominates_are_unwarned(self):
         cases = {
