@@ -9,6 +9,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
+from .ordered_reduce import ordered_all_reduce, ordered_reduce_scatter, use_ordered_tp_reduce
 from .utils import split_tensor_along_last_dim
 
 try:
@@ -104,7 +105,7 @@ def _gather_along_last_dim(input_, group):
     return output
 
 
-def _reduce_scatter_along_last_dim(input_, group):
+def _reduce_scatter_along_last_dim(input_, group, ordered=False):
     """Reduce-scatter tensors on the last dimension."""
 
     world_size = group.size()
@@ -115,7 +116,9 @@ def _reduce_scatter_along_last_dim(input_, group):
         input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1
     )
     concat_tensor = torch.cat(split_tensors, dim=0)
-    output = _reduce_scatter_along_first_dim(concat_tensor, group=group).reshape(target_shape)
+    output = _reduce_scatter_along_first_dim(concat_tensor, group=group, ordered=ordered).reshape(
+        target_shape
+    )
     return output
 
 
@@ -160,7 +163,9 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
     return output
 
 
-def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_global_buffer=False):
+def _reduce_scatter_along_first_dim(
+    input_, group, input_split_sizes=None, use_global_buffer=False, ordered=False
+):
     """Reduce-scatter the input tensor across model parallel group.
 
     Args:
@@ -168,12 +173,27 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
         input_split_sizes (List[int], optional): A list specifying the sizes of
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
+        ordered (bool): Use the batch-invariant rank-order sum when
+            `use_ordered_tp_reduce` selects it. Only the forward reductions pass True: the
+            backward of the all-gather regions calls this helper too, and gradients do not
+            need a fixed summation order.
     """
     assert group is not None, "group should not be None"
     world_size = group.size()
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
+
+    if ordered and use_ordered_tp_reduce(group, input_.dtype):
+        assert (
+            input_split_sizes is None
+        ), "uneven splits in the batch-invariant ordered reduce-scatter are not built yet"
+        output = None
+        if use_global_buffer:
+            output = get_global_memory_buffer().get_tensor(
+                [input_.size(0) // world_size, *input_.shape[1:]], input_.dtype, "mpu"
+            )
+        return ordered_reduce_scatter(input_, group, output)
 
     if input_split_sizes is None:
         dim_size = list(input_.size())
@@ -233,6 +253,9 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_, group):
         """Forward function."""
+        if use_ordered_tp_reduce(group, input_.dtype):
+            # Batch-invariant mode at TP >= 3: fixed rank-order sum (backward is unchanged).
+            return ordered_all_reduce(input_, group)
         return _reduce(input_, group)
 
     @staticmethod
@@ -370,7 +393,9 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         ctx.group = group
         ctx.input_split_sizes = input_split_sizes
         ctx.use_global_buffer = use_global_buffer
-        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
+        return _reduce_scatter_along_first_dim(
+            input_, group, input_split_sizes, use_global_buffer, ordered=True
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -417,7 +442,7 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
-        return _reduce_scatter_along_last_dim(input_, group)
+        return _reduce_scatter_along_last_dim(input_, group, ordered=True)
 
     @staticmethod
     def backward(ctx, grad_output):

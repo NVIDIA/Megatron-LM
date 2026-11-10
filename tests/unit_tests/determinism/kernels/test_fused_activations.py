@@ -30,6 +30,7 @@ from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.ops.norm.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
@@ -328,6 +329,20 @@ class TestFusedCrossEntropy:
             what="fused_vocab_parallel_cross_entropy",
         )
         assert grads["in[0]"].dtype == dtype
+
+    def test_fused_vocab_parallel_cross_entropy_batch_invariant_replays(self):
+        """Batch-invariant mode: fixed-order vocab-shard sum and the ordered TP fold."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        logits = _act((TOKENS, 32768), dtype=torch.float32)
+        target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
+        with set_batch_invariant_mode(True):
+            assert_replays_bit_exact(
+                lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
+                (logits, target),
+                replays=3,
+                what="fused_vocab_parallel_cross_entropy (batch-invariant)",
+            )
 
     @staticmethod
     def _peak_bytes(fn, logits, target):
