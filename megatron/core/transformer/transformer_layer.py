@@ -78,10 +78,13 @@ _LAYER_PROCESS_GROUPS = (
     # TransformerLayer and TransformerBlock: tensor parallelism and the pipeline stage.
     'tp',
     'pp',
-    # Attention: context parallelism, hierarchical CP for a2a+p2p, and dp for config.test_mode.
+    # Attention: context parallelism, hierarchical CP for a2a+p2p, and the data-parallel groups
+    # for config.test_mode: with qk_layernorm, SelfAttention.run_realtime_tests compares the Q/K
+    # layernorm parameters over dp_gtp_remat.
     'cp',
     'hcp',
     'dp',
+    'dp_gtp_remat',
     # MoE router, token dispatcher and experts.
     'tp_cp',
     'tp_dp_cp',

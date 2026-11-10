@@ -11,6 +11,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
+    destroy_copied_amax_groups,
     forbid_global_amax_group,
     record_amax_groups,
     with_copied_amax_groups,
@@ -26,6 +27,7 @@ class TestCudaGraphRunnerAmaxReductionGroup:
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
 
     def teardown_method(self, method):
+        destroy_copied_amax_groups()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("quantization", ["fp8", "fp4"])

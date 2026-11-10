@@ -184,7 +184,9 @@ class MegatronModule(torch.nn.Module):
         dp_cp_group = None
         if pg_collection is not None:
             dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
-        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, dp_cp_group, owner=f"{type(self).__name__}.sharded_state_dict"
+        )
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,

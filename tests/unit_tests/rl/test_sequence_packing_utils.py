@@ -582,6 +582,7 @@ def test_pack_all_trajectories_uses_given_process_groups(monkeypatch):
     data-parallel group it is given, and aligns the sequences for the context-parallel group it
     is given, not for the global grid; the efficiency counts the ranks of that DP group."""
     Utils.initialize_model_parallel(1, 1)
+    own_groups = []
     try:
         world_size = Utils.world_size
         # The global grid has one data-parallel group over every rank and no context
@@ -589,9 +590,11 @@ def test_pack_all_trajectories_uses_given_process_groups(monkeypatch):
         dp_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, world_size, 2)]
         )
+        own_groups.append(dp_group)
         cp_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[start + i, start + i + 2] for start in range(0, world_size, 4) for i in (0, 1)]
         )
+        own_groups.append(cp_group)
         tokenizer = MockTokenizer()
         monkeypatch.setattr(sequence_packing_utils, "get_tokenizer", lambda: tokenizer)
         monkeypatch.setattr(
@@ -626,7 +629,14 @@ def test_pack_all_trajectories_uses_given_process_groups(monkeypatch):
         # 12 tokens in 1 bin of 8 tokens on each of the 2 ranks.
         assert sequence_packing_utils.get_packing_efficiency(ctx) == pytest.approx(12 / 16)
     finally:
-        Utils.destroy_model_parallel()
+        try:
+            # Every rank finishes its collectives before any communicator goes away.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            for group in own_groups:
+                torch.distributed.destroy_process_group(group)
+        finally:
+            Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize(

@@ -171,6 +171,32 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
         assert parameter.grad.placements == (expected_outer, Shard(0))
 
 
+def test_hybrid_mesh_needs_no_dp_cp(model_parallel_cleanup):
+    """The hybrid mesh comes from inter_dist_opt and intra_dp_cp, so dp_cp may stay unset."""
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+    process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
+    delattr(process_group_collection, "dp_cp")
+    model_parallel_cuda_manual_seed(1234)
+    config = _config()
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            num_distributed_optimizer_instances=2,
+            outer_dp_sharding_strategy="no_shard",
+        ),
+        module=TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+            device="cuda", dtype=config.params_dtype
+        ),
+        pg_collection=process_group_collection,
+    )
+    for parameter in model.parameters():
+        assert parameter.data.placements == (Replicate(), Shard(0))
+
+
 @pytest.mark.parametrize("microbatches", [1, 2])
 @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
 @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])

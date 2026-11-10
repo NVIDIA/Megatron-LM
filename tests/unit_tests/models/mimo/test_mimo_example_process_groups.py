@@ -110,6 +110,25 @@ def test_loss_func_reduces_over_the_language_model_groups(train, monkeypatch):
     assert reduced_over == [pg_collection.cp, pg_collection.dp_gtp_remat]
 
 
+@pytest.mark.parametrize(
+    "groups", [{"cp": None, "dp_gtp_remat": _Group()}, {"cp": _Group(), "dp_gtp_remat": None}]
+)
+def test_loss_func_rejects_a_none_group_it_reduces_over(train, monkeypatch, groups):
+    """torch.distributed reduces over every rank of the job when the group is None."""
+    monkeypatch.setattr(train, "get_args", lambda: SimpleNamespace(context_parallel_size=2))
+    reduced_over = []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, group=None: reduced_over.append(group)
+    )
+
+    with pytest.raises(ValueError, match="loss_func requires pg_collection.dp_gtp_remat"):
+        train.loss_func(
+            torch.ones(4), torch.ones(4), pg_collection=ProcessGroupCollection(**groups)
+        )
+
+    assert not reduced_over
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.skipif(Utils.world_size % 2 != 0, reason="needs an even world size")
 @pytest.mark.parametrize("grid_pg_collection", [{"tp": 2}], indirect=True)
@@ -221,3 +240,32 @@ def test_mock_model_provider_builds_every_module_on_its_groups(monkeypatch):
     }
     # Wrappers such as Float16Module take the model's groups from it.
     assert model.pg_collection is pg_collection
+
+
+def test_mock_model_provider_without_collection_warns_and_uses_the_global_grid(monkeypatch):
+    """Callers that omit pg_collection keep the global groups, with a deprecation warning."""
+    from examples.mimo.model_providers import mock
+
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    monkeypatch.setattr(mock, "MimoModel", lambda mimo_config, **groups: SimpleNamespace())
+    for name in (
+        "get_mock_language_layer_spec",
+        "get_mock_vision_layer_spec",
+        "get_mock_projection_layer_spec",
+    ):
+        monkeypatch.setattr(mock, name, lambda: SimpleNamespace(submodules=None))
+    # The provider collects the groups of the global grid exactly once.
+    global_groups = ProcessGroupCollection(tp=_Group(), cp=_Group(), tp_cp=_Group())
+    monkeypatch.setattr(
+        mock,
+        "ProcessGroupCollection",
+        SimpleNamespace(use_mpu_process_groups=lambda: global_groups),
+    )
+
+    with pytest.warns(
+        ProcessGroupFallbackWarning,
+        match="model_provider_mock_vlm_single_encoder was called without `pg_collection`",
+    ):
+        model = mock.model_provider_mock_vlm_single_encoder()
+
+    assert model.pg_collection is global_groups

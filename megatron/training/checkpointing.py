@@ -457,6 +457,24 @@ def _first_group(*groups):
     return next((group for group in groups if group is not None), None)
 
 
+def _data_parallel_group(group, pg_collection, *fields):
+    """Return ``group``, or the first of ``fields`` that ``pg_collection`` holds a group for.
+
+    A collection that sets none of ``fields`` says nothing about that group: a language model
+    needs only its tp, cp, pp and embd groups. The group is then read from the global parallel
+    grid, as it was before checkpointing took a collection. A field that is set to None means
+    that the axis is not used, and without torch.distributed there is no group to read.
+    """
+    if group is not None:
+        return group
+    if torch.distributed.is_initialized() and not any(
+        field in vars(pg_collection) for field in fields
+    ):
+        # Compatibility fallback for collections that leave these groups out.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=[fields[0]])
+    return _first_group(*(getattr(pg_collection, field) for field in fields))
+
+
 def _group_rank(group):
     """Return this rank's index in ``group``, or 0 when the collection has no such group.
 
@@ -984,6 +1002,8 @@ def save_checkpoint(
             follows the section, which is not written.
         pg_collection: Process groups of the model being saved. Defaults to the collection the
             model was built on, and to the global parallel grid for a model built without one.
+            The data-parallel groups that a collection leaves out are also read from the
+            global parallel grid.
     """
     start_ckpt = time()
     args = get_args()
@@ -1052,12 +1072,12 @@ def save_checkpoint(
     tp_group = _first_group(tp_group, pg_collection.tp)
     pp_group = _first_group(pp_group, pg_collection.pp)
     cp_group = _first_group(cp_group, pg_collection.cp)
-    dp_group = _first_group(dp_group, pg_collection.dp)
-    dp_gtp_remat_group = _first_group(
-        dp_gtp_remat_group, pg_collection.dp_gtp_remat, pg_collection.dp
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_gtp_remat_group = _data_parallel_group(
+        dp_gtp_remat_group, pg_collection, 'dp_gtp_remat', 'dp'
     )
-    dp_cp_group = _first_group(dp_cp_group, pg_collection.dp_cp_gtp_remat, pg_collection.dp_cp)
-    expt_dp_group = _first_group(expt_dp_group, pg_collection.expt_dp)
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(
@@ -3067,7 +3087,8 @@ def load_checkpoint(
         else follows the section, which is not written.
     pg_collection: Process groups of the model being loaded; each group argument above
         overrides the matching group. Defaults to the collection the model was built on, and to
-        the global parallel grid for a model built without one.
+        the global parallel grid for a model built without one. The data-parallel groups that a
+        collection leaves out are also read from the global parallel grid.
     """
     cfg = get_run_config()
     args = get_args()
@@ -3242,9 +3263,9 @@ def load_checkpoint(
     # data-parallel groups stand in for them.
     tp_group = _first_group(tp_group, pg_collection.tp)
     pp_group = _first_group(pp_group, pg_collection.pp)
-    dp_group = _first_group(dp_group, pg_collection.dp)
-    dp_cp_group = _first_group(dp_cp_group, pg_collection.dp_cp_gtp_remat, pg_collection.dp_cp)
-    expt_dp_group = _first_group(expt_dp_group, pg_collection.expt_dp)
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
@@ -3768,7 +3789,9 @@ def load_checkpoint(
                 and load_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = get_pg_rank(_first_group(pg_collection.dp_gtp_remat, pg_collection.dp))
+                dp_rank = get_pg_rank(
+                    _data_parallel_group(None, pg_collection, 'dp_gtp_remat', 'dp')
+                )
                 optim_checkpoint_name = os.path.join(
                     os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
                 )

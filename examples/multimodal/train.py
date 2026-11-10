@@ -138,7 +138,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len, pg_collection=None)
     else:
         data = None
 
-    if batch_broadcast_group is not None:
+    if deduplicate_across_context_parallel:
         group_is_source = batch_broadcast_group.rank() == 0
         if (data is not None) != group_is_source:
             raise RuntimeError(
