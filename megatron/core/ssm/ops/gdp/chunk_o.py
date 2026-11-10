@@ -74,9 +74,12 @@ def chunk_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
 ):
     """Emit one chunk of output from the chunk-boundary state plus local attention."""
-    # int64 sequence and head indices, so the base offsets below are int64 products: GDP's
-    # Householder-expanded keys reach 2**31 elements at 174763 tokens of M 3, 32 heads, K 128.
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    # Value tiles and chunks share grid axis 0, the value tile varying fastest: CUDA caps axes 1
+    # and 2 at 65535 programs, which the chunks pass from 4194241 tokens. int64 sequence and head
+    # indices, so the base offsets below are int64 products: GDP's Householder-expanded keys
+    # reach 2**31 elements at 174763 tokens of M 3, 32 heads, K 128.
+    i_v, i_t = tl.program_id(0) % tl.cdiv(V, BV), tl.program_id(0) // tl.cdiv(V, BV)
+    i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -201,7 +204,7 @@ def chunk_gated_delta_product_fwd_o(
     o = v.new_zeros(B, T, H, V)
 
     def grid(meta):
-        return (triton.cdiv(V, meta['BV']), NT, B * H)
+        return (triton.cdiv(V, meta['BV']) * NT, B * H)
 
     chunk_fwd_kernel_o[grid](
         q,

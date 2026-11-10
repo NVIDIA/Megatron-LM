@@ -85,7 +85,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     COMPACT_OUTPUT: tl.constexpr = False,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # Value tiles and (sequence, head) pairs share grid axis 0, the value tile varying fastest:
+    # CUDA caps axes 1 and 2 at 65535 programs, which N * HV passes from 2048 requests of 32
+    # heads.
+    i_v, i_nh = tl.program_id(0) % tl.cdiv(V, BV), tl.program_id(0) // tl.cdiv(V, BV)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
@@ -430,7 +433,7 @@ def fused_recurrent_gated_delta_rule_update(
         ), "intermediate_states requires the slot-indexed state cache it shadows"
         final_state = q.new_empty(N, HV, K, V, dtype=torch.float32) if output_final_state else None
 
-    fused_recurrent_gated_delta_rule_fwd_kernel[(NV, N * HV)](
+    fused_recurrent_gated_delta_rule_fwd_kernel[(NV * N * HV,)](
         q=q,
         k=k,
         v=v,

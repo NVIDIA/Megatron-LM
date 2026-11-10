@@ -51,8 +51,10 @@ def _causal_conv1d_varlen_kernel(
 
     Fully vectorized over BLOCK_T tokens x BLOCK_C channels per thread block.
     """
-    pid_c = tl.program_id(0)
-    pid_t = tl.program_id(1)
+    # Channel and token blocks share grid axis 0, the channel block varying fastest: CUDA caps
+    # axes 1 and 2 at 65535 programs, which the token blocks pass from 524281 tokens at BLOCK_T 8.
+    pid_c = tl.program_id(0) % tl.cdiv(conv_dim, BLOCK_C)
+    pid_t = tl.program_id(0) // tl.cdiv(conv_dim, BLOCK_C)
 
     c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)  # (BLOCK_C,)
     c_mask = c_off < conv_dim
@@ -200,8 +202,7 @@ def causal_conv1d_varlen_fn(
         is_stride_dim = initial_states.stride(1)
 
     grid = lambda meta: (
-        triton.cdiv(conv_dim, meta["BLOCK_C"]),
-        triton.cdiv(total_tokens, meta["BLOCK_T"]),
+        triton.cdiv(conv_dim, meta["BLOCK_C"]) * triton.cdiv(total_tokens, meta["BLOCK_T"]),
     )
 
     _causal_conv1d_varlen_kernel[grid](

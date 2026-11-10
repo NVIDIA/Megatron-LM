@@ -76,9 +76,12 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
 ):
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
-    # int64 sequence and head indices, so the base offsets below are int64 products: a step's
-    # chunk states reach 2**31 elements at 262144 tokens of 32 heads with K = V = 128.
-    i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    # Value tiles and (sequence, head) pairs share grid axis 0, the value tile varying fastest:
+    # CUDA caps axes 1 and 2 at 65535 programs, which N * H passes from 2048 sequences of 32
+    # heads. int64 sequence and head indices, so the base offsets below are int64 products: a
+    # step's chunk states reach 2**31 elements at 262144 tokens of 32 heads with K = V = 128.
+    i_v = tl.program_id(0) % tl.cdiv(V, BV)
+    i_nh = (tl.program_id(0) // tl.cdiv(V, BV)).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
@@ -324,7 +327,7 @@ def chunk_gated_delta_product_fwd_h(
     v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
-        return (triton.cdiv(V, meta['BV']), N * H)
+        return (triton.cdiv(V, meta['BV']) * N * H,)
 
     chunk_gated_delta_product_fwd_kernel_h_blockdim64[grid](
         k=k,
