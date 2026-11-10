@@ -1367,17 +1367,18 @@ def test_dataset_helpers_use_registered_model(
     assert dataset.data_parallel_size == 2
     assert dataset.sequence_length == 32  # Actual data length, not position capacity.
 
-    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(entrypoint.mpu, "get_pipeline_model_parallel_rank", lambda: 1)
+    # The dataset predicate lives in the providers module and reads the global grid there.
+    monkeypatch.setattr(providers.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(providers.mpu, "get_pipeline_model_parallel_rank", lambda: 1)
     # The dataset predicate places MTP by the global pipeline group, not by the rank accessor.
     monkeypatch.setattr(
-        entrypoint.mpu,
+        providers.mpu,
         "get_pipeline_model_parallel_group",
         lambda: SimpleNamespace(rank=lambda: 1, size=lambda: 3),
     )
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
+        providers.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
     )
     monkeypatch.setattr(
         "megatron.training.utils.is_first_or_last_pipeline_stage", lambda stage: False
@@ -1388,7 +1389,7 @@ def test_dataset_helpers_use_registered_model(
     monkeypatch.setattr(providers, "mtp_on_this_rank", lambda **kwargs: False)
     assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is not None)
     assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
-    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(providers.mpu, "get_tensor_model_parallel_rank", lambda: 1)
     assert not entrypoint.is_dataset_built_on_rank()
     assert not entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
     assert args.data_parallel_size == 999

@@ -2148,13 +2148,13 @@ class CudaGraphManager(torch.nn.Module):
 
         Without pipeline parallelism, microbatches execute one at a time. Therefore modules
         will always execute in the same order, so cudagraphs can both be reused and share a
-        single mempool. The pipeline group comes from `pg_collection` if it was given, else from
+        single mempool. The pipeline group comes from `pg_collection` if it sets `pp`, else from
         the collection of the graphed module, where a `pp` set to None means no pipeline
         parallelism. The global parallel state is used only when neither collection sets `pp`.
         """
         if self.reuse_cudagraphs is None:
             pg_collection = self.pg_collection
-            if pg_collection is None:
+            if pg_collection is None or "pp" not in vars(pg_collection):
                 pg_collection = getattr(megatron_module, "pg_collection", None)
             if pg_collection is None or "pp" not in vars(pg_collection):
                 # Compatibility fallback for graphed modules without a pipeline group.

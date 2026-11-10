@@ -2695,11 +2695,13 @@ def _build_pg_collection_from_parallel_state(args, config=None):
         dp_cp_ag, expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=(config.expert_model_parallel_size > 1), timeout=timeout
         )
-        # create_all_gather_groups lays the expert ranks out in the default order, so check that
-        # each all-gather group spans the ranks of the group whose parameters it gathers.
+        # create_all_gather_groups mirrors the full data-parallel groups and lays the expert
+        # ranks out in the default order, so check that each all-gather group spans the ranks
+        # of the group Megatron-FSDP shards its parameters over: the intra-instance group,
+        # which is the full group with one distributed optimizer instance.
         for ag_group, group in (
-            (dp_cp_ag, pg_collection.dp_cp),
-            (expt_dp_ag, pg_collection.expt_dp),
+            (dp_cp_ag, pg_collection.intra_dp_cp),
+            (expt_dp_ag, pg_collection.intra_expt_dp),
         ):
             if ag_group is not None and (
                 torch.distributed.get_process_group_ranks(ag_group)
@@ -2707,8 +2709,9 @@ def _build_pg_collection_from_parallel_state(args, config=None):
             ):
                 raise ValueError(
                     "--create-all-gather-group built all-gather groups whose ranks differ from "
-                    "the data-parallel groups; with expert parallelism it supports only the "
-                    "default tp-cp-ep-dp-pp rank order."
+                    "the data-parallel groups Megatron-FSDP shards over. It does not support "
+                    "--num-distributed-optimizer-instances > 1, and with expert parallelism it "
+                    "supports only the default tp-cp-ep-dp-pp rank order."
                 )
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
@@ -3156,8 +3159,8 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            # A collection carries no Gloo groups, so get_megatron_optimizer accepts one only
-            # without them; with Gloo groups it builds all of its groups from parallel_state.
+            # Without Gloo groups the optimizer takes its groups from the collection. With them
+            # it still builds every group, the Gloo ones included, from parallel_state.
             pg_collection=None if cfg.dist.use_gloo_process_groups else pg_collection,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
