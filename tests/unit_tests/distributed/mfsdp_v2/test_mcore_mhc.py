@@ -10,6 +10,9 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
+    chunk_metadata_by_fqn,
+)
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -194,6 +197,15 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
     reference_parameters = dict(reference.named_parameters())
     parameters = dict(model.module.named_parameters())
     assert parameters.keys() == reference_parameters.keys()
+    # MFSDP shards packed buffers, not each parameter independently. DTensor's
+    # full_tensor() assumes ordinary Shard(0) chunks, so compare the actual local
+    # chunks with the corresponding reference slices, including empty shards.
+    reference_slices = {
+        name: tuple(
+            slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+        )
+        for name, chunk in chunk_metadata_by_fqn(model.module).items()
+    }
     # Identical inputs across ranks make averaged FSDP gradients match the reference.
     for _ in range(3):
         losses = []
@@ -216,7 +228,11 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
             if expected is not None:
                 assert parameter.grad is not None, name
                 torch.testing.assert_close(
-                    parameter.grad.full_tensor(), expected, rtol=1e-4, atol=1e-8, msg=name
+                    parameter.grad.to_local(),
+                    expected[reference_slices[name]],
+                    rtol=1e-4,
+                    atol=1e-8,
+                    msg=name,
                 )
 
         reference_optimizer.step()
@@ -224,5 +240,5 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
         assert success
         for name, parameter in parameters.items():
             torch.testing.assert_close(
-                parameter.full_tensor(), reference_parameters[name], msg=name
+                parameter.to_local(), reference_parameters[name][reference_slices[name]], msg=name
             )
