@@ -296,6 +296,16 @@ EOF
 COPY README.md /workspace/
 RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
+# TE v2.21.0 returns a gathered-size dummy gradient for GTP-sharded LayerNormLinear weights.
+# TransformerEngine #3748 fixes it but is not in release_v2.21, so apply the same change here
+# (as core_r0.20.0 does). The patch stops applying once the pinned TE contains the fix:
+# drop it then. It is Python-only and applied after the native builds so their cache stays reusable.
+COPY docker/patches/transformer-engine-gtp-wgrad.patch /opt/transformer-engine-build-info/
+RUN te_site_packages="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+        'from importlib.metadata import distribution; print(distribution("transformer-engine").locate_file(""))')" && \
+    patch --batch --forward --fuzz=0 -p1 -d "${te_site_packages}" \
+        < /opt/transformer-engine-build-info/transformer-engine-gtp-wgrad.patch
+
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
