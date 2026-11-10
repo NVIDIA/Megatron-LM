@@ -5,8 +5,6 @@ from abc import abstractmethod
 from functools import partial
 from typing import Callable, Literal, Optional, Protocol, cast
 
-import torch
-
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
     TEColumnParallelGroupedLinear,
@@ -14,12 +12,9 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TENorm,
     TERowParallelGroupedLinear,
-    te_cross_entropy,
 )
-from megatron.core.fusions.fused_cross_entropy import (
-    fused_vocab_parallel_cross_entropy as _fused_ce,
-)
-from megatron.core.tensor_parallel.cross_entropy import unfused_cross_entropy
+from megatron.core.ops.loss.backends import CrossEntropyTarget, select_cross_entropy
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.tensor_parallel.inference_layers import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -34,17 +29,8 @@ from megatron.core.transformer.moe.experts import (
     SequentialMLP,
 )
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
-from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
-
-CrossEntropyTarget = Callable[
-    [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
-]
-"""``loss = target(logits, labels, tp_group)``, with ``logits`` [s, b, vocab/tp] and the
-target owning every reduction over ``tp_group``. Targets *consume* ``logits``: they subtract
-the row max and exponentiate in place, so a caller that needs them afterwards passes a clone.
-"""
 
 
 def require(requirement: str, requested_by: str = "This backend", instead: str = "") -> None:
@@ -66,39 +52,6 @@ def require(requirement: str, requested_by: str = "This backend", instead: str =
     if not HAVE_TE:
         message = f"Transformer Engine is not installed, and {requested_by} needs it."
         raise ImportError(f"{message} {instead}".strip())
-
-
-def select_cross_entropy(
-    cross_entropy_loss_fusion: bool = False,
-    cross_entropy_fusion_impl: str = "native",
-    cuda_graph_impl: Optional[str] = None,
-) -> CrossEntropyTarget:
-    """Which cross entropy a config asks for, resolved once rather than on every forward.
-
-    Shared by every provider: the choice depends on the config, not on which backend supplies
-    the rest of the model, which is how it behaved before this was a provider decision.
-    """
-    if cross_entropy_fusion_impl not in ("native", "te"):
-        raise ValueError(
-            f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
-            "Valid choices: native, te"
-        )
-    if not cross_entropy_loss_fusion:
-        return unfused_cross_entropy
-    if cross_entropy_fusion_impl == "native":
-        return _fused_ce
-
-    # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
-    capturable = cuda_graph_impl == "full_iteration"
-    if capturable and not is_te_min_version("2.7.0"):
-        from megatron.core.utils import get_te_version
-
-        raise AssertionError(
-            "CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, but "
-            f"found version {get_te_version()}. Please upgrade TransformerEngine or set "
-            "cuda_graph_impl to a value other than 'full_iteration'."
-        )
-    return partial(te_cross_entropy, cuda_graph_capturable=capturable)
 
 
 class BackendSpecProvider(Protocol):
@@ -210,7 +163,7 @@ class LocalSpecProvider(BackendSpecProvider):
         del for_qk, has_residual
         if rms_norm:
             return WrappedTorchNorm
-        from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
+        from megatron.core.ops.norm.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 
         return FusedLayerNorm if HAVE_FUSED_LAYER_NORM else WrappedTorchNorm
 
@@ -294,7 +247,7 @@ class InferenceSpecProvider(LocalSpecProvider):
             # TENorm significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
-            from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+            from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
 
             return not_none(FusedLayerNorm)
         return TENorm

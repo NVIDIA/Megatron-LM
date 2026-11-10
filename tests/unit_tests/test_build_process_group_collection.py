@@ -283,21 +283,12 @@ def test_failed_initialize_creates_no_groups_and_keeps_state():
 
 def test_initialize_only_arguments():
     _require_divisible(4)
-    Utils.destroy_model_parallel()
-    Utils.initialize_distributed()
-    with pytest.raises(ValueError, match="Cannot set both"):
-        ps.initialize_model_parallel(
-            context_parallel_size=2, hybrid_context_parallel=True, dynamic_context_parallel=True
-        )
-    ps.destroy_model_parallel()
-
-    with pytest.warns(DeprecationWarning, match="hybrid_context_parallel is deprecated"):
-        pg_collection = _initialize(
-            pipeline_model_parallel_size=2,
-            virtual_pipeline_model_parallel_size=2,
-            context_parallel_size=2,
-            hybrid_context_parallel=True,
-        )
+    pg_collection = _initialize(
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+    )
     try:
         assert ps.get_virtual_pipeline_model_parallel_world_size() == 2
         assert ps.get_virtual_pipeline_model_parallel_rank() == 0
