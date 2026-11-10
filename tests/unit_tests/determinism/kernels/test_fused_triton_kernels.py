@@ -20,6 +20,8 @@
 """
 
 import contextlib
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,8 +36,12 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
-from megatron.core.transformer.hyper_connection import native_h_aggregate_into
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -603,6 +609,43 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
+    )
+
+    def run_mapping(x, weight, alpha_pre, alpha_post, alpha_res, bias):
+        ready = False
+
+        def publish_weight():
+            nonlocal ready
+            ready = True
+
+        def projection(*args):
+            assert ready, "mapping projection must wait before reading the weight"
+            return fused_mhc_kernels.fused_proj_rms_compute_h(*args, backend=backend)
+
+        setattr(weight, PARAM_READY_CALLBACK_ATTR, publish_weight)
+        module = SimpleNamespace(
+            n=n,
+            hidden_size=C,
+            mapping_proj=SimpleNamespace(weight=weight),
+            alpha_pre=alpha_pre,
+            alpha_post=alpha_post,
+            alpha_res=alpha_res,
+            bias=bias,
+            norm_eps=1e-6,
+            compute_h_eps=1e-6,
+            sinkhorn_iterations=20,
+            sinkhorn_eps=1e-6,
+            _proj_rms_compute_h_op=projection,
+            _sinkhorn_op=partial(fused_mhc_kernels.fused_sinkhorn, backend=backend),
+            config=SimpleNamespace(mhc_keep_mappings_in_fp32=False),
+        )
+        return HyperConnectionModule.compute_mappings(module, x.view(S, B, n * C))
+
+    assert_replays_bit_exact(
+        run_mapping,
+        (x, weight, alpha_pre, alpha_post, alpha_res, bias),
+        contention=True,
+        what=f"mhc mappings with parameter readiness[{backend}]",
     )
 
 

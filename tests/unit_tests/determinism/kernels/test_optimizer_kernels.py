@@ -35,6 +35,44 @@ def _grads(num=256, seed=7):
     return [torch.randn(n, device="cuda", dtype=torch.float32) for n in sizes]
 
 
+@pytest.mark.parametrize("layer_sharded", [False, True])
+def test_grouped_muon_replays(layer_sharded):
+    """Identical grouped weights, gradients and momentum replay under stream contention."""
+    pytest.importorskip("emerging_optimizers")
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+    from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+    seeded()
+    weight = torch.randn(2, 128, 512, device="cuda")
+    gradient = torch.randn_like(weight)
+
+    def run(initial, grad):
+        parameter = torch.nn.Parameter(initial.clone())
+        parameter.muon_matrix_shape = (256, 512)
+        optimizer_type = LayerShardedMuon if layer_sharded else TensorParallelMuon
+        kwargs = {"gtp_remat_group": None} if layer_sharded else {}
+        optimizer = optimizer_type(
+            [parameter],
+            lr=0.01,
+            momentum=0.95,
+            coefficient_type="deepseekv4",
+            num_ns_steps=10,
+            fp32_matmul_prec="highest",
+            **kwargs,
+        )
+        if layer_sharded:
+            optimizer.set_param_ns_homes({})
+        # Include an update with nonzero momentum, starting from the same state each replay.
+        for _ in range(2):
+            parameter.grad = grad.clone()
+            optimizer.step()
+        return parameter.detach(), optimizer.state[parameter]["momentum_buffer"]
+
+    assert_replays_bit_exact(
+        run, (weight, gradient), replays=3, backward=False, contention=True, what="grouped Muon"
+    )
+
+
 class TestGradNormAndClip:
     def setup_method(self, method):
         Utils.initialize_model_parallel()
