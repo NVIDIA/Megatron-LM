@@ -17,7 +17,7 @@ import torch
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 
 def _raise_global_read(*args, **kwargs):
@@ -243,9 +243,13 @@ class TestDataParallelGroupOnAGrid:
         monkeypatch.setattr(parallel_state, "get_data_parallel_group", _raise_global_read)
         rank = torch.distributed.get_rank()
 
-        total = training._reduce_sum_across_data_parallel_group(
-            float(rank + 1), with_context_parallel=True, pg_collection=pg_collection
-        )
+        try:
+            total = training._reduce_sum_across_data_parallel_group(
+                float(rank + 1), with_context_parallel=True, pg_collection=pg_collection
+            )
+        finally:
+            # pair_group is the collection's only group; every rank destroys its own.
+            destroy_test_pg_collection(pg_collection)
 
         first_rank_of_pair = rank - rank % 2
         assert total == (first_rank_of_pair + 1) + (first_rank_of_pair + 2)
