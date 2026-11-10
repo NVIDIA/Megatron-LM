@@ -301,9 +301,7 @@ optimizer.step()
 
 MCore's training loop selects `REDUCE_OUTER` around its schedule call. The schedule uses
 `SKIP_OUTER` within existing `no_sync()` scopes and waits in `finalize_model_grads()` after
-all backward work. It calls `context.post_backward()` once per shared context to finish
-execution-order recording or validate replay. Per-microbatch deferred weight cleanup runs
-separately. Other callers select the mode explicitly with the same context manager.
+all backward work. Other callers select the mode explicitly with the same context manager.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
   `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
@@ -452,13 +450,3 @@ We’ll follow a standard prototype-design-execute process.
    - Critical horizontal features (for example, CUDA Graphs and `torch.compile`) should
      be validated from the beginning. These integrations are easy to break and difficult
      to retrofit, so we should rely on CI coverage to catch regressions early.
-
-Execution-order completion is independent of gradient finalization. By default,
-`RuntimePolicy(autograd_completes_execution=True)` records one autograd backward and
-replays that order for subsequent microbatches, including while outer reduction is
-skipped. MCore selects `autograd_completes_execution=False` for PP/VPP;
-those schedulers call `context.post_backward()` after the complete schedule.
-
-Combined 1F1B retains its existing demand-only unsharding hooks. Those hooks do not
-record, replay, or prefetch successor weights. Automatic recording
-is selected only for ordinary PP/VPP schedules.
