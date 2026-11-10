@@ -1084,6 +1084,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
     ),
     KernelEntry(
+        name="engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=("tests/unit_tests/models/engram/test_engram_numerics.py",),
+        kind="torch-op",
+        notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
+        "sorted segment_reduce backward that writes each touched row once; torch.bincount counts "
+        "the integer per-(peer, table) requests of the multi-rank all-to-all. "
+        "test_engram_numerics checks the single-rank lookup in both modes against an independent "
+        "FP64 F.embedding reference on CPU, and replays the deterministic backward bit-exactly on "
+        "GPU under stream contention. The multi-rank routing has no replay test yet.",
+    ),
+    KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
         tests=(K + "test_fused_triton_kernels.py", R + 'test_indexer_replay.py'),
