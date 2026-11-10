@@ -23,7 +23,7 @@ import pretrain_hybrid
 import pretrain_vlm
 from megatron.core import parallel_state, process_groups_config, tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.training import arguments, global_vars, training
+from megatron.training import global_vars, training
 from megatron.training import utils as training_utils
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.datasets import data_samplers, providers
@@ -154,26 +154,25 @@ def test_dataset_provider_without_a_pg_collection_parameter_is_called_with_the_s
 
 @pytest.fixture(params=[pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
 def dataset_script(request, monkeypatch):
-    """A training script whose dataset rank check reads stubbed arguments and config.
+    """A training script whose dataset rank check reads a stubbed model config.
 
     The scripts pass the shared predicate of megatron.training.datasets.providers, which reads
-    the arguments and the transformer config at call time from global_vars and arguments.
+    the transformer config of the registered run config at call time from global_vars.
     """
     module = request.param
-    args = SimpleNamespace(
-        sequence_packing_scheduler=None,
-        sft=False,
-        use_varlen_dataset=False,
-        mock_data=True,
-        fim_data=False,
-    )
+    args = SimpleNamespace(sft=False, use_varlen_dataset=False, mock_data=True, fim_data=False)
     config = SimpleNamespace(
+        sequence_packing_scheduler=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
     )
     monkeypatch.setattr(global_vars, "get_args", lambda: args)
-    monkeypatch.setattr(arguments, "core_transformer_config_from_args", lambda args: config)
+    monkeypatch.setattr(
+        global_vars,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
     return SimpleNamespace(module=module, args=args, config=config)
 
 
@@ -214,7 +213,7 @@ def test_dataset_rank_check_reads_the_supplied_groups(
 ):
     _forbid_global_process_groups(monkeypatch)
     _use_fake_groups(monkeypatch)
-    dataset_script.args.sequence_packing_scheduler = scheduler
+    dataset_script.config.sequence_packing_scheduler = scheduler
     dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
 
     built = dataset_script.module.is_dataset_built_on_rank(
@@ -278,7 +277,10 @@ def test_dataset_provider_builds_on_the_supplied_groups(
     module = dataset_script.module
     # The scripts' providers run the shared provider body on the run config's data section.
     data_config = SimpleNamespace(builder_inputs=lambda: (object, object(), False))
-    monkeypatch.setattr(global_vars, "get_run_config", lambda: SimpleNamespace(data=data_config))
+    run_config = SimpleNamespace(
+        data=data_config, model=SimpleNamespace(transformer=dataset_script.config)
+    )
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_utils, "print_rank_0", lambda message: None)
     monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
 
@@ -434,17 +436,17 @@ def batch_script(request, monkeypatch):
     module = request.param
     _use_fake_groups(monkeypatch)
     args = SimpleNamespace(
-        sequence_packing_scheduler=None,
-        dynamic_context_parallel=False,
-        context_parallel_size=1,
         sft=False,
         dataloader_inter_document_masking=False,
         create_attention_mask_in_dataloader=False,
         micro_batch_size=1,
         seq_length=8,
-        pipeline_model_parallel_size=1,
     )
     config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
@@ -454,7 +456,9 @@ def batch_script(request, monkeypatch):
         attention_cp_layout="zigzag",
     )
     monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    monkeypatch.setattr(
+        module, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+    )
     tp_broadcast = Mock(side_effect=lambda batch, **kwargs: dict.fromkeys(module.BATCH_KEYS))
     monkeypatch.setattr(module, "get_batch_on_this_tp_rank", tp_broadcast)
     if module is pretrain_gpt:
@@ -632,7 +636,7 @@ def test_dataset_rank_check_matches_the_global_grid(dataset_script, vp_size, sch
         virtual_pipeline_model_parallel_size=vp_size,
     )
     try:
-        dataset_script.args.sequence_packing_scheduler = scheduler
+        dataset_script.config.sequence_packing_scheduler = scheduler
         dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
         pgs = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
         for vp_stage in [None] if vp_size is None else range(vp_size):

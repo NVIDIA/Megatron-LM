@@ -105,10 +105,11 @@ def build_checkpoint_converter_process_groups(
     groups therefore alias the corresponding non-GTP groups, matching
     ``initialize_model_parallel`` when the GTP axes have size one.
 
-    Context parallelism is not used during conversion either, but the model
-    still needs a size-one context-parallel group: ``LanguageModule`` requires
-    tensor-, context- and pipeline-parallel groups once ``torch.distributed`` is
-    initialized.
+    Context parallelism is not used during conversion either, but the collection
+    holds a size-one context-parallel group, as the one that
+    ``initialize_model_parallel`` builds does. ``LanguageModule`` rejects a
+    caller's collection whose tensor-, context- or pipeline-parallel group is
+    None once ``torch.distributed`` is initialized.
 
     Conversion creates no other groups. Every other field, such as the embedding,
     GTP and distributed-optimizer groups, is set to None and the runtime

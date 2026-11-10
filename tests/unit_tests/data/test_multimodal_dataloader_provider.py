@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
 import warnings
@@ -95,7 +95,6 @@ def test_new_dataloader_prefetch_factor(
     values = {
         "dataloader_seed": 0,
         "encoder_pipeline_model_parallel_size": 0,
-        "load": None,
         "num_workers": num_workers,
         "packing_buffer_size": 10000,
     }
@@ -105,6 +104,8 @@ def test_new_dataloader_prefetch_factor(
     loader_kwargs = {}
 
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    # The provider reads the checkpoint policy from the run config's checkpoint section.
+    monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda _, **kwargs: True)
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kwargs: kwargs)
     monkeypatch.setattr(
@@ -147,22 +148,33 @@ def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
         )
 
 
+def _run_config(load, pretrained_checkpoint=None):
+    """The run config the provider reads its checkpoint policy from."""
+    return SimpleNamespace(
+        checkpoint=SimpleNamespace(load=load, pretrained_checkpoint=pretrained_checkpoint)
+    )
+
+
 @pytest.fixture
 def strict_resume_provider(monkeypatch):
     args = SimpleNamespace(
-        load="/checkpoints/model",
         dataloader_save="/checkpoints/dataloader",
         strict_dataloader_state_load=True,
         num_workers=0,
         dataloader_seed=0,
         packing_buffer_size=10000,
     )
-    train_state = SimpleNamespace(iteration=100)
+    # The resume facts come from the train state (the primary load's classification included)
+    # and the checkpoint section, not from args.
+    train_state = SimpleNamespace(iteration=100, effective_finetune=False)
     loader = MagicMock()
     loader.__len__.return_value = 42
     checkpoint_name = Mock(return_value="/checkpoints/dataloader/iter_0000100/state.pt")
     load_state = Mock(return_value={"dataloader_state_dict": "saved-state"})
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(
+        dataloader_provider, "get_run_config", lambda: _run_config(load="/checkpoints/model")
+    )
     monkeypatch.setattr(dataloader_provider, "get_train_state", lambda: train_state)
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
@@ -221,6 +233,22 @@ def test_probe_does_not_disable_strict_restore(monkeypatch, strict_resume_provid
     loader.restore_state_rank.assert_not_called()
 
 
+def test_initial_finetune_load_tolerates_missing_state(monkeypatch, strict_resume_provider):
+    """A primary load that applied finetune semantics starts the dataloader from the beginning
+    when its state is missing, strict restore or not; the provider learns it from the train
+    state, not from the namespace."""
+    args, loader, _, load_state, train_state = strict_resume_provider
+    train_state.iteration = 0
+    train_state.effective_finetune = True
+    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: False)
+    dataloader_provider.train_valid_test_dataloaders_provider(
+        None, task_encoder=object(), pg_collection=_pg_collection()
+    )
+    assert args.strict_dataloader_state_load
+    load_state.assert_not_called()
+    loader.restore_state_rank.assert_not_called()
+
+
 def test_loaders_shard_over_the_collection_data_parallel_group(monkeypatch, strict_resume_provider):
     args, _, checkpoint_name, _, _ = strict_resume_provider
     args.strict_dataloader_state_load = False
@@ -257,7 +285,6 @@ def test_restore_reads_the_state_file_the_checkpoint_writes(monkeypatch, tmp_pat
     from megatron.training import checkpointing
 
     args = SimpleNamespace(
-        load="/checkpoints/model",
         dataloader_save=str(tmp_path),
         strict_dataloader_state_load=True,
         num_workers=0,
@@ -267,7 +294,12 @@ def test_restore_reads_the_state_file_the_checkpoint_writes(monkeypatch, tmp_pat
     loader = MagicMock()
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
     monkeypatch.setattr(
-        dataloader_provider, "get_train_state", lambda: SimpleNamespace(iteration=100)
+        dataloader_provider, "get_run_config", lambda: _run_config(load="/checkpoints/model")
+    )
+    monkeypatch.setattr(
+        dataloader_provider,
+        "get_train_state",
+        lambda: SimpleNamespace(iteration=100, effective_finetune=False),
     )
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
@@ -313,8 +345,8 @@ def test_loaders_shard_over_the_data_parallel_group_without_gtp_fields(
     monkeypatch, strict_resume_provider
 ):
     """A collection without the GTP weight-remat fields shards over its replicate group."""
-    args, _, _, _, _ = strict_resume_provider
-    args.load = None
+    # No checkpoint to load, so the provider restores nothing.
+    monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))
     worker_configs = []
     monkeypatch.setattr(
         dataloader_provider,
@@ -377,9 +409,10 @@ def test_full_dataset_probe_builds_the_loader_on_the_run_collection(
 def test_provider_without_collection_warns_and_uses_the_global_grid(monkeypatch):
     """Callers that omit pg_collection keep the global groups, with a deprecation warning."""
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
-    args = SimpleNamespace(load=None, num_workers=0, dataloader_seed=0, packing_buffer_size=None)
+    args = SimpleNamespace(num_workers=0, dataloader_seed=0, packing_buffer_size=None)
     worker_configs = []
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kwargs: kwargs)
     monkeypatch.setattr(
         dataloader_provider,

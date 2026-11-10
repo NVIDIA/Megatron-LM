@@ -9,7 +9,7 @@ and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each sc
 ``is_dataset_built_on_rank_explicit`` below is the GPT and hybrid rule with its inputs spelled out
 (a packed dataset is built on every pipeline stage, the others on the first and last stages and on
 the multi-token-prediction ranks); ``is_dataset_built_on_rank`` applies it to the registered
-arguments and is the predicate ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass; hybrid-flex
+model config and is the predicate ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass; hybrid-flex
 passes its own.
 """
 
@@ -37,7 +37,7 @@ def is_dataset_built_on_rank_explicit(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> bool:
     """Whether the dataset should be built on the current rank: the GPT and hybrid rule, with the
-    run's inputs given explicitly (``is_dataset_built_on_rank`` reads them from the arguments).
+    run's inputs given explicitly (``is_dataset_built_on_rank`` reads them from the model config).
 
     Only the first rank of the tensor-parallel group builds. A sequence-packing scheduler or
     packed dataset builds on every pipeline stage; the others on the first and last stages of the
@@ -86,21 +86,19 @@ def is_dataset_built_on_rank(
     is_packed_sequence: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> bool:
-    """``is_dataset_built_on_rank_explicit`` applied to the registered arguments: the predicate
+    """``is_dataset_built_on_rank_explicit`` applied to the registered model config: the predicate
     ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``.
-    The arguments and the transformer config are read at call time from
-    ``megatron.training.global_vars`` and ``megatron.training.arguments``, which is where tests
-    patch them. ``pg_collection`` holds the process groups of the run (see
-    ``is_dataset_built_on_rank_explicit``); omitting it is deprecated."""
-    from megatron.training.arguments import core_transformer_config_from_args
-    from megatron.training.global_vars import get_args
+    The transformer config is read at call time from the run container. ``pg_collection`` holds
+    the process groups of the run (see ``is_dataset_built_on_rank_explicit``); omitting it is
+    deprecated.
+    """
+    from megatron.training.global_vars import get_run_config
 
-    args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = get_run_config().model.transformer
     return is_dataset_built_on_rank_explicit(
         vp_stage,
         is_packed_sequence,
-        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        sequence_packing_scheduler=config.sequence_packing_scheduler,
         pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
         vp_size=config.virtual_pipeline_model_parallel_size or 1,

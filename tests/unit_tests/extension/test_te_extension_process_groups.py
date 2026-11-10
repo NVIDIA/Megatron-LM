@@ -203,7 +203,7 @@ class TestTEDotProductAttentionContextParallelGroup:
         else:
             pg_collection = ProcessGroupCollection(tp=tp_group, cp=None)
 
-        with pytest.raises(ValueError, match="pg_collection.cp"):
+        with pytest.raises(ValueError, match="must have a cp process group"):
             self._build(pg_collection)
 
     def test_uses_the_cp_group_of_the_collection(self):
