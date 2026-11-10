@@ -743,6 +743,17 @@ def maybe_compact_rollout_bank(iteration):
         bank.checkpoint(iteration)
 
 
+def _mark_rollouts_consumed(rollouts: GroupedRollouts, iteration: int) -> None:
+    """Record that the trainer took ``rollouts`` for the update after ``iteration``.
+
+    On a rollback (restart before this update) the marker > T rule restores these
+    groups; once a checkpoint includes the update they are pruned.
+    """
+    bank = get_rollout_bank()
+    if bank is not None:
+        bank.mark_consumed_many((group.uid for group in rollouts), iteration + 1)
+
+
 def _get_or_create_rollout_agent(env_config_path):
     """Return the cached rollout agent used by the persistent pipeline."""
     global _ROLLOUT_AGENT
@@ -930,13 +941,7 @@ def colocated_inference(
                     ]
                     if not cfg.rl.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
-                    # Record consumption for every group handed to the trainer. On a
-                    # rollback (restart before this update) the marker > T rule restores
-                    # these; once a checkpoint includes the update they are pruned.
-                    if bank is not None:
-                        bank.mark_consumed_many(
-                            (group.uid for group in rollouts), train_state.iteration + 1
-                        )
+                    _mark_rollouts_consumed(rollouts, train_state.iteration)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -991,6 +996,7 @@ def get_environment_rollouts(
         rollouts = [
             loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
         ]
+        _mark_rollouts_consumed(rollouts, train_state.iteration)
     else:
         # Just set up space to collect the rollouts
         rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
