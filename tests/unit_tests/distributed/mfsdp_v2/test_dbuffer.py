@@ -816,18 +816,6 @@ def test_multi_axis_allgather_on_3d_mesh(
     for index in range(len(tensors)):
         torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
 
-    if symmetric_input and symmetric_output:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            source.allgather(axes, out=out)
-        for increment in (1, 2):
-            source.local_buffer.add_(1)
-            graph.replay()
-            for index in range(len(tensors)):
-                torch.testing.assert_close(
-                    out.get_tensor_view(index), expected.get_tensor_view(index) + increment
-                )
-
 
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""

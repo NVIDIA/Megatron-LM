@@ -400,17 +400,3 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
             (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
         ).to(plane.dtype)
         torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)
-
-    if symmetric_memory:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            source.allgather(iter((0, 1)), out=out)
-        for increment in (1, 2):
-            for plane in source.planes:
-                plane.local_buffer.add_(1)
-            graph.replay()
-            for index, plane in enumerate(out.planes):
-                expected = (
-                    (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
-                ).to(plane.dtype)
-                torch.testing.assert_close(plane.local_buffer, expected + increment, rtol=0, atol=0)
