@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Oracle for the Mamba prefix-cache metadata that #5119 rewrote as `PrefixCachedMambaMetadata`
-(megatron/core/inference/contexts/attention_context/mamba_metadata.py:772) and the extraction kernels
-it drives, `_scatter_intermediate_ssm_kernel` / `_scatter_intermediate_conv_kernel`
+(megatron/core/inference/contexts/attention_context/mamba_metadata.py:772) and the extraction
+kernels it drives, `_scatter_intermediate_ssm_kernel` / `_scatter_intermediate_conv_kernel`
 (megatron/core/ssm/ops/common/intermediate_extraction.py), through the commit into the durable cache
 (`MambaSlotAllocator.commit_intermediate_states`) and the restore of a later request
 (`restore_to_live`), driven by the dynamic engine on a real hybrid model.
@@ -29,8 +29,8 @@ size; q = the SSM chunk quantum (`ssm_chunk_alignment`, a multiple of c; bs is a
   (ceil(e / bs) - 1) * bs, and, for a request's first chunk, the end of its KV-matched prefix.
   A staged B is recorded against the request's own KV block B / bs - 1.
 * **Extraction metadata.** Staged boundaries are numbered request by request (prefill order), then
-  ascending. Slot i of boundary B of request j: `intermediate_chunk_indices[i]` = R_j + (B - s) / c - 1,
-  where R_j = sum over earlier prefill requests k of max(1, ceil(n_k / c)) (the scan's chunk rows);
+  ascending. Slot i of boundary B of request j: `intermediate_chunk_indices[i]` =
+  R_j + (B - s) / c - 1, where R_j = sum over earlier prefill requests k of max(1, ceil(n_k / c)) (the scan's chunk rows);
   `intermediate_abs_positions[i]` = T_j + (B - s), where T_j = sum of n_k over earlier prefill
   requests (B's offset in the step's prefill tokens); `intermediate_real_count` = the number of
   slots. Entries past it in the per-step view hold the safe defaults chunk 0 and position d_conv.
@@ -59,9 +59,11 @@ Scenarios (structure-derived: bs = 256, c = q = 128): prompts of bs - 1, bs, bs 
 tokens packed in one step (several requests, so R_j and T_j are nontrivial); followers admitted
 while those decode (mixed steps, decode tokens ahead of the prefill tokens) with full-block hits, a
 one-token resume chunk, a whole-prompt hit that backs off, partial-block hits (KV match ends inside
-the shared prefix) and a restore from a divergence boundary; chunked prefill with chunk starts
-aligned to c (384) and unaligned (320), where continuation chunks stage boundaries and commit chunk
-ends; and a durable cache of three slots, so commits are dropped and slots are evicted and reused
+the shared prefix) and a restore from a divergence boundary; chunked prefill with a two-block step
+budget (640: the scheduler stops a partial chunk at a block boundary, and the final continuation
+chunk stages an interior boundary) and with a budget below one block (192: chunks start off the
+block grid, at 192 and 448, so no interior boundary is legal and only chunk ends at 256, 512 and 768
+commit); and a durable cache of three slots, so commits are dropped and slots are evicted and reused
 before later requests resume. The `graphs` case replays prefill steps from CUDA graphs (the
 extraction kernels' values are then checked only through the commit and resume chain, and the
 metadata's padded entries are checked).
@@ -676,15 +678,15 @@ SCENARIOS = {
     "chunked": SimpleNamespace(
         waves=_chunked_waves,
         chunked=True,
-        max_tokens=384,
+        max_tokens=640,
         durable_slots=None,
         graphs=False,
         async_sched_mode="async",
     ),
-    "chunked-unaligned": SimpleNamespace(
+    "chunked-small-budget": SimpleNamespace(
         waves=_chunked_waves,
         chunked=True,
-        max_tokens=320,
+        max_tokens=192,
         durable_slots=None,
         graphs=False,
         async_sched_mode="async",
@@ -718,6 +720,11 @@ COVERAGE = {
         "end of chunk commits checked",
         "restores checked",
         "ssm extractions checked",
+    ],
+    "chunked-small-budget": [
+        "continuation chunks",
+        "end of chunk commits checked",
+        "restores checked",
     ],
     "evict": ["restores checked", "evicted Mamba blocks", "interior commits checked"],
 }
@@ -766,10 +773,7 @@ def test_prefix_cache_metadata_matches_reference(model_parallel, monkeypatch, na
     del engine
     _reset_cuda_graph_state(model)
 
-    required = COVERAGE.get(name.split("-")[0] if name != "chunked-unaligned" else "chunked", [])
-    if name == "chunked-unaligned":
-        # Chunks end at multiples of 320, so no chunk end is a block boundary here.
-        required = ["continuation chunks", "staged boundaries", "restores checked"]
+    required = COVERAGE[name if name in COVERAGE else name.split("-")[0]]
     if scenario.graphs:
         required = [c for c in required if "extractions" not in c]
     missing = [c for c in required if oracle.counts[c] == 0]
