@@ -615,13 +615,14 @@ def _linear_forward(
     )
     # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
     # the final-shaped allocation, then return the owning tensor rather than that view.
+    # cuBLASLt reads the bias in the output dtype, and TE >= 2.21 rejects any other bias dtype.
     te_general_gemm(
         weight,
         input_2d,
         out_dtype=output_dtype,
         layout="TN",
         out=output.view(-1, weight.size(0)),
-        bias=bias,
+        bias=None if bias is None else bias.to(output_dtype),
     )
     return output
 
