@@ -43,8 +43,15 @@ class TestClipQKGroup:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel()
+        self.created_groups = []
 
     def teardown_method(self, method):
+        if self.created_groups:
+            # Every rank finishes its collectives before any communicator goes away.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            for group in self.created_groups:
+                torch.distributed.destroy_process_group(group)
         Utils.destroy_model_parallel()
 
     def test_reduces_over_the_given_group_without_global_reads(self):
@@ -56,6 +63,7 @@ class TestClipQKGroup:
         pair_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[r, r + 1] for r in range(0, world_size, 2)]
         )
+        self.created_groups.append(pair_group)
         model, self_attention = _model_with_logits(_rank_logits())
 
         with mock.patch.object(
