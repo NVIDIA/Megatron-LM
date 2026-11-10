@@ -25,8 +25,9 @@ stream's kernels in the same order, so every output is the same, bit for bit:
   dummy forward, and requests admitted while others decode;
 * at any relative timing of the two streams. A missing or misplaced fork lets the side stream read
   the pair input before the main stream has written it; a missing join lets the main stream read
-  the combined routed output before the side stream has written it. Delays injected into each
-  stream (`torch.cuda._sleep`) make either hazard produce wrong values instead of a lucky pass.
+  the combined routed output before the side stream has written it. Late writes injected into each
+  stream (a NaN poison, then one kernel that spins and writes) make either hazard produce NaN
+  instead of a lucky pass, also under CUDA_DEVICE_MAX_CONNECTIONS=1 (`LATE_WRITE_SPINS`).
 
 The reference is the option-off run of the same model on the same requests. A metamorphic test is
 used because no independent numeric reference can see a stream-ordering bug that a correct kernel
@@ -64,6 +65,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
@@ -101,19 +104,19 @@ NUM_CUDA_GRAPHS = 4
 NUM_EXPERTS = 16
 """Two local experts per rank at EP 8 (H100), four at EP 4 (GB200)."""
 PATTERN = "ME*E"
-PRODUCER_DELAY_CYCLES = 100_000_000
-"""~50 ms (H100 and GB200 run near 2 GHz) before the main stream writes the pair input."""
-ROUTER_DELAY_CYCLES = 20_000_000
-"""~10 ms before the side stream's router reads the pair input."""
-COMBINE_DELAY_CYCLES = 100_000_000
-"""~50 ms before the side stream's combine writes the routed output.
+LATE_WRITE_SPINS = 25_000_000
+"""Dependent fp32 FMAs each program of `_late_copy_kernel` runs before it writes: ~50 ms or more on
+H100 and GB200, longer than the host launches the other stream's dependent kernel competes with.
 
-Sizing. An eager step is host-bound: the host launches the routed half's kernels, then the
-predecessor's, then the join, so either stream's kernels can finish before the other stream's
-dependent kernel is even launched, and a 1 ms delay hides a missing fork or join (mutants
-o5p-sc-001..003 survived the eager cases at 1 ms; only graph capture failed). Each delay must exceed
-the host time it competes with (a few ms of launches), and the router delay must stay shorter than
-the producer delay, or it would itself wait out the missing fork."""
+Why a late write and not a sleep before the writer. Our runner sets CUDA_DEVICE_MAX_CONNECTIONS=1
+(as Megatron's training scripts do), so all streams share one hardware queue in host launch order. A
+`torch.cuda._sleep` followed by the writing kernel stalls that queue at the writer (it waits for the
+sleep on its own stream), and the other stream's later commands wait behind it: the hazard can never
+show. That is what happened with sleeps of 1 ms (pdx 7995676) and 50 ms (pdx 7996484): the fork and
+join mutants o5p-sc-001..003 passed the eager cases and died only in graph capture. A NaN fill
+followed by one kernel that spins and then writes is dispatched at once and leaves the queue free,
+so a reader that does not wait for it runs during the spin and reads the NaN, with one hardware
+queue or many."""
 MAX_STEPS = 200
 
 # (step at which the request arrives, prompt length, tokens to generate), per EP rank modulo 4.
@@ -313,22 +316,43 @@ class _Spy:
         self.collective_streams = []
 
 
-def _inject_delays(monkeypatch):
-    """Delay each stream in turn (values unchanged).
+@triton.jit
+def _late_copy_kernel(dst_ptr, src_ptr, n, spins, BLOCK: tl.constexpr):
+    """dst[:n] = src[:n], written only after `spins` dependent FMAs per program."""
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for _ in range(spins):
+        acc = acc * 0.999 + 1.0
+    values = tl.load(src_ptr + offsets, mask=mask)
+    # acc is never NaN, so this selects `values`; the compiler cannot drop the loop.
+    values = tl.where(acc != acc, values * 0, values)
+    tl.store(dst_ptr + offsets, values, mask=mask)
 
-    Main stream: the pair input is re-materialized after a ~50 ms sleep, so a side stream that does
-    not wait for the fork reads it before it is written. Side stream: a ~10 ms sleep before the
-    router (a main-stream write to the pair input after the fork would be seen) and a ~50 ms sleep
-    before the combine (a main stream that does not wait for the join reads the combined output
-    early).
+
+def _late_write(dst, src):
+    """Poison `dst` with NaN, then copy `src` into it from one late kernel, all on this stream."""
+    dst.fill_(float("nan"))
+    n = dst.numel()
+    _late_copy_kernel[(triton.cdiv(n, 1024),)](dst, src, n, LATE_WRITE_SPINS, BLOCK=1024)
+
+
+def _inject_delays(monkeypatch):
+    """Make each stream write late (values unchanged).
+
+    Main stream: the pair input is rewritten into a NaN-poisoned buffer by a late kernel, so a side
+    stream that does not wait for the fork reads NaN. Side stream: the combined routed output is
+    poisoned and rewritten by a late kernel after the combine, so a main stream that does not wait
+    for the join reads NaN. See `LATE_WRITE_SPINS` for why a late write and not a sleep.
     """
     forward = ShortcutMoEBlock.forward
-    preprocess = ShortcutMoEBlock._moe_router_preprocess
     launch_combine = ShortcutMoEBlock._launch_combine
 
     def late_input(hidden_states):
-        torch.cuda._sleep(PRODUCER_DELAY_CYCLES)
-        return hidden_states.clone()
+        source = hidden_states.contiguous()
+        late = torch.empty_like(source)
+        _late_write(late, source)
+        return late
 
     def delayed_forward(block, *args, **kwargs):
         if "hidden_states" in kwargs:
@@ -337,16 +361,13 @@ def _inject_delays(monkeypatch):
             args = (late_input(args[0]),) + tuple(args[1:])
         return forward(block, *args, **kwargs)
 
-    def delayed_preprocess(block, *args, **kwargs):
-        torch.cuda._sleep(ROUTER_DELAY_CYCLES)
-        return preprocess(block, *args, **kwargs)
-
     def delayed_combine(block, *args, **kwargs):
-        torch.cuda._sleep(COMBINE_DELAY_CYCLES)
-        return launch_combine(block, *args, **kwargs)
+        combined = launch_combine(block, *args, **kwargs)
+        saved = combined.clone()
+        _late_write(combined, saved)
+        return combined
 
     monkeypatch.setattr(ShortcutMoEBlock, "forward", delayed_forward)
-    monkeypatch.setattr(ShortcutMoEBlock, "_moe_router_preprocess", delayed_preprocess)
     monkeypatch.setattr(ShortcutMoEBlock, "_launch_combine", delayed_combine)
 
 
@@ -588,7 +609,7 @@ def test_overlap_is_bitwise_invariant(expert_parallel, monkeypatch, graphs, wide
     "graphs", [pytest.param(False, id="eager"), pytest.param(True, id="graphs")]
 )
 def test_overlap_with_delayed_streams(expert_parallel, monkeypatch, graphs):
-    """As above, with each stream delayed in turn: a missing fork or join changes the output."""
+    """As above, with each stream writing late in turn: a missing fork or join reads NaN."""
     _overlap_case(monkeypatch, expert_parallel, wide=False, graphs=graphs, delayed=True)
 
 
