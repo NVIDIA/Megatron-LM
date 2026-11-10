@@ -90,14 +90,15 @@ def _causal_conv1d_varlen_kernel(
         )  # (BLOCK_T, BLOCK_C)
 
         if HAS_INITIAL_STATES:
-            # For tokens where src < req_start, load from initial_states
+            # For tokens where src < req_start, load from initial_states. The request offset
+            # is int64: it reaches 2^31 elements once num_requests * initial_states_stride_req does.
             state_col = (WIDTH - 1) - (req_start - src)  # (BLOCK_T,)
             valid_state = (~in_seq) & (state_col >= 0)  # (BLOCK_T,)
             state_col_safe = tl.maximum(state_col, 0)
 
             state_val = tl.load(
                 initial_states_ptr
-                + req_id[:, None] * initial_states_stride_req
+                + req_id.to(tl.int64)[:, None] * initial_states_stride_req
                 + c_off[None, :] * initial_states_stride_dim
                 + state_col_safe[:, None],
                 mask=t_mask[:, None] & c_mask[None, :] & valid_state[:, None],
@@ -317,7 +318,9 @@ def _causal_conv1d_carry_states_kernel(
     over `D_CONV`, so the index arithmetic lands in registers and needs no
     precomputed plan.
     """
-    pid_req = tl.program_id(0)
+    # int64, as the request offsets below reach 2^31 elements once num_requests * conv_dim *
+    # d_conv does.
+    pid_req = tl.program_id(0).to(tl.int64)
     pid_c = tl.program_id(1)
 
     c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
