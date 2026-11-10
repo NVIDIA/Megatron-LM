@@ -218,6 +218,23 @@ def test_combined_1f1b_backward_only_delayed_fp8_context_uses_backward_chunk_col
     assert get_fp8_context.call_args.kwargs.get("pg_collection") is b_collection
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "wrapped"])
+def test_combined_1f1b_delayed_fp8_context_requires_a_chunk_collection(wrapped):
+    """A chunk that owns no collection at any wrapper level has no amax group to reduce over."""
+    model = _ModelChunk(ProcessGroupCollection())
+    del model.pg_collection
+    if wrapped:
+        model = _Wrapper(model)
+
+    with (
+        patch.object(combined_1f1b, "get_fp8_context") as get_fp8_context,
+        pytest.raises(RuntimeError, match="couldn't find attribute pg_collection"),
+    ):
+        _run_combined_step(_fp8_schedule_config(Fp8Recipe.delayed), f_model=model, b_model=model)
+
+    get_fp8_context.assert_not_called()
+
+
 def test_combined_1f1b_opens_no_outer_fp8_context_for_per_layer_recipes():
     """The layers open their own contexts for recipes other than delayed scaling."""
     model = _ModelChunk(ProcessGroupCollection())
