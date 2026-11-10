@@ -148,7 +148,15 @@ def _create_fsdp_emerging_optimizer(
     """Build FsdpMuon."""
     kwargs = _kwargs_from_config(Muon, "muon", config)
     kwargs["weight_decay_method"] = "decoupled" if config.decoupled_weight_decay else "l2"
-    return FsdpMuon(param_groups, **kwargs)
+    optimizer = FsdpMuon(param_groups, **kwargs)
+    if config.optimizer_cuda_graph:
+        # A captured step reads the learning rate from device memory, which the scheduler
+        # updates in place; a Python number would stay at its value during capture.
+        for group in optimizer.param_groups:
+            group["lr"] = torch.tensor(
+                group["lr"], dtype=torch.float32, device=torch.cuda.current_device()
+            )
+    return optimizer
 
 
 # ===========================================================================

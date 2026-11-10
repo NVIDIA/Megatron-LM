@@ -449,16 +449,26 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
     def sync_model_weight_from_main_weight(self) -> None:
-        """Refresh compute weights from optimizer weights."""
+        """Refresh compute weights from optimizer weights.
+
+        When the optimizer and compute placements differ, as with HFSDP, the next unshard
+        redistributes the refreshed shards. A replay of an optimizer step captured in a CUDA graph
+        does not run this method's host code, which marks the weights stale, so a captured step
+        redistributes them right away instead.
+        """
         if isinstance(self.post_optimizer_model_weight, DBuffer):
             self.main_weight.cast(
                 self.post_optimizer_model_weight.dtype, out=self.post_optimizer_model_weight
             )
         else:
             self.post_optimizer_model_weight.quantize_(self.main_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
-        )
+        stale = self.post_optimizer_model_weight.placements != self.model_weight.placements
+        if stale and torch.cuda.is_current_stream_capturing():
+            self.post_optimizer_model_weight.redistribute(
+                self.model_weight.placements, out=self.model_weight
+            )
+            stale = False
+        self._model_weight_is_stale = stale
 
     @property
     def is_rowwise_unsharded(self) -> bool:
