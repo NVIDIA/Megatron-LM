@@ -4692,16 +4692,20 @@ def _param_hashes_match_across_dp_replicas(model):
     """Return whether every data-parallel replica of the model holds the same parameters.
 
     The replicas are those of the model's process-group collection; a model without one is
-    checked across the replicas of the global parallel state.
+    checked across the replicas of the global parallel state. For a collection without an
+    expert data-parallel group, the expert replicas are those of the group that
+    DistributedDataParallel built in its place.
     """
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
     if model_pg_collection is None:
         model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    expt_dp_group = model_pg_collection.expt_dp
+    if expt_dp_group is None:
+        # DistributedDataParallel accepts a collection without expt_dp and reduces the expert
+        # gradients over single-rank groups of its own; compare the expert hashes over the same.
+        expt_dp_group = getattr(model[0], "expt_dp_group", None)
     return check_param_hashes_across_dp_replicas(
-        model,
-        cross_check=True,
-        dp_group=model_pg_collection.dp,
-        expt_dp_group=model_pg_collection.expt_dp,
+        model, cross_check=True, dp_group=model_pg_collection.dp, expt_dp_group=expt_dp_group
     )
 
 
