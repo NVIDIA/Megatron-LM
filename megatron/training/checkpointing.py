@@ -52,6 +52,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
 )
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.transformer.wide_residual import has_legacy_residual_keys
 from megatron.core.utils import (
     get_model_config,
     get_pg_rank,
@@ -3210,6 +3211,12 @@ def load_checkpoint(
             # run that saved the checkpoint. Recover those grad dtypes from the checkpoint's keys
             # so that a run with a different main-grad dtype still addresses the same tensors.
             sharded_sd_metadata['legacy_grad_dtypes'] = get_legacy_grad_dtypes(
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
+            )
+        if getattr(args, 'wide_residual_num_streams', None):
+            # Checkpoints saved before the residual read/write split name these tensors
+            # residual_connection{suffix}; the wide-residual layers address them by those keys.
+            sharded_sd_metadata['legacy_residual_keys'] = has_legacy_residual_keys(
                 dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
             )
         if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
