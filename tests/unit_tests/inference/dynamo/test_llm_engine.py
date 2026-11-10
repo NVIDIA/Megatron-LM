@@ -470,11 +470,111 @@ async def test_streaming_generation_rejects_misaligned_log_probs():
 async def test_abort_uses_megatron_request_id_recorded_for_context():
     engine = MegatronLLMEngine(_config())
     engine.client = SimpleNamespace(abort_request_and_wait=AsyncMock(return_value=True))
-    engine._request_ids["dynamo-request"] = 77
+    engine._request_ids["dynamo-request"] = {77}
 
     await engine.abort(_Context())
 
     engine.client.abort_request_and_wait.assert_awaited_once_with(77)
+    assert not engine._request_ids
+
+
+@pytest.mark.asyncio
+async def test_abort_reaches_every_attempt_of_a_context():
+    # A retried attempt can run beside the first under the same Dynamo context.
+    streams = [AsyncStream(request_id, MagicMock()) for request_id in (5, 6)]
+    engine = MegatronLLMEngine(_config())
+    engine.client = SimpleNamespace(
+        add_request_streaming=MagicMock(side_effect=streams),
+        abort_request_and_wait=AsyncMock(return_value=True),
+    )
+    attempts = [engine.generate({"token_ids": [1]}, _Context()) for _ in streams]
+    consumers = [asyncio.create_task(anext(attempt)) for attempt in attempts]
+    await asyncio.sleep(0)
+    assert engine._request_ids == {"dynamo-request": {5, 6}}
+
+    await engine.abort(_Context())
+
+    assert sorted(
+        call.args[0] for call in engine.client.abort_request_and_wait.await_args_list
+    ) == [5, 6]
+    assert not engine._request_ids
+    for stream, consumer in zip(streams, consumers):
+        stream.finish(exception=InferenceRequestAborted("cancelled"))
+        assert (await consumer)["finish_reason"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_retried_prefill_sharing_a_context_delivers_its_handoff():
+    streams = [AsyncStream(request_id, MagicMock()) for request_id in (36, 37)]
+    engine = MegatronLLMEngine(_config("prefill"))
+    engine._engine_endpoint = _endpoint()
+    engine.client = SimpleNamespace(
+        add_request_streaming=MagicMock(side_effect=streams),
+        release_handoff=MagicMock(),
+        coordinator_instance_id="instance",
+    )
+    first = engine.generate({"token_ids": [1]}, _Context())
+    retry = engine.generate({"token_ids": [1]}, _Context())
+    first_reply = asyncio.create_task(anext(first))
+    await asyncio.sleep(0)
+    retry_reply = asyncio.create_task(anext(retry))
+    await asyncio.sleep(0)
+
+    # The first attempt's consumer is gone; its result arrives first.
+    first_reply.cancel()
+    streams[0].put({"final": {"status": "COMPLETED", "disaggregated_params": {"request_id": 900}}})
+    streams[0].finish()
+    with pytest.raises(asyncio.CancelledError):
+        await first_reply
+    streams[1].put({"final": {"status": "COMPLETED", "disaggregated_params": {"request_id": 901}}})
+    streams[1].finish()
+
+    chunk = await retry_reply
+    assert chunk["disaggregated_params"]["release"]["request_id"] == 901
+    await asyncio.gather(*engine._cleanup_tasks)
+    engine.client.release_handoff.assert_called_once_with(900)
+    assert not engine._request_waiters
+
+
+@pytest.mark.asyncio
+async def test_duplicate_decode_delivery_keeps_the_claimed_attempt():
+    # Duplicate delivery of one handoff to one adapter: the first claim is accepted and the
+    # duplicate's is rejected while the first is still in flight.
+    claims = [asyncio.get_running_loop().create_future() for _ in range(2)]
+    stream = AsyncStream(1, MagicMock())
+    engine = MegatronLLMEngine(_config("decode"))
+    pending = iter(claims)
+
+    async def claim(_release):
+        await next(pending)
+
+    engine._claim_remote_handoff = claim
+    engine._release_completed_handoff = AsyncMock()
+    engine.client = SimpleNamespace(
+        add_request_with_kv_handoff_streaming=MagicMock(return_value=stream)
+    )
+    with patch(
+        "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result", return_value={}
+    ):
+        original = engine.generate({"token_ids": [1]}, _Context())
+        duplicate = engine.generate({"token_ids": [1]}, _Context())
+        original_chunk = asyncio.create_task(anext(original))
+        await asyncio.sleep(0)
+        duplicate_chunk = asyncio.create_task(anext(duplicate))
+        await asyncio.sleep(0)
+        claims[0].set_result(None)
+        claims[1].set_exception(RuntimeError("Unexpected or rejected handoff acknowledgement"))
+        with pytest.raises(RuntimeError, match="rejected"):
+            await duplicate_chunk
+        stream.put({"final": {"status": "COMPLETED", "generated_tokens": [7]}})
+        stream.finish()
+        chunk = await original_chunk
+
+    assert chunk["token_ids"] == [7]
+    engine.client.add_request_with_kv_handoff_streaming.assert_called_once()
+    await asyncio.gather(*engine._cleanup_tasks)
+    # Released once, by the attempt that imported, after its output.
+    engine._release_completed_handoff.assert_awaited_once_with({})
 
 
 @pytest.mark.asyncio
@@ -588,7 +688,7 @@ async def test_cancelled_prefill_releases_state_after_final_reply(cancellation):
     if cancellation == "completed_abort":
         # The shield can already have a result while its consumer has not yet
         # resumed. Cancelling a done future alone does not cancel that consumer.
-        engine._request_waiters["dynamo-request"].set_result(
+        next(iter(engine._request_waiters["dynamo-request"])).set_result(
             {"status": "COMPLETED", "disaggregated_params": {"request_id": 900}}
         )
     if cancellation != "consumer":
