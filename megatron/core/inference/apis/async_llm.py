@@ -181,7 +181,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         await self._await_shutdown(self._begin_shutdown())
 
     @staticmethod
-    async def _await_shutdown(shutdown_complete_future: "concurrent.futures.Future") -> None:
+    async def _await_shutdown(shutdown_complete_future: concurrent.futures.Future) -> None:
         # Each caller gets a loop-local wrapper around the shared completion
         # future, so concurrent callers and callers on distinct loops are safe.
         await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
