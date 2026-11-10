@@ -43,10 +43,21 @@ class _Group:
 
 
 def _import_script(name):
-    """Import an example script whose ModelOpt imports need a recent ModelOpt release."""
+    """Import an example script whose ModelOpt imports need a recent ModelOpt release.
+
+    The test is skipped only when ModelOpt lacks the module, name or attribute the script asks
+    for. Every other import error fails the test, such as a Megatron name the script imports.
+    """
     try:
         return importlib.import_module(name)
     except (ImportError, AttributeError) as error:
+        if isinstance(error, ImportError):
+            missing_from = error.name or ""
+        else:
+            # convert_model.py reads attributes of ModelOpt modules while it is imported.
+            missing_from = getattr(getattr(error, "obj", None), "__name__", "")
+        if missing_from.split(".")[0] != "modelopt":
+            raise
         pytest.skip(f"{name}.py needs a newer ModelOpt: {error}")
 
 
@@ -189,6 +200,51 @@ def test_convert_builds_the_model_on_the_stage_of_its_groups(monkeypatch):
     assert built_with == [
         {"pre_process": False, "post_process": True, "pg_collection": pg_collection}
     ]
+
+
+def test_auto_quantize_takes_its_groups_from_the_model(monkeypatch):
+    quantize = _import_script("quantize")
+
+    args = SimpleNamespace(
+        calib_dataset_path_or_name="dataset",
+        calib_size=16,
+        calib_max_sequence_length=8,
+        calib_batch_size=2,
+        auto_quantize_formats=[],
+        auto_quantize_score_size=16,
+        auto_quantize_bits=4.8,
+        auto_quantize_method="gradient",
+        auto_quantize_checkpoint=None,
+        save=None,
+    )
+    searches, cp_groups = [], []
+
+    def build_lm_batch(batch, cp_group=None):
+        cp_groups.append(cp_group)
+        return dict.fromkeys(("tokens", "position_ids", "attention_mask", "labels", "loss_mask"))
+
+    monkeypatch.setattr(quantize, "get_args", lambda: args)
+    monkeypatch.setattr(quantize, "print_rank_0", lambda message: None)
+    monkeypatch.setattr(
+        quantize, "get_megatron_calibration_dataloader", lambda *a, **kw: [{}] * 8, raising=False
+    )
+    monkeypatch.setattr(quantize, "build_lm_batch_from_input_ids", build_lm_batch)
+    monkeypatch.setattr(
+        quantize.mtq, "auto_quantize", lambda model, **kwargs: searches.append(kwargs) or (None, {})
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    pg_collection = ProcessGroupCollection(cp=_Group(0, 2), dp_gtp_remat=_Group(0, 4))
+    model = MagicMock(spec=["forward", "pg_collection"])
+    model.pg_collection = pg_collection
+    model.forward.return_value = torch.ones(2, requires_grad=True)
+
+    with forbid_global_process_groups():
+        quantize.auto_quantize_model(model, tokenizer=None)
+        searches[0]["forward_backward_step"](model, {})
+
+    # 16 score samples over 4 data-parallel ranks with a batch of 2 take 2 steps.
+    assert searches[0]["num_score_steps"] == 2
+    assert cp_groups == [pg_collection.cp]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

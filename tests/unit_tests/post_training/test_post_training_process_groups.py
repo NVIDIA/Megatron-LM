@@ -158,7 +158,18 @@ def test_loss_func_reduces_distillation_losses_over_the_model_group(monkeypatch,
     assert all_reduce_groups == [tp_group]
 
 
-def test_loss_func_without_a_model_computes_the_plain_loss(monkeypatch, all_reduce_groups):
+# No model, a model class that carries no collection, and a model whose collection is None.
+_MODELS_WITHOUT_A_COLLECTION = [
+    pytest.param(None, id="no-model"),
+    pytest.param(SimpleNamespace(), id="no-collection-attribute"),
+    pytest.param(SimpleNamespace(pg_collection=None), id="none"),
+]
+
+
+@pytest.mark.parametrize("model", _MODELS_WITHOUT_A_COLLECTION)
+def test_loss_func_without_a_model_collection_computes_the_plain_loss(
+    monkeypatch, all_reduce_groups, model
+):
     _forbid_global_process_groups(monkeypatch)
     monkeypatch.setattr(
         loss_func_module, "get_args", lambda: SimpleNamespace(export_kd_teacher_load=False)
@@ -167,7 +178,7 @@ def test_loss_func_without_a_model_computes_the_plain_loss(monkeypatch, all_redu
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         loss, num_tokens, report = loss_func_module.loss_func(
-            torch.ones(1, 3), torch.tensor([[1.0, 2.0, 4.0]]), None
+            torch.ones(1, 3), torch.tensor([[1.0, 2.0, 4.0]]), model
         )
 
     assert loss.item() == pytest.approx(7.0)
@@ -176,7 +187,10 @@ def test_loss_func_without_a_model_computes_the_plain_loss(monkeypatch, all_redu
     assert all_reduce_groups == []
 
 
-def test_loss_func_without_a_model_warns_for_a_split_loss(monkeypatch, all_reduce_groups):
+@pytest.mark.parametrize("model", _MODELS_WITHOUT_A_COLLECTION)
+def test_loss_func_without_a_model_collection_warns_for_a_split_loss(
+    monkeypatch, all_reduce_groups, model
+):
     global_tp_group = _FakeGroup(rank=0, size=2)
     monkeypatch.setattr(
         parallel_state, "get_tensor_model_parallel_group", lambda *args, **kwargs: global_tp_group
@@ -189,7 +203,7 @@ def test_loss_func_without_a_model_warns_for_a_split_loss(monkeypatch, all_reduc
         ProcessGroupFallbackWarning, match="_mask_loss was called without `tp_group`"
     ):
         loss, _, _ = loss_func_module.loss_func(
-            torch.ones(1, 2), (torch.tensor([[1.0, 2.0]]), True, False), None
+            torch.ones(1, 2), (torch.tensor([[1.0, 2.0]]), True, False), model
         )
 
     assert loss.item() == pytest.approx(3.0)

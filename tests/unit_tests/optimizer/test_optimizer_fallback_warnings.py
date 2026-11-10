@@ -25,11 +25,14 @@ from megatron.core.optimizer import (
     _get_megatron_optimizer_based_on_param_groups,
     get_megatron_optimizer,
 )
-from megatron.core.optimizer import optimizer as optimizer_module
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import FP32Optimizer
-from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    enable_strict_process_group_fallbacks,
+)
 from megatron.core.tensor_parallel import layers as tensor_parallel_layers
 from megatron.core.tensor_parallel import (
     param_is_not_gtp_duplicate,
@@ -40,10 +43,9 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(autouse=True)
-def fresh_warning_registries(monkeypatch):
+def fresh_warning_registry(monkeypatch):
     """Each test observes the first fallback warning of every owner."""
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
-    monkeypatch.setattr(optimizer_module, "_warned_world_grad_stats_owners", set(), raising=False)
 
 
 def _stub_optimizer(cls, **attributes):
@@ -119,6 +121,19 @@ class TestGradStatsGroupGetters:
             _stub_optimizer(
                 FP32Optimizer, grad_stats_parallel_group=None
             ).get_grad_stats_parallel_group()
+
+    @pytest.mark.parametrize(
+        "cls", [DistributedOptimizer, FP32Optimizer], ids=["distributed", "non-distributed"]
+    )
+    def test_strict_mode_raises_for_a_world_fallback_that_already_warned(self, cls):
+        optimizer = _stub_optimizer(cls, grad_stats_parallel_group=None)
+        with pytest.warns(ProcessGroupFallbackWarning):
+            optimizer.get_grad_stats_parallel_group()
+        # Strict mode forgets the fallbacks that already warned, this one included.
+        with warnings.catch_warnings():
+            enable_strict_process_group_fallbacks()
+            with pytest.raises(ProcessGroupFallbackWarning, match=f"^{cls.__name__} has no"):
+                optimizer.get_grad_stats_parallel_group()
 
 
 class TestDuplicateFilterFallbacks:

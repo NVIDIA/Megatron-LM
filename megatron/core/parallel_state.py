@@ -190,8 +190,9 @@ def _warn_deprecated_call(name: str, message: str, caller) -> None:
         warnings.warn(message, ParallelStateDeprecationWarning, stacklevel=3)
     finally:
         in_progress.discard(call_site)
-    # Recorded once the warning is shown: a warning that a filter turns into an error leaves no
-    # record, so it raises at every call, in every thread.
+    # Recorded once warnings.warn() returns, whether a filter showed the warning or ignored it. A
+    # warning that a filter turns into an error leaves no record, so it raises at every call, in
+    # every thread.
     _warned_accessor_call_sites.add(call_site)
 
 
@@ -3077,7 +3078,7 @@ def get_pipeline_model_parallel_rank():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+    return get_pipeline_model_parallel_group().rank()
 
 
 @_deprecated_accessor(

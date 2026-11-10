@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.rl import callbacks as rl_callbacks
 from megatron.rl import rl_profiling, rl_utils
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
@@ -49,6 +50,14 @@ def env(monkeypatch):
     monkeypatch.setattr(rl_utils, "log_rl_throughput_metrics", lambda *a: " tokens/s: 10 |")
     monkeypatch.setattr("megatron.rl.sequence_packing_utils.get_num_microbatches", lambda: 3)
     return env
+
+
+def test_data_parallel_group_of_a_collection_without_dp_gtp_remat():
+    """A collection without a GTP weight-remat axis may carry only dp, and the bins are
+    spread over it."""
+    dp_group = FakeGroup(3)
+    model = [SimpleNamespace(pg_collection=ProcessGroupCollection(dp=dp_group, gtp_remat=None))]
+    assert rl_callbacks._data_parallel_group(model) is dp_group
 
 
 @pytest.mark.parametrize("profile", [False, True])

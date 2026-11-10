@@ -14,8 +14,10 @@ from torch.utils.data._utils.collate import default_collate
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron import core
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.training import setup_model_and_optimizer
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
@@ -243,8 +245,7 @@ def get_blocks_by_rank(
     block_size: int,
     validate: Optional[Callable] = None,
     sample: Optional[float] = None,
-    *,
-    process_group: ProcessGroup,
+    process_group: Optional[ProcessGroup] = None,
 ) -> SimpleNamespace:
     """Divide existing and missing blocks evenly across all ranks.
 
@@ -261,7 +262,9 @@ def get_blocks_by_rank(
         validate (Callable): Method for validating each block file during load.
         sample (Optional[float]): If provided, sample a random subset of the blocks.
             Used for validating preprocessing correctness.
-        process_group (ProcessGroup): The data-parallel group whose ranks split the blocks.
+        process_group (Optional[ProcessGroup]): The data-parallel group whose ranks split the
+            blocks. If None, falls back to the global data-parallel group with a
+            ``ProcessGroupFallbackWarning``; the fallback is deprecated.
 
     Returns:
         A namespace consisting of 2 lists: existing blocks, and missing blocks.
@@ -271,6 +274,10 @@ def get_blocks_by_rank(
         total number of existing and missing blocks, independent of samples.
         Therefore, (n_existing_world + n_missing_world) * block_size == n_samples.
     """
+
+    if process_group is None:
+        with global_process_group_fallback("get_blocks_by_rank", "process_group"):
+            process_group = parallel_state.get_data_parallel_group()
 
     # Get world blocks.
     blocks = get_blocks(dirname, n_samples, block_size, validate)

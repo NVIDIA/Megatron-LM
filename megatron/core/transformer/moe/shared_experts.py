@@ -217,9 +217,11 @@ class SharedExpertMLP(MLP):
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Gets sharded state dict."""
-        # MLP.sharded_state_dict fills only its own copy when metadata is None. Fill it here so
-        # gate_weight below gets the same DP x CP group as linear_fc1 and linear_fc2.
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # MLP.sharded_state_dict fills only its own copy when metadata is None. Fill it here, with
+        # the same group, so gate_weight below gets the DP x CP group of linear_fc1 and linear_fc2.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.use_shared_expert_gate:
             name = 'gate_weight'
