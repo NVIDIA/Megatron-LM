@@ -251,6 +251,20 @@ def test_tensor_merge_small(device):
     assert torch.equal(output_tensor[2:7], tensor_b)
 
 
+def test_tensor_merge_truncates_tensor_b(device):
+    """Rows of tensor_b past the end of the output are dropped."""
+    tensor_a = torch.randn(3, 256, device=device)
+    tensor_b = torch.randn(5, 256, device=device)
+    pos_on_device = torch.tensor([2, 5], dtype=torch.int32, device=device)
+    output_ref = torch.full((6, 256), float("nan"), device=device)
+    output_triton = output_ref.clone()
+
+    tensor_merge_pytorch(tensor_a, tensor_b, output_ref, pos_on_device)
+    tensor_merge(tensor_a, tensor_b, pos_on_device, output_tensor=output_triton, check_bounds=True)
+
+    assert torch.equal(output_triton, output_ref)
+
+
 IN_PROJ_ROW = 2 * 8192 + 2 * 8 * 128 + 128
 """Elements per token of Nemotron-H 8B's Mamba in_proj output at TP 1 (z, x, B, C, dt): the rows
 that the SSM layer's mixed-batch slice copies."""
@@ -279,12 +293,12 @@ def _require_free_memory(nbytes):
 
 @pytest.mark.large
 class TestInt32RowOffsets:
-    """Rows that start at or past 2**31 elements, where int32 row offsets would wrap.
+    """Rows and row counts at or past 2**31 elements, where int32 arithmetic would wrap.
 
     The sources sit behind zeros and the output behind NaN, so a wrapped read leaves an output
     row unequal to its source and a wrapped write shows in the output's guard. Opt in with
-    ``-m large`` (about 20 GiB of device memory each); run one case per process, since a wrapped
-    offset can leave a sticky illegal-address error.
+    ``-m large`` (up to about 20 GiB of device memory each); run one case per process, since a
+    wrapped offset can leave a sticky illegal-address error.
     """
 
     def test_get_slice_after(self, device):
@@ -322,6 +336,20 @@ class TestInt32RowOffsets:
 
         assert out_guard.isnan().all(), "wrote before the output"
         assert torch.equal(out, src)
+
+    def test_tensor_merge_position_plus_rows(self, device):
+        """tensor_b's first row is copied when position + tensor_b's rows is 2**31: one row of
+        tensor_a, position 1, and 2**31 - 1 one-element rows of tensor_b (4 GiB)."""
+        rows_b = 2**31 - 1
+        _require_free_memory(6 << 30)
+        tensor_a = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+        tensor_b = torch.full((rows_b, 1), 2.0, dtype=torch.bfloat16, device=device)
+        out = torch.full((2, 1), float("nan"), dtype=torch.bfloat16, device=device)
+        pos = torch.tensor([1, rows_b], dtype=torch.int32, device=device)
+
+        tensor_merge(tensor_a, tensor_b, pos, output_tensor=out)
+
+        assert out.flatten().tolist() == [1.0, 2.0]
 
 
 @pytest.mark.parametrize("ndim", [2, 3, 4])
