@@ -251,6 +251,64 @@ def test_get_pp_rank_microbatches_without_a_communicator_warns_once():
         Utils.destroy_model_parallel()
 
 
+def _calc_loss(**stage):
+    """Run forward_step_calc_loss on a loss of 8 over 4 microbatches; return the loss and store."""
+    forward_data_store = []
+    loss, _ = schedule.forward_step_calc_loss(
+        None,  # model
+        torch.tensor(8.0),
+        lambda output: (output.clone(), {"value": output.item()}),
+        SimpleNamespace(timers=None),
+        None,  # vp_stage
+        False,  # collect_non_loss_data
+        4,  # num_microbatches
+        forward_data_store,
+        **stage,
+    )
+    return loss.item(), forward_data_store
+
+
+@requires_4_ranks
+def test_forward_step_calc_loss_without_cp_size_and_last_stage_warns_once():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=2, context_parallel_size=2
+    )
+    try:
+        cp_size = parallel_state.get_context_parallel_group().size()
+        is_last_stage = is_pp_last_stage(parallel_state.get_pipeline_model_parallel_group())
+        assert cp_size == 2
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            default_results = [_calc_loss() for _ in range(2)]
+        _assert_one_fallback_warning(
+            record, "forward_step_calc_loss", "cp_group_size/is_last_stage"
+        )
+
+        with _forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            explicit_result = _calc_loss(cp_group_size=cp_size, is_last_stage=is_last_stage)
+
+        # Only the last stage computes the loss, scaled by the CP size over the microbatches.
+        expected = (4.0, [{"value": 8.0}]) if is_last_stage else (8.0, [])
+        assert default_results == [expected, expected]
+        assert explicit_result == expected
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "stage, message",
+    [
+        ({"cp_group_size": 4}, "is_last_stage must be True or False"),
+        ({"is_last_stage": True}, "cp_group_size must be set on the last stage"),
+    ],
+)
+def test_forward_step_calc_loss_takes_cp_size_and_last_stage_or_neither(stage, message):
+    with _forbid_global_process_groups(), pytest.raises(ValueError, match=message):
+        _calc_loss(**stage)
+
+
 @requires_4_ranks
 def test_get_forward_backward_func_without_sizes_warns_once():
     Utils.initialize_model_parallel(
