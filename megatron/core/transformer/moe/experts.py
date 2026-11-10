@@ -1522,9 +1522,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
         raise ValueError(f"No FlashInfer ActivationType mapping for activation_func={func}")
 
     def _resolve_mcore_activation_type(self):
-        """Map megatron activation config to mcore_fused_moe ActivationType."""
+        """Map megatron activation config to mcore_fused_moe ActivationType.
+
+        The kernels implement squared ReLU (optionally tanh-clamped), gated squared ReLU and
+        SwiGLU, so any other activation, or the tanh-clamped gated form (SiTU-GLU), is rejected
+        here, when the experts are built. TransformerConfig cannot reject them: the same
+        activation_func drives dense MLP layers, and a config with num_moe_experts set does not
+        always build these experts.
+        """
         func = self.config.activation_func
         gated = self.config.gated_linear_unit
+        if gated and self.config.activation_func_tanh_clamp_scale is not None:
+            raise ValueError(
+                "activation_func_tanh_clamp_scale with gated_linear_unit (SiTU-GLU) has no "
+                "inference-optimized expert kernel."
+            )
         if func == squared_relu:
             # relu(gate)^2 * up with a gated linear unit, as in training's GLU.
             if gated:
@@ -1534,8 +1546,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # gated SiLU -> SwiGLU (padded_swiglu / vllm silu_and_mul path)
             return McoreActivationType.SWIGLU
         raise ValueError(
-            f"No mcore_fused_moe ActivationType mapping for activation_func={func} "
-            f"with gated_linear_unit={gated}"
+            "Inference-optimized experts support only squared-ReLU experts "
+            "(activation_func=squared_relu, with or without gated_linear_unit) and SwiGLU experts "
+            f"(activation_func=F.silu with gated_linear_unit=True), got activation_func={func} "
+            f"with gated_linear_unit={gated}."
         )
 
     @staticmethod
