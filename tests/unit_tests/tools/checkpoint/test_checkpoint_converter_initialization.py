@@ -92,7 +92,12 @@ def test_saver_starts_torch_distributed_without_a_port():
     saver of another conversion on the same host."""
     # The store server of another process holds the port.
     store = torch.distributed.TCPStore('localhost', 0, world_size=1, is_master=True)
-    env = dict(os.environ, MASTER_ADDR='localhost', MASTER_PORT=str(store.port))
+    # Under torch.distributed.run, TORCHELASTIC_USE_AGENT_STORE makes every rank connect to
+    # the store at MASTER_PORT instead of starting one, so a saver that reads the port would
+    # connect to the store held here and pass. Without the launcher's variables it has to
+    # start a store on the taken port, which fails.
+    env = {k: v for k, v in os.environ.items() if not k.startswith('TORCHELASTIC_')}
+    env.update(MASTER_ADDR='localhost', MASTER_PORT=str(store.port))
 
     description = _run_in_new_process('_initialize_saver_environment', env)
 

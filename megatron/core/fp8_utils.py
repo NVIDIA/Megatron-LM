@@ -769,6 +769,7 @@ def is_mxfp8_output_proj_active(config) -> bool:
 
 
 if HAVE_TE:
+    from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
 
     def get_fp8_recipe(config: TransformerConfig):
@@ -875,9 +876,10 @@ if HAVE_TE:
                 owns the layer. The autocast context reduces amaxes over
                 ``amax_reduction_group(pg_collection, config.tp_only_amax_red)``. Omitting it is
                 deprecated and emits a ``ProcessGroupFallbackWarning``: the context then uses
-                the global amax reduction group of ``parallel_state``, or passes no group, which
-                Transformer Engine reads as its default group, when ``parallel_state`` has none.
-                Unused by fp8_model_init, which does not reduce amaxes.
+                the global amax reduction group of ``parallel_state``, and raises ``ValueError``
+                if an initialized ``parallel_state`` has none. When ``parallel_state`` is not
+                initialized, it passes no group, which Transformer Engine reads as its default
+                group. Unused by fp8_model_init, which does not reduce amaxes.
 
         Returns:
             FP8 context.
@@ -907,8 +909,11 @@ if HAVE_TE:
                         deprecated_in="0.21",
                         removed_in="0.23",
                     )
+                    # An initialized grid without the group is an error, as it is for a collection.
                     fp8_group = (
-                        global_groups.tp_cp if config.tp_only_amax_red else global_groups.tp_dp_cp
+                        amax_reduction_group(global_groups, config.tp_only_amax_red)
+                        if parallel_state.model_parallel_is_initialized()
+                        else None
                     )
                 fp8_context = transformer_engine.pytorch.fp8_autocast(
                     enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group

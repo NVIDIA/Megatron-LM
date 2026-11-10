@@ -22,7 +22,11 @@ from megatron.core.inference.text_generation_server import tokenization
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     tokenization as dynamic_tokenization,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+)
 from megatron.core.utils import get_pg_size
 from tests.unit_tests.test_utilities import (
     Utils,
@@ -273,8 +277,10 @@ class TestBuildInferencePgCollection:
             )
 
         sizes = {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS}
-        assert sizes == {"tp": 2, "cp": 1, "pp": 1, "ep": 1, "expt_tp": 2}
+        # Utils.destroy_model_parallel destroys only the groups of parallel_state.
+        destroy_test_pg_collection(pg_collection)
         destroy_test_pg_collection(training_pg_collection)
+        assert sizes == {"tp": 2, "cp": 1, "pp": 1, "ep": 1, "expt_tp": 2}
 
     def test_fallback_uses_global_sizes(self):
         _require_even_world_size()
@@ -290,10 +296,35 @@ class TestBuildInferencePgCollection:
         with pytest.warns(ProcessGroupFallbackWarning) as record, _reads_only_through_resolver():
             pg_collection = build_inference_pg_collection(Utils.world_size)
 
-        assert {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS} == expected
+        sizes = {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS}
+        destroy_test_pg_collection(pg_collection)
+        assert sizes == expected
         _check_fallback_warnings(
             record, ("build_inference_pg_collection", "training_pg_collection")
         )
+
+    def test_fallback_without_global_grid_raises(self):
+        # Without a global grid, the fallback groups would be None, which sizes every axis to 1.
+        Utils.destroy_model_parallel()
+        with pytest.warns(ProcessGroupFallbackWarning):
+            with pytest.raises(ValueError, match="without the tp, cp, pp, ep, expt_tp size"):
+                build_inference_pg_collection(Utils.world_size)
+
+    def test_multi_module_training_collection_raises(self):
+        # Its modules have different groups, so there is no one group to take a size from.
+        training_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"llm": ProcessGroupCollection()}, language_model_module_name="llm"
+        )
+
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            with pytest.raises(
+                TypeError,
+                match="build_inference_pg_collection requires the ProcessGroupCollection of one",
+            ):
+                build_inference_pg_collection(
+                    Utils.world_size, pp_size=1, training_pg_collection=training_pg_collection
+                )
 
 
 @pytest.fixture

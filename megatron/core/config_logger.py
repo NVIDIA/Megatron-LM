@@ -130,13 +130,17 @@ def log_config_to_disk(config, dict_data, prefix='', rank_str='', *, pg_collecti
     # rank_str defaults to '0_0_0_0_0_0' format (tp_gtp_dp_cp_pp_ep ranks)
     if rank_str == '':
         groups = {} if pg_collection is None else vars(pg_collection)
-        if all(name in groups for name in _RANK_STRING_GROUPS):
+        missing = [name for name in _RANK_STRING_GROUPS if name not in groups]
+        if not missing:
             rank_str = _rank_string(groups[name] for name in _RANK_STRING_GROUPS)
         else:
             # A partial collection could give two processes the same file name, so it falls back
-            # to the global ranks too.
+            # to the global ranks too; the warning then names the fields it does not set.
             warn_global_process_group_fallback(
-                'log_config_to_disk', deprecated_in='0.21', removed_in='0.23'
+                'log_config_to_disk',
+                'pg_collection' if pg_collection is None else f"pg_collection.{'/'.join(missing)}",
+                deprecated_in='0.21',
+                removed_in='0.23',
             )
             rank_str = parallel_state.get_all_ranks()
 

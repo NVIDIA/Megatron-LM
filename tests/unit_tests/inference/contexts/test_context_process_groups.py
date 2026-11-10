@@ -39,7 +39,7 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 # Same accessor selection as tools/check_process_group_usage.py.
 _ACCESSOR_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size")
@@ -107,11 +107,24 @@ def _require_world_size_multiple_of(*sizes):
             pytest.skip(f"needs a world size that is a multiple of {size}")
 
 
-def _build_collection(tp_size, ep_size=1):
-    """A collection for an inference grid with its own TP size, built without global reads."""
-    return build_inference_pg_collection(
-        Utils.world_size, tp_size=tp_size, pp_size=1, cp_size=1, ep_size=ep_size, expt_tp_size=1
-    )
+@pytest.fixture
+def build_collection():
+    """Build collections for inference grids with their own TP size, without global reads.
+
+    Their groups are not part of the global grid, so they are destroyed here after the test.
+    """
+    collections = []
+
+    def build(tp_size, ep_size=1):
+        collection = build_inference_pg_collection(
+            Utils.world_size, tp_size=tp_size, pp_size=1, cp_size=1, ep_size=ep_size, expt_tp_size=1
+        )
+        collections.append(collection)
+        return collection
+
+    yield build
+    for collection in collections:
+        destroy_test_pg_collection(collection)
 
 
 @pytest.fixture
@@ -134,11 +147,11 @@ class TestDynamicContextTensorParallelSize:
     @pytest.mark.parametrize("global_tp, context_tp", [(1, 2), (1, 4), (2, 1)])
     @pytest.mark.parametrize("num_speculative_tokens", [0, 2])
     def test_step_padding_uses_collection_tp_size(
-        self, unit_rounders, global_tp, context_tp, num_speculative_tokens
+        self, unit_rounders, build_collection, global_tp, context_tp, num_speculative_tokens
     ):
         _require_world_size_multiple_of(global_tp, context_tp)
         Utils.initialize_model_parallel(tensor_model_parallel_size=global_tp)
-        pg_collection = _build_collection(context_tp)
+        pg_collection = build_collection(context_tp)
         model_config = TransformerConfig(
             params_dtype=torch.float32,
             num_layers=2,
@@ -197,11 +210,13 @@ class TestDynamicContextTensorParallelSize:
         )
 
     @pytest.mark.parametrize("global_tp, context_tp", [(1, 2), (2, 1)])
-    def test_moe_buffers_use_collection_tp_size(self, unit_rounders, global_tp, context_tp):
+    def test_moe_buffers_use_collection_tp_size(
+        self, unit_rounders, build_collection, global_tp, context_tp
+    ):
         ep_size = 2
         _require_world_size_multiple_of(global_tp, context_tp, ep_size)
         Utils.initialize_model_parallel(tensor_model_parallel_size=global_tp)
-        pg_collection = _build_collection(context_tp, ep_size=ep_size)
+        pg_collection = build_collection(context_tp, ep_size=ep_size)
         model_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=2,
@@ -268,11 +283,11 @@ class TestStaticContextProcessGroups:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_static_engine_uses_collection_of_static_context(self):
+    def test_static_engine_uses_collection_of_static_context(self, build_collection):
         context_tp = 2
         _require_world_size_multiple_of(context_tp)
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-        pg_collection = _build_collection(context_tp)
+        pg_collection = build_collection(context_tp)
         model_parallel_cuda_manual_seed(123)
         vocab_size = 100
         model = GPTModel(
