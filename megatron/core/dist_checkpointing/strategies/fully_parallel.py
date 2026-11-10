@@ -216,7 +216,11 @@ class FullyParallelLoadStrategyWrapper:
         self.pg_cache_create = pg_cache_create
 
         self.cached_distribution: Optional[ShardDistribution] = None
-        self.cached_global_metadata: Optional[Metadata] = None
+
+    @property
+    def cached_global_metadata(self) -> Metadata | None:
+        """Metadata the base strategy read at load, for save-time reuse."""
+        return getattr(self.base_strategy, "cached_global_metadata", None)
 
     @property
     def stream_ckpt_dequant(self) -> bool:
@@ -369,8 +373,6 @@ class FullyParallelLoadStrategyWrapper:
 
         merge(loaded_state_dict, sharded_objects)
         merge(loaded_state_dict, sharded_tensors)
-        if hasattr(self.base_strategy, "cached_global_metadata"):
-            self.cached_global_metadata = self.base_strategy.cached_global_metadata
         return loaded_state_dict
 
     @staticmethod

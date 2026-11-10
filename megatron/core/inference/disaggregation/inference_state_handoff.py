@@ -290,6 +290,11 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
+        if self.context.cache_dsa_indexer_keys:
+            raise ValueError(
+                "Disaggregated KV transfer does not support DSA models yet; "
+                "handoffs do not transfer the prompt's indexer keys"
+            )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(

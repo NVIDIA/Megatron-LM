@@ -8,11 +8,9 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.models.backends import (
-    backend_slot,
-    get_backend_from_config,
-    select_cross_entropy,
-)
+from megatron.core.inference.utils import lm_head_can_emit
+from megatron.core.models.backends import backend_slot, get_backend_from_config
+from megatron.core.ops.loss.backends import select_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -20,6 +18,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import (
+    _FALLBACK_REMOVED_IN,
     _FALLBACK_WARNING_SKIP_PREFIXES,
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -38,29 +37,31 @@ def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollect
     for pg_name in ('tp', 'cp', 'pp'):
         if pg_name not in groups:
             raise ValueError(
-                f"LanguageModule pg_collection must explicitly define {pg_name}; "
-                "use None only when that group is not needed."
+                f"{owner} pg_collection must explicitly define {pg_name}: the group this rank "
+                "belongs to, or None when torch.distributed is not initialized."
             )
     if 'embd' not in groups:
         warnings.warn(
             f"{owner} was given a pg_collection without an embd field and treats it as "
             "embd=None. Set embd explicitly, to None when it is unused; a missing embd becomes "
-            "an error in Megatron Core 0.23.",
+            f"an error in Megatron Core {_FALLBACK_REMOVED_IN}.",
             FutureWarning,
             skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
         )
     for pg_name in ('tp', 'cp', 'pp', 'embd'):
         if groups.get(pg_name) == torch.distributed.GroupMember.NON_GROUP_MEMBER:
-            raise ValueError(
-                f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
-                "use None for a nonparticipating embedding group."
+            remedy = (
+                "use None on ranks outside the embedding group"
+                if pg_name == 'embd'
+                else "pass the group this rank belongs to"
             )
+            raise ValueError(f"{owner} {pg_name} cannot be NON_GROUP_MEMBER; {remedy}.")
     if torch.distributed.is_initialized():
         for pg_name in ('tp', 'cp', 'pp'):
             if groups[pg_name] is None:
                 raise ValueError(
-                    f"LanguageModule requires a participating {pg_name} group when "
-                    "distributed is initialized, including for singleton dimensions."
+                    f"{owner} requires a participating {pg_name} group when "
+                    "torch.distributed is initialized, including for singleton dimensions."
                 )
 
 
@@ -74,13 +75,21 @@ class LanguageModule(MegatronModule):
             ``tp``, ``cp``, and ``pp`` must be participating groups, including singleton
             dimensions. Use ``embd=None`` on nonparticipating embedding stages; PyTorch's
             NON_GROUP_MEMBER sentinel is not a usable group. Explicit None fields are
-            permitted for offline model construction.
+            permitted for offline model construction. Omitting the collection, or its
+            ``embd`` field, is deprecated: an omitted collection falls back to the global
+            groups in ``megatron.core.parallel_state`` without these checks, and an omitted
+            ``embd`` is treated as None. Both warn and become errors in Megatron Core 0.23.
+            With tied output weights or MTP across pipeline stages, a stage that holds the
+            word embeddings or a copy of them needs a usable ``embd`` group once distributed
+            is initialized; ``embd=None`` there also warns until 0.23 (T5 raises already).
     """
 
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
+        # Checks that need the subclass's stage layout run later, on a caller's collection only.
+        self._pg_collection_supplied = pg_collection is not None
         if pg_collection is None:
             # The global grid is only a compatibility default: a model built on independent grids
             # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it. The deprecated
@@ -94,7 +103,9 @@ class LanguageModule(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
-        self.embd_group = pg_collection.embd
+        # A collection without an embd field is deprecated and treated as embd=None, whatever
+        # object carries the groups.
+        self.embd_group = getattr(pg_collection, 'embd', None)
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
@@ -245,6 +256,8 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
+        self._warn_if_shared_embedding_is_unsynchronized()
+
         # The shared embedding weights need to be materialized before they are all-reduced.
         self._materialize_shared_embedding_weight()
 
@@ -305,6 +318,35 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
+
+    def _warn_if_shared_embedding_is_unsynchronized(self) -> None:
+        """Warn when a caller's collection leaves a cross-stage embedding copy unsynchronized.
+
+        With tied output weights or MTP and more than one pipeline stage, the first stage owns the
+        word embeddings and a later stage keeps a copy that is initialized and kept in sync over
+        ``embd_group``. With ``embd_group`` None on one of these stages, the copy starts at zero
+        and is never synchronized. T5 already rejects this case in its constructor.
+        """
+        if (
+            not getattr(self, '_pg_collection_supplied', False)
+            or self.embd_group is not None
+            or not torch.distributed.is_initialized()
+        ):
+            return
+        keeps_copy = (self.post_process and self.share_embeddings_and_output_weights) or getattr(
+            self, 'mtp_process', False
+        )
+        if not (self.pre_process or keeps_copy):
+            return
+        warnings.warn(
+            f"{type(self).__name__} shares its word embeddings across pipeline stages (tied "
+            "output weights or MTP), but its pg_collection has embd=None on this stage, so the "
+            "copies are never synchronized. Pass the embedding group of the stages that hold "
+            "them; this becomes an error in Megatron Core "
+            f"{_FALLBACK_REMOVED_IN}.",
+            FutureWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
 
     def _materialize_shared_embedding_weight(self) -> None:
         """Give a shared embedding copy that was built on the meta device storage and values."""
@@ -376,6 +418,11 @@ class LanguageModule(MegatronModule):
             return self.output_layer.weight
         return None
 
+    @property
+    def lm_head_can_emit_fp32(self) -> bool:
+        """Whether the LM head can emit fp32 logits; reads the batch-invariant mode flag live."""
+        return lm_head_can_emit(self.output_layer, torch.float32)
+
     @torch.inference_mode()
     def compute_mtp_single_step(
         self,
@@ -422,8 +469,16 @@ class LanguageModule(MegatronModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
-        logits = self._scale_logits(logits)
+        # Speculative decoding is inference-only, and inference consumes logits in fp32: emit
+        # them so when the head can, upcast otherwise.
+        logits, _ = self.output_layer(
+            mtp_hidden,
+            weight=output_weight,
+            runtime_gather_output=True,
+            output_dtype=torch.float32 if self.lm_head_can_emit_fp32 else None,
+        )
+        # MuP scaling first: a bf16 head scales in bf16, as training does, then the upcast.
+        logits = self._scale_logits(logits).float()
 
         return mtp_hidden, logits
 
