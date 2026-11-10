@@ -311,6 +311,29 @@ def test_an_error_filter_raises_at_every_call():
                 parallel_state.get_virtual_pipeline_model_parallel_rank()
 
 
+def test_a_call_site_reached_under_an_ignore_filter_stays_silent(monkeypatch):
+    """A call site is recorded once its warning has passed the filters, shown or ignored. A site
+    that a test first reaches under the ignore filter of the test suite therefore does not warn
+    under a later "always" filter, until the record of call sites is cleared."""
+
+    def call_accessor():
+        parallel_state.get_virtual_pipeline_model_parallel_rank()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+        call_accessor()
+    with _recorded_warnings() as record:
+        call_accessor()
+    assert _deprecated_calls(record) == []
+
+    monkeypatch.setattr(parallel_state, "_warned_accessor_call_sites", set())
+    with _recorded_warnings() as record:
+        call_accessor()
+    assert [name for name, _, _ in _deprecated_calls(record)] == [
+        "get_virtual_pipeline_model_parallel_rank"
+    ]
+
+
 def test_an_error_filter_raises_in_a_thread_while_another_raises_at_the_same_site(monkeypatch):
     """A call site is recorded only once its warning has been shown, so a call that comes while
     another thread's warning is raising at the same site raises as well."""
