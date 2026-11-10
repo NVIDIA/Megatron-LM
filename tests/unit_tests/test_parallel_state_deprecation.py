@@ -62,7 +62,6 @@ GROUPS = {
     "get_dynamic_data_context_parallel_group_map": "pg_collection.dynamic_cp",
     "get_dynamic_tensor_data_context_parallel_group_map": "pg_collection.dynamic_tp_cp",
     "get_dynamic_data_context_parallel_groups": "pg_collection.dynamic_cp[group_size]",
-    "get_hybrid_data_context_parallel_groups": "pg_collection.dynamic_cp[group_size]",
     "get_dynamic_tensor_data_context_parallel_group": "pg_collection.dynamic_tp_cp[group_size]",
     "get_embedding_group": "pg_collection.embd",
     "get_position_embedding_group": "pg_collection.pos_embd",
@@ -678,7 +677,7 @@ def test_pretrain_builds_its_collection_from_the_registered_grid_without_a_warni
     """The collection that pretrain() runs on is read from the registry at bootstrap: no
     deprecation or fallback warning, also under strict fallbacks."""
     registered = _register_data_parallel_groups(monkeypatch)
-    args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+    args = SimpleNamespace(create_all_gather_group=False)
 
     with _recorded_warnings() as record:
         enable_strict_process_group_fallbacks()

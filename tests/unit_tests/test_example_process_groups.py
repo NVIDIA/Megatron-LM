@@ -63,8 +63,7 @@ def test_model_provider_warns_without_a_collection(monkeypatch, folder, name):
     global_groups = ProcessGroupCollection()
     shim = Mock(return_value=global_groups)
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", shim)
-    # The provider reads the arguments and the run config once it has its groups; BERT reads
-    # the run config first, T5 the arguments.
+    # The provider reads the run config once it has its groups; the arguments are guarded too.
     monkeypatch.setattr(script, "get_args", Mock(side_effect=_Stop))
     monkeypatch.setattr(script, "get_run_config", Mock(side_effect=_Stop))
 
@@ -105,7 +104,9 @@ def test_bert_step_uses_the_groups_of_the_model(monkeypatch):
         for name in ("text", "types", "labels", "is_random", "loss_mask", "padding_mask")
     }
     broadcast_groups, averaged_over = [], []
-    monkeypatch.setattr(script, "get_args", lambda: SimpleNamespace(bert_binary_head=False))
+    # The step reads the binary-head setting from the run config's model section.
+    run_config = SimpleNamespace(model=SimpleNamespace(bert_binary_head=False))
+    monkeypatch.setattr(script, "get_run_config", lambda: run_config)
     monkeypatch.setattr(script, "get_timers", lambda: Mock())
     monkeypatch.setattr(
         script.tensor_parallel, "broadcast_data", _broadcast(batch, broadcast_groups)

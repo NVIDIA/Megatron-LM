@@ -22,6 +22,7 @@ from megatron.core import process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import activation_logging, checkpointing, dgrad_logging
 from megatron.training import training as training_mod
+from megatron.training.config import CheckpointConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_checkpointing import init_model_parallel
 from tests.unit_tests.test_utilities import Utils
@@ -154,23 +155,17 @@ def test_get_rng_state_warns_for_each_omitted_group(rng_state_without_cuda):
     assert state.global_offset == (0, 0, 3)
 
 
-def _metadata_args():
-    return SimpleNamespace(use_distributed_optimizer=False, ckpt_format="torch_dist")
-
-
 def test_sharded_state_dict_metadata_group(run_config):
     """The metadata carries the caller's group, or warns and carries the global one."""
     group = _StandInGroup(0, 2)
     with _no_global_grid():
-        metadata = checkpointing._build_sharded_state_dict_metadata(
-            _metadata_args(), dp_cp_group=group
-        )
+        metadata = checkpointing._build_sharded_state_dict_metadata(dp_cp_group=group)
     assert metadata["dp_cp_group"] is group
 
     global_grid = mock.Mock()
     global_grid.get_data_parallel_group.return_value = group
     with mock.patch.object(checkpointing, "mpu", global_grid), _record_warnings() as record:
-        metadata = checkpointing._build_sharded_state_dict_metadata(_metadata_args())
+        metadata = checkpointing._build_sharded_state_dict_metadata()
 
     assert metadata["dp_cp_group"] is group
     global_grid.get_data_parallel_group.assert_called_once_with(with_context_parallel=True)
@@ -189,18 +184,17 @@ class _ShardedModule:
 
 
 def _generate_state_dict(ckpt_format, **kwargs):
-    args = SimpleNamespace(
-        ckpt_format=ckpt_format,
-        no_save_optim=False,
-        no_save_rng=True,
-        use_distributed_optimizer=False,
-    )
+    # The checkpoint policy is the run config's section and the format of the operation; the
+    # namespace is only persisted with the state.
+    args = SimpleNamespace()
     model = _ShardedModule()
     if ckpt_format == "fsdp_dtensor":
         model.state_dict_for_save_checkpoint = dict
     optimizer = mock.Mock(is_stub_optimizer=False)
     optimizer.sharded_state_dict.return_value = {}
-    checkpointing.generate_state_dict(args, [model], optimizer, None, None, **kwargs)
+    checkpointing.generate_state_dict(
+        args, [model], optimizer, None, None, ckpt_format=ckpt_format, **kwargs
+    )
     return model, optimizer
 
 
@@ -353,7 +347,7 @@ def test_local_non_persistent_load_group(has_sharded_state, pass_group):
     intermediate_state_dict = mock.Mock()
     manager = mock.Mock()
     manager.load.return_value = (intermediate_state_dict, "ckpt")
-    args = SimpleNamespace(
+    checkpoint = CheckpointConfig(
         non_persistent_ckpt_type="local", non_persistent_local_ckpt_algo="fully_parallel"
     )
     global_grid = mock.Mock()
@@ -361,12 +355,13 @@ def test_local_non_persistent_load_group(has_sharded_state, pass_group):
     with mock.patch.object(checkpointing, "mpu", global_grid), _record_warnings() as record:
         checkpointing._load_non_persistent_base_checkpoint(
             None,
-            args,
+            SimpleNamespace(),
             False,
             {"model": {}} if has_sharded_state else None,
             3,
             {"local_checkpoint_manager": manager},
             dp_cp_group=group if pass_group else None,
+            checkpoint=checkpoint,
         )
 
     falls_back = has_sharded_state and not pass_group
@@ -393,9 +388,9 @@ def test_local_non_persistent_load_group(has_sharded_state, pass_group):
 def test_fully_parallel_load_group(monkeypatch, process_group, argument, global_read, pass_group):
     """The fully parallel load runs on the caller's group, or warns and reads the global one."""
     group = _StandInGroup(0, 2)
-    args = SimpleNamespace(
+    checkpoint = CheckpointConfig(
         ckpt_assume_constant_structure=False,
-        ckpt_fully_parallel_load=True,
+        fully_parallel_load=True,
         ckpt_fully_parallel_load_process_group=process_group,
         ckpt_fully_parallel_load_exchange_algo="broadcast",
         ckpt_load_validate_sharding_integrity=False,
@@ -413,12 +408,13 @@ def test_fully_parallel_load_group(monkeypatch, process_group, argument, global_
     with mock.patch.object(checkpointing, "mpu", global_grid), _record_warnings() as record:
         checkpointing._load_global_dist_base_checkpoint(
             "ckpt",
-            args,
+            SimpleNamespace(),
             False,
             {},
             3,
             False,
             gtp_pad_for_alignment=1,
+            checkpoint=checkpoint,
             **({argument: group} if pass_group else {}),
         )
 
@@ -483,13 +479,11 @@ def test_train_step_debug_dumps_use_the_model_collection(monkeypatch, run_config
     monkeypatch.setattr(training_mod, "save_dgrads", record_dump("dgrads"))
     monkeypatch.setattr(training_mod, "save_grads", record_dump("wgrads"))
 
-    _run_train_step(
-        args_overrides=dict(
-            save="save", save_activations_interval=1, save_dgrads_interval=1, save_wgrads_interval=1
-        ),
-        model=model,
-        pg_collection=schedule_pg_collection,
-    )
+    run_config.checkpoint.save = "save"
+    run_config.checkpoint.save_activations_interval = 1
+    run_config.checkpoint.save_dgrads_interval = 1
+    run_config.checkpoint.save_wgrads_interval = 1
+    _run_train_step(model=model, pg_collection=schedule_pg_collection)
 
     assert dumps == {
         "activations": model_pg_collection,

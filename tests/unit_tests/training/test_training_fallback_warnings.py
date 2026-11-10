@@ -206,7 +206,7 @@ def test_get_model_without_a_collection_warns_and_builds_one(monkeypatch, run_co
     model_provider = mock.Mock(side_effect=_GlobalRead)
 
     _assert_warns_then_reads_global("get_model", lambda: training.get_model(model_provider))
-    build.assert_called_once_with(args, owner="get_model")
+    build.assert_called_once_with(args, config=run_config.model.transformer, owner="get_model")
     assert model_provider.call_args.kwargs["pg_collection"] is built
 
 
@@ -309,11 +309,6 @@ def test_data_loaders_without_a_collection_warn(monkeypatch, run_config):
             lambda: common_utils.calc_params_l2_norm([torch.nn.Linear(1, 1)]),
         ),
         (
-            "set_jit_fusion_options",
-            "get_tensor_model_parallel_world_size",
-            lambda: initialize._warmup_jit_function(),
-        ),
-        (
             "_set_random_seed",
             "get_pipeline_model_parallel_rank",
             lambda: initialize._set_random_seed(1234),
@@ -336,7 +331,6 @@ def test_data_loaders_without_a_collection_warn(monkeypatch, run_config):
         "logical_and",
         "average_losses",
         "params_norm",
-        "jit_warmup",
         "random_seed",
         "packed_sequence_stats",
         "distillation_listing",
@@ -350,30 +344,8 @@ def test_utilities_warn_before_reading_the_global_grid(
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args: 2)
-    args = SimpleNamespace(
-        use_megatron_fsdp=False,
-        bf16=False,
-        fp16=False,
-        use_te_activation_func=False,
-        swiglu=False,
-        bias_gelu_fusion=False,
-        bias_swiglu_fusion=False,
-        sequence_parallel=True,
-        ffn_hidden_size=4,
-        tensor_model_parallel_size=1,
-        seq_length=4,
-        context_parallel_size=1,
-        hidden_size=4,
-    )
-    run_config.train.micro_batch_size = 1
+    args = SimpleNamespace(use_megatron_fsdp=False)
     monkeypatch.setattr(common_utils, "get_args", lambda: args)
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
-    # The JIT warmup draws its tensors on the GPU; only their shapes matter here.
-    monkeypatch.setattr(
-        initialize.torch,
-        "rand",
-        lambda *size, **kwargs: torch.zeros(size[0] if len(size) == 1 else size),
-    )
 
     _assert_warns_then_reads_global(owner, call)
 
@@ -411,22 +383,25 @@ def test_report_memory_without_a_group_warns(monkeypatch, run_config):
     _assert_warns_then_reads_global("report_memory", lambda: common_utils.report_memory("x"))
 
 
-def test_jit_warmup_takes_the_tensor_parallel_size_it_is_given(monkeypatch, run_config):
-    args = SimpleNamespace(
+@pytest.mark.parametrize("tp_size, sequence_length", [(2, 4), (None, 8)], ids=["given", "omitted"])
+def test_jit_warmup_takes_the_tensor_parallel_size_it_is_given(
+    monkeypatch, tp_size, sequence_length
+):
+    # A stand-in for the model's transformer config with the settings the warmup reads; a real
+    # one rejects sequence parallelism with a tensor-parallel size of 1.
+    config = SimpleNamespace(
         bf16=False,
         fp16=False,
         use_te_activation_func=False,
-        swiglu=False,
-        bias_gelu_fusion=False,
+        gated_linear_unit=False,
+        activation_func=torch.nn.functional.gelu,
+        bias_activation_fusion=False,
         sequence_parallel=True,
-        ffn_hidden_size=4,
+        ffn_hidden_size=6,
         tensor_model_parallel_size=1,
-        seq_length=8,
         context_parallel_size=1,
         hidden_size=4,
     )
-    run_config.train.micro_batch_size = 1
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", _raise_global_read)
     shapes = []
 
@@ -440,10 +415,14 @@ def test_jit_warmup_takes_the_tensor_parallel_size_it_is_given(monkeypatch, run_
     monkeypatch.setattr(initialize.torch.cuda, "empty_cache", mock.Mock())
 
     with _record_fallbacks() as record:
-        initialize._warmup_jit_function(tp_size=2)
+        initialize._warmup_jit_function(
+            config, sequence_length=8, micro_batch_size=1, tp_size=tp_size
+        )
 
-    # The sequence-parallel input of the fused bias+dropout+add is split over 2 ranks.
-    assert (4, 1, 4) in shapes
+    # The sequence-parallel input of the fused bias+dropout+add (hidden size 4) is split over
+    # the given tensor-parallel size. Without one, it is split over the config's size, which is
+    # 1 here; the global parallel state is not read, so nothing warns.
+    assert (sequence_length, 1, 4) in shapes
     assert _owners(record) == []
 
 
