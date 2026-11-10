@@ -39,13 +39,16 @@ from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    get_parameter_parallel_domain,
 )
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
+    get_extra_parameter_replica_groups,
     get_pg_rank,
     get_pg_size,
     to_local_if_dtensor,
@@ -135,6 +138,9 @@ def calc_params_l2_norm(
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
+    # Extra parameter domains (e.g. sharded Engram tables), sharded or not → reduce over dp_cp.
+    domain_params_data = []
+    extra_replica_groups = get_extra_parameter_replica_groups(model, pg_collection)
 
     if pg_collection is None:
         gtp_rank = mpu.get_gtp_weight_remat_rank()
@@ -172,7 +178,25 @@ def calc_params_l2_norm(
                 param, tp_group=tp_group, expert_tp_group=expert_tp_group
             ):
                 continue
-            is_expert = not getattr(param, 'allreduce', True)
+            domain = get_parameter_parallel_domain(param)
+            if domain not in IMPLICIT_PARAMETER_DOMAINS:
+                if domain not in extra_replica_groups:
+                    raise ValueError(
+                        f"No replica process group is registered for parameter domain {domain!r}"
+                    )
+                # Replicas of an extra-domain param hold the same row shard: count it on
+                # replica rank 0, or count every distributed-optimizer fragment of it.
+                if param_is_not_shared(param):
+                    param = to_local_if_dtensor(param)
+                    data, is_sharded = _get_param_data(
+                        param, force_create_fp32_copy, cfg.model.transformer.bf16
+                    )
+                    if data is not None and (
+                        is_sharded or get_pg_rank(extra_replica_groups[domain]) == 0
+                    ):
+                        domain_params_data.append(data)
+                continue
+            is_expert = domain == 'expert'
 
             # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
             if is_expert:
@@ -239,6 +263,15 @@ def calc_params_l2_norm(
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
     norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
+
+    # --- Extra parameter domains ---
+    # The row shards and replicas of a domain partition dp_cp, and each element was counted
+    # once within its replica group above, so dp_cp covers every row exactly once. The
+    # model-parallel reduce below then adds the pipeline stages, as for dense params.
+    if extra_replica_groups:
+        domain_norm_2 = _compute_norm_2(domain_params_data)
+        _sum_reduce(domain_norm_2, dp_cp_group)
+        norm_2 += domain_norm_2
 
     # --- Combine MoE + MoE-GTP_remat norms ---
     # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need

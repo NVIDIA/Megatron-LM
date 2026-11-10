@@ -1,12 +1,13 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
 import os
 import warnings
 from dataclasses import dataclass, field, fields
+from datetime import timedelta
 from functools import partial
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -71,6 +72,182 @@ def warn_global_process_group_fallback(owner: str, argument: str = "pg_collectio
     )
 
 
+# Domains every model has: dense parameters are replicated over dp_cp and expert parameters over
+# expt_dp. Any other domain is an extra one, whose replica group the model registers in
+# ProcessGroupCollection.parameter_replica_groups.
+IMPLICIT_PARAMETER_DOMAINS = ('dense', 'expert')
+
+
+def get_parameter_parallel_domain(parameter: Union[torch.Tensor, Dict[str, Any]]) -> str:
+    """Return the replica domain of a parameter or of an optimizer param group.
+
+    A domain names the group over which copies of a parameter are kept in sync: ``'dense'``
+    (dp_cp), ``'expert'`` (expt_dp), or an extra domain whose group is registered in
+    ``ProcessGroupCollection.parameter_replica_groups``. Parameters and optimizer metadata
+    store only the name; the process groups stay in the collection.
+
+    A parameter's ``parallel_domain`` attribute wins; otherwise ``allreduce=False`` marks an
+    expert parameter. A param group carries ``parallel_domain`` only for an extra domain and is
+    otherwise dense or expert according to its ``is_expert_parallel`` flag.
+
+    Args:
+        parameter: A parameter, or a param-group dict built by the optimizer factory.
+
+    Returns:
+        str: The domain name.
+    """
+    if isinstance(parameter, dict):
+        return parameter.get('parallel_domain') or (
+            'expert' if parameter.get('is_expert_parallel', False) else 'dense'
+        )
+    return getattr(parameter, 'parallel_domain', None) or (
+        'dense' if getattr(parameter, 'allreduce', True) else 'expert'
+    )
+
+
+def replica_group_shard(
+    parent_ranks: Sequence[int], replica_ranks: Sequence[int]
+) -> Tuple[int, int]:
+    """Return ``(o, n)`` for a replica group that is the strided slice ``parent[o::n]``.
+
+    ``create_row_parallel_groups`` builds replica groups this way: one per row shard ``o`` of the
+    ``n`` shards of the parent (a pipeline stage's dp_cp group). Data-parallel reduction and the
+    naming of a domain's optimizer both rely on it.
+
+    Raises:
+        ValueError: If the replica group is not such a slice of the parent.
+    """
+    parent_ranks, replica_ranks = list(parent_ranks), list(replica_ranks)
+    num_shards = len(parent_ranks) // len(replica_ranks) if replica_ranks else 0
+    shard = (
+        parent_ranks.index(replica_ranks[0])
+        if replica_ranks and replica_ranks[0] in parent_ranks
+        else -1
+    )
+    if not 0 <= shard < num_shards or parent_ranks[shard::num_shards] != replica_ranks:
+        raise ValueError(
+            f"Replica group {replica_ranks} is not a strided slice parent[o::n] of {parent_ranks}, "
+            "as create_row_parallel_groups builds it."
+        )
+    return shard, num_shards
+
+
+def create_row_parallel_groups(
+    parent_group: torch.distributed.ProcessGroup,
+    shard_size: int,
+    *,
+    world_group: Optional[torch.distributed.ProcessGroup],
+    name: str,
+    timeout: Optional[timedelta] = None,
+) -> Tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, List[List[int]]]:
+    """Split parent groups into row-shard groups and the replica groups across them.
+
+    Each parent group (for example the dp_cp group of one pipeline stage) is read as a
+    [replica, row shard] mesh in its own rank order: with ``k = shard_size``, shard ``s`` holds
+    ``parent[s * k : (s + 1) * k]`` and replica ``o`` holds ``parent[o::k]``. A table whose
+    rows are sharded over a shard group is replicated over its replica group.
+
+    This is a collective over ``world_group``, which must span every rank: all ranks call it
+    once, at the same point. The ranks exchange their configuration before validating it, so a
+    bad one raises on every rank instead of leaving the others waiting. Every rank then creates
+    every group in the same order, as ``torch.distributed.new_group`` requires. The groups go
+    through ``parallel_state.create_group``, which registers them for timeout updates;
+    ``destroy_model_parallel`` does not release them, so callers drop their own references.
+
+    Communicators are created at a group's first collective, so an unused group costs nothing.
+    In case a launcher creates them eagerly, single-rank NCCL groups are limited to one CTA.
+
+    Args:
+        parent_group (ProcessGroup): This rank's parent group. The parents of all ranks must
+            partition the world.
+        shard_size (int): Ranks per row shard; must divide the size of every parent. When it
+            equals a parent's size, that parent group itself is the shard group; when it is 1,
+            the parent group itself is the replica group. Neither then gets a second
+            communicator over the same ranks.
+        world_group (ProcessGroup): Group spanning all ranks, used to exchange the parents
+            (None for the default group).
+        name (str): Prefix of the group descriptions ``{name}_SHARD`` and ``{name}_REPLICA``.
+        timeout (timedelta, optional): Timeout of the new groups; the backend default if None.
+
+    Returns:
+        Tuple of this rank's shard group, this rank's replica group, and the global ranks of
+        every shard group of every parent, in creation order.
+    """
+    world_size = torch.distributed.get_world_size()
+    if torch.distributed.get_world_size(world_group) != world_size:
+        raise ValueError(f"{name}: row-parallel groups must be created by all {world_size} ranks")
+    parent_ranks = tuple(torch.distributed.get_process_group_ranks(parent_group))
+    backend = torch.distributed.get_backend(parent_group)
+    descriptions = [None] * world_size
+    torch.distributed.all_gather_object(
+        descriptions, (parent_ranks, shard_size, backend, name), group=world_group
+    )
+
+    # Validate only after the exchange: a bad local configuration then raises on every rank
+    # instead of leaving its peers waiting in the group creation below.
+    if any(description[1:] != descriptions[0][1:] for description in descriptions):
+        raise ValueError(
+            f"{name}: shard size, backend and name must agree on all ranks, got "
+            f"{sorted({str(description[1:]) for description in descriptions})}"
+        )
+    parents = sorted({description[0] for description in descriptions})
+    if (
+        type(shard_size) is not int
+        or shard_size <= 0
+        or any(len(parent) % shard_size for parent in parents)
+    ):
+        raise ValueError(
+            f"{name}: shard size {shard_size!r} must be a positive divisor of every parent "
+            f"group size, got sizes {sorted({len(parent) for parent in parents})}"
+        )
+    if sorted(rank for parent in parents for rank in parent) != list(range(world_size)):
+        raise ValueError(f"{name}: parent groups must partition all {world_size} ranks")
+
+    single_rank_pg_options = None
+    if backend == torch.distributed.Backend.NCCL:
+        single_rank_pg_options = torch.distributed.ProcessGroupNCCL.Options()
+        single_rank_pg_options.config.max_ctas = 1
+        single_rank_pg_options.config.min_ctas = 1
+
+    rank = torch.distributed.get_rank()
+    shard_group = replica_group = None
+    shard_ranks = []
+    for parent in parents:
+        for start in range(0, len(parent), shard_size):
+            ranks = list(parent[start : start + shard_size])
+            shard_ranks.append(ranks)
+            if shard_size == len(parent):
+                # The only shard spans the parent: reuse its group (and communicator).
+                group = parent_group
+            else:
+                group = parallel_state.create_group(
+                    ranks,
+                    timeout=timeout,
+                    backend=backend,
+                    pg_options=single_rank_pg_options if len(ranks) == 1 else None,
+                    group_desc=f"{name}_SHARD",
+                )
+            if rank in ranks:
+                shard_group = group
+        for offset in range(shard_size):
+            ranks = list(parent[offset::shard_size])
+            if shard_size == 1:
+                # The only replica spans the parent: reuse its group (and communicator).
+                group = parent_group
+            else:
+                group = parallel_state.create_group(
+                    ranks,
+                    timeout=timeout,
+                    backend=backend,
+                    pg_options=single_rank_pg_options if len(ranks) == 1 else None,
+                    group_desc=f"{name}_REPLICA",
+                )
+            if rank in ranks:
+                replica_group = group
+    assert shard_group is not None and replica_group is not None
+    return shard_group, replica_group, shard_ranks
+
+
 class ProcessGroupHelperMeta(type):
     """Metaclass to protect virtual_pipeline_model_parallel_size from direct assignment."""
 
@@ -122,6 +299,12 @@ class ProcessGroupCollection:
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
+
+        # Parameter Replica Domains
+        engram: Row-shard group of the sharded Engram tables, a slice of dp_cp
+        engram_dp: Replica group of those row shards
+        parameter_replica_groups: Replica group of each extra parameter domain, keyed by
+            domain name (see get_parameter_parallel_domain); 'dense' and 'expert' are implicit
 
     Example:
         # Create instance and set needed process groups
@@ -255,6 +438,15 @@ class ProcessGroupCollection:
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
+    # Row-shard and replica groups of the sharded Engram tables, created by the model builder
+    # (create_row_parallel_groups over dp_cp), never by MPU.
+    engram: torch.distributed.ProcessGroup = field(init=False)
+    engram_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # Replica group of each extra parameter domain, keyed by domain name. 'dense' and 'expert'
+    # are implicit (dp_cp and expt_dp); see get_parameter_replica_group.
+    parameter_replica_groups: Dict[str, torch.distributed.ProcessGroup] = field(init=False)
+
     def __init__(self, **kwargs):
         for key in kwargs:
             if key in [field.name for field in fields(self)]:
@@ -268,6 +460,34 @@ class ProcessGroupCollection:
         if name in {f.name for f in fields(self.__class__)}:
             return None
         raise AttributeError(f"'ProcessGroupCollection' object has no attribute '{name}'")
+
+    def get_parameter_replica_group(
+        self, domain: str, partial: bool = False
+    ) -> torch.distributed.ProcessGroup:
+        """Return the group that keeps the copies of a parameter domain in sync.
+
+        Args:
+            domain (str): Domain name, as returned by get_parameter_parallel_domain.
+            partial (bool): For 'dense' and 'expert', return the group within one distributed
+                optimizer instance (intra_dp_cp, intra_expt_dp) when it is set. Extra domains
+                support a single instance only, so they ignore it.
+
+        Returns:
+            ProcessGroup: The replica group of the domain.
+        """
+        if domain == 'dense':
+            return self.intra_dp_cp if partial and self.intra_dp_cp is not None else self.dp_cp
+        if domain == 'expert':
+            return (
+                self.intra_expt_dp if partial and self.intra_expt_dp is not None else self.expt_dp
+            )
+        replica_groups = self.parameter_replica_groups or {}
+        if domain not in replica_groups:
+            raise ValueError(
+                f"No replica process group is registered for parameter domain {domain!r}; "
+                f"registered extra domains: {sorted(replica_groups)}"
+            )
+        return replica_groups[domain]
 
     def __repr__(self):
         """Return a concise representation showing which process groups exist and their sizes."""
@@ -428,6 +648,10 @@ class ProcessGroupCollection:
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
             ),
+            # Created by model builders when a model registers an extra parameter domain.
+            'engram': lambda: None,
+            'engram_dp': lambda: None,
+            'parameter_replica_groups': dict,
         }
 
         assert all(
@@ -761,6 +985,8 @@ class ProcessGroupCollection:
                     if ddp_config.use_distributed_optimizer
                     else None
                 ),
+                # Extra parameter domains are registered on a pg_collection by model builders.
+                'parameter_replica_groups': {},
             }
         else:
             # Use provided process group collection with validation and fallbacks
@@ -834,6 +1060,11 @@ class ProcessGroupCollection:
             # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
             result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
             result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
+
+            # Replica groups of the extra parameter domains, if the model registered any.
+            result['parameter_replica_groups'] = dict(
+                getattr(pg_collection, 'parameter_replica_groups', None) or {}
+            )
 
             return result
 

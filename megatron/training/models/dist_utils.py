@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from contextlib import nullcontext
@@ -31,7 +31,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config, get_pg_rank
+from megatron.core.utils import get_extra_parameter_replica_groups, get_model_config, get_pg_rank
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -293,7 +293,8 @@ def _ddp_wrap(
             for overlapping parameter gathering with optimizer step
         use_megatron_fsdp: Whether to use Megatron FSDP.
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
-        pg_collection: Model communication process groups.
+        pg_collection: Model communication process groups. Extra parameter domains
+            registered in its ``parameter_replica_groups`` require the standard DDP.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             controls whether to compute and supply a shard-aligned param layout to DDP.
@@ -312,6 +313,19 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
+    extra_replica_groups = get_extra_parameter_replica_groups(pg_collection=pg_collection)
+    if extra_replica_groups and DP is not DistributedDataParallel:
+        raise ValueError(
+            f"Parameter replica domains {sorted(extra_replica_groups)} require the standard "
+            "DistributedDataParallel; Megatron FSDP and Torch FSDP2 do not support them."
+        )
+    # Buffers of an extra domain are sharded over the domain's whole replica group. The
+    # argument is passed only when such domains exist.
+    layout_kwargs = {}
+    if extra_replica_groups:
+        layout_kwargs["parallel_group_sizes"] = {
+            name: group.size() for name, group in extra_replica_groups.items()
+        }
 
     if not use_torch_fsdp2:
         num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
@@ -428,6 +442,7 @@ def _ddp_wrap(
                             if intra_expt_dp_group is not None
                             else pg_collection.expt_dp
                         ).size(),
+                        **layout_kwargs,
                     )
 
                 wrapped_chunk = DP(

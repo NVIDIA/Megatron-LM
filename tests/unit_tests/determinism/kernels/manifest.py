@@ -663,11 +663,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/test_parameter_domains.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "test_parameter_domains trains a table of an extra parameter domain through its own "
+        "distributed optimizer bit for bit against the same table held as a dense parameter, and "
+        "checks the params norm over domains against the dense reference.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -686,13 +690,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
+            "tests/unit_tests/distributed/test_parameter_domains.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. "
+        "test_parameter_domains reduces the buffers of an extra parameter domain over its "
+        "replica group exactly, by all-reduce and reduce-scatter, overlapped or not, including "
+        "single-rank replica groups, whose collectives are skipped.",
     ),
     KernelEntry(
         name="nccl_allocator",
