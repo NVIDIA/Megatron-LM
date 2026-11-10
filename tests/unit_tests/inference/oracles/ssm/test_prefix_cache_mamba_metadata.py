@@ -768,7 +768,8 @@ def test_prefix_cache_metadata_matches_reference(model_parallel, monkeypatch, na
 
     required = COVERAGE.get(name.split("-")[0] if name != "chunked-unaligned" else "chunked", [])
     if name == "chunked-unaligned":
-        required = ["continuation chunks", "end of chunk commits checked", "restores checked"]
+        # Chunks end at multiples of 320, so no chunk end is a block boundary here.
+        required = ["continuation chunks", "staged boundaries", "restores checked"]
     if scenario.graphs:
         required = [c for c in required if "extractions" not in c]
     missing = [c for c in required if oracle.counts[c] == 0]
