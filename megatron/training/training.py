@@ -4131,6 +4131,9 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+    # The MoE metrics tracker gets the caller's argument: without a collection it keeps its own
+    # fallback, which averages over the global data-parallel group without CP.
+    moe_metrics_pg_collection = pg_collection
     # The memory report prints on rank 0 of this data-parallel group; None selects
     # pg_collection.dp.
     memory_report_group = None
@@ -4366,7 +4369,7 @@ def training_log(
             num_moe_layers=num_moe_layers,
             moe_layer_freq=cfg.model.transformer.moe_layer_freq,
             num_hash_layers=num_hash_layers,
-            pg_collection=pg_collection,
+            pg_collection=moe_metrics_pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
