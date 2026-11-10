@@ -367,15 +367,17 @@ def _scope_bindings(node):
 def _moved_bindings(tree, source):
     """Return the binding events that ``global`` and ``nonlocal`` declarations move.
 
-    Returns ``{id(scope node): {name: [(position, target), ...]}}``. A function or class body
-    that declares a name ``global`` binds it in the module, and one that declares it ``nonlocal``
-    binds it in the nearest enclosing function that binds it. The events keep their positions and
-    are resolved in the scope they move to.
+    Returns ``(moved, written)``. ``moved`` is ``{id(scope node): {name: [(position, target),
+    ...]}}``: a function or class body that declares a name ``global`` binds it in the module, and
+    one that declares it ``nonlocal`` binds it in the nearest enclosing function that binds it.
+    The events keep their positions. An expression assigned to such a name is still resolved in
+    the body that assigns it, where its names are bound: ``written`` is ``{id(expression):
+    chain}``, the module, function and class nodes that enclose the assignment, innermost last.
     """
-    moved = {}
+    moved, written = {}, {}
     # Only a source with one of the words can declare a name; skip the walk of the others.
     if not re.search(r"\b(?:global|nonlocal)\b", source):
-        return moved
+        return moved, written
     collected = {}
 
     def bindings(scope):
@@ -407,6 +409,9 @@ def _moved_bindings(tree, source):
                         moved.setdefault(id(target), {}).setdefault(name, []).extend(
                             events.get(name, [])
                         )
+                        for _, value in events.get(name, []):
+                            if not isinstance(value, str):
+                                written[id(value)] = chain
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 visit(statement.body, chain + [statement])
             else:
@@ -415,7 +420,7 @@ def _moved_bindings(tree, source):
                     visit(getattr(statement, field, ()), chain)
 
     visit(tree.body, [tree])
-    return moved
+    return moved, written
 
 
 class _Scope:
@@ -451,7 +456,7 @@ def _violations_in(path: pathlib.Path):
     """Return (lineno, scope:kind:detail) pairs for global process-group reads in one file."""
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
-    moved = _moved_bindings(tree, source)
+    moved, written = _moved_bindings(tree, source)
 
     class Visitor(ast.NodeVisitor):
         """Attach a stable enclosing scope to each reference to the global grid."""
@@ -460,6 +465,8 @@ def _violations_in(path: pathlib.Path):
             self.scope = []
             self.hits = []
             self.scopes = [_Scope("module", tree, None, moved)]
+            # The scope of each function and class body, by the id of its node (_scope).
+            self.bodies = {}
             # What each binding event refers to, once resolved (_target).
             self.targets = {}
             # Whether a fallback warning dominates the statement being visited.
@@ -484,10 +491,18 @@ def _violations_in(path: pathlib.Path):
                 self.visit(expression)
             self._visit_scope(node, "class")
 
+        def _scope(self, node, enclosing):
+            """Return the scope of the function or class ``node``, defined in the body whose
+            scope is ``enclosing``. It is made once: _target also resolves in it what the body
+            assigns to a name declared ``global`` or ``nonlocal``, before or after the visit."""
+            if id(node) not in self.bodies:
+                kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                parent = enclosing.parent if enclosing.kind == "class" else enclosing
+                self.bodies[id(node)] = _Scope(kind, node, parent, moved)
+            return self.bodies[id(node)]
+
         def _visit_scope(self, node, kind):
-            current = self.scopes[-1]
-            parent = current.parent if current.kind == "class" else current
-            self.scopes.append(_Scope(kind, node, parent, moved))
+            self.scopes.append(self._scope(node, self.scopes[-1]))
             self.scope.append(node.name)
             # A function body runs when it is called, not where it is defined; a class body runs
             # in place.
@@ -549,6 +564,9 @@ def _violations_in(path: pathlib.Path):
             function is not followed: it is a reference, which counts where the assignment is.
             Each event is resolved once: the events of ``x = x.y`` repeated in one scope would
             otherwise resolve each earlier one again, in time exponential in their number.
+            An event that a ``global`` or ``nonlocal`` declaration moved to ``scope`` is resolved
+            in the body that assigns it: a module imported there is an alias, and a parameter
+            of that body is not, whatever its name refers to in ``scope``.
             """
             if isinstance(target, str):
                 return target
@@ -556,7 +574,10 @@ def _violations_in(path: pathlib.Path):
             if key not in self.targets:
                 # An event that its own resolution reaches again refers to nothing.
                 self.targets[key] = ""
-                path = self._path(target, scope)
+                body = self.scopes[0] if id(target) in written else scope
+                for node in written.get(id(target), ())[1:]:
+                    body = self._scope(node, body)
+                path = self._path(target, body)
                 self.targets[key] = path if path in ALIAS_TARGETS else ""
             return self.targets[key]
 

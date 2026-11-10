@@ -646,6 +646,25 @@ class TestDetection(unittest.TestCase):
                 f"def use():\n    return {call}\n",
                 [],
             ),
+            # The assigned value is resolved where it is written, not where the name is bound.
+            "a global alias of a module imported in the function": (
+                "grid = None\ndef init():\n    global grid\n"
+                "    from megatron.core import parallel_state\n    grid = parallel_state\n"
+                f"def use():\n    return {call}\n",
+                ["use"],
+            ),
+            "a nonlocal alias of a module imported in the function": (
+                "def outer():\n    grid = None\n"
+                "    def init():\n        nonlocal grid\n"
+                "        from megatron.core import parallel_state\n        grid = parallel_state\n"
+                f"    def use():\n        return {call}\n",
+                ["outer.use"],
+            ),
+            "a global name assigned a parameter named like the imported module": (
+                IMPORT + "grid = None\ndef init(parallel_state):\n    global grid\n"
+                f"    grid = parallel_state\ndef use():\n    return {call}\n",
+                [],
+            ),
         }
         for case, (source, scopes) in cases.items():
             with self.subTest(case=case):
