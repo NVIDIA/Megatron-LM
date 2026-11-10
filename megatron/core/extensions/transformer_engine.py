@@ -1700,7 +1700,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
