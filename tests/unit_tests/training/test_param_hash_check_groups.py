@@ -75,6 +75,8 @@ def test_post_training_step_callbacks_check_the_model_dp_groups():
         train=SimpleNamespace(**train),
         logger=SimpleNamespace(log_interval=1),
         profiling=SimpleNamespace(use_nsys_profiler=False, use_pytorch_profiler=False),
+        # The straggler detector is a section of the run config; None leaves it off.
+        straggler=None,
     )
     check = mock.Mock(return_value=True)
 
