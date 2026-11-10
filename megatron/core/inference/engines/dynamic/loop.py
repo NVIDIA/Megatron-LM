@@ -81,6 +81,9 @@ def _get_decode_only_log_state(
             step when it differs, and whether to use decode coloring.
     """
     if mode == AsyncScheduleMode.LEGACY:
+        if decode_only.consumed is None and decode_only.launched is None:
+            # A legacy step with nothing active runs no forward.
+            return "idle", None
         is_decode_only = bool(decode_only)
         return ("decode" if is_decode_only else "non-decode"), is_decode_only
 
