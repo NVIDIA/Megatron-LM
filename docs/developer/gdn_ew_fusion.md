@@ -8,8 +8,10 @@ GDN-family layers have two independent, opt-in `TransformerConfig` options:
 | `gdn_gated_output_norm_fusion` | Output RMSNorm and SiLU (GDN) or sigmoid (KDA) gating after the gated delta rule | `False` |
 
 Both options support the `gdn` attention variant, including the deprecated
-`gated_delta_net` alias. They can be enabled independently or together. The post-GDR
-option also supports `kda`; KDA does not support pre-GDR fusion. The
+`gated_delta_net` alias, and the `kda` variant. They can be enabled independently or
+together. KDA's pre-GDR fusion runs the same streamed kernels through its own wrapper
+(`megatron/core/fusions/fused_pre_kda.py`); it is rejected under `deterministic_mode`
+and with `kda_two_stage_gates`, which normalize Q/K inside the recurrence kernel. The
 linear-attention recurrence and output projection retain their existing
 implementations. The post-GDR implementation is adapted from Layali Rashid's
 [output-gating fusion in PR #7368](https://github.com/NVIDIA/Megatron-LM/pull/7368).
@@ -27,8 +29,8 @@ config = TransformerConfig(
 )
 ```
 
-For KDA, set `experimental_attention_variant="kda"` and
-`gdn_gated_output_norm_fusion=True`, leaving `gdn_pre_gated_delta_rule_fusion=False`.
+For KDA, set `experimental_attention_variant="kda"`; both fusion options apply, and
+`gdn_pre_gated_delta_rule_fusion=True` requires `kda_two_stage_gates=False`.
 KDA uses sigmoid gating regardless of the convolution activation. Its fused
 forward computes `RMSNorm(x) * sigmoid(gate)`; backward uses
 `sigmoid(gate) * (1 - sigmoid(gate))` for the gate derivative. Both variants share
