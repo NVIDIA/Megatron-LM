@@ -244,12 +244,8 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
 
 ## Liger vocab-parallel cross entropy
 
-Install `pip install liger-kernel==0.8.5` or a newer compatible release, then set
-`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`. The corresponding
-`TransformerConfig` fields select Liger independently of the model's provider.
-Losses are unreduced FP32 values; `-100` labels are ignored, as in TE. Logits are
-preserved, so MTP uses its existing argmax fallback. Disabling fusion keeps native unfused CE;
-the existing deterministic-training restriction on fused CE remains unchanged.
+Install `pip install liger-kernel==0.8.5` (or a newer compatible release) and select
+`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`.
 
 ## Adding a cross-entropy or normalization backend
 

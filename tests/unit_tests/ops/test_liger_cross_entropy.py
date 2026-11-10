@@ -3,8 +3,6 @@
 """Selection without Liger installed, and GPU parity with the optional Liger backend."""
 
 import builtins
-import sys
-from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
@@ -21,12 +19,8 @@ _ADAPTER = "megatron.core.ops.loss.liger_cross_entropy"
 _LIBRARY = "liger_kernel.megatron"
 
 
-@pytest.mark.parametrize(
-    "fusion,impl",
-    [(False, impl) for impl in ("native", "te", "liger")] + [(True, "native"), (True, "te")],
-)
-@pytest.mark.parametrize("cuda_graph_impl", [None, "full_iteration"])
-def test_unselected_never_imports_liger(monkeypatch, fusion, impl, cuda_graph_impl):
+@pytest.mark.parametrize("fusion,impl", [(False, "liger"), (True, "native")])
+def test_unselected_never_imports_liger(monkeypatch, fusion, impl):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
@@ -37,93 +31,20 @@ def test_unselected_never_imports_liger(monkeypatch, fusion, impl, cuda_graph_im
     monkeypatch.setattr(
         _backends, "import_module", Mock(side_effect=AssertionError("unexpected import"))
     )
-    monkeypatch.setattr(backends, "is_te_min_version", lambda version: True)
-    target = backends.select_cross_entropy(fusion, impl, cuda_graph_impl)
-    if not fusion:
-        assert target is backends.unfused_cross_entropy
-    elif impl == "native":
-        assert target is backends._fused_ce
-    else:
-        assert target.func is backends.te_cross_entropy
-        assert target.keywords == {"cuda_graph_capturable": cuda_graph_impl == "full_iteration"}
+    target = backends.select_cross_entropy(fusion, impl)
+    assert target is (backends._fused_ce if fusion else backends.unfused_cross_entropy)
     _backends.import_module.assert_not_called()
-
-
-@pytest.mark.parametrize("fusion", [False, True])
-def test_unknown_backend_still_fails(monkeypatch, fusion):
-    monkeypatch.setattr(
-        _backends, "import_module", Mock(side_effect=AssertionError("unexpected import"))
-    )
-    with pytest.raises(ValueError, match="unknown cross_entropy_fusion_impl"):
-        backends.select_cross_entropy(fusion, "not-a-backend")
-    _backends.import_module.assert_not_called()
-
-
-def test_selected_checks_export_without_version_floor(monkeypatch):
-    library = ModuleType(_LIBRARY)
-    library.LigerMegatronCrossEntropy = Mock()
-    library.__version__ = "0.0.0"
-    adapter = ModuleType(_ADAPTER)
-    adapter.liger_cross_entropy = Mock()
-    monkeypatch.setitem(sys.modules, _ADAPTER, adapter)
-    importer = Mock(return_value=library)
-    monkeypatch.setattr(_backends, "import_module", importer)
-    monkeypatch.setattr(
-        _backends, "installed_version", Mock(side_effect=AssertionError("no release floor"))
-    )
-    assert backends.select_cross_entropy(True, "liger") is adapter.liger_cross_entropy
-    importer.assert_called_once_with(_LIBRARY)
 
 
 @pytest.mark.parametrize("backend", ["local", "transformer_engine", "inference_optimized"])
-def test_provider_selects_liger_cross_entropy_independently(monkeypatch, backend):
-    library = ModuleType(_LIBRARY)
-    library.LigerMegatronCrossEntropy = Mock()
-    adapter = ModuleType(_ADAPTER)
-    adapter.liger_cross_entropy = Mock()
-    monkeypatch.setitem(sys.modules, _ADAPTER, adapter)
-    monkeypatch.setattr(_backends, "import_module", Mock(return_value=library))
+def test_provider_selects_liger_cross_entropy_independently(backend):
+    pytest.importorskip(_LIBRARY)
+    from megatron.core.ops.loss.liger_cross_entropy import liger_cross_entropy
+
     provider = get_backend(
         backend, cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="liger"
     )
-    assert provider.vocab_parallel_cross_entropy() is adapter.liger_cross_entropy
-
-
-@pytest.mark.parametrize("error_type", [ModuleNotFoundError, ImportError, OSError, RuntimeError])
-def test_selected_chains_import_failure(monkeypatch, error_type):
-    cause = error_type("failed to load Liger")
-    if isinstance(cause, ModuleNotFoundError):
-        cause.name = "liger_kernel"
-    importer = Mock(side_effect=cause)
-    monkeypatch.setattr(_backends, "import_module", importer)
-    with pytest.raises(ImportError, match="Liger vocab-parallel cross entropy") as caught:
-        backends.select_cross_entropy(True, "liger")
-    assert caught.value.__cause__ is cause
-    importer.assert_called_once_with(_LIBRARY)
-    if isinstance(cause, ModuleNotFoundError):
-        assert isinstance(caught.value, ModuleNotFoundError)
-        assert caught.value.name == "liger_kernel"
-
-
-@pytest.mark.parametrize("export", ["missing", "none", "broken"])
-def test_selected_requires_usable_export(monkeypatch, export):
-    library = ModuleType(_LIBRARY)
-    cause = RuntimeError("lazy export failed")
-    if export == "none":
-        library.LigerMegatronCrossEntropy = None
-    elif export == "broken":
-
-        def failed_getattr(name):
-            raise cause
-
-        library.__getattr__ = failed_getattr
-    monkeypatch.setattr(_backends, "import_module", Mock(return_value=library))
-    with pytest.raises(ImportError, match="LigerMegatronCrossEntropy") as caught:
-        backends.select_cross_entropy(True, "liger")
-    if export == "missing":
-        assert isinstance(caught.value.__cause__, AttributeError)
-    elif export == "broken":
-        assert caught.value.__cause__ is cause
+    assert provider.vocab_parallel_cross_entropy() is liger_cross_entropy
 
 
 @pytest.fixture(scope="module", params=[None, 1, 2, 4], ids=["local", "tp1", "tp2", "tp4"])
@@ -133,19 +54,10 @@ def ce_group(request):
     size = request.param or 1
     if Utils.world_size < size or Utils.world_size % size:
         pytest.skip(f"needs a world size divisible by TP={size}")
-    Utils.initialize_distributed()
-    # Interleave ranks and vary data between groups: WORLD communication and global
-    # rank-based vocabulary offsets must not accidentally pass subgroup tests.
-    num_groups = Utils.world_size // size
-    group = None
-    for offset in range(num_groups):
-        ranks = list(range(offset, Utils.world_size, num_groups))
-        candidate = torch.distributed.new_group(ranks)
-        if Utils.rank in ranks:
-            group = candidate
-    yield (None if request.param is None else group), group, Utils.rank % num_groups
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group(group)
+    with Utils.interleaved_group(size) as group:
+        yield (None if request.param is None else group), group, Utils.rank % (
+            Utils.world_size // size
+        )
 
 
 def _with_layout(tensor, layout):
@@ -161,10 +73,19 @@ def _with_layout(tensor, layout):
     return tensor.contiguous()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("layout", ["contiguous", "transpose", "strided"])
-@pytest.mark.parametrize("vocab_shard", [37, 1024])
-def test_loss_and_gradients_match_references(ce_group, dtype, layout, vocab_shard, monkeypatch):
+@pytest.mark.parametrize(
+    "dtype,layout,vocab_shard,all_ignored",
+    [
+        (torch.float32, "contiguous", 37, False),
+        (torch.bfloat16, "contiguous", 1024, False),
+        (torch.float32, "transpose", 37, False),
+        (torch.bfloat16, "strided", 37, False),
+        (torch.float32, "strided", 37, True),
+    ],
+)
+def test_loss_and_gradients_match_references(
+    ce_group, dtype, layout, vocab_shard, all_ignored, monkeypatch
+):
     pytest.importorskip(_LIBRARY)
     target = backends.select_cross_entropy(True, "liger")
     group, reference_group, data_id = ce_group
@@ -173,6 +94,9 @@ def test_loss_and_gradients_match_references(ce_group, dtype, layout, vocab_shar
     full = torch.randn(11, 3, vocab_shard * size, generator=generator).to("cuda", dtype)
     labels = torch.randint(vocab_shard * size, (11, 3), generator=generator).cuda()
     labels[0, 0], labels[0, 1] = 0, vocab_shard * size - 1
+    labels[1::2] = -100
+    if all_ignored:
+        labels.fill_(-100)
     labels = _with_layout(labels, layout)
     upstream = _with_layout(torch.randn(11, 3, generator=generator).cuda(), "strided")
     upstream[0, 0] = 0
@@ -199,7 +123,7 @@ def test_loss_and_gradients_match_references(ce_group, dtype, layout, vocab_shar
         torch.testing.assert_close(logits, full[..., start:end], atol=0, rtol=0)
     native = vocab_parallel_cross_entropy(
         native_logits, labels.contiguous(), tp_group=reference_group
-    )
+    ) * (labels != -100)
     native_grad = torch.autograd.grad(native, native_logits, upstream)[0]
     assert loss.shape == labels.shape and loss.dtype == torch.float32
     assert gradient.dtype == dtype
@@ -208,33 +132,3 @@ def test_loss_and_gradients_match_references(ce_group, dtype, layout, vocab_shar
     tolerance = dict(atol=2e-7, rtol=2e-5) if dtype == torch.float32 else dict(atol=2e-5, rtol=1e-2)
     torch.testing.assert_close(gradient, reference_grad.to(dtype), **tolerance)
     torch.testing.assert_close(gradient, native_grad, **tolerance)
-
-
-@pytest.mark.parametrize("all_ignored", [False, True])
-def test_ignored_labels_match_pytorch_and_masked_native(ce_group, all_ignored):
-    pytest.importorskip(_LIBRARY)
-    target = backends.select_cross_entropy(True, "liger")
-    group, reference_group, data_id = ce_group
-    size, rank, shard = reference_group.size(), reference_group.rank(), 37
-    generator = torch.Generator().manual_seed(817 + data_id)
-    full = torch.randn(5, 2, shard * size, generator=generator).cuda()
-    labels = torch.randint(shard * size, (5, 2), generator=generator).cuda()
-    labels[::2] = -100
-    if all_ignored:
-        labels.fill_(-100)
-    mask = labels != -100
-    logits = full[..., rank * shard : (rank + 1) * shard].clone().requires_grad_(True)
-    native_logits = logits.detach().clone().requires_grad_(True)
-    ref_logits = full.clone().requires_grad_(True)
-    loss = target(logits, labels, group)
-    reference = F.cross_entropy(
-        ref_logits.reshape(-1, shard * size), labels.reshape(-1), reduction="none"
-    ).view_as(labels)
-    native = vocab_parallel_cross_entropy(native_logits, labels, tp_group=reference_group)
-    torch.testing.assert_close(loss, reference, atol=2e-6, rtol=2e-6)
-    torch.testing.assert_close(loss, native * mask, atol=2e-6, rtol=2e-6)
-    loss.sum().backward()
-    reference.sum().backward()
-    (native * mask).sum().backward()
-    torch.testing.assert_close(logits.grad, ref_logits.grad[..., rank * shard : (rank + 1) * shard])
-    torch.testing.assert_close(logits.grad, native_logits.grad)

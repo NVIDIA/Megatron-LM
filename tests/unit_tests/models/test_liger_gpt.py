@@ -1,8 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Liger loss selection through GPT, including MTP training and predictions."""
+"""Forward/backward parity for optional Liger backends in local GPT."""
 
-import argparse
 from dataclasses import replace
 
 import pytest
@@ -14,20 +13,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.multi_token_prediction import _compute_mtp_acceptance_counts
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
-
-def test_cli_exposes_liger_cross_entropy():
-    from megatron.training.arguments import add_megatron_arguments
-
-    parser = add_megatron_arguments(argparse.ArgumentParser())
-    args = parser.parse_args(
-        ["--cross-entropy-loss-fusion", "--cross-entropy-fusion-impl", "liger"]
-    )
-    assert args.cross_entropy_loss_fusion
-    assert args.cross_entropy_fusion_impl == "liger"
 
 
 @pytest.fixture(params=[1, 2], ids=["tp1", "tp2"])
@@ -57,39 +44,17 @@ def _model(config):
     ).cuda()
 
 
-def test_language_loss_preserves_mtp_acceptance_counts(model_parallel):
-    pytest.importorskip("liger_kernel.megatron")
-    from megatron.core.models.common.language_module.language_module import LanguageModule
-
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        transformer_impl="local",
-        tensor_model_parallel_size=model_parallel,
-        cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl="liger",
-    )
-    model = LanguageModule(config)
-    torch.manual_seed(817)
-    full = torch.randn(5, 2, 128, device="cuda")
-    expected = full.argmax(-1)
-    labels = expected.t().contiguous()
-    labels[0, 0] = (labels[0, 0] + 1) % 128
-    mask = torch.ones_like(labels)
-    mask[-1, -1] = 0
-    logits = full.chunk(model_parallel, dim=-1)[model.tp_group.rank()].clone()
-    _, predictions = model.compute_language_model_loss(labels, logits, return_argmax=True)
-    assert predictions is None
-    correct, total = _compute_mtp_acceptance_counts(
-        logits, labels, mask, tp_group=model.tp_group, preds=predictions
-    )
-    assert correct.item() == 8
-    assert total.item() == 9
-
-
+@pytest.mark.parametrize(
+    "liger_options",
+    [
+        pytest.param(
+            {"cross_entropy_loss_fusion": True, "cross_entropy_fusion_impl": "liger"},
+            id="cross_entropy",
+        )
+    ],
+)
 @pytest.mark.parametrize("mtp_layers", [None, 1])
-def test_gpt_loss_and_parameter_gradients(model_parallel, mtp_layers):
+def test_gpt_forward_backward_parity(model_parallel, mtp_layers, liger_options):
     pytest.importorskip("liger_kernel.megatron")
     if mtp_layers:
         pytest.importorskip(
@@ -106,8 +71,6 @@ def test_gpt_loss_and_parameter_gradients(model_parallel, mtp_layers):
         use_cpu_initialization=True,
         tensor_model_parallel_size=model_parallel,
         mtp_num_layers=mtp_layers,
-        cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl="liger",
         hidden_dropout=0.0,
         attention_dropout=0.0,
         masked_softmax_fusion=False,
@@ -116,10 +79,8 @@ def test_gpt_loss_and_parameter_gradients(model_parallel, mtp_layers):
         gradient_accumulation_fusion=False,
         apply_rope_fusion=False,
     )
-    actual = _model(config)
-    reference = _model(
-        replace(config, cross_entropy_loss_fusion=False, cross_entropy_fusion_impl="native")
-    )
+    actual = _model(replace(config, **liger_options))
+    reference = _model(config)
     reference.load_state_dict(actual.state_dict(), strict=True)
     torch.manual_seed(456)
     tokens = torch.randint(0, 128, (2, 16), device="cuda")

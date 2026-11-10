@@ -16,17 +16,8 @@ def tp_group(request):
     size = request.param
     if Utils.world_size < size or Utils.world_size % size:
         pytest.skip(f"needs a world size divisible by TP={size}")
-    Utils.initialize_distributed()
-    num_groups = Utils.world_size // size
-    group = None
-    for offset in range(num_groups):
-        ranks = list(range(offset, Utils.world_size, num_groups))
-        candidate = torch.distributed.new_group(ranks)
-        if Utils.rank in ranks:
-            group = candidate
-    yield group
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group(group)
+    with Utils.interleaved_group(size) as group:
+        yield group
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
