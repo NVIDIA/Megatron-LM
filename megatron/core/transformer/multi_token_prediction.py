@@ -1012,12 +1012,24 @@ def get_mtp_layer_offset(
 def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
-    """Get the number of MTP layers to build."""
+    """Get the number of MTP layers to build.
+
+    Args:
+        config: Configuration of the model.
+        vp_stage: Virtual pipeline stage; required with a virtual pipeline.
+        pp_rank: Rank of this stage in the model's pipeline-parallel group. A model with a single
+            pipeline stage does not need it. With pipeline parallelism, omitting it is
+            deprecated: the global pipeline rank in ``parallel_state`` is used instead, with a
+            ``ProcessGroupFallbackWarning``.
+    """
     if pp_rank is None:
-        warn_global_process_group_fallback(
-            "get_mtp_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
-        )
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if config.pipeline_model_parallel_size == 1:
+            pp_rank = 0
+        else:
+            warn_global_process_group_fallback(
+                "get_mtp_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+            )
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     if config.pipeline_model_parallel_layout is not None:
         # If we have a custom PP layout, get the number of mtp layers in the layout array.
