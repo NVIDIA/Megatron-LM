@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
+import inspect
 import logging
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -330,6 +332,25 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
+            if config.cross_entropy_mxfp8_grad and isinstance(
+                self.output_layer, TELMHeadColumnParallelLinear
+            ):
+                # The cross entropy returns the gradient of the logits in MXFP8, in the format
+                # the LM head's recipe uses for gradients, and the MXFP8 LM head uses it without
+                # quantizing. The MTP heads share this output layer and loss, so they get it too.
+                if (
+                    "grad_fp8_format"
+                    not in inspect.signature(self.vocab_parallel_cross_entropy).parameters
+                ):
+                    raise ValueError(
+                        "cross_entropy_mxfp8_grad needs Transformer Engine's fused cross "
+                        "entropy, but the backend selected a cross entropy without an MXFP8 "
+                        "gradient."
+                    )
+                self.vocab_parallel_cross_entropy = functools.partial(
+                    self.vocab_parallel_cross_entropy,
+                    grad_fp8_format="e5m2" if config.fp8 == "hybrid" else "e4m3",
+                )
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
