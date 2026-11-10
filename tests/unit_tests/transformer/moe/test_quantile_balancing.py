@@ -16,11 +16,15 @@ from megatron.core.distributed.finalize_model_grads import (
     reset_model_temporary_tensors,
 )
 from megatron.core.extensions.transformer_engine import fused_topk_with_score_function_supports_qb
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias_with_quantile,
     topk_routing_with_score_function,
 )
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class _QBFinalizeModel(torch.nn.Module):
@@ -91,6 +95,96 @@ def test_qb_cli_exposes_global_batch_scope_and_histogram_bins():
 def test_qb_main_accepts_micro_batch_scope():
     config = _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
     assert config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "tp_size,sequence_parallel,dynamic,dense_output",
+    [
+        (1, False, True, False),
+        (2, True, True, False),
+        (2, False, True, True),
+        (2, True, False, False),
+    ],
+)
+def test_qb_micro_batch_pack_statistics(tp_size, sequence_parallel, dynamic, dense_output):
+    """Compare changing pack domains with an independent full-pack quantile oracle."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 4 * tp_size or world_size % (4 * tp_size):
+        pytest.skip("requires a world size divisible by 4 * TP")
+    Utils.initialize_model_parallel(
+        tp_size, 1, context_parallel_size=2, dynamic_context_parallel=dynamic
+    )
+    try:
+        config = _config(
+            tensor_model_parallel_size=tp_size,
+            context_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            moe_router_quantile_balancing_estimation_scope="micro_batch",
+            moe_router_fusion=False,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+        )
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        router = TopKRouter(config, pg_collection=groups).cuda().train()
+        router.qb_beta.copy_(torch.tensor([-0.15, 0.1, 0.2, -0.05], device="cuda"))
+        rank = dist.get_rank()
+        # Non-SP TP replicas see the same tokens; SP ranks own distinct rows.
+        source_ranks = torch.arange(world_size, device="cuda")
+        if not sequence_parallel:
+            source_ranks = source_ranks // tp_size * tp_size
+        all_logits = (
+            torch.randn(world_size, 12, 4, generator=torch.Generator().manual_seed(29))
+            .cuda()
+            .index_select(0, source_ranks)
+        )
+        expected_accum = torch.zeros_like(router.qb_beta)
+        for step in range(3 if dynamic else 1):
+            packed = None
+            group = groups.tp_cp
+            if dynamic:
+                cp_size = (
+                    1,
+                    1 if rank // tp_size < world_size // tp_size // 2 else 2,
+                    world_size // tp_size,
+                )[step]
+                cp_group = groups.dynamic_cp[cp_size]
+                tp_cp_group = groups.dynamic_tp_cp[cp_size]
+                packed = PackedSeqParams(
+                    local_cp_size=cp_size, cp_group=cp_group, tp_cp_group=tp_cp_group
+                )
+                group = tp_cp_group if sequence_parallel else cp_group
+            ranks = dist.get_process_group_ranks(group)
+            # First use equal sizes to expose silent statistics corruption. Then
+            # use mixed CP1/CP2 packs with unequal sizes, and finally one large pack.
+            rows = 4 * (1 + ranks[0] // tp_size % 3) if step == 1 else 4
+            full = all_logits[ranks, :rows].reshape(-1, config.num_moe_experts)
+            logits = all_logits[rank, :rows].clone().requires_grad_()
+            values, expert_ids = (full - router.qb_beta).topk(config.moe_router_topk + 1)
+            quantiles = (full - values[:, -1:]).sort(dim=0, descending=True).values
+            expected_accum += quantiles[full.shape[0] * config.moe_router_topk // 4]
+            begin = ranks.index(rank) * rows
+            selected = expert_ids[begin : begin + rows, :-1]
+            expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, selected, True)
+            scores = logits.detach().sigmoid()
+            if dense_output:
+                probs, indices = router.quantile_balancing(logits, True, packed_seq_params=packed)
+                assert torch.equal(indices, selected)
+                expected_probs = scores.gather(1, selected)
+            else:
+                probs, routing_map = router.routing(logits[:, None], packed_seq_params=packed)
+                assert torch.equal(routing_map, expected_map)
+                expected_probs = scores * expected_map
+            torch.testing.assert_close(probs, expected_probs)
+            torch.testing.assert_close(router.qb_beta_accum, expected_accum)
+            assert router.qb_beta_count.item() == step + 1
+            probs.square().sum().backward()
+            torch.testing.assert_close(
+                logits.grad, 2 * scores.square() * (1 - scores) * expected_map
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_qb_main_defaults_to_micro_batch_scope():
