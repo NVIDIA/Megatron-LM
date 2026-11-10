@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Bit-exact Liger CE loss, input gradients and original-logit argmax under contention."""
+"""Bit-exact Liger CE loss and input gradients under contention."""
 
 import pytest
 import torch
@@ -30,8 +30,7 @@ def tp_group(request):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("return_argmax", [False, True])
-def test_liger_cross_entropy_replays(tp_group, dtype, return_argmax):
+def test_liger_cross_entropy_replays(tp_group, dtype):
     pytest.importorskip("liger_kernel.megatron")
     from megatron.core.ops.loss.liger_cross_entropy import liger_cross_entropy
 
@@ -39,27 +38,21 @@ def test_liger_cross_entropy_replays(tp_group, dtype, return_argmax):
         1912 + Utils.rank % (Utils.world_size // tp_group.size())
     )
     logits = torch.randn(1024, 4, 1024, generator=generator).to("cuda", dtype)
-    # Tie across every shard, exercising the smallest-global-index prediction rule.
-    logits[0, :, 3] = 16
     logits.requires_grad_(True)
     labels = torch.randint(1024 * tp_group.size(), (1024, 4), generator=generator).cuda()
     upstream = torch.randn(4, 1024, generator=generator).cuda().t()
 
     def run(logits, labels):
-        return liger_cross_entropy(logits, labels, tp_group, return_argmax=return_argmax)
+        return liger_cross_entropy(logits, labels, tp_group)
 
     outputs, gradients = assert_replays_bit_exact(
         run,
         (logits, labels),
-        grad_outputs={"out[0]" if return_argmax else "out": upstream},
+        grad_outputs={"out": upstream},
         replays=4,
         contention=True,
-        what=f"Liger CE[tp={tp_group.size()},dtype={dtype},argmax={return_argmax}]",
+        what=f"Liger CE[tp={tp_group.size()},dtype={dtype}]",
     )
-    loss = outputs["out[0]" if return_argmax else "out"]
+    loss = outputs["out"]
     assert loss.shape == labels.shape and loss.dtype == torch.float32
     assert gradients["in[0]"].shape == logits.shape and gradients["in[0]"].dtype == dtype
-    if return_argmax:
-        predictions = outputs["out[1]"]
-        assert predictions.dtype == torch.int64 and not predictions.requires_grad
-        assert torch.equal(predictions[0], torch.full_like(predictions[0], 3))

@@ -3,10 +3,7 @@
 """Selection without Liger installed, and GPU parity with the optional Liger backend."""
 
 import builtins
-import importlib.util
-import inspect
 import sys
-from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
 
@@ -129,60 +126,6 @@ def test_selected_requires_usable_export(monkeypatch, export):
         assert caught.value.__cause__ is cause
 
 
-@pytest.fixture
-def mocked_adapter(monkeypatch):
-    """Load the real adapter with a fake library, without polluting its canonical import."""
-    library = ModuleType(_LIBRARY)
-    kernel = Mock()
-    library.LigerMegatronCrossEntropy = Mock(return_value=kernel)
-    monkeypatch.setitem(sys.modules, _LIBRARY, library)
-    spec = importlib.util.spec_from_file_location(
-        "_test_liger_ce_adapter", Path(backends.__file__).with_name("liger_cross_entropy.py")
-    )
-    adapter = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(adapter)
-    library.LigerMegatronCrossEntropy.assert_called_once_with(
-        ignore_index=-100, reduction="none", label_smoothing=0.0
-    )
-    return adapter, kernel
-
-
-@pytest.mark.parametrize("return_argmax", [False, True])
-def test_original_argmax_precedes_mutating_forward(mocked_adapter, monkeypatch, return_argmax):
-    adapter, kernel = mocked_adapter
-    logits = torch.tensor([[[1.0, 5.0, 5.0, 2.0], [9.0, 1.0, 0.0, 9.0]]], requires_grad=True)
-    labels = torch.tensor([[1, 0]])
-    original_predictions = logits.detach().argmax(dim=-1)
-    expected_loss = torch.ones_like(labels, dtype=torch.bfloat16)
-
-    def consume_logits(logits, labels, tp_group):
-        assert tp_group is None
-        with torch.no_grad():
-            logits.zero_()
-            logits[..., -1] = 1.0
-        return expected_loss
-
-    kernel.side_effect = consume_logits
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", Mock(side_effect=AssertionError("None is local"))
-    )
-    argmax = Mock(wraps=adapter._original_argmax)
-    monkeypatch.setattr(adapter, "_original_argmax", argmax)
-    assert "return_argmax" in inspect.signature(adapter.liger_cross_entropy).parameters
-    result = adapter.liger_cross_entropy(logits, labels, None, return_argmax=return_argmax)
-    loss = result[0] if return_argmax else result
-    torch.testing.assert_close(loss, expected_loss.float())
-    kernel.assert_called_once_with(logits, labels, tp_group=None)
-    if return_argmax:
-        predictions = result[1]
-        assert torch.equal(predictions, original_predictions)
-        assert not torch.equal(predictions, logits.argmax(dim=-1))
-        assert predictions.dtype == torch.int64 and not predictions.requires_grad
-        argmax.assert_called_once()
-    else:
-        argmax.assert_not_called()
-
-
 @pytest.fixture(scope="module", params=[None, 1, 2, 4], ids=["local", "tp1", "tp2", "tp4"])
 def ce_group(request):
     if not torch.cuda.is_available():
@@ -221,10 +164,7 @@ def _with_layout(tensor, layout):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("layout", ["contiguous", "transpose", "strided"])
 @pytest.mark.parametrize("vocab_shard", [37, 1024])
-@pytest.mark.parametrize("return_argmax", [False, True])
-def test_loss_and_gradients_match_references(
-    ce_group, dtype, layout, vocab_shard, return_argmax, monkeypatch
-):
+def test_loss_and_gradients_match_references(ce_group, dtype, layout, vocab_shard, monkeypatch):
     pytest.importorskip(_LIBRARY)
     target = backends.select_cross_entropy(True, "liger")
     group, reference_group, data_id = ce_group
@@ -253,9 +193,10 @@ def test_loss_and_gradients_match_references(
 
     with monkeypatch.context() as patch:
         patch.setattr(torch.distributed, "all_reduce", checked_reduce)
-        result = target(logits, labels, group, return_argmax=return_argmax)
-        loss = result[0] if return_argmax else result
+        loss = target(logits, labels, group)
+        torch.testing.assert_close(logits, full[..., start:end], atol=0, rtol=0)
         gradient = torch.autograd.grad(loss, logits, upstream)[0]
+        torch.testing.assert_close(logits, full[..., start:end], atol=0, rtol=0)
     native = vocab_parallel_cross_entropy(
         native_logits, labels.contiguous(), tp_group=reference_group
     )
@@ -267,30 +208,6 @@ def test_loss_and_gradients_match_references(
     tolerance = dict(atol=2e-7, rtol=2e-5) if dtype == torch.float32 else dict(atol=2e-5, rtol=1e-2)
     torch.testing.assert_close(gradient, reference_grad.to(dtype), **tolerance)
     torch.testing.assert_close(gradient, native_grad, **tolerance)
-    if return_argmax:
-        assert torch.equal(result[1], full.argmax(dim=-1))
-        assert result[1].dtype == torch.int64 and not result[1].requires_grad
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_global_argmax_ties_and_original_predictions(ce_group, dtype):
-    pytest.importorskip(_LIBRARY)
-    target = backends.select_cross_entropy(True, "liger")
-    group, reference_group, data_id = ce_group
-    size, rank, vocab_shard = reference_group.size(), reference_group.rank(), 17
-    full = torch.zeros(4, 2, size * vocab_shard, device="cuda", dtype=dtype)
-    full[0, :, 2] = full[0, :, -1] = 9
-    full[1, :, -2:] = 7
-    # Equal maxima on every shard, and a winner that differs between TP subgroups.
-    full[2, :, 1::vocab_shard] = 8
-    full[3, :, (data_id + 3) % full.size(-1)] = 6
-    labels = full.argmax(dim=-1)
-    logits = full[..., rank * vocab_shard : (rank + 1) * vocab_shard].clone().requires_grad_(True)
-    loss, predictions = target(logits, labels, group, return_argmax=True)
-    assert torch.equal(predictions, labels)
-    assert not predictions.requires_grad and predictions.grad_fn is None
-    loss.sum().backward()
-    assert logits.grad.dtype == dtype
 
 
 @pytest.mark.parametrize("all_ignored", [False, True])

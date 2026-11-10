@@ -203,7 +203,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ops/loss/liger_cross_entropy.py",),
         tests=(K + "test_liger_loss.py",),
         kind="external-lib",
-        notes="Vocab-parallel loss, logits gradients and original predictions replayed "
+        notes="Vocab-parallel loss and logits gradients replayed "
         "under contention with explicit TP groups.",
     ),
     KernelEntry(
