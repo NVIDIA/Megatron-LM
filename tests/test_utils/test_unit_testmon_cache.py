@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -312,6 +313,104 @@ def test_manifest_requires_timezone_for_age_reporting(generation):
         cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
 
 
+def test_main_identity_and_manifest_are_unchanged(source_tree, generation):
+    directory, identity = generation
+    bucket_hash = hashlib.sha256(BUCKET.encode()).hexdigest()[:16]
+    assert identity == cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID, "main")
+    assert identity["cache_prefix"] == f"unit-testmon-v1-main-dgx_h100-{bucket_hash}-"
+    assert set(identity["compatibility"]) == {
+        "schema",
+        "testmon",
+        "platform",
+        "bucket",
+        "environment",
+        "tag",
+        "inputs",
+    }
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["source_ref"] == "refs/heads/main"
+
+
+def test_branch_baselines_are_isolated_by_prefix_and_source(source_tree, generation, tmp_path):
+    main_directory, main = generation
+    dev = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID, "dev")
+    # Shared tests keep one compatibility contract, but never share generations.
+    assert dev["compatibility"] == main["compatibility"]
+    assert dev["cache_prefix"] == main["cache_prefix"].replace("-main-", "-dev-", 1)
+    assert not dev["cache_prefix"].startswith(main["cache_prefix"])
+    assert not main["cache_prefix"].startswith(dev["cache_prefix"])
+
+    dev_directory = tmp_path / "dev-baseline"
+    shutil.copytree(main_directory, dev_directory)
+    (dev_directory / "manifest.json").unlink()
+    cache.finalize(dev_directory, dev, "d" * 40, "789-2")
+    manifest = cache.validate_cache(dev_directory, dev, dev["cache_prefix"] + "789-2", "d" * 40)
+    assert manifest["source_ref"] == "refs/heads/dev"
+
+    # Neither branch accepts the other's generation, even under a forged key.
+    for directory, consumer, generation_id in (
+        (main_directory, dev, "123-1"),
+        (dev_directory, main, "789-2"),
+    ):
+        before = _snapshot(directory)
+        with pytest.raises(ValueError, match="baseline source"):
+            cache.validate_cache(directory, consumer, consumer["cache_prefix"] + generation_id)
+        assert _snapshot(directory) == before
+
+
+def test_validation_can_require_the_producer_commit(generation):
+    directory, identity = generation
+    key = identity["cache_prefix"] + "123-1"
+    assert cache.validate_cache(directory, identity, key, "b" * 40)["source_sha"] == "b" * 40
+    with pytest.raises(ValueError, match="expected producer commit"):
+        cache.validate_cache(directory, identity, key, "c" * 40)
+
+
+@pytest.mark.parametrize("branch", ["", "release", "pull-request/6934", "dev/feature", "Main"])
+def test_branches_without_a_trusted_producer_are_rejected(source_tree, generation, branch):
+    with pytest.raises(ValueError, match="baseline branch"):
+        cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID, branch)
+    directory, identity = generation
+    with pytest.raises(ValueError, match="baseline branch"):
+        cache.validate_cache(
+            directory, {**identity, "target_branch": branch}, identity["cache_prefix"] + "123-1"
+        )
+    with pytest.raises(ValueError, match="baseline branch"):
+        cache.finalize(directory, {**identity, "target_branch": branch}, "b" * 40, "123-1")
+
+
+@pytest.mark.parametrize(("branch", "transport"), [("main", "cache"), ("dev", "artifact")])
+def test_identity_cli_reports_the_baseline_transport(source_tree, tmp_path, branch, transport):
+    output = tmp_path / "identity.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "identity",
+            "--root",
+            str(source_tree),
+            "--bucket",
+            BUCKET,
+            "--platform",
+            "dgx_h100",
+            "--target-branch",
+            branch,
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    identity = json.loads(output.read_text())
+    assert result.stdout.splitlines() == [
+        f"cache_prefix={identity['cache_prefix']}",
+        f"baseline_transport={transport}",
+    ]
+    assert identity["target_branch"] == branch
+    assert cache.BASELINE_BRANCHES[branch] == transport
+
+
 def _action_script(name):
     action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
     return next(step["run"] for step in action["runs"]["steps"] if step["name"] == name)
@@ -367,7 +466,10 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
     assert consumer["image_id"] == "unknown"
     assert consumer["cache_prefix"] == producer["cache_prefix"]
     assert consumer["compatibility"] == producer["compatibility"]
-    assert output.read_text().strip() == f"cache_prefix={producer['cache_prefix']}"
+    assert output.read_text().splitlines() == [
+        f"cache_prefix={producer['cache_prefix']}",
+        "baseline_transport=cache",
+    ]
     manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
     assert manifest["source_sha"] == "b" * 40
     assert _snapshot(directory) == before
@@ -541,6 +643,9 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
             "MATCHED_KEY": "" if restore == "miss" else identity["cache_prefix"] + "123-1",
+            "BASELINE_SOURCE": "Actions cache",
+            "BASELINE_SOURCE_SHA": "",
+            "TARGET_BRANCH": "main",
             "CACHE_HIT": "false",
             "RUNNER_TEMP": str(runtime_dir),
             "GITHUB_OUTPUT": str(output),
@@ -574,6 +679,135 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     else:
         assert "without recording or saving" in summary.read_text()
         assert changed_files is None
+    assert "- Baseline branch: main" in summary.read_text()
+    assert "- Baseline source: Actions cache" in summary.read_text()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "dev-artifact",
+        "main-generation",
+        "wrong-producer-commit",
+        "no-artifact",
+        "download-failed",
+        "pinned",
+        "pinned-other-generation",
+    ],
+)
+def test_action_resolver_validates_dev_artifacts_like_cache_baselines(
+    generation, source_tree, tmp_path, case
+):
+    """The GPU resolver applies the cache checks plus the producer commit to dev artifacts."""
+    directory, main = generation
+    dev = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID, "dev")
+    if case != "main-generation":
+        (directory / "manifest.json").unlink()
+        cache.finalize(directory, dev, "d" * 40, "456-1")
+    pr_files_dir = tmp_path / "pr-files"
+    pr_files_dir.mkdir()
+    (pr_files_dir / "changed-files").write_text("megatron/core/a.py\n")
+    (pr_files_dir / "metadata.json").write_text(
+        json.dumps({"tested_sha": "c" * 40, "changed_files": 1, "changed_paths": 1})
+    )
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "unit-testmon-identity.json").write_text(json.dumps(dev))
+    helper = tmp_path / "tests/unit_tests/testmon_cache.py"
+    helper.parent.mkdir(parents=True)
+    shutil.copy2(HELPER, helper)
+    before = _snapshot(directory)
+    output = tmp_path / "output"
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", _action_script("Resolve unit Testmon mode")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), os.environ["PATH"])),
+            "PR_FILES_OUTCOME": "success",
+            "PR_FILES_DIR": str(pr_files_dir),
+            "TESTED_SHA": "c" * 40,
+            "REQUESTED_MODE": "enforce",
+            "IDENTITY_OUTCOME": "success",
+            "RESTORE_OUTCOME": "success",
+            "MATCHED_KEY": (
+                ""
+                if case in {"no-artifact", "download-failed"}
+                else dev["cache_prefix"] + ("123-1" if case == "main-generation" else "456-1")
+            ),
+            "BASELINE_SOURCE": "" if case == "no-artifact" else "artifact of producer run 456",
+            "BASELINE_SOURCE_SHA": ("e" if case == "wrong-producer-commit" else "d") * 40,
+            "TARGET_BRANCH": "dev",
+            # A prepared checkout pins the baseline commit and generation.
+            "TESTMON_BASE_SHA": "d" * 40 if case.startswith("pinned") else "",
+            "TESTMON_GENERATION": {"pinned": "456-1", "pinned-other-generation": "457-1"}.get(
+                case, ""
+            ),
+            "RUNNER_TEMP": str(runtime_dir),
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    valid = case in {"dev-artifact", "pinned"}
+    assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
+    after = _snapshot(directory)
+    after.pop("summary.md", None)
+    after.pop("changed-files", None)
+    assert after == before
+    assert "- Baseline branch: dev" in summary.read_text()
+    if valid:
+        assert "d" * 40 + " on refs/heads/dev" in summary.read_text()
+    else:
+        assert "no valid compatible dev baseline" in summary.read_text()
+
+
+@pytest.mark.parametrize(
+    ("cache_outcome", "cache_key", "artifact_outcome", "artifact_key", "expected"),
+    [
+        ("success", "cache-key", "skipped", "", ("cache-key", "Actions cache")),
+        ("success", "", "skipped", "", None),
+        ("failure", "", "skipped", "", None),
+        ("skipped", "", "success", "artifact-key", ("artifact-key", "artifact of producer run 9")),
+        ("skipped", "", "failure", "artifact-key", None),
+        ("skipped", "", "skipped", "artifact-key", None),
+        ("skipped", "", "success", "", None),
+    ],
+)
+def test_restored_baseline_records_only_successful_transports(
+    tmp_path, cache_outcome, cache_key, artifact_outcome, artifact_key, expected
+):
+    output = tmp_path / "output"
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-u",
+            "-o",
+            "pipefail",
+            "-c",
+            _action_script("Record restored unit Testmon baseline"),
+        ],
+        env={
+            **os.environ,
+            "CACHE_OUTCOME": cache_outcome,
+            "CACHE_KEY": cache_key,
+            "ARTIFACT_OUTCOME": artifact_outcome,
+            "ARTIFACT_KEY": artifact_key,
+            "ARTIFACT_RUN_ID": "9",
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+    )
+    recorded = output.read_text().splitlines() if output.exists() else []
+    if expected is None:
+        assert recorded == []
+    else:
+        assert recorded == [f"matched_key={expected[0]}", f"source={expected[1]}"]
 
 
 @pytest.mark.parametrize(
@@ -584,6 +818,18 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         ({"SOURCE_REPOSITORY": "fork/Megatron-LM"}, False),
         ({"SOURCE_EVENT": "pull_request"}, False),
         ({"REQUESTED_SHA": "c" * 40}, False),
+        ({"SOURCE_REF": "refs/heads/dev", "TARGET_BRANCH": "dev", "SOURCE_EVENT": "push"}, True),
+        ({"SOURCE_REF": "refs/heads/dev", "TARGET_BRANCH": "dev"}, True),
+        ({"SOURCE_REF": "refs/heads/dev"}, False),
+        ({"TARGET_BRANCH": "dev"}, False),
+        ({"SOURCE_REF": "refs/tags/dev", "TARGET_BRANCH": "dev"}, False),
+        ({"SOURCE_REF": "refs/heads/release", "TARGET_BRANCH": "release"}, False),
+        ({"SOURCE_REF": "refs/heads/", "TARGET_BRANCH": ""}, False),
+        ({"SOURCE_REF": "refs/heads/dev", "TARGET_BRANCH": "dev", "SUITE_TAG": "legacy"}, False),
+        (
+            {"SOURCE_REF": "refs/heads/dev", "TARGET_BRANCH": "dev", "SOURCE_EVENT": "merge_group"},
+            False,
+        ),
     ],
 )
 def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, allowed):
@@ -617,3 +863,56 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
         check=False,
     )
     assert (result.returncode == 0) is allowed
+
+
+@pytest.mark.parametrize(("branch", "transport"), [("main", "cache"), ("dev", "artifact")])
+def test_action_identity_passes_only_non_main_targets(source_tree, tmp_path, branch, transport):
+    """Main keeps its original identity call, which older helper versions accept."""
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    output = tmp_path / "output"
+    calls = tmp_path / "calls"
+    # Stub Docker and sudo, and record the helper arguments before running it.
+    functions = tmp_path / "functions.sh"
+    functions.write_text(
+        "docker() { return 1; }\n"
+        'sudo() { [[ "$*" == "rm -rf -- assets_dir/testmon" ]]; }\n'
+        'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; shift; '
+        'printf "%s\\n" "$*" >> "$TEST_CALLS"; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }\n'
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-u",
+            "-o",
+            "pipefail",
+            "-c",
+            _action_script("Compute unit Testmon cache identity"),
+        ],
+        cwd=source_tree,
+        env={
+            **os.environ,
+            "BASH_ENV": str(functions),
+            "TEST_PYTHON": sys.executable,
+            "TESTMON_HELPER": str(HELPER),
+            "TEST_CALLS": str(calls),
+            "TARGET_BRANCH": branch,
+            "SUITE_TAG": "latest",
+            "BUCKET": BUCKET,
+            "RECIPE_PLATFORM": "dgx_h100",
+            "CONTAINER_IMAGE": "image:latest",
+            "RUNNER_TEMP": str(runtime_dir),
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", target_branch=branch)
+    assert output.read_text().splitlines() == [
+        f"cache_prefix={identity['cache_prefix']}",
+        f"baseline_transport={transport}",
+    ]
+    assert ("--target-branch" in calls.read_text()) is (branch != "main")
