@@ -923,15 +923,16 @@ def test_inference_model_is_built_and_loaded_on_the_collection(
         gpt_model.load_state_dict(loaded["model"], strict=kwargs["strict"])
 
     # The arguments get_model_for_inference reads, with the builder and the checkpoint loader
-    # of the training script replaced by the ones of this model. It also reads the tokenizer
-    # config of `run_config`, which this builder ignores: the model config sets the vocabulary.
+    # of the training script replaced by the ones of this model. It also reads two sections of
+    # `run_config`: the tokenizer config, which this builder ignores (the model config sets the
+    # vocabulary), and the checkpoint config, which names the directory to load from.
     args = SimpleNamespace(
-        load=checkpoint,
         inference_ckpt_non_strict=False,
         transformer_impl="local",
         fp8_recipe=None,
         modelopt_enabled=False,
     )
+    run_config.checkpoint.load = checkpoint
     monkeypatch.setattr(inference_utils, "get_args", lambda: args)
     monkeypatch.setattr(inference_utils, "get_model_builder", get_model_builder)
     monkeypatch.setattr(inference_utils, "load_checkpoint", load_checkpoint)
