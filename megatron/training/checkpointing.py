@@ -467,6 +467,24 @@ def _first_group(*groups):
     return next((group for group in groups if group is not None), None)
 
 
+def _data_parallel_group(group, pg_collection, *fields):
+    """Return ``group``, or the first of ``fields`` that ``pg_collection`` holds a group for.
+
+    A collection that sets none of ``fields`` says nothing about that group: a language model
+    needs only its tp, cp, pp and embd groups. The group is then read from the global parallel
+    grid, as it was before checkpointing took a collection. A field that is set to None means
+    that the axis is not used, and without torch.distributed there is no group to read.
+    """
+    if group is not None:
+        return group
+    if torch.distributed.is_initialized() and not any(
+        field in vars(pg_collection) for field in fields
+    ):
+        # Compatibility fallback for collections that leave these groups out.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=[fields[0]])
+    return _first_group(*(getattr(pg_collection, field) for field in fields))
+
+
 def _group_rank(group):
     """Return this rank's index in ``group``, or 0 when the collection has no such group.
 
@@ -862,8 +880,13 @@ def save_grads(
     Args:
         pg_collection: Process groups of the model whose state is saved. It must set ``tp``,
             ``pp``, ``ep`` and ``expt_dp``. The writers are the first ranks of
-            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. Omitting the
-            collection reads the global parallel grid, which is deprecated and warns.
+            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. A model
+            without expert parallelism may set ``expt_dp`` to None: its writers are then the
+            first ranks of its data-parallel group (``dp_cp_gtp_remat``, ``dp_cp``,
+            ``dp_gtp_remat`` or ``dp``, whichever is set first). With expert parallelism and
+            ``expt_dp`` set to None, every rank writes the file of its expert-parallel rank.
+            Omitting the collection reads the global parallel grid, which is deprecated and
+            warns.
     """
 
     print_rank_0(
@@ -882,7 +905,16 @@ def save_grads(
         tp_group, pp_group, ep_group, expt_dp_group = require_process_groups(
             pg_collection, ('tp', 'pp', 'ep', 'expt_dp'), owner='save_grads'
         )
-        expt_dp_rank = get_pg_rank(_first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group))
+        writer_group = _first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group)
+        if writer_group is None and get_pg_size(ep_group) == 1:
+            # Without expert parallelism, the replicas of a file are the data-parallel ranks.
+            writer_group = _first_group(
+                pg_collection.dp_cp_gtp_remat,
+                pg_collection.dp_cp,
+                pg_collection.dp_gtp_remat,
+                pg_collection.dp,
+            )
+        expt_dp_rank = get_pg_rank(writer_group)
         tp_rank = get_pg_rank(tp_group)
         pp_rank = get_pg_rank(pp_group)
         ep_rank = get_pg_rank(ep_group)
@@ -979,6 +1011,8 @@ def save_checkpoint(
             follows the section, which is not written.
         pg_collection: Process groups of the model being saved. Defaults to the collection the
             model was built on, and to the global parallel grid for a model built without one.
+            The data-parallel groups that a collection leaves out are also read from the
+            global parallel grid.
     """
     start_ckpt = time()
     args = get_args()
@@ -1047,12 +1081,12 @@ def save_checkpoint(
     tp_group = _first_group(tp_group, pg_collection.tp)
     pp_group = _first_group(pp_group, pg_collection.pp)
     cp_group = _first_group(cp_group, pg_collection.cp)
-    dp_group = _first_group(dp_group, pg_collection.dp)
-    dp_gtp_remat_group = _first_group(
-        dp_gtp_remat_group, pg_collection.dp_gtp_remat, pg_collection.dp
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_gtp_remat_group = _data_parallel_group(
+        dp_gtp_remat_group, pg_collection, 'dp_gtp_remat', 'dp'
     )
-    dp_cp_group = _first_group(dp_cp_group, pg_collection.dp_cp_gtp_remat, pg_collection.dp_cp)
-    expt_dp_group = _first_group(expt_dp_group, pg_collection.expt_dp)
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(
@@ -3059,7 +3093,8 @@ def load_checkpoint(
         else follows the section, which is not written.
     pg_collection: Process groups of the model being loaded; each group argument above
         overrides the matching group. Defaults to the collection the model was built on, and to
-        the global parallel grid for a model built without one.
+        the global parallel grid for a model built without one. The data-parallel groups that a
+        collection leaves out are also read from the global parallel grid.
     """
     cfg = get_run_config()
     args = get_args()
@@ -3234,9 +3269,9 @@ def load_checkpoint(
     # data-parallel groups stand in for them.
     tp_group = _first_group(tp_group, pg_collection.tp)
     pp_group = _first_group(pp_group, pg_collection.pp)
-    dp_group = _first_group(dp_group, pg_collection.dp)
-    dp_cp_group = _first_group(dp_cp_group, pg_collection.dp_cp_gtp_remat, pg_collection.dp_cp)
-    expt_dp_group = _first_group(expt_dp_group, pg_collection.expt_dp)
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
@@ -3760,7 +3795,9 @@ def load_checkpoint(
                 and load_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = get_pg_rank(_first_group(pg_collection.dp_gtp_remat, pg_collection.dp))
+                dp_rank = get_pg_rank(
+                    _data_parallel_group(None, pg_collection, 'dp_gtp_remat', 'dp')
+                )
                 optim_checkpoint_name = os.path.join(
                     os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
                 )

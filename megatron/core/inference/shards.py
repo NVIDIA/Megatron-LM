@@ -51,7 +51,8 @@ def build_inference_pg_collection(
             ``pp``, ``cp``, ``ep`` or ``expt_tp``). If None while a size is
             None, the sizes of the global groups in
             ``megatron.core.parallel_state`` are used; that fallback is
-            deprecated.
+            deprecated, and raises ``ValueError`` when ``parallel_state`` is
+            not initialized.
 
     Returns:
         ProcessGroupCollection configured for the inference model. On ranks
@@ -65,6 +66,7 @@ def build_inference_pg_collection(
     sizes = {"tp": tp_size, "cp": cp_size, "pp": pp_size, "ep": ep_size, "expt_tp": expt_tp_size}
     omitted = [name for name, size in sizes.items() if size is None]
     if omitted:
+        from_global_grid = training_pg_collection is None
         training_pg_collection = resolve_process_groups(
             training_pg_collection,
             owner="build_inference_pg_collection",
@@ -73,7 +75,18 @@ def build_inference_pg_collection(
             deprecated_in="0.21",
             removed_in="0.23",
         )
-        sizes.update({name: get_pg_size(vars(training_pg_collection)[name]) for name in omitted})
+        groups = vars(training_pg_collection)
+        # Without a global grid the fallback groups are None, which would size each axis to 1.
+        # In a collection that the caller passed, None means that the axis is off.
+        missing = [name for name in omitted if from_global_grid and groups[name] is None]
+        if missing:
+            raise ValueError(
+                f"build_inference_pg_collection was called without the {', '.join(missing)} "
+                "size(s) and without `training_pg_collection`, and megatron.core.parallel_state "
+                "has no such group(s) to take a size from. Pass every size, or the training "
+                "model's process groups."
+            )
+        sizes.update({name: get_pg_size(groups[name]) for name in omitted})
     tp_size, cp_size, pp_size, ep_size, expt_tp_size = sizes.values()
 
     # Dense layer DP size (world = tp * cp * dp * pp)

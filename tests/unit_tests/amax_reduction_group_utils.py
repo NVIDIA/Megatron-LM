@@ -43,6 +43,7 @@ def copy_of(group):
     torch.distributed.all_gather_object(all_ranks, torch.distributed.get_process_group_ranks(group))
     enumeration = [list(ranks) for ranks in sorted({tuple(ranks) for ranks in all_ranks})]
     copy, _ = torch.distributed.new_subgroups_by_enumeration(enumeration)
+    _copied_groups.append(copy)
     return copy
 
 
@@ -50,13 +51,32 @@ def with_copied_amax_groups(pg_collection=None):
     """Set amax groups that match the global ones in ranks but not in identity.
 
     A context that reads the global group instead of the collection's then fails an identity
-    check, although both groups reduce over the same ranks.
+    check, although both groups reduce over the same ranks. The test's teardown releases the
+    copies with destroy_copied_amax_groups.
     """
     if pg_collection is None:
         pg_collection = ProcessGroupCollection()
     pg_collection.tp_cp = copy_of(global_amax_group(True))
     pg_collection.tp_dp_cp = copy_of(global_amax_group(False))
     return pg_collection
+
+
+# The groups that copy_of created and destroy_copied_amax_groups has not destroyed yet.
+_copied_groups = []
+
+
+def destroy_copied_amax_groups():
+    """Destroy this rank's groups from copy_of; every rank must call it, in the teardown.
+
+    Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+    """
+    if not _copied_groups:
+        return
+    # Every rank finishes its collectives before any communicator goes away.
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    while _copied_groups:
+        torch.distributed.destroy_process_group(_copied_groups.pop())
 
 
 @contextmanager

@@ -28,7 +28,9 @@ from megatron.training.utils import print_rank_0
 
 def _data_parallel_group(model):
     """Data-parallel group of the model being trained, over which the packed bins are spread."""
-    return get_attr_wrapped_model(model[0], "pg_collection").dp_gtp_remat
+    return rl_utils.get_training_data_parallel_group(
+        get_attr_wrapped_model(model[0], "pg_collection")
+    )
 
 
 class RLLoggingCallback(Callback):

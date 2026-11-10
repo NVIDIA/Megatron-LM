@@ -5,11 +5,13 @@
 import logging
 import threading
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core import parallel_state, process_groups_config
+from megatron.core.config_logger import log_config_to_disk
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -23,15 +25,17 @@ from megatron.core.models.multimodal.context_parallel import (
     split_to_context_parallel_ranks,
     split_to_context_parallel_ranks_dynamic_res,
 )
+from megatron.core.models.T5.t5_spec import decoder_model_with_transformer_engine_default_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     ProcessGroupFallbackWarning,
+    amax_reduction_group,
     enable_strict_process_group_fallbacks,
     resolve_process_groups,
     warn_global_process_group_fallback,
 )
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import CrossAttention, SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_token_prediction import (
@@ -409,6 +413,23 @@ def test_mtp_placement_without_mtp_layers_needs_no_pp_group():
         assert mtp_on_this_rank(mtp_num_layers=None, ignore_virtual=True) is False
 
 
+def test_config_logger_names_the_groups_a_partial_collection_does_not_set(monkeypatch, tmp_path):
+    # A collection without all six rank groups names the dump by the global ranks, like none.
+    monkeypatch.setattr(parallel_state, "get_all_ranks", lambda: "global_ranks")
+    config = SimpleNamespace(config_logger_dir=str(tmp_path))
+    partial = ProcessGroupCollection(tp=None, pp=None)
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        log_config_to_disk(config, {"key": 1}, prefix="dump", pg_collection=partial)
+        log_config_to_disk(config, {"key": 1}, prefix="dump")
+    # The fields are listed in the order of the rank string: tp_gtp_dp_cp_pp_ep.
+    _fallback_warning(record, "log_config_to_disk", "pg_collection.gtp_remat/dp_gtp_remat/cp/ep")
+    _fallback_warning(record, "log_config_to_disk")
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "dump.rank_global_ranks.iter0.json",
+        "dump.rank_global_ranks.iter1.json",
+    ]
+
+
 class TestGlobalProcessGroupFallbacks:
     """Each fallback resolves the same groups as the global grid, which has size > 1 here."""
 
@@ -472,6 +493,34 @@ class TestGlobalProcessGroupFallbacks:
             assert groups["dp"] is global_dp_group
         else:
             assert "dp" not in groups
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the T5 cross-attention spec needs Transformer Engine")
+    def test_cross_attention_linears_without_collection_keep_the_global_amax_groups(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            use_cpu_initialization=True,
+        )
+        decoder_layer = decoder_model_with_transformer_engine_default_spec().submodules
+        with pytest.warns(FutureWarning) as record:
+            attention = CrossAttention(
+                config, decoder_layer.cross_attention.submodules, layer_number=1
+            )
+        _fallback_warning(record, "CrossAttention")
+        # linear_q and linear_kv get the fallback collection. A Transformer Engine linear with a
+        # per-module FP8/FP4 recipe takes its amax reduction group from that collection, so it
+        # must hold the groups that the linear read from the global grid without a collection.
+        for linear in (attention.linear_q, attention.linear_kv):
+            assert linear._pg_collection is attention.pg_collection
+            for tp_only_amax_red in (False, True):
+                assert amax_reduction_group(
+                    linear._pg_collection, tp_only_amax_red
+                ) is parallel_state.get_amax_reduction_group(
+                    with_context_parallel=True, tp_only_amax_red=tp_only_amax_red
+                )
 
     @requires_te_hierarchical_cp
     def test_self_attention_without_collection_supports_hierarchical_cp(self):

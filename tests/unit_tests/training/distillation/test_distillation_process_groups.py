@@ -25,7 +25,7 @@ from megatron.training.distillation.cached_logits_loss import (
 )
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
 from megatron.training.distillation.utils import resolve_distillation_process_groups
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 _GROUP_NAMES = ('tp', 'cp', 'dp_gtp_remat', 'tp_dp_cp')
 
@@ -72,13 +72,38 @@ def test_resolve_rejects_a_collection_without_a_required_group(missing, explicit
         resolve_distillation_process_groups(pg_collection, "LogitsSaverHooks")
 
 
+@pytest.mark.parametrize("wrappers", [0, 2])
+@pytest.mark.parametrize("carries_collection", [True, False])
+def test_loss_func_builds_the_kd_loss_on_the_model_collection(
+    monkeypatch, wrappers, carries_collection
+):
+    pg_collection = ProcessGroupCollection()
+    model = SimpleNamespace(training=False)
+    if carries_collection:
+        model.pg_collection = pg_collection
+    for _ in range(wrappers):
+        model = SimpleNamespace(training=False, module=model)
+    built = []
+    monkeypatch.setattr(
+        cached_logits_loss,
+        "CachedLogitsKDLoss",
+        lambda **kwargs: built.append(kwargs["pg_collection"]),
+    )
+
+    LossFuncCallable(logprobs_dir="unused")(torch.ones(2, 3), torch.zeros(2, 3), model)
+
+    # A model that carries no collection leaves the loss on the global groups.
+    assert [id(groups) for groups in built] == [id(pg_collection if carries_collection else None)]
+
+
 # ---------------------------------------------------------------------------
 # Distributed: a model grid unlike the global one
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(name="pg_collection")
 def _strided_grid():
-    """Return this rank's groups in a grid laid out unlike the global TP=2 grid.
+    """This rank's groups in a grid laid out unlike the global TP=2 grid, destroyed afterwards.
 
     The ranks form two pipeline stages, the even and the odd ranks. In each stage, tensor
     parallelism pairs ranks half a stage apart and data parallelism spans the remaining ranks;
@@ -94,7 +119,9 @@ def _strided_grid():
     dp, _ = dist.new_subgroups_by_enumeration(dp_ranks)
     cp, _ = dist.new_subgroups_by_enumeration([[rank] for rank in range(world_size)])
     stage, _ = dist.new_subgroups_by_enumeration(stages)
-    return ProcessGroupCollection(tp=tp, cp=cp, dp_gtp_remat=dp, tp_dp_cp=stage)
+    pg_collection = ProcessGroupCollection(tp=tp, cp=cp, dp_gtp_remat=dp, tp_dp_cp=stage)
+    yield pg_collection
+    destroy_test_pg_collection(pg_collection)
 
 
 def _patch_run_state(monkeypatch, *, global_batch_size=8):
@@ -185,8 +212,9 @@ class TestDistillationProcessGroups:
             parallel_state.get_context_parallel_world_size(),
         )
 
-    def test_saver_computes_top_k_over_the_model_tensor_parallel_group(self, monkeypatch):
-        pg_collection = _strided_grid()
+    def test_saver_computes_top_k_over_the_model_tensor_parallel_group(
+        self, pg_collection, monkeypatch
+    ):
         _patch_run_state(monkeypatch)
         _forbid_global_process_groups(monkeypatch)
 
@@ -218,8 +246,9 @@ class TestDistillationProcessGroups:
         torch.testing.assert_close(indices, expected_indices)
         torch.testing.assert_close(values, expected_values, rtol=1e-5, atol=1e-5)
 
-    def test_saver_lists_remote_shards_once_per_model_pipeline_stage(self, monkeypatch):
-        pg_collection = _strided_grid()
+    def test_saver_lists_remote_shards_once_per_model_pipeline_stage(
+        self, pg_collection, monkeypatch
+    ):
         _patch_run_state(monkeypatch)
         _forbid_global_process_groups(monkeypatch)
         _fake_remote_listing(
@@ -239,9 +268,8 @@ class TestDistillationProcessGroups:
 
     @pytest.mark.parametrize("format_version", [1, 2])
     def test_teacher_loader_lists_remote_shards_once_per_model_pipeline_stage(
-        self, monkeypatch, format_version
+        self, pg_collection, monkeypatch, format_version
     ):
-        pg_collection = _strided_grid()
         _patch_run_state(monkeypatch)
         _forbid_global_process_groups(monkeypatch)
         root = "msc://bucket/teacher"
@@ -286,8 +314,9 @@ class TestDistillationProcessGroups:
             expected_shard = f"{root}/cp0_dp0__{stage_first_rank}.tar"
         assert dataset._discover_shards(set(), 0) == [expected_shard]
 
-    def test_kd_loss_builds_the_teacher_loader_on_the_model_groups(self, monkeypatch):
-        pg_collection = _strided_grid()
+    def test_kd_loss_builds_the_teacher_loader_on_the_model_groups(
+        self, pg_collection, monkeypatch
+    ):
         _patch_run_state(monkeypatch)
         _forbid_global_process_groups(monkeypatch)
         built = {}
@@ -307,8 +336,7 @@ class TestDistillationProcessGroups:
         assert built["dp"] == (pg_collection.dp_gtp_remat.rank(), pg_collection.dp_gtp_remat.size())
         assert built["tp_dp_cp_group"] is pg_collection.tp_dp_cp
 
-    def test_kd_loss_reduces_over_the_model_tensor_parallel_group(self, monkeypatch):
-        pg_collection = _strided_grid()
+    def test_kd_loss_reduces_over_the_model_tensor_parallel_group(self, pg_collection, monkeypatch):
         _patch_run_state(monkeypatch)
         _forbid_global_process_groups(monkeypatch)
         tp_rank, tp_size = pg_collection.tp.rank(), pg_collection.tp.size()

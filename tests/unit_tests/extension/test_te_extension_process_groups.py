@@ -84,6 +84,13 @@ def _strided_tp_group(tp_size):
 class TestTEFusedMLPTensorParallelGroup:
 
     def teardown_method(self, method):
+        tp_group = getattr(self, "tp_group", None)
+        if tp_group is not None:
+            # The MLPs ran collectives on this group, so every rank finishes them before the
+            # communicator goes away. Utils.destroy_model_parallel does not destroy it.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group(tp_group)
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("fused_mlp_class", _FUSED_MLP_CLASSES)
@@ -98,7 +105,7 @@ class TestTEFusedMLPTensorParallelGroup:
         Utils.initialize_model_parallel(tensor_model_parallel_size=global_tp_size)
         model_parallel_cuda_manual_seed(123)
 
-        tp_group = _strided_tp_group(tp_size)
+        tp_group = self.tp_group = _strided_tp_group(tp_size)
         # gtp_remat=None stops the linear layers from looking up GTP groups in the global grid.
         pg_collection = ProcessGroupCollection(tp=tp_group, gtp_remat=None)
         config = TransformerConfig(
@@ -171,13 +178,15 @@ class TestTEDotProductAttentionContextParallelGroup:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if getattr(self, "grid", None) is not None:
+            self.grid.destroy()
         Utils.destroy_model_parallel()
 
-    @staticmethod
-    def _tp_and_cp_groups():
+    def _tp_and_cp_groups(self):
         world_size = torch.distributed.get_world_size()
-        grid = HyperCommGrid([1, 2, world_size // 2], ["tp", "cp", "dp"])
-        return grid.create_pg("tp"), grid.create_pg("cp")
+        self.grid = HyperCommGrid([1, 2, world_size // 2], ["tp", "cp", "dp"])
+        return self.grid.create_pg("tp"), self.grid.create_pg("cp")
 
     @staticmethod
     def _build(pg_collection):
@@ -205,6 +214,14 @@ class TestTEDotProductAttentionContextParallelGroup:
 
         with pytest.raises(ValueError, match="must have a cp process group"):
             self._build(pg_collection)
+
+    def test_fallback_on_uninitialized_grid_leaves_the_cp_group_unset(self):
+        """Without a collection or a global grid, the CP group is set later, as before."""
+        Utils.destroy_model_parallel()
+
+        attention = self._build(None)
+
+        assert attention.cp_group is None
 
     def test_uses_the_cp_group_of_the_collection(self):
         if Utils.world_size % 2:
