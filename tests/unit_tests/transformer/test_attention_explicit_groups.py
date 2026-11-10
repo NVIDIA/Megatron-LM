@@ -173,7 +173,9 @@ def test_realtime_tests_gather_over_module_groups():
             slot.copy_(tensor)
 
     with _forbid_global_groups(), mock.patch.object(torch.distributed, "all_gather", all_gather):
-        attention.run_realtime_tests()
+        # get_pg_rank() and get_pg_size() read a group only once torch.distributed is initialized.
+        with mock.patch.object(torch.distributed, "is_initialized", return_value=True):
+            attention.run_realtime_tests()
 
     assert len(gathers) == 2
     assert gathers[0][0] is dp_group and gathers[0][1] == dp_group.size()
@@ -182,7 +184,8 @@ def test_realtime_tests_gather_over_module_groups():
 
 @pytest.mark.parametrize("dp_gtp_remat", ["unset", None])
 def test_realtime_tests_require_data_parallel_group(dp_gtp_remat):
-    """Without dp_gtp_remat the check raises before any collective could run over WORLD.
+    """Without dp_gtp_remat the module is rejected when it is built, before any forward could
+    run a collective over WORLD.
 
     The collection sets dp, which does not stand in for dp_gtp_remat.
     """
@@ -194,22 +197,22 @@ def test_realtime_tests_require_data_parallel_group(dp_gtp_remat):
     }
     if dp_gtp_remat != "unset":
         groups["dp_gtp_remat"] = dp_gtp_remat
-    attention = _build_attention(
-        ProcessGroupCollection(**groups),
-        tensor_model_parallel_size=1,
-        on_gpu=False,
-        qk_layernorm=True,
-        test_mode=True,
-    )
 
-    with mock.patch.object(torch.distributed, "all_gather") as all_gather:
-        with pytest.raises(ValueError, match="dp_gtp_remat"):
-            attention.run_realtime_tests()
-    all_gather.assert_not_called()
+    with pytest.raises(ValueError, match="dp_gtp_remat"):
+        _build_attention(
+            ProcessGroupCollection(**groups),
+            tensor_model_parallel_size=1,
+            on_gpu=False,
+            qk_layernorm=True,
+            test_mode=True,
+        )
 
 
 def test_realtime_tests_require_tensor_parallel_group():
-    """Without a TP group the check raises before any collective could run over WORLD."""
+    """Without a TP group the check raises before any collective could run over WORLD.
+
+    A collection without one is rejected when the module is built, so the group is removed after.
+    """
     pg_collection = ProcessGroupCollection(
         tp=_StandInGroup(), cp=_StandInGroup(), dp_gtp_remat=_StandInGroup(), gtp_remat=None
     )
@@ -230,7 +233,10 @@ def test_default_collection_resolves_dp_gtp_remat_for_realtime_tests(
     fresh_fallback_warnings, test_mode, qk_layernorm
 ):
     """Only a model that runs the Q/K layernorm check resolves the global dp_gtp_remat group."""
-    pg_collection = ProcessGroupCollection(tp=_StandInGroup(), cp=_StandInGroup(), gtp_remat=None)
+    # The construction-time check needs the group the fallback asked for.
+    pg_collection = ProcessGroupCollection(
+        tp=_StandInGroup(), cp=_StandInGroup(), dp_gtp_remat=_StandInGroup(), gtp_remat=None
+    )
     with mock.patch.object(
         ProcessGroupCollection, "use_mpu_process_groups", return_value=pg_collection
     ) as use_mpu_process_groups:
