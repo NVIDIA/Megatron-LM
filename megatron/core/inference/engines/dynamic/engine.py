@@ -26,7 +26,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, InferenceMode
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -202,10 +201,7 @@ class DynamicInferenceEngine(
                 if isinstance(module, ShortcutMoEBlock):
                     module.setup_inference_overlap()
 
-        if inference_config.pg_collection is not None:
-            self.pg_collection = inference_config.pg_collection
-        else:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = inference_config.resolve_pg_collection()
 
         # Initialization options.
         self.controller = controller

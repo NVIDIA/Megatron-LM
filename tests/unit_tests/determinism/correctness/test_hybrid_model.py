@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
 from tests.unit_tests.determinism.configs import HYBRID_CONFIGS, hybrid_base
@@ -108,6 +109,7 @@ class TestHybridModelDeterminism:
                 pre_process=pre_process,
                 post_process=post_process,
                 vp_stage=vp_stage,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
 
         runner = BitExactRunner(

@@ -122,7 +122,11 @@ def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size
             fp8=None,
         )
     )
-    context = SimpleNamespace(config=SimpleNamespace(pg_collection=pg_collection))
+    context = SimpleNamespace(
+        config=SimpleNamespace(
+            pg_collection=pg_collection, resolve_pg_collection=lambda: pg_collection
+        )
+    )
     monkeypatch.setattr(
         torch.distributed,
         "get_world_size",

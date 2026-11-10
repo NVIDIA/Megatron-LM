@@ -29,8 +29,9 @@ it does not read global process-group state and is outside this deprecation.
 
 The helpers in `megatron/core/inference/communication_utils.py` accept an explicit pipeline
 group, but only check physical stages; they do not replace virtual-pipeline-aware predicates.
-Gloo groups are still tier-1 group accessors, although the collection has no corresponding
-fields. Pass those groups explicitly when migrating a caller. The dynamic (formerly hybrid)
+Gloo groups are still tier-1 group accessors. The collection holds only the partial
+data-parallel Gloo groups, as `intra_dp_cp_gloo` and `intra_expt_dp_gloo`; pass the other Gloo
+groups explicitly when migrating a caller. The dynamic (formerly hybrid)
 data/context groups map to the `dynamic_cp` and `dynamic_tp_cp` fields, which are keyed by the
 runtime context-parallel size.
 
@@ -53,6 +54,8 @@ expert tensor parallelism uses `expt_tp`, which may differ from the dense `tp` g
 | `get_data_parallel_group()` | `dp_gtp_remat`; use `dp` when `with_gtp_remat=False` |
 | `get_data_parallel_group(with_context_parallel=True)` | `dp_cp_gtp_remat`; use `dp_cp` when `with_gtp_remat=False` |
 | `get_expert_data_parallel_group()` | `expt_dp_gtp_remat`; use `expt_dp` when `with_gtp_remat=False` |
+| `get_data_parallel_group_gloo(with_context_parallel=True, partial_data_parallel=True)` | `intra_dp_cp_gloo` |
+| `get_expert_data_parallel_group_gloo(partial_expert_data_parallel=True)` | `intra_expt_dp_gloo` |
 
 These data-parallel mappings assume the partial-group flag is false. For partial groups,
 `intra_dp_cp` and `intra_expt_dp` exclude GTP-remat; the collection does not cover every flag
