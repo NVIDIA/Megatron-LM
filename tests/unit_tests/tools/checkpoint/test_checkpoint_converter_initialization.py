@@ -37,6 +37,8 @@ def _initialize_loader_environment():
     loader.margs = SimpleNamespace(
         tensor_model_parallel_size=2, pipeline_model_parallel_size=2, expert_model_parallel_size=1
     )
+    # The model config is built from the checkpoint's arguments, which this setup does not parse.
+    loader.build_model_config = lambda: None
     with (
         mock.patch('megatron.training.argument_utils.inference_cfg_container_from_args'),
         mock.patch('megatron.training.global_vars.set_global_variables'),
@@ -58,6 +60,8 @@ def _initialize_saver_environment():
     saver.margs = SimpleNamespace()
     saver.md = SimpleNamespace(iteration=3)
     saver.import_model_provider = lambda: None
+    # The model config is built from the checkpoint's arguments, which this setup does not parse.
+    saver.build_model_config = lambda: None
     with (
         mock.patch('megatron.training.argument_utils.inference_cfg_container_from_args'),
         mock.patch('megatron.training.global_vars.set_global_variables'),
