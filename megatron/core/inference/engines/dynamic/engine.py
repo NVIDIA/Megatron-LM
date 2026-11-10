@@ -1006,16 +1006,17 @@ class DynamicInferenceEngine(
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 request = self.get_request(request_id)
-                self._add_request(request, is_resume=True)
                 if isinstance(request, DynamicVLMInferenceRequest):
                     # Buffer reinitialization wipes the context maps. Restore
                     # either the freshly recomputed state or the explicitly
-                    # permitted retained state.
+                    # permitted retained state before re-admission, so that a
+                    # request failing re-admission releases it on completion.
                     self.context.add_vlm_request_data(
                         request_id,
                         image_embeddings=request.image_embeddings,
                         image_token_mask=request.image_token_mask,
                     )
+                self._add_request(request, is_resume=True)
 
             # Ensure chunked prefill request remains at the head of the waiting queue
             if self.context.chunked_prefill_request_id != -1:
