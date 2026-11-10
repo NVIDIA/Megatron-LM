@@ -135,7 +135,9 @@ def _selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
+    # int64: the batch offsets below (pid_b * stride_*_batch) reach 2^31 elements once the
+    # batch does, e.g. for dt and z, which are views of the in_proj output.
+    pid_b = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -147,7 +149,9 @@ def _selective_scan_update_kernel(
     # 1. State Mapping (handles dynamic batching slot allocation)
     if HAS_STATE_BATCH_INDICES:
         state_batch_indices_ptr += pid_b
-        state_batch_idx = tl.load(state_batch_indices_ptr)
+        # int64 whatever the index dtype: a slot's offset reaches 2^31 elements once one
+        # layer's state or snapshot buffer does.
+        state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         # Skip padding tokens (e.g. from graph capture or inactive slots)
         if state_batch_idx < 0:
             for s in range(seq_len):

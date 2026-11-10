@@ -59,15 +59,18 @@ def causal_conv1d_update_kernel(
     SILU_ACTIVATION: tl.constexpr,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
-    batch_id = tl.program_id(0)
+    # int64: the batch offsets below (batch_id * x_b_stride, batch_id * out_b_stride) reach
+    # 2^31 elements once the batch does, e.g. for x, which is a view of the in_proj output.
+    batch_id = tl.program_id(0).to(tl.int64)
     channel_block_id = tl.program_id(1)
 
     channel_offsets = channel_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     mask = channel_offsets < dim
 
-    # State batch coordinate mapping
+    # State batch coordinate mapping. int64 whatever the index dtype: a slot's offset reaches
+    # 2^31 elements once one layer's state or snapshot buffer does.
     if HAS_STATE_INDICES:
-        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id)
+        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id).to(tl.int64)
     else:
         state_batch_coord = batch_id
 
