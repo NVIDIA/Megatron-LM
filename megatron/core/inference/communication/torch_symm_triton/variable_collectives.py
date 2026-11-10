@@ -97,11 +97,13 @@ def _multimem_all_gather_v_kernel(
         return
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token + channel_offset + tid
 
@@ -214,11 +216,13 @@ def _multimem_reduce_scatter_v_kernel(
     sync_threads()
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         program_offset = token_offset * numel_per_token
 
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
@@ -418,13 +422,15 @@ def _multimem_all_gatherv_3tensor_kernel(
         return
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token_0 = tl.cdiv(HIDDEN_SIZE_0, NUMEL_PER_THREAD_0)
     numel_per_token_1 = tl.cdiv(HIDDEN_SIZE_1, NUMEL_PER_THREAD_1)
     numel_per_token_2 = tl.cdiv(HIDDEN_SIZE_2, NUMEL_PER_THREAD_2)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         # --- Tensor 0 ---
         for channel_offset in range(0, numel_per_token_0, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_0 + channel_offset + tid
