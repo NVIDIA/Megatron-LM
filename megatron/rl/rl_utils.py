@@ -2540,6 +2540,32 @@ def compute_logprobs_batch(
     return logprobs.cpu()
 
 
+def get_training_data_parallel_group(pg_collection: ProcessGroupCollection):
+    """Return the data-parallel group that the rollouts of the trained model are spread over.
+
+    This is ``dp_gtp_remat``, which holds every rank that reads distinct data. A collection
+    that predates the GTP weight-remat fields carries only the replicate group ``dp``; without
+    a GTP weight-remat axis that is the same group.
+
+    Args:
+        pg_collection: Process groups of the model being trained.
+
+    Raises:
+        ValueError: ``pg_collection`` sets neither group, or sets only ``dp`` while its
+            ``gtp_remat`` group holds more than one rank, so that ``dp`` misses ranks that read
+            distinct data.
+    """
+    group = pg_collection.dp_gtp_remat
+    if group is not None:
+        return group
+    if pg_collection.dp is None or get_pg_size(pg_collection.gtp_remat) > 1:
+        raise ValueError(
+            "RL training requires the trained model's pg_collection to set dp_gtp_remat, or "
+            "dp without GTP weight remat"
+        )
+    return pg_collection.dp
+
+
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
@@ -2579,7 +2605,7 @@ def prepare_data_for_update(
     # The rollouts are split and packed over the process groups of the model being trained,
     # which can differ from those of a separate inference model.
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
-    dp_group = pg_collection.dp_gtp_remat
+    dp_group = get_training_data_parallel_group(pg_collection)
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):

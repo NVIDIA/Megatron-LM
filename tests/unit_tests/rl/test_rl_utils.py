@@ -1666,18 +1666,39 @@ class TestRLUtils:
         )
         assert get_num_microbatches() == expected_microbatches
 
+    def test_get_training_data_parallel_group(self, monkeypatch):
+        """The rollouts are spread over dp_gtp_remat. A collection that predates the GTP
+        weight-remat fields carries only dp, which is the same group unless gtp_remat holds
+        more than one rank. A collection with neither group is rejected."""
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        dp, dp_gtp_remat = SimpleNamespace(size=lambda: 2), SimpleNamespace(size=lambda: 4)
+        gtp_remat = SimpleNamespace(size=lambda: 2)
+        select = rl_utils.get_training_data_parallel_group
+
+        full = ProcessGroupCollection(dp=dp, dp_gtp_remat=dp_gtp_remat, gtp_remat=gtp_remat)
+        assert select(full) is dp_gtp_remat
+        assert select(ProcessGroupCollection(dp=dp)) is dp
+        assert select(ProcessGroupCollection(dp=dp, dp_gtp_remat=None, gtp_remat=None)) is dp
+        for groups in ({"dp": dp, "gtp_remat": gtp_remat}, {"dp": None}, {"cp": dp}):
+            with pytest.raises(ValueError, match="pg_collection to set dp_gtp_remat"):
+                select(ProcessGroupCollection(**groups))
+
     @pytest.mark.skipif(
         Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
     )
+    @pytest.mark.parametrize("dp_field", ["dp_gtp_remat", "dp"])
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
-    def test_prepare_data_for_update_uses_training_model_groups(self, initialize_model_parallel):
+    def test_prepare_data_for_update_uses_training_model_groups(
+        self, initialize_model_parallel, dp_field
+    ):
         """The rollouts are split over the data-parallel group of the model being trained, which
         need not be the global one, and the logprobs pass selects and runs its schedule on the
-        model's process groups: no global grid accessor is read."""
+        model's process groups: no global grid accessor is read. The group is dp_gtp_remat, or
+        dp in a collection that does not set dp_gtp_remat."""
         world_size, _, _, _ = initialize_model_parallel
         tokenizer = MockTokenizer()
         self.create_test_args(
@@ -1693,7 +1714,8 @@ class TestRLUtils:
         model_dp_group, _ = dist.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, world_size, 2)]
         )
-        model.pg_collection.dp_gtp_remat = model_dp_group
+        model.pg_collection.dp_gtp_remat = None
+        setattr(model.pg_collection, dp_field, model_dp_group)
 
         def rollout(row):
             # The second token identifies the row.
