@@ -885,7 +885,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
         "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
-        "the default atomic top-k finalize and routed backend are not covered by that test.",
+        "the default atomic top-k finalize and routed backend are not covered by that test. "
+        "test_flashinfer_routed_mxfp8_padded_launch_replays replays a routed launch at expert "
+        "hidden 128 padded with unrouted rows, with top-k=1.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
