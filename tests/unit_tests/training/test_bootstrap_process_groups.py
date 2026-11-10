@@ -14,7 +14,12 @@ update of the run's groups, and the deprecation of the overrides that --lazy-mpu
 """
 
 import dataclasses
+import json
+import os
+import pathlib
 import re
+import subprocess
+import sys
 import warnings
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -37,6 +42,8 @@ from megatron.core.process_groups_config import (
 from megatron.training import arguments, global_vars, initialize, training
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from tests.unit_tests.test_utilities import Utils
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 FIELDS = {field.name for field in dataclasses.fields(ProcessGroupCollection)}
 DATA_PARALLEL_FIELDS = ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
@@ -97,9 +104,16 @@ def _require_divisible(num_ranks):
         pytest.skip(f"needs a world size divisible by {num_ranks}, got {Utils.world_size}")
 
 
-def _require_no_distributed():
+def _destroy_the_grid():
+    """Destroy the grid that an earlier test may have left, so that a test can register stand-in
+    groups, or run without a grid, also in a run that initialized torch.distributed."""
     if torch.distributed.is_initialized():
-        pytest.skip("registering fake groups would replace the groups of the distributed run")
+        # As Utils.initialize_model_parallel() does: every rank has finished creating the groups
+        # before any rank destroys them.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.distributed.barrier()
+    parallel_state.destroy_model_parallel()
 
 
 @contextmanager
@@ -200,7 +214,7 @@ class TestFrameworkCollection:
     """A framework registers a collection that may leave fields unset."""
 
     def setup_method(self, method):
-        _require_no_distributed()
+        _destroy_the_grid()
 
     def teardown_method(self, method):
         parallel_state.destroy_model_parallel()
@@ -271,7 +285,7 @@ class TestUnregisteredGrid:
     """A grid set up without the registry is read from the global grid, with a warning."""
 
     def setup_method(self, method):
-        _require_no_distributed()
+        _destroy_the_grid()
 
     @pytest.fixture
     def unregistered_grid(self, monkeypatch):
@@ -309,8 +323,6 @@ class TestUnregisteredGrid:
                 initialize._registered_pg_collection("pretrain")
 
     def test_an_uninitialized_grid_fails_after_the_warning_as_before(self):
-        if parallel_state.is_initialized():
-            pytest.skip("a grid is initialized")
         with pytest.raises(AssertionError, match="data parallel group"):
             _read_with_the_shim()
 
@@ -372,7 +384,7 @@ class TestBootstrapReads:
     """pretrain() and initialize_megatron() read the registry: no shim, no warning."""
 
     def setup_method(self, method):
-        _require_no_distributed()
+        _destroy_the_grid()
 
     def teardown_method(self, method):
         parallel_state.destroy_model_parallel()
@@ -478,38 +490,66 @@ class TestLazyMpuInit:
         assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK == 3
 
 
-@pytest.mark.skipif(Utils.world_size > 1, reason="A distributed run initializes the real world")
+# Rank 5 of 8 builds the all-gather groups of a TP2 x EP2 x DP2 grid on the fake backend. It
+# prints, for the dense and the expert group: whether the all-gather group is a communicator of
+# its own, its ranks, and the ranks of the group that it mirrors.
+_FAKE_BACKEND_ALL_GATHER_GROUPS = """
+import json
+
+import torch
+from torch.testing._internal.distributed.fake_pg import FakeStore
+
+from megatron.core import parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.process_groups_config import ProcessGroupCollection
+
+torch.distributed.init_process_group("fake", store=FakeStore(), rank=5, world_size=8)
+grid = HyperCommGrid([2, 2, 2], ["tp", "ep", "dp"])
+pg_collection = ProcessGroupCollection(
+    dp_cp=grid.create_pg(["ep", "dp"]), ep=grid.create_pg("ep"), expt_dp=grid.create_pg("dp")
+)
+all_gather_groups = parallel_state.create_all_gather_groups(
+    for_expert_parallelism=True, pg_collection=pg_collection
+)
+ranks = torch.distributed.get_process_group_ranks
+print(
+    json.dumps(
+        [
+            [all_gather_group is not group, ranks(all_gather_group), ranks(group)]
+            for all_gather_group, group in zip(
+                all_gather_groups, (pg_collection.dp_cp, pg_collection.expt_dp)
+            )
+        ]
+    )
+)
+"""
+
+
 class TestFakeBackend:
     """With --fake-process-group, each process stands for one rank and communicates nothing."""
 
-    def test_all_gather_groups_mirror_the_collection(self, monkeypatch):
+    def test_all_gather_groups_mirror_the_collection(self):
         """The fake all-gather returns this rank's own entry from every rank."""
-        _require_no_distributed()
-        from torch.testing._internal.distributed.fake_pg import FakeStore
+        # In a new process: the fake backend takes the place of the default process group,
+        # which a distributed test run has already initialized. HyperCommGrid takes the world
+        # size from WORLD_SIZE when it is set, which is the size of the test run.
+        env = {name: value for name, value in os.environ.items() if name != "WORLD_SIZE"}
+        result = subprocess.run(
+            [sys.executable, "-c", _FAKE_BACKEND_ALL_GATHER_GROUPS],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        groups = json.loads(result.stdout.strip().splitlines()[-1])
 
-        monkeypatch.setattr(parallel_state, "_global_process_group_list", None)
-        torch.distributed.init_process_group("fake", store=FakeStore(), rank=5, world_size=8)
-        try:
-            grid = HyperCommGrid([2, 2, 2], ["tp", "ep", "dp"])
-            pg_collection = ProcessGroupCollection(
-                dp_cp=grid.create_pg(["ep", "dp"]),
-                ep=grid.create_pg("ep"),
-                expt_dp=grid.create_pg("dp"),
-            )
-
-            all_gather_groups = parallel_state.create_all_gather_groups(
-                for_expert_parallelism=True, pg_collection=pg_collection
-            )
-
-            for all_gather_group, group in zip(
-                all_gather_groups, (pg_collection.dp_cp, pg_collection.expt_dp)
-            ):
-                assert all_gather_group is not group
-                assert torch.distributed.get_process_group_ranks(
-                    all_gather_group
-                ) == torch.distributed.get_process_group_ranks(group)
-        finally:
-            torch.distributed.destroy_process_group()
+        # The dense group spans the EP x DP ranks of rank 5, the expert group its DP ranks.
+        assert [ranks for _, _, ranks in groups] == [[1, 3, 5, 7], [1, 5]]
+        for is_own_communicator, all_gather_ranks, ranks in groups:
+            assert is_own_communicator
+            assert all_gather_ranks == ranks
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="Requires a distributed run")
