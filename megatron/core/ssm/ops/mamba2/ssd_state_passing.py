@@ -9,6 +9,24 @@ import triton.language as tl
 
 from megatron.core.tuning import autotune_configs
 
+# dst mode updates `dst_states` in place, and decode passes the slot states as both
+# `initial_states` and `dst_states`, so every timed autotuning launch must start from the
+# caller's states. This is Triton's `restore_value=["dst_states_ptr"]`, which before
+# Triton 3.8 fails on the None that the other mode passes.
+_dst_states_before_launch = []
+
+
+def _save_dst_states(nargs, reset_only=False):
+    """Autotuner pre-hook: copy dst mode's destination before a timed launch."""
+    if not reset_only and nargs["dst_states_ptr"] is not None:
+        _dst_states_before_launch.append(nargs["dst_states_ptr"].clone())
+
+
+def _restore_dst_states(nargs, exception):
+    """Autotuner post-hook: undo the timed launch's in-place update."""
+    if nargs["dst_states_ptr"] is not None:
+        nargs["dst_states_ptr"].copy_(_dst_states_before_launch.pop())
+
 
 @triton.autotune(
     configs=autotune_configs(
@@ -22,6 +40,8 @@ from megatron.core.tuning import autotune_configs
         ]
     ),
     key=["dim"],
+    pre_hook=_save_dst_states,
+    post_hook=_restore_dst_states,
 )
 @triton.jit
 def _state_passing_fwd_kernel(

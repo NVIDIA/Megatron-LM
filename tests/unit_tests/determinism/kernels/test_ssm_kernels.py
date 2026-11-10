@@ -207,6 +207,43 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def test_state_passing_dst_mode_replays():
+    """State passing in dst mode, in place as batch-invariant decode's tile path calls it: the
+    slot states are both the initial and the destination states, and each flagged entry
+    commits its boundary state into its slot."""
+    from megatron.core.ssm.ops.mamba2.ssd_state_passing import _state_passing_fwd
+
+    seeded()
+    entries, num_slots, nheads, dim, chunk = 64, 80, 32, 64 * 128, 128
+    states = torch.randn(entries, nheads, dim, device="cuda")
+    dA_cumsum = -torch.rand(nheads, entries, chunk, device="cuda")
+    slots = torch.randperm(num_slots, device="cuda")[:entries].to(torch.int32)
+    flags = (torch.rand(entries, device="cuda") < 0.5).to(torch.int32)
+    ssm_state = torch.randn(num_slots, nheads, dim, device="cuda")
+
+    def fn(states, dA_cumsum, ssm_state):
+        _state_passing_fwd(
+            states,
+            dA_cumsum,
+            None,
+            slots,
+            initial_states=ssm_state,
+            dst_states=ssm_state,
+            dst_indices=slots,
+            dst_flags=flags,
+        )
+        return ssm_state
+
+    assert_replays_bit_exact(
+        fn,
+        (states, dA_cumsum, ssm_state),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="_state_passing_fwd (dst mode, in place)",
+    )
+
+
 def test_batch_invariant_decode_step_replays():
     """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
     current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""
