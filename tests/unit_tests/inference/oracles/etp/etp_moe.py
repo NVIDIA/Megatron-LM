@@ -553,16 +553,23 @@ def local_expert_range(problem: Problem, env: SimpleNamespace) -> range:
 
 
 def build_layer(config, problem: Problem, env: SimpleNamespace):
-    """The inference MoE layer from the production spec, with this rank's shards loaded.
-
-    The shards go into the per-expert TE parameters, which the experts concatenate at their
-    first inference forward, as after a checkpoint load.
-    """
+    """The inference MoE layer from the production spec, with this rank's shards loaded."""
     from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+
+    layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+    load_shards(layer, problem, env)
+    return layer
+
+
+def load_shards(layer, problem: Problem, env: SimpleNamespace) -> None:
+    """Write this rank's expert shards into the layer's per-expert weights.
+
+    The experts concatenate (or quantize) these at their first inference forward, as after a
+    checkpoint load or refit; MCore MXFP8 weights requantize in place (``MXFP8Tensor.copy_``).
+    """
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
     from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 
-    layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
     assert isinstance(layer.experts, InferenceGroupedMLP), type(layer.experts)
     assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
     experts = local_expert_range(problem, env)
@@ -575,12 +582,11 @@ def build_layer(config, problem: Problem, env: SimpleNamespace):
                 ("linear_fc2", problem.fc2[expert][:, cols]),
             ):
                 weight = getattr(getattr(layer.experts, name), f"weight{i}")
-                assert weight.shape == value.shape, (
+                assert tuple(weight.shape) == tuple(value.shape), (
                     f"{name}.weight{i} is {tuple(weight.shape)}; the {env.layout.name} shard of"
                     f" expert {expert} is {tuple(value.shape)}"
                 )
-                weight.copy_(value)
-    return layer
+                weight.copy_(value.contiguous())
 
 
 @contextlib.contextmanager
@@ -683,8 +689,13 @@ def poison_nvls(stale_expert: int) -> None:
     sync_all()
 
 
-def check_nvls(gathered: int, stale_expert: int, *, rsv_rows_untouched: bool, what: str) -> None:
-    """After a step: rows past the gathered tokens and the bytes past each buffer untouched."""
+def check_nvls(gathered: int, stale_expert: int, *, flashinfer: bool = False, what: str) -> None:
+    """After a step: rows past the gathered tokens and the bytes past each buffer untouched.
+
+    The FlashInfer backends are the exception their contract states: the dispatcher sets every
+    routing row to -1 before the gather (``update_metadata``), and the kernels write the whole
+    reduce-scatter buffer (zero rows for -1 routing).
+    """
     sync_all()
     tensors = _nvls_tensors()
     problems = []
@@ -695,9 +706,9 @@ def check_nvls(gathered: int, stale_expert: int, *, rsv_rows_untouched: bool, wh
     expected = {
         "ep_agv_h": POISON_BITS[torch.bfloat16],
         "ep_agv_p": POISON_BITS[torch.float32],
-        "ep_agv_r": stale_expert,
+        "ep_agv_r": -1 if flashinfer else stale_expert,
     }
-    if rsv_rows_untouched:
+    if not flashinfer:
         expected["ep_rsv"] = POISON_BITS[torch.float32]
     for key, value in expected.items():
         rows = tensors[key][gathered:]
@@ -724,9 +735,13 @@ def check_output(
     *,
     probs_at_activation: bool = False,
     exact: bool = False,
+    trusted_fn=None,
     what: str,
 ) -> None:
-    """Real rows against the fp64 reference, padding rows exactly 0."""
+    """Real rows against the fp64 reference, padding rows exactly 0.
+
+    ``trusted_fn(problem, x, routing, probs)`` replaces the default trusted implementation.
+    """
     assert out.shape == batch.x.shape and out.dtype == torch.bfloat16, (out.shape, out.dtype)
     padding = out[~batch.is_real]
     ou.assert_exact(padding, torch.zeros_like(padding), what=f"{what}: padding rows")
@@ -741,7 +756,11 @@ def check_output(
         ou.assert_close_to_reference(
             out[batch.is_real],
             ref,
-            trusted(problem, x, routing, probs, etp, probs_at_activation),
+            (
+                trusted_fn(problem, x, routing, probs)
+                if trusted_fn is not None
+                else trusted(problem, x, routing, probs, etp, probs_at_activation)
+            ),
             dim=-1,
             what=what,
         )
@@ -753,7 +772,7 @@ def run_step(
     problem: Problem,
     batch: Batch,
     *,
-    h100: bool = True,
+    flashinfer: bool = False,
     bind: bool = True,
     route: bool = False,
 ):
@@ -772,7 +791,7 @@ def run_step(
     out = forward(layer, x)
     gathered = gathered_rows(env, batch.x.shape[0])
     check_nvls(
-        gathered, stale_expert, rsv_rows_untouched=h100, what=f"{env.layout.name} rank {env.rank}"
+        gathered, stale_expert, flashinfer=flashinfer, what=f"{env.layout.name} rank {env.rank}"
     )
     ou.assert_exact(x, batch.x, what="hidden states are read-only")
     ou.assert_exact(probs, batch.probs, what="probabilities are read-only")
@@ -799,3 +818,129 @@ def gather_by_token(
     result = torch.empty(num_tokens, hidden, dtype=out.dtype, device="cuda")
     result[recv_ids[held]] = recv[held]
     return result
+
+
+# ---------------------------------------------------------------------------------------------
+# Lossless inputs for the FlashInfer MXFP8 / NVFP4 backends (Blackwell)
+# ---------------------------------------------------------------------------------------------
+
+E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# Exponents of the lossless construction (powers of two in the values below).
+LOSSLESS_EXP_V = -3  # FC1 weight magnitude 6 * 2**3
+LOSSLESS_EXP_X = -2  # token magnitude 6 * 2**2
+LOSSLESS_EXP_W2 = 8  # FC2 weight magnitude 6 * 2**-8
+
+
+def grid_values(shape: Sequence[int], exponent: int, g: torch.Generator) -> torch.Tensor:
+    """E2M1-grid values times ``2**-exponent`` with ``+-6 * 2**-exponent`` first in every
+    16-block of the last dim: exact under MXFP8 (32-blocks), NVFP4 (16-blocks) and bf16."""
+    grid = torch.tensor(E2M1_GRID, device="cuda")
+    numel = math.prod(shape)
+    assert shape[-1] % 16 == 0
+    values = grid[torch.randint(0, 8, (numel,), device="cuda", generator=g)]
+    signs = torch.randint(0, 2, (numel,), device="cuda", generator=g).float() * 2 - 1
+    blocks = (values * signs).view(-1, 16)
+    pins = torch.randint(0, 2, (blocks.shape[0],), device="cuda", generator=g).float() * 2 - 1
+    blocks[:, 0] = 6.0 * pins
+    return (blocks.view(*shape) * 2.0**-exponent).bfloat16()
+
+
+def _block_levels(rows: int, g: torch.Generator) -> torch.Tensor:
+    """``+-2**-n`` with ``n`` in {0, 1} constant over every 32-row block (an FC2-input
+    quantization block), random signs per row."""
+    assert rows % 32 == 0
+    level = torch.pow(
+        2.0, -torch.randint(0, 2, (rows // 32, 1), device="cuda", generator=g).float()
+    )
+    signs = torch.randint(0, 2, (rows // 32, 32), device="cuda", generator=g).float() * 2 - 1
+    return (level * signs).view(rows)
+
+
+def lossless_problem(
+    experts: int, hidden: int, ffn: int, topk: int, activation: str, seed: int
+) -> Problem:
+    """Experts whose FC2 input every MXFP8/NVFP4 recipe represents exactly (after O4b).
+
+    FC1 of expert e is rank one, ``u_e (c e_j)^T`` with ``c = 6 * 2**3`` at one coordinate
+    ``j = coordinate(e)`` of the hidden state and ``u_e = +-2**-n`` constant in magnitude over
+    every 32-block of FFN rows (``n`` in {0, 1}); every FC1 row then has a single nonzero, a
+    power of two times 6 (exact under every recipe, zero blocks included). Tokens
+    (``lossless_tokens``) carry ``+-{1, 2, 4} * 2**2`` at those coordinates, so every FC1
+    output is ``+-6 * 2**m`` with ``|.| >= 96`` and the FC2 input is a block-constant
+    ``0`` or ``36 * 4**m`` (squared ReLU), exactly ``s**2 = 0.25`` (tanh clamp, ``tanh`` of at
+    least 192 is 1 in fp32 and fp64), or ``gate * up`` with ``gate >= 96`` (SwiGLU, ``silu``
+    exact) -- each block a single magnitude, which E4M3 and E2M1 codes with a power-of-two
+    scale hold exactly. FC2 is ``grid_values`` (exact). So the fp64 MoE of these values is the
+    exact contract, and a backend's only roundings are its bf16 outputs.
+    """
+    g = _generator(seed)
+    c = 6.0 * 2.0**-LOSSLESS_EXP_V
+    rows = 2 * ffn if activation == "swiglu" else ffn
+    fc1 = torch.zeros(experts, rows, hidden, device="cuda")
+    for e in range(experts):
+        if activation == "swiglu":
+            u = torch.cat([_block_levels(ffn, g), _block_levels(ffn, g)])  # [gate; up]
+        else:
+            u = _block_levels(rows, g)
+        fc1[e, :, lossless_coordinate(e, hidden)] = u * c
+    fc2 = grid_values((experts, hidden, ffn), LOSSLESS_EXP_W2, g)
+    return Problem(experts, hidden, ffn, topk, activation, fc1.bfloat16(), fc2)
+
+
+def lossless_coordinate(expert: int, hidden: int) -> int:
+    """The hidden coordinate expert ``e``'s FC1 reads: never a block's pinned first element."""
+    return (16 * (expert % (hidden // 16)) + 1 + expert % 15) % hidden
+
+
+def lossless_tokens(
+    problem: Problem, n: int, seed: int, routing: str = "random", ep: int = 1
+) -> Tokens:
+    """Tokens for ``lossless_problem``: ``grid_values`` with ``+-{1, 2, 4} * 2**2`` at every
+    expert's coordinate; probabilities ``k / 16`` (exact in bf16, which routed MXFP8 packs)."""
+    g = _generator(seed)
+    hidden = grid_values((n, problem.hidden), LOSSLESS_EXP_X, g).float()
+    for e in range(problem.experts):
+        j = lossless_coordinate(e, problem.hidden)
+        magnitude = torch.pow(2.0, torch.randint(0, 3, (n,), device="cuda", generator=g).float())
+        sign = torch.randint(0, 2, (n,), device="cuda", generator=g).float() * 2 - 1
+        hidden[:, j] = sign * magnitude * 2.0**-LOSSLESS_EXP_X
+    probs = torch.randint(4, 16, (n, problem.topk), device="cuda", generator=g).float() / 16
+    route = make_routing(n, problem.experts, problem.topk, routing, ep, g)
+    return Tokens(hidden.bfloat16(), route, probs.contiguous(), problem.experts)
+
+
+def trusted_flashinfer(
+    problem: Problem,
+    hidden: torch.Tensor,
+    routing: torch.Tensor,
+    probs: torch.Tensor,
+    layout: Layout,
+) -> torch.Tensor:
+    """torch MoE at the FlashInfer design's least precise rounding points (bf16 out).
+
+    Each rank (EP rank q, expert-TP shard r) finalizes its local routes into a bf16 partial,
+    accumulating the bf16 route outputs ``p * y`` in bf16 (the documented atomic finalize), the
+    reduce-scatter sums the partials in fp32, and the output is rounded once to bf16. The GEMMs
+    run in fp32 (exact on these inputs).
+    """
+    local = problem.experts // layout.ep
+    total = torch.zeros(hidden.shape[0], problem.hidden, dtype=torch.float32, device="cuda")
+    with fp32_matmul():
+        for q in range(layout.ep):
+            for shard in range(layout.etp):
+                cols = shard_columns(problem, layout.etp, shard)
+                partial = torch.zeros_like(total).bfloat16()
+                for slot in range(routing.shape[1]):
+                    for expert in routing[:, slot].unique().tolist():
+                        if expert // local != q:
+                            continue
+                        rows = routing[:, slot] == expert
+                        w1 = fc1_shard(problem, expert, cols).float()
+                        w2 = problem.fc2[expert][:, cols].float()
+                        h = (hidden[rows].float() @ w1.t()).bfloat16()
+                        a = _activate(problem, h.float()).bfloat16()
+                        y = a.float() @ w2.t()
+                        routed = (y * probs[rows, slot, None]).bfloat16()
+                        partial[rows] = (partial[rows].float() + routed.float()).bfloat16()
+                total += partial.float()
+    return total.bfloat16()

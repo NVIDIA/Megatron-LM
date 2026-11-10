@@ -314,7 +314,7 @@ def test_cuda_graph_replay(env, backend, bi):
             etp.check_nvls(
                 rows * layout.tp_ep,
                 stale_expert,
-                rsv_rows_untouched=True,
+                flashinfer=False,
                 what=f"{layout.name} replay {step}",
             )
             etp.check_output(
