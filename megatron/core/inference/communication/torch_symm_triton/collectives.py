@@ -80,10 +80,8 @@ def _multimem_all_gather_kernel(
 ):
     """Single-tensor multicast all-gather kernel."""
     if BARRIER_BEFORE:
-        # Ensure every rank has finished reading the previous contents before
-        # this all-gather reuses the symmetric buffer. The usual RS -> AG
-        # sequence gets this ordering from the reduce-scatter; consecutive AGs
-        # must request it explicitly.
+        # Ensure every rank has finished its earlier work on the symmetric buffer before
+        # this all-gather overwrites it (see multimem_all_gather for when that is known).
         symm_mem_sync(
             signal_pad_ptrs,
             None,
@@ -125,12 +123,25 @@ def _multimem_all_gather_3_kernel(
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    BARRIER_BEFORE: tl.constexpr,
 ):
     """
     Fused 3-tensor multicast all-gather. Processes three tensors in sequence
     then synchronizes once, eliminating 2 kernel launches and 2 barriers
     compared to three separate multimem_all_gather calls.
     """
+    if BARRIER_BEFORE:
+        # Same as in _multimem_all_gather_kernel.
+        symm_mem_sync(
+            signal_pad_ptrs,
+            None,
+            RANK,
+            WORLD_SIZE,
+            hasPreviousMemAccess=True,
+            hasSubsequentMemAccess=True,
+        )
+        sync_threads()
+
     _ag_phase(
         local_ptr_0,
         multicast_ptr,
@@ -187,6 +198,7 @@ def _multimem_reduce_scatter_kernel(
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
     When REDUCE_F32=True, uses fp32 reduction instead of bf16x2 reduction.
+    It barriers on entry only (see multimem_reduce_scatter).
     """
     symm_mem_sync(
         signal_pad_ptrs,
@@ -257,7 +269,7 @@ def multimem_all_gather(
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
     byte_offset: int = 0,
-    barrier_before: bool = False,
+    barrier_before: bool = True,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -265,11 +277,22 @@ def multimem_all_gather(
     Output tensor must be a symmetric memory buffer.
     Input tensor can be a regular torch tensor.
 
-    ``barrier_before`` inserts a pre-all-gather barrier so every rank has finished
-    reading the buffer's previous contents before this all-gather overwrites them.
-    It must be set by the caller whenever this all-gather directly follows another
-    all-gather on the same symmetric buffer with no reduce-scatter in between (a
-    reduce-scatter already establishes that ordering inside its own kernel).
+    Each rank multicast-stores its input into its own segment of every rank's buffer, then
+    all ranks barrier, so the gathered output is complete when this returns. Those stores can
+    land while a peer still reads its buffer for an earlier operation, so ``barrier_before``
+    (the default) first waits until every rank has finished its earlier work. Pass False only
+    when no peer can still be reading the bytes this all-gather writes:
+
+    - A collective that synchronizes the group, such as an NCCL all-gather, ran after the
+      buffer's last operation; or
+    - this all-gather directly follows a multimem_reduce_scatter on the buffer, with the same
+      per-rank size in bytes and byte_offset 0. That reduce-scatter has no exit barrier, so a
+      peer may still be reducing its own segment of every rank's buffer. An all-gather of the
+      same per-rank size writes only this rank's segment, which no peer reads; any other size
+      overlaps a peer's segment.
+
+    After another all-gather, or fused_multimem_rs_add_norm_ag, peers may still be reading the
+    whole gathered tensor, so the barrier is needed.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
     assert are_tensors_nvls_eligible(
@@ -311,13 +334,15 @@ def multimem_all_gather_fused(
     input_2: torch.Tensor,
     byte_offset_2: int,
     symm_mem_hdl: _SymmetricMemory,
+    barrier_before: bool = True,
     **kwargs,
 ) -> None:
     """
     Fused 3-tensor multicast all-gather. Equivalent to calling multimem_all_gather
     three times but with a single kernel launch and a single barrier.
 
-    All tensors must share the same symmetric memory handle.
+    All tensors must share the same symmetric memory handle. ``barrier_before`` is as in
+    multimem_all_gather.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
     assert are_tensors_nvls_eligible(
@@ -349,6 +374,7 @@ def multimem_all_gather_fused(
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
+        BARRIER_BEFORE=barrier_before,
         num_warps=config["num_warps"],
     )
 
@@ -364,6 +390,14 @@ def multimem_reduce_scatter(
     Input tensor must be a symmetric memory buffer.
     Output tensor can be a regular torch tensor.
     Supports bfloat16 and float32 dtypes.
+
+    All ranks barrier on entry, once each has written its input to its own buffer, and then
+    each rank reduces its own segment across every rank's buffer. There is no exit barrier:
+    when this returns on one rank, peers may still be reading their segments of its buffer.
+    So the next write to the buffer must not overlap them. A following all-gather may skip
+    its barrier only if it writes the same per-rank segments (see multimem_all_gather), and
+    the next local write of this rank's buffer, such as the input of a later reduce-scatter,
+    must come after an all-gather or another collective that synchronizes the group.
     """
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
     assert input_tensor.dtype in (

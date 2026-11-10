@@ -876,6 +876,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
             output_dtype=torch.float32 if emit_fp32 else None,
+            # The sequence-parallel gather above synchronized the TP group, as the output
+            # layer's own input gather does otherwise, so the logits gather needs no barrier.
+            inference_tp_ag_barrier=not sequence_parallel_override,
         )
 
         # Apply MuP output scaling to logits
