@@ -65,7 +65,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
-    parser = _add_autoresume_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
@@ -79,7 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_transformer_engine_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_inprocess_restart_args(parser)
-    parser = _add_ft_package_args(parser)
+    parser = _add_fault_tolerance_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -600,7 +599,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1125,7 +1124,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-
     if args.num_layers is not None:
         assert args.encoder_num_layers is None, \
             'cannot have both num-layers and encoder-num-layers specified'
@@ -1192,7 +1190,7 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.moe_grouped_gemm:
+    if args.num_experts is not None and args.moe_grouped_gemm and args.transformer_impl != "local":
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1237,18 +1235,6 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
-
-    if args.hybrid_context_parallel:
-        warn_rank_0(
-            "--hybrid-context-parallel is deprecated. Use --dynamic-context-parallel instead.",
-            args.rank,
-        )
-        if args.dynamic_context_parallel:
-            raise ValueError(
-                "Cannot set both --hybrid-context-parallel and --dynamic-context-parallel"
-            )
-        args.dynamic_context_parallel = True
-        args.hybrid_context_parallel = False
 
     if args.dynamic_context_parallel:
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
@@ -1326,7 +1312,6 @@ def validate_args(args, defaults={}):
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
-
 
     # Derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
@@ -1553,7 +1538,7 @@ def validate_args(args, defaults={}):
         # Packed microbatches carry different numbers of valid tokens, so the
         # default per-microbatch loss averaging would weight tokens unevenly
         # depending on how samples happened to be packed (same reasoning as
-        # the hybrid-context-parallel check above).
+        # the dynamic-context-parallel check above).
         assert args.calculate_per_token_loss, (
             'Sequence packing must be used with --calculate-per-token-loss'
         )
@@ -2044,6 +2029,19 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--mamba-replay-ssm',
+                       dest='mamba_replay_ssm',
+                       action='store_true', default=False,
+                       help='For Mamba speculative decoding: enable ReplaySSM state management '
+                            '(checkpoint SSM state + ring buffer of cached post-conv inputs, '
+                            'output-only decode, flush-on-buffer-full, pointer-move rollback). '
+                            'Requires a per-head scalar A (Mamba-2 / TIE_HDIM).')
+    group.add_argument('--mamba-replay-buffer-len',
+                       dest='mamba_replay_buffer_len',
+                       type=int, default=16,
+                       help='ReplaySSM committed-history buffer length B (tokens). Logical flush '
+                            'threshold is B + (1 + num_speculative_tokens); must satisfy '
+                            'B >= 1 + num_speculative_tokens.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
@@ -2303,7 +2301,6 @@ def _add_network_size_args(parser):
         "mamba_training_ssm_states_dtype",
         "max_seqlen_per_dp_cp_rank",
         "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
-        "hybrid_context_parallel",
         "dynamic_context_parallel",
         "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
@@ -2549,19 +2546,12 @@ def _add_inprocess_restart_args(parser):
                        help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
 
-def _add_ft_package_args(parser):
-    group = parser.add_argument_group(title='ft_package')
-    group.add_argument('--enable-ft-package', action='store_true',
-                       help='If set, Fault Tolerance package is enabled. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--calc-ft-timeouts', action='store_true',
-                       help='If set, FT package will try to automatically compute the timeouts. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
-                       help='Number of warmup iterations before monitoring step section and '
-                       'out-of-section timeouts. The first N iterations are excluded from '
-                       'timeout monitoring as they can be significantly slower than steady-state. '
-                       'Default: 5. Note: This feature is for Nvidia internal use only.')
+def _add_fault_tolerance_args(parser):
+    from megatron.training.config import FaultToleranceConfig
+
+    ArgumentGroupFactory(FaultToleranceConfig, exclude=["fault_injector"]).build_group(
+        parser, "fault tolerance"
+    )
     return parser
 
 
@@ -3005,11 +2995,6 @@ def _add_distributed_args(parser):
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
                        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.')
-    group.add_argument('--gtp-remat-nccl-ub', action='store_true', dest='gtp_remat_nccl_ub',
-                       default=False, help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
-                       'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).')
-    group.add_argument('--gtp-expert-remat-nccl-ub', action='store_true', dest='gtp_expert_remat_nccl_ub',
-                       default=False, help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
@@ -3074,9 +3059,7 @@ def _add_distributed_args(parser):
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
     group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
-                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
-    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Deprecated alias for --dynamic-context-parallel.')
+                       'number of sub-samples assigned to each CP rank when using dynamic context parallel.')
     group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
                        help='Enable variable-sized CP groups selected per packed microbatch.')
     group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
@@ -3234,18 +3217,6 @@ def _add_data_args(parser):
     return parser
 
 
-def _add_autoresume_args(parser):
-    group = parser.add_argument_group(title='autoresume')
-
-    group.add_argument('--adlr-autoresume', action='store_true',
-                       help='Enable autoresume on adlr cluster.')
-    group.add_argument('--adlr-autoresume-interval', type=int, default=1000,
-                       help='Intervals over which check for autoresume'
-                       'termination signal')
-
-    return parser
-
-
 def _add_vision_args(parser):
     group = parser.add_argument_group(title="vision")
 
@@ -3316,6 +3287,14 @@ def _add_vision_args(parser):
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     # General arguments
+    # TransformerConfig generates --no-moe-grouped-gemm / --disable-moe-grouped-gemm
+    # now that grouped GEMM defaults to True. Keep the existing positive flag too.
+    group.add_argument(
+        "--moe-grouped-gemm",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable grouped GEMM for MoE experts (enabled by default).",
+    )
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,

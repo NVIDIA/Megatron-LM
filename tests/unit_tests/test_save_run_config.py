@@ -10,11 +10,16 @@ import torch
 from megatron.core.dist_checkpointing import load_common_state_dict
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig
+from megatron.training.config import (
+    FaultInjectorConfig,
+    FaultToleranceConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+)
+from megatron.training.config.utils import serialize_value
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
@@ -69,7 +74,7 @@ def _assert_saved_config(ckpt_dir, run_config, checkpoint):
     loaded_config = read_run_config(run_config_filename)
     assert loaded_config["train"]["global_batch_size"] == 8
     # The saved checkpoint section describes the policy of this save.
-    assert loaded_config["checkpoint"] == run_config._convert_value_to_dict(checkpoint)
+    assert loaded_config["checkpoint"] == serialize_value(checkpoint)
     return loaded_config
 
 
@@ -82,6 +87,13 @@ def test_save_checkpoint_writes_run_config(
 
     args = create_args
     model, optimizer, opt_param_scheduler = _model_and_states("torch_dist")
+    run_config.fault_tolerance = FaultToleranceConfig(
+        enable_ft_package=True,
+        calc_ft_timeouts=True,
+        ft_num_warmup_iters=9,
+        fault_injector=FaultInjectorConfig(fault_injector_seed=42),
+    )
+    args.enable_ft_package = False
 
     with TempNamedDir(
         tmp_path_dist_ckpt / "test_save_checkpoint_run_config", sync=True
@@ -91,6 +103,8 @@ def test_save_checkpoint_writes_run_config(
         loaded = _assert_saved_config(save_dir / "iter_0000123", run_config, checkpoint)
         assert loaded["checkpoint"]["ckpt_format"] == "torch_dist"
         assert loaded["checkpoint"]["save"] == str(save_dir)
+        assert loaded["fault_tolerance"] == run_config.to_dict()["fault_tolerance"]
+        assert args.enable_ft_package is False
 
 
 def test_save_checkpoint_without_optimizer(
@@ -190,7 +204,7 @@ def test_save_with_explicit_values_records_the_policy_of_the_save(
             get_checkpoint_run_config_filename(str(save_dir / "converted" / "iter_0000123"))
         )
         assert loaded["checkpoint"] == {
-            **run_config._convert_value_to_dict(registered),
+            **serialize_value(registered),
             "ckpt_format": "torch",
             "save": converted_dir,
         }
