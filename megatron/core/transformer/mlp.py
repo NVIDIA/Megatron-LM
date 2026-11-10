@@ -477,10 +477,6 @@ def apply_swiglu_sharded_factory(
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
-    # TP owns a [W_tp; V_tp] pair, whereas GTP shards that pair contiguously.
-    # A GTP shard therefore need not contain both a W and a V slice.
-    source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
-    gtp_size = getattr(source_param, "gtp_remat_size", 1)
 
     # Only FSDP2 supports torch_dist ShardedTensor. (Add other DP sharding algos here if needed.)
     is_torch_fsdp2_param = getattr(original_sh_ten, "is_torch_fsdp2_param", False)
@@ -490,6 +486,15 @@ def apply_swiglu_sharded_factory(
         is_dp_sharded = dp_size > 1
     else:
         is_dp_sharded = False
+
+    source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
+    gtp_size = getattr(source_param, "gtp_remat_size", 1)
+    if gtp_size > 1 and not is_dp_sharded:
+        from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_swiglu_sharded_factory
+
+        return make_gtp_swiglu_sharded_factory(
+            original_sh_ten, sharded_offsets, singleton_local_shards, gtp_size
+        )
 
     @torch.no_grad()
     def sh_ten_build_fn(
@@ -514,35 +519,6 @@ def apply_swiglu_sharded_factory(
             v_key = key
 
         tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
-        if gtp_size > 1:
-            assert not getattr(
-                original_sh_ten, "gtp_pad_length", 0
-            ), "SwiGLU checkpoint mapping requires unpadded GTP FC1 shards."
-            assert local_axis_size % 2 == 0
-            tp_rank, gtp_rank = divmod(rank_offset, gtp_size)
-            tp_size = axis_frag // gtp_size
-            pieces = []
-            for tile_idx, tile in enumerate((tensor_w, tensor_v)):
-                half_idx, half_offset = divmod(2 * gtp_rank + tile_idx, gtp_size)
-                tile_rank = tp_rank * gtp_size + half_offset
-                if singleton_local_shards:
-                    tile_key = f'{key}_{"w" if half_idx == 0 else "v"}'
-                    tile_frag = axis_frag
-                else:
-                    tile_key = key
-                    tile_rank += half_idx * tp_size * gtp_size
-                    tile_frag = axis_frag * 2
-                pieces.append(
-                    ShardedTensor.from_rank_offsets(
-                        tile_key,
-                        tile,
-                        *sharded_offsets,
-                        (swiglu_shard_axis + prepend_axis_num, tile_rank, tile_frag),
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                    )
-                )
-            return pieces
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,
