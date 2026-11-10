@@ -1682,7 +1682,7 @@ class TransformerConfig(ModelParallelConfig):
         # moe_router_padding_for_quantization before any check below reads it.
         if self.moe_router_padding_for_fp8:
             warnings.warn(
-                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "--moe-router-padding-for-fp8 is deprecated. "
                 "Use --moe-router-padding-for-quantization instead."
             )
             self.moe_router_padding_for_quantization = True
