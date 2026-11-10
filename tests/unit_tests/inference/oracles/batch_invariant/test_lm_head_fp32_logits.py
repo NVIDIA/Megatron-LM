@@ -239,16 +239,23 @@ def build_head(config, w_full, *, frozen=True):
 
 
 def shape_input(x2d, layout, seed):
-    """`x2d` [M, H] as the head's input: 2-D, [S, 1, H] (the dynamic batch), or a row-strided
-    [M, H] view (rows of a twice-as-tall buffer)."""
+    """`x2d` [M, H] as the head's input: 2-D, [S, 1, H] (the dynamic batch), or a view whose
+    rows are strided: every other row of a twice-as-tall buffer ("row_strided"), or the left
+    half of a twice-as-wide one ("column_slice")."""
     if layout == "2d":
         return x2d.clone()
     if layout == "s1h":
         return x2d.clone().unsqueeze(1)
-    tall = bf16((2 * x2d.shape[0], x2d.shape[1]), seed + 7)
-    tall[::2] = x2d
-    view = tall[::2]
-    assert x2d.shape[0] < 2 or not view.is_contiguous()
+    tokens, hidden = x2d.shape
+    if layout == "row_strided":
+        tall = bf16((2 * tokens, hidden), seed + 7)
+        tall[::2] = x2d
+        view = tall[::2]
+    else:
+        wide = bf16((tokens, 2 * hidden), seed + 7)
+        wide[:, :hidden] = x2d
+        view = wide[:, :hidden]
+    assert tokens < 2 or not view.is_contiguous()
     return view
 
 
@@ -266,7 +273,7 @@ HEAD_CASES = ou.pairwise_cases(
         "vocab": VOCABS,
         "hidden": HIDDENS,
         "tokens": TOKENS,
-        "layout": ["s1h", "2d", "row_strided"],
+        "layout": ["s1h", "2d"],
         "weight": ["own", "runtime"],
         "frozen": [True, False],
     }
@@ -317,6 +324,40 @@ def test_head_emits_fp32_logits(parallel, case, kind, monkeypatch):
     if kind == "integer" and hidden >= 1024:
         ref = fp64_logits(x2d[:64], w[:4096])
         assert bool((ref.abs() > 256).any()), "no logit above 256: bf16 output would pass"
+
+
+STRIDED_CASES = [  # (vocab, hidden, tokens, layout, weight, frozen)
+    (129, 4096, 7, "row_strided", "own", True),
+    (32000, 2880, 64, "column_slice", "runtime", False),
+    (151936, 4096, 129, "row_strided", "own", False),
+    (257, 64, 2, "column_slice", "runtime", True),
+]
+
+
+@pytest.mark.parametrize(
+    "vocab,hidden,tokens,layout,weight,frozen",
+    [pytest.param(*c, id=f"V{c[0]}-H{c[1]}-M{c[2]}-{c[3]}-{c[4]}") for c in STRIDED_CASES],
+)
+def test_strided_hidden_states(
+    parallel, vocab, hidden, tokens, layout, weight, frozen, monkeypatch
+):
+    """Hidden states whose rows are strided (a view, as `ColumnParallelLinear` accepts and
+    `torch.matmul` handles) give the logits of their values, exactly (integer operands).
+
+    Finding O8a-P1 (H100 dfw 21627808): on main the fp32 path reshapes such a view to [M, H]
+    without a copy and hands it to TE's `general_gemm`, which reads it as contiguous: every row
+    but the first holds another row's logits. Expected to fail on main (expect-fail task); the
+    model call sites pass contiguous hidden states (reach in the packet doc)."""
+    x2d, w = operands(tokens, hidden, vocab, "integer", seed=vocab + tokens)
+    head = build_head(make_config(hidden), w, frozen=frozen)
+    runtime_w = None
+    if weight == "runtime":
+        runtime_w = w.clone()
+        with torch.no_grad():
+            head.weight.zero_()
+    GemmSpy(monkeypatch)
+    out = run_head(head, shape_input(x2d, layout, seed=tokens), runtime_w)
+    check_logits(out.reshape(-1, vocab), x2d, w, f"{layout} input", exact=True)
 
 
 PRODUCTION = [  # (vocab, hidden, tokens)
@@ -492,7 +533,7 @@ MODEL_HIDDEN = 256
 MODEL_SEQ = 37
 
 
-def build_model(kind, vocab, *, tied, mup_mult=None):
+def build_model(kind, vocab, *, tied, mup_mult=None, **config_overrides):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -513,6 +554,7 @@ def build_model(kind, vocab, *, tied, mup_mult=None):
         attention_dropout=0.0,
         hidden_dropout=0.0,
         **extra,
+        **config_overrides,
     )
     model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     common = dict(
@@ -522,8 +564,11 @@ def build_model(kind, vocab, *, tied, mup_mult=None):
         share_embeddings_and_output_weights=tied,
     )
     if kind == "gpt":
+        # RoPE, as production GPT models; an unwrapped learned position table would be fp32.
         model = GPTModel(
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(), **common
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            position_embedding_type="rope",
+            **common,
         )
     else:
         model = HybridModel(
@@ -559,6 +604,16 @@ def model_forward(model, input_ids, *, inference):
     trace = HeadTrace(model.output_layer)
     positions = torch.arange(input_ids.shape[1], device=_DEVICE).expand_as(input_ids)
     mode = InferenceMode.active() if inference else contextlib.nullcontext()
+    dtypes = []
+    hooks = [
+        module.register_forward_hook(
+            lambda mod, args, out, name=name: dtypes.append(
+                (name, getattr(out[0] if isinstance(out, tuple) else out, "dtype", None))
+            )
+        )
+        for name, module in model.named_modules()
+        if name
+    ]
     try:
         with torch.no_grad(), mode:
             logits = model(
@@ -567,8 +622,20 @@ def model_forward(model, input_ids, *, inference):
                 attention_mask=None,
                 runtime_gather_output=True,
             )
+    except Exception as error:
+        record = trace.records[-1] if trace.records else {}
+        h = record.get("h")
+        weight = record.get("kwargs", {}).get("weight")
+        weight = model.output_layer.weight if weight is None else weight
+        raise AssertionError(
+            f"forward ({'inference' if inference else 'training'}) raised {error!r}; head input "
+            f"{None if h is None else h.dtype}, head weight {getattr(weight, 'dtype', None)}; "
+            f"module output dtypes in order: {dtypes}"
+        ) from error
     finally:
         trace.remove()
+        for h in hooks:
+            h.remove()
     assert len(trace.records) == 1, f"the head ran {len(trace.records)} times"
     return logits, trace.records[0]
 
@@ -717,6 +784,34 @@ def test_batch_invariant_logits_are_the_training_logits_upcast(
     ou.assert_exact(logits, train_logits.float(), what="inference logits vs training logits")
 
 
+@pytest.mark.parametrize("kind", ["gpt", "hybrid"])
+def test_batch_invariant_fp32_residual_stream(parallel, kind, monkeypatch):
+    """`fp32_residual_connection=True`: the residual stream is fp32, and TE's final norm returns
+    its parameter dtype, so the head reads bf16 hidden states (checked without the mode). Under
+    batch-invariant mode (triton) the forward must run alike, and the inference logits must be
+    the training logits upcast, bit for bit.
+
+    Suspected finding O8a-P2: the batch-invariant TE RMSNorm returns its input's dtype (fp32),
+    so the head's `torch.matmul` gets an fp32 input and a bf16 weight and
+    `matmul_persistent` raises "Incompatible dtypes" (first seen with an fp32 learned position
+    table, dfw 21627808). Focused case:
+    `test_rmsnorm_batch_invariant.py::test_te_rmsnorm_module_output_dtype_follows_te`."""
+    vocab = 32000
+    model = build_model(kind, vocab, tied=False, fp32_residual_connection=True)
+    g = ou.make_generator(17)
+    input_ids = torch.randint(0, vocab, (2, MODEL_SEQ), generator=g).to(_DEVICE)
+    _, native = model_forward(model, input_ids, inference=False)
+    assert native["h"].dtype == BF16, f"without the mode the head reads {native['h'].dtype}"
+    with bik.set_batch_invariant_mode(True, backend="triton"):
+        train_logits, train_record = model_forward(model, input_ids, inference=False)
+        logits, record = model_forward(model, input_ids, inference=True)
+    assert (
+        train_record["h"].dtype == BF16
+    ), f"under the mode the head reads {train_record['h'].dtype}"
+    ou.assert_exact(record["h"], train_record["h"], what="the head's input (decoder output)")
+    ou.assert_exact(logits, train_logits.float(), what="inference logits vs training logits")
+
+
 # ---------------------------------------------------------------------------------------------
 # The dynamic-inference prefill of a batch-invariant hybrid MoE model (4 GPUs)
 # ---------------------------------------------------------------------------------------------
@@ -817,9 +912,13 @@ def test_hybrid_moe_batch_invariant_prefill_logits(monkeypatch):
             train_rec["out"].view(torch.int16), inf_rec["out"].view(torch.int16)
         )
         upcast_equal = torch.equal(inference_logits, full_logits.float())
+        h_diff = (h_train.float() - h_inf.float()).abs()
+        l_diff = (inference_logits - full_logits.float()).abs()
         assert upcast_equal, (
             "dynamic prefill logits != training logits upcast: head input equal="
-            f"{head_inputs_equal}, head output (bf16) equal={head_outputs_equal}; "
+            f"{head_inputs_equal} ({int((h_diff > 0).sum())} of {h_diff.numel()} differ, max "
+            f"{h_diff.max().item():.3e}, rows {sorted(set((h_diff > 0).nonzero()[:, 0].tolist()))[:16]}), "
+            f"head output (bf16) equal={head_outputs_equal}, logits max diff {l_diff.max().item():.3e}; "
             + (
                 "the decoder output differs, so the head is not the cause"
                 if not head_inputs_equal
