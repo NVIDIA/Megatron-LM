@@ -40,8 +40,10 @@ Tolerance classes:
     element by element (``nu.assert_fp32_sum_within_bound``); bf16: bounded against the fp64 sum
     of the NCCL-gathered partials, calibrated by NCCL's fp32 all-reduce rounded once to bf16;
   * multimem fp32 batch invariance: exact (bitwise) across calls, positions and co-batches, on
-    Blackwell; on Hopper the config contract instead: "multimem" is refused (needs the fix PR
-    s4f-multimem-rounding-doc; fails on main);
+    Blackwell. On Hopper "multimem" is refused when the config is built: main accepts it, and
+    #8961 (``fix/multimem-rounding-doc``) adds the rejection and tests it in
+    ``test_transformer_config.py``
+    (``test_batch_invariant_multimem_collective_is_rejected_on_hopper``);
   * ordered on N(0, 1) data: exact against the rank-order fp32 sum in torch.
 
 Structure-derived inputs: one block per token (grid min(per_rank_max, 128), grid-stride beyond
@@ -62,15 +64,14 @@ rank); `test_ordered_sum_is_rank_ordered` is the case it must pass, and it fails
 reordering happens on the target compiler. #8879 (t3-r09f1) runs the multimem combine at EP =
 world size inside the dispatcher and asserts the correctly-rounded claim; it passed on H100 because
 expert outputs carry few significant bits, so their fp32 sums are exact in any order.
-`test_hopper_refuses_batch_invariant_multimem` fails on main: it is the contract the fix PR
-s4f-multimem-rounding-doc adds (a config-time rejection on Hopper).
 
 Since the medium-risk batch: production shapes at the whole node for both combines
 (`test_production_shapes`: DeepSeek-V3, Nemotron 3 Nano and Nemotron 3 Super's latent MoE,
 2048 tokens per step); NaN and infinities in the partials (`test_special_values_propagate`);
-one compute-sanitizer case per kernel (`test_sanitizer_small_case`); and the int32 limits of
-the row offsets (`test_int32_row_offsets`, `large`: 8 GiB of fp32 rows for the ordered kernel,
-16 GiB for the multimem one; suspected findings O5-M1 and O5-M2 on main).
+and one compute-sanitizer case per kernel (`test_sanitizer_small_case`). Row offsets past the
+int32 limit fail on main (findings O5-M1 and O5-M2); #9314 (``fix/nvls-int64-row-offsets``)
+fixes them and tests both combines there
+(``test_variable_collectives.py::test_reduce_scatter_v_past_int32_offsets``, ``large``).
 """
 
 import pytest
@@ -293,8 +294,8 @@ def test_multimem_fp32_combine_is_batch_invariant(nvls_groups, ws, hidden):
     over several calls the per-rank counts, the probes' row positions, the co-batched tokens
     and the timing (a random rank is delayed) change, and every probe's combined row must keep
     its bits. Every call is also checked against the fp32 summation bound. Correct rounding is
-    not required. Blackwell only: on Hopper Megatron refuses the collective
-    (test_hopper_refuses_batch_invariant_multimem)."""
+    not required. Blackwell only: on Hopper the sum is not guaranteed batch-invariant, and #8961
+    refuses the collective there."""
     g = nvls_groups.get(ws)
     symm = g.buffer()
     per_rank_max, probes, calls = 129, PROBES, 6
@@ -372,19 +373,6 @@ def batch_invariant_config(collective):
         batch_invariant_mode=True,
         batch_invariant_collective=collective,
     )
-
-
-@ou.requires_sm(ou.HOPPER)
-def test_hopper_refuses_batch_invariant_multimem():
-    """On Hopper, batch-invariant mode with batch_invariant_collective="multimem" is refused when
-    the config is built ("ordered", the default, is accepted). The in-switch sum there is not
-    guaranteed to depend on a token's partials alone (NVLS reductions can depend on the
-    multicast objects allocated before them unless the driver and Fabric Manager carry the fix,
-    NVIDIA/nccl#2360), and Megatron does not check those versions, as for deterministic
-    training. Fails on main; the fix PR s4f-multimem-rounding-doc adds the rejection."""
-    batch_invariant_config("ordered")
-    with pytest.raises((AssertionError, ValueError)):
-        batch_invariant_config("multimem")
 
 
 @blackwell_test
@@ -530,85 +518,3 @@ def test_sanitizer_small_case(nvls_groups, combine):
         run_multimem_combine(case, "randn")
     else:
         run_ordered_combine(case)
-
-
-INT32_HIDDEN = 7168
-"""Row width of the int32-limit cases (DeepSeek-V3's hidden size)."""
-
-INT32_LIMITS = {
-    # combine: (row width in the unit the kernel indexes, the int32 limit in that unit)
-    # multimem: 16-byte lanes, scaled by 2 into 8-byte units (variable_collectives.py:239-243)
-    "multimem": (INT32_HIDDEN // 4, 2**30),
-    # ordered: fp32 elements, global_token * HIDDEN_SIZE + offsets (batch_invariant.py:486)
-    "ordered": (INT32_HIDDEN, 2**31),
-}
-
-
-def _int32_params():
-    labels = ["fits", "crosses", "row-starts-past"]
-    params = []
-    for k, label in enumerate(labels):  # every control first: a fault later poisons the process
-        for combine, (row_units, limit) in INT32_LIMITS.items():
-            rows = ou.int32_overflow_rows(row_units, limit=limit)[k]
-            params.append(
-                pytest.param(
-                    combine, rows, id=f"{combine}-{rows}[int32-{label}]", marks=pytest.mark.large
-                )
-            )
-    return params
-
-
-@gpu_test
-@pytest.mark.parametrize("combine,rows", _int32_params())
-def test_int32_row_offsets(nvls_groups, combine, rows):
-    """Row offsets at the int32 limit (`large`): the combine buffer holds ``rows`` fp32 rows of
-    H 7168 and the last rank's rows reach the row whose offsets cross 2**31 in the unit the
-    kernel indexes (INT32_LIMITS): 8 GiB of rows for the ordered kernel, 16 GiB for the
-    multimem one. A dispatcher would reach these with EP 32 (ordered) or EP 64 (multimem) at
-    the default 16384 max tokens and H 7168, e.g. on a GB200 NVL72 domain. Contract: the same sums
-    as below the limit. ws 2, counts split in half, data in closed form
-    (``nu.closed_form_rows``: every rank computes the expected sums without moving 16 GiB),
-    exact. The `fits` ids are controls. Suspected on main (findings O5-M1, O5-M2): the row
-    offsets are int32, so the `crosses` and `row-starts-past` ids read rows 16 or 32 GiB
-    before the buffer: wrong sums or an illegal-address fault. A fault on one rank leaves its
-    peer waiting in the next collective until the NCCL timeout: run each id in its own job."""
-    g = nvls_groups.get(2)
-    hidden = INT32_HIDDEN
-    counts = [rows // 2, rows - rows // 2]
-    first = counts[0] * g.rank
-    mine = counts[g.rank]
-    row_bytes = hidden * 4
-    allocated = "large" in g.buffers
-    need = mine * row_bytes + (0 if allocated else nu.LARGE_BUFFER_MB << 20) + (2 << 30)
-    nu.require_free_memory_everywhere(need)
-    symm = g.large_buffer()
-    view = symm.view((rows, hidden), torch.float32)
-    for start, count in nu.row_chunks(0, rows, hidden):
-        view[start : start + count] = nu.closed_form_rows(
-            g.rank, start, count, hidden, torch.float32
-        )
-    after = symm.sentinel_after(rows * row_bytes)
-    out = torch.empty((mine, hidden), dtype=torch.float32, device="cuda")
-    COMBINES[combine](
-        out,
-        view,
-        symm.hdl,
-        rank_token_offset=torch.tensor([first], dtype=torch.int32, device="cuda"),
-        ep_max_tokens=torch.tensor([max(counts)], dtype=torch.int32, device="cuda"),
-        per_rank_max_tokens=max(counts),
-    )
-
-    def check():
-        for start, count in nu.row_chunks(0, mine, hidden):
-            expected = sum(
-                nu.closed_form_rows(q, first + start, count, hidden, torch.float32)
-                for q in range(2)
-            )
-            ou.assert_exact(
-                out[start : start + count],
-                expected,
-                what=f"{combine} combine, global rows {first + start}-{first + start + count - 1}",
-            )
-        after.check("large buffer after the rows")
-
-    nu.agree(check, f"{combine} combine of {rows} rows (counts {counts})")

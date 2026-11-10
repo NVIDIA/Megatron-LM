@@ -78,11 +78,6 @@ PRODUCTION_MOE = {
 fp32 probabilities (top-k 8: 128-bit; 6 and 22: 64-bit) and one, two and several windows of the
 fp32 combine rows (256, 672 and 1792 lanes)."""
 
-LARGE_BUFFER_MB = 16 * 1024 + 128
-"""The symmetric buffer of the ``large`` (int32 limit) cases: 16 GiB of rows, so 16-byte-lane
-offsets in 8-byte units reach 2**31, plus the three-tensor all-gather-v's side tensors packed
-after them. Allocated on first use, for groups of 2 only."""
-
 
 def group_size_params() -> List[Any]:
     """``GROUP_SIZES`` as ``pytest.param`` objects with ids ``ws2``, ``ws4``, ``ws8``."""
@@ -176,28 +171,6 @@ class NvlsGroup:
 
     def buffer(self, name: str = "main") -> SymmBuffer:
         return self.buffers[name]
-
-    def large_buffer(self) -> SymmBuffer:
-        """A ``LARGE_BUFFER_MB`` symmetric buffer for this group, made on first use and kept.
-
-        Every rank of the job calls it in the same test. A rank that cannot allocate fails (on
-        target hardware) or skips together with every other rank, so none is left waiting.
-        """
-        if "large" not in self.buffers:
-            from megatron.core.inference.symmetric_memory import SymmetricMemoryBuffer
-
-            buf = SymmetricMemoryBuffer(size_in_mb=LARGE_BUFFER_MB, process_group=self.group)
-            problem = buf.init_failure_reason or ""
-            if not problem and not buf.symm_mem_hdl.multicast_ptr:
-                problem = "no NVLink multicast (multicast_ptr is 0)"
-            anywhere = torch.tensor([1 if problem else 0], device="cuda")
-            dist.all_reduce(anywhere)
-            if int(anywhere):
-                unavailable(
-                    f"{LARGE_BUFFER_MB} MiB symmetric buffer: {problem or 'failed on another rank'}"
-                )
-            self.buffers["large"] = SymmBuffer(raw=buf.symm_buffer, hdl=buf.symm_mem_hdl)
-        return self.buffers["large"]
 
     # NCCL references -------------------------------------------------------------------------
 
@@ -436,7 +409,7 @@ def concat_rows(gathered: torch.Tensor, counts: Sequence[int]) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------------------------
-# Production shapes, special values and int32 limits
+# Production shapes and special values
 # ---------------------------------------------------------------------------------------------
 
 
@@ -512,36 +485,3 @@ def assert_ieee_sum(out: torch.Tensor, parts: torch.Tensor, *, what: str) -> Non
         )
     if problems:
         raise AssertionError(f"{what}: " + "; ".join(problems))
-
-
-def closed_form_rows(
-    owner: int, first_row: int, rows: int, hidden: int, dtype: torch.dtype
-) -> torch.Tensor:
-    """Rows ``[first_row, first_row + rows)`` of rank ``owner``'s data in the int32-limit
-    cases: (((r mod 61) * 3 + (r // 61) mod 17 + 7 c + 29 q) mod 61 - 30) / 16 at row r, column
-    c, rank q. Every rank can compute any rank's rows without moving data; the values differ
-    between neighbouring rows, columns and ranks, and sums of two of them are exact in bf16 and
-    fp32 under any order (multiples of 1/16 below 4 in magnitude)."""
-    r = torch.arange(first_row, first_row + rows, device="cuda", dtype=torch.int64)[:, None]
-    c = torch.arange(hidden, device="cuda", dtype=torch.int64)[None, :]
-    v = ((r % 61) * 3 + (r // 61) % 17 + 7 * c + 29 * owner) % 61 - 30
-    return (v.to(torch.float32) / 16).to(dtype)
-
-
-def row_chunks(start: int, stop: int, hidden: int, elements: int = 1 << 25):
-    """``(first, count)`` chunks of rows ``[start, stop)`` of at most ``elements`` elements."""
-    step = max(1, elements // hidden)
-    for first in range(start, stop, step):
-        yield first, min(step, stop - first)
-
-
-def require_free_memory_everywhere(nbytes: int) -> None:
-    """Skip on every rank (with the numbers) when any rank has less than ``nbytes`` free."""
-    free, _ = torch.cuda.mem_get_info()
-    least = torch.tensor([free], dtype=torch.int64, device="cuda")
-    dist.all_reduce(least, op=dist.ReduceOp.MIN)
-    if int(least) < nbytes:
-        pytest.skip(
-            f"needs {nbytes / 2**30:.1f} GiB free on every rank; least free"
-            f" {int(least) / 2**30:.1f} GiB"
-        )

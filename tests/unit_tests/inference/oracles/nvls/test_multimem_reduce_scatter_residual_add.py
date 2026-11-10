@@ -31,7 +31,10 @@ inference_layers.py:502-521, and the RMSNorm the next layer would otherwise appl
      stores could land while a peer reads Y).
   Preconditions, which the launcher must check (it launches nothing otherwise): bf16 tensors;
   T % ws == 0 (every rank owns T/ws tokens); H % 8 == 0 (rows of whole 16-byte lanes); w is bf16
-  with H elements; the residual tensors hold T/ws * H elements; ws a power of two.
+  with H elements; the residual tensors hold T/ws * H elements; ws a power of two. On main the
+  launcher checks only the dtypes of three tensors and numel % 8 (findings O5-N1, O5-N2);
+  #8958 (``fix/fused-rs-launcher-preconditions``) adds the checks and tests them
+  (``test_nvls_fused_collectives.py::test_launcher_refuses_inputs_outside_the_contract``).
 
 Tolerance classes:
   * residual_out: bit-exact on ``nu.EXACT`` partials and residuals, whose sums are exact in bf16
@@ -42,7 +45,6 @@ Tolerance classes:
   * Y: bounded per row against fp64 RMSNorm of the kernel's own residual_out (gathered with
     NCCL), calibrated by torch's bf16 ``rms_norm`` on the same device; bit-identical across
     ranks (exact); doubling w doubles Y bit for bit, and zero inputs give zero (exact).
-  * The launcher's preconditions: it raises and launches nothing (CPU, kernel replaced).
 
 Structure-derived inputs (kernel and launcher read after the contract above): 8 bf16 per 16-byte
 lane, so a row is H/8 lanes; blocks of at most 1024 lanes (multi-window rows for H > 8192) and
@@ -55,7 +57,7 @@ sized from the whole shard (T*H/(8*ws) lanes); #8880 (t3-r09f2) sizes it from on
   * T/ws around the 128-block grid at H=8192: 127/128/129 tokens per rank, and 257 at H=1152;
   * the shard-sized block cap on main: H=2048 with 4/5 tokens per rank (1024/1280 shard lanes);
   * production: H=1152 (the functional-test model), 4096 with 64 tokens per rank;
-  * rows narrower than a warp (H <= 128 with one or two tokens per rank);
+  * rows narrower than a warp (H = 128 with two tokens per rank, H = 8 with 129);
   * ws in {2, 4, 8} (subgroups of the job), residual in place (production) and separate,
     eps in {1e-5, 1e-6}; combined pairwise. Every third token's residual has two 1024 outliers
     at lane or window edges (first and last lanes, 8191/8192), which dominate the row's sum of
@@ -70,13 +72,12 @@ and random per-rank delays, and CUDA-graph replay with the token count changing 
 Int32 offsets cannot overflow: the index math is in 16-byte lanes and the symmetric buffer is
 512 MiB.
 
-On main, `test_rows_narrower_than_a_warp` fails where the shard has at most 16 lanes
-(T*H/(8*ws) <= 16): the launcher passes num_warps = 0, which Triton rejects. #8880 (t3-r09f2)
-fixes it. `test_launcher_refuses_inputs_outside_the_contract` fails on main and on every open
-PR: the launcher checks none of those preconditions (suspected findings O5-N1, O5-N2).
+On main a shard of at most 16 lanes (T*H/(8*ws) <= 16, e.g. one token per rank at H <= 128)
+launches with num_warps = 0, which Triton rejects. #8880 (t3-r09f2) fixes it and tests those
+shapes (``test_nvls_fused_collectives.py::test_launch_runs_one_token_per_block``); the narrow
+rows here have wider shards and pass on main.
 """
 
-import math
 from types import SimpleNamespace
 
 import pytest
@@ -117,7 +118,7 @@ SHAPES = [
     (16384, 2),
     (16392, 1),
 ]
-TINY_ROWS = [(8, 1), (64, 1), (128, 1), (128, 2), (8, 129)]
+TINY_ROWS = [(128, 2), (8, 129)]
 
 
 def gpu_test(fn):
@@ -352,11 +353,8 @@ def test_sanitizer_small_case(nvls_groups):
 )
 @pytest.mark.parametrize("ws", nu.group_size_params())
 def test_rows_narrower_than_a_warp(nvls_groups, ws, hidden, tokens_per_rank):
-    """Rows of 1 to 16 lanes. Fails on main when the whole shard is at most 16 lanes
-    (T*H/(8*ws) <= 16: H=8, 64, 128 with one token per rank): the shard-sized launch passes
-    num_warps = block_size // 32 = 0 (fused_collectives.py:259-264), which Triton rejects.
-    #8880 (t3-r09f2) launches at least one warp per block; these cases must pass with it.
-    (128, 2) and (8, 129) pass on main."""
+    """Rows of 16 and 1 lanes in shards wider than 16 lanes, which pass on main and with #8880.
+    Shards of at most 16 lanes are #8880's (see the module docstring)."""
     g = nvls_groups.get(ws)
     run_and_check(g, hidden, tokens_per_rank, "separate", "exact", 1e-5, what="narrow rows")
 
@@ -551,75 +549,3 @@ def test_cuda_graph_replay_with_changing_token_count(nvls_groups, ws):
             check_normalized(res.y, res.gathered_y, res.gathered_residual, weight, eps)
 
     nu.agree(check, f"CUDA-graph replays in the order {order}")
-
-
-class _LaunchRecorder:
-    """Stands in for the Triton kernel: records launches instead of running them."""
-
-    def __init__(self):
-        self.launches = []
-
-    def __getitem__(self, grid):
-        return lambda *args, **kwargs: self.launches.append((grid, args, kwargs))
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "valid",
-        "tokens-not-a-multiple-of-ws",
-        "hidden-not-a-multiple-of-8",
-        "weights-not-bf16",
-        "weights-not-hidden-long",
-        "residual-not-shard-sized",
-    ],
-)
-def test_launcher_refuses_inputs_outside_the_contract(monkeypatch, case):
-    """The launcher must reject inputs the kernel cannot process, before launching; "valid" is
-    the control (one launch).
-
-    The other cases fail on main and with every open PR: it checks only dtypes and numel % 8.
-      * T % ws != 0 (suspected finding O5-N1): the kernel gives each rank cdiv(T, ws) tokens, so
-        the last rank adds and normalizes rows past T and multicasts them past T*H*2 into every
-        rank's buffer, and reads and writes its residual past T/ws rows.
-      * H % 8 != 0 with T*H % 8 == 0 (O5-N2): rows are cdiv(H, 8) lanes, so every row after the
-        first is misaligned and reads the next row's elements.
-      * Norm weights that are not bf16, or not H long (O5-N2): the kernel reads them as H bf16
-        values, silently misdecoding fp32 weights.
-      * Residual tensors that are not T/ws * H elements (O5-N2): read and written out of bounds.
-    Runs on CPU: the kernel is replaced by a recorder and the handle by a namespace.
-    """
-    pytest.importorskip("triton")
-    recorder = _LaunchRecorder()
-    monkeypatch.setattr(fused_collectives, "_multimem_reduce_scatter_residual_add_kernel", recorder)
-    ws, tokens, hidden = 4, 8, 1024
-    weight_dtype, weight_len, residual_rows = BF16, None, None
-    if case == "valid":
-        pass
-    elif case == "tokens-not-a-multiple-of-ws":
-        tokens = 10
-    elif case == "hidden-not-a-multiple-of-8":
-        hidden = 12
-    elif case == "weights-not-bf16":
-        weight_dtype = torch.float32
-    elif case == "weights-not-hidden-long":
-        weight_len = hidden + 8
-    else:
-        residual_rows = tokens // ws + 1
-    handle = SimpleNamespace(world_size=ws, rank=ws - 1, multicast_ptr=0, signal_pad_ptrs_dev=0)
-    symm = torch.zeros(tokens, 1, hidden, dtype=BF16)
-    residual = torch.zeros(residual_rows or math.ceil(tokens / ws), 1, hidden, dtype=BF16)
-    weight = torch.ones(weight_len or hidden, dtype=weight_dtype)
-
-    def launch():
-        fused_collectives.fused_multimem_rs_add_norm_ag(
-            residual, symm, handle, residual, weight, 1e-5
-        )
-
-    if case == "valid":
-        launch()
-        assert len(recorder.launches) == 1
-        return
-    with pytest.raises((AssertionError, ValueError, TypeError)):
-        launch()
-    assert not recorder.launches, f"{case}: the kernel was launched"
