@@ -568,24 +568,28 @@ def _violations_in(path: pathlib.Path):
             global grid by then. Other bindings never hide an earlier import or alias (a
             conservative choice for branches and loops), but a name bound in the scope without a
             preceding one is a local value, not a module.
+
+            The events are resolved from the oldest on, so that an assignment that refers to the
+            name's previous value, such as ``x = x.y``, finds that value resolved. From the most
+            recent on, each one would resolve the one before it first, and a few hundred of them
+            in a row would exceed the recursion limit.
             """
-            for start, target in sorted(events, key=lambda event: event[0], reverse=True):
+            resolved = ""
+            for start, target in sorted(events, key=lambda event: event[0]):
                 if start < position:
-                    resolved = self._target(target, scope)
-                    if resolved:
-                        return resolved
-            return ""
+                    resolved = self._target(target, scope) or resolved
+            return resolved
 
         def _seen_by_nested_scopes(self, name, scope):
-            """Return what ``name`` of ``scope`` refers to when a nested scope runs later."""
+            """Return what ``name`` of ``scope`` refers to when a nested scope runs later: its
+            most recent import or alias, resolved from the oldest on as in _binding_at."""
             if name not in scope.seen:
+                # Until all are resolved, the name refers to nothing for one that reads it again.
                 scope.seen[name] = ""
-                events = sorted(scope.events[name], key=lambda event: event[0], reverse=True)
-                for _, target in events:
-                    resolved = self._target(target, scope)
-                    if resolved:
-                        scope.seen[name] = resolved
-                        break
+                resolved = ""
+                for _, target in sorted(scope.events[name], key=lambda event: event[0]):
+                    resolved = self._target(target, scope) or resolved
+                scope.seen[name] = resolved
             return scope.seen[name]
 
         def _enclosing(self, name, scope):

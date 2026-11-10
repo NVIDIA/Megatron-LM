@@ -672,6 +672,32 @@ class TestDetection(unittest.TestCase):
         worker.join(timeout=10)
         self.assertEqual(hits, [[]], "resolving 60 reassignments took more than 10 s")
 
+    def test_many_reassignments_of_a_name_resolve_within_the_recursion_limit(self):
+        # A function defined above the assignments of a name, or one that declares the name
+        # global, sees them all at once. Resolved from the most recent on, each resolved the one
+        # before it first, and 200 of them raised RecursionError.
+        hit = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+        cases = {
+            "below a function that reads the name": (
+                "def f():\n    return x.y\nx = a\n" + "x = x.attr\n" * 300,
+                [],
+            ),
+            "below a function that reads an alias": (
+                IMPORT + "def f():\n    return x.get_tensor_model_parallel_group()\n"
+                "x = parallel_state\n" + "x = x.replace('a', 'b')\n" * 300,
+                [hit],
+            ),
+            "of a global name": (
+                "x = a\ndef init():\n    global x\n"
+                + "    x = x or y\n" * 300
+                + "def f():\n    return x.y\n",
+                [],
+            ),
+        }
+        for case, (source, hits) in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), hits)
+
     def test_attribute_aliases_through_self_cls_and_the_class(self):
         hit = "Model.rank:accessor:parallel_state.get_tensor_model_parallel_group"
         cases = {
