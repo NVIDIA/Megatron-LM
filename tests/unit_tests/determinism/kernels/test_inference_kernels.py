@@ -559,6 +559,19 @@ def test_squared_relu_special_values_replay(clamp_scale):
             quant, (x,), backward=False, what="squared_relu_and_quantize_mxfp8 (special values)"
         )
 
+        def bi_quant(x):
+            q = batch_invariant.squared_relu_with_probs_quantize_mxfp8(
+                x, perm, n_used_t, probs, clamp_scale
+            )
+            return live(q.data.view(torch.uint8)), q.scale.view(torch.uint8)
+
+        assert_replays_bit_exact(
+            bi_quant,
+            (x,),
+            backward=False,
+            what="squared_relu_with_probs_quantize_mxfp8 (special values)",
+        )
+
 
 @pytest.mark.parametrize("clamp_scale", [None, 10.0], ids=["unclamped", "clamped"])
 def test_vllm_fused_squared_relu_special_values_replay(clamp_scale):

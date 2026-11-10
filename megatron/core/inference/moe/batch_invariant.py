@@ -441,7 +441,8 @@ def _squared_relu_with_probs_quantize_kernel(
             if tl.load(permutation_map_ptr + row_i64) >= 0:
                 prob = tl.load(probs_ptr + row_i64)
                 value = tl.load(input_ptr + row_i64 * K + offs, mask=mask, other=0.0).to(tl.float32)
-                value = tl.maximum(value, 0.0)
+                # Keeps NaN NaN, as training's F.relu does.
+                value = tl.maximum(value, 0.0, propagate_nan=tl.PropagateNan.ALL)
                 if CLAMP:
                     value = clamp_scale * libdevice.tanh(value / clamp_scale)
                 value = value * value
