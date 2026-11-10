@@ -361,7 +361,7 @@ attribute with the following groups:
 | Field | Required | Purpose |
 |-------|----------|---------|
 | `tp` | Yes | Tensor parallelism sharding |
-| `dp` | Yes | Data parallelism routing |
+| `dp` | Yes (on the source, a missing `dp` is filled from `parallel_state` with a `ProcessGroupFallbackWarning`; deprecated in 0.21, removed in 0.23) | Data parallelism routing |
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
