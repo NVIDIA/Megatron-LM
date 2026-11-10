@@ -19,6 +19,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DecodeOnly,
     DynamicBatchControllerStepResult,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import (
     get_asyncio_loop,
     internal_api,
@@ -645,6 +646,10 @@ class EngineLoopMixin:
         await self._drain_staging_tasks()
         self.state = EngineState.STOPPED
         self._exit_custom_gc_mode()
+        # The stopped engine no longer uses the model; clear the process-wide flag, as a
+        # suspend does, so a later forward of the same model (training, for example) does
+        # not take inference-only paths.
+        InferenceMode.unset_active()
 
         # Cleanup the request futures.
         for entry in self.requests.values():

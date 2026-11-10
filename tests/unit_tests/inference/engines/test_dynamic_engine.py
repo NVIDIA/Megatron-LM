@@ -2466,6 +2466,29 @@ def test_shutdown_exits_custom_gc_mode_once():
         unfreeze.assert_called_once_with()
 
 
+def test_shutdown_clears_inference_mode():
+    """A stopped engine no longer uses the model, so shutdown clears the process-wide flag.
+
+    A suspend clears it too. While it is set, a forward of the same model takes inference
+    paths: MoE layers select their inference token dispatcher, and the GPT postprocess skips
+    MTP, as a training step after an engine stopped from PAUSED would.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._staging_tasks = set()
+    engine.requests = {}
+    engine.zmq_context = types.SimpleNamespace(closed=True)
+    engine._state_events = {EngineState.STOPPED: asyncio.Event()}
+    engine._in_custom_gc_mode = False
+
+    InferenceMode.set_active()
+    try:
+        asyncio.run(engine.shutdown())
+        assert engine.state == EngineState.STOPPED
+        assert not InferenceMode.is_active()
+    finally:
+        InferenceMode.unset_active()
+
+
 def test_add_request_defaults_sampling_params():
     """The public optional sampling argument constructs a fresh default before token handling."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
