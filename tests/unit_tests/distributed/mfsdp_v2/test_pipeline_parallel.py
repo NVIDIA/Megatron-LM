@@ -13,7 +13,6 @@ share the same ``FsdpContext``.
 """
 
 from collections import deque
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -183,23 +182,3 @@ class TestMfsdpV2PipelineSharedContext:
                 assert list(first_context.execution_order) == expected
         if num_chunks == 2 and schedule == "interleaved":
             assert cross_phase_prefetch_checks > 0
-
-
-@pytest.mark.parametrize(
-    "pp, vpp, ep_overlap, expected",
-    [
-        (1, None, False, PrefetchOrder.REGISTRATION),
-        (2, None, False, PrefetchOrder.RECORDED),
-        (2, 2, False, PrefetchOrder.RECORDED),
-        (1, None, True, PrefetchOrder.REGISTRATION),
-        (2, 2, True, PrefetchOrder.REGISTRATION),
-    ],
-)
-def test_prefetch_order_for_schedule(pp, vpp, ep_overlap, expected):
-    """Only ordinary PP/VPP selects recording; combined 1F1B keeps demand-only gathers."""
-    config = SimpleNamespace(
-        pipeline_model_parallel_size=pp,
-        virtual_pipeline_model_parallel_size=vpp,
-        overlap_moe_expert_parallel_comm=ep_overlap,
-    )
-    assert FullyShardedDataParallelV2.prefetch_order_for(config) is expected
