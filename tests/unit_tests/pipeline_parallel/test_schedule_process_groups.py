@@ -4,7 +4,7 @@
 
 import inspect
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -397,6 +397,49 @@ def test_interleaved_combined_1f1b_without_groups_leaves_the_stage_to_the_loss_s
         for groups in ({"cp_group_size": 2}, {"pp_group": _FakeGroup(size=2)}):
             with pytest.raises(ValueError, match="both cp_group_size and pp_group, or neither"):
                 _run_interleaved_combined_1f1b(monkeypatch, **groups)
+
+
+def _run_no_pipelining_combined_1f1b(monkeypatch, *cp_group_size):
+    """Run the no-pipelining combined 1F1B helper on two microbatches with the 14 positional
+    arguments it was released with, plus ``cp_group_size`` if given; return the CP size and
+    last-stage flag that each combined step receives."""
+    received = []
+
+    def combined_step(*args, cp_group_size=None, is_last_stage=None, **kwargs):
+        received.append((cp_group_size, is_last_stage))
+        return None, 0, None
+
+    monkeypatch.setattr(combined_1f1b, "combined_forward_backward_step", combined_step)
+    monkeypatch.setattr(combined_1f1b, "set_streams", lambda **kwargs: None)
+    combined_1f1b.combined_1f1b_schedule_for_no_pipelining(
+        None,  # forward_step_func
+        None,  # data_iterator
+        None,  # model
+        2,  # num_microbatches
+        None,  # input_tensor
+        None,  # output_tensor_grad
+        [],  # forward_data_store
+        SimpleNamespace(high_priority_a2a_comm_stream=False),  # config
+        False,  # collect_non_loss_data
+        None,  # first_val_step
+        False,  # forward_only
+        nullcontext,  # no_sync_func
+        0,  # total_num_tokens
+        lambda cond: cond,  # check_first_val_step
+        *cp_group_size,
+    )
+    return received
+
+
+def test_no_pipelining_combined_1f1b_takes_a_cp_size_or_leaves_the_stage_to_the_loss_step(
+    monkeypatch,
+):
+    with _forbid_global_process_groups():
+        # A forward-only, a forward-backward and a backward-only step. forward_step_calc_loss
+        # falls back to the global grid only when it gets neither value.
+        assert _run_no_pipelining_combined_1f1b(monkeypatch) == [(None, None)] * 3
+        # With a CP size, every microbatch runs on the last (only) pipeline stage.
+        assert _run_no_pipelining_combined_1f1b(monkeypatch, 2) == [(2, True)] * 3
 
 
 @requires_4_ranks

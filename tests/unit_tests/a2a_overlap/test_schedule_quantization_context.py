@@ -183,6 +183,31 @@ def _run_combined_step(config, f_model=None, b_model=None):
         )
 
 
+def test_combined_1f1b_step_without_stage_arguments_leaves_them_to_the_loss_step():
+    """Called with the arguments it was released with, the step hands neither the CP size nor
+    the last-stage flag to the loss step, which then falls back to the global grid."""
+    config = SimpleNamespace(enable_autocast=False, timers=None, fp8=None, fp8_recipe=None)
+    with patch.object(
+        schedules, "forward_step_calc_loss", return_value=(torch.zeros(1), torch.ones(1))
+    ) as forward_step_calc_loss:
+        combined_1f1b.combined_forward_backward_step(
+            _forward_step,
+            None,  # data_iterator
+            _ModelChunk(ProcessGroupCollection()),  # f_model
+            1,  # num_microbatches
+            None,  # input_tensor
+            [],  # forward_data_store
+            None,  # b_model
+            None,  # b_input_tensor
+            None,  # b_output_tensor
+            None,  # b_output_tensor_grad
+            config,
+        )
+
+    # cp_group_size and is_last_stage are the last two arguments of the loss step.
+    assert forward_step_calc_loss.call_args.args[-2:] == (None, None)
+
+
 def _fp8_schedule_config(fp8_recipe):
     return SimpleNamespace(enable_autocast=False, timers=None, fp8="e4m3", fp8_recipe=fp8_recipe)
 
