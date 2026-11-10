@@ -23,7 +23,9 @@ from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.extensions.transformer_engine import HAVE_TE, _gtp_replica_group
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.huggingface.module import HuggingFaceModule
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -358,6 +360,14 @@ class _WrappedLayer(MegatronModule):
         self.tp_group = tp_group
 
 
+class _HuggingFaceStub(HuggingFaceModule):
+    """A HuggingFace wrapper: no state of its own, around a model without a sharded_state_dict."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = torch.nn.Linear(2, 2)
+
+
 @needs_tp2
 class TestOwnersPassTheirTensorParallelGroup:
     def test_bert_lm_head(self, owner_groups):
@@ -405,6 +415,46 @@ class TestOwnersPassTheirTensorParallelGroup:
 
         assert layer.hyper_connection.tp_group is tp_group
         assert any(key.startswith('hyper_connection.') for key in sharded_state_dict)
+        for entry in sharded_state_dict.values():
+            assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
+
+    def test_llava_submodules_built_without_groups(self, owner_groups, monkeypatch):
+        tp_group, dp_cp_group = owner_groups
+        monkeypatch.setattr(
+            "megatron.core.models.huggingface.module.build_hf_model",
+            lambda config, model_path: _HuggingFaceStub(config),
+        )
+        language_config, vision_config = _config(), _config()
+        language_config.language_model_type = "hf://stub"
+        vision_config.vision_model_type = "clip"
+        # Without an encoder, the model holds the wrapped language model and the sound model.
+        model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=None,
+            language_vocab_size=32,
+            language_max_sequence_length=8,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=None,
+            drop_vision_class_token=False,
+            vision_projection_config=_config(),
+            vision_projection_layer_spec=None,
+            add_encoder=False,
+            pg_collection=ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group),
+            sound_model=_Leaf(_config()),
+        )
+
+        with forbid_global_process_groups(), _no_fallback():
+            sharded_state_dict = model.sharded_state_dict()
+
+        assert model.language_model.tp_group is tp_group
+        assert model.sound_model.tp_group is tp_group
+        assert sorted(sharded_state_dict) == [
+            'language_model.model.bias',
+            'language_model.model.weight',
+            'sound_model.linear.bias',
+            'sound_model.linear.weight',
+            'sound_model.weight',
+        ]
         for entry in sharded_state_dict.values():
             assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
 
