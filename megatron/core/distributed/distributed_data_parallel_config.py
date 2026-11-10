@@ -17,7 +17,11 @@ class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
-    """If true, reduce grads in fp32."""
+    """If true, accumulate and reduce grads in fp32 with DDP. With Megatron-FSDP,
+    explicitly set megatron_fsdp_main_grads_dtype to torch.float32 and
+    megatron_fsdp_grad_comm_dtype to torch.float32 or None (inherit main grads).
+    This flag validates those MFSDP settings; it does not override them.
+    """
 
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
@@ -106,6 +110,10 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
+
+    overlap_outer_communication: bool = False
+    """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
+    reductions on a separate CUDA stream."""
 
     use_custom_fsdp: bool = False
     """
@@ -279,6 +287,14 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_padded_shards: bool = True
+    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
+    gets an equal shard. If false, pack the group without padding and split it into
+    generally unequal per-rank shards at row boundaries (32-row block boundaries for
+    MXFP8), which saves the padding memory and communication but is incompatible with
+    nccl_ub (symmetric memory).
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
@@ -343,8 +359,29 @@ class DistributedDataParallelConfig:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
+        if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
+            if self.megatron_fsdp_main_grads_dtype != torch.float32:
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_main_grads_dtype=torch.float32 for FP32 accumulation. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
+                )
+            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
+                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
+                )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.overlap_outer_communication:
+            if not self.use_megatron_fsdp:
+                raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
+            if self.megatron_fsdp_version != 2:
+                raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

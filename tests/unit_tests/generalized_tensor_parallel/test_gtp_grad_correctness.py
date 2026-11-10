@@ -118,7 +118,9 @@ def _make_wide_config(
 
 def _make_wide_stack(config, pg_collection):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+    from megatron.core.transformer.wide_residual_transformer_layer import (
+        WideResidualTransformerLayer,
+    )
 
     spec = get_gpt_layer_with_transformer_engine_spec()
     return torch.nn.ModuleList(
