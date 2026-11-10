@@ -247,6 +247,10 @@ def mcore_fused_moe(
     )
 
     # --- Pre-processing: permute ---
+    # The permute also returns the one map the combine reads. Batch-invariant mode takes
+    # the inverse map, (token, local expert) -> expert-grouped row, to reduce in fixed
+    # expert order; the default path takes the slot map, (token, top-k slot) -> row (-1
+    # when the expert is not local), to gather in slot order.
     if use_fused_permute_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
         permuted = permute_and_quantize_mxfp8(
@@ -259,9 +263,8 @@ def mcore_fused_moe(
             alignment=expert_alignment,
             zero_padding=batch_invariant_mode,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            return_slot_map=not batch_invariant_mode,
         )
-        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
-        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
     else:
         permuted = permute_tokens(
             hidden_states,
@@ -274,11 +277,11 @@ def mcore_fused_moe(
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
             zero_padding=batch_invariant_mode and use_mxfp8,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            return_slot_map=not batch_invariant_mode,
         )
-        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
-        # Maps each (token, local expert) pair to its row in the expert-grouped buffer,
-        # allowing batch-invariant unpermute to read contributions in fixed expert order.
-        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
+    hidden_states, permuted_probs, permutation_map, offs, combine_map = permuted
+    batch_invariant_inverse_map = combine_map if batch_invariant_mode else None
+    slot_map = None if batch_invariant_mode else combine_map
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
@@ -291,7 +294,7 @@ def mcore_fused_moe(
 
     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
     # number of rows actually used by experts this iteration (valid tokens + alignment
-    # padding within expert blocks). Passed to activation and unpermute to skip unused rows.
+    # padding within expert blocks). Passed to the activation to skip unused rows.
     n_used = offs[-1:]
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
@@ -358,9 +361,8 @@ def mcore_fused_moe(
     output = unpermute_tokens(
         fc2_output,
         None if batch_invariant_mode else permuted_probs,
-        permutation_map,
+        slot_map,
         max_tokens,
-        n_used,
         valid_tokens,
         out=out,
         batch_invariant_inverse_map=batch_invariant_inverse_map,

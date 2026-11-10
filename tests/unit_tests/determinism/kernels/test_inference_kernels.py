@@ -5,8 +5,8 @@
 Inference kernels do not feed the training loss, but RL rollouts and batch-invariant
 inference depend on them replaying bit-exactly. Covered here: KV-cache tensor ops and the
 fused KV append, the inference MoE activations and MXFP8 quantisation, the inference MoE
-permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
-control), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM
+permute/unpermute (the default slot-order gather and the batch-invariant expert-order
+path), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM
 and top-k sum, the batch-invariant GEMM / log-softmax / mean kernels, the CUDA-graph
 routing-map padding mask, and the zeroing of padding-token rows. Multi-rank NVLS
 symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
@@ -18,11 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import (
-    assert_replays_bit_exact,
-    count_differing_replays,
-    seeded,
-)
+from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 try:
     import triton  # noqa: F401
@@ -749,23 +745,27 @@ def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
     assert torch.all(out[0] == 2.0**24 + 8)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="Negative control: the default combine accumulates with fp32 tl.atomic_add, whose "
-    "order is hardware dependent (it raced on GB300); recorded, not gated.",
-)
-def test_inference_default_unpermute_is_the_racy_path():
+def test_inference_default_unpermute_replays():
+    """The default combine gathers each token's rows through the slot map and sums them in
+    top-k slot order, so it replays bit-exactly. (Its predecessor scattered with fp32
+    tl.atomic_add and raced on GB300.)"""
     from megatron.core.inference.moe import permute
 
-    expert_output, perm_p, perm_map, _, n_used, valid, num_tokens = _unpermute_case()
+    seeded()
+    # Every slot is local, so each element sums eight weighted rows; the token count and
+    # width leave a partial token tile and a partial column tile.
+    num_tokens, hidden, topk, num_local = 100, 257, 8, 32
+    hidden_states, probs, routing_map, valid, _ = _permute_case(num_tokens, hidden, topk, num_local)
+    perm_h, perm_p, _, _, slot_map = permute.permute_tokens(
+        hidden_states, probs, routing_map, 0, num_local, valid, return_slot_map=True
+    )
+    expert_output = torch.randn_like(perm_h)
 
     def default(expert_output):
-        return permute.unpermute_tokens(expert_output, perm_p, perm_map, num_tokens, n_used, valid)
+        return permute.unpermute_tokens(expert_output, perm_p, slot_map, num_tokens, valid)
 
-    differing = count_differing_replays(default, (expert_output,), replays=8, backward=False)
-    assert differing > 0, (
-        "the fp32 tl.atomic_add combine replayed bit-exactly 7 times; if upstream made it "
-        "deterministic, drop this control and register the kernel as tested"
+    assert_replays_bit_exact(
+        default, (expert_output,), replays=4, backward=False, what="unpermute_tokens"
     )
 
 
