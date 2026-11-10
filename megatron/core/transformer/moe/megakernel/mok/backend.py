@@ -83,11 +83,17 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
-        self.situ_beta = (
-            (config.situ_glu_beta1, config.situ_glu_beta2)
-            if config.activation_func == situlu
-            else None
-        )
+        if config.activation_func == situlu:
+            self.situ_beta = (config.situ_glu_beta1, config.situ_glu_beta2)
+        elif getattr(config, "activation_func_tanh_clamp_scale", None) is not None:
+            # Gated silu with both tanh clamp scales: s*tanh(g/s)*sigmoid(g) * l*tanh(u/l), the
+            # same function as situlu(x, s, l). TransformerConfig rejects the other spellings.
+            self.situ_beta = (
+                config.activation_func_tanh_clamp_scale,
+                config.activation_func_tanh_clamp_scale_linear,
+            )
+        else:
+            self.situ_beta = None
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
