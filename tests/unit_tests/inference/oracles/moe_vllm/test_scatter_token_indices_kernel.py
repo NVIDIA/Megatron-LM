@@ -23,9 +23,11 @@ of its segment of the padded table, in any order) and the launcher, before readi
   map are never read (their pairs are never written); the map is read-only.
 * **Degenerate**: ``valid_tokens = 0`` writes nothing and leaves the counters; nothing local;
   every slot ``-1``; every slot on one expert; ``max_tokens = 0`` (an empty grid).
-* **``valid_tokens > max_tokens``** (finding F1, fix #8563): only the map's ``max_tokens`` rows
-  exist, so only their pairs may be scattered. ``main`` reads past the map; #8563 clamps the
-  pair count to ``max_pairs``.
+* **``valid_tokens > max_tokens``** (finding F1): only the map's ``max_tokens`` rows exist, so
+  only their pairs may be scattered. ``main`` reads past the map; the case is #8563's regression
+  test ``TestMoeAlignBlockSize::test_valid_tokens_past_routing_map_rows``
+  (``tests/unit_tests/inference/test_vllm_fused_moe.py``), through the launcher that runs this
+  kernel.
 * **Tolerance class**: exact. The segment order is unspecified, so each segment is compared
   sorted (``align_reference.canonical_segments``) and every other entry bit for bit.
 
@@ -53,7 +55,7 @@ Hardware: H100 (integer atomics; nothing architecture-specific).
 
 import dataclasses
 import importlib
-from typing import List, Optional
+from typing import List
 
 import pytest
 import torch
@@ -113,24 +115,16 @@ def make_map(case: Case, g: torch.Generator) -> torch.Tensor:
 
 
 def run_scatter(
-    routing: torch.Tensor,
-    valid: int,
-    start: int,
-    num_local: int,
-    block_m: int,
-    what: str,
-    rows: Optional[int] = None,
+    routing: torch.Tensor, valid: int, start: int, num_local: int, block_m: int, what: str
 ) -> None:
     """Launch with the launcher's grid and buffer sizes and check the table and the counters.
 
-    ``routing`` is the map (contiguous). ``rows`` (default: all of them) is how many rows the
-    launcher is told about; rows past it must not be read even when ``valid`` exceeds it.
+    ``routing`` is the map (contiguous).
     """
-    rows = routing.shape[0] if rows is None else rows
-    topk = routing.shape[1]
+    rows, topk = routing.shape
     max_pairs = rows * topk
     live_rows = min(valid, rows)
-    pairs = ar.live_pairs_per_expert(routing[:rows], live_rows, start, num_local)
+    pairs = ar.live_pairs_per_expert(routing, live_rows, start, num_local)
     counts = [p.numel() for p in pairs]
     exclusive, _ = ar.aligned_offsets(counts, block_m)
     max_sorted = max_pairs + block_m * (num_local + 1)  # the launcher's table length (:443)
@@ -239,25 +233,6 @@ PRODUCTION = {
 def test_production_sizes(name):
     """Deployed top-k, expert counts and batch sizes."""
     run_case(PRODUCTION[name])
-
-
-@ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("extra", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
-def test_valid_above_rows_scatters_only_the_map_rows(dtype, extra):
-    """``valid_tokens = max_tokens + extra``: only the map's rows are scattered (finding F1).
-
-    The map is the head of a longer buffer whose next rows route to local experts, so reading
-    past ``max_tokens`` claims extra slots and writes pair ids of rows that do not exist. Fails
-    on ``main`` (the kernel bounds the pairs by ``valid_tokens`` alone); passes with #8563, which
-    clamps the pair count to ``max_pairs``. No out-of-bounds access: the longer buffer holds the
-    rows read.
-    """
-    rows, topk, num_local, start = 40, 2, 4, 4
-    g = ou.make_generator(device=DEVICE)
-    live = ar.make_routing("random", rows, topk, 12, start, num_local, g, DEVICE)
-    longer = ar.full_routing(live, rows + extra, start, num_local, dtype, g)
-    run_scatter(longer, rows + extra, start, num_local, 16, f"valid = rows + {extra}", rows=rows)
 
 
 @pytest.mark.sanitizer

@@ -10,8 +10,8 @@ weighted activations, ``_moe_sum``).
 Contract
 --------
 Written from the call site (``InferenceGroupedMLP._vllm_forward``, ``experts.py``), the training
-expert math (``TEGroupedMLP``: ``squared_relu``, the tanh clamp, gated SiLU,
-``moe_apply_probs_on_input``) and the function's documented API, before reading the kernels.
+expert math (``TEGroupedMLP``: ``squared_relu``, the tanh clamp, gated SiLU) and the function's
+documented API, before reading the kernels.
 
 * **Computes**, for each live token ``t < valid_tokens``, with ``g = routing_map[t, j]`` and the
   rank's experts ``[start, start + E_local)``::
@@ -24,10 +24,6 @@ expert math (``TEGroupedMLP``: ``squared_relu``, the tanh clamp, gated SiLU,
   ``(s * tanh(relu(h) / s))**2``; or SwiGLU ``silu(gate) * up`` with ``gate`` the first half of
   ``h`` (SWIGLU, ``N1 = 2F``). Slots on other ranks' experts or ``-1`` contribute nothing; a
   token without a local slot gets an exact zero row.
-* **Probabilities on the input** (``moe_apply_probs_on_input``, training's
-  ``_unfused_forward``, top-k 1): ``out[t] = sum_j W2[e] @ act(W1[e] @ bf16(p[t, j] * x[t]))``,
-  with no probability applied to the output. On ``main`` the backend has no such option (the
-  layer ignores the config; audit finding D2). #8566 adds ``apply_probs_on_input``.
 * **Inputs**: ``hidden_states`` ``[max_tokens, H]`` bf16, any row stride; ``probs``
   ``[max_tokens, topk]`` fp32, contiguous; ``routing_map`` ``[max_tokens, topk]`` int32 or
   int64, contiguous; ``fc1_weight`` ``[E_local, N1, H]`` and ``fc2_weight`` ``[E_local, H, F]``
@@ -47,8 +43,7 @@ expert math (``TEGroupedMLP``: ``squared_relu``, the tanh clamp, gated SiLU,
   - batch-invariant mode (``batch_invariant.enabled()``): ``h = bf16(W1 @ x)``;
     ``a = bf16(act(h) * p)`` in fp32, as training's weighted activations; ``y = bf16(W2 @ a)``;
     ``out = fp32(sum_j y)`` summed in fp64. A token's output bits must not depend on the other
-    tokens, ``valid_tokens``, ``max_tokens`` or ``num_tokens_hint``;
-  - probabilities on the input: ``x' = bf16(p * x)``, then as above with no other probability.
+    tokens, ``valid_tokens``, ``max_tokens`` or ``num_tokens_hint``.
 * **Degenerate inputs**: ``valid_tokens = 0`` writes nothing; ``max_tokens = 0`` returns an
   empty output; experts with no tokens; every token on one expert; ``top-k = E_local``.
 * **Special values**: a NaN in a live token's hidden row makes that token's output row NaN
@@ -85,10 +80,17 @@ Variants and dispatch (from the kernels, after the contract)
 
 Open PRs
 --------
-* #8566 (d2) adds ``apply_probs_on_input`` (and the GLU options and gated squared ReLU, which this
-  file does not cover). ``test_probs_on_input`` fails on ``main`` with a ``TypeError`` (the
-  option does not exist; the layer silently ignores ``moe_apply_probs_on_input``) and must pass
-  with #8566. Every other test has the same expected result with #8566 (default options).
+* #8566 (d2) adds ``apply_probs_on_input`` (``moe_apply_probs_on_input``, which the layer
+  ignores on ``main``: audit finding D2), the GLU options and the gated squared ReLU, none of
+  which this file covers; its regression test
+  ``TestInferenceGroupedMLPMatchesTraining::test_inference_matches_training``
+  (``tests/unit_tests/inference/test_moe_dispatching_and_routing.py``) checks them on this
+  backend. Every test here has the same expected result with #8566 (default options).
+* #8955 makes the squared ReLU keep NaN (finding O3-N1: it is 0 on ``main``). Its regression
+  tests ``TestVllmFusedMoe::test_nan_token_propagates`` (``test_vllm_fused_moe.py``) and
+  ``test_squared_relu_propagates_nan`` (``test_moe_permute.py``, the batch-invariant kernel)
+  carry the squared-ReLU NaN cases, so ``test_nan_hidden_row_propagates_to_its_token_only``
+  runs SwiGLU only.
 * #8562 (d4-d9) changes the router, not this file: it makes top-1 routing a dense
   ``[tokens, 1]`` map, the layout every test here feeds. No expected result changes.
 
@@ -167,7 +169,6 @@ class Case:
     act: str = SQRELU
     data: str = "gauss"  # "gauss": fp64 reference + trusted bound; "int": exact spec
     bi: bool = False
-    probs_on_input: bool = False
     topk: int = 2
     hint: Optional[int] = 16  # num_tokens_hint; None: the config follows max_tokens
     num_local: int = 4
@@ -204,7 +205,6 @@ class Case:
 
     def id(self) -> str:
         parts = [self.act, self.data, "bi" if self.bi else "nobi", f"k{self.topk}"]
-        parts += ["poi"] if self.probs_on_input else []
         parts += [f"hint{self.hint}", f"el{self.num_local}", f"ep{self.ep}", f"t{self.tokens}"]
         parts += [f"pad{self.pad}", self.routing, f"h{self.hidden}", f"f{self.ffn}", self.out]
         parts += ["i32"] if self.routing_dtype == torch.int32 else []
@@ -386,7 +386,7 @@ def _activation(h: torch.Tensor, act: str) -> torch.Tensor:
     return r * r
 
 
-def reference_moe(x, probs, fc1, fc2, routing, *, act, start, probs_on_input):
+def reference_moe(x, probs, fc1, fc2, routing, *, act, start):
     """fp64 MoE from the contract: each token's sum over its local slots, no padding or tiles.
 
     Evaluated one expert at a time (each row of an expert's matmul is one token).
@@ -398,9 +398,8 @@ def reference_moe(x, probs, fc1, fc2, routing, *, act, start, probs_on_input):
         if tok.numel() == 0:
             continue
         p = probs[tok, slot].unsqueeze(1)
-        inp = x[tok] * p if probs_on_input else x[tok]
-        out = _activation(inp @ fc1[e].t(), act) @ fc2[e].t()
-        y[tok, slot] = out if probs_on_input else out * p
+        out = _activation(x[tok] @ fc1[e].t(), act) @ fc2[e].t()
+        y[tok, slot] = out * p
     return y.sum(dim=1)
 
 
@@ -461,18 +460,15 @@ def rounded_moe(inp: Inputs, case: Case, exact: bool) -> torch.Tensor:
             if tok.numel() == 0:
                 continue
             pe = p[tok, slot].unsqueeze(1)
-            xe = x[tok]
-            if case.probs_on_input:
-                xe = (xe.float() * pe).to(torch.bfloat16)
-            h = _gemm(xe, inp.fc1[e], exact, "FC1")
+            h = _gemm(x[tok], inp.fc1[e], exact, "FC1")
             if kind == ActivationType.SWIGLU or case.bi:
                 h = h.to(torch.bfloat16).float()  # FC1 output in bf16
             a = _activation(h, case.act)  # fp32
-            if case.bi and not case.probs_on_input:
+            if case.bi:
                 a = a * pe  # batch-invariant: the probability at the activation
             a = a.to(torch.bfloat16)
             acc = _gemm(a, inp.fc2[e], exact, "FC2")
-            if not case.bi and not case.probs_on_input:
+            if not case.bi:
                 acc = acc * pe  # default: the probability on FC2's fp32 accumulator
             y[tok, slot] = acc.to(torch.bfloat16).float()
     if case.bi:
@@ -513,10 +509,6 @@ def launches(monkeypatch) -> List[dict]:
 
 def run(case: Case, inp: Inputs, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     kind, clamp, _ = ACTIVATIONS[case.act]
-    kwargs = {}
-    if case.probs_on_input:
-        # Not a parameter on main: this raises TypeError there (see the module docstring).
-        kwargs["apply_probs_on_input"] = True
     mode = set_batch_invariant_mode(True, backend="triton") if case.bi else contextlib.nullcontext()
     with mode:
         return vfm.vllm_fused_moe(
@@ -532,7 +524,6 @@ def run(case: Case, inp: Inputs, out: Optional[torch.Tensor] = None) -> torch.Te
             out=out,
             num_tokens_hint=case.hint,
             activation_clamp_scale=clamp,
-            **kwargs,
         )
 
 
@@ -558,7 +549,6 @@ def check_output(result: torch.Tensor, case: Case, inp: Inputs, what: str) -> No
             inp.routing[: inp.valid].long(),
             act=case.act,
             start=inp.start,
-            probs_on_input=case.probs_on_input,
         )
         trusted = rounded_moe(inp, case, exact=False).to(live.dtype)
         ou.assert_close_to_reference(live, reference, trusted, dim=-1, what=what)
@@ -814,12 +804,13 @@ def test_production_sizes(name, launches):
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("act", [SWIGLU, SQRELU, CLAMP16])
+@pytest.mark.parametrize("act", [SWIGLU])
 @pytest.mark.parametrize("bi", [False, True])
 def test_nan_hidden_row_propagates_to_its_token_only(act, bi):
     """NaN in a live token's hidden row: that row is NaN, every other row is unchanged.
 
-    The token's other copy with no local slot still gets a zero row.
+    The token's other copy with no local slot still gets a zero row. Squared ReLU (finding
+    O3-N1, which drops the NaN on main) is #8955's regression test (module docstring).
     """
     case = Case(act=act, bi=bi, ep=4, topk=2, tokens=40, hint=48)
     g = ou.make_generator(device=DEVICE)
@@ -836,37 +827,6 @@ def test_nan_hidden_row_propagates_to_its_token_only(act, bi):
     ou.check_guards(out=out)
     check_output(result, case, inp, case.id())
     assert bool(torch.isnan(result[int(with_local[0])]).all()), "NaN token's row is not NaN"
-
-
-PROBS_ON_INPUT_CASES = [
-    Case(probs_on_input=True, topk=1, **with_tuner(c))
-    for c in ou.pairwise_cases(
-        {
-            "act": [SWIGLU, SQRELU, CLAMP16],
-            "bi": [False, True],
-            "hint_el": ["bm16", "bm32-bn128", "bm64-w8", "bm128-g16"],
-            "tokens": ["bm-1", "2bm+1"],
-            "routing": ["random", "block_counts", "masked"],
-            "ep": [1, 4],
-        }
-    )
-] + [
-    Case(data="int", probs_on_input=True, topk=1, bi=bi, hint=h, num_local=4, ep=2, ffn=65)
-    for bi in (False, True)
-    for h in (16, 112)
-]
-
-
-@ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("case", params(PROBS_ON_INPUT_CASES))
-def test_probs_on_input(case, launches):
-    """moe_apply_probs_on_input: the probability scales the expert input (bf16), not its output.
-
-    Fails on main: ``vllm_fused_moe`` has no ``apply_probs_on_input`` (TypeError), and the
-    layer silently ignores ``moe_apply_probs_on_input`` (audit finding D2). Passes with #8566.
-    Top-k 1, as training requires.
-    """
-    run_and_check(case, launches)
 
 
 @pytest.mark.launch_on_gb200

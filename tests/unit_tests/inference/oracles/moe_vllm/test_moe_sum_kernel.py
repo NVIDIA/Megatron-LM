@@ -26,8 +26,10 @@ before reading the kernel body.
 * **Outputs**: rows ``< valid_tokens`` of ``out``; rows past it are not written. The input rows
   and probabilities of non-local or ``-1`` slots, and every row of tokens past ``valid_tokens``,
   are never read. The inputs are read-only.
-* **``valid_tokens > max_tokens``** (finding F1, fix #8563): only the ``max_tokens`` rows exist,
-  so only they are summed and written. ``main`` reads and writes past them; #8563 clamps.
+* **``valid_tokens > max_tokens``** (finding F1): only the ``max_tokens`` rows exist, so only
+  they are summed and written. ``main`` reads and writes past them; the case is #8563's
+  regression test ``TestVllmFusedMoe::test_valid_tokens_past_input_rows``
+  (``tests/unit_tests/inference/test_vllm_fused_moe.py``).
 * **Special values**: IEEE arithmetic. An Inf or NaN in a summed slot propagates; ``Inf - Inf``
   gives NaN; a sum past fp32's range is Inf; a sum of ``-0.0`` slots is ``+0.0``.
 * **Batch-invariant mode** (``vllm_fused_moe``): the sum is the fp64 one, as training's
@@ -508,44 +510,6 @@ PRODUCTION = {
 def test_production_sizes(name, monkeypatch):
     """Deployed hidden sizes (one to seven K blocks), top-k, expert counts and batch sizes."""
     run_case(PRODUCTION[name], monkeypatch)
-
-
-@ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("extra", [1, 3])
-@pytest.mark.parametrize("acc_fp64", [False, True])
-def test_valid_above_rows_sums_only_the_map_rows(acc_fp64, extra, monkeypatch):
-    """``valid_tokens = max_tokens + extra``: only the ``max_tokens`` rows are summed and written.
-
-    Every buffer is the head of a longer one whose next rows are routed locally, so a read past
-    ``max_tokens`` finds real data and a write lands in the poisoned tail. Fails on ``main`` (the
-    loop runs to ``valid_tokens``); passes with #8563, which clamps it to ``max_tokens``
-    (finding F1). No out-of-bounds access.
-    """
-    rows, k, hidden, num_local = 30, 2, 96, 4
-    case = Case(acc_fp64=acc_fp64, topk=k, hidden=hidden, tokens=rows + extra, pad=0)
-    g = ou.make_generator(device=DEVICE)
-    sms = set_num_sms(monkeypatch, 3)
-    inp = make_inputs(case, sms, g)
-    longer_out = ou.guarded_empty((rows + extra, hidden), torch.float32, DEVICE)
-    vfm._moe_sum(
-        inp.input.tensor[: rows * k],
-        inp.probs.tensor[:rows],
-        rows,
-        k,
-        hidden,
-        torch.tensor([rows + extra], dtype=torch.int32, device=DEVICE),
-        inp.routing.tensor[:rows],
-        case.start,
-        num_local,
-        out=longer_out.tensor[:rows],
-        apply_weights=False,
-        acc_fp64=acc_fp64,
-    )
-    ou.assert_poisoned(longer_out.tensor[rows:], what="output rows past max_tokens")
-    x = inp.input.tensor.view(rows + extra, k, hidden)[:rows]
-    spec = ou.fp64_reference(reference_sum, x, inp.probs.tensor[:rows], inp.local[:rows], False)
-    ou.assert_exact(longer_out.tensor[:rows], spec.float(), what="the map's rows")
-    ou.check_guards(out=longer_out, input=inp.input, probs=inp.probs, routing=inp.routing)
 
 
 @ou.requires_sm(ou.HOPPER)
