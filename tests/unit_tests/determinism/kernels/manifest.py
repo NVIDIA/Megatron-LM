@@ -793,8 +793,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
-        "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
+        "kernels replayed piecewise, and the static-batching decode step whole, in "
+        "test_ssm_kernels.py. Runtime helper projections, convolution and CP collectives are "
+        "replayed in runtime/test_ssm_replay.py.",
     ),
     KernelEntry(
         name="ssm_runtime_cp_collectives",
