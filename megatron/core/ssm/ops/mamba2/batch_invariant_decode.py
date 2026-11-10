@@ -125,6 +125,10 @@ def _decode_step_prep_kernel(
         values = tl.load(C_ptr + e * stride_C + o + offs, mask=mask)
         tl.store(C_buf_ptr + row * BC_SIZE + o + offs, values, mask=mask)
     crossed = write_pos + 1 == CHUNK_SIZE
+    # Every thread of the program loads num_buffered[slot] above and one thread stores its
+    # next value below. Wait here until all of them have loaded it: a thread that got to the
+    # load after the store would copy its part of the token into the next buffer row.
+    tl.debug_barrier()
     tl.store(target_rows_ptr + e, write_pos)
     tl.store(chunk_flags_ptr + e, crossed.to(tl.int32))
     tl.store(num_buffered_ptr + slot, tl.where(crossed, 0, write_pos + 1))
