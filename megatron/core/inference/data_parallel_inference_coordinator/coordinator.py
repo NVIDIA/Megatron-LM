@@ -32,7 +32,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
-from .state import CoordinatorState
+from .state import SIGNALS_FROM_RUNNING, CoordinatorState
 
 try:
     import zmq
@@ -730,10 +730,19 @@ class DataParallelInferenceCoordinator:
                 break
 
     def _handle_rank_registration(self, sender_identity):
-        """Register a data parallel rank that connected to a running coordinator."""
+        """Register a data parallel rank that connected to a running coordinator.
+
+        Every engine starts RUNNING. One that registers while the others are paused or
+        suspended is first sent the signals that lead to the coordinator's state, so it
+        neither steps while they are paused nor fails the next UNPAUSE or SUSPEND.
+        """
         if sender_identity not in self.identities_of_data_parallel_ranks:
             self.identities_of_data_parallel_ranks.append(sender_identity)
             self._register_rank_identity(sender_identity)
+            for signal in SIGNALS_FROM_RUNNING[self.state]:
+                self._send_to_engine(
+                    sender_identity, [msgpack.packb([signal.value], use_bin_type=True)]
+                )
 
     def finalize_text(self, finished_request: dict) -> None:
         """Populate ``generated_text`` by detokenizing a finished request's tokens.
