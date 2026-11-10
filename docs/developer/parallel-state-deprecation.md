@@ -553,10 +553,13 @@ loses its warning, therefore fails the job whether or not the allowlist holds it
 fallbacks Megatron Core may add is left to the report-only ratchet.
 [API backward compatibility checking](../api-backwards-compatibility-check.md) describes the job.
 
-The unit-test buckets run the three test files as well. They read the source as text, so a
+The unit-test buckets run the three test files as well, and
+`tests/unit_tests/test_global_memory_buffer_imports.py`. The four read the source as text, so a
 selective (Testmon) run would never select them for a source change;
 `tests/unit_tests/testmon_mandatory_tests.yaml` adds them whenever a pull request changes a file
-under the folders they scan or a top-level script. A new top-level script needs an entry there.
+under the folders they scan or a top-level script. A new top-level script needs an entry there,
+and so does a folder added to the `SCANNED_FOLDERS` of one of the checks: without the entry the
+checker's tests fail, and the job above with them.
 
 ### When the check reports a new read
 
@@ -586,7 +589,7 @@ and scope, or a read gains a fallback warning, it swaps the entry. It never adds
 
 ### Run it locally
 
-The checker and the three tests need only the Python standard library:
+The checker and the four tests need only the Python standard library:
 
 ```bash
 python tools/check_process_group_usage.py           # the ratchet
@@ -594,6 +597,7 @@ python tools/check_process_group_usage.py --stats   # count reads by kind and wa
 python tests/unit_tests/test_check_process_group_usage.py   # the checker's own tests
 python tests/unit_tests/test_parallel_state_accessor_uses.py   # the guard outside megatron/core
 python tests/unit_tests/test_removal_versions.py   # removals that the version has reached
+python tests/unit_tests/test_global_memory_buffer_imports.py   # memory-buffer aliases
 ```
 
 ## Removal schedule
