@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -48,6 +49,10 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    EPInvariantCombineArgs,
+    num_leaf_blocks,
+)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1847,6 +1852,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _batch_invariant_kwargs(self) -> Optional[EPInvariantCombineArgs]:
+        """``moe_ep_invariant_combine``: this rank's subtree of the combine tree (token_combine
+        sums the rank partials over the rest of the tree) and the expert-TP group, else None."""
+        if not self.config.moe_ep_invariant_combine:
+            return None
+        return EPInvariantCombineArgs(
+            leaves=num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size(),
+            expert_tp_group=self.tp_group,
+        )
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1863,6 +1878,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
@@ -1882,6 +1898,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            batch_invariant_kwargs=self._batch_invariant_kwargs(),
         )
         return output, None
 
@@ -1955,10 +1972,25 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _warn_sequential_mlp_deprecated() -> None:
+    """Emit the migration warning once, even when a model has many MoE layers."""
+    warn_single_rank(
+        "SequentialMLP is deprecated. Use TEGroupedMLP with "
+        "transformer_impl='transformer_engine' and "
+        "moe_grouped_gemm=True (the default). The local backend still uses SequentialMLP; "
+        "switch to the Transformer Engine backend to migrate.",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
     This class executes each expert sequentially.
+
+    Deprecated. Use TEGroupedMLP on the Transformer Engine backend instead.
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
@@ -1970,6 +2002,8 @@ class SequentialMLP(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
     ):
+
+        _warn_sequential_mlp_deprecated()
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
             super().__init__(config=config)
