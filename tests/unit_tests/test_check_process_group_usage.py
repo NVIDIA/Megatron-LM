@@ -899,6 +899,29 @@ class TestDetection(unittest.TestCase):
             ),
             ["f:guarded:resolve_process_groups"],
         )
+        # A later star import leaves the names of an earlier one bound.
+        self.assertEqual(
+            self.hits(
+                "from megatron.core.parallel_state import *\nfrom torch import *\n"
+                "def f():\n    return get_tensor_model_parallel_group()\n"
+            ),
+            ["f:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+        self.assertEqual(
+            self.hits(
+                "from ..process_groups_config import *\nfrom .hybrid_block import *\n"
+                "resolve_process_groups" + GUARDED_ARGS + "\n"
+            ),
+            ["<module>:guarded:resolve_process_groups"],
+        )
+        # One that follows a module-level reference has not bound its names yet.
+        self.assertEqual(
+            self.hits(
+                "from torch import *\nget_tensor_model_parallel_group()\n"
+                "from megatron.core.parallel_state import *\n"
+            ),
+            [],
+        )
         # megatron.core exports parallel_state, but not mpu.
         self.assertEqual(
             self.hits("from megatron.core import *\ndef f():\n    return " + CALL + "\n"),
