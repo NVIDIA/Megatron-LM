@@ -917,6 +917,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/quantization/mxfp8_tensor.py",
             "megatron/core/inference/quantization/utils.py",
             "megatron/core/inference/moe/flashinfer_mxfp8.py",
+            "megatron/core/inference/moe/flashinfer_cutedsl_mxfp8.py",
         ),
         tests=(K + "test_inference_kernels.py",),
         kind="dispatch",
@@ -925,7 +926,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
         "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
-        "the default atomic top-k finalize and routed backend are not covered by that test.",
+        "the default atomic top-k finalize and routed backend are not covered by that test. "
+        "The CuTe-DSL fused MoE (inference_grouped_gemm_backend=flashinfer_cutedsl) scatters "
+        "with atomic adds in its FC2 epilogue: test_inference_kernels.py keeps it as a racy-path "
+        "control and test_moe_kernels.py replays its weight repack.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",

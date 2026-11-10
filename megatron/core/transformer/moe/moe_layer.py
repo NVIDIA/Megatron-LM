@@ -11,6 +11,7 @@ import torch
 from megatron.core import utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_cutedsl_mxfp8 import require_flashinfer_cutedsl_mxfp8
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     require_flashinfer_cutlass_mxfp8,
     require_flashinfer_routed_mxfp8,
@@ -469,6 +470,11 @@ class MoELayer(BaseMoELayer):
                     from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                     check_flashinfer_jit_cache_installed()
+            elif (
+                config.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL
+            ):
+                require_flashinfer_cutedsl_mxfp8()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'

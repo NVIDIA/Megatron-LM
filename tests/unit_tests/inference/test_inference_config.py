@@ -628,6 +628,9 @@ def test_shortcut_overlap_model_validation():
     config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
     for backend in InferenceGroupedGemmBackend:
         for mxfp8 in (False, True):
+            if backend == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL and not mxfp8:
+                # TransformerConfig accepts this backend only with MXFP8 experts.
+                continue
             candidate = dataclasses.replace(
                 model_config,
                 inference_grouped_gemm_backend=backend,

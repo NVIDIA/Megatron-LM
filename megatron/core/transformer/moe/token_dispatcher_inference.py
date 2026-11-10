@@ -488,7 +488,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
-        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+        if self.config.inference_grouped_gemm_backend in (
+            InferenceGroupedGemmBackend.FLASHINFER,
+            InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL,
+        ):
             cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
             local_tokens=local_tokens,
