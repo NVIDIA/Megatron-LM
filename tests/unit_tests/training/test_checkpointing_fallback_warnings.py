@@ -25,7 +25,7 @@ from megatron.training import training as training_mod
 from megatron.training.config import CheckpointConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_checkpointing import init_model_parallel
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 from tests.unit_tests.training.test_checkpointing_pg_collection import (
     _grid_unlike_the_global_one,
     _no_global_grid,
@@ -521,22 +521,28 @@ def test_train_step_debug_dumps_use_the_model_collection(monkeypatch, run_config
 def test_save_grads_on_model_grid(init_model_parallel, tmp_path_dist_ckpt):
     """Each tensor/pipeline shard of a grid unlike the global one is written once, by its name."""
     grid = _grid_unlike_the_global_one()
-    tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
-    state_dict = {"chunk": {"tp": torch.tensor(tp_rank), "pp": torch.tensor(pp_rank)}}
-    with TempNamedDir(tmp_path_dist_ckpt / "test_save_grads_on_model_grid", sync=True) as save_dir:
-        with _no_global_grid():
-            checkpointing.save_grads(str(save_dir), state_dict, 7, "wgrads", pg_collection=grid)
-        torch.distributed.barrier()
+    try:
+        tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
+        state_dict = {"chunk": {"tp": torch.tensor(tp_rank), "pp": torch.tensor(pp_rank)}}
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_save_grads_on_model_grid", sync=True
+        ) as save_dir:
+            with _no_global_grid():
+                checkpointing.save_grads(str(save_dir), state_dict, 7, "wgrads", pg_collection=grid)
+            torch.distributed.barrier()
 
-        iteration_dir = save_dir / "wgrads" / "iter_0000007"
-        assert sorted(os.listdir(iteration_dir)) == [
-            f"mp_rank_{t:02d}_{p:03d}.pth" for t in range(2) for p in range(2)
-        ]
-        for t in range(2):
-            for p in range(2):
-                saved = torch.load(iteration_dir / f"mp_rank_{t:02d}_{p:03d}.pth")
-                assert (saved["chunk"]["tp"].item(), saved["chunk"]["pp"].item()) == (t, p)
-        torch.distributed.barrier()
+            iteration_dir = save_dir / "wgrads" / "iter_0000007"
+            assert sorted(os.listdir(iteration_dir)) == [
+                f"mp_rank_{t:02d}_{p:03d}.pth" for t in range(2) for p in range(2)
+            ]
+            for t in range(2):
+                for p in range(2):
+                    saved = torch.load(iteration_dir / f"mp_rank_{t:02d}_{p:03d}.pth")
+                    assert (saved["chunk"]["tp"].item(), saved["chunk"]["pp"].item()) == (t, p)
+            torch.distributed.barrier()
+    finally:
+        # The model's groups go before the fixture tears the global grid down.
+        destroy_test_pg_collection(grid)
 
 
 @pytest.mark.skipif(
