@@ -31,7 +31,11 @@ from tests.unit_tests.test_checkpointing import (
     create_ckpt_load_args,
     init_model_parallel,
 )
-from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.test_utilities import (
+    Utils,
+    destroy_test_pg_collection,
+    sync_checkpoint_config,
+)
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -112,6 +116,14 @@ def _grid_unlike_the_global_one():
     )
 
 
+@pytest.fixture
+def model_grid(init_model_parallel):
+    """Yield the model's grid, and destroy its groups before the global grid is torn down."""
+    grid = _grid_unlike_the_global_one()
+    yield grid
+    destroy_test_pg_collection(grid)
+
+
 def test_get_checkpoint_name_reads_ranks_from_collection():
     """Ranks that are not given come from the collection, never from the global grid."""
     pg_collection = ProcessGroupCollection(
@@ -165,7 +177,7 @@ def test_checkpoint_pg_collection_resolution():
 @requires_four_rank_multiple
 @pytest.mark.parametrize("pass_collection", [False, True], ids=["model", "argument"])
 def test_legacy_checkpoint_round_trip_on_model_grid(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, pass_collection
+    model_grid, create_ckpt_load_args, tmp_path_dist_ckpt, pass_collection
 ):
     """Legacy shards are named, written and read by the ranks of the model's grid."""
     args = create_ckpt_load_args
@@ -175,7 +187,7 @@ def test_legacy_checkpoint_round_trip_on_model_grid(
     args.fp16 = False
     args.bf16 = False
 
-    grid = _grid_unlike_the_global_one()
+    grid = model_grid
     tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model, restored = MockModel(config), MockModel(config)
@@ -219,7 +231,7 @@ def test_legacy_checkpoint_round_trip_on_model_grid(
 
 @requires_four_rank_multiple
 def test_torch_dist_checkpoint_round_trip_on_model_grid(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+    model_grid, create_ckpt_load_args, tmp_path_dist_ckpt
 ):
     """The RNG shards and the replica ids of a distributed checkpoint use the model's grid."""
     args = create_ckpt_load_args
@@ -231,7 +243,7 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
     # A load requests the RNG shards only when the job size matches the saved arguments.
     args.world_size = torch.distributed.get_world_size()
 
-    grid = _grid_unlike_the_global_one()
+    grid = model_grid
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model, restored = MockModel(config), MockModel(config)
     model.pg_collection = grid
