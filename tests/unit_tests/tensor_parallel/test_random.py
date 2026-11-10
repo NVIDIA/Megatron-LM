@@ -380,6 +380,36 @@ def test_model_parallel_cuda_manual_seed_falls_back_for_unset_pg_collection_grou
         Utils.destroy_model_parallel()
 
 
+def test_model_parallel_cuda_manual_seed_keeps_the_global_rank_of_an_unset_group(monkeypatch):
+    """Each group that the collection leaves unset warns once and keeps its global rank."""
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("needs a world size that is a multiple of 4")
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, expert_model_parallel_size=2, expert_tensor_parallel_size=1
+    )
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["expt_tp"])
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
+        actual = _tracker_states()
+        fallbacks = [
+            str(w.message) for w in record if issubclass(w.category, ProcessGroupFallbackWarning)
+        ]
+        # One warning per unset group, and none that says the collection itself was omitted.
+        assert len(fallbacks) == 4
+        for message, name in zip(fallbacks, ("tp", "ep", "gtp_remat", "expt_gtp_remat")):
+            assert f"without `pg_collection.{name}`" in message
+
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        expected = _tracker_states()
+        assert actual.keys() == expected.keys()
+        for name, state in expected.items():
+            assert torch.equal(actual[name], state), name
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_model_parallel_cuda_manual_seed_needs_a_global_grid_for_omitted_ranks():
     """Without a collection or a global grid, an omitted rank is an error, not rank 0."""
     Utils.initialize_model_parallel()
@@ -390,6 +420,14 @@ def test_model_parallel_cuda_manual_seed_needs_a_global_grid_for_omitted_ranks()
         model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
     with pytest.raises(RuntimeError, match=r"without ep_rank \(no global ep group\):"):
         model_parallel_cuda_manual_seed(1234, force_reset_rng=True, tp_rank=0, etp_rank=0)
+
+    # A collection that leaves the group of an omitted rank unset gets the same error; a group
+    # that it sets to None is an axis that is off.
+    pg_collection = ProcessGroupCollection(
+        tp=None, expt_tp=None, gtp_remat=None, expt_gtp_remat=None
+    )
+    with pytest.raises(RuntimeError, match=r"without ep_rank \(no global ep group\) and with a"):
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
 
     # A caller that passes its ranks still seeds without a grid, with the GTP_remat axes off.
     model_parallel_cuda_manual_seed(1234, force_reset_rng=True, tp_rank=0, ep_rank=0, etp_rank=0)
