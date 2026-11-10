@@ -610,7 +610,7 @@ def test_shortcut_overlap_model_validation():
         num_layers=2,
         hidden_size=128,
         num_attention_heads=4,
-        num_moe_experts=2,
+        num_moe_experts=4,
         moe_router_topk=1,
         moe_router_pre_softmax=True,
         moe_router_dtype="fp32",

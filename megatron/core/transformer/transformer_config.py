@@ -2406,6 +2406,21 @@ class TransformerConfig(ModelParallelConfig):
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
                     )
+                # Unclamped MXFP8 experts run FlashInfer's TRT-LLM routed MoE, whose routing
+                # checks the global expert count and top-k when the first forward launches it.
+                if (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                    and self.activation_func_tanh_clamp_scale is None
+                    and (
+                        self.num_moe_experts % 4 != 0
+                        or self.num_moe_experts <= self.moe_router_topk
+                    )
+                ):
+                    raise ValueError(
+                        "FlashInfer routed MXFP8 experts need num_moe_experts divisible by 4 and "
+                        f"greater than moe_router_topk; got {self.num_moe_experts} experts with "
+                        f"moe_router_topk={self.moe_router_topk}."
+                    )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:
