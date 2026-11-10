@@ -53,6 +53,7 @@ def make_coordinator_direct(
     """
     coordinator = object.__new__(DataParallelInferenceCoordinator)
     coordinator.state = CoordinatorState.RUNNING
+    coordinator.generation_epoch = None
     coordinator.request_id_to_rank = {}
     coordinator.request_id_to_sampling_params = {}
     coordinator.handoff_ownership = HandoffOwnership()
