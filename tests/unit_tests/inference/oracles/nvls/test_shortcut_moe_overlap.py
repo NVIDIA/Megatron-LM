@@ -101,9 +101,19 @@ NUM_CUDA_GRAPHS = 4
 NUM_EXPERTS = 16
 """Two local experts per rank at EP 8 (H100), four at EP 4 (GB200)."""
 PATTERN = "ME*E"
-DELAY_CYCLES = 2_000_000
-"""About 1 ms on H100 and GB200: far longer than any kernel of this model, so the delayed stream
-is certainly late if the other stream does not wait for it."""
+PRODUCER_DELAY_CYCLES = 100_000_000
+"""~50 ms (H100 and GB200 run near 2 GHz) before the main stream writes the pair input."""
+ROUTER_DELAY_CYCLES = 20_000_000
+"""~10 ms before the side stream's router reads the pair input."""
+COMBINE_DELAY_CYCLES = 100_000_000
+"""~50 ms before the side stream's combine writes the routed output.
+
+Sizing. An eager step is host-bound: the host launches the routed half's kernels, then the
+predecessor's, then the join, so either stream's kernels can finish before the other stream's
+dependent kernel is even launched, and a 1 ms delay hides a missing fork or join (mutants
+o5p-sc-001..003 survived the eager cases at 1 ms; only graph capture failed). Each delay must exceed
+the host time it competes with (a few ms of launches), and the router delay must stay shorter than
+the producer delay, or it would itself wait out the missing fork."""
 MAX_STEPS = 200
 
 # (step at which the request arrives, prompt length, tokens to generate), per EP rank modulo 4.
@@ -292,17 +302,18 @@ class _Spy:
 def _inject_delays(monkeypatch):
     """Delay each stream in turn (values unchanged).
 
-    Main stream: the pair input is re-materialized after a ~1 ms sleep, so a side stream that does
-    not wait for the fork reads it before it is written. Side stream: a sleep before the router
-    (a main stream that overwrote the pair input after the fork would be seen) and before the
-    combine (a main stream that does not wait for the join reads the combined output early).
+    Main stream: the pair input is re-materialized after a ~50 ms sleep, so a side stream that does
+    not wait for the fork reads it before it is written. Side stream: a ~10 ms sleep before the
+    router (a main-stream write to the pair input after the fork would be seen) and a ~50 ms sleep
+    before the combine (a main stream that does not wait for the join reads the combined output
+    early).
     """
     forward = ShortcutMoEBlock.forward
     preprocess = ShortcutMoEBlock._moe_router_preprocess
     launch_combine = ShortcutMoEBlock._launch_combine
 
     def late_input(hidden_states):
-        torch.cuda._sleep(DELAY_CYCLES)
+        torch.cuda._sleep(PRODUCER_DELAY_CYCLES)
         return hidden_states.clone()
 
     def delayed_forward(block, *args, **kwargs):
@@ -313,11 +324,11 @@ def _inject_delays(monkeypatch):
         return forward(block, *args, **kwargs)
 
     def delayed_preprocess(block, *args, **kwargs):
-        torch.cuda._sleep(DELAY_CYCLES)
+        torch.cuda._sleep(ROUTER_DELAY_CYCLES)
         return preprocess(block, *args, **kwargs)
 
     def delayed_combine(block, *args, **kwargs):
-        torch.cuda._sleep(DELAY_CYCLES)
+        torch.cuda._sleep(COMBINE_DELAY_CYCLES)
         return launch_combine(block, *args, **kwargs)
 
     monkeypatch.setattr(ShortcutMoEBlock, "forward", delayed_forward)
