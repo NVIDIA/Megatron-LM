@@ -164,16 +164,6 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
->
-> Batch-invariant MoE matches training and inference only at the same expert-parallel
-> size: the expert combine adds per-EP-rank partials. To train and generate at different
-> EP sizes (for example EP8 training, EP4 generation), also set
-> `moe_ep_invariant_combine=True` on both configs. Every EP size then sums a token's
-> expert outputs over one fixed fp32 tree over the expert ids, so MoE outputs are
-> bitwise identical at every power-of-two EP that divides `num_moe_experts`. It covers
-> the training AllToAll dispatcher and the inference `nvls` dispatcher with the `torch`
-> or `vllm` grouped-GEMM backend, at any expert-tensor-parallel size: inference sums each
-> expert's rows over expert TP before the combine, as training does.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`

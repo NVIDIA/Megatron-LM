@@ -86,6 +86,17 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_normalize_loss_by_main_tokens: bool = False
+    """Normalize summed MTP losses with the global main-loss token count.
+
+    By default, each rank and microbatch first normalizes MTP loss with its local number of
+    valid MTP targets. Enabling this option instead leaves MTP losses as sums so the normal
+    per-token gradient finalization divides them by the global main-loss token count. This
+    makes the MTP objective invariant to how samples with different valid-token fractions are
+    partitioned across ranks and gradient-accumulation microbatches. Requires
+    ``calculate_per_token_loss=True``.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1517,16 +1528,6 @@ class TransformerConfig(ModelParallelConfig):
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
 
-    moe_ep_invariant_combine: bool = False
-    """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
-    reduction tree over the expert ids (moe/ep_invariant_combine.py) instead of per-EP-rank
-    partials added in rank order, so MoE outputs are bitwise identical at every power-of-two
-    expert-parallel size dividing num_moe_experts (e.g. training and inference with
-    different EP). Covers the training AllToAll combine and the inference NVLS combine of
-    the 'torch' and 'vllm' grouped-GEMM backends, which use the ordered fp32 combine
-    (whatever the batch-invariant collective). With expert tensor parallelism, inference
-    sums each expert row over expert TP before the combine, as training does."""
-
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
@@ -1939,6 +1940,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.mtp_normalize_loss_by_main_tokens and not self.calculate_per_token_loss:
+            raise ValueError(
+                "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -4856,23 +4862,6 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
-
-        if self.moe_ep_invariant_combine:
-            if not self.batch_invariant_mode:
-                raise ValueError("moe_ep_invariant_combine requires batch_invariant_mode=True.")
-            if self.num_moe_experts:
-                from megatron.core.transformer.moe.ep_invariant_combine import check_ep_size
-
-                check_ep_size(self.num_moe_experts, self.expert_model_parallel_size)
-            if self.transformer_impl == "inference_optimized" and (
-                self.inference_grouped_gemm_backend
-                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
-            ):
-                raise ValueError(
-                    "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
-                    "'torch' or 'vllm' for inference-optimized MoE: FlashInfer sums a "
-                    "token's routes inside its kernel."
-                )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (

@@ -32,6 +32,8 @@ from megatron.training.config import (
     DataConfig,
     DataloaderConfig,
     DistributedInitConfig,
+    FaultInjectorConfig,
+    FaultToleranceConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
@@ -689,7 +691,15 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
         raise ValueError(f"--spec must name a module and a spec, got {spec}.")
     base_path, name = spec
     training_spec = import_module((base_path, name))
-    module_specs = vars(importlib.import_module(base_path))
+    module = importlib.import_module(base_path)
+    # dir() and getattr() rather than vars(): a deprecated import path (megatron.core.ops._compat)
+    # serves its names, private ones included, through module __getattr__, which answers no
+    # dunder names.
+    module_specs = {
+        spec: getattr(module, spec)
+        for spec in dir(module)
+        if not (spec.startswith("__") and spec.endswith("__"))
+    }
     aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
     for alias in aliases or [name]:
         stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")
@@ -1133,6 +1143,15 @@ def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
     return deepcopy(_default_config_from_args(DataloaderConfig, args))
 
 
+def fault_tolerance_config_from_args(args: Namespace) -> FaultToleranceConfig:
+    """Collect the flat legacy CLI settings into the FT section and optional injector."""
+    config = _default_config_from_args(FaultToleranceConfig, args)
+    injector = _default_config_from_args(FaultInjectorConfig, args)
+    if any(getattr(injector, f.name) is not None for f in fields(FaultInjectorConfig)):
+        config.fault_injector = injector
+    return config
+
+
 def pretrain_cfg_container_from_args(
     args: Namespace, model_cfg=None, *, data_cfg: DataConfig | None = None
 ) -> PretrainConfigContainer:
@@ -1182,6 +1201,7 @@ def pretrain_cfg_container_from_args(
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+        fault_tolerance=fault_tolerance_config_from_args(args),
     )
 
     return cfg

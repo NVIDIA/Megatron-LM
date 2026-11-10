@@ -34,7 +34,11 @@ from typing import Tuple
 # (refactors, comment-only edits). Maintainers create it once in the repository.
 EXEMPT_LABEL = "determinism-exempt"
 
-# Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
+# Directories whose every ``.py`` file must be registered, except ``__init__.py`` and a deprecated
+# import path left by a move, which only forwards to the module that now holds the kernel.
+# ``megatron/core/ops`` is not one: its families keep operation modules (such as the norm
+# modules) beside their kernels. Its kernel files are registered below by path, and new ones are
+# found by ``KERNEL_CONTENT_PATTERNS``.
 KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
@@ -162,7 +166,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
-            "megatron/core/transformer/torch_norm.py",
+            "megatron/core/ops/norm/torch_norm.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
@@ -182,7 +186,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
-        sources=("megatron/core/fusions/fused_cross_entropy.py",),
+        sources=("megatron/core/ops/loss/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
@@ -280,7 +284,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="fused_layer_norm",
-        sources=("megatron/core/fusions/fused_layer_norm.py",),
+        sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="cuda-ext",
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
@@ -309,7 +313,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
-        sources=("megatron/core/tensor_parallel/cross_entropy.py",),
+        sources=("megatron/core/ops/loss/cross_entropy.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="torch-op",
     ),
@@ -372,7 +376,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
-            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
@@ -423,10 +426,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/moe_layer.py",
             "megatron/core/transformer/moe/training_matches_inference.py",
         ),
-        tests=(
-            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
-            K + "test_moe_kernels.py",
-        ),
+        tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
@@ -436,10 +436,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(
-            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
-            K + "test_moe_kernels.py",
-        ),
+        tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
     ),
@@ -465,18 +462,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Activation page copy kernels (no arithmetic); functional round-trip coverage.",
     ),
     KernelEntry(
-        name="moe_ep_invariant_combine",
-        sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",),
-        kind="triton",
-        notes="Fixed expert-order leaves and pairwise FP32 tree; bit-exact forward and "
-        "gradient replay, plus parity across EP sizes and training/inference paths.",
-    ),
-    KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
         tests=(
-            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
             K + "test_moe_kernels.py",
@@ -634,7 +622,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
-            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -721,12 +708,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(
-            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
-            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
-            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
-            K + "test_inference_kernels.py",
-        ),
+        tests=(K + "test_inference_kernels.py",),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "

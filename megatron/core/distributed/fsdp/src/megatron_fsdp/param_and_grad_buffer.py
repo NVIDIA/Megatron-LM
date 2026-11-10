@@ -1283,6 +1283,8 @@ class DataParallelBuffer:
         self.temporary_bucket_allocator = (
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
+        # Stream that allocated the temporary bucket, if one is allocated.
+        self.bucket_allocation_stream = None
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
@@ -1439,6 +1441,8 @@ class DataParallelBuffer:
             dtype = self.dtype
         if device is None:
             device = self.device
+        if self.bucket_allocation_stream is None:
+            self.bucket_allocation_stream = torch.cuda.current_stream()
         # Allocate temporary storage using standardized sizes.
         alloc_size = self.shard_bucket_index.size if shard else self.bucket_index.size
         bucket = self.temporary_bucket_allocator.allocate(
@@ -1463,6 +1467,7 @@ class DataParallelBuffer:
         Release the storage of a temporarily-allocated communication bucket.
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
+        self.bucket_allocation_stream = None
 
     def reset_param_main_grad(self):
         """
@@ -4500,6 +4505,18 @@ class GradReducePipeline:
                     # Empty the set of parameters that are ready for gradient reduction.
                     self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
+                    # The allocating stream can differ from the current one under the 1F1B
+                    # overlap schedule, which runs some gradient hooks on its communication
+                    # stream. PyTorch's caching allocator, which backs the temporary bucket,
+                    # lets the allocating stream reuse the memory as soon as it is freed, so
+                    # that stream must wait for the reduce-scatter first, or it could
+                    # overwrite the bucket while the reduce-scatter still reads it.
+                    allocation_stream = gbuf.bucket_allocation_stream
+                    if (
+                        allocation_stream is not None
+                        and allocation_stream != torch.cuda.current_stream()
+                    ):
+                        allocation_stream.wait_event(reduce_scatter_view_out_event)
                     # Free the memory backing the temporarily-allocated communication
                     # bucket associated with this buffer. Only exists for sharded
                     # gradient buffers, or if a custom gradient data-type is used!
@@ -4707,35 +4724,6 @@ class AllGatherPipeline:
             seen_units.update(unseen_units)
             new_units += len(unseen_units)
             bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
-
-        return list(sorted(result))
-
-    def _complete_frontier_fsdp_unit(
-        self, bucket_ids: List[int], prefetch_order: PrefetchOrder
-    ) -> List[int]:
-        """Extend a bucket list through the rest of the FSDP unit at its prefetch frontier,
-        including buckets of that unit the window skipped."""
-        parameter_groups = self.buffer.parameter_groups
-        result = set(bucket_ids)
-        step = 1 if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER else -1
-        frontier = max(result) if step > 0 else min(result)
-        fsdp_unit_id = parameter_groups[frontier].fsdp_unit_id
-        if fsdp_unit_id is None:
-            return list(sorted(result))
-
-        bucket_id = frontier + step
-        while (
-            0 <= bucket_id < len(parameter_groups)
-            and parameter_groups[bucket_id].fsdp_unit_id == fsdp_unit_id
-        ):
-            result.update(self.buffer.bucket_to_bucket_group[bucket_id])
-            bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
-
-        # Buckets split by dtype but bucket groups only by expert status, so a selected group
-        # can skip over buckets of the same unit.
-        for bucket_id in range(min(result), max(result) + 1):
-            if bucket_id not in result and parameter_groups[bucket_id].fsdp_unit_id == fsdp_unit_id:
-                result.update(self.buffer.bucket_to_bucket_group[bucket_id])
 
         return list(sorted(result))
 
@@ -4998,10 +4986,6 @@ class AllGatherPipeline:
                 double_buf_units,
                 outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
-            if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
-                # DP-Outer gathers count toward the size, so one large bucket can end the
-                # window mid-unit; finish that unit instead of gathering the rest at its hook.
-                ag_buckets = self._complete_frontier_fsdp_unit(ag_buckets, prefetch_order)
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
             outer_ag_buckets = self._extend_by_fsdp_units(

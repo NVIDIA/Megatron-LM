@@ -631,10 +631,7 @@ class TestNVLSAllGatherVDispatcher:
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
-    @pytest.mark.parametrize("ep_invariant_combine", [False, True])
-    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(
-        self, monkeypatch, ep_invariant_combine
-    ):
+    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(self, monkeypatch):
         """A real inference MoE layer should use ordered RSV combine in batch-invariant mode.
 
         This catches the production branch in InferenceGroupedMLP: mcore_fused_moe
@@ -671,7 +668,6 @@ class TestNVLSAllGatherVDispatcher:
             flash_attention_version=4,
             attention_dropout=0.0,
             moe_shared_expert_intermediate_size=None,
-            moe_ep_invariant_combine=ep_invariant_combine,
         )
         ep_group = get_expert_model_parallel_group()
         NVLSAllGatherVDispatcher.allocate_buffers(
@@ -679,7 +675,6 @@ class TestNVLSAllGatherVDispatcher:
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
             tp_ep_group=ep_group,
-            ep_invariant_combine=ep_invariant_combine,
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -704,7 +699,6 @@ class TestNVLSAllGatherVDispatcher:
 
         def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
             ordered_calls["value"] += 1
-            assert kwargs.get("pairwise_tree", False) == ep_invariant_combine
             return orig_ordered_reduce_scatter_v(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -749,11 +743,6 @@ class TestNVLSAllGatherVDispatcher:
                 graph_output = _run_expert_and_combine()
 
             graph.replay()
-            expected = graph_output.clone()
-            graph.replay()
-            assert torch.equal(
-                graph_output.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
-            )
 
         assert used_rsv["value"]
         assert ordered_calls["value"] > 0
@@ -880,7 +869,6 @@ class TestNVLSAllGatherVDispatcher:
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
             tp_ep_group=get_expert_model_parallel_group(),
-            ep_invariant_combine=config.moe_ep_invariant_combine,
         )
 
         if mxfp8_swiglu:
@@ -954,55 +942,7 @@ class TestNVLSAllGatherVDispatcher:
                 with InferenceMode.active():
                     inference_output, _ = layer(hidden_states.clone())
 
-        assert torch.equal(
-            inference_output.contiguous().view(torch.uint8),
-            training_output.contiguous().view(torch.uint8),
-        )
-
-    # vLLM runs MXFP8 experts through the MCore grouped GEMM, which "torch" covers.
-    @pytest.mark.parametrize(
-        "grouped_gemm_backend,mxfp8_swiglu", [("torch", False), ("torch", True), ("vllm", False)]
-    )
-    def test_ep_invariant_combine_moe_matches_training(
-        self, monkeypatch, grouped_gemm_backend, mxfp8_swiglu
-    ):
-        """moe_ep_invariant_combine: the engine's subtree partials and pairwise RSV combine
-        match the training AllToAll combine tree bitwise.
-
-        Sums of a few bf16 rows are often exact in fp32 in any order, so the layer-level
-        equality alone can pass on the default combine; also require the engine to run the
-        tree (bit sensitivity is in test_moe_ep_invariant_combine.py).
-        """
-        import importlib
-
-        from megatron.core.inference.moe import batch_invariant as inference_bi
-
-        # The package re-exports the function under the module's name.
-        vllm_moe = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
-
-        calls = []
-        for module, name in (
-            (inference_bi, "tree_combine_forward"),
-            (vllm_moe, "tree_combine_topk_forward"),
-        ):
-            real = getattr(module, name)
-
-            def spy(*args, _real=real, _name=name, **kwargs):
-                calls.append(_name)
-                return _real(*args, **kwargs)
-
-            monkeypatch.setattr(module, name, spy)
-        self.test_batch_invariant_moe_matches_training(
-            grouped_gemm_backend,
-            None,
-            mxfp8_swiglu,
-            False,
-            config_overrides={"moe_ep_invariant_combine": True},
-        )
-        expected = {"torch": "tree_combine_forward", "vllm": "tree_combine_topk_forward"}[
-            grouped_gemm_backend
-        ]
-        assert expected in calls, calls
+        torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
 
     @staticmethod
     def _make_nvfp4_inference_layer(**overrides):

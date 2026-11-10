@@ -39,11 +39,6 @@ from megatron.core.inference.moe.permute import (
     compute_expert_offsets,
     compute_local_tokens_per_expert,
 )
-from megatron.core.transformer.moe.ep_invariant_combine import (
-    EPInvariantCombineArgs,
-    expert_tp_fold,
-    tree_combine_topk_forward,
-)
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
@@ -721,7 +716,6 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
-    batch_invariant_kwargs: Optional[EPInvariantCombineArgs] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -749,9 +743,6 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
-        batch_invariant_kwargs: ``moe_ep_invariant_combine`` (batch-invariant mode) only;
-            when set, each token is summed over this rank's subtree of the EP-invariant
-            combine tree instead of in top-k order (see ``EPInvariantCombineArgs``).
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -898,27 +889,6 @@ def vllm_fused_moe(
     # non-local expert slots. Batch-invariant mode uses training's invariant
     # within-rank accumulation (fp64).
     accumulate_in_fp64 = batch_invariant_mode
-    if batch_invariant_kwargs is not None:
-        assert batch_invariant_mode, "moe_ep_invariant_combine requires batch-invariant mode"
-        if out is None:
-            out = VllmFusedMoeBuffers.get(
-                "moe_sum_out", (max_tokens, K), torch.float32, hidden_states.device
-            )
-        expert_tp_rank = 0
-        if batch_invariant_kwargs.expert_tp_group is not None:
-            intermediate3 = expert_tp_fold(intermediate3, batch_invariant_kwargs.expert_tp_group)
-            expert_tp_rank = batch_invariant_kwargs.expert_tp_group.rank()
-        if expert_tp_rank != 0:
-            return out.zero_()
-        return tree_combine_topk_forward(
-            intermediate3,
-            routing_map,
-            local_expert_start,
-            num_local_experts,
-            batch_invariant_kwargs.leaves,
-            valid_tokens,
-            out,
-        )
 
     return _moe_sum(
         intermediate3,
