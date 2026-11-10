@@ -70,6 +70,7 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         shard_layout: ShardLayout = ShardLayout.PADDED,
+        gradient_accumulation_fusion: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
@@ -104,6 +105,7 @@ class FsdpModule:
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
                     shard_layout=shard_layout,
+                    gradient_accumulation_fusion=gradient_accumulation_fusion,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -284,6 +286,8 @@ class FsdpModule:
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
         )
+        if is_recomputing:
+            self._prepare_fused_gradients()
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -432,6 +436,21 @@ class FsdpModule:
             # _reduce_gradient_groups.
 
         self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
+        self._prepare_fused_gradients()
+
+    def _prepare_fused_gradients(self) -> None:
+        """Bound pending reductions before allocating this backward's TE output buffers."""
+        groups = [
+            group
+            for group in self._parameter_groups
+            if group.gradient_accumulation_fusion
+            and group.requires_grad
+            and group.fused_grad_buffer is None
+        ]
+        if groups:
+            self.context._release_grad_buffers(keep=1)
+            for group in groups:
+                group.prepare_fused_gradients()
 
     def post_backward(self) -> None:
         """Finish this module's backward and release weights when safe."""
@@ -456,27 +475,31 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
+            current_stream = context.current_stream()
+            buffers = []
+            try:
+                for group in self._parameter_groups:
+                    if not group.requires_grad:
+                        continue
 
-            for group in self._parameter_groups:
-                if not group.requires_grad:
-                    continue
+                    if group.requires_inner_reduction:
+                        self._reduce_inner_gradients(group, buffers)
+                    else:
+                        self._accumulate_local_gradients(group)
 
-                if group.requires_inner_reduction:
-                    self._reduce_inner_gradients(group)
-                else:
-                    self._accumulate_local_gradients(group)
-
-                if not context.finalize_gradients:
-                    continue
-                # Finalize the DP-outer reduction. When overlap is enabled its stream is
-                # distinct, so it overlaps the following group's DP-inner reduce; the
-                # persistent accumulator and its optimizer-layout view stay alive across
-                # the handoff. When disabled the stream aliases inner_reduction_stream and
-                # this stays serialized.
-                if context.outer_reduction_stream is not inner_reduction_stream:
-                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
-                with torch.cuda.stream(context.outer_reduction_stream):
-                    group.reduce_outer_gradients()
+                    if not context.finalize_gradients:
+                        continue
+                    # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                    # distinct, so it overlaps the following group's DP-inner reduce; the
+                    # persistent accumulator and its optimizer-layout view stay alive across
+                    # the handoff. When disabled the stream aliases inner_reduction_stream and
+                    # this stays serialized.
+                    if context.outer_reduction_stream is not inner_reduction_stream:
+                        context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                    with torch.cuda.stream(context.outer_reduction_stream):
+                        group.reduce_outer_gradients()
+            finally:
+                context._retain_grad_buffers(buffers, current_stream)
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
@@ -489,17 +512,20 @@ class FsdpModule:
         # finish_grad_sync(), without making compute wait for earlier collectives.
         self.context.inner_reduction_stream.wait_stream(self.context.current_stream())
 
-    def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
-        """Pack on compute and enqueue reduction on the inner reduction stream.
-
-        Allocate the packing buffer on the inner stream. On return, that stream
-        contains the queued reduction and accumulation into main_grad.
-        """
-        current_stream = self.context.current_stream()
-        inner_reduction_stream = self.context.inner_reduction_stream
-        with torch.cuda.stream(inner_reduction_stream):
-            partial_grad = group.allocate_partial_grad_buffer()
-        current_stream.wait_stream(inner_reduction_stream)
+    def _reduce_inner_gradients(
+        self, group: FsdpParameterGroup, buffers: list[torch.Tensor]
+    ) -> None:
+        """Pack on compute and retain the input through inner reduction."""
+        context = self.context
+        current_stream = context.current_stream()
+        inner_reduction_stream = context.inner_reduction_stream
+        if not buffers:
+            # Bound pending reduction inputs before allocating ordinary staging.
+            context._release_grad_buffers(keep=1)
+        partial_grad = group.allocate_partial_grad_buffer()
+        buffers.append(partial_grad.local_buffer)
+        if group.fused_grad_buffer is not None and group.fused_grad_buffer is not partial_grad:
+            buffers.append(group.fused_grad_buffer.local_buffer)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):

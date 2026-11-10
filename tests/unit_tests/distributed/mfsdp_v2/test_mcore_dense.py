@@ -311,10 +311,18 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
         assert not isinstance(layer, FsdpModule)
 
 
-def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
+@pytest.mark.parametrize("fusion", [False, True], ids=["unfused", "fused"])
+def test_finish_grad_sync_waits_for_delayed_wgrad(
+    process_group_collection, distributed_setup, fusion
+):
     """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
     config = TransformerConfig(
-        num_layers=1, hidden_size=16, num_attention_heads=4, bf16=True, params_dtype=torch.bfloat16
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        gradient_accumulation_fusion=fusion,
     )
     layer = te.Linear(
         16,
@@ -323,7 +331,7 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
         params_dtype=config.params_dtype,
         device=distributed_setup.device,
         delay_wgrad_compute=True,
-        fuse_wgrad_accumulation=False,
+        fuse_wgrad_accumulation=fusion,
     )
     model = FullyShardedDataParallel(
         config=config,
@@ -332,6 +340,7 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            megatron_fsdp_main_grads_dtype=torch.float32 if fusion else None,
         ),
         module=layer,
         pg_collection=process_group_collection,
@@ -374,8 +383,9 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
 
 
 @pytest.mark.parametrize("init_model_with_meta_device", [False, True], ids=["cuda", "meta"])
+@pytest.mark.parametrize("fusion", [False, True], ids=["unfused", "fused"])
 def test_delayed_wgrad_matches_immediate(
-    process_group_collection, distributed_setup, init_model_with_meta_device
+    process_group_collection, distributed_setup, init_model_with_meta_device, fusion
 ):
     """Delaying weight gradients preserves training losses with microbatch accumulation."""
     num_microbatches = 3
@@ -386,6 +396,7 @@ def test_delayed_wgrad_matches_immediate(
         bf16=True,
         params_dtype=torch.bfloat16,
         init_model_with_meta_device=init_model_with_meta_device,
+        gradient_accumulation_fusion=fusion,
     )
     # Every rank initializes both layers with the same weights, also when the adapter
     # materializes the delayed layer from the meta device.
@@ -404,7 +415,7 @@ def test_delayed_wgrad_matches_immediate(
             params_dtype=config.params_dtype,
             device=device,
             delay_wgrad_compute=delay_wgrad_compute,
-            fuse_wgrad_accumulation=False,
+            fuse_wgrad_accumulation=fusion,
         )
 
     immediate_layer = build_layer(delay_wgrad_compute=False, device=distributed_setup.device)
@@ -430,6 +441,7 @@ def test_delayed_wgrad_matches_immediate(
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_grads_dtype=torch.float32 if fusion else None,
             ),
             module=layer,
             pg_collection=process_group_collection,
