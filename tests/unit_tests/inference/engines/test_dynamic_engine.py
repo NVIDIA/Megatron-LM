@@ -5367,13 +5367,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize(
+        "sampling_backend, top_p",
+        [("torch", 0.7), ("flashinfer", 0.7), ("torch", 0.0)],
+        ids=["torch-top-p", "flashinfer-top-p", "torch-no-top-p"],
+    )
     @pytest.mark.parametrize("beyond", [0, 1000], ids=["vocab", "beyond-vocab"])
     @torch.inference_mode()
-    def test_top_k_keeping_the_whole_vocabulary_is_served(self, sampling_backend, beyond):
+    def test_top_k_keeping_the_whole_vocabulary_is_served(self, sampling_backend, top_p, beyond):
         """A top-k at or above the vocabulary is served as no top-k, next to a plain request.
 
-        The engine admits it as no top-k; the torch backend asserted on it inside the step.
+        The engine admits it as no top-k, keeping any top-p. The torch backend asserted on it
+        inside the step: on the vocabulary alone, or first on the top-k + top-p check.
         """
         if sampling_backend == "flashinfer":
             pytest.importorskip("flashinfer")
@@ -5390,7 +5395,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         top_k = env.engine.controller.vocab_size + beyond
         params = [
             SamplingParams(num_tokens_to_generate=8, termination_id=-1),
-            SamplingParams(num_tokens_to_generate=8, termination_id=-1, top_k=top_k, top_p=0.7),
+            SamplingParams(num_tokens_to_generate=8, termination_id=-1, top_k=top_k, top_p=top_p),
         ]
 
         finished = _serve_requests(env, [[1, 2, 3], [4, 5, 6]], params)
