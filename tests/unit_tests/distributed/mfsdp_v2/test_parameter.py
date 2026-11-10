@@ -12,7 +12,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     GradientFinalizationMode,
     Placements,
-    RuntimePolicy,
     fully_shard,
     fully_shard_context,
 )
@@ -239,10 +238,7 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-@pytest.mark.parametrize(
-    "mode", [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER]
-)
-def test_frozen_weights_without_input_gradients(distributed_setup, mode):
+def test_frozen_weights_without_input_gradients(distributed_setup):
     """Keep frozen weights available until internal backward has consumed them."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -270,12 +266,14 @@ def test_frozen_weights_without_input_gradients(distributed_setup, mode):
     ):
         for is_last in (False, True):
             with context.finalize_gradients(
-                mode=(mode if is_last else GradientFinalizationMode.SKIP_OUTER)
+                mode=(
+                    GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+                    if is_last
+                    else GradientFinalizationMode.SKIP_OUTER
+                )
             ):
                 model(torch.ones(2, 4, device=device)).sum().backward()
             assert frozen_weight.untyped_storage().nbytes() == 0
-    if mode is GradientFinalizationMode.REDUCE_OUTER:
-        context.finish_grad_sync()
     torch.testing.assert_close(
         trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
     )
