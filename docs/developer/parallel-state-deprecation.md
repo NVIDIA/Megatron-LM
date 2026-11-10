@@ -487,7 +487,12 @@ Two checks report new reads of the global grid. CI runs both.
 - the helpers of `process_groups_config.py` that read the grid when the caller omits its groups
   and warn for that fallback: `resolve_process_groups()`, `resolve_gtp_remat_group()`,
   `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()` (kind `guarded`);
+  `setup_process_groups_for_optimizer()` (kind `guarded`). `resolve_gtp_remat_group()` does not
+  warn when its caller passes `owner=None`, which is for a caller that has warned already, so
+  the checker counts that call as guarded only when a fallback warning precedes it, by the rule
+  for `:warned` entries below. Without one it is an unwarned read of kind `shim`,
+  `resolve_gtp_remat_group(owner=None)`, which the checker reports as new. It recognizes only
+  the constant `None`;
 - reads, writes and deletions of the private attributes of `parallel_state`, such as
   `_DATA_PARALLEL_GROUP` or an `_MPU_*` override (kind `private`); the deprecated
   `_set_global_memory_buffer()` counts as a function. That state is not an interface, so a
