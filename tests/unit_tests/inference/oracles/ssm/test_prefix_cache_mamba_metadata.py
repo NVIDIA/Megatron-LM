@@ -30,7 +30,8 @@ size; q = the SSM chunk quantum (`ssm_chunk_alignment`, a multiple of c; bs is a
   A staged B is recorded against the request's own KV block B / bs - 1.
 * **Extraction metadata.** Staged boundaries are numbered request by request (prefill order), then
   ascending. Slot i of boundary B of request j: `intermediate_chunk_indices[i]` =
-  R_j + (B - s) / c - 1, where R_j = sum over earlier prefill requests k of max(1, ceil(n_k / c)) (the scan's chunk rows);
+  R_j + (B - s) / c - 1, where R_j = sum over earlier prefill requests k of max(1, ceil(n_k / c))
+  (the scan's chunk rows);
   `intermediate_abs_positions[i]` = T_j + (B - s), where T_j = sum of n_k over earlier prefill
   requests (B's offset in the step's prefill tokens); `intermediate_real_count` = the number of
   slots. Entries past it in the per-step view hold the safe defaults chunk 0 and position d_conv.
