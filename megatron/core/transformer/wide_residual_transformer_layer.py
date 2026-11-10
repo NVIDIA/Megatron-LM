@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
 from typing import Optional
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
@@ -16,15 +19,64 @@ from megatron.core.transformer.wide_residual import (
 )
 
 
+@dataclass
+class WideResidualTransformerLayerSubmodules(TransformerLayerSubmodules):
+    """TransformerLayerSubmodules plus the branches' wide-residual connections (a fused spec
+    selects WriteReadNorm reads and DeferredWrite writes)."""
+
+    residual_read_self_attn: type = StreamwiseSigmoidWideResidualConnection
+    residual_write_self_attn: type = StreamwiseSigmoidWideResidualConnection
+    residual_read_mlp: type = StreamwiseSigmoidWideResidualConnection
+    residual_write_mlp: type = StreamwiseSigmoidWideResidualConnection
+
+    @classmethod
+    def widen(cls, submodules: TransformerLayerSubmodules, **connections):
+        """``submodules`` with these connections (the defaults for the others)."""
+        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
+        return cls(**{**values, **connections})
+
+
 class WideResidualTransformerLayer(TransformerLayer):
     """Transformer layer carrying a wide stream around ordinary-width branches."""
 
     supports_wide_residual_connections: bool = True
 
+    @staticmethod
+    def _is_attention_layer(submodules: TransformerLayerSubmodules) -> bool:
+        """Whether a single-branch layer's branch is attention (else its MLP)."""
+        attention = submodules.self_attention is not IdentityOp
+        if attention == (submodules.mlp is not IdentityOp):
+            raise ValueError("a fused layer has exactly one of self_attention and mlp")
+        return attention
+
+    @classmethod
+    def get_input_layernorm_module(cls, submodules: TransformerLayerSubmodules) -> tuple[str, ...]:
+        """Where a spec puts this single-branch layer's input RMSNorm, as attribute names from
+        the layer: fused into attention's linear_qkv (or a GDN mixer's in_proj); fused into the
+        MLP's linear_fc1, or held in pre_mlp_layernorm (MoE). Raises elsewhere."""
+        if not cls._is_attention_layer(submodules):
+            if submodules.pre_mlp_layernorm is not IdentityOp:
+                return ("pre_mlp_layernorm",)
+            return ("mlp", "linear_fc1")
+        attention = getattr(submodules.self_attention, "submodules", None)
+        for projection in ("linear_qkv", "in_proj"):
+            if submodules.input_layernorm is IdentityOp and hasattr(attention, projection):
+                return ("self_attention", projection)
+        raise ValueError(
+            "its input RMSNorm must be fused into self_attention's linear_qkv or in_proj"
+        )
+
+    @classmethod
+    def get_wide_residual_modules(cls, submodules: TransformerLayerSubmodules) -> tuple[str, str]:
+        """This single-branch layer's wide-residual (read, write) connection fields."""
+        if cls._is_attention_layer(submodules):
+            return "residual_read_self_attn", "residual_write_self_attn"
+        return "residual_read_mlp", "residual_write_mlp"
+
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: TransformerLayerSubmodules,
+        submodules: WideResidualTransformerLayerSubmodules | TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -35,6 +87,8 @@ class WideResidualTransformerLayer(TransformerLayer):
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ) -> None:
+        if not isinstance(submodules, WideResidualTransformerLayerSubmodules):
+            submodules = WideResidualTransformerLayerSubmodules.widen(submodules)
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
@@ -61,21 +115,29 @@ class WideResidualTransformerLayer(TransformerLayer):
         self.residual_read_self_attn = None
         self.residual_write_self_attn = None
         if has_attention:
-            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="read"
+            self.residual_read_self_attn = build_module(
+                submodules.residual_read_self_attn,
+                config,
+                self.layer_number,
+                "self_attention",
+                operation="read",
             )
-            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="write"
+            self.residual_write_self_attn = build_module(
+                submodules.residual_write_self_attn,
+                config,
+                self.layer_number,
+                "self_attention",
+                operation="write",
             )
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
         if has_mlp:
-            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="read"
+            self.residual_read_mlp = build_module(
+                submodules.residual_read_mlp, config, self.layer_number, "mlp", operation="read"
             )
-            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="write"
+            self.residual_write_mlp = build_module(
+                submodules.residual_write_mlp, config, self.layer_number, "mlp", operation="write"
             )
 
         self.register_load_state_dict_pre_hook(load_residual_state)
