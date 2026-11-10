@@ -123,7 +123,8 @@ def _tensor_masked_update_kernel_2d(
 
     # 2D Calculation: base + batch * stride0 + col * stride1
     # Int arguments get no .to(tl.int64): Triton passes an int argument equal to 1 as a
-    # constexpr, which has no .to(); the int64 operands already promote this arithmetic.
+    # constexpr, which has no .to(). Each product is still int64: target_idx, pid_batch and
+    # row_offsets (from pid_row_chunk) are int64.
     dst_ptr = (
         STATES_PTR
         + (target_idx.to(tl.int64) * stride_state_b)
@@ -171,7 +172,8 @@ def _tensor_masked_update_kernel_3d(
     # idx_d1 = flat_idx % D1
     # idx_d0 = flat_idx // D1
     # Int arguments get no .to(tl.int64): Triton passes an int argument equal to 1 as a
-    # constexpr, which has no .to(); the int64 operands already promote this arithmetic.
+    # constexpr, which has no .to(). The index arithmetic is still int64: flat_offsets (from
+    # pid_row_chunk), target_idx and pid_batch are int64.
     idx_d1 = flat_offsets % SIZE_D1
     idx_d0 = flat_offsets // SIZE_D1
 
@@ -231,7 +233,8 @@ def _tensor_masked_update_kernel_4d(
     # idx_d0 = temp // D1
 
     # Int arguments get no .to(tl.int64): Triton passes an int argument equal to 1 as a
-    # constexpr, which has no .to(); the int64 operands already promote this arithmetic.
+    # constexpr, which has no .to(). The index arithmetic is still int64: flat_offsets (from
+    # pid_row_chunk), target_idx and pid_batch are int64.
     idx_d2 = flat_offsets % SIZE_D2
     temp = flat_offsets // SIZE_D2
     idx_d1 = temp % SIZE_D1
