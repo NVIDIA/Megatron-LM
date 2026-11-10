@@ -52,9 +52,14 @@ def _forbid_global_reads(monkeypatch, *modules):
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", classmethod(_raise))
 
 
+# The groups of the running test, which the default_grid fixture destroys.
+_created_groups = []
+
+
 def _subgroup(rank_lists):
     """This rank's group from a partition of the world; every rank creates every group."""
     group, _ = torch.distributed.new_subgroups_by_enumeration(rank_lists)
+    _created_groups.append(group)
     return group
 
 
@@ -94,6 +99,11 @@ class TestTrainingLoopPgCollection:
         # Set up before, and torn down after, the monkeypatched accessors.
         Utils.initialize_model_parallel()
         yield
+        # Every rank finishes its collectives before any communicator goes away.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        while _created_groups:
+            torch.distributed.destroy_process_group(_created_groups.pop())
         Utils.destroy_model_parallel()
 
     @_needs_4_ranks
