@@ -490,6 +490,51 @@ class TestGradNormWithCollectionGroups:
             squared_norm += expert_grad.double().pow(2).sum().item()
         assert grad_norm == pytest.approx(squared_norm**0.5, rel=1e-5)
 
+    @pytest.mark.parametrize("expert_tp", ["own_pairs", "unset"])
+    def test_replicated_expert_params_count_once_per_expert_tp_group(self, expert_tp):
+        """A replicated expert parameter is kept on rank 0 of ``expt_tp``, which defaults to ``tp``."""
+        world_size = Utils.world_size
+        if world_size % 4 != 0:
+            pytest.skip(f"world size {world_size} must be a multiple of 4 for TP=2 and ETP=2")
+
+        # The global grid has no tensor parallelism: a global TP read would keep every replica.
+        Utils.initialize_model_parallel()
+
+        # The module pairs neighbouring ranks along TP, and ranks {r, r + world_size // 2} along
+        # its expert TP axis.
+        grid = HyperCommGrid([2, world_size // 4, 2], ["tp", "pp", "etp"])
+        groups = {"tp": grid.create_pg("tp"), "gtp_remat": None, "expt_gtp_remat": None}
+        expert_tp_group = grid.create_pg("etp")
+        grad_stats_group = grid.create_pg(["tp", "pp", "etp"])
+        rank = torch.distributed.get_rank()
+        if expert_tp == "own_pairs":
+            groups["expt_tp"] = expert_tp_group
+            replica_set = rank % (world_size // 2)
+        else:
+            # The collection leaves expt_tp unset, so the experts replicate over the TP pairs.
+            replica_set = rank // 2
+
+        # One expert parameter per replica set, with the same gradient on both of its ranks.
+        expert_grad, _ = _logical_layer_grads(replica_set)
+        parameters = [_parameter_with_grad(expert_grad, allreduce=False)]
+
+        try:
+            with _forbid_global_grid_reads():
+                optimizer = _build_optimizer_from_collection(
+                    parameters, ProcessGroupCollection(**groups), grad_stats_group
+                )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
+
+        num_replica_sets = world_size // 2
+        assert counted_elements == num_replica_sets * ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT
+        squared_norm = sum(
+            _logical_layer_grads(index)[0].double().pow(2).sum().item()
+            for index in range(num_replica_sets)
+        )
+        assert grad_norm == pytest.approx(squared_norm**0.5, rel=1e-5)
+
     def test_collection_without_tp_warns_and_filters_by_the_global_grid(self, monkeypatch):
         """An unset ``tp`` is deprecated: the filters still read the global TP rank, and warn."""
         world_size = Utils.world_size
