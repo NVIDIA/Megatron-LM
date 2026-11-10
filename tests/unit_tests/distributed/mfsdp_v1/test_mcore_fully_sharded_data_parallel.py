@@ -1771,7 +1771,6 @@ class TestMegatronFsdpGradAccumFusionReusedWeight:
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 use_megatron_fsdp=True,
-                grad_reduce_in_fp32=True,
             ),
             module=ReusedHead(config).cuda().to(torch.bfloat16),
             fsdp_unit_modules=[ColumnParallelLinear, torch.nn.Linear],
