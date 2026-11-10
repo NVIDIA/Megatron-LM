@@ -46,10 +46,13 @@ Llama-3-8B-shaped GQA layer at TP 1), and int32 limits (``large``).
 dummy block NaN-poisoned; the whole cache must equal the expected one. Inputs and indices checked
 unchanged. One small case runs under compute-sanitizer.
 
-**Hardware.** H100. No open PR changes this kernel. ``large``: cache offsets past 2**31 through
-int64 block indices should pass; key/value token offsets past 2**31 are expected to fail on main,
-finding O6-M2 (``token_idx * stride_key_token`` and ``token_idx * stride_value_token`` are int32,
-``fused_kv_append_kernel.py:75-76``).
+**Hardware.** H100. ``large``: cache offsets past 2**31 through int64 block indices pass. A token
+whose key/value row starts past 2**31 fails on main, finding O6-M2
+(``token_idx * stride_key_token`` and ``token_idx * stride_value_token`` are int32,
+``fused_kv_append_kernel.py:75-76``). #9307 (fix/context-kernels-int64-offsets) fixes it and
+carries that case as its regression test
+(``test_fused_kv_append_kernel.py::TestKVAppendFusedQKVViews::test_token_offsets_past_int32``);
+the token-offset sizes here stop at the one whose last row crosses 2**31.
 """
 
 import math
@@ -349,14 +352,17 @@ TOKEN_STRIDE = 8 * (16 + 2) * 128
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("tokens", ou.int32_overflow_params(TOKEN_STRIDE))
+@pytest.mark.parametrize(
+    "tokens",
+    [p for p in ou.int32_overflow_params(TOKEN_STRIDE) if (p.values[0] - 1) * TOKEN_STRIDE < 2**31],
+)
 def test_append_key_offsets_past_int32(tokens):
     """Key and value token offsets ``t * 18432`` up to and past 2**31: key and value are views
     of a fused QKV tensor behind a 2**31-element poisoned front guard, so a wrapped int32 offset
-    reads poison instead of faulting. Expected to fail on main where a token's row starts past
-    2**31 (finding O6-M2). Unreachable at production sizes: it needs ``max_tokens`` times the
-    per-rank fused QKV width to reach 2**31 (about 350k tokens for an 8B GQA model at TP 1).
-    About 14 GB."""
+    reads poison instead of faulting. A token whose row starts past 2**31 fails on main (finding
+    O6-M2) and is #9307's regression case. Unreachable at production sizes: it needs
+    ``max_tokens`` times the per-rank fused QKV width to reach 2**31 (about 350k tokens for an 8B
+    GQA model at TP 1). About 14 GB."""
     heads, head_dim, group, bt, dtype = 8, 128, 16, 64, torch.bfloat16
     width = (group + 2) * head_dim
     ou.require_free_memory(3 * tokens * TOKEN_STRIDE * dtype.itemsize + 2**31)

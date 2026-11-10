@@ -42,9 +42,11 @@ int32 limits (``large``): output offsets ``row * ROW_SIZE`` reach 2**31.
 NaN-poisoned and its untouched rows must stay poisoned; inputs checked unchanged. One small case
 runs under compute-sanitizer.
 
-**Hardware.** H100. No open PR changes this kernel. The ``large`` case where an output row
-starts past 2**31 elements is expected to fail on main: finding O6-M1 (``pid * ROW_SIZE`` and
-``tensor_b_idx * ROW_SIZE`` are int32, ``tensor_ops.py:80-81, 93-94``).
+**Hardware.** H100. An output row that starts past 2**31 elements fails on main: finding O6-M1
+(``pid * ROW_SIZE`` and ``tensor_b_idx * ROW_SIZE`` are int32, ``tensor_ops.py:80-81, 93-94``).
+#9307 (fix/context-kernels-int64-offsets) fixes it and carries that case as its regression test
+(``test_tensor_ops.py::TestInt32RowOffsets::test_tensor_merge``); the ``large`` case here stops
+at the last size whose rows all start below 2**31.
 """
 
 import math
@@ -256,13 +258,16 @@ def test_cuda_graph_replay_follows_pos():
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("tokens", ou.int32_overflow_params(D_INNER_8B))
+@pytest.mark.parametrize(
+    "tokens",
+    [p for p in ou.int32_overflow_params(D_INNER_8B) if (p.values[0] - 1) * D_INNER_8B < 2**31],
+)
 def test_merge_offsets_past_int32(tokens):
-    """Output offsets ``row * 8192`` (the 8B SSM output at TP 1) up to and past 2**31, as in
-    production (``out`` and ``b`` with ``T`` rows, ``pos`` = 3 decode tokens). The output sits
-    behind a 2**31-element poisoned front guard, so a wrapped int32 offset writes into the guard
-    instead of faulting. Expected to fail on main where an output row starts past 2**31
-    (finding O6-M1); reachable only with ``max_tokens`` of at least 262,145 for this width.
+    """Output offsets ``row * 8192`` (the 8B SSM output at TP 1) up to 2**31, as in production
+    (``out`` and ``b`` with ``T`` rows, ``pos`` = 3 decode tokens). The output sits behind a
+    2**31-element poisoned front guard, so a wrapped int32 offset writes into the guard instead of
+    faulting. An output row that starts past 2**31 fails on main (finding O6-M1) and is #9307's
+    regression case; it is reachable only with ``max_tokens`` of at least 262,145 for this width.
     About 22 GB."""
     row, dtype, pos = D_INNER_8B, torch.bfloat16, 3
     numel = tokens * row

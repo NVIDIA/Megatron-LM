@@ -45,9 +45,11 @@ whole range on fresh data. Production sizes: 8192 tokens of the 8B ``in_proj`` a
 starts NaN-poisoned and its untouched rows must stay poisoned; the input allocation, ``pos`` and
 the second ``pos`` element are checked unchanged. One small case runs under compute-sanitizer.
 
-**Hardware.** H100. No open PR changes this kernel. The ``large`` case where a row starts past
-2**31 elements is expected to fail on main: finding O6-M1 (``input_idx * ROW_SIZE`` and
-``pid * ROW_SIZE`` are int32, ``tensor_ops.py:46-47``).
+**Hardware.** H100. A row that starts past 2**31 elements fails on main: finding O6-M1
+(``input_idx * ROW_SIZE`` and ``pid * ROW_SIZE`` are int32, ``tensor_ops.py:46-47``). #9307
+(fix/context-kernels-int64-offsets) fixes it and carries that case as its regression test
+(``test_tensor_ops.py::TestInt32RowOffsets::test_get_slice_after``); the ``large`` sizes here stop
+at the one whose last row crosses 2**31.
 """
 
 import math
@@ -251,13 +253,17 @@ def test_cuda_graph_replay_follows_pos():
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("tokens", ou.int32_overflow_params(IN_PROJ_8B))
+@pytest.mark.parametrize(
+    "tokens",
+    [p for p in ou.int32_overflow_params(IN_PROJ_8B) if (p.values[0] - 1) * IN_PROJ_8B < 2**31],
+)
 def test_slice_offsets_past_int32(tokens):
     """Element offsets ``row * 18560`` (the 8B ``in_proj`` at TP 1) up to and past 2**31, with
     ``pos = 0`` so the last rows are both read and written. Both tensors sit behind a 2**31-element
     poisoned front guard, so a wrapped int32 offset reads poison or writes into the guard instead
-    of faulting. Expected to fail on main where a row starts past 2**31 (finding O6-M1);
-    reachable only with ``max_tokens`` above about 115,700 for this width (default 16384).
+    of faulting. A row that starts past 2**31 fails on main (finding O6-M1) and is #9307's
+    regression case; it is reachable only with ``max_tokens`` above about 115,700 for this width
+    (default 16384).
     About 26 GB: 4.3 GB per tensor and per guard, plus the comparison."""
     row, dtype = IN_PROJ_8B, torch.bfloat16
     numel = tokens * row

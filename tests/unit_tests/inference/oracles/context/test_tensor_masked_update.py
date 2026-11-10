@@ -42,12 +42,13 @@ limits (``large``: a slot past 2**31 elements, int64 offsets, expected to pass).
 allocation, gaps of strided layouts included, must equal the expected one. New states and
 ``idx`` are checked unchanged. One small case runs under compute-sanitizer.
 
-**Hardware.** H100. No open PR changes these kernels. ``test_unit_dimensions`` is expected to
-fail on main: finding O6-M3. The kernels call ``.to(tl.int64)`` on runtime int arguments
-(``stride_new_b``, ``stride_state_b``, ``SIZE_D1``, ``SIZE_D2``), and Triton 3.8 compiles an int
-argument equal to 1 as a ``constexpr`` without ``.to``, so a unit trailing dimension or a
-one-element row fails to compile. Production states never have one (``d_conv``, ``headdim`` and
-``d_state`` are above 1).
+**Hardware.** H100. Finding O6-M3: on main the kernels call ``.to(tl.int64)`` on runtime int
+arguments (``stride_new_b``, ``stride_state_b``, ``SIZE_D1``, ``SIZE_D2``), and Triton 3.8
+compiles an int argument equal to 1 as a ``constexpr`` without ``.to``, so a unit trailing
+dimension or a one-element row fails to compile. Production states never have one (``d_conv``,
+``headdim`` and ``d_state`` are above 1). #9306 (fix/masked-update-unit-dims) fixes it and
+carries those shapes as its regression test
+(``test_tensor_ops.py::test_tensor_masked_update_unit_dimensions``).
 """
 
 import math
@@ -207,24 +208,6 @@ def test_no_updates_is_a_no_op(ndim):
     new = _placed_random((0, *trail), torch.float32, "contiguous", g)
     idx = torch.empty(0, dtype=torch.int64)
     _update_and_check(states, idx, new, what=f"{ndim}-D, B = 0")
-
-
-@ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize(
-    "trail",
-    [(1,), (64, 1), (1, 1), (16, 64, 1), (16, 1, 128), (1, 1, 1)],
-    ids=lambda t: "x".join(map(str, t)),
-)
-def test_unit_dimensions(trail):
-    """Shapes with a unit trailing dimension or a one-element row, which the launcher accepts.
-    Expected to fail on main (finding O6-M3): a runtime int argument equal to 1 compiles as a
-    ``constexpr``, and the kernel's ``.to(tl.int64)`` on it raises a CompilationError (a host
-    error; no kernel runs)."""
-    g = ou.make_generator(device=DEVICE)
-    states = _placed_random((6, *trail), torch.float32, "contiguous", g)
-    new = _placed_random((3, *trail), torch.float32, "contiguous", g)
-    idx = torch.tensor([4, -1, 0], dtype=torch.int64)
-    _update_and_check(states, idx, new, what=f"trailing shape {trail}")
 
 
 @ou.requires_sm(ou.HOPPER)
