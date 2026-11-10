@@ -263,9 +263,9 @@ def test_batch_invariant_mode_dispatches_log_softmax(backend, monkeypatch):
     calls = []
     launcher = bik.log_softmax
 
-    def spy(input, dim=-1):
+    def spy(input, dim=-1, **kwargs):
         calls.append(input.dtype)
-        return launcher(input, dim=dim)
+        return launcher(input, dim=dim, **kwargs)
 
     monkeypatch.setattr(bik, "log_softmax", spy)
     with bik.set_batch_invariant_mode(True, backend=backend):

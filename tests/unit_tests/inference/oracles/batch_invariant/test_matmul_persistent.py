@@ -478,9 +478,10 @@ def test_linear_entry_points_run_the_kernel(monkeypatch):
     calls = []
     launcher = bik.matmul_persistent
 
-    def spy(a, b, bias=None):
+    def spy(a, b, bias=None, **kwargs):
+        # Forward any keywords: open PRs add some (#8957 out_dtype=, the addmm fix beta=/alpha=).
         calls.append(bias is not None)
-        return launcher(a, b, bias)
+        return launcher(a, b, bias, **kwargs)
 
     x = operand((3, 5, 256), torch.bfloat16, seed=17)
     w = operand((96, 256), torch.bfloat16, seed=18, scale=256**-0.5)
