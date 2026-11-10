@@ -1054,14 +1054,17 @@ class StepPostProcessingMixin:
                 )
 
         # Epoch stamps are positions in the whole sequence, and each sits on one of
-        # its tokens. Drop the stamps on stripped tokens from every segment's copy,
-        # or the result reports an epoch boundary past its last token.
-        last_position = len(request.prompt_tokens) + len(request.generated_tokens) - 1
-        for segment in segments:
-            for key in ("policy_epoch", "kv_cache_epoch"):
-                boundaries = getattr(segment, key, None)
-                if boundaries is not None:
-                    setattr(segment, key, [b for b in boundaries if b[0] <= last_position])
+        # its tokens. The engine stamps a request's last token between steps, so only
+        # a trim that reaches back past this step's tokens can strip a stamped token.
+        # Drop such stamps from every segment's copy, or the result reports an epoch
+        # boundary past its last token.
+        if total_trim > pending_trim:
+            last_position = len(request.prompt_tokens) + len(request.generated_tokens) - 1
+            for segment in segments:
+                for key in ("policy_epoch", "kv_cache_epoch"):
+                    boundaries = getattr(segment, key, None)
+                    if boundaries is not None:
+                        setattr(segment, key, [b for b in boundaries if b[0] <= last_position])
 
         prompt_score_trim = 0
         if older_segment_trim > 0 and not request.sampling_params.skip_prompt_log_probs:
