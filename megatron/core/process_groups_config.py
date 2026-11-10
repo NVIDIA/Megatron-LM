@@ -29,7 +29,8 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
 )
 
 # Fallbacks that have already warned in this process: (owner, argument) for a fallback to the
-# global grid, and (owner, argument, "uninitialized") for one that found the grid uninitialized.
+# global grid, (owner, argument, "uninitialized") for one that found the grid uninitialized, and
+# (owner, "grad_stats_parallel_group", "world") for an optimizer that reduces over WORLD.
 _warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
 
 
