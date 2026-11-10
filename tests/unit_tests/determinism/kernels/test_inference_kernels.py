@@ -877,6 +877,32 @@ def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_toke
 # --- batch-invariant kernels -----------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "dtype,shape,dim",
+    [
+        (torch.bfloat16, (8192, 4096), [-1]),
+        (torch.float32, (4096, 4, 7168), [1]),
+        (torch.float32, (2048, 33, 160), [1, 2]),
+        (torch.bfloat16, (33, 2048, 160), [0, 2]),
+        (torch.float32, (2048, 4096), []),
+    ],
+    ids=["bf16-last", "fp32-middle", "fp32-two-dims", "bf16-split-dims", "fp32-all-dims"],
+)
+def test_batch_invariant_mean_replays(dtype, shape, dim):
+    """The batch-invariant aten::mean.dim over one, several and all dims."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    seeded()
+    x = torch.randn(*shape, device="cuda").to(dtype)
+    assert_replays_bit_exact(
+        lambda x: bik.mean_batch_invariant(x, dim),
+        (x,),
+        replays=4,
+        backward=False,
+        what=f"bik mean[{dtype}, {shape}, dim={dim}]",
+    )
+
+
 def test_batch_invariant_kernels_replay():
     from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 
