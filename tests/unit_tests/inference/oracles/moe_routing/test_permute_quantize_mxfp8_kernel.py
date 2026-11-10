@@ -62,15 +62,15 @@ Hardware: Triton's FP8 conversion needs sm_89 or newer; production runs this ker
 needs a GPU: the Triton 3.8 interpreter rounds fp32 -> E4M3 differently from compiled Triton
 (``cvt.rn.satfinite``), so CPU runs are not evidence for this kernel.
 
-Expected to fail on origin/main:
+Cases that fail on main are regression tests of their fix PRs:
 
-* ``test_valid_above_rows_permutes_only_the_map_rows``: finding F1 (the count kernel reads past
-  the map when ``valid > rows``); passes with #8563.
-* ``test_tiny_blocks_take_the_smallest_scale``: finding O2-N1 (amax <= 448 * 2^-127 gets scale
-  byte 0x01 instead of 0x00); passes with #8956 (``fix/mxfp8-quant-tiny-scales-strides``),
-  which moves this kernel onto the shared scale helper.
-* ``test_strided_input_is_quantized_or_rejected``: a strided view is read as if contiguous
-  (the O2-N2 class); #8956 makes the launcher reject it.
+* ``valid > rows`` (finding F1, the count kernel reads past the map): #8563's
+  ``TestComputeLocalTokensPerExpert::test_valid_tokens_past_routing_map_rows``
+  (``tests/unit_tests/inference/test_moe_permute.py``).
+* Blocks with amax <= 448 * 2^-127 (finding O2-N1, scale byte 0x01 instead of 0x00) and strided
+  ``hidden_states`` (read as if contiguous; rejected with the fix): #8956's
+  ``TestPermuteAndQuantizeMxfp8::test_tiny_groups_take_the_smallest_scale`` and
+  ``test_rejects_strided_input`` (``tests/unit_tests/inference/test_mxfp8_utils.py``).
 """
 
 import pytest
@@ -456,84 +456,6 @@ def test_special_values():
             assert got != got or saturated, f"{v} at ({r}, {c}) decodes to {got}"
 
 
-TINY_AMAX = (448.0 * 2.0**-127, 2.0**-126, 2.0**-127, 2.0**-130, 2.0**-133)
-
-
-def test_tiny_blocks_take_the_smallest_scale():
-    """Blocks with ``amax / 448 <= 2^-127`` take E8M0's smallest scale, 0x00 (2^-127), the
-    smallest power of two with ``amax / X <= 448``.
-
-    **Fails on origin/main** (finding O2-N1, in this kernel's copy of the scale computation):
-    rounding ``amax / 448`` up by adding 0x7FFFFF to its fp32 bits gives 2^-126 (byte 0x01) for
-    a subnormal quotient, and codes half the spec's. Passes with #8956, which moves this kernel
-    onto the shared ``_mxfp8_group_scales`` helper.
-    """
-    dev = rr.device()
-    rows = len(TINY_AMAX)
-    x = torch.zeros(rows, 64, dtype=torch.float64)
-    for r, amax in enumerate(TINY_AMAX):
-        x[r, 0] = amax
-        x[r, 1:32] = torch.linspace(-amax, amax, 31, dtype=torch.float64)
-        x[r, 32:] = 1.5  # an ordinary block next to it
-    hidden = x.to(torch.bfloat16).to(dev)
-    probs = torch.ones(rows, 1, device=dev)
-    routing_map = torch.zeros(rows, 1, dtype=torch.int64, device=dev)
-    with rr.poisoned_outputs():
-        out = permute.permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, 1, rr.valid_tensor(rows, dev)
-        )
-    check_mxfp8_permutation(
-        out,
-        hidden,
-        probs,
-        routing_map,
-        rows,
-        0,
-        1,
-        alignment=128,
-        zero_padding=False,
-        inverse=False,
-        what="tiny blocks",
-    )
-
-
-def test_strided_input_is_quantized_or_rejected():
-    """A strided ``hidden_states`` view is quantized by its values, or rejected up front.
-
-    **Fails on origin/main**: the kernel addresses token ``t`` at ``t * K`` and reads a
-    ``[:, :K]`` view of a ``[rows, 2K]`` buffer as if it were contiguous (all reads stay inside
-    the buffer). #8956 makes the launcher reject non-contiguous input.
-    """
-    dev = rr.device()
-    rows, k, topk = 20, 64, 2
-    g = ou.make_generator()
-    base = mx.value_kind_inputs(rows, 2 * k, "randn", g).to(dev)
-    hidden = base[:, :k]
-    assert not hidden.is_contiguous()
-    routing_map = rr.topk_distinct_ids(rows, topk, 8, generator=g, dev=dev)
-    probs = torch.rand(rows, topk, generator=g).to(dev)
-    try:
-        with rr.poisoned_outputs():
-            out = permute.permute_and_quantize_mxfp8(
-                hidden, probs, routing_map, 0, 8, rr.valid_tensor(rows, dev)
-            )
-    except (AssertionError, ValueError, RuntimeError):
-        return  # rejected
-    check_mxfp8_permutation(
-        out,
-        hidden,
-        probs,
-        routing_map,
-        rows,
-        0,
-        8,
-        alignment=128,
-        zero_padding=False,
-        inverse=False,
-        what="strided hidden_states",
-    )
-
-
 def test_rejects_hidden_size_not_multiple_of_32():
     """K must be a multiple of the 32-element block (asserted before any launch)."""
     dev = rr.device()
@@ -547,44 +469,6 @@ def test_rejects_hidden_size_not_multiple_of_32():
             1,
             rr.valid_tensor(4, dev),
         )
-
-
-@pytest.mark.parametrize("alignment", [128])
-def test_valid_above_rows_permutes_only_the_map_rows(alignment):
-    """``valid > rows`` (finding F1): offsets and placements cover only the map's rows.
-
-    **Fails on origin/main**: the count kernel reads the canary tail past the map, so the
-    offsets reserve rows this kernel (which clamps to ``rows``) never claims. Passes with #8563.
-    """
-    dev = rr.device()
-    rows, topk, num_local = 6, 2, 8
-    hidden, probs, head = _inputs(
-        rows, 64, topk, num_local - 1, masked=0, kind="randn", pdtype=torch.float32, dev=dev
-    )
-    routing_map, _ = rr.with_canary_tail(head, 4 + rr.COUNT_BLOCK, num_local - 1)
-    with rr.poisoned_outputs():
-        out = permute.permute_and_quantize_mxfp8(
-            hidden,
-            probs,
-            routing_map,
-            0,
-            num_local,
-            rr.valid_tensor(rows + 4, dev),
-            alignment=alignment,
-        )
-    check_mxfp8_permutation(
-        out,
-        hidden,
-        probs,
-        routing_map,
-        rows + 4,
-        0,
-        num_local,
-        alignment=alignment,
-        zero_padding=False,
-        inverse=False,
-        what="valid > rows",
-    )
 
 
 @pytest.mark.parametrize("live", ou.int32_overflow_params(7168))

@@ -32,8 +32,10 @@ compacted scatter. Inputs therefore cover E in {1, 2, 3, 7, 8, 9, 64, 127, 128, 
 512, 513, 1024} (around the power-of-two blocks and the warp switch), top-k {1, 2, 3, 6, 8, E},
 routes per row {0, fewer than, exactly, more than top-k, all}, bool / uint8 / int32 / int64 maps,
 fp32 / bf16 / fp16 probabilities with signed zeros, subnormals, Inf and NaN, and T {1, 2, 37,
-300}, pairwise; zero tokens; the input checks; production shapes; opt-in (``large``), row
-offsets ``t * E`` past 2^31 (suspected finding O1-M1: the offset is int32).
+300}, pairwise; zero tokens; the input checks; production shapes. Row offsets ``t * E`` past
+2^31 (finding O1-M1, which fails on main: the offset is int32) are #8962's regression test
+``TestInt32Limits::test_mok_route_adapter_row_offsets``
+(``tests/unit_tests/inference/test_moe_permute.py``).
 
 Hardware: any CUDA GPU (H100 in the manifest).
 """
@@ -232,38 +234,3 @@ def test_sanitizer_small_case():
     run_and_check(
         37, 129, 6, routes="mixed", map_dtype=torch.bool, pdtype=torch.bfloat16, special=True
     )
-
-
-@pytest.mark.large
-def test_int32_row_offsets():
-    """Suspected finding O1-M1: the row offset ``token * E`` of the probabilities and the map is
-    int32. With ``E = 256`` and ``2^23 + 1`` tokens the last token's offset is ``2^31``, which
-    wraps to ``-2^31``.
-
-    Both inputs sit behind a ``2^31``-element front guard in one allocation (map guard all
-    routed, probability guard NaN), so a wrapped read lands in the guard and changes the result
-    instead of faulting. Token ``t`` routes to experts ``(t + 32 j) % 256``, ``j < 8``, with
-    probability ``e + 1``, so the expected outputs are computed in closed form. Expected to fail
-    on origin/main (the last token reads the guard). About 22 GiB; opt-in ``large``.
-    """
-    dev = rr.require_cuda()
-    num_experts, topk, guard = 256, 8, 2**31
-    tokens = guard // num_experts + 1
-    ou.require_free_memory((guard + tokens * num_experts) * 5 + (4 << 30))
-    map_buf = torch.ones(guard + tokens * num_experts, dtype=torch.bool, device=dev)
-    probs_buf = torch.full((guard + tokens * num_experts,), float("nan"), device=dev)
-    routing_map = map_buf[guard:].view(tokens, num_experts)
-    probs = probs_buf[guard:].view(tokens, num_experts)
-    probs.copy_(torch.arange(1, num_experts + 1, device=dev, dtype=torch.float32).expand_as(probs))
-    token = torch.arange(tokens, device=dev)[:, None]
-    experts = (token + 32 * torch.arange(topk, device=dev)[None, :]) % num_experts
-    routing_map.zero_()
-    routing_map.scatter_(1, experts, True)
-    weights, indices = ra.routing_map_to_mok_inputs(probs, routing_map, topk)
-    expected = experts.sort(dim=1).values
-    for lo in range(0, tokens, 1 << 20):
-        hi = min(tokens, lo + (1 << 20))
-        ou.assert_exact(indices[lo:hi], expected[lo:hi], what=f"indices of tokens {lo}..{hi}")
-        ou.assert_exact(
-            weights[lo:hi], (expected[lo:hi] + 1).float(), what=f"weights of tokens {lo}..{hi}"
-        )

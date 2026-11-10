@@ -45,13 +45,13 @@ production shapes; CUDA-graph replay with ``valid`` changing (the map keeps the 
 entries past the new ``n_used``, the hidden rows are re-poisoned; neither may be written); the
 zero-padding kernel launched directly on bf16 and byte rows with stale ``-1`` entries past
 ``n_used``, ``output_size`` at 511/512/513, between guard bands; opt-in (``large``), hidden
-and permuted-row element offsets at 2^31 (``rows * H`` with ``H = 7168``) and inverse-map
-offsets ``tok * E_l + lid`` past 2^31.
+and permuted-row element offsets at 2^31 (``rows * H`` with ``H = 7168``).
 
-Known finding F1 (audit family 01): with ``valid > rows`` the count kernel over-reads on main
-while this kernel clamps, so offsets and placements disagree.
-``test_valid_above_rows_permutes_only_the_map_rows`` **fails on origin/main** and passes with
-#8563 (``fix/d3-s6-mtp-moe-metadata``).
+Cases that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_moe_permute.py``: ``valid`` above ``rows`` (finding F1: the
+count kernel over-reads while this kernel clamps) in #8563's
+``TestPermuteTokens::test_valid_tokens_past_routing_map_rows``, and inverse-map offsets
+``tok * E_l + lid`` past 2^31 (O1-N3) in #8962's ``TestInt32Limits::test_inverse_map_offsets``.
 """
 
 import pytest
@@ -496,97 +496,3 @@ def test_int32_row_offsets(live):
     )
     claimed = int((out[2][:live] >= 0).sum())
     assert claimed == live, f"{claimed} of the first {live} permuted rows claimed, expected all"
-
-
-@pytest.mark.large
-def test_int32_inverse_map_offsets():
-    """Finding O1-N3: the inverse-map store offset ``tok * E_l + lid`` is int32.
-
-    With ``E_l = 128`` and ``2^24 + 1`` rows (top-1, token ``t`` on expert ``t % 128``,
-    ``HAS_INVERSE``, alignment 128 as on the batch-invariant path), the last token's offset is
-    ``2^31``: on origin/main it wraps and the store lands 8 GiB before the ``[rows, E_l]``
-    inverse map, which keeps ``-1`` in that row (or the stray store faults). The check is
-    vectorised: offsets, every claimed row on its token's expert, then the whole inverse map
-    against the one implied by ``permutation_map``. About 20 GiB; opt-in ``large``.
-    """
-    dev = rr.require_cuda()
-    num_local, alignment, hidden_dim = 128, 128, 16
-    rows = 2**31 // num_local + 1
-    ou.require_free_memory(2 * rows * num_local * 4 + (4 << 30))
-    hidden = torch.zeros(rows, hidden_dim, dtype=torch.bfloat16, device=dev)
-    probs = torch.ones(rows, 1, dtype=torch.float32, device=dev)
-    routing_map = torch.arange(rows, device=dev).remainder_(num_local).view(rows, 1)
-    _, _, perm_map, offsets, inv = permute.permute_tokens(
-        hidden,
-        probs,
-        routing_map,
-        0,
-        num_local,
-        rr.valid_tensor(rows, dev),
-        alignment=alignment,
-        return_batch_invariant_inverse_map=True,
-    )
-    counts = torch.full((num_local,), rows // num_local, dtype=torch.int64)
-    counts[: rows % num_local] += 1
-    _, ref_in = rr.aligned_offsets(counts.tolist(), alignment)
-    ou.assert_exact(offsets, torch.tensor(ref_in), what="inclusive offsets")
-    used = torch.arange(ref_in[-1], device=dev)
-    real = used[perm_map[: ref_in[-1]] >= 0]
-    assert real.numel() == rows, f"{real.numel()} claimed rows, expected {rows}"
-    expert = torch.searchsorted(offsets.to(torch.int64), real, right=True)
-    tokens = perm_map[real].long()
-    ou.assert_exact(tokens % num_local, expert, what="each claimed row on its token's expert")
-    expected = torch.full_like(inv, -1)
-    expected[tokens, expert] = real.to(torch.int32)
-    for lo in range(0, rows, 1 << 20):
-        ou.assert_exact(
-            inv[lo : lo + (1 << 20)],
-            expected[lo : lo + (1 << 20)],
-            what=f"inverse map rows from {lo}",
-        )
-
-
-@pytest.mark.parametrize("alignment", [1, 16])
-def test_valid_above_rows_permutes_only_the_map_rows(alignment):
-    """``valid > rows`` (finding F1): offsets and placements cover only the map's rows.
-
-    Fails on origin/main: the count kernel reads the canary tail past the map, so the offsets
-    reserve rows the permute kernel (which clamps to ``rows``) never claims. Passes with #8563.
-    """
-    dev = rr.device()
-    rows, topk, num_local, start = 6, 2, 8, 0
-    hidden, probs, head = _inputs(
-        rows,
-        64,
-        topk,
-        num_local - 1,
-        masked=0,
-        hdtype=torch.bfloat16,
-        pdtype=torch.float32,
-        dev=dev,
-    )
-    routing_map, _ = rr.with_canary_tail(head, 4 + rr.COUNT_BLOCK, num_local - 1)
-    with rr.poisoned_outputs():
-        out = permute.permute_tokens(
-            hidden,
-            probs,
-            routing_map,
-            start,
-            num_local,
-            rr.valid_tensor(rows + 4, dev),
-            alignment=alignment,
-        )
-    check_permutation(
-        out,
-        hidden,
-        probs,
-        routing_map,
-        rows + 4,
-        start,
-        num_local,
-        alignment=alignment,
-        row_alignment=1,
-        zero_padding=False,
-        inverse=False,
-        what="valid > rows",
-    )

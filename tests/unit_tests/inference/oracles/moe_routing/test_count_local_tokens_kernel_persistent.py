@@ -31,17 +31,16 @@ dtype; ``BLOCK_SIZE = 1024``; grid ``num_sms`` (cached process-wide from the dev
 Inputs therefore cover ``num_sms`` in {1, 2, total_blocks-1, total_blocks, total_blocks+1, 132
 (H100), 1000} against ``valid * topk`` at block boundaries, ``valid`` in {0, 1, rows-1, rows},
 the ``E_l`` / slice / topk / dtype variants pairwise, ``-1`` ids, production sizes and, opt-in
-(``large``), live pair counts at the int32 limits (the ``cdiv`` adds 1023 first) and a map of
-more than 2^31 pairs behind a front guard.
+(``large``), a live pair count whose ``cdiv`` (which adds 1023 first) still fits int32 and a map
+of more than 2^31 pairs behind a front guard.
 
 Memory: canary-tailed routing maps (reads past the rows change a count), guard bands around the
 caller-zeroed output, the map checked unchanged; one ``sanitizer`` case.
 
-Known finding F1 (audit family 01): with ``valid > rows`` this variant reads
-``(valid - rows) * topk`` entries past the map, with no grid cap.
-``test_valid_above_rows_counts_only_the_map_rows`` and
-``test_valid_above_rows_in_cuda_graph_replay`` therefore **fail on origin/main** and pass with
-#8563 (``fix/d3-s6-mtp-moe-metadata``), which bounds the count kernels by the routing-map rows.
+Cases that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_moe_permute.py``: ``valid`` above ``rows`` (finding F1) in
+#8563's ``TestComputeLocalTokensPerExpert::test_valid_tokens_past_routing_map_rows``, and pair
+counts whose ``cdiv`` or product passes int32 (O1-N1) in #8962's ``TestInt32Limits``.
 """
 
 import pytest
@@ -276,67 +275,19 @@ def test_cuda_graph_replay_follows_valid(kind):
         )
 
 
-@pytest.mark.parametrize(
-    "rows,topk,extra",
-    [
-        pytest.param(6, 2, 4, id="mtp-rows6-topk2"),
-        pytest.param(37, 6, 3, id="partial-last-block"),
-        pytest.param(170, 6, 1000, id="valid-far-above-rows"),
-    ],
-)
-def test_valid_above_rows_counts_only_the_map_rows(rows, topk, extra):
-    """``valid > rows`` (finding F1): only the ``rows`` rows of the map are counted.
-
-    Fails on origin/main: the persistent kernel derives its work from ``valid`` alone and reads
-    ``(valid - rows) * topk`` entries of the canary tail. Passes with #8563.
-    """
-    dev = rr.device()
-    g = ou.make_generator()
-    num_local, start = 8, 0
-    head = rr.topk_distinct_ids(rows, topk, num_local - 1, generator=g, dev=dev)
-    routing_map, _ = rr.with_canary_tail(head, extra + rr.COUNT_BLOCK, num_local - 1)
-    _check(routing_map, start, num_local, rows + extra, what="valid > rows", dev=dev)
-
-
-def test_valid_above_rows_in_cuda_graph_replay():
-    """F1 in its production form: a graph captured for an MTP-sized map replayed with the
-    main forward's larger ``valid``. Fails on origin/main; passes with #8563."""
-    dev = rr.require_cuda()
-    g = ou.make_generator()
-    rows, topk, num_local, start = 12, 6, 8, 0
-    head = rr.topk_distinct_ids(rows, topk, num_local - 1, generator=g, dev=dev)
-    routing_map, _ = rr.with_canary_tail(head, 4096, num_local - 1)
-    valid = rr.valid_tensor(rows, dev)
-    graph, out = _capture_zero_and_count(routing_map, start, num_local, valid)
-    for v in [rows, rows + 1, 4 * rows, 4000, rows]:
-        valid.fill_(v)
-        graph.replay()
-        torch.cuda.synchronize()
-        ou.check_guards(out=out)
-        ou.assert_exact(
-            out.tensor,
-            rr.local_counts(routing_map, v, start, num_local),
-            what=f"replay valid={v} rows={rows}",
-        )
-
-
-@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8))
+@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8, ("count-fits",)))
 def test_int32_pair_count(rows):
-    """Live pair counts ``valid * topk`` at the int32 limits (opt-in ``large``; 16 GiB map).
-
-    Suspected finding O1-N1 (GPU-confirmed for the non-persistent kernel at 2^31 pairs, dfw
-    21220533): ``valid * topk`` is int32, and so is ``cdiv``'s ``valid_pairs + 1023``. Expected
-    on origin/main and with #8563: ``count-fits`` passes; ``cdiv-wraps`` (2^31 - 8 pairs) and
-    ``count-wraps`` (2^31 pairs) count nothing (``total_blocks`` < 0). Unreachable at
-    production sizes (2^31 pairs is about 268M routing rows at top-8).
+    """The largest live pair count ``valid * topk`` whose ``cdiv`` by the block (which adds
+    1023 first) fits int32 (opt-in ``large``; 16 GiB map). Larger counts (finding O1-N1) are
+    #8962's ``TestInt32Limits`` cases.
     """
     rr.check_int32_pair_count(_count, rows, dev=rr.require_cuda())
 
 
 @pytest.mark.large
 def test_int32_block_offsets():
-    """Control for O1-N2: a map of 2^31 + 8 pairs behind a 2^31-entry front guard, 1000 live
-    rows. This variant bounds its blocks by ``valid`` (``block_id * 1024`` stays small), so it
-    must count only the live rows; expected to pass on origin/main. 32 GiB, opt-in ``large``.
+    """A map of 2^31 + 8 pairs behind a 2^31-entry front guard, 1000 live rows. This variant
+    bounds its blocks by ``valid`` (``block_id * 1024`` stays small), so it counts only the live
+    rows. 32 GiB, opt-in ``large``.
     """
     rr.check_int32_block_offsets(_count, dev=rr.require_cuda())

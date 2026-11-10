@@ -332,26 +332,21 @@ def assert_untouched(t: torch.Tensor, *, what: str, poison: Optional[float] = No
 INT32_LIMIT = 2**31
 
 
-def int32_pair_count_params(topk: int) -> List[Any]:
-    """Row counts whose live pair count ``rows * topk`` (``valid == rows``) sits at the int32
-    limits of a pair count, all with element offsets below 2^31:
+def int32_pair_count_params(topk: int, labels: Sequence[str]) -> List[Any]:
+    """Row counts whose live pair count ``rows * topk`` (``valid == rows``) sits just below the
+    int32 limit of a pair count, with element offsets below 2^31, for the cases in ``labels``:
 
     * ``count-fits``: ``2^31 - 1024`` pairs; ``pairs + 1023`` (a ceiling division by the
       1024-pair block) still fits int32.
     * ``cdiv-wraps``: ``2^31 - topk`` pairs; the pair count fits, ``pairs + 1023`` does not.
-    * ``count-wraps``: ``2^31`` pairs, one past ``INT32_MAX``; the last element offset is
-      ``2^31 - 1`` and still fits.
 
     ``topk`` must divide 1024. Each case needs a 16 GiB int64 map.
     """
-    cases = [
-        (INT32_LIMIT - COUNT_BLOCK, "count-fits"),
-        (INT32_LIMIT - topk, "cdiv-wraps"),
-        (INT32_LIMIT, "count-wraps"),
-    ]
+    cases = [(INT32_LIMIT - COUNT_BLOCK, "count-fits"), (INT32_LIMIT - topk, "cdiv-wraps")]
     return [
         pytest.param(p // topk, id=f"{p // topk}[pairs={p}-{label}]", marks=pytest.mark.large)
         for p, label in cases
+        if label in labels
     ]
 
 

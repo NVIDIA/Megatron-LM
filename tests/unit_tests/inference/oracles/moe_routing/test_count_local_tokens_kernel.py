@@ -33,17 +33,16 @@ boundaries (B-1/B/B+1 and 2B), ``valid`` in {0, 1, rows-1, rows}, ``topk`` in {1
 specialisation), 2, 6, 8, 16}, ``E_l`` in {1, 2, 7, 16, 32, 128}, the first / second / last
 local slice of a 4-rank model (``start`` 0, 1, 16 included), ids at the slice edges, all pairs
 on one expert (atomic contention), production sizes and, opt-in (``large``), live pair counts
-at the int32 limits and a map of more than 2^31 pairs behind a front guard (block offsets).
+just below the int32 limit.
 
 Memory: every routing map is the head of a canary buffer whose tail routes to a local expert
 (a read past the map's rows changes a count); the caller-zeroed output sits between guard
 bands; the routing map is checked unchanged. One small case is marked ``sanitizer``.
 
-Known finding F1 (audit family 01): a ``valid`` above ``rows`` reaches this kernel in MTP
-forwards on main, and the kernel reads past the routing map (up to the end of its last 1024-pair
-block). ``test_valid_above_rows_counts_only_the_map_rows`` therefore **fails on origin/main**
-and passes with #8563 (``fix/d3-s6-mtp-moe-metadata``), which bounds the count kernels by the
-routing-map rows.
+Cases that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_moe_permute.py``: ``valid`` above ``rows`` (finding F1) in
+#8563's ``TestComputeLocalTokensPerExpert::test_valid_tokens_past_routing_map_rows``, and pair
+counts and block offsets past int32 (O1-N1, O1-N2) in #8962's ``TestInt32Limits``.
 """
 
 import pytest
@@ -258,51 +257,9 @@ def test_cuda_graph_replay_follows_valid():
         )
 
 
-@pytest.mark.parametrize(
-    "rows,topk,extra",
-    [
-        pytest.param(6, 2, 4, id="mtp-rows6-topk2"),
-        pytest.param(37, 6, 3, id="partial-last-block"),
-        pytest.param(170, 6, 1000, id="valid-far-above-rows"),
-    ],
-)
-def test_valid_above_rows_counts_only_the_map_rows(rows, topk, extra):
-    """``valid > rows`` (finding F1): only the ``rows`` rows of the map are counted.
-
-    Fails on origin/main: the kernel masks by ``valid * topk`` alone and reads the canary tail
-    up to the end of the last 1024-pair block of its grid. Passes with #8563, which bounds both
-    count kernels by the routing-map rows.
-    """
-    dev = rr.device()
-    g = ou.make_generator()
-    num_local, start = 8, 0
-    head = rr.topk_distinct_ids(rows, topk, num_local - 1, generator=g, dev=dev)
-    routing_map, _ = rr.with_canary_tail(head, rows + extra + rr.COUNT_BLOCK, num_local - 1)
-    _check(routing_map, start, num_local, rows + extra, what="valid > rows", dev=dev)
-
-
-@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8))
+@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8, ("count-fits", "cdiv-wraps")))
 def test_int32_pair_count(rows):
-    """Live pair counts ``valid * topk`` at the int32 limits (opt-in ``large``; 16 GiB map).
-
-    Finding O1-N1 (GPU-confirmed, dfw 21220533: 0 instead of 2^26 on every expert at 2^31
-    pairs): ``valid * topk`` is int32 and wraps to ``-2^31``, so the mask drops every pair.
-    Expected on origin/main and with #8563: ``count-fits`` and ``cdiv-wraps`` pass,
-    ``count-wraps`` fails. Unreachable at production sizes (2^31 pairs is about 268M routing
-    rows at top-8).
+    """Live pair counts ``valid * topk`` just below the int32 limit (opt-in ``large``; 16 GiB
+    map). 2^31 pairs and more (finding O1-N1) are #8962's ``TestInt32Limits`` cases.
     """
     rr.check_int32_pair_count(_count, rows, dev=rr.require_cuda())
-
-
-@pytest.mark.large
-def test_int32_block_offsets():
-    """Finding O1-N2: ``pid * 1024`` is int32, so with a map of more than 2^31 pairs the last
-    program's offsets wrap to ``-2^31 .. -2^31 + 1023``, pass the ``< valid * topk`` mask and
-    read 16 GiB before the map, whatever ``valid`` is.
-
-    The map (2^31 + 8 pairs, 1000 live rows) sits behind a 2^31-entry front guard routed to
-    expert 31, so the stray read is counted instead of faulting. Expected to fail on
-    origin/main and with #8563 (``counts[31] = 1024``). On dfw 21220533 the unguarded
-    ``2^31 + 8``-pair case faulted with an illegal memory access. 32 GiB, opt-in ``large``.
-    """
-    rr.check_int32_block_offsets(_count, dev=rr.require_cuda())
