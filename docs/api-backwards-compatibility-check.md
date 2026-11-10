@@ -179,7 +179,9 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   with an error. Its allowlist of the existing calls records which ones are warned: preceded, in
   the same function, by a `warn_global_process_group_fallback()` call in their block or in a
   block that contains it, or inside a `with global_process_group_fallback(...)` block. A warned
-  call that loses its warning is an error too.
+  call that loses its warning is an error too. `resolve_gtp_remat_group(..., owner=None)` does
+  not warn, so the check counts it as guarded only where such a warning precedes it, and as an
+  unwarned call elsewhere.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
