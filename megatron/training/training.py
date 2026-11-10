@@ -2682,11 +2682,11 @@ def _build_pg_collection_from_parallel_state(args, config=None):
     config's.
     """
     cfg = get_run_config()
-    if config is None:
-        config = cfg.model.transformer
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if args.create_all_gather_group:
+        if config is None:
+            config = cfg.model.transformer
         timeout = (
             timedelta(minutes=cfg.dist.distributed_timeout_minutes)
             if cfg.dist.distributed_timeout_minutes
