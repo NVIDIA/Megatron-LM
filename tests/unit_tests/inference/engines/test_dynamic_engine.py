@@ -4171,6 +4171,44 @@ def test_stop_word_strip_across_decode_steps_trims_stored_metadata():
 
 
 @pytest.mark.parametrize("keep_stop", [False, True], ids=["strip", "keep"])
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["one-segment", "checkpointed"])
+def test_stop_word_strip_drops_epoch_stamps_on_stripped_tokens(keep_stop, checkpointed):
+    """A stripped stop that reaches back past an epoch stamp drops the stamp, so every
+    boundary the result reports sits on a token of its visible sequence."""
+    request = DynamicInferenceRequest(
+        request_id=34,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=8, termination_id=-1, detokenize_stop_sequence=keep_stop
+        ),
+        stop_word_ids=[[8, 9]],
+        generated_tokens=[10, 8],
+        # The epoch changed after token 8: its stamp sits on that token, position 4.
+        policy_epoch=[(0, 6), (4, 7)],
+        kv_cache_epoch=[(0, 6), (4, 7)],
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    if checkpointed:
+        record.checkpoint()
+        # Re-admission recomputes the whole KV under the current epoch.
+        record[-1].kv_cache_epoch = [(0, 7)]
+    current = record[-1]
+    current.generated_tokens.append(9)
+    engine = types.SimpleNamespace(num_speculative_tokens=0)
+
+    hit, _, _ = DynamicInferenceEngine._check_stop_words_for_request_post_append(
+        engine, current, record=record, num_new_tokens=1
+    )
+    merged = record.merge()
+
+    assert hit
+    assert merged.generated_tokens == ([10, 8, 9] if keep_stop else [10])
+    policy_epoch = [(0, 6), (4, 7)] if keep_stop else [(0, 6)]
+    assert merged.policy_epoch == policy_epoch
+    assert merged.kv_cache_epoch == ([(0, 7)] if checkpointed else policy_epoch)
+
+
+@pytest.mark.parametrize("keep_stop", [False, True], ids=["strip", "keep"])
 @pytest.mark.parametrize(
     "prompt_scores_already_stored", [False, True], ids=["pending-scores", "stored-scores"]
 )
