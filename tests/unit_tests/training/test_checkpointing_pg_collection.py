@@ -447,3 +447,40 @@ def test_legacy_save_selects_the_data_parallel_groups(
     assert save_dataloader_state.call_args.kwargs["dp_group"] is groups.get(
         "dp_gtp_remat", groups["dp"]
     )
+
+
+def _stand_in_collection(**groups):
+    """Return a one-shard collection of stand-in groups, with ``groups`` in place of its own.
+
+    The first rank of the job is the only first data-parallel rank, so it alone writes a legacy
+    shard that every rank can then load.
+    """
+    one = _StandInGroup(rank=0, size=1)
+    replicas = _StandInGroup(torch.distributed.get_rank(), torch.distributed.get_world_size())
+    fields = dict(tp=one, pp=one, cp=one, ep=one, dp=replicas, dp_cp=replicas, expt_dp=replicas)
+    return ProcessGroupCollection(**{**fields, **groups})
+
+
+def test_legacy_load_reads_the_shard_of_the_stand_in_ranks(ckpt_args, tmp_path_dist_ckpt):
+    """Offline tools walk the legacy shards by the ranks of their stand-in groups."""
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    with (
+        TempNamedDir(
+            tmp_path_dist_ckpt / "test_legacy_load_reads_the_shard_of_the_stand_in_ranks", sync=True
+        ) as ckpt_dir,
+        _no_global_grid(),
+    ):
+        _legacy_checkpoint_args(ckpt_args, ckpt_dir)
+        for tp_rank in range(2):
+            model = MockModel(config)
+            with torch.no_grad():
+                model.l.weight.fill_(tp_rank + 1)
+            pg_collection = _stand_in_collection(tp=_StandInGroup(tp_rank, 2))
+            save_checkpoint(123, [model], None, None, 456, pg_collection=pg_collection)
+
+        for tp_rank in (1, 0):
+            restored = MockModel(config)
+            pg_collection = _stand_in_collection(tp=_StandInGroup(tp_rank, 2))
+            loaded = load_checkpoint([restored], None, None, pg_collection=pg_collection)
+            assert loaded == (123, 456)
+            assert torch.all(restored.l.weight == tp_rank + 1)
