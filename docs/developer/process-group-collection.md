@@ -170,7 +170,10 @@ Transformer Engine layer spec, without calling `initialize_model_parallel`. Some
 - Pass the collection to `model_parallel_cuda_manual_seed`, and `pp_size` and `vp_size` to
   `get_forward_backward_func`. Without them, both fall back to `parallel_state` with a
   `ProcessGroupFallbackWarning`. The seed reads `tp`, `ep`, `expt_tp`, `gtp_remat` and
-  `expt_gtp_remat`, so the collection must set all five.
+  `expt_gtp_remat`. Set all five, to `None` when the axis is off: the seed also reads a group
+  that the collection leaves unset from `parallel_state`, with the same warning. For a grid of
+  your own that is the group of another grid, and without a global grid `tp`, `ep` and `expt_tp`
+  raise `RuntimeError`.
 - Set `config.finalize_model_grads_func` as shown; the schedules call it with the collection.
 - With pipeline parallelism, the schedules take a `P2PCommunicator` for the pipeline group
   together with the collection.
