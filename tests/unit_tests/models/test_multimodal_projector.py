@@ -15,6 +15,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
+    destroy_copied_amax_groups,
     forbid_global_amax_group,
     record_amax_groups,
     with_copied_amax_groups,
@@ -47,6 +48,7 @@ class TestMultimodalProjector:
         )
 
     def teardown_method(self, method):
+        destroy_copied_amax_groups()
         Utils.destroy_model_parallel()
 
     def test_constructor(self):

@@ -26,7 +26,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 # The accessors that tools/check_process_group_usage.py counts.
 _ACCESSOR_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
@@ -96,14 +96,17 @@ def tp2_collection():
     """A collection for a TP=2, DP=world/2 grid, built without the global grid.
 
     Its TP size differs from the world size, and its DP rank differs from the global rank on
-    every rank but 0, so a world-group read changes the result.
+    every rank but 0, so a world-group read changes the result. Its groups are not part of the
+    global grid, so they are destroyed here after the last test of the module.
     """
     Utils.initialize_distributed()
     if Utils.world_size < 4 or Utils.world_size % 2 != 0:
         pytest.skip("needs an even world size of at least 4")
-    return build_inference_pg_collection(
+    collection = build_inference_pg_collection(
         Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
     )
+    yield collection
+    destroy_test_pg_collection(collection)
 
 
 def _partial_collection(collection, *names, **explicit):

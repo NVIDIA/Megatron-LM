@@ -170,29 +170,34 @@ class TestExplicitCollection:
         # New communicators over the ranks of the global groups: a stray global read would hand
         # a module a group object that is not in this collection.
         grid = HyperCommGrid([2, 1, Utils.world_size // 4, 2], ["tp", "cp", "dp", "pp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"),
-            cp=grid.create_pg("cp"),
-            pp=grid.create_pg("pp"),
-            dp_cp=grid.create_pg(["dp", "cp"]),
-            hcp=None,
-            gtp_remat=None,
-            expt_gtp_remat=None,
-        )
-        _forbid_global_process_groups(monkeypatch)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", ProcessGroupFallbackWarning)
-            block = TransformerBlock(config, _layer_spec(), pg_collection=pg_collection)
-        assert block.pg_collection is pg_collection
-        assert block.tp_group is pg_collection.tp
-        assert _layer_numbers(block) == [
-            2 * pg_collection.pp.rank() + 1,
-            2 * pg_collection.pp.rank() + 2,
-        ]
-        for layer in block.layers:
-            assert layer.pg_collection is pg_collection
-            assert layer.self_attention.pg_collection is pg_collection
-            assert layer.mlp.tp_group is pg_collection.tp
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"),
+                cp=grid.create_pg("cp"),
+                pp=grid.create_pg("pp"),
+                dp_cp=grid.create_pg(["dp", "cp"]),
+                hcp=None,
+                gtp_remat=None,
+                expt_gtp_remat=None,
+            )
+            _forbid_global_process_groups(monkeypatch)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                block = TransformerBlock(config, _layer_spec(), pg_collection=pg_collection)
+            assert block.pg_collection is pg_collection
+            assert block.tp_group is pg_collection.tp
+            assert _layer_numbers(block) == [
+                2 * pg_collection.pp.rank() + 1,
+                2 * pg_collection.pp.rank() + 2,
+            ]
+            for layer in block.layers:
+                assert layer.pg_collection is pg_collection
+                assert layer.self_attention.pg_collection is pg_collection
+                assert layer.mlp.tp_group is pg_collection.tp
+        finally:
+            # Every rank finishes creating the groups before any communicator goes away.
+            torch.distributed.barrier()
+            grid.destroy()
 
 
 class TestDefaultCollection:
@@ -263,8 +268,14 @@ class TestDefaultCollection:
         assert layer.self_attention.pg_collection is layer.pg_collection
 
     @pytest.mark.skipif(not HAVE_TE, reason="the MoE layer spec needs Transformer Engine")
-    @pytest.mark.parametrize("moe", [False, True])
-    def test_modules_read_only_the_fields_the_fallback_builds(self, monkeypatch, moe):
+    @pytest.mark.parametrize(
+        "moe, realtime_tests",
+        [(False, False), (True, False), (False, True)],
+        ids=["dense", "moe", "realtime_tests"],
+    )
+    def test_modules_read_only_the_fields_the_fallback_builds(
+        self, monkeypatch, moe, realtime_tests
+    ):
         Utils.initialize_model_parallel(expert_model_parallel_size=2 if moe else 1)
         model_parallel_cuda_manual_seed(123)
         moe_kwargs = (
@@ -279,7 +290,10 @@ class TestDefaultCollection:
             if moe
             else {}
         )
-        config = _config(num_layers=2, **moe_kwargs)
+        # In test_mode with qk_layernorm, every SelfAttention forward compares the Q/K layernorm
+        # parameters across the data-parallel group.
+        test_kwargs = dict(test_mode=True, qk_layernorm=True) if realtime_tests else {}
+        config = _config(num_layers=2, **moe_kwargs, **test_kwargs)
         field_names = {f.name for f in dataclasses.fields(ProcessGroupCollection)}
 
         # __getattr__ only runs for a field that is not in vars(): make reading one fail.
@@ -304,9 +318,11 @@ class TestFloat16ModuleCollection:
     """Float16Module converts on the pipeline stages of the wrapped module's own groups."""
 
     class _Recorder(torch.nn.Module):
+        """Records the dtype of its input and returns it in the model precision."""
+
         def forward(self, x):
             self.input_dtype = x.dtype
-            return x
+            return x.to(torch.bfloat16)
 
     class _StageGroup:
         """A pipeline group of which this rank is ``rank`` out of ``size``."""
@@ -320,17 +336,19 @@ class TestFloat16ModuleCollection:
         def size(self):
             return self._size
 
+    # Every row feeds float32, so the dtype that the wrapped module sees tells whether the inputs
+    # were converted: only the first stage converts them.
     @pytest.mark.parametrize(
-        "rank, size, input_dtype, converted_input, output_dtype",
+        "rank, size, module_input, output_dtype",
         [
-            (0, 1, torch.float32, torch.bfloat16, torch.float32),  # only stage
-            (0, 2, torch.float32, torch.bfloat16, torch.bfloat16),  # first stage
-            (1, 3, torch.bfloat16, torch.bfloat16, torch.bfloat16),  # middle stage
-            (1, 2, torch.bfloat16, torch.bfloat16, torch.float32),  # last stage
+            (0, 1, torch.bfloat16, torch.float32),  # only stage
+            (0, 2, torch.bfloat16, torch.bfloat16),  # first stage
+            (1, 3, torch.float32, torch.bfloat16),  # middle stage
+            (1, 2, torch.float32, torch.float32),  # last stage
         ],
     )
     def test_explicit_collection_selects_the_stage(
-        self, monkeypatch, rank, size, input_dtype, converted_input, output_dtype
+        self, monkeypatch, rank, size, module_input, output_dtype
     ):
         Utils.initialize_model_parallel()
         config = _config(bf16=True, pipeline_model_parallel_size=size)
@@ -340,8 +358,8 @@ class TestFloat16ModuleCollection:
         with warnings.catch_warnings():
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             wrapper = Float16Module(config, recorder, pg_collection=pg_collection)
-            output = wrapper(torch.ones(2, dtype=input_dtype, device="cuda"))
-        assert recorder.input_dtype == converted_input
+            output = wrapper(torch.ones(2, dtype=torch.float32, device="cuda"))
+        assert recorder.input_dtype == module_input
         assert output.dtype == output_dtype
 
     def test_argument_takes_precedence_over_the_module_collection(self):
@@ -353,7 +371,8 @@ class TestFloat16ModuleCollection:
         wrapper = Float16Module(config, recorder, pg_collection=pg_collection)
         assert wrapper.pg_collection is pg_collection
         # The last stage of two converts outputs but not inputs.
-        assert wrapper(torch.ones(2, dtype=torch.bfloat16, device="cuda")).dtype == torch.float32
+        assert wrapper(torch.ones(2, dtype=torch.float32, device="cuda")).dtype == torch.float32
+        assert recorder.input_dtype == torch.float32
 
     def test_module_collection_without_pp_raises_under_pipeline_parallelism(self):
         Utils.initialize_model_parallel()
@@ -391,6 +410,15 @@ class TestMultiTokenPrediction:
         _fallback_warning(record, "get_mtp_num_layers_to_build", "pp_rank")
         # Without a layout, all MTP layers sit on the last stage.
         assert expected == (1 if pp_rank == 1 else 0)
+
+    @pytest.mark.parametrize("layout", [None, [['embedding', 'decoder', 'decoder', 'mtp', 'loss']]])
+    def test_layer_count_of_a_single_stage_needs_no_pp_rank(self, monkeypatch, layout):
+        # No grid is initialized: the only stage has rank 0, so nothing is read or deprecated.
+        config = _config(num_layers=2, mtp_num_layers=1, pipeline_model_parallel_layout=layout)
+        _forbid_global_process_groups(monkeypatch)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            assert get_mtp_num_layers_to_build(config) == 1
 
     @requires_two_ranks
     def test_layer_offset_without_pp_rank_warns_and_uses_the_global_rank(self):

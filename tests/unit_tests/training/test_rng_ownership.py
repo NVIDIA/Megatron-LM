@@ -12,7 +12,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, checkpointing, global_vars, initialize
@@ -268,14 +271,29 @@ def test_collection_seed_offsets_use_full_data_parallel_group(monkeypatch, dp_ra
 
 
 @pytest.mark.parametrize(
-    "groups, dp_random",
-    [({"dp_gtp_remat": object()}, False), ({"pp": object(), "dp": object()}, True)],
+    "groups, dp_random", [({"dp_gtp_remat": object()}, False), ({"pp": object()}, True)]
 )
 def test_collection_seed_requires_its_offset_groups(monkeypatch, groups, dp_random):
-    """A collection without pp, or without dp_gtp_remat for DP-random init, is an error."""
+    """A collection without pp, or without a data-parallel group for DP-random init, is an error."""
     _forbid_global_process_groups(monkeypatch)
     with pytest.raises(ValueError, match="pg_collection must set pp"):
         initialize._set_random_seed(101, dp_random, pg_collection=ProcessGroupCollection(**groups))
+
+
+def test_collection_without_dp_gtp_remat_takes_the_seed_offset_from_dp(monkeypatch):
+    """A collection built without the GTP_remat groups keeps the DP offset of its dp group."""
+    pp, dp = object(), object()
+    ranks = {pp: 2, dp: 5}
+    monkeypatch.setattr(initialize, "get_pg_rank", lambda group: ranks[group])
+    _forbid_global_process_groups(monkeypatch)
+    python_seed, numpy_seed, torch_seed = Mock(), Mock(), Mock()
+    monkeypatch.setattr(initialize.random, "seed", python_seed)
+    monkeypatch.setattr(initialize.np.random, "seed", numpy_seed)
+    monkeypatch.setattr(initialize.torch, "manual_seed", torch_seed)
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 0)
+    initialize._set_random_seed(101, True, pg_collection=ProcessGroupCollection(pp=pp, dp=dp))
+    for seeded in (python_seed, numpy_seed, torch_seed):
+        seeded.assert_called_once_with(101 + 100 * 2 + 10 * 5)
 
 
 def test_initialization_seeds_from_the_model_collection(monkeypatch, run_config):
@@ -301,6 +319,34 @@ def test_initialization_seeds_from_the_model_collection(monkeypatch, run_config)
         allow_no_cuda=True, skip_dependency_compilation=True, seed_pg_collection=pg_collection
     )
     assert seed.call_args.kwargs["pg_collection"] is pg_collection
+
+
+@pytest.mark.parametrize("multi_module", [False, True])
+def test_pretrain_seeds_from_its_collection(monkeypatch, run_config, multi_module):
+    """pretrain() seeds from a plain collection; a multi-module one is seeded by its builder."""
+    from megatron.training import training
+
+    class BeforeInitialization(Exception):
+        pass
+
+    initialize_megatron = Mock(side_effect=BeforeInitialization)
+    monkeypatch.setattr(training, "initialize_megatron", initialize_megatron)
+    monkeypatch.setattr(training.ft_integration, "setup", Mock())
+    # pretrain() finalizes the container before fault-tolerance setup; that needs the
+    # registered args, which this check stops short of.
+    monkeypatch.setattr(run_config, "finalize", Mock())
+    pg_collection = ProcessGroupCollection()
+    if multi_module:
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"llm": pg_collection}, language_model_module_name="llm"
+        )
+
+    with pytest.raises(BeforeInitialization):
+        training.pretrain(run_config, Mock(), None, Mock(), pg_collection=pg_collection)
+
+    seeding = initialize_megatron.call_args.kwargs
+    assert seeding["skip_random_seed"] is multi_module
+    assert seeding["seed_pg_collection"] is (None if multi_module else pg_collection)
 
 
 @pytest.mark.parametrize("source", ["grid", "model", "none"])
