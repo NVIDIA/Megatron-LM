@@ -2714,11 +2714,13 @@ def _build_pg_collection_from_parallel_state(args, config=None):
         dp_cp_ag, expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=(config.expert_model_parallel_size > 1), timeout=timeout
         )
-        # create_all_gather_groups lays the expert ranks out in the default order, so check that
-        # each all-gather group spans the ranks of the group whose parameters it gathers.
+        # create_all_gather_groups mirrors the full data-parallel groups and lays the expert
+        # ranks out in the default order, so check that each all-gather group spans the ranks
+        # of the group Megatron-FSDP shards its parameters over: the intra-instance group,
+        # which is the full group with one distributed optimizer instance.
         for ag_group, group in (
-            (dp_cp_ag, pg_collection.dp_cp),
-            (expt_dp_ag, pg_collection.expt_dp),
+            (dp_cp_ag, pg_collection.intra_dp_cp),
+            (expt_dp_ag, pg_collection.intra_expt_dp),
         ):
             if ag_group is not None and (
                 torch.distributed.get_process_group_ranks(ag_group)
@@ -2726,8 +2728,9 @@ def _build_pg_collection_from_parallel_state(args, config=None):
             ):
                 raise ValueError(
                     "--create-all-gather-group built all-gather groups whose ranks differ from "
-                    "the data-parallel groups; with expert parallelism it supports only the "
-                    "default tp-cp-ep-dp-pp rank order."
+                    "the data-parallel groups Megatron-FSDP shards over. It does not support "
+                    "--num-distributed-optimizer-instances > 1, and with expert parallelism it "
+                    "supports only the default tp-cp-ep-dp-pp rank order."
                 )
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
@@ -3159,7 +3162,7 @@ def setup_model_and_optimizer(
             p=args.logits_save_top_p,
             min_k=args.logits_save_top_p_min_k,
             save_dtype=args.logits_save_dtype,
-            pg_collection=unwrapped_model[-1].pg_collection,
+            pg_collection=_get_model_pg_collection(model[0], pg_collection),
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
@@ -4773,16 +4776,20 @@ def _param_hashes_match_across_dp_replicas(model):
     """Return whether every data-parallel replica of the model holds the same parameters.
 
     The replicas are those of the model's process-group collection; a model without one is
-    checked across the replicas of the global parallel state.
+    checked across the replicas of the global parallel state. For a collection without an
+    expert data-parallel group, the expert replicas are those of the group that
+    DistributedDataParallel built in its place.
     """
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
     if model_pg_collection is None:
         model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    expt_dp_group = model_pg_collection.expt_dp
+    if expt_dp_group is None:
+        # DistributedDataParallel accepts a collection without expt_dp and reduces the expert
+        # gradients over single-rank groups of its own; compare the expert hashes over the same.
+        expt_dp_group = getattr(model[0], "expt_dp_group", None)
     return check_param_hashes_across_dp_replicas(
-        model,
-        cross_check=True,
-        dp_group=model_pg_collection.dp,
-        expt_dp_group=model_pg_collection.expt_dp,
+        model, cross_check=True, dp_group=model_pg_collection.dp, expt_dp_group=expt_dp_group
     )
 
 
