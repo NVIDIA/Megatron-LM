@@ -267,6 +267,14 @@ _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
 
+# Which stages' captured full-iteration CUDA graphs produced packed/padded sequence
+# statistics. The producers set ``_seqlen_stats_active`` in Python, and Python state
+# is not replayed, so a graph that produced stats must have the consumer flag
+# re-armed before every replay -- otherwise ``consume_*`` reports the BSHD
+# ``(None, None)`` defaults after the first iteration and the accumulator is never
+# drained.
+_seqlen_stats_produced_in_capture: Dict[str, bool] = {'training': False, 'validation': False}
+
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
@@ -769,6 +777,35 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
     _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
     _seqlen_stats_active = True
     _seqlen_stats_are_global = True
+
+
+def record_seqlen_stats_capture(stage: str = 'training') -> None:
+    """Remember whether the just-captured iteration produced sequence statistics.
+
+    Registered as a capture hook of :class:`FullCudaGraphWrapper`; the capture
+    iteration runs the producers eagerly, so ``_seqlen_stats_active`` still
+    reflects what the captured graph produces on every replay.
+    """
+    _seqlen_stats_produced_in_capture[stage] = _seqlen_stats_active
+
+
+def reactivate_seqlen_stats_for_graph_replay(stage: str = 'training') -> bool:
+    """Re-arm the per-iteration sequence statistics for one CUDA graph replay.
+
+    Under ``--cuda-graph-impl full_iteration`` the producers run inside the
+    captured region: their device-side ``+=`` is replayed, but the Python
+    ``_seqlen_stats_active`` assignment is not. Re-activate it so
+    ``consume_seqlen_stats_in_iteration`` keeps returning real-token statistics
+    and drains the accumulator once per replayed iteration.
+
+    Returns ``False`` -- leaving the zero-collective BSHD path untouched -- when
+    the graph for this stage was captured without a statistics producer.
+    """
+    global _seqlen_stats_active
+    if not _seqlen_stats_produced_in_capture.get(stage, False):
+        return False
+    _seqlen_stats_active = True
+    return True
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -5117,6 +5154,10 @@ def train(
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
+        FullCudaGraphWrapper.register_state_hooks(
+            on_capture=record_seqlen_stats_capture,
+            on_replay=reactivate_seqlen_stats_for_graph_replay,
+        )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
         copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
@@ -5878,6 +5919,10 @@ def evaluate(
             forward_backward_func,
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+        FullCudaGraphWrapper.register_state_hooks(
+            on_capture=record_seqlen_stats_capture,
+            on_replay=reactivate_seqlen_stats_for_graph_replay,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:

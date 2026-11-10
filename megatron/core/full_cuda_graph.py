@@ -241,6 +241,27 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
+    # Bookkeeping that lives in Python (per-iteration statistics flags, counters, ...)
+    # is executed only while capturing, because only device work is replayed. Callers
+    # that keep such state register hooks here: ``on_capture`` runs once after the
+    # graph is captured, ``on_replay`` runs before every replay, both with the stage
+    # name. That lets the owning module decide what has to be re-armed.
+    capture_hooks: list[Callable[[str], None]] = []
+    replay_hooks: list[Callable[[str], None]] = []
+
+    @classmethod
+    def register_state_hooks(
+        cls,
+        *,
+        on_capture: Optional[Callable[[str], None]] = None,
+        on_replay: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Register Python-side state hooks for graph capture and replay."""
+        if on_capture is not None and on_capture not in cls.capture_hooks:
+            cls.capture_hooks.append(on_capture)
+        if on_replay is not None and on_replay not in cls.replay_hooks:
+            cls.replay_hooks.append(on_replay)
+
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
@@ -343,6 +364,10 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
+            # The capture iteration ran the Python-side bookkeeping eagerly, so its
+            # final state tells the hooks what this graph produces on every replay.
+            for capture_hook in FullCudaGraphWrapper.capture_hooks:
+                capture_hook(training_str)
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             # Keep autograd nodes retained during warmup on the eventual capture stream.
             # Leaves receiving None gradients can bypass PyTorch's stale-stream override.
@@ -355,6 +380,8 @@ class FullCudaGraphWrapper:
                 )
             caller_stream.wait_stream(warmup_stream)
         else:
+            for replay_hook in FullCudaGraphWrapper.replay_hooks:
+                replay_hook(training_str)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
         # Validate before returning to the training loop's rerun/update decision.
