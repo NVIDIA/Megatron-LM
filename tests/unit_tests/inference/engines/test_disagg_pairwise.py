@@ -264,21 +264,40 @@ class _LoopbackP2P:
         return works
 
 
-def _has_work(engine):
-    """Whether the engine loop would step: resident active rows, waiting work or an import."""
-    return (
+class _FailedTransfer:
+    """A terminal transfer failure after which the destination is no longer accessed."""
+
+    storage_safe = True
+
+    def poll(self):
+        raise RuntimeError("injected transfer failure")
+
+    def wait(self):
+        raise RuntimeError("injected transfer failure")
+
+
+def _run_engine_iteration(engine):
+    """One iteration of `run_engine()`: poll handoffs, then step only when there is work."""
+    engine._poll_pending_kv_imports()
+    engine._poll_pending_kv_pushes()
+    if (
         engine.context.get_active_request_count() > 0
         or engine.waiting_request_ids
         or engine.has_admittable_kv_import
-    )
+    ):
+        engine.step_modern()
 
 
+@pytest.mark.parametrize("ending", ["admitted", "cancelled", "failed"])
 @pytest.mark.parametrize("mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])
 @torch.inference_mode()
-def test_decode_paused_behind_an_import_resumes_after_it(mode):
+def test_decode_paused_behind_an_import_resumes_after_it(mode, ending):
     """A lone decode paused because an import holds the last blocks waits, then resumes.
 
-    Both real engines run in one process; a loopback carries the NCCL backend's own plans.
+    The import is admitted and finishes, is cancelled, or its transfer fails; in each case
+    the paused request resumes under the engine loop's own work check and completes with
+    the collocated engine's tokens. Both real engines run in one process; a loopback
+    carries the NCCL backend's own plans.
     """
     Utils.initialize_model_parallel()
     try:
@@ -330,26 +349,34 @@ def test_decode_paused_behind_an_import_resumes_after_it(mode):
                 # A is admitted, needs a new block for its second token, and pauses with no
                 # request active while B's transfer is still in flight.
                 for _ in range(4):
-                    if _has_work(decode):
-                        decode.step_modern()
+                    _run_engine_iteration(decode)
                     if context.paused_request_count == 1:
                         break
                 assert context.paused_request_count == context.total_request_count == 1
                 assert context.kv_blocks_held_for_imports() == 7
 
-                # B arrives, decodes and finishes; its blocks let A resume and finish.
-                prefill.push_handoff_kv(102, [decode_peer_meta(decode, b_pending)], 0)
+                if ending == "failed":
+                    b_pending.handle = _FailedTransfer()
+                else:
+                    if ending == "cancelled":
+                        assert decode.abort_kv_handoff(102)
+                    prefill.push_handoff_kv(102, [decode_peer_meta(decode, b_pending)], 0)
                 for _ in range(64):
                     if a_future.done() and b_future.done():
                         break
-                    decode._poll_pending_kv_imports()
-                    if _has_work(decode):
-                        decode.step_modern()
-                assert b_future.result().generated_tokens == b_expected
+                    _run_engine_iteration(decode)
+                assert a_future.done(), "the paused request never resumed"
                 assert a_future.result().generated_tokens == a_expected
+                if ending == "admitted":
+                    assert b_future.result().generated_tokens == b_expected
+                elif ending == "cancelled":
+                    assert b_future.cancelled()
+                else:
+                    assert isinstance(b_future.exception(), RuntimeError)
                 assert_released(decode)
 
-                assert prefill._poll_pending_kv_pushes() == 2
+                prefill._poll_pending_kv_pushes()
+                assert not prefill._pending_kv_pushes
                 prefill.release_handoff_blocks(101)
                 prefill.release_handoff_blocks(102)
                 assert_released(prefill)

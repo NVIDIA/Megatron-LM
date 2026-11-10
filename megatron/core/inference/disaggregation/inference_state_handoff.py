@@ -168,16 +168,53 @@ class InferenceStateHandoffMixin:
 
         return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
 
-    def _pending_import_block_count(self) -> int:
-        """KV blocks that started imports hold before they become requests.
+    def _import_held_block_count(self) -> int:
+        """KV blocks that started or quarantined imports hold outside request rows.
 
         Side: decode engine; pull and push transport paths.
         """
 
         return sum(
             len(pending.local_blocks) + len(pending.continuation_blocks)
-            for pending in self._pending_kv_imports
+            for pending in (*self._pending_kv_imports, *self._quarantined_kv_imports)
         )
+
+    def _resume_decodes_paused_behind_imports(self) -> None:
+        """Resume decodes that paused behind imports released without admission.
+
+        A decode may pause with no request active while imports hold the free blocks.
+        An admitted import frees blocks through later steps, but a cancelled, failed,
+        reclaimed or already-finished import only returns its blocks, and the engine
+        steps only for active, waiting or admittable work. Run the context's own resume
+        path once no import holds a block.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
+        context = self.context
+        if (
+            self._kv_transfer_role != "decode"
+            or context.paused_request_count == 0
+            or context.get_active_request_count() > 0
+            or context.chunked_prefill_request_id != -1
+            or self._import_held_block_count() > 0
+            or self.controller._async_sched_forward.is_valid
+        ):
+            return
+        speculative = context.paused_speculative_tokens
+        result = context.update_requests(
+            active_requests_mask=context.paused_tokens.new_zeros(0),
+            new_tokens=context.paused_tokens.new_empty(0),
+            new_speculative_tokens=(
+                speculative.new_empty((speculative.shape[0], 0))
+                if context.num_speculative_tokens > 0 and speculative is not None
+                else None
+            ),
+        )
+        # The paused set fit its block budget when it paused, so resuming evicts nothing.
+        evicted = (result or {}).get("evict_request_ids")
+        if evicted is not None and evicted.numel() > 0:
+            raise RuntimeError(f"Resuming paused decodes evicted requests {evicted.tolist()}")
 
     @property
     def has_admittable_kv_import(self) -> bool:
@@ -329,7 +366,7 @@ class InferenceStateHandoffMixin:
             self.cuda_graph_all_prefills = False
             # Imports hold KV blocks outside request rows until admission, so a resident
             # decode may pause behind them with no request active.
-            self.context.kv_blocks_held_for_imports = self._pending_import_block_count
+            self.context.kv_blocks_held_for_imports = self._import_held_block_count
         self._kv_transfer_role = role
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
@@ -1464,6 +1501,7 @@ class InferenceStateHandoffMixin:
 
         self._poll_quarantined_kv_imports()
         self._drain_deferred_kv_handoffs()
+        self._resume_decodes_paused_behind_imports()
         if not self._pending_kv_imports:
             return 0
         self._report_completed_kv_imports()
@@ -1587,6 +1625,7 @@ class InferenceStateHandoffMixin:
                 self._pending_kv_imports = remaining
                 raise
         self._pending_kv_imports = remaining
+        self._resume_decodes_paused_behind_imports()
         if ready:
             self._loop.call_soon_threadsafe(
                 self._loop.create_task, self._notify_cond_for_new_request()
