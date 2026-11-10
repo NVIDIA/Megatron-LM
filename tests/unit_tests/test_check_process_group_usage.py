@@ -34,6 +34,7 @@ GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
 GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
 GTP_IMPORT = "from megatron.core.process_groups_config import resolve_gtp_remat_group\n"
 GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False)"
+SILENT_GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False, owner=None)"
 WARN_IMPORT = "from megatron.core.process_groups_config import warn_global_process_group_fallback\n"
 WARN = "warn_global_process_group_fallback('f')"
 WARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group:warned"
@@ -135,7 +136,7 @@ class TestDetection(unittest.TestCase):
             ),
             (
                 "from megatron.core import process_groups_config as pgc\n",
-                "pgc.resolve_gtp_remat_group(None, False, owner=None)",
+                "pgc.resolve_gtp_remat_group(None, False, owner='Model')",
                 "resolve_gtp_remat_group",
             ),
             (
@@ -520,6 +521,33 @@ class TestDetection(unittest.TestCase):
             self.hits(WARN_IMPORT + GUARDED_IMPORT + f"def f():\n    {WARN}\n    {GUARDED_CALL}"),
             ["f:guarded:resolve_process_groups"],
         )
+
+    def test_gtp_resolver_with_owner_none_is_guarded_only_after_a_fallback_warning(self):
+        # resolve_gtp_remat_group(..., owner=None) does not warn, so the warning of its caller
+        # has to dominate it like any other read.
+        prefix = GTP_IMPORT + WARN_IMPORT
+        guarded = ["f:guarded:resolve_gtp_remat_group"]
+        self.assertEqual(
+            self.hits(prefix + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n"), guarded
+        )
+        unwarned = {
+            "no warning": f"def f():\n    {SILENT_GTP_CALL}\n",
+            "after a branch that warns": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {SILENT_GTP_CALL}\n"
+            ),
+            "through a module alias": (
+                "from megatron.core import process_groups_config as pgc\n"
+                "def f():\n    pgc.resolve_gtp_remat_group(None, False, owner=None)\n"
+            ),
+        }
+        for case, body in unwarned.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(prefix + body), ["f:" + checker.SILENT_GTP_READ])
+        # A named owner warns for itself, and only the constant None is recognized.
+        for owner in ("'Model'", "name"):
+            with self.subTest(owner=owner):
+                call = f"resolve_gtp_remat_group(None, False, owner={owner})"
+                self.assertEqual(self.hits(prefix + f"def f(name):\n    {call}\n"), guarded)
 
     def test_counts_every_deprecated_parallel_state_function(self):
         # Megatron Core's own calls do not emit ParallelStateDeprecationWarning, so the ratchet is
@@ -1326,6 +1354,40 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(
             json.loads(self.allowlist.read_text())["allowed"],
             {"megatron/core/sample.py": ["build:guarded:resolve_gtp_remat_group"]},
+        )
+
+    def test_gtp_resolver_with_owner_none_that_loses_its_warning_fails(self):
+        prefix = GTP_IMPORT + WARN_IMPORT
+        self.write_baseline(prefix + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.assertEqual(
+            json.loads(original)["allowed"],
+            {"megatron/core/sample.py": ["f:guarded:resolve_gtp_remat_group"]},
+        )
+        self.assertEqual(self.run_check(), 0)
+        self.source.write_text(prefix + f"def f():\n    {SILENT_GTP_CALL}\n", encoding="utf-8")
+        self.assertEqual(checker._counts(checker.scan())["unwarned"], 1)
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 1)
+        self.assertEqual(self.allowlist.read_bytes(), original)
+
+    def test_unwarned_gtp_resolver_with_owner_none_does_not_replace_a_read(self):
+        # After a fallback warning the call is guarded and replaces the warned read of its scope
+        # like any guarded call. Without one it is a new unwarned read.
+        self.write_baseline(IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.source.write_text(GTP_IMPORT + f"def f():\n    {SILENT_GTP_CALL}\n", encoding="utf-8")
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 1)
+        self.assertEqual(self.allowlist.read_bytes(), original)
+        self.source.write_text(
+            GTP_IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": ["f:guarded:resolve_gtp_remat_group"]},
         )
 
     def test_guarded_call_without_a_replaced_read_is_new(self):

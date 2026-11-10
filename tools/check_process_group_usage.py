@@ -63,6 +63,11 @@ A read that is warned only through data flow, for example under a later ``if gro
 is *unwarned*. A read that gains its warning is a conversion; an allowlisted warned read that
 loses it fails like a new read.
 
+``resolve_gtp_remat_group(..., owner=None)`` leaves the warning to its caller, so the check holds
+it to the same rule: the call is ``guarded`` only when a fallback warning dominates it. Without
+one it is the unwarned ``shim`` read ``resolve_gtp_remat_group(owner=None)``, which fails like a
+new read. Only the constant ``None`` is recognized.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
@@ -195,6 +200,22 @@ ALIAS_TARGETS = {
 WARNED = ":warned"
 FALLBACK_WARNING = "megatron.core.process_groups_config.warn_global_process_group_fallback"
 FALLBACK_BLOCK = "megatron.core.process_groups_config.global_process_group_fallback"
+
+# resolve_gtp_remat_group(..., owner=None) reads the grid without warning, for a caller that has
+# warned already. Such a call is guarded when a fallback warning dominates it; without one it is
+# this unwarned shim read.
+GTP_RESOLVER = "megatron.core.process_groups_config.resolve_gtp_remat_group"
+SILENT_GTP_READ = "shim:resolve_gtp_remat_group(owner=None)"
+
+
+def _passes_owner_none(call: ast.Call) -> bool:
+    """True if ``call`` passes the constant ``owner=None``."""
+    return any(
+        keyword.arg == "owner"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is None
+        for keyword in call.keywords
+    )
 
 
 def _is_deprecated_accessor(name: str) -> bool:
@@ -486,6 +507,9 @@ def _violations_in(path: pathlib.Path):
             # megatron: those found by the previous pass, and those this pass finds.
             self.attribute_aliases = attribute_aliases
             self.found_aliases = {}
+            # The references to resolve_gtp_remat_group that are called with owner=None where no
+            # fallback warning dominates the call (SILENT_GTP_READ), by id.
+            self.silent_gtp_reads = set()
 
         def visit_FunctionDef(self, node):
             """Resolve function-local imports independently of sibling and class bindings."""
@@ -726,6 +750,8 @@ def _violations_in(path: pathlib.Path):
             if not path and isinstance(node, ast.Call):
                 path = self._named_attribute(node, ("setattr", "delattr"))
             identity = _classify(path)
+            if id(node) in self.silent_gtp_reads:
+                identity = SILENT_GTP_READ
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 if self.warned and identity.split(":", 1)[0] not in (GUARDED, PRIVATE):
@@ -744,8 +770,18 @@ def _violations_in(path: pathlib.Path):
 
         def visit_Call(self, node):
             """Record ``getattr()``, ``setattr()`` or ``delattr()`` of a counted function or
-            attribute with a constant name."""
+            attribute with a constant name, and mark the resolver that an unwarned
+            ``resolve_gtp_remat_group(..., owner=None)`` calls."""
             self._reference(node)
+            # resolve_gtp_remat_group(..., owner=None) does not warn: unless a fallback warning
+            # dominates the call, the reference to the resolver that it calls, however it was
+            # imported, is the unwarned read rather than a guarded one.
+            if (
+                not self.warned
+                and _passes_owner_none(node)
+                and self._path(node.func) == GTP_RESOLVER
+            ):
+                self.silent_gtp_reads.add(id(node.func))
             self.generic_visit(node)
 
         def visit_Assign(self, node):
