@@ -68,7 +68,10 @@ decision changes with the step's token count. Covered:
   mixed steps, eager or with layer-scope (local) or block-scope (full-iteration) CUDA graphs from
   `CudaGraphManager`, with the default buffer and one whose capacity splits the graph sizes;
 - the MTP inner layer at depths 1 and 2 (`forward_single_position`, as speculative decoding calls
-  it), a HybridStack of attention and MLP layers, and MLA blocks (MLA only, and GPT/MLA mixed).
+  it), a HybridStack of attention and MLP layers, and MLA blocks (MLA only, and GPT/MLA mixed);
+- production widths (Llama-3-8B, H 4096, and Qwen2.5-72B, H 8192: SwiGLU, grouped-query
+  attention, 3 layers) at TP 2 and TP 8 with NVLS, over steps of 8192, tp, 1032, 256 and tp
+  tokens on one block and buffer.
 
 Main vs open PRs:
 - On main a row-parallel layer adds the residual only inside the fused kernel, and the consumer
@@ -579,6 +582,67 @@ def test_step_sizes_keep_the_residual(case, parallel, monkeypatch):
         _check_fused_norms(block.layers, trace.fused_norms, fits, problems, what)
         branches.append(list(trace.branches))
     _verdict(case, branches, problems)
+
+
+# ---- Production sizes -------------------------------------------------------------------------
+
+# Production widths, LAYERS layers each (first, middle, last), with the SwiGLU MLP and the
+# grouped-query attention of these models. No QKV bias: the selection never reads it.
+PRODUCTION_MODELS = {
+    # Llama-3-8B.
+    "llama3_8b": dict(
+        hidden_size=4096, ffn_hidden_size=14336, num_attention_heads=32, num_query_groups=8
+    ),
+    # Qwen2.5-72B; Llama-3-70B and Nemotron-H-56B have the same hidden width.
+    "qwen25_72b": dict(
+        hidden_size=8192, ffn_hidden_size=29568, num_attention_heads=64, num_query_groups=8
+    ),
+}
+# Tokens per step over all TP ranks (sequence parallel), in dynamic batching's [T, 1, H] layout:
+# an 8192-token prefill chunk, one decode token per rank ("tp"), a mixed step of 1032 tokens (129
+# per rank at TP 8), a 256-request decode step, and one token per rank again. Every step fits the
+# default 512 MiB buffer ([8192, 1, 8192] bf16 is 128 MiB), so every step fuses. One token per
+# rank is H / 8 >= 512 threads of the fused kernel here, a whole number of warps, so main's
+# launcher takes it (its narrow-rows bug, #8880, needs fewer than 32 threads: H / 8 < 32).
+PRODUCTION_STEPS = (8192, "tp", 1032, 256, "tp")
+
+
+@pytest.mark.parametrize("parallel", [2, 8], indirect=True, ids=["tp2", "tp8"])
+@pytest.mark.parametrize("model", list(PRODUCTION_MODELS))
+def test_production_sizes_keep_the_residual(model, parallel, monkeypatch):
+    """Production widths at TP 2 and TP 8 with NVLS: prefill, decode and mixed steps in turn on
+    one block and one buffer. Every step must take the fused kernel with each consumer's own norm
+    weight, give back its input bit for bit with the "tp" buffer NaN-poisoned before it, and feed
+    each QKV / FC1 GEMM the fp64 RMSNorm of the stream."""
+    tp = parallel
+    sizes = PRODUCTION_MODELS[model]
+    hidden = sizes["hidden_size"]
+    config, dtype = make_config(
+        tp, "nvls", True, gated_linear_unit=True, activation_func=torch.nn.functional.silu, **sizes
+    )
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+    block = TransformerBlock(config, get_gpt_layer_with_inference_spec(), post_layer_norm=False)
+    block = block.cuda().eval()
+    zero_projections_(block.layers)
+    trace = _Trace(monkeypatch)
+    eps = config.layernorm_epsilon
+    problems, branches = [], []
+    for step, tokens in enumerate(PRODUCTION_STEPS):
+        tokens = tp if tokens == "tp" else tokens
+        x_full = full_input(dtype, (tokens, 1, hidden), seed=step)
+        x = tp_shard(x_full)
+        _poison_tp_buffer(tp)
+        trace.clear()
+        with torch.no_grad(), InferenceMode.active():
+            out = block(hidden_states=x.clone(), attention_mask=None)
+        torch.cuda.synchronize()
+        what = f"{model} step {step} (T = {tokens}): "
+        _check_exact(out, x, f"{what}block output", problems)
+        _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
+        _check_fused_norms(block.layers, trace.fused_norms, True, problems, what)
+        branches.append(list(trace.branches))
+        trace.clear()  # the recorded GEMM inputs are hundreds of MiB at these sizes
+    _verdict(f"{model}-tp{tp}", branches, problems)
 
 
 # ---- CUDA graphs: the block (full-iteration) or each layer (local) captured -------------------
