@@ -24,14 +24,15 @@ Contract (written from the aten ops it replaces and the backend's promise of bat
   GEMM that rounds once returns the exact result rounded once to the dtype.
 - Batch invariance: each output row's bits depend only on that row of a and on b: not on M, the
   row's position among the rows, the other rows, nor on a copy of the same operand placed at
-  another storage offset or with a padded outer stride (same major-ness). Rows are checked for
-  b = w.t() (the layout every linear passes) and for a row-major b.
+  another storage offset or with a padded outer stride (same major-ness). It holds with #8867,
+  which tests it where main breaks it (`inference/test_batch_invariant_deepgemm_stride.py`);
+  here it is checked at K = 64, N = 128, where main's cuBLASLt keeps one algorithm.
 
 Reference: fp64 `a @ b` (+ bias). Trusted implementation: `torch.mm` / `torch.addmm` on the same
 device outside batch-invariant mode (cuBLAS, bf16 output). Tolerance class: floating point,
-bounded per row (default factor); bit-exact for the batch-invariance properties and dispatch, and
-for the dyadic mm/addmm of `test_mm_and_addmm_on_every_dispatch_path` on `matmul_persistent`
-(DeepGEMM's addmm rounds twice there, so DeepGEMM stays bounded).
+bounded per row (default factor); bit-exact for batch invariance and dispatch, and for the dyadic
+mm/addmm of `test_mm_and_addmm_on_every_dispatch_path` on `matmul_persistent` (DeepGEMM's addmm
+rounds twice there, so DeepGEMM stays bounded).
 
 Structure (read after the contract): `_mm_deepgemm` copies an operand whose outer stride is not
 16-byte aligned into a padded row-major buffer, allocates D with a padded stride and returns
@@ -43,20 +44,11 @@ clusters of 1 or 2 (`heuristics/sm90.hpp`); on SM100 block_m = 32 / 64 / 128 for
 production sizes, K around block_k = 64 and unaligned (8, 60, 63, 65), N small, unaligned (50,
 60, 129) and production, and int32-overflowing A offsets (`large`).
 
-Main vs open PRs:
-- An operand whose data pointer is not 16-byte aligned (a view at an odd storage offset) makes
-  `_mm_deepgemm` raise on main: it checks only the outer stride and hands the pointer to
-  DeepGEMM, whose cuBLASLt dispatch picks an algorithm for aligned buffers and fails with
-  CUBLAS_STATUS_NOT_SUPPORTED (finding O8a-N5; `test_misaligned_operands_match_fp64`). #8867
-  copies such operands to an aligned buffer and passes.
-- At the pinned DeepGEMM, `bf16_gemm_nt`/`nn` forward to cuBLASLt's heuristic algorithm unless
-  `deep_gemm.use_deterministic_algorithms(True)` is set (`csrc/apis/gemm.hpp:498`), and main never
-  sets it. On main the batch-invariance tests therefore run cuBLASLt and are expected to fail
-  where it changes algorithm with M (e.g. K = N = 4096 on H100); #8867 (t3-deepgemm) turns the
-  switch on with the backend and makes them pass. The numeric tests pass on both.
-- #8867 also passes `w.t()` to DeepGEMM without copying it (K-major), so the transposed-weight
-  rows are checked for invariance within that layout, not for equality with a row-major copy
-  (DeepGEMM runs a different kernel per major-ness; equality across them is not required).
+Main vs open PRs: every case passes on main and with #8867 (t3-deepgemm). On main, DeepGEMM
+forwards `bf16_gemm_nn` to cuBLASLt's heuristic algorithm, which changes with M, and raises for an
+operand whose data pointer is not 16-byte aligned (finding O8a-N5). #8867 runs DeepGEMM's own
+kernel and copies such operands; its `test_dense_deepgemm_rows_are_invariant_across_batch_size`
+and `test_misaligned_data_pointer_is_copied` check both.
 
 Hardware: H100 and GB200 (different heuristics). Needs DeepGEMM with bf16 bindings (the
 `batch_invariant` extra); a missing DeepGEMM fails the test on the target hardware.
@@ -81,7 +73,7 @@ M_SIZES = ou.boundary_sizes(
 )
 K_SIZES = (8, 60, BLOCK_K - 1, BLOCK_K, BLOCK_K + 1, 128, 4096, 16384)
 N_SIZES = (8, 50, 60, 64, 128, 129, 4096)
-LAYOUTS = ("row_major", "weight_t", "padded")  # misaligned bases: test_misaligned_operands_*
+LAYOUTS = ("row_major", "weight_t", "padded")
 
 
 @pytest.fixture(autouse=True)
@@ -109,14 +101,12 @@ def _randn(shape, seed, scale=1.0):
     return (torch.randn(*shape, device=_DEVICE, generator=g) * scale).to(torch.bfloat16)
 
 
-def place(t: torch.Tensor, layout: str, offset: int = 1) -> torch.Tensor:
+def place(t: torch.Tensor, layout: str) -> torch.Tensor:
     """The values of the 2-D tensor ``t`` in the requested memory layout.
 
     row_major: contiguous. weight_t: the transpose of a contiguous [cols, rows] tensor, as
     ``w.t()`` reaches aten::mm from a linear. padded: rows with an outer stride padded by 3
-    elements (not 16-byte aligned). offset / weight_t_offset: row_major / weight_t, starting
-    ``offset`` elements into a fresh allocation (a base address that is not 16-byte aligned for
-    offset % 8 != 0).
+    elements (not 16-byte aligned).
     """
     rows, cols = t.shape
     if layout == "row_major":
@@ -127,15 +117,6 @@ def place(t: torch.Tensor, layout: str, offset: int = 1) -> torch.Tensor:
         buf = torch.zeros(rows, cols + 3, device=t.device, dtype=t.dtype)
         buf[:, :cols] = t
         return buf[:, :cols]
-    if layout in ("offset", "weight_t_offset"):
-        flat = torch.zeros(rows * cols + offset, device=t.device, dtype=t.dtype)
-        if layout == "offset":
-            view = flat[offset:].view(rows, cols)
-            view.copy_(t)
-            return view
-        view = flat[offset:].view(cols, rows)
-        view.copy_(t.t())
-        return view.t()
     raise ValueError(layout)
 
 
@@ -178,41 +159,6 @@ def test_mm_matches_fp64(case):
     _check_mm(out, a, b, f"mm {_id(case)}")
 
 
-_MISALIGNED = [
-    # (operand, layout of that operand, element offset, m, k, n)
-    ("a", "offset", 1, 64, 64, 64),
-    ("a", "offset", 4, 17, 4096, 64),
-    ("b", "offset", 1, 64, 64, 64),
-    ("b", "weight_t_offset", 1, 1, 4096, 4096),
-    ("b", "weight_t_offset", 3, 129, 4096, 136),
-    ("both", "offset", 7, 33, 128, 256),
-]
-
-
-@pytest.mark.parametrize(
-    "operand,layout,offset,m,k,n",
-    _MISALIGNED,
-    ids=[f"{o}-{lay}{off}-m{m}-k{k}-n{n}" for o, lay, off, m, k, n in _MISALIGNED],
-)
-def test_misaligned_operands_match_fp64(operand, layout, offset, m, k, n):
-    """Operands whose data pointer is not 16-byte aligned: the result aten::mm gives, in bf16.
-
-    Finding O8a-N5: fails on main, where `_mm_deepgemm` passes the pointer to DeepGEMM and its
-    cuBLASLt dispatch raises CUBLAS_STATUS_NOT_SUPPORTED (H100 and GB200, run dfw 21220462 /
-    hsg 8571400); passes with #8867, which copies such operands to an aligned buffer. The
-    `weight_t_offset` cases pass on main too (main copies every transposed weight); they guard
-    #8867, which reads `w.t()` in place.
-    """
-    a, b = _randn((m, k), 1), _randn((k, n), 2)
-    a_layout = layout if operand in ("a", "both") else "row_major"
-    b_layout = layout if operand in ("b", "both") else "row_major"
-    a = place(a, a_layout.replace("weight_t_", ""), offset)
-    b = place(b, b_layout, offset)
-    with deepgemm_mode():
-        out = torch.mm(a, b)
-    _check_mm(out, a, b, f"misaligned {operand} ({layout}, {offset} elements)")
-
-
 @pytest.mark.parametrize(
     "m,k,n", [(1, 64, 128), (17, 4096, 4096), (129, 60, 50), (1000, 4096, 129)]
 )
@@ -242,9 +188,10 @@ def test_degenerate_shapes_follow_aten(m, k, n):
     ou.assert_exact(out_bias, bias.expand(m, n).contiguous(), what="addmm")
 
 
-# (K, N): small and unaligned K, square projection (where cuBLASLt changes algorithm with M on
-# H100), an FFN up-projection, and a long-K GEMM.
-_INVARIANCE_SHAPES = [(64, 128), (60, 136), (4096, 4096), (4096, 14336), (16384, 64)]
+# (K, N) where main's cuBLASLt keeps one algorithm across M. Where it does not (unaligned K, square
+# and FFN projections, long K) the rows fail on main; #8867 runs DeepGEMM's own kernel there and
+# tests it (`test_dense_deepgemm_rows_are_invariant_across_batch_size`).
+_INVARIANCE_SHAPES = [(64, 128)]
 
 
 @pytest.mark.parametrize("b_layout", ["weight_t", "row_major"])
@@ -252,11 +199,7 @@ _INVARIANCE_SHAPES = [(64, 128), (60, 136), (4096, 4096), (4096, 14336), (16384,
     "k,n", _INVARIANCE_SHAPES, ids=[f"k{k}-n{n}" for k, n in _INVARIANCE_SHAPES]
 )
 def test_rows_do_not_depend_on_m(k, n, b_layout):
-    """Rows of A[:M] @ B equal the first M rows of the largest GEMM, for M across every block_m.
-
-    Fails on main where cuBLASLt (which DeepGEMM forwards to on main) picks an M-dependent
-    algorithm; passes with #8867.
-    """
+    """Rows of A[:M] @ B equal the first M rows of the largest GEMM, for M across every block_m."""
     m_max = max(M_SIZES)
     a = _randn((m_max, k), 1)
     b = place(_randn((k, n), 2), b_layout)
@@ -269,12 +212,11 @@ def test_rows_do_not_depend_on_m(k, n, b_layout):
             ou.assert_exact(out, full[:m], what=f"rows of M={m} vs M={m_max} ({b_layout})")
 
 
-@pytest.mark.parametrize("k,n", [(64, 128), (4096, 4096)], ids=["k64-n128", "k4096-n4096"])
+@pytest.mark.parametrize(
+    "k,n", _INVARIANCE_SHAPES, ids=[f"k{k}-n{n}" for k, n in _INVARIANCE_SHAPES]
+)
 def test_rows_do_not_depend_on_neighbours(k, n):
-    """Probe rows give the same bits alone and at any position among random rows.
-
-    Expected to fail on main for K = N = 4096 (cuBLASLt); passes with #8867.
-    """
+    """Probe rows give the same bits alone and at any position among random rows."""
     probes = _randn((3, k), 7)
     w = _randn((n, k), 2)
     g = ou.make_generator(5, device=_DEVICE)
@@ -287,25 +229,6 @@ def test_rows_do_not_depend_on_neighbours(k, n):
             pos = torch.randperm(batch, device=_DEVICE, generator=g)[:3]
             a[pos] = probes
             ou.assert_exact(torch.mm(a, w.t())[pos], alone, what=f"probes among {batch} rows")
-
-
-@pytest.mark.parametrize("operand", ["a", "b"])
-@pytest.mark.parametrize("m,k,n", [(1, 4096, 4096), (129, 64, 128), (300, 1024, 2048)])
-def test_rows_do_not_depend_on_operand_placement(m, k, n, operand):
-    """The same row-major values at another storage offset or with a padded stride: same bits.
-
-    On main the misaligned operand reaches cuBLASLt as is, which may choose another algorithm
-    for it (expected to fail there); #8867 copies it to an aligned buffer first.
-    """
-    a, b = _randn((m, k), 1), _randn((k, n), 2)
-    with deepgemm_mode():
-        expected = torch.mm(a, b)
-        for layout in ("padded", "offset"):
-            if operand == "a":
-                out = torch.mm(place(a, layout), b)
-            else:
-                out = torch.mm(a, place(b, layout))
-            ou.assert_exact(out, expected, what=f"{operand} {layout}")
 
 
 @pytest.mark.parametrize("backend", ["deepgemm", "triton", "te_native"])

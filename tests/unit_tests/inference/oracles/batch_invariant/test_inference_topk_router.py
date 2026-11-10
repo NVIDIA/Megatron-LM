@@ -64,10 +64,11 @@ routing (batch-invariant) or the compiled routing, which may call TE's fused rou
 sigmoid kernel has variants by k (< 8 left-fold sum, >= 8 tree sum, `tl.topk` for k >= 8), E
 (power-of-two padding up to 512) and rows per program, and it orders routing scores by integer
 keys built from their bits, with a separate rule for negative scores. Covered: E in {8, 64, 256}
-(and 1024 for the dispatch boundary), k in {1, 2, 6, 8, 32, E}, T in {0, 1, 7, 128, 129, 4096},
-B in {1, 2, 3}, every score function, expert bias, scaling, sinkhorn, hash layers, fusion, all
+(and 1024 for the dispatch boundary), k in {1 (hash layers), 2, 6, 8, 32, E}, T in
+{0, 1, 7, 128, 129, 4096}, B = 1, every score function, expert bias, scaling, hash layers, all
 three paths, CUDA-graph replay, and expert biases that make the k-th selected score (and the
 order among the selected ones) negative (`test_negative_routing_scores_select_like_fp64`).
+Top-1 and B > 1 outputs, TE's fused router and sinkhorn routing are #8562's (below).
 QB (`_forward`: micro-batch QB precomputes the indices, so it takes the compiled routing; global
 QB's bias goes through the expert-bias route, so the Triton kernel where the shape allows):
 micro-batch pairwise over 3 score functions x 3 paths x E {8, 64, 256} x k {2, 6, 8} (k < E) x
@@ -80,17 +81,14 @@ T {0, 1, 7, 129}; REPLAY_FORWARD pairwise over 4 kinds x 3 paths x E x T x scali
 that differ from the natural top-k; RECORD captured in a CUDA graph into the static and the
 banked buffer, the bank switched between replays.
 
-Main vs open PRs (#8562, d4-d9 "Return dense [num_tokens, topk] routing from InferenceTopKRouter
-with router fusion and top-1", which also routes sinkhorn like the eval router):
-- `test_top1_returns_dense_topk` and `test_batched_input_layout` fail on main: the compiled and
-  BI paths return `probs.squeeze(1)` ([T] for k = 1) and `logits.squeeze(1)` leaves [S, B, E]
-  for B > 1 (d9).
-- `test_fused_router_returns_dense_topk` fails on main: the fused branch returns [T, E] (d4).
-- `test_sinkhorn_matches_eval_router` fails on main: sinkhorn is ignored (step 3 R06-F1).
-- `test_gating_logits_are_fp32` fails on main for batch-invariant backends 'triton' and
-  'deepgemm': their TE GEMM replacement rounds the fp32-output router GEMM to bf16 (finding
-  O8a-N3); no open PR changes it.
-All other tests pass on main and on #8562.
+Main vs open PRs: every test passes on main and on #8562 (d4-d9 "Return dense [num_tokens, topk]
+routing from InferenceTopKRouter with router fusion and top-1"). On main the compiled and BI
+paths return [T] for k = 1 and [S, B, E] logits for B > 1 (d9), the fused branch returns [T, E]
+(d4) and sinkhorn is ignored (step 3 R06-F1); #8562's tests in
+`inference/test_moe_dispatching_and_routing.py` cover them. Under the batch-invariant backends
+'triton' and 'deepgemm', the router GEMM rounds its fp32 logits to bf16 on main (finding O8a-N3);
+#8957 fixes it, with `test_bik_router_gating_logits_are_fp32` in
+`transformer/test_te_layers_batch_invariant.py`.
 
 Hardware: H100 (1 GPU), with Transformer Engine.
 """
@@ -222,13 +220,6 @@ def routing_reference(logits, topk, kind, bias, scaling):
     return weights_of(logits, experts, kind, scaling), experts
 
 
-def sinkhorn_reference(logits, topk):
-    """Eval-mode sinkhorn: sigmoid (k = 1) or softmax over all experts, unnormalized."""
-    act = torch.sigmoid(logits) if topk == 1 else torch.softmax(logits, dim=-1)
-    experts = act.topk(topk, dim=-1).indices.sort(dim=-1).values
-    return act.gather(-1, experts), experts
-
-
 def bf16_pool(span):
     """Every bf16 value v with 2**-4 <= |v| <= span / 2, ascending (1792 values for span 16)."""
     bits = torch.arange(0, 0x7F80, dtype=torch.int32).to(torch.int16)  # positive finite bf16
@@ -328,14 +319,14 @@ def check_against(probs, experts, logits, topk, reference, args, what):
     )
 
 
-def _setup(num_experts, topk, kind, tokens, seed, batch=1, **router_kwargs):
+def _setup(num_experts, topk, kind, tokens, seed, **router_kwargs):
     router = build_router(num_experts, topk, kind, **router_kwargs)
     bias = None
     if KINDS[kind]["bias"]:
         bias = make_bias(num_experts)
         router.expert_bias.copy_(bias)
-    logits = make_logits(tokens * batch, num_experts, topk, kind, bias, seed)
-    x = logits.view(tokens, batch, num_experts)
+    logits = make_logits(tokens, num_experts, topk, kind, bias, seed)
+    x = logits.view(tokens, 1, num_experts)
     return router, bias, logits, x
 
 
@@ -396,72 +387,6 @@ def test_negative_routing_scores_select_like_fp64(num_experts, topk, path):
         bias,
         None,
         f"negative scores E={num_experts} k={topk} {path}",
-    )
-
-
-@pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize("kind", ["softmax_pre", "sigmoid", "sigmoid_bias"])
-def test_top1_returns_dense_topk(kind, path):
-    """k = 1 gives [T, 1] outputs. Fails on main (probs.squeeze(1), d9); passes with #8562."""
-    backend = "torch" if path == "compiled" else "triton"
-    for tokens in (1, 7, 128):
-        router, bias, logits, x = _setup(64, 1, kind, tokens, seed=tokens, backend=backend)
-        probs, experts = run_router(router, x, path)
-        check_routing(
-            probs, experts, logits, 1, kind, bias, None, f"top-1 {kind} {path} T={tokens}"
-        )
-
-
-@pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize("kind", ["softmax", "sigmoid_bias"])
-@pytest.mark.parametrize("batch", [2, 3])
-def test_batched_input_layout(batch, kind, path):
-    """[S, B, H] inputs with B > 1 route every token (sequence-major order).
-
-    Fails on main (logits.squeeze(1) keeps [S, B, E], d9); passes with #8562.
-    """
-    backend = "torch" if path == "compiled" else "triton"
-    router, bias, logits, x = _setup(64, 6, kind, 5, seed=batch, batch=batch, backend=backend)
-    probs, experts = run_router(router, x, path)
-    check_routing(probs, experts, logits, 6, kind, bias, None, f"B={batch} {kind} {path}")
-
-
-@pytest.mark.parametrize("path", ["compiled", "batch_invariant"])
-@pytest.mark.parametrize(
-    "kind,topk", [("softmax", 2), ("softmax_pre", 1), ("softmax_pre", 6), ("sigmoid_bias", 6)]
-)
-def test_fused_router_returns_dense_topk(kind, topk, path):
-    """moe_router_fusion=True (TE's fused router) keeps the dense contract.
-
-    Fails on main (the fused branch returns [T, E], d4); passes with #8562, which fuses when TE
-    writes dense top-k indices and otherwise routes unfused.
-    """
-    router, bias, logits, x = _setup(
-        64, topk, kind, 129, seed=3, backend="torch", moe_router_fusion=True
-    )
-    probs, experts = run_router(router, x, path)
-    check_routing(probs, experts, logits, topk, kind, bias, None, f"fused {kind} k={topk} {path}")
-
-
-@pytest.mark.parametrize("path", ["compiled", "batch_invariant"])
-@pytest.mark.parametrize("topk", [1, 2])
-def test_sinkhorn_matches_eval_router(topk, path):
-    """Sinkhorn routing weights like the eval-mode TopKRouter: sigmoid / full softmax, unscaled.
-
-    Fails on main (InferenceTopKRouter ignores the routing type; step 3 R06-F1); passes with
-    #8562.
-    """
-    kind = "softmax_pre" if topk == 1 else "softmax"
-    router = build_router(64, topk, kind, backend="torch", load_balancing="sinkhorn", scaling=None)
-    logits = make_logits(129, 64, topk, kind, None, seed=4)
-    probs, experts = run_router(router, logits.view(129, 1, 64), path)
-    assert tuple(probs.shape) == (129, topk) and tuple(experts.shape) == (129, topk)
-    order = experts.argsort(dim=-1)
-    ref_probs, ref_experts = ou.fp64_reference(sinkhorn_reference, logits, topk)
-    ou.assert_exact(experts.gather(-1, order), ref_experts, what="sinkhorn expert sets")
-    trusted, _ = sinkhorn_reference(logits.float(), topk)
-    ou.assert_close_to_reference(
-        probs.gather(-1, order), ref_probs, trusted, factor=PROB_FACTOR, what="sinkhorn probs"
     )
 
 
@@ -626,16 +551,13 @@ def _gemm_reference(x, w):
     return x @ w.t()
 
 
-@pytest.mark.parametrize("bi_backend", [None, "te_native", "triton", "deepgemm"])
+@pytest.mark.parametrize("bi_backend", [None, "te_native"])
 def test_gating_logits_are_fp32(bi_backend):
     """Router logits are the fp32 product x @ W^T of the bf16 operands, in and out of BI mode.
 
-    Fails on main for 'triton' and 'deepgemm' (finding O8a-N3): the batch-invariant TE GEMM
-    computes the bf16 product in bf16 and casts it to fp32 afterwards, so logits carry bf16
-    rounding (relative 2**-9) and expert selection can flip near ties. No open PR changes it.
+    The 'triton' and 'deepgemm' backends round them to bf16 on main (finding O8a-N3); #8957
+    fixes that and tests it (`test_bik_router_gating_logits_are_fp32`).
     """
-    if bi_backend == "deepgemm":
-        assert bik.HAVE_DEEPGEMM_BF16, "the deepgemm backend needs DeepGEMM's bf16 bindings"
     # The trusted fp32 GEMM multiplies bf16 values, which TF32 represents exactly, and TF32
     # tensor cores accumulate in fp32: its result does not depend on TF32 being allowed (the
     # H100 CI image reports torch.backends.cuda.matmul.allow_tf32 = True).

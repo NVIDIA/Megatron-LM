@@ -46,13 +46,13 @@ is allowed, bf16, eligible, buffered and batch-invariant mode is off. `_te_rms_n
 `rmsnorm_batch_invariant` under triton/deepgemm. Covered: TP 1 and 2 (NCCL forced by
 `inference_disable_triton_nvls_kernels`, and by batch-invariant mode for the row layer), T from 1
 to 1000 tokens (odd counts at TP 1), [T, 1, H] inputs as dynamic batching passes them, the four
-layer kinds, the norm on every path, batch invariance on triton/deepgemm (all T) and te_native
+layer kinds, the norm on every path, batch invariance on triton (all T) and te_native
 (multiples of 64), and Llama-3.1-8B's QKV and FFN widths.
 
-Main vs open PRs: all cases are expected to pass on main, except
-`test_rows_do_not_depend_on_tokens_deepgemm`, which fails where DeepGEMM forwards to
-cuBLASLt (as `test_deepgemm_dense.py::test_rows_do_not_depend_on_m`) and passes with #8867.
-#8561 (d1) and #8704 change the fused residual wiring, not these paths.
+Main vs open PRs: all cases are expected to pass on main. Under deepgemm the layers' rows change
+with the token count on main, where DeepGEMM forwards to cuBLASLt; #8867 fixes that and tests it
+(`inference/test_batch_invariant_deepgemm_stride.py`). #8561 (d1) and #8704 change the fused
+residual wiring, not these paths.
 
 Hardware: H100, 1 GPU (TP 1) and 2 GPUs (TP 2), with Transformer Engine.
 """
@@ -304,8 +304,8 @@ def _probe_rows_equal(fn, probe, filler, sizes, what):
 
 def check_rows_do_not_depend_on_tokens(kind, backend):
     """TP 1: four probe tokens among 4 ... 8192 tokens give the same bits. 8192 tokens is where
-    cuBLASLt, which DeepGEMM forwards to on main, changes algorithm at K = N = 4096 on H100
-    (`test_deepgemm_dense.py`, pdx 7986825); up to 4096 it did not."""
+    cuBLASLt, which DeepGEMM forwards to on main (the deepgemm backend, #8867), changes algorithm
+    at K = N = 4096 on H100 (pdx 7986825); up to 4096 it did not."""
     config = make_config(1, 4096)
     layer, _, _ = build(kind, config, 4096, 4096)
     probe, filler = cpu_bf16((4, 1, 4096), seed=21), cpu_bf16((8192, 1, 4096), seed=22)
@@ -323,14 +323,6 @@ def check_rows_do_not_depend_on_tokens(kind, backend):
 def test_rows_do_not_depend_on_tokens(kind, parallel):
     """TP 1 under the triton backend (norm and GEMM replaced): batch-invariant rows."""
     check_rows_do_not_depend_on_tokens(kind, "triton")
-
-
-@pytest.mark.parametrize("parallel", [1], indirect=True, ids=["tp1"])
-@pytest.mark.parametrize("kind", ["ln_column", "row"])
-def test_rows_do_not_depend_on_tokens_deepgemm(kind, parallel):
-    """TP 1 under the deepgemm backend. Fails on main where DeepGEMM forwards to cuBLASLt
-    (#8867 makes it pass)."""
-    check_rows_do_not_depend_on_tokens(kind, "deepgemm")
 
 
 @pytest.mark.parametrize("parallel", [1], indirect=True, ids=["tp1"])

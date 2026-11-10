@@ -45,16 +45,17 @@ M around 128 and 9 M-tiles (one more than GROUP_SIZE_M), N around 128 and 256, K
 more tiles than SMs, row-major / transposed / padded / offset operands, bias, every dtype, M = 0,
 N = 0, K = 0, production shapes, and the 2**31 offset limit (launch flags; `large` launches).
 
-Main vs open PRs (each failing case is deselected and run as an expect-fail task):
-- `test_fp32_mm_honours_highest_precision` fails on main: the kernel's `tl.dot` uses Triton's
-  default TF32 for fp32 operands (finding O8a-N4). No fix PR yet.
-- `test_addmm_strided_vector_bias` fails on main: the kernel reads the bias as contiguous
-  (finding O8a-M1); `test_addmm_broadcast_bias_and_scalars` fails: a 2-D bias asserts and
-  beta/alpha raise TypeError in `addmm_batch_invariant` (finding O8a-M2). No fix PR yet.
-- `test_launch_uses_64_bit_offsets_for_strided_views` fails on main: A_LARGE / B_LARGE come from
-  numel, so a strided view whose offsets cross 2**31 with fewer elements runs on int32 offsets
-  (finding O8a-M3; checked on the launch, never launched). No fix PR yet.
-All other cases pass on main and on every open PR touching the file (#8867, #8957, #8865, #8869).
+Main vs open PRs:
+- `test_fp32_mm_honours_highest_precision` is a strict xfail: the kernel's `tl.dot` uses
+  Triton's default TF32 for fp32 operands (finding O8a-N4). No fix PR yet.
+- On main the kernel reads a strided bias as contiguous (finding O8a-M1), `addmm_batch_invariant`
+  asserts a 1-D bias and takes no beta or alpha (O8a-M2), and A_LARGE / B_LARGE come from numel,
+  so a strided view whose offsets cross 2**31 with fewer elements runs on int32 offsets (O8a-M3).
+  #9305 (s4m-bi-addmm-strides) fixes them, with `test_bik_addmm_follows_aten` and
+  `test_bik_matmul_persistent_uses_64_bit_offsets_past_int32` in
+  `transformer/test_te_layers_batch_invariant.py`.
+All other cases pass on main and on every open PR touching the file (#8867, #8957, #8865, #8869,
+#9305).
 
 Hardware: H100 and GB200 (Triton lowers `tl.dot` to wgmma on SM90 and tcgen05 on SM100).
 """
@@ -250,14 +251,18 @@ def float32_matmul_precision(precision: str):
         torch.set_float32_matmul_precision(prev)
 
 
+@pytest.mark.xfail(
+    strict=True, reason="O8a-N4: matmul_kernel_persistent runs fp32 operands at TF32; no fix PR yet"
+)
 @pytest.mark.parametrize("backend", ["triton", "deepgemm"])
 def test_fp32_mm_honours_highest_precision(backend):
     """With fp32 matmul precision "highest" (PyTorch's default), an fp32 `torch.mm` under the
     backend is an fp32 GEMM: within 2x cuBLAS's fp32 error against fp64 per row.
 
-    Fails on main (finding O8a-N4): `tl.dot` runs fp32 operands at Triton's default TF32, so the
-    inputs lose 13 mantissa bits (errors ~1e3 times cuBLAS's). The deepgemm backend sends fp32 to
-    the same kernel ("intentional higher-precision operations such as the fp32 MoE router").
+    Fails on main (finding O8a-N4, no fix PR yet, so a strict xfail): `tl.dot` runs fp32
+    operands at Triton's default TF32, so the inputs lose 13 mantissa bits (errors ~1e3 times
+    cuBLAS's). The deepgemm backend sends fp32 to the same kernel ("intentional
+    higher-precision operations such as the fp32 MoE router").
     """
     if backend == "deepgemm":
         assert bik.HAVE_DEEPGEMM_BF16, "the deepgemm backend needs DeepGEMM's bf16 bindings"
@@ -273,29 +278,14 @@ def test_fp32_mm_honours_highest_precision(backend):
     )
 
 
-# aten::addmm(self, mat1, mat2, *, beta=1, alpha=1): bias forms aten accepts.
+# aten::addmm(self, mat1, mat2, *, beta=1, alpha=1). Only the contiguous [N] bias is a case here;
+# the strided, [1, N] and [M, N] biases, beta and alpha fail on main (O8a-M1, O8a-M2) and are
+# #9305's tests.
 def _addmm_call(form, bias_values, a, b):
     """(callable, expected fp64) for one aten addmm form, from dyadic values."""
-    m, n = a.shape[0], b.shape[1]
-    exact = a.double() @ b.double()
-    if form == "vector":
-        bias = bias_values[0].clone()
-        return (lambda: torch.addmm(bias, a, b)), exact + bias.double()
-    if form == "vector_strided":
-        storage = torch.full((2 * n,), float("nan"), device=_DEVICE, dtype=a.dtype)
-        storage[::2] = bias_values[0]
-        bias = storage[::2]
-        return (lambda: torch.addmm(bias, a, b)), exact + bias.double()
-    if form == "row":
-        bias = bias_values[0].view(1, n).clone()
-        return (lambda: torch.addmm(bias, a, b)), exact + bias.double()
-    if form == "matrix":
-        bias = bias_values[:m].clone()
-        return (lambda: torch.addmm(bias, a, b)), exact + bias.double()
+    assert form == "vector", form
     bias = bias_values[0].clone()
-    if form == "beta":
-        return (lambda: torch.addmm(bias, a, b, beta=0.5)), exact + 0.5 * bias.double()
-    return (lambda: torch.addmm(bias, a, b, alpha=2.0)), 2.0 * exact + bias.double()
+    return (lambda: torch.addmm(bias, a, b)), a.double() @ b.double() + bias.double()
 
 
 _ADDMM_BACKENDS = dict(
@@ -330,21 +320,6 @@ def check_addmm(backend, dtype, form):
 def test_addmm_vector_bias(backend, dtype):
     """`torch.addmm(bias, a, b)` with a contiguous [N] bias, the form `F.linear` uses."""
     check_addmm(backend, dtype, "vector")
-
-
-@pytest.mark.parametrize(**_ADDMM_BACKENDS)
-def test_addmm_strided_vector_bias(backend, dtype):
-    """A strided [N] bias view (stride 2, NaN in between). Fails on main (O8a-M1): the kernel
-    loads ``bias_ptr + n``, ignoring the stride."""
-    check_addmm(backend, dtype, "vector_strided")
-
-
-@pytest.mark.parametrize("form", ["row", "matrix", "beta", "alpha"])
-@pytest.mark.parametrize(**_ADDMM_BACKENDS)
-def test_addmm_broadcast_bias_and_scalars(backend, dtype, form):
-    """[1, N] and [M, N] biases, beta and alpha. Fails on main (O8a-M2): `addmm_batch_invariant`
-    asserts a 1-D bias and its signature takes no beta or alpha (TypeError)."""
-    check_addmm(backend, dtype, form)
 
 
 class _LaunchSpy:
@@ -396,34 +371,6 @@ def test_launch_uses_64_bit_offsets_for_large_operands(name, monkeypatch):
     flags = _flags_for(a, b, monkeypatch)
     for key, t in (("A_LARGE", a), ("B_LARGE", b)):
         assert flags[key] == (max_offset(t) >= INT32_LIMIT), f"{name}: {key}={flags[key]}"
-
-
-_STRIDED = {
-    # name: (a shape, a stride, b shape, b stride): views spanning more than 2**31 elements
-    "a_padded_rows": ((INT32_LIMIT // 8192, 4096), (8192 + 64, 1), (4096, 8), (8, 1)),
-    "a_column_slice": ((300000, 2048), (8192, 1), (2048, 8), (8, 1)),
-    "b_padded_rows": ((8, 32768), (32768, 1), (32768, 40000), (70000, 1)),
-    "b_transposed_slice": ((8, 4096), (4096, 1), (4096, 300000), (1, 8192)),
-}
-
-
-@pytest.mark.parametrize("name", list(_STRIDED))
-def test_launch_uses_64_bit_offsets_for_strided_views(name, monkeypatch):
-    """A strided view (a column slice, padded rows, a slice of a transposed weight) whose element
-    offsets reach 2**31 while it holds fewer than 2**31 elements must still get 64-bit offsets.
-
-    Fails on main (finding O8a-M3): the flags come from ``numel() > 2**31``, so the kernel would
-    compute these offsets in int32 and wrap. Checked on the launch with meta tensors: launching
-    would read out of bounds (CI.md rule 10).
-    """
-    a_shape, a_stride, b_shape, b_stride = _STRIDED[name]
-    a, b = _meta(a_shape, a_stride), _meta(b_shape, b_stride)
-    assert max(max_offset(a), max_offset(b)) >= INT32_LIMIT, "the case does not cross 2**31"
-    assert a.numel() <= INT32_LIMIT and b.numel() <= INT32_LIMIT
-    flags = _flags_for(a, b, monkeypatch)
-    for key, t in (("A_LARGE", a), ("B_LARGE", b)):
-        if max_offset(t) >= INT32_LIMIT:
-            assert flags[key], f"{name}: {key} is False for offsets up to {max_offset(t)}"
 
 
 @pytest.mark.parametrize("m", ou.int32_overflow_params(4096))

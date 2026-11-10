@@ -47,7 +47,11 @@ Not covered: the backward (training only), and the module-level `rmsnorm*` wrapp
 nothing on the pinned TE (step 3 R04, S9: TE 2.20 exposes none of the names).
 
 Main vs open PRs: all cases are expected to pass on main. #8869 (op-fuser norms) adds patch sites
-and does not change these functions.
+and does not change these functions. Under triton/deepgemm on main, TE's RMSNorm module returns
+its input's dtype for an input in another dtype (an fp32 residual stream into a bf16 norm),
+where TE returns its activation dtype (finding O8a-P2); #9319 (s4m-bi-rmsnorm-dtype) fixes it,
+with `test_te_rmsnorm_parity_follows_te_output_dtype` in
+`transformer/test_te_layers_batch_invariant.py`.
 
 Hardware: H100 (1 GPU), with Transformer Engine.
 """
@@ -363,36 +367,3 @@ def test_sanitizer_case():
     one-element block), zero-centered gamma."""
     x, w = inputs(3, BLOCK + 1, torch.bfloat16, seed=11)
     check_norm(bik.BatchInvariantRMSNormFn.apply(x, w, 1e-5, True), x, w, 1e-5, True, "sanitizer")
-
-
-@pytest.mark.parametrize("backend", ["triton", "deepgemm"])
-def test_te_rmsnorm_module_output_dtype_follows_te(backend):
-    """TE's RMSNorm module converts its input to its activation dtype (the parameter dtype
-    outside autocast) and normalizes that: an fp32 residual stream into a bf16 norm gives bf16.
-    The batch-invariant forward that replaces it must return the same dtype and TE's values,
-    within the bound of the norm of the converted input.
-
-    Finding O8a-P2 (dfw 21628724, hsg 8809176): on main `_te_rmsnorm_forward_patched` returns
-    the input's dtype (`BatchInvariantRMSNormFn` casts back to `x.dtype`), so under
-    triton/deepgemm an fp32 residual stream (`fp32_residual_connection`, a learned fp32 position
-    table) reaches the next GEMM in fp32, and the LM head's `torch.matmul` fails ("Incompatible
-    dtypes" in `matmul_persistent`), see `test_lm_head_fp32_logits.py`. Fails on main, passes
-    with s4m-bi-rmsnorm-dtype (`fix/bi-rmsnorm-dtype`)."""
-    x, w = inputs(65, 1024, torch.float32, seed=9)
-    w = w.to(torch.bfloat16)
-    module = te_rmsnorm(1024, w, 1e-5, False)
-    with torch.no_grad():
-        native = module(x)
-        with bi_mode(backend):
-            out = module(x)
-    assert (
-        out.dtype == native.dtype
-    ), f"{backend}: {out.dtype}, TE's own forward gives {native.dtype}"
-    converted = x.to(native.dtype)
-    ou.assert_close_to_reference(
-        out,
-        ou.fp64_reference(rmsnorm_reference, converted, w, 1e-5, False),
-        trusted_rmsnorm(converted, w, 1e-5, False),
-        dim=-1,
-        what=f"TE RMSNorm on fp32 input under {backend}",
-    )

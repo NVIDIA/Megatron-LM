@@ -13,7 +13,7 @@ Contract (written from the aten op it replaces, `torch.log_softmax(x, dim=-1)`):
   contiguous tensor of the input's shape and dtype; the input is read only.
 - Special values as in torch: a row holding a NaN or a +inf is all NaN; a row of only -inf is
   all NaN; a -inf entry of any other row gives -inf; a one-column row gives 0. Empty inputs give
-  empty outputs.
+  empty outputs; #8963's `test_log_softmax_handles_empty_and_0d_inputs` covers an empty last dim.
 - Only the last dimension: any other dim raises. `F.log_softmax(fp16, dtype=torch.float32)` on
   CUDA (aten's `half_to_float=True`) is not implemented and must raise, never return a wrong
   value or dtype.
@@ -33,7 +33,7 @@ Structure (read after the contract was written): one program per row, three pass
 blocks of BLOCK_SIZE = 1024 columns (max, sum of exp, store), fp32 max and sum, int64 row offsets.
 One compiled variant per input dtype and per Triton specialization of n_cols, the row stride and
 the base pointer (integers and pointers divisible by 16 are specialized), so the alignment case
-compares launches whose loads vectorize differently. Covered: n_cols around 1024 and 2048 (0, 1,
+compares launches whose loads vectorize differently. Covered: n_cols around 1024 and 2048 (1,
 B-1, B, B+1), production vocabularies (32000, 151936, 152064, 262144), rows 0..1000 and
 int32-overflowing element offsets (`large`), bf16/fp16/fp32, every special value above, every
 backend's aten registration, and one `sanitizer` case.
@@ -55,7 +55,6 @@ _DEVICE = "cuda"
 BLOCK_SIZE = 1024  # batch_invariant_kernels.py, log_softmax(): BLOCK_SIZE = 1024
 PRODUCTION_VOCABS = (32000, 151936, 152064, 262144)
 DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-# n_cols = 0 has its own test (test_empty_inputs).
 N_COLS = ou.boundary_sizes(BLOCK_SIZE, multiples=(2,), production=PRODUCTION_VOCABS, minimum=1)
 N_ROWS = (0, 1, 2, 3, 31, 32, 33, 1000)
 
@@ -128,15 +127,15 @@ def test_log_softmax_matches_fp64(case):
     _check(out, x, f"log_softmax {_case_id(case)}")
 
 
-_EMPTY_SHAPES = [(0, 5), (3, 0), (0, 0), (2, 0, 7), (2, 3, 0)]
+_EMPTY_SHAPES = [(0, 5), (2, 0, 7)]
 
 
 @pytest.mark.parametrize("shape", _EMPTY_SHAPES, ids=["x".join(map(str, s)) for s in _EMPTY_SHAPES])
 def test_empty_inputs(shape):
-    """Empty inputs, including an empty last dim, give empty outputs of the same shape (as torch).
+    """Inputs without rows give empty outputs of the same shape (as torch).
 
-    Fails on main for an empty last dim: the launcher's ``reshape(-1, 0)`` raises (finding
-    O8a-N2; unreachable from inference, where the last dim is the vocabulary).
+    An empty last dim (finding O8a-N2) is tested by #8963's
+    `transformer/test_te_layers_batch_invariant.py::test_log_softmax_handles_empty_and_0d_inputs`.
     """
     x = torch.empty(shape, device=_DEVICE, dtype=torch.bfloat16)
     out = bik.log_softmax(x)

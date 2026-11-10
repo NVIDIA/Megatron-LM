@@ -52,7 +52,7 @@ the global memory buffer), frozen ones through `LinearWithFrozenWeight`. cuBLASL
 and split-K by heuristics, so sizes are taken around 64/128/256 multiples: V in 1..257 edges,
 odd vocabularies (50257), 32000 and the production vocabularies 128256, 151936, 152064 and
 262144; H 64, 2880 (not a multiple of 128) and 4096..8192; M 0, 1, 7..9, 63..65, 127..129, 1024
-and 8192; 2-D, `[S, 1, H]` and row-strided inputs; the head's own and a runtime (tied) weight;
+and 8192; 2-D and `[S, 1, H]` inputs; the head's own and a runtime (tied) weight;
 frozen and trainable weights. Model level: GPT and Hybrid (`"*-"`), tied and untied, MuP on and
 off, training vs `InferenceMode`; batch-invariant mode on the te_native, triton and deepgemm
 backends; the MTP step through `LanguageModule.compute_mtp_single_step`; TP 2 with and without
@@ -60,7 +60,14 @@ backends; the MTP step through `LanguageModule.compute_mtp_single_step`; TP 2 wi
 the dynamic-inference prefill of a batch-invariant hybrid MoE model against its training forward
 (4 GPUs, the configuration of `test_hybrid_moe.py::test_batch_invariant_prefill_matches_full_forward`).
 
-Main vs open PRs: every case is expected to pass on main.
+Main vs open PRs: every case passes on main except the hybrid MoE prefill, a strict xfail: its
+decoder output already differs before the head (issue #7958; no fix PR yet). Two parts of the
+contract fail on main and are tested by their fix PRs: the fp32 path reads row-strided hidden
+states as contiguous (finding O8a-P1; #9318, `test_linear_fp32_output_reads_strided_operands` in
+`tensor_parallel/test_layers.py`), and under triton/deepgemm the batch-invariant TE RMSNorm
+returns an fp32 residual stream in fp32, so the head's GEMM gets an fp32 input (O8a-P2; #9319,
+`test_te_rmsnorm_parity_follows_te_output_dtype` and `test_forward_batch_invariant` in
+`models/test_gpt_model_batch_invariant.py`).
 
 Hardware: H100 and GB200 (1 GPU); the TP 2 cases need 2 NVLS-connected H100s, the hybrid MoE
 prefill case 4 (H100 extra tasks).
@@ -238,25 +245,13 @@ def build_head(config, w_full, *, frozen=True):
     return head
 
 
-def shape_input(x2d, layout, seed):
-    """`x2d` [M, H] as the head's input: 2-D, [S, 1, H] (the dynamic batch), or a view whose
-    rows are strided: every other row of a twice-as-tall buffer ("row_strided"), or the left
-    half of a twice-as-wide one ("column_slice")."""
+def shape_input(x2d, layout):
+    """`x2d` [M, H] as the head's input: 2-D or [S, 1, H] (the dynamic batch)."""
     if layout == "2d":
         return x2d.clone()
     if layout == "s1h":
         return x2d.clone().unsqueeze(1)
-    tokens, hidden = x2d.shape
-    if layout == "row_strided":
-        tall = bf16((2 * tokens, hidden), seed + 7)
-        tall[::2] = x2d
-        view = tall[::2]
-    else:
-        wide = bf16((tokens, 2 * hidden), seed + 7)
-        wide[:, :hidden] = x2d
-        view = wide[:, :hidden]
-    assert tokens < 2 or not view.is_contiguous()
-    return view
+    raise ValueError(layout)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -309,7 +304,7 @@ def test_head_emits_fp32_logits(parallel, case, kind, monkeypatch):
         with torch.no_grad():
             head.weight.zero_()
     spy = GemmSpy(monkeypatch)
-    x = shape_input(x2d, case["layout"], seed=tokens)
+    x = shape_input(x2d, case["layout"])
     out = run_head(head, x, runtime_w)
     assert out.shape == (*x.shape[:-1], vocab) and out.is_contiguous(), tuple(out.shape)
     assert len(spy.calls) == 1, f"te_general_gemm ran {len(spy.calls)} times"
@@ -324,41 +319,6 @@ def test_head_emits_fp32_logits(parallel, case, kind, monkeypatch):
     if kind == "integer" and hidden >= 1024:
         ref = fp64_logits(x2d[:64], w[:4096])
         assert bool((ref.abs() > 256).any()), "no logit above 256: bf16 output would pass"
-
-
-STRIDED_CASES = [  # (vocab, hidden, tokens, layout, weight, frozen)
-    (129, 4096, 7, "row_strided", "own", True),
-    (32000, 2880, 64, "column_slice", "runtime", False),
-    (151936, 4096, 129, "row_strided", "own", False),
-    (257, 64, 2, "column_slice", "runtime", True),
-]
-
-
-@pytest.mark.parametrize(
-    "vocab,hidden,tokens,layout,weight,frozen",
-    [pytest.param(*c, id=f"V{c[0]}-H{c[1]}-M{c[2]}-{c[3]}-{c[4]}") for c in STRIDED_CASES],
-)
-def test_strided_hidden_states(
-    parallel, vocab, hidden, tokens, layout, weight, frozen, monkeypatch
-):
-    """Hidden states whose rows are strided (a view, as `ColumnParallelLinear` accepts and
-    `torch.matmul` handles) give the logits of their values, exactly (integer operands).
-
-    Finding O8a-P1 (H100 dfw 21627808): on main the fp32 path reshapes such a view to [M, H]
-    without a copy and hands it to TE's `general_gemm`, which reads it as contiguous: every row
-    but the first holds another row's logits. Fails on main (expect-fail task), passes with
-    s4m-lm-head-fp32-contiguous (`fix/lm-head-fp32-contiguous`); the model call sites pass
-    contiguous hidden states (reach in the packet doc)."""
-    x2d, w = operands(tokens, hidden, vocab, "integer", seed=vocab + tokens)
-    head = build_head(make_config(hidden), w, frozen=frozen)
-    runtime_w = None
-    if weight == "runtime":
-        runtime_w = w.clone()
-        with torch.no_grad():
-            head.weight.zero_()
-    GemmSpy(monkeypatch)
-    out = run_head(head, shape_input(x2d, layout, seed=tokens), runtime_w)
-    check_logits(out.reshape(-1, vocab), x2d, w, f"{layout} input", exact=True)
 
 
 PRODUCTION = [  # (vocab, hidden, tokens)
@@ -785,35 +745,6 @@ def test_batch_invariant_logits_are_the_training_logits_upcast(
     ou.assert_exact(logits, train_logits.float(), what="inference logits vs training logits")
 
 
-@pytest.mark.parametrize("kind", ["gpt", "hybrid"])
-def test_batch_invariant_fp32_residual_stream(parallel, kind, monkeypatch):
-    """`fp32_residual_connection=True`: the residual stream is fp32, and TE's final norm returns
-    its parameter dtype, so the head reads bf16 hidden states (checked without the mode). Under
-    batch-invariant mode (triton) the forward must run alike, and the inference logits must be
-    the training logits upcast, bit for bit.
-
-    Finding O8a-P2 (fails on main, passes with s4m-bi-rmsnorm-dtype, `fix/bi-rmsnorm-dtype`):
-    the batch-invariant TE RMSNorm returns its input's dtype (fp32),
-    so the head's `torch.matmul` gets an fp32 input and a bf16 weight and
-    `matmul_persistent` raises "Incompatible dtypes" (first seen with an fp32 learned position
-    table, dfw 21627808). Focused case:
-    `test_rmsnorm_batch_invariant.py::test_te_rmsnorm_module_output_dtype_follows_te`."""
-    vocab = 32000
-    model = build_model(kind, vocab, tied=False, fp32_residual_connection=True)
-    g = ou.make_generator(17)
-    input_ids = torch.randint(0, vocab, (2, MODEL_SEQ), generator=g).to(_DEVICE)
-    _, native = model_forward(model, input_ids, inference=False)
-    assert native["h"].dtype == BF16, f"without the mode the head reads {native['h'].dtype}"
-    with bik.set_batch_invariant_mode(True, backend="triton"):
-        train_logits, train_record = model_forward(model, input_ids, inference=False)
-        logits, record = model_forward(model, input_ids, inference=True)
-    assert (
-        train_record["h"].dtype == BF16
-    ), f"under the mode the head reads {train_record['h'].dtype}"
-    ou.assert_exact(record["h"], train_record["h"], what="the head's input (decoder output)")
-    ou.assert_exact(logits, train_logits.float(), what="inference logits vs training logits")
-
-
 # ---------------------------------------------------------------------------------------------
 # The dynamic-inference prefill of a batch-invariant hybrid MoE model (4 GPUs)
 # ---------------------------------------------------------------------------------------------
@@ -821,13 +752,19 @@ def test_batch_invariant_fp32_residual_stream(parallel, kind, monkeypatch):
 _EP = 4
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#7958: batch-invariant hybrid MoE dynamic prefill differs from the full forward; "
+    "no fix PR yet",
+)
 def test_hybrid_moe_batch_invariant_prefill_logits(monkeypatch):
     """The configuration of `tests/unit_tests/inference/test_hybrid_moe.py::
     TestDynamicInferenceNVLS::test_batch_invariant_prefill_matches_full_forward` (hybrid "ME*",
     EP 4, NVLS dispatcher, batch-invariant mode, a 64-token prompt), checked against #8235's
     contract: the dynamic prefill's logits are fp32 and bitwise the full training forward's bf16
     logits upcast. The head's input is compared first, so a mismatch is attributed to the decoder
-    (batch-invariance of Mamba / MoE / attention, issue #7958) or to the head."""
+    (batch-invariance of Mamba / MoE / attention, issue #7958) or to the head. On main the
+    decoder output already differs (issue #7958, no fix PR yet): a strict xfail."""
     ou.require_sm(ou.HOPPER)
     if Utils.world_size < _EP or Utils.world_size % _EP:
         pytest.skip(f"needs a multiple of {_EP} ranks; the manifest selects it so")

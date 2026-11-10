@@ -27,13 +27,13 @@ Contract (written from the callers' semantics):
 - Batch invariance: a row's bits depend only on a[r] and w[e]: not on the other experts' counts,
   the block's position, M_total, which entry point ran, or eager vs CUDA-graph replay with new
   offsets.
-- Precondition: aligned block starts. On main it is unchecked and undeclared. With
-  s4f-grouped-gemm-alignment the caller declares the alignment the offsets were built with
-  (`offs_alignment`): a declaration that is not a positive multiple of A, or an `offs` that is not
-  one entry per expert ([E]), must be rejected before the GEMM; offsets declared with a multiple
-  of A but holding misaligned values remain the documented, unchecked precondition (their values
-  are on the device). A misaligned `offs` declared with its true alignment must raise or still
-  give every live row its own expert's product; it must never mix experts silently.
+- Precondition: aligned block starts. On main it is unchecked and undeclared, and misaligned
+  offsets mix experts silently (finding O8a-N1). With #8964 (s4f-grouped-gemm-alignment) the
+  caller declares the alignment the offsets were built with (`offs_alignment`), and a
+  declaration that is not a positive multiple of A, or an `offs` that is not one entry per expert
+  ([E]), is rejected before the GEMM; offsets declared with a multiple of A but holding
+  misaligned values remain the documented, unchecked precondition (their values are on the
+  device). #8964 carries those rejection tests (`transformer/moe/test_moe_batch_invariant.py`).
 
 Reference: a per-expert fp64 loop. Trusted implementation: per-expert `torch.mm` in bf16 on the
 same device (cuBLAS). Tolerance class: floating point, bounded per row (default factor);
@@ -49,12 +49,10 @@ K in {64, 128, 2880, 7168}, 0 / 1 / A tail rows past offs[-1], and M_total = 0.
 
 Main vs open PRs: no open PR changes these entry points' per-row results. #8866 (t3-r04f2) and
 #8869 (t3-p4n3) add `_bf16_grouped_gemm_device_counts` (the TE grouped-tensor path) on the same
-DeepGEMM kernel; it is not on main and is not tested here. s4f-grouped-gemm-alignment
-(fix/bi-grouped-gemm-offsets-contract) adds the required `offs_alignment` keyword, which
-`grouped_gemm` passes only where the entry point takes it, and the host-side checks: the
-misaligned-offsets case, the foreign-alignment rejections and the offs-shape rejections fail on
-main (finding O8a-N1: nothing is declared or checked there) and pass with that PR. Every other
-case passes on both.
+DeepGEMM kernel; it is not on main and is not tested here. #8964 (s4f-grouped-gemm-alignment,
+fix/bi-grouped-gemm-offsets-contract) adds the required `offs_alignment` keyword, which
+`grouped_gemm` passes only where the entry point takes it, and the host-side checks with their
+tests. Every case here passes on main and with #8964.
 
 Hardware: H100 and GB200. Needs DeepGEMM with bf16 bindings; a missing DeepGEMM fails the test
 on the target hardware.
@@ -314,116 +312,6 @@ def test_cuda_graph_replay_with_new_offsets():
         for e in range(num_experts):
             rows = batch.live(e)
             ou.assert_exact(out_buf[rows], eager[rows], what=f"replay {pattern}, expert {e}")
-
-
-def test_misaligned_offsets_raise_or_stay_correct():
-    """A block start that is not a multiple of the alignment, declared with its true alignment
-    (1): raise before the GEMM, or keep every row right.
-
-    Fails on main: nothing checks the alignment (main's entry point takes no declaration), and
-    DeepGEMM takes a block's expert from its first row, so expert 1's first rows are multiplied
-    by expert 0's weights (finding O8a-N1). Passes with s4f-grouped-gemm-alignment, which rejects
-    a declared alignment DeepGEMM cannot use. Offsets declared with DeepGEMM's alignment but
-    holding misaligned values stay a documented, unchecked precondition there (the values live on
-    the device), so they are not a case here. The inference permute aligns every block.
-    """
-    align = _alignment()
-    k, n = 128, 256
-    w = _weights(2, n, k)
-    counts = [align + 5, align]
-    ends = [counts[0], counts[0] + counts[1]]  # expert 1 starts at align + 5
-    g = ou.make_generator(3, device=_DEVICE)
-    a = torch.randn(ends[-1], k, device=_DEVICE, generator=g).to(torch.bfloat16)
-    offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
-    try:
-        out = grouped_gemm(a, w, offs, ends[-1], offs_alignment=1)
-        torch.cuda.synchronize()
-    except (AssertionError, RuntimeError, ValueError):
-        return
-    rows = [
-        torch.arange(0, ends[0], device=_DEVICE),
-        torch.arange(ends[0], ends[1], device=_DEVICE),
-    ]
-    _check_experts(out, a, rows, w, "misaligned offsets")
-
-
-class _GemmCalls:
-    """Counts the aligned grouped GEMM's launches, to check that a rejection comes first."""
-
-    def __init__(self, monkeypatch):
-        self.calls = 0
-        real = bik._bf16_grouped_gemm_aligned_contiguous
-
-        def spy(*args, **kwargs):
-            self.calls += 1
-            return real(*args, **kwargs)
-
-        monkeypatch.setattr(bik, "_bf16_grouped_gemm_aligned_contiguous", spy)
-
-
-def _expect_rejection(monkeypatch, call, what):
-    """`call` must raise before the GEMM runs."""
-    gemm = _GemmCalls(monkeypatch)
-    with pytest.raises((AssertionError, ValueError)):
-        call()
-    torch.cuda.synchronize()
-    assert gemm.calls == 0, f"{what}: the GEMM ran before the rejection"
-
-
-# (case, declared alignment as a function of DeepGEMM's A): offsets built from raw cumulative
-# counts, with torch grouped_mm's 16, with half of A, and a non-positive declaration.
-_FOREIGN_ALIGNMENTS = [
-    ("raw_counts", lambda a: 1),
-    ("torch_grouped_mm", lambda a: 16),
-    ("half", lambda a: a // 2),
-    ("zero", lambda a: 0),
-]
-
-
-@pytest.mark.parametrize(
-    "declared", [f for _, f in _FOREIGN_ALIGNMENTS], ids=[c for c, _ in _FOREIGN_ALIGNMENTS]
-)
-def test_declared_alignment_deepgemm_cannot_use_is_rejected(declared, monkeypatch):
-    """Offsets built for counts [A + 5, A] with an alignment that is not a positive multiple of
-    DeepGEMM's A, and declared so: rejected before the GEMM.
-
-    Fails on main (no declaration: the GEMM runs and mixes experts, O8a-N1); passes with
-    s4f-grouped-gemm-alignment.
-    """
-    align = _alignment()
-    alignment = declared(align)
-    step = max(alignment, 1)
-    counts = [align + 5, align]
-    blocks = [math.ceil(c / step) * step for c in counts]
-    ends = [blocks[0], blocks[0] + blocks[1]]
-    assert ends[0] % align, "the layout must be one DeepGEMM cannot use"
-    w = _weights(2, 128, 64)
-    a = torch.zeros(ends[-1], 64, device=_DEVICE, dtype=torch.bfloat16)
-    offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
-    _expect_rejection(
-        monkeypatch,
-        lambda: grouped_gemm(a, w, offs, ends[-1], alignment),
-        f"declared alignment {alignment}",
-    )
-
-
-@pytest.mark.parametrize("num_offs", [1, 3], ids=["fewer_than_experts", "more_than_experts"])
-def test_offsets_not_one_per_expert_are_rejected(num_offs, monkeypatch):
-    """`offs` must hold one end row per expert of `w` ([E]); one or three offsets for two experts
-    are rejected before the GEMM. The layouts are aligned and every extra block is empty, so a
-    GEMM that ran anyway would stay inside `w`.
-
-    Fails on main (offs' shape is unchecked); passes with s4f-grouped-gemm-alignment.
-    """
-    align = _alignment()
-    ends = [align, 2 * align, 2 * align][:num_offs]
-    w = _weights(2, 128, 64)
-    m_total = 2 * align
-    a = torch.zeros(m_total, 64, device=_DEVICE, dtype=torch.bfloat16)
-    offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
-    _expect_rejection(
-        monkeypatch, lambda: grouped_gemm(a, w, offs, m_total, align), f"{num_offs} offsets"
-    )
 
 
 def test_empty_problem():

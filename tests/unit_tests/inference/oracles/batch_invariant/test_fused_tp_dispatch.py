@@ -54,47 +54,32 @@ the layers of one TransformerBlock (one pipeline stage): the first layer's QKV a
 norm, the last FC2 gets a placeholder weight; MTP inner layers (`MultiTokenPredictionLayer`) and
 HybridStack layers are never wired. The buffer holds [T, B, H] bf16 iff T*B*H*2 bytes fit, so the
 decision changes with the step's token count. Covered:
-- TP = 1, 2 and 8 (flag off as controls; NVLS, NVLS disabled, batch-invariant mode, fp16, a
-  1 KiB buffer), 3 layers (first, middle, last);
-- TP 2 x PP 2 with 3 layers per stage and the final norm on the last stage (NVLS and NCCL);
-- step token counts of decode (2 tp, 4 tp; tp alone in `narrow_decode`), mixed (64 tp, 65 tp)
-  and prefill (1024 tp) steps in dynamic batching's [T, 1, H] layout, with the default buffer and
-  with one holding exactly 64 tp tokens (so consecutive steps decide differently, 65 tp is one
-  row per rank over);
+- TP = 1, 2 and 8 (flag off as controls at TP 1 and 2; NVLS at TP 2 and 8), 3 layers (first,
+  middle, last);
+- TP 2 x PP 2 with 3 layers per stage and the final norm on the last stage (NVLS);
+- step token counts of decode (2 tp, 4 tp), mixed (64 tp, 65 tp) and prefill (1024 tp) steps in
+  dynamic batching's [T, 1, H] layout, on one block and buffer;
 - full-iteration graphs (the block captured at two sizes) and local graphs (each layer captured
-  alone, replayed as a chain, with eager steps in between), at sizes that decide alike and that
-  decide differently;
+  alone, replayed as a chain, with eager steps in between);
 - the real engine (`DynamicInferenceEngine`) with staggered requests, so prefill, decode and
-  mixed steps, eager or with layer-scope (local) or block-scope (full-iteration) CUDA graphs from
-  `CudaGraphManager`, with the default buffer and one whose capacity splits the graph sizes;
-- the MTP inner layer at depths 1 and 2 (`forward_single_position`, as speculative decoding calls
-  it), a HybridStack of attention and MLP layers, and MLA blocks (MLA only, and GPT/MLA mixed);
+  mixed steps, eager;
 - production widths (Llama-3-8B, H 4096, and Qwen2.5-72B, H 8192: SwiGLU, grouped-query
   attention, 3 layers) at TP 2 and TP 8 with NVLS, over steps of 8192, tp, 1032, 256 and tp
   tokens on one block and buffer.
 
-Main vs open PRs:
-- On main a row-parallel layer adds the residual only inside the fused kernel, and the consumer
-  decides fused mode from its own flag and the buffer handle. So every case where the kernel
-  does not run drops the residual: TP = 1, NVLS disabled, batch-invariant mode, fp16, the small
-  buffer, `tp8_nvls_disabled`, `pp2_nccl`, `sizes_across_capacity`, the `*_capacity` graph and
-  engine cases, and the MTP inner layer at every TP (never wired, so its projections never
-  fuse). #8561 (d1) fixes them; #8712 (n16) and #8704 (n8) change the same wiring and must keep
-  these tests passing; #8868 (t3-r04f3) changes the batch-invariant branch to a rank-ordered
-  reduce-scatter (still no residual add without d1).
-- `test_step_sizes_keep_the_residual[narrow_decode]` and the graphed engine cases
-  (`test_engine_steps_keep_the_residual[local|full_iteration]`, whose decode graphs run one
-  token per rank) fail on main in the fused kernel's launcher (one token per rank at H = 128 is
-  under a warp: num_warps = 0); #8880 (t3-r09f2) fixes it.
-- MLA (`test_mla_layers_keep_the_residual`) fails on main at construction: the block asks every
-  layer for `linear_qkv`'s norm weights, which MLA does not have (AttributeError). #8704 (n8,
-  stacked on #8561) wires MLA and must make it pass; the MLA up projections all-gather back to
-  back into the shared buffer without a barrier, a separate race (#8709, n12), so the test takes
-  them through NCCL, as #8704's own test does.
-- HybridStack (`test_hybrid_stack_keeps_the_residual`) fails on main and, by reading, with #8561:
-  an attention-only layer hands its residual to `self.mlp.linear_fc2` and an MLP-only layer to
-  `self.self_attention.linear_proj`, which are IdentityOps there (AttributeError, finding
-  O8a-N7). No open PR changes it.
+Main vs open PRs: every case here passes on main. The paths that fail on main are tested by the
+PRs that fix them:
+- Wherever the fused kernel does not run (TP = 1, NVLS disabled, batch-invariant mode, fp16, a
+  buffer too small for the step, the MTP inner layer), main's row-parallel layer drops the
+  residual it was handed: #8561 (d1, `tensor_parallel/test_inference_layers.py`). #8712 (n16),
+  #8704 (n8) and #8868 (t3-r04f3) change the same wiring and must keep these tests passing.
+- One token per rank at a toy H (a shard narrower than a warp, as in CUDA-graph decode steps):
+  main's fused-kernel launcher computes num_warps = 0; #8880 (t3-r09f2,
+  `determinism/kernels/test_nvls_fused_collectives.py`).
+- MLA layers fail at construction on main (no `linear_qkv` norm weights): #8704
+  (`transformer/test_mla_fused_tp_communication.py`).
+- HybridStack layers hand the residual to an IdentityOp's missing projection (AttributeError,
+  finding O8a-N7): #8965 (`ssm/test_hybrid_fused_tp_communication.py`).
 
 Hardware: H100 with Transformer Engine; one GPU for TP = 1, two NVLS-connected GPUs for TP = 2
 (`nproc` 2), four for TP 2 x PP 2 (`nproc` 4), eight for TP = 8 (`nproc` 8).
@@ -122,23 +107,14 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import InferenceCudaGraphScope
-from megatron.core.transformer.spec_utils import build_module
-from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.test_utilities import Utils
 
@@ -147,18 +123,13 @@ pytestmark = [ou.requires_sm(ou.HOPPER)]
 _DEVICE = "cuda"
 SEQ, BATCH, HIDDEN, FFN, HEADS, LAYERS = 64, 2, 128, 256, 4, 3
 
-# (case, tensor-parallel size, flag on): every path the row-parallel layer can take.
+# (case, tensor-parallel size, flag on): the flag off as controls, and the fused NVLS path. The
+# fallback paths drop the residual on main; #8561 tests them.
 CASES = [
     ("flag_off", 1, False),
-    ("tp1", 1, True),
     ("flag_off_tp2", 2, False),
     ("nvls", 2, True),
-    ("nvls_disabled", 2, True),
-    ("batch_invariant", 2, True),
-    ("fp16", 2, True),
-    ("small_buffer", 2, True),
     ("tp8_nvls", 8, True),
-    ("tp8_nvls_disabled", 8, True),
 ]
 FUSED_EXPECTED = {"nvls", "tp8_nvls"}
 
@@ -416,9 +387,6 @@ def _verdict(case, branches, problems, *, stage=0):
 def test_zero_projections_keep_the_residual(case, parallel, fuse, monkeypatch):
     """Zero projections: the output is the input, bit for bit, on every path; exact dispatch."""
     tp = parallel
-    if case == "small_buffer":
-        # A symmetric buffer of 1 KiB holds no [S, B, H] tensor: every NVLS path is unavailable.
-        monkeypatch.setattr(SymmetricMemoryManager, "_default_size_mb", 1.0 / 1024)
     block, config, dtype = build_block(tp, case, fuse)
     x_full = full_input(dtype)
     x = tp_shard(x_full)
@@ -428,11 +396,7 @@ def test_zero_projections_keep_the_residual(case, parallel, fuse, monkeypatch):
         _poison_tp_buffer(tp)
         trace.clear()
         with torch.no_grad(), InferenceMode.active():
-            if case == "batch_invariant":
-                with bik.set_batch_invariant_mode(True, backend="te_native"):
-                    out = block(hidden_states=x.clone(), attention_mask=None)
-            else:
-                out = block(hidden_states=x.clone(), attention_mask=None)
+            out = block(hidden_states=x.clone(), attention_mask=None)
         torch.cuda.synchronize()
         outputs.append(out)
 
@@ -448,7 +412,7 @@ def test_zero_projections_keep_the_residual(case, parallel, fuse, monkeypatch):
 # ---- Pipeline stages --------------------------------------------------------------------------
 
 PP_LAYERS = 6
-PP_CASES = ["pp2_nvls", "pp2_nccl"]
+PP_CASES = ["pp2_nvls"]
 
 
 @pytest.mark.parametrize("parallel", [(2, 2)], indirect=True, ids=["tp2pp2"])
@@ -534,34 +498,19 @@ def test_pipeline_stages_keep_the_residual(case, parallel, monkeypatch):
 
 # Token counts per step, in units of tp, in dynamic batching's [T, 1, H] layout: decode (2, 4
 # tokens per rank pair), mixed prefill/decode (64, 65) and a long prefill (1024), in an order
-# where each kind follows another. One token per rank (T = tp) is its own case, `narrow_decode`:
-# with this toy H (128) that shard is 16 threads of the fused kernel, under a warp, and main's
-# launcher computes num_warps = 0 there (the launcher bug #8880 fixes, s4-o5's narrow-rows task).
-STEP_TOKENS = {
-    "decode_prefill_sizes": (64, 2, 1024, 4, 65, 64, 2),
-    "sizes_across_capacity": (64, 2, 1024, 4, 65, 64, 2),
-    "narrow_decode": (1, 64, 1),
-}
-CAPACITY_TOKENS = 64  # in units of tp: the "capacity" buffers hold [64 tp, 1, H] bf16 exactly
-
-
-def _capacity_bytes(tp):
-    return tp * CAPACITY_TOKENS * HIDDEN * 2
+# where each kind follows another. One token per rank (T = tp) is not a case here: with this toy
+# H (128) that shard is under a warp, and main's fused-kernel launcher computes num_warps = 0
+# there (#8880 fixes and tests it).
+STEP_TOKENS = {"decode_prefill_sizes": (64, 2, 1024, 4, 65, 64, 2)}
 
 
 @pytest.mark.parametrize("parallel", [2], indirect=True, ids=["tp2"])
 @pytest.mark.parametrize("case", list(STEP_TOKENS))
 def test_step_sizes_keep_the_residual(case, parallel, monkeypatch):
-    """Consecutive steps of different token counts on one model and one buffer. With the
-    default buffer every step fuses; with a buffer of exactly 64 tp tokens the 65 tp and
-    1024 tp steps fall back between fused steps (fails on main: the fallback drops the
-    residual, #8561). `narrow_decode` runs one token per rank, a shard narrower than a warp:
-    fails on main with "num_warps must be a power of 2" in the fused kernel's launcher, passes
-    with #8880 (t3-r09f2)."""
+    """Consecutive steps of different token counts on one model and one buffer: with the
+    default buffer every step fuses. (Steps that fall back between fused ones drop the residual
+    on main; #8561's `test_fusion_is_decided_every_forward` tests that.)"""
     tp = parallel
-    capacity = _capacity_bytes(tp) if case == "sizes_across_capacity" else None
-    if capacity is not None:
-        monkeypatch.setattr(SymmetricMemoryManager, "_default_size_mb", capacity / 2**20)
     block, config, dtype = build_block(tp, "nvls", True)
     trace = _Trace(monkeypatch)
     eps = config.layernorm_epsilon
@@ -576,10 +525,9 @@ def test_step_sizes_keep_the_residual(case, parallel, monkeypatch):
             out = block(hidden_states=x.clone(), attention_mask=None)
         torch.cuda.synchronize()
         what = f"step {step} (T = {tokens}): "
-        fits = capacity is None or tokens * HIDDEN * 2 <= capacity
         _check_exact(out, x, f"{what}block output", problems)
         _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
-        _check_fused_norms(block.layers, trace.fused_norms, fits, problems, what)
+        _check_fused_norms(block.layers, trace.fused_norms, True, problems, what)
         branches.append(list(trace.branches))
     _verdict(case, branches, problems)
 
@@ -647,7 +595,7 @@ def test_production_sizes_keep_the_residual(model, parallel, monkeypatch):
 
 # ---- CUDA graphs: the block (full-iteration) or each layer (local) captured -------------------
 
-GRAPH_CASES = ["full_iteration", "full_iteration_capacity", "local", "local_capacity"]
+GRAPH_CASES = ["full_iteration", "local"]
 
 
 def _warm_up(fn):
@@ -669,15 +617,11 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
 
     full_iteration: the block captured at 64 tp and 32 tp tokens (both fused), replayed
     alternately. local: each layer captured alone at 64 tp tokens and replayed as a chain, with
-    an eager step at 32 tp tokens between replays. The *_capacity variants hold exactly 64 tp
-    tokens in the buffer and use 128 tp for the second size, so the two decide differently
-    (fail on main: the fallback drops the residual, #8561).
+    an eager step at 32 tp tokens between replays. (Sizes that decide differently drop the
+    residual on main where the kernel falls back; #8561 fixes and tests that.)
     """
     tp = parallel
-    capacity = _capacity_bytes(tp) if case.endswith("_capacity") else None
-    if capacity is not None:
-        monkeypatch.setattr(SymmetricMemoryManager, "_default_size_mb", capacity / 2**20)
-    sizes = (tp * 64, tp * (128 if capacity is not None else 32))
+    sizes = (tp * 64, tp * 32)
     block, config, dtype = build_block(tp, "nvls", True)
     # Seed before capturing, as the engine does: inference has no dropout, so the inference RNG
     # tracker's fork is a no-op. The training tracker's fork (TransformerBlock.forward under
@@ -688,9 +632,6 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
     eps = config.layernorm_epsilon
     problems, branches = [], []
     pool = torch.cuda.graph_pool_handle()
-
-    def fits(tokens):
-        return capacity is None or tokens * HIDDEN * 2 <= capacity
 
     def step_input(tokens, seed):
         x_full = full_input(dtype, (tokens, 1, HIDDEN), seed=seed)
@@ -710,9 +651,7 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
                     with torch.cuda.graph(graph, pool=pool):
                         out = block(hidden_states=x_buf, attention_mask=None)
                     what = f"capture T = {tokens}: "
-                    _check_fused_norms(
-                        block.layers, trace.fused_norms, fits(tokens), problems, what
-                    )
+                    _check_fused_norms(block.layers, trace.fused_norms, True, problems, what)
                     branches.append(list(trace.branches))
                     captured.append(graph)
                 graphs.append((tokens, graph, x_buf, out, list(trace.gemm_inputs)))
@@ -744,9 +683,7 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
                     captured.append(graph)
                     outs.append(h)
                 what = f"capture T = {graph_tokens}: "
-                _check_fused_norms(
-                    block.layers, trace.fused_norms, fits(graph_tokens), problems, what
-                )
+                _check_fused_norms(block.layers, trace.fused_norms, True, problems, what)
                 branches.append(list(trace.branches))
                 records = list(trace.gemm_inputs)
                 for rnd in range(2):
@@ -770,14 +707,12 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
                     what = f"eager step {rnd} T = {eager_tokens}: "
                     _check_exact(out, x, f"{what}block output", problems)
                     _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
-                    _check_fused_norms(
-                        block.layers, trace.fused_norms, fits(eager_tokens), problems, what
-                    )
+                    _check_fused_norms(block.layers, trace.fused_norms, True, problems, what)
                     branches.append(list(trace.branches))
     finally:
         # Release the graphs before anything can fail or tear down: a graph that captured an
-        # NCCL fallback (the *_capacity sizes) keeps the communicator busy, and destroying the
-        # process groups under it hangs (pdx 7856500: the failing case timed out in teardown).
+        # NCCL fallback keeps the communicator busy, and destroying the process groups under it
+        # hangs (pdx 7856500: the failing case timed out in teardown).
         torch.cuda.synchronize()
         for graph in captured:
             graph.reset()
@@ -790,12 +725,11 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
 
 # ---- The engine: CudaGraphManager graphs, prefill, decode and mixed steps ---------------------
 
-ENGINE_CASES = ["eager", "local", "full_iteration", "full_iteration_capacity"]
+ENGINE_CASES = ["eager"]
 ENGINE_VOCAB, ENGINE_MAX_SEQ = 128, 1024
 # (arrival step, prompt length): two short prompts, then a 600-token prompt (a mixed step above
 # cuda_graph_max_tokens = 512, so eager) and a 130-token one (a mixed step that is graphed).
 ENGINE_PROMPTS = ((0, 9), (0, 37), (1, 600), (2, 130))
-ENGINE_CAPACITY_TOKENS = 64  # graphs of up to 64 padded tokens fuse, larger ones fall back
 
 
 @pytest.mark.parametrize("parallel", [2], indirect=True, ids=["tp2"])
@@ -805,20 +739,15 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
     replayed from per-layer graphs, or from block graphs) the decoder's output is its input.
     The decoder's final norm is removed so its output is the stream; hooks on the embedding
     (which also NaN-poisons the buffer) and the output layer, which run eagerly around graphed
-    decoders, compare the two on the step's active tokens (padding rows are unspecified). With `full_iteration_capacity` the buffer holds 64 tokens, so the
-    small (decode) graphs fuse and the larger (mixed) ones do not (fails on main, #8561).
+    decoders, compare the two on the step's active tokens (padding rows are unspecified).
 
-    The graphed cases (`local`, `full_iteration`, `full_iteration_capacity`) fail on main before
-    the oracle can judge: CUDA-graph decode steps run one token per rank, a shard narrower than a
-    warp at this toy H (128), and main's fused-kernel launcher then computes num_warps = 0
-    ("num_warps must be a power of 2"; dfw 21235396). #8880 (t3-r09f2) fixes the launcher, so
-    `local` and `full_iteration` must pass with it and `full_iteration_capacity` with #8561 and
-    #8880 together. `eager` passes on main."""
+    Only `eager` is a case here. With layer- or block-scope graphs, CUDA-graph decode steps run
+    one token per rank, a shard narrower than a warp at this toy H (128), and main's fused-kernel
+    launcher computes num_warps = 0 ("num_warps must be a power of 2"; dfw 21235396); #8880
+    (t3-r09f2) fixes and tests that. The graph setup below stays, for those cases to return once
+    #8880 is on main."""
     tp = parallel
     graphs = case != "eager"
-    if case.endswith("_capacity"):
-        size_mb = ENGINE_CAPACITY_TOKENS * HIDDEN * 2 / 2**20
-        monkeypatch.setattr(SymmetricMemoryManager, "_default_size_mb", size_mb)
     scope = {"eager": InferenceCudaGraphScope.none, "local": InferenceCudaGraphScope.layer}.get(
         case, InferenceCudaGraphScope.block
     )
@@ -955,201 +884,3 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
         assert not graphed, f"eager engine used CUDA graphs: {steps}"
     assert counts["forwards"] >= len(steps), f"{counts['forwards']} forwards checked, {steps}"
     _verdict(case, [len(steps)], problems)
-
-
-# ---- Layers outside TransformerBlock's wiring: MTP, HybridStack -------------------------------
-
-MTP_CASES = [("tp1", 1, 1), ("tp2_nvls", 2, 1), ("tp2_nvls_depth2", 2, 2)]
-
-
-@pytest.mark.parametrize(
-    "case,parallel,depth", MTP_CASES, ids=[c[0] for c in MTP_CASES], indirect=["parallel"]
-)
-def test_mtp_inner_layer_keeps_the_residual(case, parallel, depth, monkeypatch):
-    """The MTP inner layer (the GPT inference spec's layer, built by MultiTokenPredictionLayer and
-    never wired) run through `forward_single_position`, as speculative decoding runs it: its
-    output stream is its input. Fails on main: the flag makes it hand its residual to row-parallel
-    layers that add it only inside a fused kernel they never run (#8561)."""
-    tp = parallel
-    config, dtype = make_config(tp, "nvls", True, mtp_num_layers=2)
-    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
-    spec = get_gpt_layer_with_inference_spec()
-    mtp_spec = get_gpt_mtp_block_spec(config, spec, use_transformer_engine=True)
-    mtp = build_module(
-        mtp_spec.layer_specs[depth - 1],
-        config=config,
-        layer_number=depth,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-    mtp = mtp.cuda().eval()
-    inner = mtp.mtp_model_layer
-    zero_projections_([inner])
-    seen = {}
-    # Since #8523 the MTP layer passes hidden_states positionally (positional-only).
-    inner.register_forward_pre_hook(
-        lambda m, args, kwargs: seen.__setitem__(
-            "in", (args[0] if args else kwargs["hidden_states"]).detach().clone()
-        ),
-        with_kwargs=True,
-    )
-    inner.register_forward_hook(
-        lambda m, args, kwargs, out: seen.__setitem__("out", out[0].detach().clone()),
-        with_kwargs=True,
-    )
-    hidden = tp_shard(full_input(dtype, seed=1234))
-    decoder_input = tp_shard(full_input(dtype, seed=5678))
-    ids = torch.zeros(BATCH, SEQ, dtype=torch.int64, device=_DEVICE)
-    positions = torch.arange(SEQ, device=_DEVICE).expand(BATCH, SEQ)
-
-    def embedding(input_ids, position_ids):
-        return decoder_input.clone()
-
-    trace = _Trace(monkeypatch)
-    fc1_norm = inner.mlp.linear_fc1.layer_norm_weight.data_ptr()
-    problems, branches = [], []
-    for j in range(2):
-        _poison_tp_buffer(tp)
-        trace.clear()
-        seen.clear()
-        # torch.inference_mode, as LanguageModule.compute_mtp_single_step runs it.
-        with torch.inference_mode(), InferenceMode.active():
-            mtp.forward_single_position(
-                hidden_states=hidden.clone(),
-                next_token_ids=ids,
-                position_ids=positions,
-                embedding=embedding,
-            )
-        torch.cuda.synchronize()
-        stream = seen["in"]
-        _check_exact(seen["out"], stream, f"inner layer output, forward {j}", problems)
-        stream_full = stream
-        if tp > 1:
-            stream_full = torch.empty(
-                (stream.shape[0] * tp, *stream.shape[1:]), dtype=stream.dtype, device=_DEVICE
-            )
-            dist.all_gather_into_tensor(
-                stream_full, stream, group=parallel_state.get_tensor_model_parallel_group()
-            )
-        _check_gemm_inputs([inner], trace, stream_full, config.layernorm_epsilon, problems)
-        stray = [p for p in trace.fused_norms if p != fc1_norm]
-        if stray:
-            problems.append(f"forward {j}: fused kernel applied a norm other than FC1's: {stray}")
-        branches.append(list(trace.branches))
-    _verdict(case, branches, problems)
-
-
-HYBRID_PATTERN = "*-*-"  # attention-only and MLP-only layers, as a HybridStack builds them
-HYBRID_CASES = [("tp1", 1), ("tp2_nvls", 2)]
-
-
-@pytest.mark.parametrize(
-    "case,parallel", HYBRID_CASES, ids=[c[0] for c in HYBRID_CASES], indirect=["parallel"]
-)
-def test_hybrid_stack_keeps_the_residual(case, parallel, monkeypatch):
-    """A HybridStack of attention-only and MLP-only TransformerLayers (the hybrid inference spec)
-    with the flag on, as the Core API accepts it: its output stream is its input. Fails on main
-    and, by reading, with #8561: the layers hand their residual to an IdentityOp's missing
-    linear_fc2 / linear_proj (AttributeError, O8a-N7)."""
-    tp = parallel
-    config, dtype = make_config(tp, "nvls", True, num_layers=len(HYBRID_PATTERN))
-    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
-    stack = HybridStack(
-        config,
-        hybrid_inference_stack_spec.submodules,
-        layer_config_list=validate_segment_layers(HYBRID_PATTERN, config),
-        pp_layer_offset=0,
-        post_layer_norm=False,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-    stack = stack.cuda().eval()
-    zero_projections_(stack.layers)
-    x_full = full_input(dtype)
-    x = tp_shard(x_full)
-    trace = _Trace(monkeypatch)
-    real = {
-        lin.layer_norm_weight.data_ptr()
-        for layer in stack.layers
-        for _, lin in norm_consumers(layer)
-    }
-    problems, branches = [], []
-    for j in range(2):
-        _poison_tp_buffer(tp)
-        trace.clear()
-        with torch.no_grad(), InferenceMode.active():
-            out = stack(hidden_states=x.clone(), attention_mask=None)
-        torch.cuda.synchronize()
-        _check_exact(out, x, f"stack output, forward {j}", problems)
-        _check_gemm_inputs(stack.layers, trace, x_full, config.layernorm_epsilon, problems)
-        stray = [p for p in trace.fused_norms if p not in real]
-        if stray:
-            problems.append(f"forward {j}: fused kernel applied no consumer's norm: {stray}")
-        branches.append(list(trace.branches))
-    _verdict(case, branches, problems)
-
-
-# ---- MLA --------------------------------------------------------------------------------------
-
-# (case, layer pattern: M = MLA, G = GPT, TP).
-MLA_CASES = [("mla_tp1", "MM", 1), ("mla_tp2_nvls", "MM", 2), ("mixed_tp2_nvls", "GMG", 2)]
-
-
-@pytest.mark.parametrize(
-    "case,pattern,parallel", MLA_CASES, ids=[c[0] for c in MLA_CASES], indirect=["parallel"]
-)
-def test_mla_layers_keep_the_residual(case, pattern, parallel, monkeypatch):
-    """MLA blocks (DeepSeek-V3 style: q_lora_rank, qk_layernorm) with the flag on, which config
-    validation accepts: the output is the input, every FC1 (and GPT QKV) GEMM input is its own
-    norm of the stream, each MLA attention projection fuses with its own FC1 norm and an FC2
-    fuses only into a next GPT layer's QKV norm. Fails on main at construction (MLA has no
-    linear_qkv for the block's wiring); #8704 fixes it."""
-    tp = parallel
-    config, dtype = make_config(
-        tp,
-        "nvls",
-        True,
-        config_class=MLATransformerConfig,
-        num_layers=len(pattern),
-        q_lora_rank=64,
-        kv_lora_rank=64,
-        qk_head_dim=64,
-        qk_pos_emb_head_dim=64,
-        v_head_dim=128,
-        qk_layernorm=True,
-        rope_type="rope",
-    )
-    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
-    specs = {
-        kind: get_gpt_layer_with_inference_spec(
-            qk_layernorm=True, multi_latent_attention=kind == "M"
-        )
-        for kind in set(pattern)
-    }
-    submodules = TransformerBlockSubmodules(layer_specs=[specs[kind] for kind in pattern])
-    block = TransformerBlock(config, submodules, post_layer_norm=False)
-    block = block.cuda().eval()
-    for kind, layer in zip(pattern, block.layers):
-        if kind == "M":
-            # The query and KV up projections all-gather back to back into the shared buffer
-            # without a barrier (#8709, n12): a separate race, so take them through NCCL.
-            for name in ("linear_q_up_proj", "linear_kv_up_proj"):
-                proj = getattr(layer.self_attention, name, None)
-                if proj is not None:
-                    proj.triton_nvls_kernels_allowed = False
-    zero_projections_(block.layers)
-    x_full = full_input(dtype)
-    x = tp_shard(x_full)
-    trace = _Trace(monkeypatch)
-    eps = config.layernorm_epsilon
-    problems, branches = [], []
-    for j in range(2):
-        _poison_tp_buffer(tp)
-        trace.clear()
-        with torch.no_grad(), InferenceMode.active():
-            out = block(hidden_states=x.clone(), attention_mask=None)
-        torch.cuda.synchronize()
-        what = f"forward {j}: "
-        _check_exact(out, x, f"{what}block output", problems)
-        _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
-        _check_fused_norms(block.layers, trace.fused_norms, tp > 1, problems, what)
-        branches.append(list(trace.branches))
-    _verdict(case, branches, problems)

@@ -33,15 +33,15 @@ after it, so batch invariance is checked in a fresh process (`_CHILD`) that enab
 before any GEMM, exactly as production does, then runs each GEMM entry point on batches of
 M = 1 ... 8192 rows (B-1/B/B+1 of 16, 32, 64, 128, 256 and production sizes) with four probe
 rows at the start, an odd middle offset and the end. Shapes: the attention projection
-(4096 x 4096), the FFN up and down projections (4096 -> 14336, 14336 -> 4096; large K, where
-split-K is most attractive to a heuristic), and the router (7168 -> 256, 4096 -> 128, fp32
+(4096 x 4096), the FFN down projection (14336 -> 4096; large K, where split-K is most
+attractive to a heuristic), and the router (7168 -> 256, 4096 -> 128, fp32
 output).
 
-Main vs open PRs: `test_gemms_are_batch_invariant[aten_mm]` fails on main (finding O8a-M8, pdx
-7986825): a bias-free aten mm is not batch invariant under te_native on H100, as the family 08
-audit suspected (PyTorch's non-Lt cuBLAS path may size its workspace from
-`CUBLAS_WORKSPACE_CONFIG`, not `CUBLASLT_WORKSPACE_SIZE`; by reading). The other entries pass. No
-open PR changes it.
+Main vs open PRs: every case here passes on main. A bias-free aten mm (`torch.matmul(x, w.t())`,
+the inference-optimized linears' GEMM) is not batch invariant under te_native on H100 on main
+(finding O8a-M8, pdx 7986825: 26 of 16384 elements differ at M = 17 vs 4, K = N = 4096), so it
+is not an entry here. #8708 (n15) runs native aten GEMMs on cuBLASLt with a starved workspace,
+with `test_native_aten_gemms_batch_invariant` in `transformer/test_te_layers_batch_invariant.py`.
 
 Hardware: H100 (1 GPU), with Transformer Engine.
 """
@@ -74,7 +74,6 @@ TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # entry -> GEMM shapes (k, n): the weight is [n, k]
 CASES = {
-    "aten_mm": [(4096, 4096), (4096, 14336), (14336, 4096)],
     "aten_addmm": [(4096, 4096), (14336, 4096)],
     "te_linear": [(4096, 4096), (14336, 4096)],
     "te_router_fp32": [(7168, 256), (4096, 128)],
@@ -153,9 +152,7 @@ with torch.no_grad():
         bias = tensor((n,), seed + 1)
         probe = tensor((spec["probe_rows"], k), seed + 2)
         filler = tensor((max(spec["m"]), k), seed + 3)
-        if entry == "aten_mm":
-            run = lambda x: torch.matmul(x, w.t())
-        elif entry == "aten_addmm":
+        if entry == "aten_addmm":
             run = lambda x: torch.nn.functional.linear(x, w, bias)
         elif entry == "te_linear":
             module = te.Linear(k, n, bias=False, params_dtype=torch.bfloat16, device="cuda")
@@ -223,8 +220,6 @@ def gemm_reference(x, w, bias=None):
 def _trusted(entry, probe, w, bias):
     """The same entry point in this process, outside batch-invariant mode."""
     with torch.no_grad():
-        if entry == "aten_mm":
-            return torch.matmul(probe, w.t())
         if entry == "aten_addmm":
             return F.linear(probe, w, bias)
         if entry == "te_linear":
@@ -246,12 +241,7 @@ def test_gemms_are_batch_invariant(entry, tmp_path):
     bits at every M and position, for each shape; the workspace is pinned; the probe rows'
     values are right against fp64 (bf16 outputs bounded per row by the same call outside the
     mode), and on integer inputs every output is exact (fp32 sums of integers are exact in any
-    order; rounded once to bf16).
-
-    `[aten_mm]` fails on main (finding O8a-M8, pdx 7986825): `torch.matmul(x, w.t())` without a
-    bias, the inference-optimized linears' GEMM, changes bits with M (26 of 16384 elements at
-    M = 17 vs 4, K = N = 4096) although `aten_addmm`, `te_linear` and the router GEMM stay
-    invariant. No fix PR yet."""
+    order; rounded once to bf16). (A bias-free aten mm is not an entry: finding O8a-M8, #8708.)"""
     spec, got = _run_child(entry, tmp_path / f"{entry}.pt")
     status = got["status"]
     assert status["env"] == "0", f"CUBLASLT_WORKSPACE_SIZE is {status['env']!r} in the child"

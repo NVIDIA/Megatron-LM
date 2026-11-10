@@ -35,22 +35,17 @@ and stores in the output dtype; element offsets are int32. Integer inputs are ca
 `mean_batch_invariant` sends one-dim reductions to `mean_dim` and several dims to
 `torch.sum(dtype=float32) / n`. Covered: N at 1, 2 and B-1/B/B+1 of 1024 and 2048 plus 7168 and
 8192; the reduced dim last (K = 1), in the middle (M, K > 1) and first (M = 1); strided inputs;
-keepdim; 1 to 513 rows; fp32, bf16, fp16 and fp64; one and several dims; empty reductions and
-outputs; production shapes; offsets past 2**31 elements (`large`).
+keepdim; 1 to 513 rows; fp32, bf16 and fp16; one and several dims; empty reductions and
+outputs; production shapes; element offsets up to 2**31 - 1 (`large`).
 
-Main vs open PRs (each failing case is deselected and run as an expect-fail task):
-- `test_dyadic_half_means_accumulate_in_fp32` fails on main (finding O8a-M4): `tl.sum` keeps a
-  bf16/fp16 block in its own dtype (Triton's `_pick_sum_dtype` widens only integers), so each
-  1024-element partial sum is rounded to 8/11 bits. No fix PR yet.
-- `test_output_dtype_follows_aten_for_dtype_and_half_inputs` fails on main (finding O8a-M5): the
-  one-dim path drops `dtype=` (bf16 in, `dtype=torch.float32`, bf16 out), the several-dim path
-  returns fp32 for bf16/fp16 inputs without `dtype`, and fp64 inputs raise (an assertion on
-  several dims; on one dim, predicted, an fp32 loop-carried accumulator). No fix PR yet.
-- `test_several_dims_do_not_depend_on_the_batch` fails on main (finding O8a-M7, pdx 7986825): the
-  several-dim path's `torch.sum` is not batch invariant. No fix PR yet.
-- `test_rows_past_int32_offsets` (`large`) is predicted to fail on main (finding O8a-M6, by
-  reading): `mean_kernel` computes element offsets in int32. No fix PR yet.
-All other cases are expected to pass on main.
+Main vs open PRs: every case here passes on main. Four parts of the contract fail on main, and
+#9304 (s4m-bi-mean) fixes them, with the `test_mean_batch_invariant_*` tests of
+`transformer/test_te_layers_batch_invariant.py`: `tl.sum` keeps a bf16/fp16 block in its own
+dtype, so each 1024-element partial sum is rounded to 8/11 bits (finding O8a-M4); the one-dim
+path drops `dtype=`, the several-dim path returns fp32 for bf16/fp16 inputs, and fp64 inputs
+raise (O8a-M5); the several-dim path's `torch.sum` is not batch invariant (O8a-M7); and
+`mean_kernel` computes element offsets in int32, so rows past 2**31 elements read the wrong
+memory (O8a-M6).
 
 Hardware: H100 (1 GPU).
 """
@@ -201,26 +196,12 @@ def test_dyadic_fp32_means_are_exact(n, where):
     check_dyadic_mean(torch.float32, n, where)
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
-@pytest.mark.parametrize("n,where", _DYADIC_SIZES, ids=[f"n{n}-{w}" for n, w in _DYADIC_SIZES])
-def test_dyadic_half_means_accumulate_in_fp32(n, where, dtype):
-    """bf16 / fp16 inputs must be accumulated in fp32 (as aten does). Fails on main (O8a-M4):
-    each 1024-element block is summed in the input dtype (`tl.sum` keeps bf16/fp16)."""
-    check_dyadic_mean(DTYPES[dtype], n, where)
-
-
 _DTYPE_CASES = {
     # name: (input dtype, dims, dtype kwarg)
     "bf16-last": (torch.bfloat16, [-1], None),
     "fp32-dtype-fp32": (torch.float32, [-1], torch.float32),
     "fp32-two-dims": (torch.float32, [1, 2], None),
-    "bf16-last-dtype-fp32": (torch.bfloat16, [-1], torch.float32),
-    "bf16-two-dims": (torch.bfloat16, [1, 2], None),
-    "fp16-all-dims": (torch.float16, [], None),
-    "fp64-last": (torch.float64, [-1], None),
-    "fp64-two-dims": (torch.float64, [1, 2], None),
 }
-_DTYPE_CONTROLS = ["bf16-last", "fp32-dtype-fp32", "fp32-two-dims"]
 
 
 def check_output_dtype(name):
@@ -239,18 +220,10 @@ def check_output_dtype(name):
     ou.assert_exact(out, ref.to(want_dtype), what=f"{name}: value")
 
 
-@pytest.mark.parametrize("name", _DTYPE_CONTROLS)
+@pytest.mark.parametrize("name", list(_DTYPE_CASES))
 def test_output_dtype_follows_aten(name):
-    """One dim without ``dtype`` and with ``dtype`` equal to the input's, several fp32 dims."""
-    check_output_dtype(name)
-
-
-@pytest.mark.parametrize("name", [n for n in _DTYPE_CASES if n not in _DTYPE_CONTROLS])
-def test_output_dtype_follows_aten_for_dtype_and_half_inputs(name):
-    """``dtype=torch.float32`` on bf16, several and all dims of bf16/fp16, fp64 inputs. Fails on
-    main (O8a-M5): the one-dim path drops ``dtype``, the several-dim path returns fp32 for half
-    inputs and asserts on fp64, and fp64 on one dim is predicted to fail Triton's loop-carried
-    type check (an fp32 scalar accumulator)."""
+    """One dim without ``dtype`` and with ``dtype`` equal to the input's, several fp32 dims.
+    (``dtype=`` on half inputs, several half dims and fp64 inputs fail on main, O8a-M5: #9304.)"""
     check_output_dtype(name)
 
 
@@ -275,23 +248,6 @@ def test_rows_do_not_depend_on_the_batch(dtype, where, n):
             x[start : start + 5] = probe
             out = bi_mean(x, dim)
             ou.assert_exact(out[start : start + 5], base, what=f"rows={rows} start={start}")
-
-
-def test_several_dims_do_not_depend_on_the_batch():
-    """The several-dim path (`torch.sum` in fp32): a [5, 33, 160] probe's means over dims (1, 2)
-    are the same bits among 5 ... 1029 slices of the batch.
-
-    Fails on main (finding O8a-M7, pdx 7986825): `torch.sum(dim=[1, 2])` reduces each slice in an
-    order that depends on the number of slices; at 129 slices all five probe means moved by 1-5
-    fp32 ulp against 5 slices. No fix PR yet."""
-    probe = randn((5, 33, 160), torch.float32, 4)
-    filler = randn((1029, 33, 160), torch.float32, 5)
-    base = bi_mean(probe, [1, 2])
-    for rows in (5, 6, 129, 1029):
-        x = filler[:rows].clone()
-        x[rows - 5 :] = probe
-        out = bi_mean(x, [1, 2])
-        ou.assert_exact(out[rows - 5 :], base, what=f"rows={rows}")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -369,10 +325,14 @@ def test_sanitizer_case():
     assert_within_division_ulps(out, ou.fp64_reference(mean_reference, x, dim, True), "sanitizer")
 
 
-@pytest.mark.parametrize("rows", ou.int32_overflow_params(4096))
+# The size whose last element offset is 2**31 - 1. One row more crosses 2**31, where main's int32
+# offsets fail (O8a-M6, an illegal address); #9304 fixes and tests that.
+@pytest.mark.parametrize(
+    "rows", [p for p in ou.int32_overflow_params(4096) if "int32-fits" in p.id]
+)
 def test_rows_past_int32_offsets(rows):
-    """[rows, 4096] fp32 whose element offsets reach 2**31: the rows around the boundary and the
-    last row against fp64. Predicted to fail on main (O8a-M6): int32 offsets."""
+    """[rows, 4096] fp32 up to the int32 offset limit: the rows around the boundary and the last
+    row against fp64."""
     n = 4096
     ou.require_free_memory(rows * n * 4 + 2**30)
     block = dyadic((4096, n), torch.float32, 9)

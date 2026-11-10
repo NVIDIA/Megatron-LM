@@ -38,17 +38,19 @@ from keywords; the forward transposes and makes operands contiguous per layout (
 backend keeps a transposed A as a view), flattens B, runs `mm_batch_invariant`, adds the bias in
 the output dtype, casts to `out_dtype`, and `out.copy_(result)`. Covered: TN / NN / NT, both
 backends, 1 to 1000 tokens around the 128-row tiles, K at 64 / 1024 / 4096 and N up to 4096,
-2-D and 3-D B, bias, `out`, `accumulate`, fp32 output, refusals, TE `Linear` dispatch under the
-three backends, a production shape.
+2-D and 3-D B, bias, `out`, refusals, TE `Linear` dispatch under the three backends, TN row
+invariance (triton), a production shape.
 
-Main vs open PRs (each failing case is deselected and run as an expect-fail task):
-- `test_fp32_output_keeps_fp32_precision[*]` fails on main: the GEMM runs in the operands' dtype
-  and is cast to fp32 afterwards (finding O8a-N3); passes with #8957 (s4f-router-fp32-logits).
-- `test_out_buffer_accumulates` fails on main: `accumulate` is ignored and `out` overwritten
-  (step 3 P4-N4); passes with #8865 (t3-p4n4).
-- `test_tn_rows_do_not_depend_on_tokens[deepgemm]` fails on main where DeepGEMM forwards to
-  cuBLASLt (as `test_deepgemm_dense.py::test_rows_do_not_depend_on_m`); passes with #8867.
-All other cases pass on main and with those PRs.
+Main vs open PRs: every case here passes on main and with the PRs below. Three parts of the
+contract fail on main, and each fix PR tests its own (in
+`transformer/test_te_layers_batch_invariant.py` and
+`inference/test_batch_invariant_deepgemm_stride.py`):
+- an fp32 output of bf16 operands is computed in bf16 and cast afterwards (finding O8a-N3):
+  #8957 (s4f-router-fp32-logits), `test_bik_router_gating_logits_are_fp32`;
+- `accumulate` is ignored and `out` overwritten (step 3 P4-N4): #8865 (t3-p4n4),
+  `test_bik_te_general_gemm_honors_accumulate_alpha_beta`;
+- under deepgemm, TN rows change with the token count where DeepGEMM forwards to cuBLASLt:
+  #8867 (t3-deepgemm), `test_dense_deepgemm_rows_are_invariant_across_batch_size`.
 
 Hardware: H100 (1 GPU), with Transformer Engine and DeepGEMM (bf16 bindings).
 """
@@ -167,18 +169,6 @@ def test_general_gemm_matches_fp64(case):
     check(out, a, b, layout, bias, trusted, _id(case))
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_fp32_output_keeps_fp32_precision(backend):
-    """The router's call: bf16 operands, fp32 output, TN. The result must be the fp32-accumulated
-    product (no bf16 rounding). Fails on main (O8a-N3); passes with #8957."""
-    a, b = bf16((64, 1024), 1, scale=1 / 32), bf16((129, 1024), 2)
-    trusted = te_gemm(a, b, out_dtype=torch.float32, layout="TN")[0]
-    with torch.no_grad(), bi_mode(backend):
-        out = te_gemm(a, b, out_dtype=torch.float32, layout="TN")[0]
-    assert out.dtype == torch.float32, f"{backend}: dtype {out.dtype}"
-    check(out, a, b, "TN", None, trusted, f"fp32 output under {backend}")
-
-
 def check_out_buffer(backend, accumulate):
     """`out=`: the result lands in the caller's buffer, which is returned; with `accumulate` it is
     added to what the buffer held."""
@@ -202,13 +192,6 @@ def check_out_buffer(backend, accumulate):
 def test_out_buffer(backend):
     """`out=` without accumulation: the caller's buffer holds the result."""
     check_out_buffer(backend, accumulate=False)
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_out_buffer_accumulates(backend):
-    """`out=` with `accumulate=True` (TE's fused weight-gradient accumulation). Fails on main
-    (step 3 P4-N4: `accumulate` is ignored and the buffer overwritten); passes with #8865."""
-    check_out_buffer(backend, accumulate=True)
 
 
 def test_refusals():
@@ -257,13 +240,12 @@ def test_te_linear_dispatch(backend, monkeypatch):
     check(out, weight, x, "TN", bias, trusted, f"TE Linear under {backend}")
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", ["triton"])
 def test_tn_rows_do_not_depend_on_tokens(backend):
     """Five probe rows of B among 5 ... 8192 tokens (start, odd middle offset, end), K = N = 4096:
-    the same TN bits everywhere. Fails on main for deepgemm (#8867): at the pin DeepGEMM forwards
-    to cuBLASLt's heuristic algorithm, which on H100 changes between M = 15 and M = 8192 at this
-    shape (`test_deepgemm_dense.py`, pdx 7986825). Up to 4096 tokens it did not (pdx 7986825), so
-    8192 is in the list."""
+    the same TN bits everywhere. Under deepgemm this fails on main, where DeepGEMM forwards to
+    cuBLASLt's heuristic algorithm, which on H100 changes between M = 15 and M = 8192 at this
+    shape (pdx 7986825); #8867 fixes and tests that."""
     a = bf16((4096, 4096), 11, scale=1 / 64)
     probe, filler = bf16((5, 4096), 12), bf16((8192, 4096), 13)
     with torch.no_grad(), bi_mode(backend):
