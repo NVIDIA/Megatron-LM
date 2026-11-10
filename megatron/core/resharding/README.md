@@ -362,11 +362,15 @@ attribute with the following groups:
 |-------|----------|---------|
 | `tp` | Yes | Tensor parallelism sharding |
 | `dp` | Yes (on the source, a missing `dp` is filled from `parallel_state` with a `ProcessGroupFallbackWarning`; deprecated in 0.21, removed in 0.23) | Data parallelism routing |
-| `pp` | If PP > 1 | Pipeline stage / layer index remapping |
+| `pp` | Yes (may be `None` if PP = 1) | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
 | `gtp_remat` | If dense GTP | Dense weight-rematerialization shards |
 | `expt_gtp_remat` | If expert GTP | Expert weight-rematerialization shards |
+
+`tp`, `pp` and `dp` must be set on the collection: apart from the source
+`dp` fill above, a field that is not set raises `ValueError`. Set `tp` or `pp`
+to `None` when that axis is off; `dp` must be a process group.
 
 ## File Reference
 
