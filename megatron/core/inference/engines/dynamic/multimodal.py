@@ -226,10 +226,15 @@ class MultimodalRequestMixin:
             mask = request.image_token_mask.to(device=request.prompt_tokens.device)
             generated_suffix_length = len(request.prompt_tokens) - len(mask)
             if generated_suffix_length < 0:
-                raise RuntimeError(
-                    f"Preserved media mask for request {request.request_id} is longer than "
-                    "its checkpointed prompt."
-                )
+                # A refresh extends the mask over a checkpoint's generated tokens, and a
+                # stop sequence spanning that checkpoint later trims some of them from the
+                # end of the prompt. Their mask entries are text entries; drop them.
+                if bool((mask[len(request.prompt_tokens) :] >= 0).any()):
+                    raise RuntimeError(
+                        f"Preserved media mask for request {request.request_id} is longer "
+                        "than its checkpointed prompt and covers media past its end."
+                    )
+                mask = mask[: len(request.prompt_tokens)]
             if generated_suffix_length > 0:
                 # Mask out the previously generated tokens as invalid for media embeddings.
                 # This will extend our checkpointed mask for future turns as well.
