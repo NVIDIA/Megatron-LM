@@ -62,7 +62,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.resharding import prepare_swap_model_weights, swap_model_weights
 from megatron.core.tokenizers import MegatronTokenizer
@@ -2545,25 +2545,32 @@ def get_training_data_parallel_group(pg_collection: ProcessGroupCollection):
 
     This is ``dp_gtp_remat``, which holds every rank that reads distinct data. A collection
     that predates the GTP weight-remat fields carries only the replicate group ``dp``; without
-    a GTP weight-remat axis that is the same group.
+    a GTP weight-remat axis that is the same group. The axis is the collection's ``gtp_remat``.
+    For a collection that does not set ``gtp_remat``, the model's layers take the axis from the
+    global parallel state (``resolve_gtp_remat_group``, a deprecated fallback), and so does
+    this function.
 
     Args:
         pg_collection: Process groups of the model being trained.
 
     Raises:
-        ValueError: ``pg_collection`` sets neither group, or sets only ``dp`` while its
-            ``gtp_remat`` group holds more than one rank, so that ``dp`` misses ranks that read
+        ValueError: ``pg_collection`` sets neither group, or sets only ``dp`` while the GTP
+            weight-remat axis holds more than one rank, so that ``dp`` misses ranks that read
             distinct data.
     """
     group = pg_collection.dp_gtp_remat
     if group is not None:
         return group
-    if pg_collection.dp is None or get_pg_size(pg_collection.gtp_remat) > 1:
-        raise ValueError(
-            "RL training requires the trained model's pg_collection to set dp_gtp_remat, or "
-            "dp without GTP weight remat"
+    if pg_collection.dp is not None:
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert=False, owner="get_training_data_parallel_group"
         )
-    return pg_collection.dp
+        if get_pg_size(gtp_remat_group) == 1:
+            return pg_collection.dp
+    raise ValueError(
+        "RL training requires the trained model's pg_collection to set dp_gtp_remat, or dp "
+        "without GTP weight remat"
+    )
 
 
 def prepare_data_for_update(

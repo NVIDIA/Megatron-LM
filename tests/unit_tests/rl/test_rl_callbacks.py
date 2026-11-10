@@ -53,10 +53,10 @@ def env(monkeypatch):
 
 
 def test_data_parallel_group_of_a_collection_without_dp_gtp_remat():
-    """A collection that predates the GTP weight-remat fields carries only dp, and the bins
-    are spread over it."""
+    """A collection without a GTP weight-remat axis may carry only dp, and the bins are
+    spread over it."""
     dp_group = FakeGroup(3)
-    model = [SimpleNamespace(pg_collection=ProcessGroupCollection(dp=dp_group))]
+    model = [SimpleNamespace(pg_collection=ProcessGroupCollection(dp=dp_group, gtp_remat=None))]
     assert rl_callbacks._data_parallel_group(model) is dp_group
 
 

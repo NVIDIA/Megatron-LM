@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -37,7 +37,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -1690,20 +1690,36 @@ class TestRLUtils:
 
     def test_get_training_data_parallel_group(self, monkeypatch):
         """The rollouts are spread over dp_gtp_remat. A collection that predates the GTP
-        weight-remat fields carries only dp, which is the same group unless gtp_remat holds
-        more than one rank. A collection with neither group is rejected."""
+        weight-remat fields carries only dp, which serves when there is no GTP weight-remat
+        axis: in the collection's gtp_remat or, for a collection that does not set it, in the
+        global parallel state, where the model's layers then look. A collection without a
+        data-parallel group is rejected."""
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
         dp, dp_gtp_remat = SimpleNamespace(size=lambda: 2), SimpleNamespace(size=lambda: 4)
         gtp_remat = SimpleNamespace(size=lambda: 2)
         select = rl_utils.get_training_data_parallel_group
 
+        def rejected():
+            return pytest.raises(ValueError, match="pg_collection to set dp_gtp_remat")
+
+        # A collection that sets gtp_remat does not look at the global parallel state.
+        monkeypatch.setattr(
+            parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: gtp_remat
+        )
         full = ProcessGroupCollection(dp=dp, dp_gtp_remat=dp_gtp_remat, gtp_remat=gtp_remat)
         assert select(full) is dp_gtp_remat
-        assert select(ProcessGroupCollection(dp=dp)) is dp
-        assert select(ProcessGroupCollection(dp=dp, dp_gtp_remat=None, gtp_remat=None)) is dp
-        for groups in ({"dp": dp, "gtp_remat": gtp_remat}, {"dp": None}, {"cp": dp}):
-            with pytest.raises(ValueError, match="pg_collection to set dp_gtp_remat"):
+        assert select(ProcessGroupCollection(dp=dp, gtp_remat=None)) is dp
+        for groups in ({"dp": dp, "gtp_remat": gtp_remat}, {"dp": None, "gtp_remat": None}):
+            with rejected():
                 select(ProcessGroupCollection(**groups))
+
+        # A collection that does not set gtp_remat has the axis of the global parallel state.
+        with pytest.warns(ProcessGroupFallbackWarning, match="pg_collection.gtp_remat"):
+            with rejected():
+                select(ProcessGroupCollection(dp=dp))
+        monkeypatch.setattr(parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: None)
+        assert select(ProcessGroupCollection(dp=dp)) is dp
 
     @pytest.mark.skipif(
         Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
