@@ -12,9 +12,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.ops.loss import cross_entropy
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.core.tensor_parallel import cross_entropy
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
