@@ -85,7 +85,6 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     assert run_config.rng.te_rng_tracker
 
 
-@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
 @pytest.mark.parametrize(
     "optimizer, use_distributed_optimizer, use_layer_wise_distributed_optimizer",
     [
@@ -99,18 +98,11 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
 def test_finalization_resolves_layer_wise_ddp_flag(
     monkeypatch,
     run_config,
-    use_layer_wise_param_layout,
     optimizer,
     use_distributed_optimizer,
     use_layer_wise_distributed_optimizer,
 ):
-    monkeypatch.setattr(
-        global_vars,
-        "_GLOBAL_ARGS",
-        SimpleNamespace(
-            batch_parallel_size=1, use_layer_wise_param_layout=use_layer_wise_param_layout
-        ),
-    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     run_config.train.micro_batch_size = 1
     run_config.optimizer.optimizer = optimizer
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
@@ -122,8 +114,8 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     layer_wise = optimizer in ("muon", "dist_muon")
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
     assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
-    # Layout-enabled wrapping opts back into DistOpt buffers later; finalization
-    # must preserve the legacy baseline for either layout setting.
+    # Wrapping DDP with the LayerWise layout opts back into DistOpt buffers later;
+    # finalization leaves the flag off.
     assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
 
 

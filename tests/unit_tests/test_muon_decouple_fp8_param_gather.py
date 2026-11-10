@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Bitwise ON-vs-OFF check for muon + ``--fp8-param-gather`` on the DECOUPLED
-compact LayerWise layout (the default; ``--use-layer-wise-param-layout`` opts into
-the padded layout).
+compact LayerWise layout (``--second-order-optimizer-grad-collective all-reduce``; the padded
+layout is the default).
 
 Construction mirrors tests/unit_tests/test_muon_mxfp8_fp8_param_gather.py
 (PR #4987), but on the decouple path — the route where FP8 param-gather is
@@ -236,8 +236,8 @@ class TestMuonDecoupleFP8ParamGather:
         args.exp_avg_dtype = 'fp32'
         args.exp_avg_sq_dtype = 'fp32'
         args.use_distributed_optimizer = True
-        # DECOUPLED compact LayerWise layout (the supported FP8 param-gather route).
-        args.use_layer_wise_param_layout = False
+        # Compact LayerWise layout (whole-param FP8 gathers from the owners' masters).
+        args.second_order_optimizer_grad_collective = 'all-reduce'
         # --overlap-param-gather requires --overlap-grad-reduce (arguments.py); co-enable.
         args.overlap_param_gather = overlap
         args.overlap_grad_reduce = overlap
@@ -920,7 +920,7 @@ class TestMuonDecoupleFP8ParamGather:
         Under chunked optimizer-state offload, train_step has by then force-synced the
         LayerWise (Muon) bucket groups and moved their fp32 masters to CPU, so a second
         dispatch would stage the fp8 weights from CPU-bound masters (rejected by
-        ``fp8_utils._stage_param_to_bf16``) or gather stale weights. The PP=1 tests above
+        ``param_and_grad_buffer._layerwise_gather_sources``) or gather stale weights. The PP=1 tests above
         never reach this entry point; this one runs PP=2, VP=2, DP=world/2: the offload run
         must match the plain aligned-VPP run bitwise, and the aligned entry point must
         actually have met force-synced LayerWise groups.

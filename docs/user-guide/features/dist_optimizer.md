@@ -59,3 +59,35 @@ The following figures show the sharding scheme and the main steps of the paramet
 - Call all-gather on each DP rank.
 - The parameter buffer now contains all 16 updated `bf16` model parameter elements. Parameters in PyTorch modules already point to the correct views in this buffer, so forward passes can start after the all-gather completes.
 - At this point, you can zero the gradient buffer for the next iteration.
+
+## Layer-Wise Distributed Optimizer
+
+Second-order optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
+
+`--second-order-optimizer-grad-collective` selects how the gradients of these matrices are reduced across data-parallel ranks, and with it how the matrices are laid out:
+
+| `--second-order-optimizer-grad-collective` | Parameter gather | Buffers |
+| ------ | ------ | ------ |
+| `reduce-scatter` (default) | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
+| `all-reduce` | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. Twice the gradient traffic. |
+
+Both store the same optimizer state, so a `torch_dist` checkpoint saved with one collective loads with the other. The other parameters always use reduce-scatter. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
+
+With `--fp8-param-gather`, both collectives gather quantized parameters as BF16 values staged from the FP32 masters and requantize them on every rank. `reduce-scatter` stages them through the gradient buffer for its fixed-size all-gather and supports only MXFP8; use `all-reduce` for blockwise FP8 parameters.
+
+### Migrating from the boolean layout flags
+
+`--second-order-optimizer-grad-collective` replaces the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags:
+
+- Runs on the compact layout pass `--second-order-optimizer-grad-collective all-reduce`. It has been the default since July 2026, and `--no-use-layer-wise-param-layout` has selected it since October 2026.
+- Runs on the padded layout, the default in June 2026 and selected by `--use-layer-wise-param-layout` since July 2026, get it from the new default, `reduce-scatter`.
+
+The `torch_dist` checkpoints of both layouts load, optimizer state included.
+
+### Checkpoints of the removed legacy layout
+
+The legacy layout kept the Adam-managed parameters inside the layer-wise optimizer. It was the only layout before the layer-wise optimizer gained its sibling distributed optimizer in June 2026, and `--no-use-layer-wise-param-layout` selected it until July 2026. Its checkpoints store their optimizer state in a format that the current layouts do not read. Loading the optimizer state of such a checkpoint fails with a `KeyError` naming a `chained_*.optimizer.distributed.*` key.
+
+- To start a new run from such a checkpoint, such as fine-tuning, load only the model weights with `--no-load-optim`. The optimizer state starts fresh.
+- To resume an interrupted run, keep using the Megatron-LM version that wrote the checkpoint.
+- To carry the optimizer state over, convert the checkpoint yourself: the Muon state uses the same keys in every layout, and only the state of the Adam-managed parameters differs. Otherwise, open an issue describing the use case.

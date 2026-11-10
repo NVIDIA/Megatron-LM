@@ -83,10 +83,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.layer_wise_optimizer import (
-    LayerWiseDistributedOptimizer,
-    tag_params_for_buffer_routing,
-)
+from megatron.core.optimizer.layer_wise_optimizer import configure_ddp_for_layer_wise_optimizer
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -3792,6 +3789,7 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
+    second_order_optimizer_grad_collective="reduce-scatter",
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -3802,19 +3800,16 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True``: forces
-    ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed for reduce-scatter)
-    and computes per-chunk layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. That method picks the
-    padded shard-aligned LayerWise layout or the compact decoupled layout per
-    ``ddp_config.use_layer_wise_param_layout`` (True → padded, False → compact, with LayerWise
-    buffers treated as non-DistOpt and synced via legacy ``allgather_params``).
+    For standard DDP, :func:`configure_ddp_for_layer_wise_optimizer` decides the layout
+    (mutating ``ddp_config`` in place):
 
-    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
-    computes per-chunk byte-level layouts via
-    :meth:`DistributedOptimizer.compute_full_param_layout`.
-
-    Otherwise: no layouts are computed.
+    - ``use_layer_wise_distributed_optimizer=True`` forces
+      ``ddp_config.use_distributed_optimizer=True`` and computes per-chunk layouts via
+      :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout` for
+      ``second_order_optimizer_grad_collective``.
+    - Non-layerwise with ``ddp_config.use_distributed_optimizer=True`` computes per-chunk
+      byte-level layouts via :meth:`DistributedOptimizer.compute_full_param_layout`.
+    - Otherwise no layouts are computed.
 
     Layouts are only computed when ``DP is DDP`` (i.e. the standard
     ``DistributedDataParallel``); FSDP variants don't accept
@@ -3824,9 +3819,10 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True``. Its ``use_layer_wise_param_layout``
-            field selects the padded vs compact decoupled LayerWise layout (default).
+            ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        second_order_optimizer_grad_collective: See
+            ``OptimizerConfig.second_order_optimizer_grad_collective``.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -3849,23 +3845,12 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer:
-            # LayerWise (Muon) optimizer. Force use_distributed_optimizer=True so sibling
-            # non-LayerWise buffers (embeddings, biases, layernorm) shard with the byte-level
-            # DistributedOptimizer layout, and tag params so DDP buffer grouping routes
-            # LayerWise-managed matrices (Muon's Newton-Schulz domain) to a separate buffer.
-            # The padded-vs-compact LayerWise layout decision is made inside
-            # compute_full_param_layout / _ParamAndGradBuffer from use_layer_wise_param_layout:
-            # by default (compact) LayerWise buffers get the no-padding layout and the per-buffer
-            # override flips use_distributed_optimizer off for them; with
-            # --use-layer-wise-param-layout they stay on the padded DistOpt layout.
-            ddp_config.use_distributed_optimizer = True
-            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            tag_params_for_buffer_routing(model_chunks)
-        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
-            compute_layout = DistributedOptimizer.compute_full_param_layout
-        else:
-            compute_layout = None
+        compute_layout = configure_ddp_for_layer_wise_optimizer(
+            model_chunks,
+            ddp_config,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
+        )
         if compute_layout is not None:
             layout_pgs = (
                 pg_collection
@@ -4217,6 +4202,9 @@ def get_model(
                 config,
                 ddp_config,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+                second_order_optimizer_grad_collective=(
+                    cfg.optimizer.second_order_optimizer_grad_collective
+                ),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -4380,6 +4368,9 @@ def setup_model_and_optimizer(
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+                second_order_optimizer_grad_collective=(
+                    cfg.optimizer.second_order_optimizer_grad_collective
+                ),
             )
         else:
             assert (
@@ -4840,10 +4831,13 @@ def train_step(
         chunked_optimizer_state_offload
         and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
     )
-    delay_master_offload_for_param_buffer = (
-        chunked_optimizer_state_offload
-        and args.reuse_grad_buf_for_mxfp8_param_ag
-        and args.overlap_param_gather
+    # The MXFP8 param-buffer staging of a DistributedOptimizer reads its masters after the grad
+    # buffers are zeroed; follow each optimizer's own DDP config, like that staging does.
+    delay_master_offload_for_param_buffer = chunked_optimizer_state_offload and any(
+        isinstance(optim_instance, DistributedOptimizer)
+        and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        and optim_instance.ddp_config.overlap_param_gather
+        for optim_instance in getattr(optimizer, 'chained_optimizers', [optimizer])
     )
     if chunked_optimizer_state_offload:
         # Prefetch masters and the first state chunk as late as possible so H2D overlaps
@@ -4911,6 +4905,7 @@ def train_step(
     save_dgrads_in_this_iteration = (
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
+
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Sequence statistics are attempt-scoped: a retried forward/backward replaces, not
         # adds to, the statistics of the superseded attempt, and nothing accumulated outside

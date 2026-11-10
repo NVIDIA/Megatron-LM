@@ -229,7 +229,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         ddp_config=ddp_config,
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
+        second_order_optimizer_grad_collective="all-reduce",
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
@@ -241,7 +241,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         ddp_config=ddp_config,
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
+        second_order_optimizer_grad_collective="all-reduce",
     )
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
@@ -287,24 +287,6 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
         builder.build_distributed_models(
             mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
         )
-
-
-def test_builder_rejects_padded_layer_wise_param_layout_request(mocker):
-    """MIMO DDP configs keep the compact LayerWise layout, so a padded request is rejected."""
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
-
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
-    wrap = mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
-
-    with pytest.raises(ValueError, match="compact LayerWise param layout"):
-        builder.build_distributed_models(
-            mocker.Mock(),
-            ddp_config=DistributedDataParallelConfig(),
-            use_layer_wise_distributed_optimizer=True,
-            use_layer_wise_param_layout=True,
-        )
-
-    wrap.assert_not_called()
 
 
 def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):

@@ -768,7 +768,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. The opt-in "
+        "per-head split-QKV Muon update (batched Newton-Schulz per head width) is replayed in "
+        "test_optimizer_kernels.py.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -787,13 +789,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
+            "tests/unit_tests/test_layer_wise_optimizer.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. The LayerWise "
+        "all-reduce grad collective (all-reduced LayerWise buckets next to reduce-scattered "
+        "DistOpt buckets, uneven whole-param gathers with overlap) is replayed bit-exactly over "
+        "three training steps.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -984,7 +990,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). The whole-param BF16 -> MXFP8 / "
+        "blockwise requantization of LayerWise gathers is replayed in test_optimizer_kernels.py "
+        "(blockwise on Hopper, MXFP8 on Blackwell).",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",

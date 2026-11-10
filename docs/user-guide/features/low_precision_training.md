@@ -116,14 +116,13 @@ Minimum config:
 ```bash
 --fp8-format e4m3 \
 --fp8-recipe mxfp8 \
---fp8-param-gather \
---reuse-grad-buf-for-mxfp8-param-ag
+--fp8-param-gather
 ```
 
-`--reuse-grad-buf-for-mxfp8-param-ag` reuses the gradient buffer for the
-parameter all-gather and is strongly recommended whenever you combine `mxfp8`
-with `--fp8-param-gather` — Megatron will warn otherwise (see
-[`OptimizerConfig`](../../../megatron/core/optimizer/optimizer_config.py)).
+With `--fp8-param-gather`, MXFP8 parameters are all-gathered through the
+gradient buffer, which saves the memory of a separate parameter buffer. This is
+automatic; the former `--reuse-grad-buf-for-mxfp8-param-ag` flag is deprecated
+and ignored.
 
 Optional: `--keep-fp8-transpose-cache` keeps the row-wise / column-wise FP8
 data on the device to avoid recomputation under fine-grained activation
@@ -211,8 +210,9 @@ Once a recipe is stable, the following options reduce memory further:
 - **`--fp8-param-gather` / `--fp4-param-gather`** — Keep parameters quantized
   and all-gather them in the quantized dtype. Requires the distributed
   optimizer, Torch FSDP2, Megatron-FSDP, or inference mode.
-- **`--reuse-grad-buf-for-mxfp8-param-ag`** — Required companion for
-  `mxfp8 + --fp8-param-gather` (see above).
+- **`--reuse-grad-buf-for-mxfp8-param-ag`** — Deprecated and ignored; MXFP8
+  parameters are all-gathered through the gradient buffer automatically (see
+  above).
 - **`--keep-fp8-transpose-cache`** — Trades memory for compute by avoiding
   recomputation of the FP8 transpose under fine-grained activation
   offloading. See
@@ -248,7 +248,6 @@ Use `delayed` instead of `tensorwise` if you also need optimizer CPU offload.
 --fp8-format e4m3 \
 --fp8-recipe mxfp8 \
 --fp8-param-gather \
---reuse-grad-buf-for-mxfp8-param-ag \
 --use-distributed-optimizer
 ```
 
@@ -334,9 +333,8 @@ distributed optimizer, Torch FSDP2, Megatron-FSDP, or inference mode.
   optimizer CPU offload (requires `--fp8-recipe delayed`).
 - **`--fp8-param-gather` rejected at startup** — Add
   `--use-distributed-optimizer` (or run with Torch FSDP2 / Megatron-FSDP).
-- **MXFP8 + param-gather warning** — Add
-  `--reuse-grad-buf-for-mxfp8-param-ag`; this is the supported MXFP8
-  param-gather path.
+- **MXFP8 memory warning** — Add `--fp8-param-gather`; MXFP8 parameters are
+  then all-gathered through the gradient buffer.
 - **`--fp4-format requires Transformer Engine >= 2.7.0.dev0`** — Upgrade TE or
   fall back to an FP8 recipe.
 - **MXFP8 + inference CUDA Graph errors** — `--inference-cuda-graph-scope=block`

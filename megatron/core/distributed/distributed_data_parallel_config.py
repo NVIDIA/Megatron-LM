@@ -35,21 +35,9 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
-    disable_grad_buffers_cpu_backup: bool = False
-    """If true, allocate DDP gradient buffers in a torch_memory_saver region without CPU backup."""
-
-    disable_param_buffers_cpu_backup: bool = False
-    """If true, allocate DDP parameter buffers in a torch_memory_saver region without CPU backup."""
-
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
-    """
-
-    use_layer_wise_param_layout: bool = False
-    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
-       the shard-aligned padded LayerWise param layout. When False (default), the compact
-       decoupled layout is selected instead.
     """
 
     check_for_nan_in_grad: bool = False
@@ -101,7 +89,8 @@ class DistributedDataParallelConfig:
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True: MXFP8 params
+       cannot be mapped into the param buffer. The training CLI sets it automatically."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -172,6 +161,16 @@ class DistributedDataParallelConfig:
     pool so that it can be deregistered, released, recreated, and registered
     again without disturbing persistent parameter storage.
     """
+
+    disable_grad_buffers_cpu_backup: bool = False
+    """If true, allocate the gradient buffers in a torch_memory_saver region without CPU backup,
+    so that pausing that memory (e.g. between RL phases) drops their content instead of copying
+    it to host memory. Ignored, with a warning, when torch_memory_saver is not installed. Not
+    supported with ``nccl_ub``."""
+
+    disable_param_buffers_cpu_backup: bool = False
+    """Like ``disable_grad_buffers_cpu_backup``, for the parameter buffers of the distributed
+    optimizer. A buffer that MXFP8 parameters share with gradients needs both flags equal."""
 
     fsdp_double_buffer: bool = False
     """If true, enable persistent communication-buffer pools for Megatron FSDP.
@@ -344,14 +343,18 @@ class DistributedDataParallelConfig:
 
         - No gather is needed because every DP rank runs the same optimizer update.
         - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens when ``use_layer_wise_param_layout=False``, parameter-gather overlap is disabled,
-          and MXFP8 grad-buffer reuse is disabled. Each rank updates only its assigned parameters,
-          then the optimizer calls ``allgather_params()`` synchronously after the step.
+          happens for the compact layout (``second_order_optimizer_grad_collective="all-reduce"``)
+          when parameter-gather overlap and MXFP8 grad-buffer reuse are disabled. Each rank
+          updates only its assigned parameters, then the optimizer calls ``allgather_params()``
+          synchronously after the step.
+
+        Under the compact layout, DDP evaluates this property on the per-buffer config of the
+        LayerWise buffers, which has ``use_distributed_optimizer=False``.
         """
         if self.use_distributed_optimizer:
             return True
 
-        # When standard DistOpt is disabled, these flags select the legacy LayerWise
+        # Without standard DistOpt (the compact LayerWise buffers), these flags select the
         # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
@@ -402,8 +405,8 @@ class DistributedDataParallelConfig:
 
         if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                "Gradient-buffer offload is incompatible with the MXFP8 parameter all-gather "
+                "(--fp8-param-gather with mxfp8), which stages parameters in gradient storage."
             )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):

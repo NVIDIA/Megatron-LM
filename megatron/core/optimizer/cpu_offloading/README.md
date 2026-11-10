@@ -38,8 +38,9 @@ because a parameter and all of its optimizer state are an atomic bundle. Partial
 prioritizes bundles that actually include a separate master before state-only bundles;
 precision-aware FusedAdam can own a separate master for native FP32 DistributedOptimizer shards
 too.
-Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with compact-layout
-`LayerWiseDistributedOptimizer`; BF16 and FP8 parameter gather are supported. Full-iteration and
+Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with the compact
+`LayerWiseDistributedOptimizer` layout (`--second-order-optimizer-grad-collective all-reduce`); BF16 and FP8
+parameter gather are supported. Full-iteration and
 optimizer CUDA graphs are not supported while the fraction is nonzero. When optimizer state is
 saved, async distributed-checkpoint save is rejected: its background writer can retain references
 to the same pinned CPU buffers that the next optimizer update reuses. Synchronous distributed
@@ -98,8 +99,8 @@ re-dispatched as usual, and explicit `force_sync` / `force_dispatch` keep their 
 groups only (`reset_param_sync_dispatch_state(bucket_groups=...)`), so the pinned LayerWise groups are
 not gathered again from CPU-bound masters. Evaluation and checkpoint synchronization restore offloaded
 masters before forcing a new gather. Muon chunked offload requires the compact LayerWise layout; the
-padded layout (`--use-layer-wise-param-layout`) is rejected by `OptimizerConfig` and by
-`LayerWiseDistributedOptimizer`.
+padded layout (`--second-order-optimizer-grad-collective reduce-scatter`) is rejected by
+`OptimizerConfig` and by `LayerWiseDistributedOptimizer`.
 
 Setting `optimizer_state_offload_fraction` to zero is a full disable even when the feature flag is
 present: no manager, transfer stream, training hook, or checkpoint-format restriction is installed.

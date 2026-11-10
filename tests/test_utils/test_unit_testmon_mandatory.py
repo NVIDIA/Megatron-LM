@@ -91,7 +91,7 @@ def test_repository_config_is_valid():
         ),
         (
             "megatron/core/optimizer/emerging_optimizers.py",
-            "tests/unit_tests/optimizer/test_muon_sync_qkv_cpu.py",
+            "tests/unit_tests/optimizer/test_muon_qkv_split.py",
         ),
         (
             "megatron/core/fusions/fused_mrope.py",

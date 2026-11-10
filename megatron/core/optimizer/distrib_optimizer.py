@@ -9,7 +9,7 @@ import re
 from collections import ChainMap, defaultdict
 from dataclasses import replace
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
@@ -385,26 +385,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
 
     @classmethod
-    def _filter_gbuf_range_map(
-        cls, gbuf_range_map: Dict, optimizer_params: Set[torch.nn.Parameter]
-    ) -> Dict:
-        """Filter grad-buffer range maps to the params owned by this optimizer instance."""
-        return {
-            dtype: [
-                {
-                    **range_map,
-                    "param_map": {
-                        param: param_range
-                        for param, param_range in range_map["param_map"].items()
-                        if param in optimizer_params
-                    },
-                }
-                for range_map in range_maps
-            ]
-            for dtype, range_maps in gbuf_range_map.items()
-        }
-
-    @classmethod
     def _build_model_param_gbuf_map(
         cls, gbuf_ranges: List[Dict]
     ) -> Dict[torch.nn.Parameter, Tuple]:
@@ -564,7 +544,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
+                        if is_nvfp4tensor(model_param) or cls._is_distopt_quantized_param(
                             model_param
                         ):
                             if hasattr(model_param, 'get_high_precision_init_val'):
@@ -761,11 +741,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Returns:
             FullParamLayout with a PerBufferParamLayout per buffer group.
         """
-        buffer_groups = group_params_for_buffers(
-            params,
-            ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
-        )
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -888,9 +864,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_idx, buffers in self.per_model_buffers.items():
             self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
-        optimizer_params = {
-            param for param_group in self.optimizer.param_groups for param in param_group['params']
-        }
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
@@ -910,9 +883,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(
-                self._filter_gbuf_range_map(self._build_gbuf_range_map(buffer), optimizer_params)
-            )
+            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
@@ -943,20 +914,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
-
-        # _build_model_and_main_param_groups() installs each group's params as
-        # [*fp32 shards, *fp32-from-float16 shards], which reorders a group
-        # whenever it mixes fp32 and float16 model params (they live in
-        # different-dtype grad buffers, so the gbuf-iteration order used by
-        # _build_optimizer_group_ranges() interleaves them). Rebuild each
-        # param's group_order to match the installed order; the map is read by
-        # every optimizer-state save/load path via
-        # _get_main_param_and_optimizer_states().
-        for group_index, (model_fp32_params, model_float16_params) in enumerate(
-            zip(self.model_fp32_groups, self.model_float16_groups)
-        ):
-            for group_order, model_param in enumerate([*model_fp32_params, *model_float16_params]):
-                self.model_param_group_index_map[model_param] = (group_index, group_order)
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
@@ -1446,18 +1403,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            # For fp32 model params, main_param is an autograd-tracked view of
-            # the model param (built without detach() in
-            # _build_model_and_main_param_groups), so the in-place copy must
-            # run under no_grad.
-            with torch.no_grad():
-                for key in dst_tensors:
-                    # HDO's scalar step is restored from param_groups.
-                    if isinstance(self.optimizer, HybridDeviceOptimizer) and key == "step":
-                        continue
-                    if not isinstance(tensors[key], torch.Tensor):
-                        continue
-                    dst_tensors[key].copy_(tensors[key])
+            for key in dst_tensors:
+                # HDO's scalar step is restored from param_groups.
+                if isinstance(self.optimizer, HybridDeviceOptimizer) and key == "step":
+                    continue
+                if not isinstance(tensors[key], torch.Tensor):
+                    continue
+                dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -2805,7 +2757,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_dtype_key][key]
+                # Read the source at its checkpoint index; the outputs keep the current one.
+                tensor = state_dict[dtype_to_gbuf_idx[non_fp8_dtype_key]][non_fp8_dtype_key][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
@@ -3182,8 +3135,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
-                        # Quantized params are handled above.
+                    if self._is_distopt_quantized_param(model_param):
+                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
+                    elif is_nvfp4tensor(model_param):
+                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard"
+                        # function.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
@@ -3571,9 +3528,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
                     continue
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
