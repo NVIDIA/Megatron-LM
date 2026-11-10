@@ -8,6 +8,7 @@ one-slot pool). An int32 offset wraps to a wrong address or faults, so the probe
 subprocess. Needs ~4.3 GiB of GPU memory.
 """
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -21,12 +22,16 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 def test_causal_conv1d_update_slot_past_2pow31():
     dim, W = 6144, 4
     S = (2**31) // (dim * (W - 1)) + 8
+    device = int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count()
+    torch.cuda.set_device(device)
     torch.cuda.empty_cache()
     if torch.cuda.mem_get_info()[0] < S * dim * (W - 1) * 2 + (2 << 30):
         pytest.skip("not enough free GPU memory")
     code = f"""
         import torch
         from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+        # A subprocess starts on GPU 0 unless it explicitly selects its rank's device.
+        torch.cuda.set_device({device})
         S, dim, W = {S}, {dim}, {W}
         g = torch.Generator(device="cuda").manual_seed(2)
         big = torch.zeros(S, dim, W - 1, device="cuda", dtype=torch.bfloat16)
