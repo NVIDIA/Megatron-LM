@@ -1086,14 +1086,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="engram_embedding",
         sources=("megatron/core/models/engram/distributed_embedding.py",),
-        tests=("tests/unit_tests/models/engram/test_engram_numerics.py",),
+        tests=(
+            "tests/unit_tests/models/engram/test_engram_numerics.py",
+            "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
+            "tests/unit_tests/models/engram/test_distributed_lookup.py",
+        ),
         kind="torch-op",
         notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
         "sorted segment_reduce backward that writes each touched row once; torch.bincount counts "
         "the integer per-(peer, table) requests of the multi-rank all-to-all. "
         "test_engram_numerics checks the single-rank lookup in both modes against an independent "
         "FP64 F.embedding reference on CPU, and replays the deterministic backward bit-exactly on "
-        "GPU under stream contention. The multi-rank routing has no replay test yet.",
+        "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
+        "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
+        "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
+        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet.",
     ),
     KernelEntry(
         name="dsa_dispatch",

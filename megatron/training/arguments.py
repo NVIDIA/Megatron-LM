@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
+from megatron.core.models.engram.variants import DEEPSEEK_VARIANT_NAME, ENGRAM_VARIANTS
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -67,6 +68,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_tokenizer_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_engram_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -158,6 +160,11 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
                 'YAML model configuration replaces argparse model arguments.'
             )
+        if args.engram_vocab_sizes is not None:
+            raise ValueError(
+                "Engram CLI arguments cannot be combined with --yaml-cfg because "
+                "YAML model configuration replaces argparse model arguments."
+            )
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
@@ -166,6 +173,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+
+    # Engram activation is intentionally derived from table vocabulary configuration rather than
+    # a second boolean switch. TransformerConfig uses this before model construction to permit EP.
+    args.engram_enabled = getattr(args, "engram_vocab_sizes", None) is not None
 
     # Args to enable MSC (opt-in: disabled by default)
     if args.disable_msc_deprecated:
@@ -907,6 +918,22 @@ def validate_args(args, defaults={}):
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
     )
 
+    if getattr(args, "engram_enabled", False):
+        # Checked before the FSDP validation below, whose own prerequisites would otherwise
+        # fail first with an unrelated message.
+        assert not args.use_mup, (
+            "Engram does not support --use-mup: muP learning-rate overrides conflict with the "
+            "Engram embedding learning-rate override."
+        )
+        assert not (
+            args.use_megatron_fsdp or args.use_torch_fsdp2
+        ), "Engram does not support Megatron-FSDP or Torch FSDP2."
+        assert getattr(args, "moe_expert_rank_capacity_factor", None) is None, (
+            "Engram does not support --moe-expert-rank-capacity-factor: its paged-stash runner "
+            "replays the microbatches through plain iterators, which bypass the Engram token "
+            "prefetch."
+        )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -1470,9 +1497,12 @@ def validate_args(args, defaults={}):
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
-        assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
-        assert args.num_experts % args.expert_model_parallel_size == 0, \
-            "Number of experts should be a multiple of expert model parallel_size."
+        # Engram shards its tables over expert parallelism, so EP is useful without experts.
+        assert args.num_experts is not None or getattr(args, "engram_enabled", False), \
+            "num_experts must be non None to use expert model parallelism unless Engram is enabled"
+        if args.num_experts is not None:
+            assert args.num_experts % args.expert_model_parallel_size == 0, \
+                "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -1555,6 +1585,16 @@ def validate_args(args, defaults={}):
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
                 f'must be >= single sequence max length ({args.seq_length})'
             )
+
+    if getattr(args, "engram_enabled", False):
+        # Checked once the scheduler is resolved: --use-varlen-dataset and dynamic CP select one
+        # above. Engram's token prefetch reads microbatches from the plain data iterator, which a
+        # sequence-packing scheduler replaces with its own packed iterator.
+        assert args.sequence_packing_scheduler is None, (
+            "Engram does not support sequence-packing schedulers, including the ones that "
+            "--use-varlen-dataset (without --varlen-sbhd-validation) and dynamic context "
+            "parallelism select."
+        )
 
     if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
         assert args.use_varlen_dataset and args.micro_batch_size == 1, (
@@ -2329,6 +2369,8 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # internal/derived: set in parse_args from --engram-vocab-sizes
+        "engram_enabled",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
         # Parsed manually as a JSON object below.
@@ -3352,6 +3394,106 @@ def _add_moe_args(parser):
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
+
+
+def _add_engram_args(parser):
+    group = parser.add_argument_group(title="engram")
+    group.add_argument(
+        '--engram-vocab-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Global table vocabulary budget for each Engram n-gram order; enables Engram.',
+    )
+    group.add_argument(
+        '--engram-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Selected 1-based global transformer layer IDs.',
+    )
+    group.add_argument(
+        '--engram-max-ngram-order',
+        type=int,
+        default=3,
+        help='Largest n-gram order hashed; every order from 2 up to it gets its own tables.',
+    )
+    group.add_argument(
+        '--engram-num-hash-heads',
+        type=int,
+        default=8,
+        help='Hash heads per n-gram order, each with its own prime-sized table.',
+    )
+    group.add_argument(
+        '--engram-memory-dim',
+        type=int,
+        default=512,
+        help='Retrieved-memory width per n-gram order, split evenly over its hash heads.',
+    )
+    group.add_argument(
+        '--engram-kernel-size',
+        type=int,
+        default=4,
+        help='Kernel size of the depthwise causal short convolution, dilated by the maximum '
+        'n-gram order.',
+    )
+    group.add_argument(
+        '--engram-hash-seed', type=int, default=0, help='Seed of the n-gram hash multipliers.'
+    )
+    group.add_argument(
+        '--engram-pad-token-id',
+        type=int,
+        default=None,
+        help='Token ID padded before the sequence start (deepseek variant).',
+    )
+    group.add_argument(
+        '--engram-tokenizer-map',
+        type=str,
+        default=None,
+        help='Versioned token-ID compression and hash-constant artifact (deepseek variant).',
+    )
+    group.add_argument(
+        '--engram-variant',
+        type=str,
+        choices=sorted(ENGRAM_VARIANTS),
+        default=DEEPSEEK_VARIANT_NAME,
+        help='Hashing/layout variant: deepseek (offline tokenizer map + PCG64 multipliers) or '
+        'qwen (raw token IDs, splitmix64 multipliers, per-head nth-prime tables, EOS-reset '
+        'n-gram windows, fused bias-free projections with zero-centered group norms).',
+    )
+    group.add_argument(
+        '--engram-eos-token-id',
+        type=int,
+        default=None,
+        help='EOS token ID at which qwen-variant n-gram windows reset (document boundary).',
+    )
+    group.add_argument(
+        '--engram-unigram-vocab-size',
+        type=int,
+        default=None,
+        help='HF config.vocab_size bounding the qwen-variant hash multipliers; the padded '
+        'vocabulary must not exceed it.',
+    )
+    group.add_argument(
+        '--engram-embedding-lr-multiplier',
+        type=float,
+        default=5.0,
+        help='Multiplier on the learning rate and minimum learning rate of the Engram tables.',
+    )
+    group.add_argument(
+        '--engram-embedding-weight-decay',
+        type=float,
+        default=0.0,
+        help='Weight decay of the Engram tables.',
+    )
+    group.add_argument(
+        '--engram-freeze-embedding',
+        action='store_true',
+        help='Keep the n-gram hash-embedding tables fixed (no gradient, no optimizer state); '
+        'the dense part of the n-gram memory still trains.',
+    )
+    return parser
+
 
 def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
