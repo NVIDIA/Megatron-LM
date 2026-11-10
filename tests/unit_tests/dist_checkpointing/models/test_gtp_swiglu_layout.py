@@ -49,12 +49,11 @@ def test_gtp_swiglu_checkpoint_layout(tp_size, gtp_size, singleton, dequantized)
     assert all(torch.equal(restored[key], target) for key, target in targets.items())
 
 
-@pytest.mark.parametrize(("local_rows", "pad_length"), [(3, 0), (4, 2)])
-def test_gtp_swiglu_rejects_unsupported_shards(local_rows, pad_length):
+def test_gtp_swiglu_rejects_odd_unpadded_shards():
+    local_rows = 3
     data = torch.arange(local_rows * 4, dtype=torch.float32).reshape(local_rows, 4)
     data.gtp_remat_size = 2
     original = ShardedTensor.from_rank_offsets("fc1", data, (0, 0, 2))
-    original.gtp_pad_length = pad_length
     factory = apply_swiglu_sharded_factory(original, ())
     with pytest.raises(AssertionError):
         factory.build()

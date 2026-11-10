@@ -464,6 +464,10 @@ def apply_swiglu_sharded_factory(
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_group: torch.distributed.ProcessGroup | None = None,
 ):
+    from megatron.core.tensor_parallel.gtp_ckpt_util import physical_gtp_shard
+
+    original_sh_ten = physical_gtp_shard(original_sh_ten)
+
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
