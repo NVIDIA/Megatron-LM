@@ -965,6 +965,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
     KernelEntry(
+        name="duplicated_expert_muon_batching",
+        sources=(
+            "megatron/core/optimizer/muon_expert_batching.py",
+            "megatron/core/optimizer/muon_expert_normalization.py",
+            "megatron/core/optimizer/emerging_optimizers.py",
+        ),
+        tests=(K + "test_expert_muon_batching.py",),
+        kind="dispatch",
+        notes="Batch qualified duplicated-mode expert NS while preserving native per-matrix "
+        "normalization and optimizer updates. Replay is bit-exact within the batched path; "
+        "parity with per-matrix NS uses numerical tolerance.",
+    ),
+    KernelEntry(
         name="muon_newton_schulz_dispatch",
         sources=("megatron/core/optimizer/layer_sharded_muon.py",),
         tests=(
