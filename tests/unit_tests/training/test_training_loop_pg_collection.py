@@ -221,24 +221,31 @@ class TestTrainingLoopPgCollection:
         assert (next(data_iterator, None) is None) == (tp_group.rank() == 0)
 
     @_needs_4_ranks
-    def test_full_dataset_length_reduces_over_the_collection(self, monkeypatch, run_config):
+    @pytest.mark.parametrize("deduplicate_across_cp", [False, True])
+    def test_full_dataset_length_reduces_over_the_collection(
+        self, monkeypatch, run_config, deduplicate_across_cp
+    ):
+        sample_group, cp_sample_group = _subgroup(_pairs()), _subgroup(_strided_pairs())
         pg_collection = ProcessGroupCollection(
-            dp_gtp_remat=_subgroup(_pairs()), mp=_subgroup(_singletons())
+            dp_gtp_remat=sample_group, dp_cp_gtp_remat=cp_sample_group, mp=_subgroup(_singletons())
         )
         rank = torch.distributed.get_rank()
         provider = Mock(
             return_value=(SimpleNamespace(_dataloader=range(rank + 1)), None, None),
             supports_train_full_dataset=True,
         )
-        args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=False)
+        args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=deduplicate_across_cp)
         _forbid_global_reads(monkeypatch, training)
 
         sample_count = training._get_train_full_dataset_sample_count(
             args, provider, pg_collection=pg_collection
         )
 
-        first_rank_of_pair = rank - rank % 2
-        assert sample_count == (first_rank_of_pair + 1) + (first_rank_of_pair + 2)
+        # A dataloader deduplicated across context parallelism is summed over those ranks too.
+        summed_group = cp_sample_group if deduplicate_across_cp else sample_group
+        assert sample_count == sum(
+            peer + 1 for peer in torch.distributed.get_process_group_ranks(summed_group)
+        )
 
     @_needs_4_ranks
     @pytest.mark.parametrize("model_carries_collection", [True, False])
@@ -533,3 +540,34 @@ class TestTrainingLoopPgCollection:
         # Only the last pipeline stage of the collection, half of the ranks, contributes.
         assert stats["packed_sequence/original_samples"] == 2.0 * Utils.world_size / 2
         assert stats["packed_sequence/total_tokens"] == 250.0 * Utils.world_size / 2
+
+
+def test_sample_sum_requires_the_collection_sample_group(monkeypatch):
+    _forbid_global_reads(monkeypatch, training)
+
+    with pytest.raises(ValueError, match="dp_gtp_remat"):
+        training._reduce_sum_across_data_parallel_group(1.0, pg_collection=ProcessGroupCollection())
+
+
+@pytest.mark.parametrize("num_microbatches", [None, 0])
+def test_setup_rejects_a_batch_too_small_for_its_ranks(monkeypatch, run_config, num_microbatches):
+    args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_train_state", TrainState)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "get_model", Mock(return_value=[SimpleNamespace()]))
+    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: num_microbatches)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+    # The check sizes its message from the run config, not from the global grid.
+    _forbid_global_reads(monkeypatch, training)
+
+    with pytest.raises(ValueError, match="too small for"):
+        training.setup_model_and_optimizer(
+            None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
+        )
