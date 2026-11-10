@@ -241,6 +241,284 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
     assert engine._should_run_async_sched_overlap()
 
 
+def test_async_step_admits_kv_imports_while_announcing_decode_only():
+    """While the replicas sharing the MoE collectives agree on each step's phase, a no-overlap
+    step with no admittable prefill still admits completed KV imports: they enter as decode
+    requests, so its forward stays decode-only as announced."""
+    engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    engine.state = EngineState.RUNNING
+    engine.logging_step_interval = 0
+    engine.context.moe_step_phase_is_agreed = True
+    engine.context.step_count = 0
+    engine.context.prefix_cache_lru_clock = 0
+    engine.context.dynamo_helper = None
+    engine.waiting_request_ids = deque()
+    engine._pending_kv_imports.append(
+        SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+    )
+    engine._handoff_completion_notifications[7] = (False, True)
+    engine.controller.async_generate_output_tokens_dynamic_batch = mock.AsyncMock(
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=True, launched=True), output=None
+        )
+    )
+
+    asyncio.run(engine.async_forward())
+
+    kwargs = engine.controller.async_generate_output_tokens_dynamic_batch.await_args.kwargs
+    assert kwargs["run_async_overlap"] is False
+    assert kwargs["admits_prefill"] is False
+    assert kwargs["schedule_waiting_requests"] == engine._admit_pending_kv_imports
+
+
+class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
+    """A real engine, context and controller under the per-step MoE phase agreement.
+
+    The model forward returns zero logits; what is checked is the scheduling. The agreement is
+    turned on in the context with a single-rank communicator (each vote decides), and the tp_ep
+    group is made to span two replicas, so a step that has nothing left to run issues a dummy
+    step. Every launch is checked against the step's vote (the context also raises if a step
+    voted decode-only launches prefill), and each step must admit and launch exactly what it
+    does with the agreement off.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        _reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @classmethod
+    def _run(
+        cls,
+        agreed,
+        prompt_lengths,
+        num_tokens_to_generate=4,
+        refused_chunk_steps=(),
+        dummy_steps=None,
+        **config,
+    ):
+        """Run the prompts to completion, refusing to continue a chunked prefill in the steps
+        `refused_chunk_steps`. Returns the context's state before every step, the hidden-chunk
+        state seen by every idle dummy base step, and every launch as (its step, the step's
+        vote, whether the launch is decode-only). The dummy step of a step that launches no
+        forward is appended to `dummy_steps`, if given, as (its step, the requests the context
+        holds before it, its forward's rows, the requests the context holds after it)."""
+        env = cls._build_test_env(
+            _DynamicEngineTestConfig(
+                num_requests=0,
+                num_tokens_to_generate=num_tokens_to_generate,
+                max_sequence_length=max(prompt_lengths) + num_tokens_to_generate + 4,
+                context_max_requests=4,
+                context_max_tokens=64,
+                num_gap_steps=0,
+                sampling_backend="torch",
+                top_k=1,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                **config,
+            )
+        )
+        engine, context, controller = env.engine, env.engine.context, env.engine.controller
+
+        def zero_logits(inference_input):
+            tokens = inference_input["tokens"].shape[1]
+            return torch.zeros(1, tokens, controller.vocab_size, device="cuda")
+
+        controller.inference_wrapped_model.run_one_forward_step = zero_logits
+        dummy_base_steps = []
+        dummy_base_step = controller._run_dummy_async_sched_base_step
+
+        def record_dummy_base_step():
+            dummy_base_steps.append(context.chunked_prefill_request_id)
+            dummy_base_step()
+
+        controller._run_dummy_async_sched_base_step = record_dummy_base_step
+
+        trace, votes, launches = [], [], []
+        if agreed:
+            context._moe_decode_only_needs_agreement = True
+            context.set_ep_zmq_communicator(SimpleNamespace(sync_all_reduce_max=lambda vote: vote))
+            agree = context.agree_on_moe_decode_only
+            initialize = context.initialize_attention_state
+
+            def record_vote(decode_only):
+                votes.append(decode_only)
+                agree(decode_only)
+
+            def record_launch(**kwargs):
+                result = initialize(**kwargs)
+                if kwargs.get("construct_graph_dimensions") is None:
+                    decode_only = context.batch_dimensions.prefill_req_count == 0
+                    launches.append((len(trace) - 1, votes[-1] if votes else None, decode_only))
+                return result
+
+            context.agree_on_moe_decode_only = record_vote
+            context.initialize_attention_state = record_launch
+        assert context.moe_step_phase_is_agreed == agreed
+
+        if refused_chunk_steps:
+            # As when the continuing chunk gets no KV block or token budget in that step.
+            can_schedule_chunk = engine._can_schedule_chunked_prefill
+            engine._can_schedule_chunked_prefill = lambda req: (
+                len(trace) - 1 not in refused_chunk_steps and can_schedule_chunk(req)
+            )
+
+        if dummy_steps is not None:
+            run_dummy_step = controller._run_dummy_step
+            dummy_block = context.kv_block_allocator.dummy_block_idx
+
+            def held_requests():
+                """The request count, the chunk, and the first request row's KV blocks."""
+                return (
+                    context.total_request_count,
+                    context.chunked_prefill_request_id,
+                    context.request_to_kv_block_ids[0].tolist(),
+                )
+
+            def record_dummy_step():
+                before, forward_rows = held_requests(), []
+                end_dummy_step = context.end_expert_parallel_dummy_step
+
+                def record_end_dummy_step():
+                    # The dummy forward's request count, and whether row 0 is its dummy row.
+                    forward_rows.append(
+                        (
+                            context.total_request_count,
+                            context.request_to_kv_block_ids[0, 0].item() == dummy_block,
+                        )
+                    )
+                    end_dummy_step()
+
+                with mock.patch.object(
+                    context, "end_expert_parallel_dummy_step", record_end_dummy_step
+                ):
+                    run_dummy_step()
+                dummy_steps.append((len(trace) - 1, before, forward_rows, held_requests()))
+
+            controller._run_dummy_step = record_dummy_step
+
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
+        )
+        for request_id, length in enumerate(prompt_lengths):
+            engine.add_request(
+                request_id, (torch.arange(length) % 64 + 1).tolist(), sampling_params
+            )
+
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers."
+            "text_generation_controller.get_moe_dp_replica_count",
+            return_value=2,
+        ):
+            while engine.has_unfinished_requests():
+                trace.append(
+                    (
+                        context.chunked_prefill_request_id,
+                        context.total_request_count,
+                        context.paused_request_count,
+                        context.active_token_count,
+                        context.num_prefill_requests,
+                        len(engine.waiting_request_ids),
+                    )
+                )
+                engine.step_modern()
+                assert len(trace) < 64, "the requests did not finish"
+        return trace, dummy_base_steps, launches
+
+    @staticmethod
+    def _assert_votes_bind(launches):
+        """Each launch follows its step's vote, and a step that voted decode-only launched a
+        decode-only forward."""
+        assert launches and all(vote is not None for _, vote, _ in launches)
+        assert all(decode_only for _, vote, decode_only in launches if vote)
+
+    @torch.inference_mode()
+    def test_long_prompt_chunks_in_consecutive_steps(self):
+        """A prompt of four token budgets prefills in four consecutive steps as it does without
+        the agreement. Each step after a chunk admits the next one; none admits nothing and
+        lets the idle dummy base step overwrite and reset the context holding the hidden chunk,
+        whose next chunk would then run on a block table of -1."""
+        expected, _, _ = self._run(False, [256], enable_chunked_prefill=True)
+        trace, dummy_base_steps, launches = self._run(True, [256], enable_chunked_prefill=True)
+        assert trace == expected
+        assert [chunk for chunk, *_ in trace[:4]] == [-1, 0, 0, 0]
+        assert all(chunk == -1 for chunk in dummy_base_steps)
+        self._assert_votes_bind(launches)
+        # Four chunk steps voted prefill; every later step voted decode-only.
+        assert [vote for _, vote, _ in launches[:5]] == [False] * 4 + [True]
+
+    @torch.inference_mode()
+    def test_prompt_fitting_after_a_full_prefill_is_admitted_next_step(self):
+        """A prompt that fits once the previous step's prefill turns into decode rows is admitted
+        in the next step, as without the agreement, not one step later."""
+        expected, _, _ = self._run(False, [64, 32])
+        trace, _, launches = self._run(True, [64, 32])
+        assert trace == expected
+        # The 32-token prompt waits only while the 64-token one fills the token budget.
+        assert [waiting for *_, waiting in trace[:3]] == [2, 1, 0]
+        self._assert_votes_bind(launches)
+
+    @torch.inference_mode()
+    def test_steps_with_a_paused_request_vote_decode_only(self):
+        """With the KV cache too small for every request's next block, a request pauses. The
+        no-overlap steps that follow admit nothing, so they announce and launch decode-only
+        forwards, and the run matches the one without the agreement."""
+        config = dict(
+            num_tokens_to_generate=8, context_buffer_size_gb=0.0002, context_block_size_tokens=64
+        )
+        expected, _, _ = self._run(False, [60, 60, 60], **config)
+        trace, _, launches = self._run(True, [60, 60, 60], **config)
+        assert trace == expected
+        assert any(paused for _, _, paused, *_ in trace)
+        self._assert_votes_bind(launches)
+        paused_steps = {step for step, (_, _, paused, *_) in enumerate(trace) if paused}
+        paused_votes = [vote for step, vote, _ in launches if step in paused_steps]
+        assert paused_votes and all(paused_votes)
+
+    @torch.inference_mode()
+    def test_step_that_cannot_continue_its_chunk_runs_a_dummy_step(self):
+        """A step whose only work is a hidden chunk that cannot continue launches no forward, so
+        it runs a dummy step for its tp_ep peers. The chunk's continuation is refused in two
+        steps: the first still updates the pending chunk and runs the idle dummy base step; the
+        second has nothing pending and runs the dummy step. That step sets the chunk aside for
+        its dummy row and gives back its row, count and KV blocks; its launch binds to the
+        decode-only vote the step cast; and the chunk then continues as without the agreement."""
+        refused = (2, 3)
+        expected, _, _ = self._run(
+            False, [256], refused_chunk_steps=refused, enable_chunked_prefill=True
+        )
+        dummy_steps = []
+        trace, dummy_base_steps, launches = self._run(
+            True,
+            [256],
+            refused_chunk_steps=refused,
+            dummy_steps=dummy_steps,
+            enable_chunked_prefill=True,
+        )
+        assert trace == expected
+        # The chunks run in steps 0, 1, 4 and 5; admitting the last one ends the chunked prefill.
+        assert [chunk for chunk, *_ in trace[:7]] == [-1, 0, 0, 0, 0, 0, -1]
+        assert dummy_base_steps[0] == 0
+        ((before, forward_rows, after),) = [
+            held for step, *held in dummy_steps if step == refused[1]
+        ]
+        # Only the hidden chunk was held: no active request, the chunk's id, its blocks on row 0.
+        assert before[:2] == (0, 0) and before[2][0] >= 0
+        assert forward_rows == [(1, True)]
+        assert after == before
+        assert [launch for launch in launches if launch[0] in refused] == [
+            (2, False, True),
+            (3, True, True),
+        ]
+        self._assert_votes_bind(launches)
+
+
 @pytest.mark.parametrize(
     "mode, run_async_overlap, decode_only, primer_only, expected_schedule_calls, "
     "expected_nvtx_range",
@@ -314,6 +592,7 @@ def test_async_forward_routes_one_controller_iteration(
         chunked_prefill_request_id=17,
         is_decode_only=mock.Mock(return_value=decode_only.launched),
         dynamo_helper=DynamoHelper(),
+        moe_step_phase_is_agreed=False,
     )
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(
@@ -367,6 +646,7 @@ def test_async_forward_routes_one_controller_iteration(
             schedule_waiting_requests=(
                 None if run_async_overlap else engine.schedule_waiting_requests
             ),
+            admits_prefill=not run_async_overlap,
             finalize_requests=finalize_requests,
         )
     engine.context.is_decode_only.assert_not_called()

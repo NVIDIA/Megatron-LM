@@ -271,6 +271,7 @@ class TestDynamicContext:
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
         expert_model_parallel_size: int = 1,
+        expert_tensor_parallel_size: int = 1,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
     ):
@@ -296,7 +297,12 @@ class TestDynamicContext:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
                 expert_model_parallel_size=expert_model_parallel_size,
-                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
+                expert_tensor_parallel_size=expert_tensor_parallel_size,
+                num_moe_experts=(
+                    2 if expert_model_parallel_size * expert_tensor_parallel_size > 1 else None
+                ),
+                # MoE biases need ETP == 1.
+                add_bias_linear=expert_tensor_parallel_size == 1,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -2895,11 +2901,15 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
-        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
+    # ETP > TP with EP = 1 still makes the idle rank join tp_ep peers' collectives.
+    @pytest.mark.parametrize("etp, ep", [(1, 2), (2, 1)])
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self, etp, ep):
+        parallel = dict(expert_tensor_parallel_size=etp, expert_model_parallel_size=ep)
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16, **parallel)
         ctx = self._get_hybrid_ep_context(
-            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
+            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True, **parallel
         )
+        assert ctx.reserve_recurrent_state_dummy_slot
         assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
         assert ctx.max_requests == baseline.max_requests
         metadata = ctx.mamba_metadata
@@ -2936,6 +2946,75 @@ class TestDynamicContext:
 
         with pytest.raises(AssertionError, match="No free recurrent-state slots"):
             ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_ep_dummy_step_keeps_a_hidden_chunked_prefill(self, is_hybrid_model):
+        """An idle EP dummy step can run while the context holds a chunked prefill hidden
+        between chunks, e.g. when its next chunk does not fit. The step must give the request's
+        row and counts back: a reset would free its KV blocks and the next chunk would run on a
+        block table of -1."""
+        if is_hybrid_model:
+            ctx = self._get_hybrid_ep_context(num_cuda_graphs=16, enable_chunked_prefill=True)
+        else:
+            ctx = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=2,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=64,
+                max_tokens=None,
+                enable_chunked_prefill=True,
+                num_cuda_graphs=16,
+            )
+        request = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.arange(0, 256, device='cpu'),
+            sampling_params=SamplingParams(num_tokens_to_generate=4),
+        )
+        ctx.add_request(request, prefill_chunk_length=128)
+        ctx.chunked_prefill_request_id = 7
+        ctx.update_requests(
+            torch.tensor([1], dtype=torch.int32), torch.tensor([5], dtype=torch.int32)
+        )
+        # The chunk is hidden past the active rows, in row 0.
+        assert (ctx.total_request_count, ctx.request_ids[0].item()) == (0, 7)
+        block_ids = ctx.request_to_kv_block_ids[0].clone()
+        kv_offset = ctx.request_kv_length_offsets[0].item()
+        used_blocks = ctx.kv_block_allocator.get_total_used()
+        if is_hybrid_model:
+            state_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
+            free_state_slots = ctx.mamba_metadata.mamba_state_free_slot_count
+
+        ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        assert ctx.using_cuda_graph_this_step()
+        ctx.end_expert_parallel_dummy_step()
+
+        assert ctx.chunked_prefill_request_id == 7
+        assert (ctx.total_request_count, ctx.paused_request_count, ctx.active_token_count) == (
+            0,
+            0,
+            0,
+        )
+        assert torch.equal(ctx.request_to_kv_block_ids[0], block_ids)
+        assert ctx.request_kv_length_offsets[0].item() == kv_offset
+        assert ctx.kv_block_allocator.get_total_used() == used_blocks
+        if is_hybrid_model:
+            assert ctx.mamba_metadata.request_to_mamba_state_idx[0].item() == state_idx
+            assert ctx.mamba_metadata.mamba_state_free_slot_count == free_state_slots
+
+        # The next chunk continues on the first chunk's blocks.
+        request.finished_chunk_token_count = 128
+        ctx.add_request(request, prefill_chunk_length=128)
+        assert ctx.total_request_count == 1
+        first_chunk_blocks = 128 // ctx.block_size_tokens
+        assert torch.equal(
+            ctx.request_to_kv_block_ids[0, :first_chunk_blocks], block_ids[:first_chunk_blocks]
+        )
+        assert bool((ctx.request_to_kv_block_ids[0, : 2 * first_chunk_blocks] >= 0).all())
 
     @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):

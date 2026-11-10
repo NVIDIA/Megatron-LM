@@ -173,11 +173,24 @@ class EngineLoopMixin:
         elif mode == AsyncScheduleMode.ASYNC:
             run_async_overlap = self._should_run_async_sched_overlap()
             step_nvtx_range = "AsyncOverlap" if run_async_overlap else "AsyncNoOverlap"
+            # When the replicas sharing the MoE collectives agree on each step's phase at its
+            # entry, a no-overlap step admits prefill only if the entry probe, run against the
+            # counts the step's update leaves, allows it. Otherwise it admits only decode-ready
+            # (imported) requests, so its forward is decode-only, as it announced; a head that
+            # fits only because a request finishes in this update waits one step.
+            admits_prefill = not run_async_overlap and (
+                not self.context.moe_step_phase_is_agreed or self._can_admit_prefill_after_update()
+            )
+            if run_async_overlap:
+                schedule_waiting_requests = None
+            elif admits_prefill:
+                schedule_waiting_requests = self.schedule_waiting_requests
+            else:
+                schedule_waiting_requests = self._admit_pending_kv_imports
             controller_kwargs = {
                 "run_async_overlap": run_async_overlap,
-                "schedule_waiting_requests": (
-                    None if run_async_overlap else self.schedule_waiting_requests
-                ),
+                "schedule_waiting_requests": schedule_waiting_requests,
+                "admits_prefill": admits_prefill,
             }
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
@@ -772,12 +785,12 @@ class EngineLoopMixin:
                         if local_schedulable > 0:
                             await self.async_step()
                         else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
+                            # Dummy forward to participate in the EP collective. Its host does
+                            # not wait for it: the next dummy step's blocking bookkeeping copy
+                            # keeps it at most one forward ahead of the GPU, and its peers can
+                            # launch their next forward while this one runs.
                             nvtx_range_push("EP-dummy-forward")
                             self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
                             nvtx_range_pop("EP-dummy-forward")
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1

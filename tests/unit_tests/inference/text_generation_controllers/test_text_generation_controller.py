@@ -343,6 +343,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
             return_value=(torch.empty(0, dtype=torch.int32), torch.arange(metadata_len))
         ),
         copy_async_sched_sample_to_forward=mock.Mock(),
+        agree_on_moe_decode_only=mock.Mock(),
+        end_expert_parallel_dummy_step=mock.Mock(),
         reset=mock.Mock(),
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
@@ -389,6 +391,8 @@ def _make_async_sched_controller(context=None, model_config=None):
     context = context or _make_async_sched_context()
     model_config = model_config or SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=None,
         moe_enable_routing_replay=False,
@@ -401,8 +405,10 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
+    controller._overlap_gc = False
     controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
+    controller._dummy_forward_done_event = mock.Mock()
     controller._async_sched_mtp_token_row_indices = None
     controller._all_logits_cuda = torch.empty(0)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
@@ -539,6 +545,8 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     context.request_metadata["top_n_logprobs"] = torch.tensor([1, 1])
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=2,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -735,6 +743,8 @@ def test_collect_router_recording_gathers_sequence_parallel_rows():
     )
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -792,6 +802,7 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
 
     context.initialize_attention_state.assert_called_once_with(
         construct_graph_dimensions=None,
+        construct_graph_bounded_moe_rows=None,
         is_expert_parallel_dummy_cuda_graph_step=False,
         transfer_bookkeeping_to_gpu=True,
         record_bookkeeping_done_event=True,
@@ -905,6 +916,8 @@ def test_run_async_sched_forward_records_pending_routing():
     context = _make_async_sched_context()
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -952,6 +965,8 @@ def test_capture_async_sched_routing_alternates_banks_with_delayed_copy(discard)
     )
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -1014,7 +1029,7 @@ def test_run_async_sched_forward_commits_mamba_prefix_states():
     context.mamba_slot_allocator.commit_intermediate_states.assert_called_once_with()
 
 
-def test_run_dummy_async_sched_base_step_resets_without_committing_mamba_state():
+def test_run_dummy_async_sched_base_step_ends_without_committing_mamba_state():
     context = _make_async_sched_context()
     context.is_hybrid_model = True
     context.mamba_slot_allocator = SimpleNamespace(commit_intermediate_states=mock.Mock())
@@ -1029,7 +1044,9 @@ def test_run_dummy_async_sched_base_step_resets_without_committing_mamba_state()
     assert result is None
     controller._run_dummy_base_forward.assert_called_once_with(input_ids, position_ids)
     context.mamba_slot_allocator.commit_intermediate_states.assert_not_called()
-    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
+    # Ending the dummy step keeps requests the context still holds, unlike a reset.
+    context.end_expert_parallel_dummy_step.assert_called_once_with()
+    context.reset.assert_not_called()
 
 
 @pytest.mark.parametrize("is_valid", [False, True])
@@ -1077,20 +1094,31 @@ def test_dummy_forward_matches_mode_forward_order(mode, expected_order):
     controller.dummy_forward()
 
     assert order == expected_order
-    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
+    context.end_expert_parallel_dummy_step.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
-    "num_speculative_tokens, ep_size, expected_order",
-    [(0, 2, ["base"]), (2, 1, ["base"]), (2, 2, ["mtp", "base"])],
+    "num_speculative_tokens, tp_size, etp_size, ep_size, expected_order",
+    [
+        (0, 1, 1, 2, ["base"]),
+        (2, 1, 1, 1, ["base"]),
+        (2, 1, 1, 2, ["mtp", "base"]),
+        # ETP > TP: the expert-TP peers are other data-parallel replicas.
+        (2, 1, 2, 1, ["mtp", "base"]),
+        # The MoE collectives stay inside one attention TP group: no other replica to match.
+        (2, 2, 2, 1, ["base"]),
+        (2, 2, 1, 2, ["base"]),
+    ],
 )
 def test_async_sched_primer_matches_dummy_mtp_order(
-    num_speculative_tokens, ep_size, expected_order
+    num_speculative_tokens, tp_size, etp_size, ep_size, expected_order
 ):
-    """An EP primer inserts dummy MTP collectives only when its peers do."""
+    """A primer inserts dummy MTP collectives only when replicas in its tp_ep group do."""
     context = _make_async_sched_context(total_request_count=1)
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=tp_size,
+        expert_tensor_parallel_size=etp_size,
         expert_model_parallel_size=ep_size,
         num_moe_experts=4 if ep_size > 1 else None,
         moe_enable_routing_replay=False,
@@ -1108,6 +1136,146 @@ def test_async_sched_primer_matches_dummy_mtp_order(
     controller._run_async_sched_forward_primer()
 
     assert order == expected_order
+
+
+@pytest.mark.parametrize(
+    "mode, run_async_overlap, has_pending_logits, num_prefill_requests, admits_prefill, "
+    "decode_only",
+    [
+        # The engine admits a legacy step's requests before the step starts.
+        (AsyncScheduleMode.LEGACY, True, False, 0, True, True),
+        (AsyncScheduleMode.LEGACY, True, False, 1, True, False),
+        # Overlap steps launch decode-only forwards.
+        (AsyncScheduleMode.ASYNC, True, True, 0, False, True),
+        # No-overlap steps that admit no prefill launch their pending forward's requests, all
+        # decoding after the update: a paused request, too little KV to prepare, an admittable
+        # KV import (imports enter as decode requests), or the first decode after a prefill.
+        (AsyncScheduleMode.ASYNC, False, True, 0, False, True),
+        (AsyncScheduleMode.ASYNC, False, True, 1, False, True),
+        # A no-overlap step that may admit prefill does not count as decode-only.
+        (AsyncScheduleMode.ASYNC, False, True, 0, True, False),
+        # A primer launches the context's requests as they are.
+        (AsyncScheduleMode.ASYNC, False, False, 0, False, True),
+        (AsyncScheduleMode.ASYNC, False, False, 1, False, False),
+        (AsyncScheduleMode.ASYNC, False, False, 0, True, False),
+        (AsyncScheduleMode.ASYNC, True, False, 0, False, True),
+        (AsyncScheduleMode.ASYNC, True, False, 1, False, False),
+    ],
+)
+def test_step_agrees_on_the_phase_it_launches_before_its_forwards(
+    mode, run_async_overlap, has_pending_logits, num_prefill_requests, admits_prefill, decode_only
+):
+    """The replicas sharing the MoE collectives agree on the step's phase before any of them
+    issues a collective, so none bounds its MoE rows while another is not decode-only. Each rank
+    announces the phase of the forward it will launch, so no decode-only step goes unbounded."""
+    context = _make_async_sched_context()
+    context.config.async_sched_mode = mode
+    context.num_prefill_requests = num_prefill_requests
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_forward.is_valid = has_pending_logits
+    controller._validate_async_sched_support_for_step = mock.Mock()
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append(("agree", value))
+    step = mock.AsyncMock(side_effect=lambda *args, **kwargs: order.append("step"))
+    controller._run_legacy_step = step
+    controller._run_async_sched_step_no_overlap = step
+    controller._run_async_sched_step_overlap = step
+    controller._run_async_sched_step_overlap_mtp = step
+
+    asyncio.run(
+        controller.async_generate_output_tokens_dynamic_batch(
+            run_async_overlap=run_async_overlap,
+            schedule_waiting_requests=None if run_async_overlap else mock.Mock(),
+            admits_prefill=admits_prefill,
+        )
+    )
+
+    assert order == [("agree", decode_only), "step"]
+
+
+@pytest.mark.parametrize("replicas", [1, 2])
+@pytest.mark.parametrize("path", ["async-overlap", "async-primer", "legacy"])
+def test_step_that_launches_no_forward_still_runs_its_peers_dummy_step(path, replicas):
+    """A step with work that launches nothing (nothing admitted, or a kept chunk that cannot
+    continue yet) still issues the MoE collectives of its tp_ep peers, which each launch a
+    forward or a dummy step: it runs a dummy step after its vote."""
+    context = _make_async_sched_context(total_request_count=0)
+    context.active_token_count = 0
+    if path == "legacy":
+        context.config.async_sched_mode = AsyncScheduleMode.LEGACY
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_forward.is_valid = path == "async-overlap"
+    controller._validate_async_sched_support_for_step = mock.Mock()
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append("agree")
+    controller._run_dummy_step = mock.Mock(side_effect=lambda: order.append("dummy"))
+
+    with mock.patch(
+        "megatron.core.inference.text_generation_controllers.text_generation_controller."
+        "get_moe_dp_replica_count",
+        return_value=replicas,
+    ):
+        asyncio.run(
+            controller.async_generate_output_tokens_dynamic_batch(
+                run_async_overlap=path == "async-overlap",
+                schedule_waiting_requests=mock.Mock() if path == "async-primer" else None,
+            )
+        )
+
+    assert order == ["agree"] + ["dummy"] * (replicas > 1)
+
+
+def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
+    """An idle rank's dummy step counts as decode-only and agrees before its collectives. Only
+    then does it wait for its previous dummy forward, before restaging the context's host
+    buffers, so it runs at most one forward ahead without delaying its peers' launches."""
+    context = _make_async_sched_context()
+    controller = _make_async_sched_controller(context)
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append(("agree", value))
+    controller._dummy_forward_done_event.synchronize.side_effect = lambda: order.append("wait")
+    controller._dummy_forward_done_event.record.side_effect = lambda: order.append("record")
+    context.end_expert_parallel_dummy_step.side_effect = lambda: order.append("end")
+
+    def context_init(**kwargs):
+        order.append("init")
+        return torch.tensor([[1]]), torch.tensor([[0]]), None
+
+    controller._dynamic_step_context_init = mock.Mock(side_effect=context_init)
+    controller._run_dummy_base_forward = mock.Mock(side_effect=lambda *_: order.append("base"))
+    controller._run_dummy_serial_mtp_forward = mock.Mock(side_effect=lambda: order.append("mtp"))
+
+    controller.dummy_forward()
+
+    assert order == [("agree", True), "wait", "init", "mtp", "base", "record", "end"]
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_dynamic_step_forward_takes_bounded_moe_rows_from_the_context(bounded):
+    """The forward uses the bounded MoE rows exactly when the context decided so this step, and
+    keeps that bound for its MTP commit pass."""
+    context = _make_async_sched_context()
+    context.use_bounded_mxfp8_rows = bounded
+    context.is_creating_cuda_graphs = False
+    context.num_last_token_logits = 2
+    context.has_vlm_data = False
+    controller = _make_async_sched_controller(context)
+    controller.model_is_pipeline_parallel = False
+    controller._select_async_sched_routing_buffer = mock.Mock()
+    seen = []
+
+    def run_one_forward_step(inference_input):
+        seen.append(InferenceMode.use_bounded_mxfp8_rows())
+        return torch.zeros(1, 2, 4)
+
+    controller.inference_wrapped_model.run_one_forward_step = run_one_forward_step
+    tokens = torch.zeros(1, 2, dtype=torch.long)
+
+    with InferenceMode.active():
+        controller._dynamic_step_forward_logits(tokens, tokens)
+
+    assert seen == [bounded]
+    assert controller._base_forward_bounded_moe_rows is bounded
 
 
 def test_async_sched_router_returns_empty_result_without_active_requests():
@@ -2046,13 +2214,27 @@ def test_async_sched_no_overlap_updates_before_admission(
     context.commit_sampled_tokens.assert_not_called()
 
 
-def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
+@pytest.mark.parametrize(
+    "tp_size, etp_size, ep_size, matches_peer",
+    [
+        (1, 1, 2, True),
+        # ETP > TP: the expert-TP peer is another data-parallel replica.
+        (1, 2, 1, True),
+        # The MoE collectives stay inside one attention TP group: no other replica to match.
+        (2, 2, 1, False),
+    ],
+)
+def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward(
+    tp_size, etp_size, ep_size, matches_peer
+):
     """A rank that resolves its last request still matches the peer base collective."""
     context = _make_async_sched_context(total_request_count=1)
     context.num_prefill_requests = 1
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
-        expert_model_parallel_size=2,
+        tensor_model_parallel_size=tp_size,
+        expert_tensor_parallel_size=etp_size,
+        expert_model_parallel_size=ep_size,
         num_moe_experts=4,
         moe_enable_routing_replay=False,
     )
@@ -2098,7 +2280,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
     )
 
     assert result.output["finished_request_ids"].tolist() == [10]
-    controller._run_dummy_async_sched_base_step.assert_called_once_with()
+    assert controller._run_dummy_async_sched_base_step.call_count == int(matches_peer)
     controller._run_async_sched_forward.assert_not_called()
 
 

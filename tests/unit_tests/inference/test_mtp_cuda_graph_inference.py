@@ -288,7 +288,7 @@ class TestMTPCudaGraphInference:
         manager and `cache_key=...` for O(1) runner lookup.
         """
         if use_graph:
-            return {"cache_key": ("mtp", batch_size, mtp_depth)}
+            return {"cache_key": ("mtp", batch_size, mtp_depth, False)}
         return {"eager": True}
 
     @staticmethod

@@ -742,6 +742,38 @@ class RequestIntakeMixin:
             and token_capacity_available
         )
 
+    def _can_admit_waiting_request(self) -> bool:
+        """Return whether the waiting queue's head can be admitted now, without admitting it.
+
+        Returns:
+            bool: Whether the queue head would pass the admission checks.
+        """
+        if not self.waiting_request_ids:
+            return False
+        req = self.get_request(self.waiting_request_ids[0])
+        if self.enable_chunked_prefill:
+            return self._can_schedule_chunked_prefill(req)
+        return self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+
+    def _can_admit_prefill_after_update(self) -> bool:
+        """Return whether this step's admission point can admit prefill, judged at step entry.
+
+        Admission follows the update of the pending forward, so the queue head is probed
+        against the counts that update leaves (DynamicInferenceContext.counts_after_update),
+        not the pending forward's: the prefill rows it held come back as decode rows. A chunked
+        prefill in flight continues at the next admission point whenever it fits, so it counts
+        as admitting prefill.
+
+        Returns:
+            bool: Whether the step may admit prefill.
+        """
+        if not self.waiting_request_ids:
+            return False
+        if self.context.chunked_prefill_request_id != -1:
+            return True
+        with self.context.counts_after_update():
+            return self._can_admit_waiting_request()
+
     def _should_run_async_sched_overlap(self) -> bool:
         """Return whether this step should use overlap ordering.
 
@@ -756,13 +788,7 @@ class RequestIntakeMixin:
             return False
         if self.has_admittable_kv_import:
             return False
-        if not self.waiting_request_ids:
-            return True
-
-        req = self.get_request(self.waiting_request_ids[0])
-        if self.enable_chunked_prefill:
-            return not self._can_schedule_chunked_prefill(req)
-        return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+        return not self._can_admit_waiting_request()
 
     def _pending_prefill_block_hashes(self) -> set[int]:
         """Return hashes reserved by work whose KV is not yet ready for reuse."""

@@ -373,13 +373,9 @@ class CoordinatorMixin:
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.tp_ep_world_size > 1:
-            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=tp_ep_group, hostname=hostname
+            self._attach_tp_ep_communicator(
+                AsyncZMQCommunicator(self.zmq_context, process_group=tp_ep_group, hostname=hostname)
             )
-            # Give the context a CPU-side MAX-reduction primitive so
-            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
-            if hasattr(self.context, "set_ep_zmq_communicator"):
-                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -1128,3 +1124,19 @@ class CoordinatorMixin:
                 1, async_op=(not self.use_synchronous_zmq_collectives)
             )
         nvtx_range_pop("world_barrier")
+
+    def _attach_tp_ep_communicator(self, communicator) -> None:
+        """Attach the ZMQ communicator over tp_ep, and capture the CUDA graphs it enables.
+
+        Args:
+            communicator: AsyncZMQCommunicator over the tp_ep process group.
+        """
+        self.expert_parallel_zmq_communicator = communicator
+        # Give the context a CPU-side MAX-reduction primitive so
+        # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+        if hasattr(self.context, "set_ep_zmq_communicator"):
+            self.context.set_ep_zmq_communicator(communicator)
+            if self.context.moe_step_phase_is_agreed:
+                # The replicas can now agree that a step is decode-only, so its CUDA graphs may
+                # bound the MoE rows.
+                self.create_cuda_graphs(bounded_moe_rows_only=True)

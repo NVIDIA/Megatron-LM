@@ -24,6 +24,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.utils import (
+    InferenceMode,
+    get_moe_dp_replica_count,
+    mtp_cuda_graph_key,
+)
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -506,18 +511,21 @@ class MTPControllerMixin:
         # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
         # last PP stage, where the gathered decoder hidden states exist.
         if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            issued_slot = self._mtp_commit_pass(
-                context,
-                unwrapped_model,
-                hidden_states,
-                num_decode_requests=active_request_count - context.num_prefill_requests,
-                active_request_count=active_request_count,
-                base_position=base_position,
-            )
-            if not issued_slot:
-                # EP consistency: every rank runs exactly one commit-pass forward per step (real
-                # above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+            # The commit pass's rows can be a prompt's, so it keeps the MoE row bound of the base
+            # forward it commits, whatever the flag holds now.
+            with InferenceMode.bounded_mxfp8_rows(self._base_forward_bounded_moe_rows):
+                issued_slot = self._mtp_commit_pass(
+                    context,
+                    unwrapped_model,
+                    hidden_states,
+                    num_decode_requests=active_request_count - context.num_prefill_requests,
+                    active_request_count=active_request_count,
+                    base_position=base_position,
+                )
+                if not issued_slot:
+                    # EP consistency: every rank runs exactly one commit-pass forward per step
+                    # (real above, or this dummy) so the MoE all-to-alls stay count-matched.
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -610,19 +618,21 @@ class MTPControllerMixin:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 if mtp_kv_cache_on:
                     context._mtp_setup_decode_step()
-                current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                    hidden_states=current_hidden,
-                    next_token_ids=token_ids_buf,
-                    position_ids=position_ids_buf,
-                    depth=mtp_depth,
-                    eager=not context.using_cuda_graph_this_step(),
-                    cache_key=(
-                        (mtp_graph_key_prefix, padded_count, mtp_depth)
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    ),
-                    **mtp_context_kwarg,
-                )
+                # Drafts fit the bounded MoE rows in every step (mtp_draft_moe_rows_bounded).
+                with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                    current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                        hidden_states=current_hidden,
+                        next_token_ids=token_ids_buf,
+                        position_ids=position_ids_buf,
+                        depth=mtp_depth,
+                        eager=not context.using_cuda_graph_this_step(),
+                        cache_key=(
+                            mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
+                            if context.using_cuda_graph_this_step()
+                            else None
+                        ),
+                        **mtp_context_kwarg,
+                    )
                 if mtp_kv_cache_on:
                     context.mtp_metadata.advance_decode_step()
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
@@ -676,8 +686,9 @@ class MTPControllerMixin:
 
         When speculative decoding is active and MTP layers contain MoE sublayers
         (inherited from the decoder layer spec), each serial MTP step triggers
-        EP all-to-all collectives. The dummy EP rank must issue matching
-        collective calls so the real ranks do not hang.
+        MoE collectives over the tp_ep group. When that group spans more than one
+        data-parallel replica, the dummy rank must issue matching collective calls
+        so the real ranks do not hang.
 
         This mirrors the structure of `_compute_serial_mtp_and_sample`:
         - On the last PP stage (where MTP resides): run `compute_mtp_single_step`
@@ -687,7 +698,7 @@ class MTPControllerMixin:
         """
         if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
-        if self.model_config.expert_model_parallel_size <= 1:
+        if get_moe_dp_replica_count(self.model_config) <= 1:
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -745,7 +756,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                # Mirrors the peers' commit pass, which keeps the MoE row bound of their base
+                # forward; this rank's last base forward ran in the same step and agreed on it.
+                with InferenceMode.bounded_mxfp8_rows(self._base_forward_bounded_moe_rows):
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
@@ -754,19 +768,20 @@ class MTPControllerMixin:
                     mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                     if mtp_context_kwarg:
                         context._mtp_setup_decode_step()
-                    dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                        hidden_states=dummy_hidden,
-                        next_token_ids=dummy_token_ids,
-                        position_ids=dummy_position_ids,
-                        depth=mtp_depth,
-                        eager=mtp_forward_eager,
-                        cache_key=(
-                            (mtp_graph_key_prefix, padded_count, mtp_depth)
-                            if not mtp_forward_eager
-                            else None
-                        ),
-                        **mtp_context_kwarg,
-                    )
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                        dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                            hidden_states=dummy_hidden,
+                            next_token_ids=dummy_token_ids,
+                            position_ids=dummy_position_ids,
+                            depth=mtp_depth,
+                            eager=mtp_forward_eager,
+                            cache_key=(
+                                mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
+                                if not mtp_forward_eager
+                                else None
+                            ),
+                            **mtp_context_kwarg,
+                        )
                     if mtp_context_kwarg:
                         context.mtp_metadata.advance_decode_step()
                     mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]

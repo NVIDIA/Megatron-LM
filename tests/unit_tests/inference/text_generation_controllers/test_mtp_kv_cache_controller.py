@@ -30,6 +30,7 @@ from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 DEVICE = "cuda"
@@ -117,6 +118,7 @@ def _make_context(
         request_to_kv_block_ids=request_to_kv_block_ids,
         gpu_view=gpu_view,
         _nvls_dispatcher=None,
+        mtp_draft_moe_rows_bounded=False,
         inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         mtp_decoder_hidden_states=None,
         setup_prefill_calls=[],
@@ -207,6 +209,8 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
     controller.model_config = SimpleNamespace(
         params_dtype=torch.float32,
         hidden_size=HIDDEN_SIZE,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         moe_pad_experts_for_cuda_graph_inference=False,
     )
@@ -220,6 +224,7 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
     controller._is_last_pp_stage = True
     controller.model_is_pipeline_parallel = False
     controller._mtp_resolved_padded_count = None
+    controller._base_forward_bounded_moe_rows = False
     controller._accepted_token_counts_per_request = torch.zeros(
         MAX_REQUESTS, dtype=torch.int64, device=DEVICE
     )
@@ -958,7 +963,7 @@ class TestSerialMtpDraftLoop:
 
         assert len(model.mtp_step_calls) == 2
         for depth, call in enumerate(model.mtp_step_calls):
-            assert call["cache_key"] == ("mtp", 2, None if repeated_head else depth)
+            assert call["cache_key"] == ("mtp", 2, None if repeated_head else depth, False)
             assert call["eager"] is False
             # The kwarg must be ABSENT, not None: the cache-free ("mtp", ...) graph is captured
             # without it and replay requires the exact captured kwarg set, so an explicit
@@ -1040,7 +1045,7 @@ class TestMtpCudaGraphs:
         assert context._mtp_begin_decode.call_args.kwargs["graphed"] is True
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp_kv", padded_count, None)
+            assert call["cache_key"] == ("mtp_kv", padded_count, None, False)
             assert call["eager"] is False
             assert call["mtp_inference_context"] is context
 
@@ -1105,7 +1110,7 @@ class TestMtpCudaGraphs:
         assert step_mha._max_seqlen_q == 64
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp_kv", 2, None)
+            assert call["cache_key"] == ("mtp_kv", 2, None, False)
             assert call["eager"] is False
             assert call["mtp_inference_context"] is context
         metadata = context.mtp_metadata
@@ -1128,7 +1133,7 @@ class TestMtpCudaGraphs:
 
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp", 2, None)
+            assert call["cache_key"] == ("mtp", 2, None, False)
             assert "mtp_inference_context" not in call
         controller._mtp_dummy_prefill_forward.assert_not_called()
         context._mtp_setup_decode_step.assert_not_called()
@@ -1391,7 +1396,9 @@ class TestExpertParallelForwardParity:
     """Idle EP ranks must issue the same MoE forwards as real ranks, or the all-to-all hangs."""
 
     @staticmethod
-    def _dummy_rank_forwards(num_mtp_depths, graphed, kv_cache_on, sp_enabled=False, tp_size=1):
+    def _dummy_rank_forwards(
+        num_mtp_depths, graphed, kv_cache_on, sp_enabled=False, tp_size=1, etp_size=1, ep_size=2
+    ):
         """Run the idle-rank path in isolation and return its forward log."""
         context = _make_context(num_decode_requests=0)
         context.enable_mtp_kv_cache = kv_cache_on
@@ -1410,7 +1417,8 @@ class TestExpertParallelForwardParity:
 
         controller = _make_controller(context, model, sp_enabled=sp_enabled, tp_size=tp_size)
         controller.num_mtp_depths = num_mtp_depths
-        controller.model_config.expert_model_parallel_size = 2
+        controller.model_config.expert_tensor_parallel_size = etp_size
+        controller.model_config.expert_model_parallel_size = ep_size
         controller._mtp_resolved_padded_count = (tp_size if sp_enabled else 2) if graphed else None
 
         patches = _identity_sp_patches()
@@ -1421,8 +1429,10 @@ class TestExpertParallelForwardParity:
     @pytest.mark.parametrize("num_mtp_depths", [1, 2, 3])
     @pytest.mark.parametrize("graphed", [False, True])
     @pytest.mark.parametrize("kv_cache_on", [False, True])
+    # With ETP > TP = 1 and EP = 1 the expert-TP peers are separate replicas too.
+    @pytest.mark.parametrize("etp_size, ep_size", [(1, 2), (2, 1)], ids=["ep", "etp-gt-tp"])
     def test_real_and_dummy_ranks_match_forward_count_and_graph_mode(
-        self, num_mtp_depths, graphed, kv_cache_on
+        self, num_mtp_depths, graphed, kv_cache_on, etp_size, ep_size
     ):
         """Real and idle ranks must match both forward count and eager/graph mode."""
         controller, model, context, _ = _build_step(
@@ -1437,7 +1447,9 @@ class TestExpertParallelForwardParity:
         )
         real_forwards = list(model.all_forwards)
 
-        dummy_forwards = self._dummy_rank_forwards(num_mtp_depths, graphed, kv_cache_on)
+        dummy_forwards = self._dummy_rank_forwards(
+            num_mtp_depths, graphed, kv_cache_on, etp_size=etp_size, ep_size=ep_size
+        )
 
         expected = num_mtp_depths + (1 if kv_cache_on else 0)
         assert len(real_forwards) == expected
@@ -1449,6 +1461,116 @@ class TestExpertParallelForwardParity:
         dummy_modes = [kw["eager"] for tag, kw in dummy_forwards if tag == "mtp_step"]
         assert real_modes == [not graphed] * num_mtp_depths
         assert dummy_modes == real_modes
+
+    @pytest.mark.parametrize("dummy", [False, True])
+    def test_drafts_run_bounded_and_the_commit_pass_keeps_the_step_bound(self, dummy):
+        """Drafts fit the bounded MoE rows in every step, so they run bounded and replay one graph
+        per size; the commit pass, whose rows can be a prompt's, keeps the base forward's bound,
+        which is restored afterwards."""
+        if dummy:
+            context = _make_context(num_decode_requests=0)
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                model.all_forwards.append(("mtp_step", kwargs))
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model)
+            controller._mtp_resolved_padded_count = 2
+        else:
+            controller, model, context, _ = _build_step(
+                num_decode_requests=2, accepted=(2, 1), graphed=True
+            )
+        context.mtp_draft_moe_rows_bounded = True
+        bounds = []
+        draft_step, layer = model.compute_mtp_single_step, model.mtp.layers[0]
+        commit_step = layer.forward_single_position
+        model.compute_mtp_single_step = lambda **kwargs: (
+            bounds.append(("draft", InferenceMode.use_bounded_mxfp8_rows(), kwargs["cache_key"])),
+            draft_step(**kwargs),
+        )[1]
+        layer.forward_single_position = lambda **kwargs: (
+            bounds.append(("commit", InferenceMode.use_bounded_mxfp8_rows(), None)),
+            commit_step(**kwargs),
+        )[1]
+
+        with InferenceMode.active():
+            InferenceMode.set_bounded_mxfp8_rows(False)
+            if dummy:
+                controller.model_config.expert_model_parallel_size = 2
+                controller._run_dummy_serial_mtp_forward()
+            else:
+                controller._compute_serial_mtp_and_sample(
+                    base_position=torch.tensor([10, 12], device=DEVICE)
+                )
+            assert not InferenceMode.use_bounded_mxfp8_rows()
+
+        assert bounds[0][:2] == ("commit", False)
+        drafts = bounds[1:]
+        assert drafts and all(kind == "draft" and bounded for kind, bounded, _ in drafts)
+        assert all(key[-1] is True for _, _, key in drafts)
+
+    @pytest.mark.parametrize("base_bounded", [False, True])
+    @pytest.mark.parametrize("dummy", [False, True])
+    def test_commit_pass_keeps_its_base_forward_bound_after_a_graph_capture(
+        self, dummy, base_bounded
+    ):
+        """With async scheduling a forward's commit pass runs at the next step's entry. A CUDA
+        graph capture before it leaves InferenceMode's flag at the last captured graph's bound,
+        but the commit pass, and an idle rank's dummy one mirroring it, keep the bound of their
+        step's base forward: a prefill's prompt rows are never cut to a decode graph's bounded
+        rows."""
+        if dummy:
+            context = _make_context(num_decode_requests=0)
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model)
+            controller.model_config.expert_model_parallel_size = 2
+        elif base_bounded:
+            controller, model, context, _ = _build_step(num_decode_requests=2, accepted=(2, 1))
+            base_position = torch.tensor([10, 12], device=DEVICE)
+        else:
+            # A pending prefill, whose commit pass seeds its prompt's draft KV.
+            controller, model, context, _ = _build_step(prefill=((4, 0, 200),))
+            base_position = torch.tensor([4], device=DEVICE)
+        # The step's base forward and the capture run the controller's forward on a stub model.
+        context.config = SimpleNamespace(materialize_only_last_token_logits=True)
+        context.num_last_token_logits = 1
+        context.has_vlm_data = False
+        controller._enable_cuda_graph = False
+        controller._overlap_gc = False
+        controller._select_async_sched_routing_buffer = lambda: None
+        controller.inference_wrapped_model.run_one_forward_step = lambda inference_input: (
+            torch.zeros((1, 1, VOCAB_SIZE), device=DEVICE)
+        )
+        tokens = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
+        commit_bounds = []
+        layer = model.mtp.layers[0]
+        commit_step = layer.forward_single_position
+        layer.forward_single_position = lambda **kwargs: (
+            commit_bounds.append(InferenceMode.use_bounded_mxfp8_rows()),
+            commit_step(**kwargs),
+        )[1]
+
+        with InferenceMode.active():
+            for bounded, capturing in ((base_bounded, False), (not base_bounded, True)):
+                context.use_bounded_mxfp8_rows = bounded
+                context.is_creating_cuda_graphs = capturing
+                controller._dynamic_step_forward_logits(tokens, tokens)
+            assert InferenceMode.use_bounded_mxfp8_rows() == (not base_bounded)
+            if dummy:
+                controller._run_dummy_serial_mtp_forward()
+            else:
+                controller._compute_serial_mtp_and_sample(base_position=base_position)
+
+        assert commit_bounds == [base_bounded]
 
     def test_dummy_rank_matches_a_real_rank_whose_commit_pass_was_empty(self):
         """All drafts rejected: the real rank runs a dummy slot, so the count still matches."""
@@ -1637,7 +1759,7 @@ class TestMtpKvCacheCombinations:
             padded = ((active + tp_size - 1) // tp_size) * tp_size
         keys = [kw["cache_key"] for kw in steps]
         if graphed:
-            assert keys == [("mtp_kv", padded, None)] * num_mtp_depths
+            assert keys == [("mtp_kv", padded, None, False)] * num_mtp_depths
             assert all(kw["eager"] is False for kw in steps)
         else:
             assert all(k is None for k in keys)

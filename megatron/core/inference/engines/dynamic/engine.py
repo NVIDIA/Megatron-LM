@@ -25,7 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DecodeOnly,
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, InferenceMode
+from megatron.core.inference.utils import Counter, InferenceMode, mtp_cuda_graph_key
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -520,14 +520,17 @@ class DynamicInferenceEngine(
         # reset; replacing them can strand waiters on the old asyncio objects.
         self.use_coordinator = use_coordinator
 
-    def create_cuda_graphs(self, reset_context: bool = True):
+    def create_cuda_graphs(self, reset_context: bool = True, bounded_moe_rows_only: bool = False):
         """Create cuda graphs.
 
         This method iterates the dynamic context's `cuda_graph_request_counts`
-        to record and capture cuda graphs.
+        to record and capture cuda graphs, once per bounded-MoE-row variant
+        (`DynamicInferenceContext.bounded_moe_row_graph_variants`).
 
         Args:
             reset_context (bool): Whether to reset the context after building cuda graphs.
+            bounded_moe_rows_only (bool): Capture only the graphs that bound the MoE rows, which
+                become usable once the replicas sharing the MoE collectives can agree.
         """
 
         if self.inference_cuda_graph_scope == InferenceCudaGraphScope.none:
@@ -549,9 +552,20 @@ class DynamicInferenceEngine(
         # Pool-scoped baselines for the per-iteration deltas.
         prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
 
+        # A graph fixes whether its MoE kernels process only the bounded rows, so each variant
+        # that steps can use is captured as its own graph.
+        cuda_graphs = [
+            (graph, bounded_moe_rows)
+            for graph in context.cuda_graph_batch_dimensions_list
+            for bounded_moe_rows in context.bounded_moe_row_graph_variants(graph)
+            if bounded_moe_rows or not bounded_moe_rows_only
+        ]
+        if bounded_moe_rows_only and not cuda_graphs:
+            return
+
         logger.info("> dynamic_engine.py: building cuda graphs for ")
-        for graph in context.cuda_graph_batch_dimensions_list:
-            logger.info(graph)
+        for graph, bounded_moe_rows in cuda_graphs:
+            logger.info(f"{graph}{' (bounded MoE rows)' if bounded_moe_rows else ''}")
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
@@ -586,21 +600,75 @@ class DynamicInferenceEngine(
             mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
-        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+            def mtp_graph_size(graph):
+                n = graph.req_count
+                return round_up_to_nearest_multiple(n, tp_size) if sp_enabled else n
+
+            def capture_mtp_graphs(n):
+                """Capture the MTP draft graphs of `n` requests, with the bound drafts use."""
+                if n == 0 or n in mtp_seen_batch_sizes:
+                    return
+                mtp_seen_batch_sizes.add(n)
+                device = torch.cuda.current_device()
+                batch_dim = n // tp_size if sp_enabled else n
+                # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
+                # it on, real and EP dummy forwards both replay the KV-aware graph below.
+                if not context.enable_mtp_kv_cache:
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        for depth in mtp_warmup_depths:
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                                cache_key=mtp_cuda_graph_key("mtp", n, depth),
+                            )
+
+                # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
+                # that includes the draft-attention KV append+attend under a distinct
+                # ("mtp_kv", n, depth, bounded) key, replayed by the real spec-decode path and
+                # the EP dummy path (which stages the same dummy-block metadata).
+                # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
+                # replay overwrites it from gpu_view each step, so only shapes/bounds count.
+                if context.enable_mtp_kv_cache:
+                    context.mtp_metadata.begin_decode_for_capture(n)
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                        for depth in mtp_warmup_depths:
+                            context._mtp_setup_decode_step()
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                                mtp_inference_context=context,
+                                cache_key=mtp_cuda_graph_key("mtp_kv", n, depth),
+                            )
+                            context.mtp_metadata.advance_decode_step()
+                    context.mtp_metadata.end_forward()
+
+        tbar = enumerate(cuda_graphs)
         if HAVE_TQDM:
-            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
-        for tbar_idx, cuda_graph_batch_dimension in tbar:
+            tbar = tqdm(tbar, total=len(cuda_graphs))
+        for tbar_idx, (cuda_graph_batch_dimension, bounded_moe_rows) in tbar:
             input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
-                construct_graph_dimensions=cuda_graph_batch_dimension
+                construct_graph_dimensions=cuda_graph_batch_dimension,
+                construct_graph_bounded_moe_rows=bounded_moe_rows,
             )
             # Progress.
             tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:
                 tbar.set_description(tbar_str)
             else:
-                logger.info(
-                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
-                )
+                logger.info(f"{tbar_idx}/{len(cuda_graphs)}. {tbar_str}")
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
@@ -619,66 +687,11 @@ class DynamicInferenceEngine(
                     else:
                         controller._dynamic_step_sample_logits()
 
-                # MTP CUDA graph warmup for this batch dimension.
-                if mtp_warmup_enabled:
-                    n = cuda_graph_batch_dimension.req_count
+                # MTP CUDA graph warmup for this batch dimension's request count. Drafts use one
+                # bound in every step, so the graphs that add bounded base graphs add none.
+                if mtp_warmup_enabled and not bounded_moe_rows_only:
                     # pylint: disable-next=possibly-used-before-assignment
-                    if sp_enabled:
-                        n = round_up_to_nearest_multiple(n, tp_size)
-                    # pylint: disable-next=possibly-used-before-assignment
-                    if n > 0 and n not in mtp_seen_batch_sizes:
-                        mtp_seen_batch_sizes.add(n)
-                        device = torch.cuda.current_device()
-                        batch_dim = n // tp_size if sp_enabled else n
-                        # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
-                        # it on, real and EP dummy forwards both replay the KV-aware graph below.
-                        if not context.enable_mtp_kv_cache:
-                            # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                            for depth in mtp_warmup_depths:
-                                unwrapped.compute_mtp_single_step(
-                                    hidden_states=torch.zeros(
-                                        (batch_dim, 1, model_config.hidden_size),
-                                        device=device,
-                                        dtype=model_config.params_dtype,
-                                    ),
-                                    next_token_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.long
-                                    ),
-                                    position_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.int64
-                                    ),
-                                    depth=depth,
-                                    cache_key=("mtp", n, depth),
-                                )
-
-                        # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
-                        # that includes the draft-attention KV append+attend under a distinct
-                        # ("mtp_kv", n, depth) key, replayed by the real spec-decode path and the
-                        # EP dummy path (which stages the same dummy-block metadata).
-                        # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
-                        # replay overwrites it from gpu_view each step, so only shapes/bounds count.
-                        if context.enable_mtp_kv_cache:
-                            context.mtp_metadata.begin_decode_for_capture(n)
-                            for depth in mtp_warmup_depths:
-                                context._mtp_setup_decode_step()
-                                unwrapped.compute_mtp_single_step(
-                                    hidden_states=torch.zeros(
-                                        (batch_dim, 1, model_config.hidden_size),
-                                        device=device,
-                                        dtype=model_config.params_dtype,
-                                    ),
-                                    next_token_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.long
-                                    ),
-                                    position_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.int64
-                                    ),
-                                    depth=depth,
-                                    mtp_inference_context=context,
-                                    cache_key=("mtp_kv", n, depth),
-                                )
-                                context.mtp_metadata.advance_decode_step()
-                            context.mtp_metadata.end_forward()
+                    capture_mtp_graphs(mtp_graph_size(cuda_graph_batch_dimension))
 
                 context.reset()
 
@@ -689,7 +702,7 @@ class DynamicInferenceEngine(
             logger.info(
                 "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
                 tbar_idx + 1,
-                len(context.cuda_graph_batch_dimensions_list),
+                len(cuda_graphs),
                 cuda_graph_batch_dimension,
                 format_mem_bytes(pool_reserved),
                 format_mem_bytes(pool_reserved - prev_pool_reserved),
@@ -698,6 +711,7 @@ class DynamicInferenceEngine(
             )
             prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
 
+        # pylint: disable-next=possibly-used-before-assignment
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logger.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
@@ -723,6 +737,10 @@ class DynamicInferenceEngine(
             format_mem_bytes(capture_stats["reserved_bytes"]),
         )
 
+        if bounded_moe_rows_only and self.capture_stats is not None:
+            # This pass adds graphs to the ones captured at construction: report both.
+            for key in ("time", "allocated_bytes", "reserved_bytes"):
+                capture_stats[key] += self.capture_stats[key]
         self.capture_stats = capture_stats
 
     @contextmanager
