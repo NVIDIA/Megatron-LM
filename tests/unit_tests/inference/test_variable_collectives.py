@@ -11,7 +11,12 @@ the buffers with closed-form values (exact under any summation order) and checks
 every rank. The ``large`` cases (opt-in, ``-m large``; 16 GiB symmetric buffers) put the last
 rows where the offsets reach 2**31 in the unit the kernel indexes: 8-byte units of the 16-byte
 lanes for the multimem kernels, fp32 elements for the ordered reduce-scatter.
+
+``TestAllGatherVZeroTokenStep`` checks that a dispatch in which no rank has tokens still
+synchronizes the group, which the dispatcher's metadata buffer relies on.
 """
+
+import time
 
 import pytest
 import torch
@@ -19,6 +24,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
     is_device_nvls_capable,
+    multimem_all_gather_v,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
@@ -219,3 +225,93 @@ class TestVariableCollectiveRowOffsets:
     def test_all_gatherv_3tensor_past_int32_offsets(self):
         """The last two hidden-state rows of the gather buffer cross and start past 16 GiB."""
         self._run_gather(GATHER_ROWS)
+
+
+class TestAllGatherVZeroTokenStep:
+    """A dispatch step in which no rank has tokens (``ep_max_tokens`` 0) must still synchronize
+    the EP group. ``fused_metadata_update`` multicasts each rank's token count into every peer's
+    buffer before its barrier, and nothing after its read of the counts orders the next step's
+    store but the dispatch all-gather's barrier. If that all-gather returned without waiting for
+    the peers, a rank could run its next step and overwrite a peer's counts before the peer had
+    read them, so the ranks would disagree on the token offsets and on which blocks barrier.
+
+    Rank 0 launches the all-gather of a zero-token step while every peer holds its launch back
+    until rank 0 has watched its own for ``WINDOW_S`` seconds; the all-gather must not finish on
+    rank 0 within that window."""
+
+    WINDOW_S = 2.0
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_distributed()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("kernel", ["3tensor", "single"])
+    def test_zero_token_step_waits_for_every_rank(self, kernel):
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        if world < 2:
+            pytest.skip("needs at least two ranks")
+        if not is_device_nvls_capable(torch.device("cuda", torch.cuda.current_device())):
+            pytest.skip("NVLS multicast needs a Hopper or newer GPU")
+        rank = dist.get_rank()
+        specs = [(torch.bfloat16, HIDDEN), (torch.int64, TOPK), (torch.float32, TOPK)]
+        rows = world * 4
+        buffers = [SymmetricMemoryBuffer(1, dist.group.WORLD) for _ in specs]
+        problems = [b.init_failure_reason for b in buffers if b.symm_mem_hdl is None]
+        problems += [
+            "no NVLink multicast"
+            for b in buffers
+            if b.symm_mem_hdl is not None and not b.symm_mem_hdl.multicast_ptr
+        ]
+        anywhere = torch.tensor([len(problems)], device="cuda")
+        dist.all_reduce(anywhere)
+        if int(anywhere):
+            pytest.skip(f"symmetric memory with multicast unavailable: {problems or 'on a peer'}")
+        # A CPU group, so rank 0 can hold its peers back while its own stream is blocked.
+        host_group = dist.new_group(backend="gloo")
+
+        outputs = [
+            buf.symm_buffer[: rows * width * dtype.itemsize].view(dtype).view(rows, width)
+            for (dtype, width), buf in zip(specs, buffers)
+        ]
+        # No tokens on any rank: empty views of real allocations.
+        inputs = [torch.zeros(1, width, dtype=dtype, device="cuda")[:0] for dtype, width in specs]
+        step = dict(
+            rank_token_offset=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            ep_max_tokens=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            per_rank_max_tokens=4,
+        )
+
+        def dispatch():
+            if kernel == "3tensor":
+                multimem_all_gatherv_3tensor(
+                    *outputs, *inputs, *(buf.symm_mem_hdl for buf in buffers), **step
+                )
+            else:
+                multimem_all_gather_v(outputs[0], inputs[0], buffers[0].symm_mem_hdl, **step)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        finished_early = False
+        if rank == 0:
+            dispatch()
+            done = torch.cuda.Event()
+            done.record()
+            deadline = time.monotonic() + self.WINDOW_S
+            while not finished_early and time.monotonic() < deadline:
+                finished_early = done.query()
+                time.sleep(0.01)
+        dist.barrier(group=host_group)
+        if rank != 0:
+            dispatch()
+        torch.cuda.synchronize()
+        early = torch.tensor([int(finished_early)], device="cuda")
+        dist.all_reduce(early)
+        dist.destroy_process_group(host_group)
+        assert int(early) == 0, (
+            f"the {kernel} all-gather-v of a step with no tokens finished on rank 0 before any "
+            "peer launched it, so it did not synchronize the group"
+        )
