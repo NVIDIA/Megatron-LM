@@ -295,6 +295,13 @@ class TestBuildInferencePgCollection:
             record, ("build_inference_pg_collection", "training_pg_collection")
         )
 
+    def test_fallback_without_global_grid_raises(self):
+        # Without a global grid, the fallback groups would be None, which sizes every axis to 1.
+        Utils.destroy_model_parallel()
+        with pytest.warns(ProcessGroupFallbackWarning):
+            with pytest.raises(ValueError, match="without the tp, cp, pp, ep, expt_tp size"):
+                build_inference_pg_collection(Utils.world_size)
+
 
 @pytest.fixture
 def unit_rounders(monkeypatch):
