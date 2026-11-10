@@ -17,7 +17,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.training import setup_model_and_optimizer
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
@@ -276,8 +276,8 @@ def get_blocks_by_rank(
     """
 
     if process_group is None:
-        warn_global_process_group_fallback("get_blocks_by_rank", "process_group")
-        process_group = parallel_state.get_data_parallel_group()
+        with global_process_group_fallback("get_blocks_by_rank", "process_group"):
+            process_group = parallel_state.get_data_parallel_group()
 
     # Get world blocks.
     blocks = get_blocks(dirname, n_samples, block_size, validate)
