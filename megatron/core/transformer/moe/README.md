@@ -611,6 +611,56 @@ FP8 training provides benefits across all three performance walls:
 
 ### MoE Megakernel Backends
 
+#### Transformer Engine with NCCL EP
+
+Select `moe_megakernel_backend="te"` to execute routed experts in a single TE
+`Sequential`: `MoeDispatch -> GroupedLinear -> ScaledSwiGLU -> GroupedLinear -> MoeCombine`.
+MCore retains routing, expert parameters, optimizer state, DDP hooks, and checkpoint keys.
+The backend passes the same NCCL EP `EpBuffer` to dispatch and combine, and allocates a
+new buffer for each forward so pending microbatches retain their own backward routing state.
+Token counts and dispatched routing probabilities stay inside the sequence through TE channels.
+This path uses NCCL EP communication and TE grouped MLP operations; it does not require
+cuDNN MegaMoE or selection of a whole-MoE fused kernel.
+
+```bash
+--moe-megakernel-backend te \
+--bf16 --swiglu --disable-bias-linear \
+--expert-model-parallel-size 2 --expert-tensor-parallel-size 1 \
+--moe-router-dtype fp32 --moe-single-grouped-weight \
+--moe-megakernel-backend-config '{"max_tokens_per_rank": 4096}'
+```
+
+Use a TE build providing `EpConfig`, `EpBuffer`, `MoeDispatch`, `MoeCombine`, and
+operation-fuser channels, built with NCCL EP support. `use_transformer_engine_op_fuser`
+is not required; `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` do not
+choose this backend's transport. TP and expert TP must both be one, and EP must be at least two.
+BF16 and MXFP8 compute are supported. For MXFP8 add `--fp8 e4m3 --fp8-recipe mxfp8`;
+native MXFP8 parameters are optional through `--fp8-param-gather`. MXFP8 communication additionally
+uses `--moe-dispatch-fwd-dtype mxfp8 --moe-combine-bwd-dtype mxfp8`, with hidden size
+divisible by 512. Dispatch backward and combine forward retain BF16 communication.
+MXFP8 communication also requires TE's empty grouped-tensor swizzle metadata fix;
+without it, an EP rank receiving no tokens can fail the grouped-GEMM layout check.
+
+Without a rank capacity factor, NCCL EP sizes receive tensors from actual token counts.
+`moe_expert_rank_capacity_factor` selects a fixed receive allocation, rounded to the
+grouped-MLP token alignment. It must include expert padding and the worst expected routing
+imbalance: overflow fails instead of silently dropping tokens. CUDA graphs, paged stashing,
+zero-copy communication, delayed wgrad, native communication overlap, latent MoE,
+GTP weight rematerialization, and activation offloading are not supported by this initial adapter.
+Optional shared experts execute through their native MCore module and are added after combine.
+The token bound defaults to the first forward's maximum token count across EP ranks,
+rounded up to a multiple of 64; later layers share that bound.
+Set `max_tokens_per_rank` explicitly for variable-length workloads and consistently across layers.
+
+The distributed numerical suite compares the sequence with native all-to-all plus TE grouped
+MLP, including two outstanding forwards before backward, masked routes, empty experts,
+input/router/weight gradients, main-gradient accumulation, and checkpoint reload:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node 2 -m pytest -q \
+  tests/unit_tests/transformer/moe/test_te_megakernel.py
+```
+
 #### MOK
 
 A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.

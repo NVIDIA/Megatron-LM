@@ -29,6 +29,16 @@ def build_megakernel_backend(
     do not acquire optional megakernel dependencies.
     """
     backend = config.moe_megakernel_backend
+    if backend == "te":
+        from megatron.core.transformer.moe.megakernel.te import TEMegakernel
+
+        return TEMegakernel(
+            config=config,
+            ep_group=ep_group,
+            routed_experts=routed_experts,
+            shared_experts=shared_experts,
+            num_local_experts=num_local_experts,
+        )
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
@@ -45,7 +55,7 @@ def build_megakernel_backend(
 def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> TransformerConfig:
     """Return the config used to construct backend-compatible shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if backend in (None, "te"):
         return config
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -59,7 +69,7 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
 def megakernel_shared_expert_init_context(config: TransformerConfig):
     """Return the backend-specific context used to construct shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if backend in (None, "te"):
         return nullcontext()
     if backend == "mok":
         from megatron.core.fp8_utils import get_fp8_disabled_context
