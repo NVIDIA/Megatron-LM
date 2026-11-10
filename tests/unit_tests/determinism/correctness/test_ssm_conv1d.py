@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
@@ -168,7 +169,8 @@ class TestMambaMixerDeterminism:
         Utils.destroy_model_parallel()
 
     @requires_deterministic_conv1d
-    def test_mixer_replays_bit_exactly(self, monkeypatch):
+    @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
+    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
         ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
@@ -178,12 +180,32 @@ class TestMambaMixerDeterminism:
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
         mixer = _build_mixer()
         hidden_size = mixer.config.hidden_size
+        micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
+        packed_seq_params = None
+        if packed_layout != "none":
+            bounds = torch.tensor([0, 256, 640, _SEQ_LEN], device="cuda", dtype=torch.int32)
+            unpadded_bounds = (
+                torch.tensor([0, 200, 500, 850], device="cuda", dtype=torch.int32)
+                if packed_layout == "padded"
+                else bounds
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=unpadded_bounds,
+                cu_seqlens_kv=unpadded_bounds,
+                cu_seqlens_q_padded=bounds if packed_layout == "padded" else None,
+                cu_seqlens_kv_padded=bounds if packed_layout == "padded" else None,
+                max_seqlen_q=384,
+                max_seqlen_kv=384,
+            )
+            # Omit total_tokens so __post_init__ leaves IDs for the mixer to infer.
+            assert packed_seq_params.seq_idx is None
         torch.manual_seed(7)
-        hidden_states = torch.randn(_SEQ_LEN, _MICRO_BATCH, hidden_size, device="cuda")
-        grad = torch.randn(_SEQ_LEN, _MICRO_BATCH, hidden_size, device="cuda")
+        hidden_states = torch.randn(_SEQ_LEN, micro_batch, hidden_size, device="cuda")
+        grad = torch.randn(_SEQ_LEN, micro_batch, hidden_size, device="cuda")
 
         def fwd_bwd():
-            output, _ = mixer(hidden_states)
+            output, _ = mixer(hidden_states, packed_seq_params=packed_seq_params)
             output.backward(grad)
             return output.detach().clone(), collect_grads([mixer])
 
@@ -197,6 +219,20 @@ class TestMambaMixerDeterminism:
         out_b, grads_b = fwd_bwd()
 
         assert_bit_exact(out_a, grads_a, out_b, grads_b)
+
+        if packed_seq_params is not None:
+            # A separately constructed reference also catches missing/wrong boundaries,
+            # even if the broken implementation would replay deterministically.
+            assert packed_seq_params.seq_idx is None
+            packed_seq_params.seq_idx = torch.tensor(
+                [[0] * 256 + [1] * 384 + [2] * 384], device="cuda", dtype=torch.int32
+            )
+            torch.cuda.synchronize()
+            restore_rng_state(state)
+            zero_grads(mixer)
+            out_explicit, grads_explicit = fwd_bwd()
+            assert torch.isfinite(out_a).all()
+            assert_bit_exact(out_a, grads_a, out_explicit, grads_explicit)
 
     @pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal_conv1d is not installed")
     def test_deterministic_mode_requires_a_deterministic_conv(self, monkeypatch):

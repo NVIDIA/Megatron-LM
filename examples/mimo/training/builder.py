@@ -4,8 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable
 
 import torch
 
@@ -22,24 +21,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
-from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.training.models.base import ModelBuilder, compose_hooks
+from megatron.training.models.mimo import MimoBuildConfig
 
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
-
-
-@dataclass(kw_only=True)
-class MimoBuildConfig(ModelConfig):
-    """Runtime-only topology used by :class:`MimoModelBuilder`.
-
-    ``_topology`` is underscore-prefixed so ``ModelConfig`` skips it during serialization;
-    only the ``builder`` ClassVar is written into the checkpoint. The builder reads parsed
-    args from the global :func:`get_args`.
-    """
-
-    builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
-    _topology: Optional[HeteroTopology] = field(default=None)
 
 
 def _resolve_role(topology: HeteroTopology):
@@ -95,11 +82,24 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             modality_submodules_spec[name] = provider.encoder_specs[name](args, pg, grid)
             special_token_ids[name] = provider_token_ids[name]
 
+        language_model_spec = provider.language_spec(
+            args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+        )
+        language_input_projections = {}
+        for name, factory in provider.language_input_projection_specs.items():
+            spec = factory(
+                args,
+                active_pg if is_language else None,
+                topology.grids[MIMO_LANGUAGE_MODULE_KEY],
+                language_model_spec,
+            )
+            if spec is not None:
+                language_input_projections[name] = spec
+
         mimo_config = MimoModelConfig(
-            language_model_spec=provider.language_spec(
-                args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
-            ),
+            language_model_spec=language_model_spec,
             modality_submodules_spec=modality_submodules_spec,
+            language_model_input_projections_spec=language_input_projections,
             special_token_ids=special_token_ids,
             module_to_grid_map=topology.grids,
         )
@@ -107,6 +107,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mimo_config,
             cp_group=active_pg.cp if is_language else None,
             tp_group=active_pg.tp if is_language else None,
+            tp_cp_group=active_pg.tp_cp if is_language else None,
         )
 
     def build_distributed_models(
@@ -143,7 +144,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             role_seed_offset = _ENCODER_SEED_OFFSET
         configure_module_rng(args, active_pg, role_seed_offset, data_parallel_random_init)
 
-        built_with_meta_device = getattr(args, "init_model_with_meta_device", False)
+        built_with_meta_device = self._model_config.transformer.init_model_with_meta_device
         if built_with_meta_device:
             with torch.device("meta"):
                 mimo_model = self.build_model(pg_collection)

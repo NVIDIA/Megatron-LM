@@ -42,9 +42,13 @@ def dynamic_media_embedding_counts(
 
 
 def dynamic_media_replacement_counts(
-    frame_embedding_counts: list[int], *, num_frames, temporal_patch_size: int
+    frame_embedding_counts: list[int],
+    *,
+    num_frames,
+    temporal_patch_size: int,
+    aggregate_videos: bool = True,
 ) -> list[int]:
-    """Map per-frame counts to one compact placeholder per image or video."""
+    """Map frame counts to one placeholder per video or temporal tubelet."""
     if num_frames is None:
         return frame_embedding_counts
 
@@ -73,7 +77,10 @@ def dynamic_media_replacement_counts(
     for frame_count in frame_groups:
         video_frame_counts = frame_embedding_counts[frame_offset : frame_offset + frame_count]
         tubelet_counts = video_frame_counts[::temporal_patch_size]
-        per_video_counts.append(sum(tubelet_counts))
+        if aggregate_videos:
+            per_video_counts.append(sum(tubelet_counts))
+        else:
+            per_video_counts.extend(tubelet_counts)
         frame_offset += frame_count
 
     return per_video_counts

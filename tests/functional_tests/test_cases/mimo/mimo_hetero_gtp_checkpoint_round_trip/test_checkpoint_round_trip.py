@@ -42,6 +42,7 @@ _ROUND_TRIP_ARGS = {
     "do_test",
     "do_train",
     "do_valid",
+    "exit_interval",
     "exit_on_missing_checkpoint",
     "iteration",
     "load",
@@ -59,6 +60,7 @@ def _run_launcher(
         "MIMO_CHECKPOINT_PADDING_MANIFEST_DIR": str(scratch / "padding-manifest"),
         "MIMO_CHECKPOINT_TEST_PRETRAIN": "1",
         "MIMO_PRETRAIN_MODULE": _MODULE,
+        "NVTE_FLASH_ATTN_V4": "0",
         "TRAIN_ITERS": "2",
         "TORCHRUN_LOG_DIR": str(scratch / f"torchrun-{name}"),
     }
@@ -66,14 +68,22 @@ def _run_launcher(
         env["MIMO_CHECKPOINT_TEST_RESAVE"] = "1"
     env.pop("NVTE_FLASH_ATTN", None)
     env.pop("NVTE_FUSED_ATTN", None)
+    placement_args = (
+        ["--mimo-run-input-projections-on-llm-ranks"]
+        if os.environ.get("MIMO_RUN_INPUT_PROJECTIONS_ON_LLM_RANKS")
+        else []
+    )
     command = [
         "bash",
         str(_LAUNCHER),
+        "--flash-attention-version",
+        "2",
         "--num-experts",
         "8",
         "--no-save-tokenizer-assets",
         "--ckpt-format",
         "torch_dist",
+        *placement_args,
         *args,
     ]
     return subprocess.run(
@@ -184,15 +194,15 @@ def _install_checkpoint_resave_hook() -> None:
             checkpointing_context=checkpointing_context,
             **kwargs,
         )
-        args = training.get_args()
+        train_state = training.get_train_state()
         unwrapped_model = unwrap_model(model)
         pg_collection = getattr(unwrapped_model[0], "pg_collection", None)
         save_checkpoint(
-            args.iteration,
+            train_state.iteration,
             model,
             optimizer,
             opt_param_scheduler,
-            args.num_floating_point_operations_so_far,
+            train_state.num_floating_point_operations_so_far,
             checkpointing_context=checkpointing_context,
             preprocess_common_state_dict_fn=training.preprocess_common_state_dict,
             tp_group=pg_collection.tp if pg_collection is not None else None,
@@ -439,6 +449,8 @@ def test_hetero_mimo_20l_checkpoint_round_trip_is_exact():
             "--save",
             str(round_trip_root),
             "--save-interval",
+            "1",
+            "--exit-interval",
             "1",
             "--load",
             str(source_root),

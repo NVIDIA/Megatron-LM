@@ -1,13 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
 
@@ -68,11 +68,9 @@ class ModalitySubmodules(ABC, nn.Module):
         self._is_first_stage: bool = is_first_stage
         self._is_last_stage: bool = is_last_stage
 
-        warnings.warn(
+        warn_single_rank(
             "ModalitySubmodules is experimental and still under active development. "
-            "The API may change without notice in future releases.",
-            category=UserWarning,
-            stacklevel=2,
+            "The API may change without notice in future releases."
         )
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):

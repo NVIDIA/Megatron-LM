@@ -22,6 +22,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -233,6 +237,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    enable_mhc = config.enable_mhc_connections
+    hyper_connection = HyperConnectionModule if enable_mhc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -259,14 +266,16 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=layer_module,
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    self_attention_hyper_connection=hyper_connection,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
+                    mlp_hyper_connection=hyper_connection,
                 ),
             )
         )

@@ -15,11 +15,17 @@ try:
         HAVE_TE,
         GTPChain,
         GTPEmbeddingWeight,
+    )
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        _chain_is_graphed as is_graphed_chain,
+    )
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         attach_gtp_to_presharded_module,
         classify_gtp_remat_chains,
         configure_gtp_remat_from_recipe,
         dequantize_gtp_native_fp8,
         get_ag_stream,
+        get_graphed_chain_ids,
         get_rs_stream,
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
@@ -28,6 +34,7 @@ try:
         initialize_graph_wgrad_rings,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        register_prefetch_chain,
         wait_async_comms,
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
@@ -65,6 +72,8 @@ __all__ = [
     "configure_gtp_remat_from_recipe",
     "dequantize_gtp_native_fp8",
     "get_ag_stream",
+    "get_graphed_chain_ids",
+    "is_graphed_chain",
     "get_rs_stream",
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
@@ -73,6 +82,7 @@ __all__ = [
     "is_gtp_param",
     "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+    "register_prefetch_chain",
     "preserve_gtp_prefetch_state",
     "set_cuda_graph_mempool",
     "track_gtp_capture_comms",

@@ -9,6 +9,7 @@ LOG_DIR="${2:?usage: $0 LEADERBOARD_DIR LOG_DIR}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_FLASH_ATTN_V4=0
 export LOG_DIR
 
 # Clear stale per-rank logs from prior runs (torchrun never overwrites).
@@ -45,6 +46,7 @@ bash "$SCRIPT_DIR/run_nsys_breakdown.sh" "$OUT" -- \
         --mock-data \
         --split 1,0,0 \
         --transformer-impl transformer_engine \
+        --flash-attention-version 2 \
         --use-mcore-models \
         --no-gradient-accumulation-fusion \
         --bf16 \

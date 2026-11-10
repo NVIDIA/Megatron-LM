@@ -2,6 +2,7 @@
 
 import copy
 from contextlib import nullcontext
+from dataclasses import replace
 
 import pytest
 import torch
@@ -10,18 +11,91 @@ from packaging import version
 from megatron.core import mpu, parallel_state
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="Requires at least two GPUs for TP=2")
+def test_mhc_full_recompute_distributed_saved_activations_tp2():
+    """Full recompute must accept view-producing mHC boundaries with distributed activations."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=16,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            transformer_impl="transformer_engine",
+            tensor_model_parallel_size=2,
+            sequence_parallel=False,
+            distribute_saved_activations=True,
+            recompute_granularity="full",
+            recompute_method="block",
+            recompute_num_layers=1,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=2,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        layer_submodules = replace(
+            get_gpt_layer_with_transformer_engine_submodules(),
+            self_attention_hyper_connection=HyperConnectionModule,
+            mlp_hyper_connection=HyperConnectionModule,
+        )
+        block = TransformerBlock(
+            config,
+            ModuleSpec(module=HyperConnectionTransformerLayer, submodules=layer_submodules),
+            post_process=False,
+        ).cuda()
+
+        hidden_states = torch.randn(
+            8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        attention_mask = torch.zeros((1, 1, 8, 8), device="cuda", dtype=torch.bool)
+        output = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.float().sum().backward()
+
+        assert output.shape == (8, 1, config.hidden_size * config.mhc_num_residual_streams)
+        assert hidden_states.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
+    """Minimal layer for testing TransformerBlock residual observation plumbing."""
+
+    def __init__(self, config, layer_number, **kwargs):
+        super().__init__()
+        self.config = config
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, **kwargs):
+        return hidden_states + 1, None
 
 
 class TestParallelTransformerBlock:
@@ -50,6 +124,26 @@ class TestParallelTransformerBlock:
         assert layer_0.layer_number == 1
         layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
         assert layer_1.layer_number == 2
+
+    @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+    def test_layer_backward_hooks_receive_activation_gradients(self, recompute_method):
+        """Both eager and recomputed layer calls expose input-gradient completion."""
+        block = self.parallel_transformer_block.cuda()
+        if recompute_method is not None:
+            block.config.recompute_granularity = "full"
+            block.config.recompute_method = recompute_method
+            block.config.recompute_num_layers = 1
+        seen = []
+
+        def check_input_gradient(_module, grad_input, _grad_output):
+            assert grad_input and grad_input[0] is not None
+            seen.append(True)
+
+        for layer in block.layers:
+            layer.register_full_backward_hook(check_input_gradient)
+        x = torch.randn(8, 2, block.config.hidden_size, device="cuda", requires_grad=True)
+        block(x, attention_mask=None).float().square().mean().backward()
+        assert seen == [True] * block.config.num_layers
 
     def test_gpu_forward(self):
         parallel_transformer_block = self.parallel_transformer_block
@@ -556,6 +650,52 @@ class TestProcessGroupTransformerBlock:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ("sequence_parallel", "expected_tp_shard_dim"), ((False, None), (True, 0))
+    )
+    def test_residual_observations_with_tensor_and_context_parallelism(
+        self, sequence_parallel, expected_tp_shard_dim
+    ):
+        if Utils.world_size % 4 != 0:
+            pytest.skip("Test requires a world size divisible by TP=2 and CP=2")
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+        )
+        block = TransformerBlock(
+            config, ModuleSpec(module=_ResidualObservationLayer), post_process=False
+        ).cuda()
+        assert block.pg_collection.tp.size() == 2
+        assert block.pg_collection.cp.size() == 2
+
+        cp_rank = block.pg_collection.cp.rank()
+        hidden_states = torch.full((8, 1, config.hidden_size), cp_rank + 1.0, device="cuda")
+        observed = []
+        with capture_tensor_observations(
+            lambda *args: observed.append(args),
+            frozenset({"residual_accumulator", "residual_contribution"}),
+        ):
+            output = block(hidden_states=hidden_states, attention_mask=None)
+
+        torch.testing.assert_close(output, hidden_states + 1)
+        assert [(value[1], value[2]) for value in observed] == [
+            ("residual_accumulator", "residual_accumulator"),
+            ("residual_contribution", "residual_contribution"),
+        ]
+        assert all(value[0] is block.layers[0] for value in observed)
+        assert [value[4] for value in observed] == [expected_tp_shard_dim, expected_tp_shard_dim]
+        assert [value[5:] for value in observed] == [(0, 1), (0, 1)]
+        torch.testing.assert_close(observed[0][3], hidden_states)
+        torch.testing.assert_close(observed[1][3], torch.ones_like(hidden_states))
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

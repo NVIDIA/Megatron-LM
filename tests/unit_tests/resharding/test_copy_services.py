@@ -296,3 +296,105 @@ def test_nccl_service_eagerly_connects_before_first_run(monkeypatch):
 
     assert group.requested_devices == [device]
     assert backend.connected_devices == [device]
+
+
+def _windowing_fixture(monkeypatch, *, rank=0, world=2):
+    """NCCL service with fakes for the process group, streams, and batch_isend_irecv."""
+    device = torch.device("cuda", rank)
+
+    class Backend:
+        def eager_connect_single_device(self, _device):
+            pass
+
+    class Group:
+        def rank(self):
+            return rank
+
+        def size(self):
+            return world
+
+        def _get_backend(self, _device):
+            return Backend()
+
+    class Stream:
+        def wait_stream(self, _stream):
+            pass
+
+    class Work:
+        def wait(self):
+            pass
+
+    calls: list[int] = []
+
+    def fake_batch_isend_irecv(ops):
+        calls.append(len(ops))
+        return [Work()]
+
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: device.index)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "batch_isend_irecv", fake_batch_isend_irecv)
+    monkeypatch.setattr(dist, "P2POp", lambda op, tensor, peer, group=None: (op, peer))
+    return NCCLCopyService(group=Group()), calls
+
+
+class _Plan:
+    def __init__(self, total_tasks, num_batches=1):
+        self.total_tasks = total_tasks
+        self.num_batches = num_batches
+
+
+class TestNCCLTaskWindows:
+    """A huge single-batch submission is issued in global task-id windows."""
+
+    def test_large_single_batch_plan_is_windowed(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 256)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        # This rank owns only the odd task ids: windows are still keyed by the
+        # global id, so the peer (owning the even ids) lands in the same windows.
+        for task_id in range(1, 600, 2):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [128, 128, 44]
+        assert not service.send_ops and not service.recv_ops
+
+    def test_small_plan_uses_one_group(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 256)
+        service.set_plan(_Plan(total_tasks=200, num_batches=1))
+        for task_id in range(200):
+            service.submit_recv(_t(), src_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [200]
+
+    def test_planner_batches_are_trusted(self, monkeypatch):
+        """Multi-batch plans already bound each run(); no extra windowing."""
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 4)
+        service.set_plan(_Plan(total_tasks=600, num_batches=20))
+        for task_id in range(30):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [30]
+
+    def test_missing_task_ids_fall_back_to_one_group(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 4)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        for _ in range(10):
+            service.submit_send(_t(), dest_rank=1, task_id=None)
+        service.run()
+        assert calls == [10]
+
+    def test_windowing_can_be_disabled(self, monkeypatch):
+        service, calls = _windowing_fixture(monkeypatch)
+        monkeypatch.setattr(NCCLCopyService, "TASK_WINDOW", 0)
+        service.set_plan(_Plan(total_tasks=600, num_batches=1))
+        for task_id in range(600):
+            service.submit_send(_t(), dest_rank=1, task_id=task_id)
+        service.run()
+        assert calls == [600]

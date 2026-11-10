@@ -5,8 +5,21 @@ from typing import Callable, ClassVar
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+
+
+@pytest.fixture(autouse=True)
+def _disable_allowlist():
+    """Allow local test-module targets when from_dict resolves encoded callables."""
+    from megatron.training.config.instantiate_utils import target_allowlist
+
+    target_allowlist.disable()
+    yield
+    target_allowlist.enable()
+
 
 # ---------------------------------------------------------------------------
 # Dummy concrete implementations
@@ -42,22 +55,26 @@ class DummySubConfig:
     y: str = "sub"
 
 
-def _dummy_callable() -> None:
+def _dummy_callable(value=None, *, sub=None) -> None:
     """Placeholder callable used as a field default in DummyNestedModelConfig."""
+
+
+class _CallbackOwner:
+    """Owns a bound method, like the optimizer whose scale_loss setup attaches."""
+
+    def scale_loss(self, loss):
+        return loss
 
 
 @dataclass
 class DummyNestedModelConfig(ModelConfig):
-    """ModelConfig subclass with a nested dataclass field and a callable field.
-
-    Used to test nested serialization and callable-field exclusion without
-    depending on MambaModelConfig or TransformerConfig.
-    """
+    """ModelConfig subclass with nested-dataclass, callable, and TransformerConfig fields."""
 
     builder: ClassVar[str] = ""  # set dynamically below
     sub: DummySubConfig = field(default_factory=DummySubConfig)
     fn_field: Callable = _dummy_callable
     extra: int = 0
+    transformer: TransformerConfig | None = None
 
 
 DummyNestedModelConfig.builder = f"{DummyModelBuilder.__module__}.DummyModelBuilder"
@@ -118,7 +135,7 @@ class TestModelConfigGetBuilderCls:
 
 
 class TestModelConfigToDict:
-    """as_dict() serializes all non-callable, non-private dataclass fields, including nested dataclasses."""
+    """as_dict() serializes non-private fields, nested dataclasses, and importable callables."""
 
     def test_target_key_present(self):
         cfg = DummyModelConfig()
@@ -142,16 +159,51 @@ class TestModelConfigToDict:
         assert "restore_modelopt_state" in result
         assert "extra_checkpoint_metadata" in result
 
-    def test_hook_lists_excluded(self):
-        cfg = DummyModelConfig()
-        result = cfg.as_dict()
-        assert "pre_wrap_hooks" not in result
-        assert "post_wrap_hooks" not in result
+    def test_runtime_fields_excluded(self):
+        """Hooks and callbacks that each run attaches are never serialized, even when encodable."""
+        runtime_fields = [
+            "timers",
+            "finalize_model_grads_func",
+            "grad_scale_func",
+            "moe_grad_scale_func",
+            "mtp_grad_scale_func",
+            "no_sync_func",
+            "grad_sync_func",
+            "param_sync_func",
+        ]
+        transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+        for name in runtime_fields:
+            setattr(transformer, name, _dummy_callable)
+        transformer.no_sync_func = [_dummy_callable, _dummy_callable]  # one per VPP chunk
+        cfg = DummyNestedModelConfig(
+            transformer=transformer,
+            pre_wrap_hooks=[_dummy_callable],
+            post_wrap_hooks=[_dummy_callable],
+        )
 
-    def test_callable_field_excluded(self):
+        result = cfg.as_dict()
+        assert "pre_wrap_hooks" not in result and "post_wrap_hooks" not in result
+        assert set(runtime_fields).isdisjoint(result["transformer"])
+        # Setup asserts no_sync_func is unset before attaching DDP's under overlap_grad_reduce.
+        assert ModelConfig.from_dict(result).transformer.no_sync_func is None
+
+    def test_callable_field_encoded(self):
+        """Module-level callables serialize as _target_/_call_ dicts (they used to be dropped)."""
         cfg = DummyNestedModelConfig()
         result = cfg.as_dict()
-        assert "fn_field" not in result
+        assert result["fn_field"] == {
+            "_target_": f"{_dummy_callable.__module__}.{_dummy_callable.__qualname__}",
+            "_call_": False,
+        }
+
+    @pytest.mark.parametrize(
+        "fn",
+        [lambda: None, _CallbackOwner().scale_loss, torch.relu],
+        ids=["lambda", "bound_method", "torch_builtin"],
+    )
+    def test_unencodable_callable_skipped(self, fn):
+        """Callables whose import path does not resolve back to them are dropped from the dict."""
+        assert "fn_field" not in DummyNestedModelConfig(fn_field=fn).as_dict()
 
     def test_nested_dataclass_serialized_recursively(self):
         cfg = DummyNestedModelConfig()
@@ -206,6 +258,12 @@ class TestModelConfigFromDict:
         with pytest.raises(ValueError):
             ModelConfig.from_dict(d)
 
+    def test_raises_if_builder_missing(self):
+        d = self._dummy_dict()
+        del d["_builder_"]
+        with pytest.raises(KeyError, match="_builder_"):
+            ModelConfig.from_dict(d)
+
     def test_round_trip_flat(self):
         original = DummyModelConfig(value=21, name="round_trip")
         cfg = ModelConfig.from_dict(original.as_dict())
@@ -221,6 +279,25 @@ class TestModelConfigFromDict:
         assert isinstance(cfg.sub, DummySubConfig)
         assert cfg.sub.x == 7
         assert cfg.sub.y == "nested"
+        # Encoded callable fields resolve back to the original function.
+        assert cfg.fn_field is _dummy_callable
+
+    def test_round_trip_partial_with_nested_dataclasses(self):
+        from functools import partial
+
+        import yaml
+
+        from megatron.training.config.yaml_utils import safe_yaml_representers
+
+        original = DummyNestedModelConfig(
+            fn_field=partial(_dummy_callable, DummySubConfig(x=7), sub=DummySubConfig(x=9))
+        )
+        with safe_yaml_representers():
+            saved = yaml.safe_load(yaml.safe_dump(original.as_dict()))
+        restored = ModelConfig.from_dict(saved)
+        assert restored.fn_field.func is _dummy_callable
+        assert restored.fn_field.args == (DummySubConfig(x=7),)
+        assert restored.fn_field.keywords == {'sub': DummySubConfig(x=9)}
 
 
 # =============================================================================
@@ -280,3 +357,68 @@ class TestComposeHooks:
 
         composed = compose_hooks([double, add_ten])
         assert composed(5) == 20  # 5 * 2 = 10, 10 + 10 = 20
+
+
+def test_mimo_builder_config_round_trip():
+    from examples.mimo.training.builder import MimoModelBuilder
+    from megatron.training.models import MimoBuildConfig
+
+    config = MimoBuildConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+        mimo_llm_world_size=2,
+        pre_wrap_hooks=[lambda models: models],
+        post_wrap_hooks=[lambda models: models],
+        _topology=object(),
+    )
+    serialized = config.as_dict()
+    restored = ModelConfig.from_dict(serialized)
+    assert isinstance(restored, MimoBuildConfig)
+    assert restored.get_builder_cls() is MimoModelBuilder
+    assert restored.mimo_llm_world_size == 2
+    assert restored.pre_wrap_hooks == []
+    assert restored.post_wrap_hooks == []
+    assert restored._topology is None
+    assert restored.as_dict() == serialized
+
+
+@pytest.mark.parametrize("spec_name", ["hybrid_stack_spec", "gated_delta_product_stack_spec"])
+@pytest.mark.parametrize("yaml_roundtrip", [False, True])
+@pytest.mark.parametrize("customized", [False, True])
+def test_hybrid_model_spec_round_trip(spec_name, yaml_roundtrip, customized):
+    from copy import deepcopy
+
+    import yaml
+
+    from megatron.core.models.hybrid import hybrid_layer_specs
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.training.config.yaml_utils import safe_yaml_representers
+    from megatron.training.models import HybridModelConfig, ModelConfig
+
+    spec = deepcopy(getattr(hybrid_layer_specs, spec_name))
+    if customized:
+        # Old YAML conversion dropped these fields and could select the default spec.
+        spec.submodules.mlp_layer.submodules.mlp.keywords["submodules"].linear_fc1 = (
+            ColumnParallelLinear
+        )
+    model_config = HybridModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        hybrid_stack_spec=spec,
+        hybrid_layer_pattern="MM",
+        seq_length=16,
+        vocab_size=128,
+    )
+    model_dict = model_config.as_dict()
+    if yaml_roundtrip:
+        with safe_yaml_representers():
+            model_dict = yaml.safe_load(yaml.safe_dump(model_dict))
+    restored = ModelConfig.from_dict(model_dict)
+    assert isinstance(
+        restored.hybrid_stack_spec.submodules.mtp_block_spec.submodules.layer_specs[0], ModuleSpec
+    )
+    assert (
+        restored.hybrid_stack_spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
+        == spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
+    )

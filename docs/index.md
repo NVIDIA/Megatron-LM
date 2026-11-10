@@ -69,12 +69,14 @@ user-guide/deterministic-training
 user-guide/features/moe
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
+user-guide/features/checkpoint-merge
 user-guide/features/optimizer_cpu_offload
 user-guide/features/fine_grained_activation_offloading
 user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}
@@ -104,6 +106,7 @@ user-guide/observability/extending
 :caption: Developer Guide
 
 developer/contribute
+developer/parallel-state-deprecation
 developer/submit
 developer/oncall
 developer/generate_docs

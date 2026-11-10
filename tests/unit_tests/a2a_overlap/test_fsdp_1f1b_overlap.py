@@ -8,6 +8,7 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -49,6 +50,7 @@ class TestFSDP1F1BOverlap:
         set_streams()
 
     def teardown_method(self, method):
+        PipelineOffloadManager.reset_instance()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")

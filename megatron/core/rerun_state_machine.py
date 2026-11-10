@@ -8,8 +8,9 @@ import os
 import random
 import re
 from collections import defaultdict
+from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -206,6 +207,11 @@ class RerunStateMachine:
         # Request to resume normal execution when no HW fault was detected.
         self.continue_requested: bool = False
         self.logged_sdc_enabled: bool = False
+        # None means validation runs immediately. During CUDA graph capture, a list
+        # (initially empty) records tensor snapshots and validation arguments for
+        # host-side validation after replay.
+        self._captured_validation_calls: Optional[list[dict]] = None
+        self._deferred_validations: dict[str, list[dict]] = {}
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
         self.validation_counts: dict[Caller, int] = defaultdict(int)
@@ -461,6 +467,35 @@ class RerunStateMachine:
             return False, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         return False, False, 0
 
+    @contextmanager
+    def capture_deferred_validations(self, key: str) -> Iterator[None]:
+        """Record validations for a graph, replacing any previous capture under ``key``.
+
+        Capture the value at its original validation site, before later in-place
+        operations can change it. Call ``run_deferred_validations(key)`` after each
+        replay, before deciding whether to rerun or update the optimizer.
+        """
+        if self._captured_validation_calls is not None:
+            raise RuntimeError("Result-validation capture cannot be nested")
+        self._deferred_validations[key] = []
+        self._captured_validation_calls = self._deferred_validations[key]
+        try:
+            yield
+        except BaseException:
+            self.clear_deferred_validations(key)
+            raise
+        finally:
+            self._captured_validation_calls = None
+
+    def run_deferred_validations(self, key: str) -> None:
+        """Validate replayed snapshots without allowing later replays to overwrite saved results."""
+        for validation in self._deferred_validations.get(key, []):
+            self.validate_result(**{**validation, "result": validation["result"].clone()})
+
+    def clear_deferred_validations(self, key: str) -> None:
+        """Release the snapshots and callbacks owned by a graph that is being reset."""
+        self._deferred_validations.pop(key, None)
+
     def validate_result(
         self,
         result: Any,
@@ -513,6 +548,21 @@ class RerunStateMachine:
         - an expected result is detected by rerunning the iteration on a different GPU and
           verifying the result is the same.
         """
+
+        if self._captured_validation_calls is not None:
+            if not isinstance(result, torch.Tensor) or not result.is_cuda:
+                raise TypeError("Full-graph result validation requires a CUDA tensor result")
+            self._captured_validation_calls.append(
+                dict(
+                    result=result.detach().clone(),
+                    rejection_func=rejection_func,
+                    message=message,
+                    comparison_func=comparison_func,
+                    tolerance=tolerance,
+                    fatal=fatal,
+                )
+            )
+            return
 
         # If reruns are disabled, still validate the result and throw a RuntimeError if it is
         # rejected when fatal. This is a backward-compatible behavior for infs and NaNs.

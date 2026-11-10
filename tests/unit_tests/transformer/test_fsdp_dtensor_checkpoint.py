@@ -783,6 +783,7 @@ class _MTPLayer(torch.nn.Module):
     def __init__(self, mtp_layer_pattern=None):
         super().__init__()
         self.mtp_layer_pattern = mtp_layer_pattern
+        self.is_hybrid_mtp = mtp_layer_pattern is not None
         self.mtp_model_layer = torch.nn.Module()
 
 

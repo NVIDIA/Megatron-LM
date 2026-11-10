@@ -52,6 +52,7 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
@@ -65,7 +66,10 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
     actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs)
     expected_unweighted = squared_relu(x)
-    expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
+    # The kernel reproduces the fused training op (use_fused_weighted_squared_relu=True),
+    # which keeps the square in FP32 and rounds to BF16 once. Eager ops would round the
+    # square to BF16 first and land one ULP away for some elements.
+    expected = weighted_squared_relu(x, probs.unsqueeze(1))
 
     assert torch.equal(unweighted, expected_unweighted)
     assert torch.equal(actual, expected)
@@ -130,6 +134,61 @@ def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
     expected = weighted_clamped_squared_relu(x, probs.unsqueeze(1), clamp_scale)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("clamp_scale", [None, 16.0])
+@pytest.mark.parametrize(
+    "rows,n_used,hidden", [(1, 1, 1856), (37, 37, 1856), (300, 129, 1856), (256, 256, 2688)]
+)
+def test_batch_invariant_squared_relu_quantize_matches_unfused(rows, n_used, hidden, clamp_scale):
+    """The fused BI activation + MXFP8 quantize kernel is bitwise the two-kernel sequence.
+
+    Covers alignment-padding rows (permutation map -1), rows past n_used, magnitudes across
+    the whole BF16 range (MXFP8 scale saturation, subnormals) and signed zeros.
+    """
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu
+    from megatron.core.inference.moe.batch_invariant import (
+        squared_relu_with_probs,
+        squared_relu_with_probs_quantize_mxfp8,
+    )
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    torch.manual_seed(rows * 7 + n_used)
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.float32)
+    x = x * torch.exp2(torch.randint(-60, 60, (rows, hidden // 32, 1), device="cuda")).repeat(
+        1, 1, 32
+    ).view(rows, hidden)
+    x = x.to(torch.bfloat16)
+    x[0, :32] = 0.0
+    x[0, 32:64] = -0.0
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+    permutation_map[1::5] = -1
+    n_used_t = _vt(n_used)
+
+    unfused = _quantize_mxfp8_used_rows(
+        squared_relu_with_probs(
+            x, permutation_map, n_used_t, probs, clamp_scale, zero_padding=True
+        ),
+        n_used_t,
+    )
+    fused = squared_relu_with_probs_quantize_mxfp8(x, permutation_map, n_used_t, probs, clamp_scale)
+
+    assert torch.equal(
+        fused.data[:n_used].view(torch.uint8), unfused.data[:n_used].view(torch.uint8)
+    )
+    assert torch.equal(fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8))
+
+    if clamp_scale is None:
+        # Live rows also match quantizing training's fused weighted squared ReLU output.
+        live = (permutation_map[:n_used] >= 0).nonzero().flatten()
+        expected = weighted_squared_relu(x, probs.unsqueeze(1))
+        expected[permutation_map < 0] = 0
+        reference = _quantize_mxfp8_used_rows(expected, n_used_t)
+        assert torch.equal(
+            fused.data[live].view(torch.uint8), reference.data[live].view(torch.uint8)
+        )
+        assert torch.equal(fused.scale.view(torch.uint8), reference.scale.view(torch.uint8))
 
 
 @pytest.mark.internal
@@ -200,6 +259,35 @@ class TestComputeLocalTokensPerExpert:
         )
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         assert result.sum().item() == local_mask.sum().item()
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_counts_into_caller_zeroed_buffer(self, persistent):
+        """A caller-zeroed counter buffer is filled in place and returned."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        routing_map = torch.randint(0, 32, (64, 6), device="cuda")
+        counts = torch.zeros(8, dtype=torch.int32, device="cuda")
+        result = compute_local_tokens_per_expert(
+            routing_map, 8, 8, _vt(64), persistent=persistent, pre_initialized_output_buffer=counts
+        )
+        assert result is counts
+        expected = _ref_tokens_per_expert(routing_map, 8, 8)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
+    def test_rejects_invalid_counter_buffer(self, invalid):
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        counts = {
+            "shape": torch.zeros(7, dtype=torch.int32, device="cuda"),
+            "dtype": torch.zeros(8, dtype=torch.int64, device="cuda"),
+            "stride": torch.zeros(16, dtype=torch.int32, device="cuda")[::2],
+        }[invalid]
+        routing_map = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
+        with pytest.raises(AssertionError):
+            compute_local_tokens_per_expert(
+                routing_map, 0, 8, _vt(4), pre_initialized_output_buffer=counts
+            )
 
 
 @pytest.mark.internal
@@ -338,6 +426,56 @@ class TestPermuteTokens:
         real_mask = perm_map_used >= 0
         assert padding_mask.sum() > 0, "Expected some padding rows with large alignment"
         assert real_mask.sum() > 0, "Expected some real rows"
+
+    def test_zero_padding_rows_for_grouped_gemm(self):
+        """The MXFP8 path materializes zeros while empty experts stay at zero rows."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        num_tokens, hidden_dim, num_experts = 19, 64, 4
+        hidden = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, 2, device="cuda", dtype=torch.float32)
+        # Expert 3 is deliberately absent; the other counts are not 128-aligned.
+        routing_map = torch.tensor(
+            [[token % 3, (token + 1) % 3] for token in range(num_tokens)],
+            device="cuda",
+            dtype=torch.int64,
+        )
+
+        permuted, _, permutation_map, offsets = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=128,
+            row_alignment=128,
+            zero_padding=True,
+        )
+
+        n_used = offsets[-1].item()
+        padding_mask = permutation_map[:n_used] == -1
+        assert padding_mask.any()
+        assert torch.count_nonzero(permuted[:n_used][padding_mask]) == 0
+
+        splits = torch.cat((offsets[:1], offsets[1:] - offsets[:-1]))
+        assert splits.tolist() == [128, 128, 128, 0]
+
+    @pytest.mark.parametrize("activation", ["squared_relu", "swiglu"])
+    def test_activation_zeroes_grouped_gemm_padding(self, activation):
+        """FC2 quantization sees zeros for every aligned padding row."""
+        from megatron.core.inference.moe.activations import padded_squared_relu, padded_swiglu
+
+        rows, width, real_rows = 256, 64, 13
+        permutation_map = torch.full((rows,), -1, device="cuda", dtype=torch.int32)
+        permutation_map[:real_rows] = torch.arange(real_rows, device="cuda", dtype=torch.int32)
+        input_width = 2 * width if activation == "swiglu" else width
+        x = torch.randn(rows, input_width, device="cuda", dtype=torch.bfloat16)
+        func = padded_swiglu if activation == "swiglu" else padded_squared_relu
+
+        output = func(x, permutation_map, _vt(rows), zero_padding=True)
+
+        assert torch.count_nonzero(output[real_rows:]) == 0
 
     @pytest.mark.parametrize(
         "num_tokens,topk,num_experts", [(16, 2, 4), (32, 4, 8), (64, 6, 16), (128, 8, 128)]

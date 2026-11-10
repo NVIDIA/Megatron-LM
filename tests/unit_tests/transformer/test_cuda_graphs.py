@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import inspect
 import os
 import sys
 
@@ -11,6 +12,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -42,6 +44,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     create_cudagraphs,
     delete_cuda_graphs,
+    is_graph_warmup,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -56,12 +59,14 @@ from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version
 from megatron.training import arguments as training_arguments
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -94,6 +99,142 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+@pytest.mark.parametrize("has_te_modules", [False, True])
+@pytest.mark.parametrize("failure_phase", ["before_capture", "capture", "warmup", None])
+def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failure_phase):
+    """Propagate capture errors while restoring only the state started by this call."""
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", False)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [object()])
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_CAPTURING", False)
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_WARMUP", False)
+    monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_te_capture_started", False)
+    te_events = []
+    monkeypatch.setattr(
+        cuda_graphs_module, "te_set_capture_start", lambda: te_events.append("start")
+    )
+    monkeypatch.setattr(cuda_graphs_module, "te_set_capture_end", lambda: te_events.append("end"))
+    # Configuration alone must not cause the outer cleanup to unfreeze GC.
+    monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", True)
+    gc_events = []
+    monkeypatch.setattr(gc, "unfreeze", lambda: gc_events.append("unfreeze"))
+    original_save = torch.autograd.function.FunctionCtx.save_for_backward
+    capture_error = RuntimeError("injected capture failure")
+
+    def capture(cls):
+        cls._enable_saved_tensors_observer()
+        if failure_phase == "before_capture":
+            raise capture_error
+        cuda_graphs_module._set_capture_start()
+        if has_te_modules:
+            cuda_graphs_module.te_set_capture_start()
+            cls._te_capture_started = True
+        if failure_phase == "warmup":
+            cuda_graphs_module._set_warmup_start()
+        if failure_phase is not None:
+            raise capture_error
+        cuda_graphs_module._set_capture_end()
+        if has_te_modules:
+            cuda_graphs_module.te_set_capture_end()
+            cls._te_capture_started = False
+        return "captured"
+
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_create_cudagraphs", classmethod(capture))
+    if failure_phase is None:
+        assert create_cudagraphs() == "captured"
+    else:
+        with pytest.raises(RuntimeError, match="injected capture failure") as exc_info:
+            create_cudagraphs()
+        assert exc_info.value is capture_error
+
+    assert not cuda_graphs_module.is_graph_capturing()
+    assert not cuda_graphs_module.is_graph_warmup()
+    expected_te_events = (
+        ["start", "end"] if has_te_modules and failure_phase != "before_capture" else []
+    )
+    assert te_events == expected_te_events
+    assert not _CudagraphGlobalRecord._te_capture_started
+    assert gc_events == []
+    assert _CudagraphGlobalRecord._saved_tensors_observer is None
+    assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+
+class TestCudaGraphSavedTensorObserver:
+    @pytest.fixture
+    def record(self):
+        # Exercise the real observer without sharing the process-global graph records.
+        class Record(_CudagraphGlobalRecord):
+            cudagraph_created = False
+            cudagraph_record = []
+            _saved_tensors_observer = None
+
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        try:
+            yield Record
+        finally:
+            Record._disable_saved_tensors_observer()
+            assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+    @pytest.mark.parametrize("save_view", [False, True])
+    def test_empty_create_preserves_observer_for_later_training(self, record, save_view):
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+
+        # GRPO computes old/reference logprobs with forward-only schedules before
+        # its first training forward records any CUDA graphs.
+        for _ in range(2):
+            assert record.create_cudagraphs() is None
+            assert record._saved_tensors_observer is not None
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+
+        class SaveInput(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, value):
+                # TE 2.20 saves an input view; TE 2.21 saves the input directly.
+                ctx.save_for_backward(value.view(-1, 3) if save_view else value)
+                return value * 2
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output * 2
+
+        value = torch.ones(2, 3, requires_grad=True)
+        output = SaveInput.apply(value)
+        assert value.cg_buffer_metadata.is_saved_for_backward
+        assert (output.grad_fn.saved_tensors[0] is value) is not save_view
+
+    @pytest.mark.parametrize("capture_fails", [False, True])
+    def test_capture_restores_observer_on_success_or_failure(
+        self, record, monkeypatch, capture_fails
+    ):
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record.cudagraph_record = [object()]
+        capture_stats = {"time": 1.0}
+
+        def capture(cls):
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+            value = torch.ones(2, 3)
+            torch.autograd.function.FunctionCtx().save_for_backward(value)
+            assert value.cg_buffer_metadata.is_saved_for_backward
+            if capture_fails:
+                raise RuntimeError("capture failed")
+            cls.cudagraph_created = True
+            cls.cudagraph_record = []
+            return capture_stats
+
+        monkeypatch.setattr(record, "_create_cudagraphs", classmethod(capture))
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                record.create_cudagraphs()
+        else:
+            assert record.create_cudagraphs() is capture_stats
+
+        assert record._saved_tensors_observer is None
+        assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -591,7 +732,7 @@ class TestPackedSeqCudagraphs:
         )
 
     @pytest.mark.parametrize("cp_size", [1, 2])
-    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+    def test_thd_capture_with_pad_between_seqs(self, cp_size, monkeypatch):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         model_parallel_cuda_manual_seed(123)
@@ -616,6 +757,9 @@ class TestPackedSeqCudagraphs:
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
         block.train()
+        # GRPO's forward-only logprob schedules request graph creation before the
+        # first training forward. This must preserve saved-tensor lifetime tracking.
+        create_cudagraphs()
         # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
         for param in block.parameters():
             param.main_grad = torch.zeros_like(param)
@@ -668,8 +812,51 @@ class TestPackedSeqCudagraphs:
         assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
 
-        # This is the primary function under test.
-        create_cudagraphs()
+        # Graph warmup must see the recorded offsets, not zero-filled placeholders:
+        # TE's THD context-parallel backward indexes with them and asserts out of bounds on zeros.
+        # Resolved by TransfomerEngine#3205.
+        warmup_offsets = []
+        attention_forward = TEDotProductAttention.forward
+
+        def recording_forward(module, *args, **kwargs):
+            if is_graph_warmup():
+                bound = inspect.signature(attention_forward).bind(module, *args, **kwargs)
+                params = bound.arguments["packed_seq_params"]
+                warmup_offsets.append(
+                    (params.cu_seqlens_q.clone(), params.cu_seqlens_q_padded.clone())
+                )
+            return attention_forward(module, *args, **kwargs)
+
+        monkeypatch.setattr(TEDotProductAttention, "forward", recording_forward)
+
+        # Reproduce the stale AccumulateGrad stream failure without inheriting an override
+        # enabled by an earlier test. Keep the eager graph alive through backward capture.
+        set_override = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+        if set_override is None:
+            create_cudagraphs()
+        else:
+            override_calls = []
+
+            def tracked_override(enabled):
+                override_calls.append(enabled)
+                return set_override(enabled)
+
+            set_override(False)
+            try:
+                with monkeypatch.context() as capture_patch:
+                    capture_patch.setattr(
+                        torch.autograd.graph, "set_override_stale_capture_stream", tracked_override
+                    )
+                    create_cudagraphs()
+                assert override_calls == [True]
+            finally:
+                # Preserve MCore's enabled policy even if this regression test fails.
+                set_override(True)
+
+        assert warmup_offsets
+        for cu_seqlens, cu_seqlens_padded in warmup_offsets:
+            assert torch.equal(cu_seqlens, packed_seq_params.cu_seqlens_q)
+            assert torch.equal(cu_seqlens_padded, packed_seq_params.cu_seqlens_q_padded)
 
         runners = []
         for layer in block.layers:
@@ -1141,6 +1328,200 @@ _unique_buffer_counts = {}
 
 
 class TestTECudaGraphHelper:
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
+    def test_scheduler_thd_replay_preserves_pipeline_inputs(
+        self, monkeypatch, pp_size, cp_size, chunks
+    ):
+        """Changing packed microbatch counts must preserve outputs and every gradient."""
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+            set_current_microbatch,
+        )
+        from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
+            virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+        )
+        # Match training initialization: DDP keeps AccumulateGrad nodes alive,
+        # so construct and warm up on the non-default training stream.
+        training_stream = torch.cuda.Stream()
+        training_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(training_stream):
+            monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+            monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+            monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            model_parallel_cuda_manual_seed(321)
+            init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=4,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                decrease_batch_size_if_needed=False,
+            )
+            config = TransformerConfig(
+                num_layers=pp_size * chunks,
+                hidden_size=64,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_thd_max_packed_sequences=4,
+                cuda_graph_modules=[CudaGraphModule.attn],
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32 // cp_size,
+                pad_packed_seq_alignment="max",
+                cuda_graph_warmup_steps=1,
+                use_te_rng_tracker=True,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                pipeline_dtype=torch.bfloat16,
+                pipeline_model_parallel_size=pp_size,
+                context_parallel_size=cp_size,
+                virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+                microbatch_group_size_per_vp_stage=2,
+                attention_backend=AttnBackend.fused,
+                deterministic_mode=True,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+            )
+            models = []
+            for chunk in range(chunks):
+                model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                    vocab_size=128,
+                    max_sequence_length=32,
+                    parallel_output=True,
+                    position_embedding_type="rope",
+                    vp_stage=chunk if chunks > 1 else None,
+                ).cuda()
+                models.append(
+                    DistributedDataParallel(
+                        config,
+                        DistributedDataParallelConfig(),
+                        model,
+                        disable_bucketing=True,
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    )
+                )
+            helper = TECudaGraphHelper(models, config, 32, 1, optimizers=[])
+            rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
+            physical = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device="cuda")
+            packed = []
+            for valid_end in (32, 24):
+                valid = physical.clone()
+                valid[-1] = valid_end
+                packed.append(
+                    PackedSeqParams(
+                        qkv_format="thd",
+                        cu_seqlens_q=valid,
+                        cu_seqlens_kv=valid.clone(),
+                        cu_seqlens_q_padded=physical,
+                        cu_seqlens_kv_padded=physical.clone(),
+                        max_seqlen_q=32,
+                        max_seqlen_kv=32,
+                        pad_between_seqs=True,
+                    )
+                )
+            inputs, expected, expected_params = {}, {}, {}
+            for chunk, callables in enumerate(helper.callables_per_chunk):
+                layer = callables[0]
+                for mb in range(4):
+                    hidden = torch.randn(
+                        32 // cp_size,
+                        1,
+                        64,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                        requires_grad=True,
+                    )
+                    inputs[chunk, mb] = hidden.detach().clone()
+                    output, _ = layer(
+                        hidden,
+                        attention_mask=None,
+                        rotary_pos_emb=rotary,
+                        packed_seq_params=packed[mb % 2],
+                    )
+                    value = output.detach().clone()
+                    valid_tokens = (24 if mb % 2 else 32) // cp_size
+                    output[:valid_tokens].float().sum().backward()
+                    expected[chunk, mb] = value, hidden.grad.detach().clone()
+                    if mb in (1, 3):
+                        expected_params[chunk, mb + 1] = {
+                            name: param.main_grad.detach().clone()
+                            for name, param in layer.named_parameters()
+                            if param.requires_grad
+                        }
+                models[chunk].zero_grad_buffer()
+            del hidden, output
+            try:
+                helper.create_cudagraphs()
+                assert helper.graphs_created()
+                assert helper.num_microbatches == (1 if pp_size == 1 else 4)
+                for count in (4, 2, 4):
+                    _, _, warmup, _ = get_pp_rank_microbatches(
+                        count, chunks, 2, p2p_communicator=helper.p2p_communicator
+                    )
+                    order = convert_schedule_table_to_order(
+                        warmup, chunks, get_schedule_table(count, chunks, 2)
+                    )
+                    forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
+                    for entry in order:
+                        chunk = abs(entry) - 1
+                        layer = helper.callables_per_chunk[chunk][0]
+                        if entry > 0:
+                            mb = forwards[chunk]
+                            forwards[chunk] += 1
+                            set_current_microbatch(models[chunk], mb)
+                            hidden = inputs[chunk, mb].clone().requires_grad_(True)
+                            output, _ = layer(
+                                hidden,
+                                attention_mask=None,
+                                rotary_pos_emb=rotary,
+                                packed_seq_params=packed[mb % 2],
+                            )
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
+                            torch.testing.assert_close(
+                                output[:valid_tokens],
+                                expected[chunk, mb][0][:valid_tokens],
+                                msg=f"output count={count} chunk={chunk} mb={mb}",
+                            )
+                            pending[chunk, mb] = hidden, output
+                        else:
+                            mb = backwards[chunk]
+                            backwards[chunk] += 1
+                            hidden, output = pending.pop((chunk, mb))
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
+                            output[:valid_tokens].float().sum().backward()
+                            torch.testing.assert_close(
+                                hidden.grad,
+                                expected[chunk, mb][1],
+                                msg=f"input grad count={count} chunk={chunk} mb={mb}",
+                            )
+                    assert not pending
+                    for chunk, callables in enumerate(helper.callables_per_chunk):
+                        actual = {
+                            name: param.main_grad
+                            for name, param in callables[0].named_parameters()
+                            if param.requires_grad
+                        }
+                        assert actual.keys() == expected_params[chunk, count].keys()
+                        for name, grad in actual.items():
+                            torch.testing.assert_close(
+                                grad,
+                                expected_params[chunk, count][name],
+                                msg=f"parameter {name} count={count} chunk={chunk}",
+                            )
+                        models[chunk].zero_grad_buffer()
+            finally:
+                if helper.graphs_created():
+                    helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(training_stream)
+
     def setup_method(self, method):
         # Initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -1449,6 +1830,7 @@ class TestPartialCudaGraph:
         **config_kwargs,
     ):
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -1465,7 +1847,7 @@ class TestPartialCudaGraph:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -1487,7 +1869,6 @@ class TestPartialCudaGraph:
         args = parse_args()
         args.num_layers = 4
         args.mtp_num_layers = 1
-        args.vocab_size = 1024
         args.hidden_size = 512
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -1539,7 +1920,9 @@ class TestPartialCudaGraph:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.vocab_size = 1024
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size, cp_size):
@@ -1554,7 +1937,14 @@ class TestPartialCudaGraph:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self, ep_size, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, **kwargs
+        self,
+        ep_size,
+        cuda_graph_impl,
+        cuda_graph_modules,
+        cuda_graph_warmup_steps,
+        padding_mask=None,
+        mlp_chunks_for_training=1,
+        **kwargs,
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
@@ -1568,11 +1958,16 @@ class TestPartialCudaGraph:
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size, self.cp_size
         )
+        if padding_mask is not None:
+            loss_mask = loss_mask * (~padding_mask).to(loss_mask.dtype)
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+        if mlp_chunks_for_training > 1:
+            # Not a training argument; the layers read it from the shared TransformerConfig.
+            gpt_model[0].config.mlp_chunks_for_training = mlp_chunks_for_training
 
         if cuda_graph_impl == "transformer_engine":
             self.cuda_graph_helper = TECudaGraphHelper(
@@ -1592,6 +1987,19 @@ class TestPartialCudaGraph:
             # Capture CUDA graphs after warmup if helper is provided
             if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
                 self.cuda_graph_helper.create_cudagraphs()
+                if padding_mask is not None:
+                    # Eager warmup routed with a mask, so every graphed MoE router must have
+                    # reserved a padding_mask graph input of the batch-first mask shape as the
+                    # layer sees it: GPTModel scatters the mask along the sequence under
+                    # sequence parallelism before the decoder block.
+                    expected_shape = list(padding_mask.shape)
+                    if args.sequence_parallel:
+                        expected_shape[1] //= args.tensor_model_parallel_size
+                    for layer in get_attr_wrapped_model(gpt_model[0], "decoder").layers:
+                        if layer._moe_router_in_cuda_graph():
+                            assert layer._cuda_graph_padding_mask_shape == tuple(
+                                expected_shape
+                            ), layer.layer_number
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -1600,6 +2008,7 @@ class TestPartialCudaGraph:
                 attention_mask=attention_mask,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
             )
 
             # Check output shapes
@@ -1728,6 +2137,104 @@ class TestPartialCudaGraph:
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
         if moe_dispatcher_type in ("ncclep", "ncclep_fp8"):
+            from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+
+            nccl_ep_finalize()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        "moe_dispatcher_type,mlp_chunks",
+        [("alltoall", 1), ("alltoall", 2), ("hybridep", 1), ("ncclep", 1)],
+        ids=["alltoall", "alltoall-chunked", "hybridep", "ncclep"],
+    )
+    def test_moe_partial_cudagraph_padding_mask(self, moe_dispatcher_type, mlp_chunks):
+        """Graphed routing must see the MoE padding mask exactly like eager routing.
+
+        Eager warmup records the mask shape, TE capture reserves a padding_mask graph input for
+        every graphed MoE router (whether or not attention is graphed too), and replay feeds the
+        real mask. The loss trajectory must match the eager run bit for bit. With MLP chunking the
+        layer splits the mask per chunk, so the reserved graph input must still be the whole-layer
+        mask (checked at capture); that case graphs the whole layer, which is where the chunk loop
+        runs inside the graph. Whole-layer graphs with MLP chunking are not bit-exact against
+        eager even without a mask (pre-existing), so the chunked case only checks capture/replay.
+        """
+        ep_size = 4
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            expert_model_parallel_size=ep_size,
+        )
+
+        extra_kwargs = {}
+        if moe_dispatcher_type == "hybridep":
+            if not is_hybrid_ep_available():
+                pytest.skip("Hybrid EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        elif moe_dispatcher_type == "ncclep":
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+        else:
+            extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if mlp_chunks > 1:
+            # The chunked case graphs the whole layer, which a dropless dispatcher cannot do (its
+            # dispatch syncs token counts to the host); use drop-and-pad for both runs.
+            extra_kwargs["moe_expert_capacity_factor"] = 1.0
+            extra_kwargs["moe_pad_expert_input_to_capacity"] = True
+
+        # Batch-first mask matching input_ids: pad the tail of the second sample.
+        seq_per_cp = self.seq_length // self.cp_size
+        padding_mask = torch.zeros((self.micro_batch_size, seq_per_cp), dtype=torch.bool).cuda()
+        padding_mask[1, seq_per_cp // 2 :] = True
+
+        loss_list_ref = None
+        if mlp_chunks == 1:
+            loss_list_ref = self._run_test_helper(
+                ep_size, "none", None, 0, padding_mask=padding_mask, **extra_kwargs
+            )
+        if mlp_chunks > 1:
+            # Whole-layer graph: eager warmup chunks the MLP, capture must reserve the unchunked
+            # [b, s] mask (a chunk-shaped input fails at capture with a mask/token-count mismatch).
+            cuda_graph_modules_list = [None]
+        else:
+            cuda_graph_modules_list = [
+                # Attention eager: replay used to reset kwargs and drop the mask.
+                [CudaGraphModule.mlp, CudaGraphModule.moe_router],
+                # Attention graphed: the mask reached TE but was not a captured input.
+                [
+                    CudaGraphModule.attn,
+                    CudaGraphModule.mlp,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                ],
+            ]
+        for cuda_graph_modules in cuda_graph_modules_list:
+            loss_list = self._run_test_helper(
+                ep_size,
+                "transformer_engine",
+                cuda_graph_modules,
+                3,
+                padding_mask=padding_mask,
+                mlp_chunks_for_training=mlp_chunks,
+                **extra_kwargs,
+            )
+            if loss_list_ref is not None:
+                assert torch.equal(loss_list, loss_list_ref), cuda_graph_modules
+
+        if moe_dispatcher_type == "hybridep":
+            reset_hybrid_ep_buffer()
+        if moe_dispatcher_type == "ncclep":
             from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
             nccl_ep_finalize()

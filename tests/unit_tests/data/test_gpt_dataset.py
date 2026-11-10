@@ -190,5 +190,62 @@ def test_inter_document_masking():
     assert "cu_seqlens" in sample
 
 
+def test_mask_cache_does_not_leak_padding():
+    """A sample's loss_mask must not depend on which sample was served first.
+
+    The mask cache is populated with the first sample's mask, which is then masked
+    in place for that sample's padding. Caching the tensor itself rather than a copy
+    bakes that padding into every subsequent sample, so a dataset instance whose
+    first served sample is padded returns wrong masks from then on.
+    """
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    def build_dataset():
+        config = GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=1024,
+            split="990,10,0",
+            # All three False is what makes the masks cacheable.
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            create_attention_mask=False,
+            # Keeps the padded trailing sequence, which is what poisons the cache.
+            drop_last_partial_validation_sequence=False,
+            add_extra_token_to_sequence=False,
+            tokenizer=tokenizer,
+            mid_level_dataset_surplus=0.005,
+        )
+        return BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [0, None, 0], lambda: True, config
+        ).build()[1]
+
+    # An instance served in index order, so the cache is filled by an unpadded sample.
+    expected = build_dataset()[0]["loss_mask"]
+
+    dataset = build_dataset()
+    assert dataset.masks_and_position_ids_are_cacheable, "config no longer uses the cache"
+
+    # Serve the padded trailing sequence first, filling the cache from it. Asserting
+    # that it really is padded keeps the comparison below from passing vacuously.
+    padded_index = int(dataset.shuffle_index.argmax())
+    padded_mask = dataset[padded_index]["loss_mask"]
+    assert int((padded_mask == 0).sum()) > 1, f"index {padded_index} is no longer padded"
+
+    assert torch.equal(
+        dataset[0]["loss_mask"], expected
+    ), "padding from the first served sample leaked into a later sample's loss_mask"
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()

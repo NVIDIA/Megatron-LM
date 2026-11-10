@@ -1,7 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
-from unittest.mock import MagicMock
+import pickle
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -133,6 +137,353 @@ def test_hf_tokenizer():
     assert tokenizer.tokenize("<TEST_BOS><TEST_EOS>") == [128257, 128256]
     assert tokenizer.detokenize([3, 4, 5]) == "$%&"
     assert tokenizer.vocab_size == 128258
+
+
+@pytest.fixture
+def gigatoken_hf_pair(tmp_path: Path) -> tuple[HuggingFaceTokenizer, HuggingFaceTokenizer]:
+    pytest.importorskip("gigatoken")
+    from tokenizers import (  # type: ignore[import-untyped]
+        Tokenizer,
+        decoders,
+        models,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        ["Invoice 1234567 café 中文 ١٢٣٤٥٦٧ hello assistant user tool"] * 4,
+        trainers.BpeTrainer(
+            vocab_size=320,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=["<pad>", "<eos>", "<extra>"],
+            show_progress=False,
+        ),
+    )
+    backend.post_processor = processors.TemplateProcessing(
+        single="<extra> $A <eos>",
+        special_tokens=[(t, backend.token_to_id(t)) for t in ("<extra>", "<eos>")],
+    )
+    hf = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        pad_token="<pad>",
+        eos_token="<eos>",
+        model_input_names=["input_ids", "attention_mask"],
+    )
+    hf.add_special_tokens({"additional_special_tokens": ["<extra>"]})
+    hf.add_tokens(["<ordinary>"])
+    hf.chat_template = (
+        "{% for m in messages %}{{ m.role }}:{{ m.content }}<eos>{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    hf.save_pretrained(tmp_path)
+    baseline = HuggingFaceTokenizer(str(tmp_path), include_special_tokens=False)
+    native = HuggingFaceTokenizer(str(tmp_path), include_special_tokens=False, use_gigatoken=True)
+    return baseline, native
+
+
+def test_gigatoken_user_text_and_special_filtering(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    texts = ["Invoice 1234567", "x<eos>12345<extra>y", "<ordinary> café 中文 ١٢٣٤٥٦٧"]
+    with patch.object(
+        native.tokenizer._split_special_tokenizer.tokenizer,
+        "encode",
+        wraps=native.tokenizer._split_special_tokenizer.tokenizer.encode,
+    ) as encode:
+        for include_special_tokens in (False, True):
+            hf.include_special_tokens = native.include_special_tokens = include_special_tokens
+            for text in texts:
+                assert native.text_to_ids(text) == hf.text_to_ids(text)
+                assert (
+                    native.tokenizer(
+                        text,
+                        add_special_tokens=native.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                    == hf.tokenizer(
+                        text,
+                        add_special_tokens=hf.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                )
+                for remove in (False, True):
+                    ids = hf.text_to_ids(text)
+                    assert native.ids_to_text(ids, remove) == hf.ids_to_text(ids, remove)
+        assert encode.call_count > 0
+
+
+@pytest.mark.parametrize(
+    "character",
+    ["\u0295", "\ua7cf", "\u1acf", "\U00011de0", "\U00016ff4", "\U0002b73a", "\U00033479"],
+)
+def test_gigatoken_unicode_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], character: str
+) -> None:
+    hf, native = gigatoken_hf_pair
+    with (
+        patch.object(native.tokenizer, "_gigatoken") as encode,
+        patch.object(native.tokenizer, "_split_special_tokenizer") as split_encode,
+    ):
+        for include in (False, True):
+            hf.include_special_tokens = native.include_special_tokens = include
+            for offset in (0, 15, 16, 31, 32, 63, 64):
+                text = "x" * offset + f"aa{character}bb 12345{character}6789 <extra><ordinary>"
+                assert native.text_to_ids(text) == hf.text_to_ids(text)
+                assert (
+                    native.tokenizer(
+                        text,
+                        add_special_tokens=native.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                    == hf.tokenizer(
+                        text,
+                        add_special_tokens=hf.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                )
+        encode.assert_not_called()
+        split_encode.assert_not_called()
+
+
+@pytest.mark.parametrize("split_special_tokens", [False, True])
+def test_gigatoken_unicode_batch_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], split_special_tokens: bool
+) -> None:
+    hf, native = gigatoken_hf_pair
+    batch = ["Invoice 1234567 café 中文", "12345\U00011de06789 <extra><ordinary>"]
+    name = "_split_special_tokenizer" if split_special_tokens else "_gigatoken"
+    with patch.object(native.tokenizer, name) as encode:
+        for values in (batch, tuple(batch)):
+            kwargs = dict(add_special_tokens=False, split_special_tokens=split_special_tokens)
+            assert native.tokenizer(values, **kwargs) == hf.tokenizer(values, **kwargs)
+        encode.assert_not_called()
+
+
+def test_gigatoken_unicode_chat_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation = [{"role": "user", "content": "Invoice 1234567"}]
+    # The rendered template can introduce an affected character absent from messages.
+    template = "\U00011de0" + hf.tokenizer.chat_template
+    with patch.object(native.tokenizer, "_gigatoken") as encode:
+        assert native.apply_chat_template(
+            conversation, chat_template=template, return_dict=False
+        ) == hf.apply_chat_template(conversation, chat_template=template, return_dict=False)
+        encode.assert_not_called()
+
+
+@pytest.mark.parametrize("text", ["Invoice 1234567", "café e\u0301 中文 ١٢٣٤٥٦٧ １２３４５ 😀"])
+def test_gigatoken_compatible_unicode_stays_native(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], text: str
+) -> None:
+    hf, native = gigatoken_hf_pair
+    for split in (False, True):
+        name = "_split_special_tokenizer" if split else "_gigatoken"
+        with patch.object(native.tokenizer, name, wraps=getattr(native.tokenizer, name)) as encode:
+            assert native.tokenizer(text, split_special_tokens=split) == hf.tokenizer(
+                text, split_special_tokens=split
+            )
+            encode.assert_called_once()
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("return_dict", [False, True, None])
+@pytest.mark.parametrize("tensor_type", [None, "np", "pt"])
+def test_gigatoken_chat_template_parity(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+    batched: bool,
+    return_dict: bool | None,
+    tensor_type: str | None,
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation: list[Any] = [{"role": "user", "content": "Invoice 1234567 <extra> café"}]
+    if batched:
+        conversation = [conversation, [{"role": "user", "content": "中文 ١٢٣٤٥٦٧"}]]
+    kwargs = {"tokenize": True, "add_generation_prompt": True, "return_tensors": tensor_type}
+    if tensor_type:
+        kwargs["padding"] = True
+    if return_dict is not None:
+        kwargs["return_dict"] = return_dict
+    with patch.object(
+        native.tokenizer.tokenizer, "encode", wraps=native.tokenizer.tokenizer.encode
+    ) as encode:
+        expected = hf.apply_chat_template(conversation, chat_template=None, **kwargs)
+        actual = native.apply_chat_template(conversation, chat_template=None, **kwargs)
+        if not batched and tensor_type is None:
+            assert encode.call_count > 0
+    if hasattr(expected, "keys"):
+        assert type(actual) is type(expected)
+        assert actual.keys() == expected.keys()
+        if tensor_type == "pt":
+            assert actual.to("cpu") is actual
+        for key in expected:
+            if tensor_type:
+                assert actual[key].dtype == expected[key].dtype
+                assert np.array_equal(actual[key], expected[key])
+            else:
+                assert actual[key] == expected[key]
+    elif tensor_type:
+        assert actual.dtype == expected.dtype
+        assert np.array_equal(actual, expected)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("truncation", [False, True])
+def test_gigatoken_chat_padding_and_truncation(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+    side: str,
+    truncation: bool,
+) -> None:
+    hf, native = gigatoken_hf_pair
+    for tokenizer in (hf.tokenizer, native.tokenizer):
+        tokenizer.padding_side = tokenizer.truncation_side = side
+    messages = [[{"role": "user", "content": text}] for text in ("hello", "Invoice 1234567 café")]
+    kwargs = dict(return_dict=True, padding="max_length", truncation=truncation, max_length=32)
+    assert native.apply_chat_template(
+        messages, chat_template=None, **kwargs
+    ) == hf.apply_chat_template(messages, chat_template=None, **kwargs)
+
+
+def test_gigatoken_chat_rendering_and_assistant_masks(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation = [
+        {"role": "user", "content": "Invoice 1234567"},
+        {"role": "assistant", "content": "café 中文"},
+    ]
+    template = (
+        "{% for m in messages %}{{ m.role }}:"
+        "{% if m.role == \"assistant\" %}{% generation %}{{ m.content }}{% endgeneration %}"
+        "{% else %}{{ m.content }}{% endif %}<eos>{% endfor %}"
+    )
+    cases: list[dict[str, Any]] = [
+        {"tokenize": False},
+        {"tokenize": True, "return_dict": False, "continue_final_message": True},
+        {"tokenize": True, "return_dict": True, "return_assistant_tokens_mask": True},
+        {
+            "tokenize": True,
+            "return_dict": True,
+            "tokenizer_kwargs": {"return_offsets_mapping": True},
+        },
+    ]
+    for kwargs in cases:
+        assert native.apply_chat_template(
+            conversation, chat_template=template, **kwargs
+        ) == hf.apply_chat_template(conversation, chat_template=template, **kwargs)
+
+
+def test_gigatoken_serving_worker_serialization(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    text = "Invoice 1234567 <extra> café"
+    native.tokenizer(
+        text, add_special_tokens=native.include_special_tokens, split_special_tokens=True
+    ).input_ids  # Populate the ordinary-text cache before transfer.
+    native.tokenizer.padding_side = "left"
+    restored = pickle.loads(pickle.dumps(native))
+    assert restored.tokenizer.padding_side == "left"
+    assert restored.text_to_ids(text) == hf.text_to_ids(text)
+    assert (
+        restored.tokenizer(
+            text, add_special_tokens=restored.include_special_tokens, split_special_tokens=True
+        ).input_ids
+        == hf.tokenizer(
+            text, add_special_tokens=hf.include_special_tokens, split_special_tokens=True
+        ).input_ids
+    )
+    messages = [{"role": "user", "content": text}]
+    assert restored.apply_chat_template(
+        messages, chat_template=None, return_dict=False
+    ) == hf.apply_chat_template(messages, chat_template=None, return_dict=False)
+
+
+def test_gigatoken_added_tokens_refresh_native_encoders(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], tmp_path: Path
+) -> None:
+    """Vocabulary mutations reach native encoding, HF fallback and serialization."""
+    hf, native = gigatoken_hf_pair
+    split = dict(add_special_tokens=False, split_special_tokens=True)
+    mutations = [
+        (["<new-ordinary>"], False, 1),
+        (["<extra>", "<new-special>"], True, 1),
+        (["<extra>", "<new-special>", "<ordinary>"], True, 0),
+    ]
+    text = "<new-ordinary> <new-special> <ordinary> <extra> Invoice 1234567 café"
+    for step, (tokens, special, vocab_growth) in enumerate(mutations):
+        for tokenizer in (hf, native):
+            tokenizer.tokenizer.padding_side = "left"
+        # Repopulate the cache before each mutation, including zero-ID reclassification.
+        native.tokenizer(text, **split)
+        added_counts = []
+        for tokenizer in (hf, native):
+            size_before = tokenizer.vocab_size
+            if special:
+                added = tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+            else:
+                added = tokenizer.tokenizer.add_tokens(tokens)
+            assert tokenizer.vocab_size == size_before + vocab_growth
+            added_counts.append(added)
+        assert added_counts[0] == added_counts[1]
+        assert native.tokenizer.tokenizer.encode(text).tolist() == hf.text_to_ids(text)
+        new_ordinary_id = hf.tokenizer.convert_tokens_to_ids("<new-ordinary>")
+        ordinary_id = hf.tokenizer.convert_tokens_to_ids("<ordinary>")
+        hf_path = tmp_path / f"hf-{step}"
+        native_path = tmp_path / f"native-{step}"
+        hf.save_pretrained(str(hf_path))
+        native.save_pretrained(str(native_path))
+        restored = pickle.loads(pickle.dumps(native))
+        reloaded = HuggingFaceTokenizer(
+            str(native_path), include_special_tokens=False, use_gigatoken=True
+        )
+        hf_reloaded = HuggingFaceTokenizer(str(hf_path), include_special_tokens=False)
+        for reference, candidate in ((hf, native), (hf, restored), (hf_reloaded, reloaded)):
+            for sample in (text, text + "\U00011de0"):
+                ids = candidate.text_to_ids(sample)
+                assert ids == reference.text_to_ids(sample)
+                assert {new_ordinary_id, ordinary_id, hf.token_to_id("<extra>")} <= set(ids)
+                split_ids = candidate.tokenizer(sample, **split).input_ids
+                assert split_ids == reference.tokenizer(sample, **split).input_ids
+                assert new_ordinary_id in split_ids
+                assert hf.token_to_id("<extra>") not in split_ids
+                assert (ordinary_id in split_ids) == (step < 2)
+                if special:
+                    special_id = hf.token_to_id("<new-special>")
+                    assert special_id in ids and special_id not in split_ids
+            assert candidate.tokenizer.all_special_tokens == reference.tokenizer.all_special_tokens
+            assert candidate.tokenizer.padding_side == reference.tokenizer.padding_side
+        assert json.loads(native.tokenizer.backend_tokenizer.to_str()) == json.loads(
+            hf.tokenizer.backend_tokenizer.to_str()
+        )
+        assert (native_path / "tokenizer.json").read_text() == (
+            hf_path / "tokenizer.json"
+        ).read_text()
+
+
+def test_gigatoken_streaming_preserves_hf_interface(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
+        HuggingFaceFastIncrementalDetokenizer,
+    )
+
+    hf, native = gigatoken_hf_pair
+    original = HuggingFaceFastIncrementalDetokenizer(SimpleNamespace(_tokenizer=hf), [])
+    fast = HuggingFaceFastIncrementalDetokenizer(SimpleNamespace(_tokenizer=native), [])
+    ids = hf.text_to_ids("Invoice 1234567 café 中文 <extra>")
+    for token in ids:
+        assert fast.update([token]) == original.update([token])
+    assert fast.text == original.text
 
 
 # Uses same local path as test_hf_tokenizer; tests EOS stripping vs keeping in detokenized output (e.g. RL).
@@ -447,6 +798,8 @@ def test_own_metadata_class(tmp_path):
 
 def test_multimodal_tokenizer():
     """Test MegatronMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     prompt_format = "qwen2p0"
     special_tokens = ["<image>"]
     image_tag_type = "nvlm"
@@ -461,11 +814,12 @@ def test_multimodal_tokenizer():
     assert (
         tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
     ), "encode-decode roundtrip failed"
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": "<image>"},
+        {"role": "user", "content": [{"type": "image"}]},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
@@ -485,14 +839,153 @@ def test_multimodal_tokenizer():
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
 
-    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
-    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
-        {"role": "user", "content": "<Image><image></Image>hello"}
+    # Structured media parts keep the image sentinel between the configured tags.
+    [image_index] = np.flatnonzero(conv_tokens == DEFAULT_IMAGE_TOKEN_INDEX)
+    assert tokenizer.detokenize(conv_tokens[:image_index]).endswith("<Image>")
+    assert tokenizer.detokenize(conv_tokens[image_index + 1 :]).startswith("</Image>")
+
+
+def test_multimodal_gigatoken_tokenizer():
+    """Test gigatoken MegatronMultimodalTokenizer."""
+    prompt_format = "qwen2p0"
+    special_tokens = ["<image>"]
+    image_tag_type = "nvlm"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=True,
+    )
+
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": [{"type": "image"}]},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+    # Try converting tokens to ids.
+    assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    [image_index] = np.flatnonzero(conv_tokens == tokenizer.image_token_index)
+    assert tokenizer.detokenize(conv_tokens[:image_index]).endswith("<Image>")
+    assert tokenizer.detokenize(conv_tokens[image_index + 1 :]).startswith("</Image>")
+
+
+@pytest.mark.parametrize("structured_image", [False, True])
+@pytest.mark.parametrize("skip_chat_template", [False, True])
+def test_multimodal_matches_gigatoken_tokenizer(structured_image, skip_chat_template):
+    """Test default MegatronMultimodalTokenizer matches gigatoken."""
+    prompt_format = "qwen2p0"
+    special_tokens = ["<image>"]
+    image_tag_type = "nvlm"
+    tokenizer_default = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=False,
+    )
+    tokenizer_gigatoken = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=True,
+    )
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": [{"type": "image"}]},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    if not structured_image:
+        conversation[2]["content"] = "An ordinary text message."
+
+    original_conversation = json.loads(json.dumps(conversation))
+
+    # Test tokenization with return_target=False
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation,
+        return_target=False,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation,
+        return_target=False,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with add_generation_prompt=True
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with return_target=True
+    conv_tokens_default, target_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation,
+        return_target=True,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
+    )
+    conv_tokens_gigatoken, target_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation,
+        return_target=True,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+    assert (
+        target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    assert conversation == original_conversation, "Tokenization mutated the caller's input"
 
 
 def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     vocab_size = 10000
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
@@ -503,6 +996,7 @@ def test_null_multimodal_tokenizer():
     assert tokenizer.tokenize("1 22 333") == [1, 22, 333], "tokenization is failed."
 
     assert tokenizer.detokenize([1, 22, 333]) == "1 22 333", "detokenization is failed."
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
 
 def test_sft_tokenizer():
@@ -596,6 +1090,105 @@ def test_sft_tokenizer_target_masking(prompt_format, expect_masked_tokens):
         assert turn_start == len(tokens)
 
     np.testing.assert_array_equal(targets, expected_targets)
+
+
+def test_sft_gigatoken_tokenizer():
+    """Test gigatoken SFTTokenizer."""
+    prompt_format = "nemotron-nano-v2"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=True,
+    )
+
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+
+def test_sft_matches_gigatoken_tokenizer():
+    """Test default SFTTokenizer matches gigatoken."""
+    prompt_format = "nemotron-nano-v2"
+    tokenizer_default = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=False,
+    )
+    tokenizer_gigatoken = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=True,
+    )
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    # Test tokenization with return_target=False
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with add_generation_prompt=True
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with return_target=True
+    conv_tokens_default, target_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken, target_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+    assert (
+        target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
+    ), "default and gigatoken target tokenization do not match."
 
 
 # ------------------------------------------------------------------------
@@ -937,3 +1530,59 @@ class TestAbstractTokenizerSpecialIdAliases:
         assert tok.cls_id == 5
         assert tok.sep_id == 6
         assert tok.mask_id == 7
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_resolves_hub_model_id(tmp_path, monkeypatch):
+    """Regression for a review comment on the multi-EOS PR: `tokenizer_path` can be
+    a Hub model id, not just a local directory. The old `os.path.join` +
+    `os.path.isfile` check only ever resolved a local directory, silently finding
+    nothing for a Hub id -- generation_config.json (and therefore the multi-EOS
+    termination set) was dead code for any Hub-id-based model. This verifies the
+    fix actually resolves via HF's cached_file helper rather than a local path.
+    """
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    gc_path = tmp_path / "generation_config.json"
+    gc_path.write_text(json.dumps({"eos_token_id": [2, 11], "temperature": 0.6}))
+
+    seen_args = {}
+
+    def fake_cached_file(path_or_repo_id, filename, **kwargs):
+        # A real Hub id, e.g. "org/model-name" -- not a local path that
+        # os.path.isfile could ever have found.
+        seen_args["path_or_repo_id"] = path_or_repo_id
+        seen_args["filename"] = filename
+        assert kwargs.get("_raise_exceptions_for_missing_entries") is False
+        return str(gc_path)
+
+    monkeypatch.setattr(hf_mod, "cached_file", fake_cached_file)
+
+    result = hf_mod._load_generation_config("org/some-hub-model-id")
+
+    assert seen_args["path_or_repo_id"] == "org/some-hub-model-id"
+    assert seen_args["filename"] == "generation_config.json"
+    assert result == {"eos_token_id": [2, 11], "temperature": 0.6}
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_missing_file_returns_none(monkeypatch):
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    monkeypatch.setattr(hf_mod, "cached_file", lambda path_or_repo_id, filename, **kwargs: None)
+
+    assert hf_mod._load_generation_config("org/some-hub-model-id-without-one") is None
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_unreadable_file_degrades_gracefully(monkeypatch):
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    def raising_cached_file(path_or_repo_id, filename, **kwargs):
+        raise OSError("network error")
+
+    monkeypatch.setattr(hf_mod, "cached_file", raising_cached_file)
+
+    # Must not raise -- graceful degradation to None, same as the pre-existing
+    # behavior for a missing/unreadable local file.
+    assert hf_mod._load_generation_config("org/unreachable-model") is None

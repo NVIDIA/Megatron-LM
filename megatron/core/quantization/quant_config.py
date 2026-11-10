@@ -196,6 +196,40 @@ class RecipeConfig:
 
         return RecipeConfig(matchers, config_dict)
 
+    def as_dict(self) -> dict:
+        """Serialize recipe to dict configuration."""
+
+        # need to specify how to re-initialize with these contents
+        target_str = f"{self.__class__.__module__}.{self.__class__.__qualname__}.from_config_dict"
+
+        return {
+            "config": {"matchers": self._matchers_to_dict(), "configs": self.configs},
+            "_target_": target_str,
+        }
+
+    def _matchers_to_dict(self) -> dict | None:
+        # Reverses _build_matchers()
+
+        if self.matchers == []:
+            return None
+
+        matchers_dict = {}
+        for i, m in enumerate(self.matchers):
+            if type(m) is GlobMatcher:
+                m_dict = {
+                    "enabled": True,
+                    "type": "glob",
+                    "pattern": m.pattern,
+                    "config": m.config_key,
+                }
+                matchers_dict[i] = m_dict
+            else:
+                raise NotImplementedError(
+                    f"Serialization of Matcher type '{type(m)}' not implemented"
+                )
+
+        return matchers_dict
+
     def match_to_config_key(self, operator_context: MatchContext) -> str | None:
         """
         Gives an operator's context, return a configuration key if

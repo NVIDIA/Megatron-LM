@@ -391,7 +391,20 @@ class MegatronFSDP(torch.nn.Module):
         Whether this parameter's gradients are sharded, and therefore reduced on every
         backward pass rather than once per optimization cycle.
         """
-        return self._sharding_strategy_for_param(param) in ["optim_grads", "optim_grads_params"]
+        # Frozen parameters are grouped separately from trainable ones and such a group is
+        # never given a gradient buffer, so there is no reduction to describe.
+        if not param.requires_grad:
+            return False
+        if self._sharding_strategy_for_param(param) in ["no_shard", "optim"]:
+            return False
+        # A gradient-sharding strategy still reduces only once per cycle when its DP-Shard
+        # group holds a single rank, so the strategy alone is not enough to answer this.
+        # Such a group shards nothing: the reduction degenerates to a local rescale, which
+        # cannot carry a premul-sum multiplier and so is applied explicitly instead (see
+        # ParamAndGradBuffer). Its buffer therefore accumulates microbatches in place, and
+        # reducing every backward would rescale those accumulated microbatches repeatedly.
+        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+        return self.grad_reduce_pipeline.get_fsdp_buffer(bucket_id).data_parallel_group.size() > 1
 
     def _init_fsdp_param_and_grad_buffer(self):
         if self.calculate_per_token_loss:
@@ -466,7 +479,7 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
-            suggested_communication_unit_size = max(
+            suggested_communication_unit_size = min(
                 1_000_000_000, suggested_communication_unit_size
             )
 
@@ -499,10 +512,15 @@ class MegatronFSDP(torch.nn.Module):
         prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
         wait_bucket_ready=True,
         bwd=False,
+        recompute=False,
     ):
         """
         All-gather parameters across the data parallel group and wait for
         the all-gather operation to complete.
+
+        `prefetch`, `prefetch_order`, `bwd` and `recompute` are passed through to
+        `AllGatherPipeline.all_gather_params`, which documents them. If
+        `wait_bucket_ready`, block until the buckets of `params` are gathered.
         """
         if all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
             return
@@ -526,6 +544,7 @@ class MegatronFSDP(torch.nn.Module):
                 and (self.microbatch_count == 0 or self.model_auto_sync)
             ),
             bwd=bwd,
+            recompute=recompute,
         )
         if wait_bucket_ready:
             for param in params:
@@ -848,6 +867,7 @@ class MegatronFSDP(torch.nn.Module):
                 params=param_list,
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
+                recompute=input_training_state == TrainingState.PRE_BACKWARD,
             )
             return None
 

@@ -3,6 +3,7 @@
 import logging
 import math
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.tokenizers import MegatronTokenizer
 
 MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETokenizer']
@@ -89,10 +90,13 @@ def build_tokenizer(args, **kwargs):
         )
         kwargs['image_tag_type'] = args.image_tag_type
         kwargs['force_system_message'] = args.force_system_message
+        kwargs['keep_history_thinking'] = getattr(args, 'tokenizer_keep_history_thinking', False)
+        kwargs['use_gigatoken'] = args.use_gigatoken
     elif args.tokenizer_type == 'SFTTokenizer':
         tokenizer_library = 'sft'
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
+        kwargs['use_gigatoken'] = args.use_gigatoken
     elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
         tokenizer_library = (
             'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
@@ -109,10 +113,6 @@ def build_tokenizer(args, **kwargs):
                 kwargs['pad_id'] = null_pad_id
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
-        # Add vocab size (if not already set from a checkpoint).
-        if args.pad_vocab_size:
-            _set_padded_vocab_size(args, tokenizer)
-
         return tokenizer
 
     if args.metadata_path:
@@ -123,30 +123,25 @@ def build_tokenizer(args, **kwargs):
         tokenizer_path=tokenizer_path, metadata_path=metadata, **kwargs
     )
 
-    # Add vocab size (if not already set from a checkpoint).
-    if args.pad_vocab_size:
-        _set_padded_vocab_size(args, tokenizer)
-
     return tokenizer
 
 
-def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
+def vocab_size_with_padding(
+    orig_vocab_size: int,
+    make_vocab_size_divisible_by: int,
+    tensor_model_parallel_size: int,
+    logging_enabled=True,
+):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
     after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    multiple = make_vocab_size_divisible_by * tensor_model_parallel_size
     after = int(math.ceil(after / multiple) * multiple)
-    if args.rank == 0 and logging_enabled:
+    if safe_get_rank() == 0 and logging_enabled:
         logger.info(
             f' > padded vocab (size: {orig_vocab_size}) with '
             f'{after - orig_vocab_size} dummy tokens '
             f'(new size: {after})'
         )
     return after
-
-
-def _set_padded_vocab_size(args, tokenizer):
-    """Sets padded vocab size if None."""
-    if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)

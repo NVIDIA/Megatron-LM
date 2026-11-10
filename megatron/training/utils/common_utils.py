@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -15,7 +15,7 @@ import torch
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -50,7 +50,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.training import get_adlr_autoresume, get_args, get_timers
+from megatron.training import get_adlr_autoresume, get_args, get_timers, get_train_state
+from megatron.training.global_vars import get_run_config
 
 
 def _compute_norm_2(params_list):
@@ -68,15 +69,14 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
     """Extract the appropriate data tensor from a param for norm computation.
 
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
-    a sharded main_param from the distributed optimizer.
+    a DP-sharded optimizer main_param. Non-owners may have no main_param attribute.
     """
     if bf16:
-        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+        if not force_create_fp32_copy:
             if getattr(param, 'main_param_sharded', False):
-                if param.main_param is not None:
-                    return param.main_param, True
-                return None, True
-            return param.main_param, False
+                return getattr(param, 'main_param', None), True
+            if hasattr(param, 'main_param'):
+                return param.main_param, False
         return param.data.float(), False
     return param.data, False
 
@@ -87,6 +87,7 @@ def calc_params_l2_norm(
     *,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
     return_squared_tensor=False,
+    trainable_only=False,
 ):
     """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
     if not isinstance(model, list):
@@ -101,6 +102,7 @@ def calc_params_l2_norm(
         )
 
     args = get_args()
+    cfg = get_run_config()
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
@@ -109,6 +111,8 @@ def calc_params_l2_norm(
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
+                if trainable_only and not param.requires_grad:
+                    continue
                 if not hasattr(param, "_local_tensor"):
                     raise RuntimeError(
                         f"Megatron FSDP requires parameters are PyTorch DTensor. "
@@ -156,6 +160,9 @@ def calc_params_l2_norm(
 
     for model_chunk in model:
         for param in model_chunk.parameters():
+            if trainable_only and not param.requires_grad:
+                continue
+
             is_gtp = getattr(param, 'is_gtp_weight_remat', False)
 
             # Filter TP duplicates. GTP_remat params are always unique across TP ranks
@@ -178,7 +185,9 @@ def calc_params_l2_norm(
             if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                data, is_sharded = _get_param_data(
+                    param, force_create_fp32_copy, cfg.model.transformer.bf16
+                )
                 if data is None:
                     continue
                 if is_gtp:
@@ -188,7 +197,9 @@ def calc_params_l2_norm(
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    data, is_sharded = _get_param_data(
+                        param, force_create_fp32_copy, cfg.model.transformer.bf16
+                    )
                     if data is None:
                         continue
                     if is_gtp:
@@ -276,11 +287,20 @@ def _calc_mimo_params_l2_norm(
         if name not in pg_collection.keys():
             continue
 
+        module_chunks_on_rank = [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks]
+        # With PP > 1, all stages must enter the module collectives even if one stage
+        # owns no trainable parameters. A PP=1 module can be skipped locally.
+        if pg_collection[name].pp.size() == 1 and not any(
+            param.requires_grad for module in module_chunks_on_rank for param in module.parameters()
+        ):
+            continue
+
         module_norm_sq = calc_params_l2_norm(
-            [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks],
+            module_chunks_on_rank,
             force_create_fp32_copy,
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
+            trainable_only=True,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 
@@ -394,14 +414,14 @@ def report_memory(name, process_group=None):
     process_group: optional data-parallel group to gate the rank-0 print on; None falls back
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
-    args = get_args()
+    cfg = get_run_config()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
+    if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0
@@ -440,8 +460,14 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
     if autoresume.termination_requested():
-        if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+        if get_run_config().checkpoint.save:
+            save_checkpoint(
+                iteration,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                get_train_state().num_floating_point_operations_so_far,
+            )
         print_rank_0(">>> autoresume termination request found!")
         if torch.distributed.get_rank() == 0:
             autoresume.request_resume()
@@ -557,6 +583,34 @@ def warn_rank_0(message, rank=None):
             warnings.warn(message)
 
 
+def setup_multi_storage_client(enable_msc: bool) -> None:
+    """Apply the process-wide Multi-Storage Client policy: enable the feature flag when
+    requested, disable it otherwise (a process does not inherit the flag from an earlier run in
+    the same interpreter), and fail early when it is requested but the package is missing.
+    Warns once, when the flag turns on.
+
+    ``parse_args`` calls it for ``--enable-msc``; a script or entry point that enables MSC itself
+    calls it before any path is read (a configuration YAML loaded from an ``msc://`` path
+    included). MSC applies to datasets, tokenizers and configuration files as much as to
+    checkpoints, which is why it is not a setting of any one config section; consumers ask
+    ``MultiStorageClientFeature.is_enabled()``.
+    """
+    if not enable_msc:
+        MultiStorageClientFeature.disable()
+        return
+    was_enabled = MultiStorageClientFeature.is_enabled()
+    MultiStorageClientFeature.enable()
+    if not MultiStorageClientFeature.is_enabled():
+        MultiStorageClientFeature.disable()
+        raise RuntimeError(
+            "MSC was requested (--enable-msc or setup_multi_storage_client(True)) but the "
+            "multistorageclient package is not installed. Install it with "
+            "`pip install multi-storage-client`."
+        )
+    if not was_enabled:
+        warn_rank_0('The MSC feature is enabled.')
+
+
 def is_rank0():
     """Returns true if called in the rank0, false otherwise."""
     return _safe_get_rank() == 0
@@ -577,9 +631,9 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
-def is_hybrid_model(args):
+def is_hybrid_model(model_config):
     """Returns True if the model is a hybrid Mamba-Transformer model."""
-    return args.hybrid_layer_pattern is not None
+    return getattr(model_config, "hybrid_layer_pattern", None) is not None
 
 
 def is_gtp_remat_active(args):

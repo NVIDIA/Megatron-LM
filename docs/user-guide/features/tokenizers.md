@@ -207,6 +207,19 @@ encoded_docs = tokenizer.tokenize_files("data.jsonl", field="text")
 `tokenize_files()` is only supported for the `huggingface` and `megatron` tokenizer libraries,
 and only when the tokenizer was constructed with `use_gigatoken=True`.
 
+**Faster Conversation Tokenization for SFT and Multimodal**
+
+`use_gigatoken=True` also speeds up `tokenize_conversation()` on the SFT (`SFTTokenizer`) and
+multimodal (`MegatronMultimodalTokenizer`) tokenizers: the chat template is rendered to text once,
+then re-encoded with GigaToken instead of the default Hugging Face tokenizer, while producing the
+same token ids. On a benchmark of a single conversation with 1370 messages, this measured ~30x
+faster than the default Hugging Face tokenizer:
+
+| Tokenizer | Execution time (1370-message conversation) |
+|---|---|
+| GigaToken (`use_gigatoken=True`) | 0.206449 s |
+| Hugging Face default | 6.432063 s |
+
 ## Integration with Megatron-LM
 
 ### Using with Training Scripts

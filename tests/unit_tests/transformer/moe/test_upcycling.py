@@ -25,13 +25,15 @@ from megatron.core.utils import (
     is_te_min_version,
     unwrap_model,
 )
-from megatron.training.argument_utils import gpt_config_from_args
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
@@ -62,6 +64,7 @@ def model_provider(
 ):
     model_parallel_cuda_manual_seed(_SEED)
     args = get_args()
+    cfg_container = get_run_config()
 
     config = core_transformer_config_from_args(args)
     use_te = args.transformer_impl == "transformer_engine"
@@ -75,7 +78,7 @@ def model_provider(
         transformer_layer_spec=layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
         ),
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
@@ -133,7 +136,13 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
         args.bias_swiglu_fusion = False
 
     validate_args(args)
-    set_global_variables(args, False)
+    set_args(args)
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.finalize()
+    set_run_config(cfg)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     return args
 
 

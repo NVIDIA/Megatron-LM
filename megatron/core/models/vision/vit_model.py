@@ -63,6 +63,18 @@ def _dynamic_patch_grid(
     return patch_hw, seq_lens
 
 
+def _dynamic_patch_grid_lists(
+    imgs_sizes: Union[List[Tuple[int, int]], torch.Tensor], patch_dim: int
+) -> Tuple[List[Tuple[int, int]], List[int]]:
+    """Return dynamic patch metadata without synchronizing CUDA to the host."""
+    if torch.is_tensor(imgs_sizes):
+        if imgs_sizes.is_cuda:
+            raise ValueError("imgs_sizes must remain on CPU to avoid CUDA-to-host synchronization")
+        imgs_sizes = imgs_sizes.tolist()
+    patch_hw = [(int(height) // patch_dim, int(width) // patch_dim) for height, width in imgs_sizes]
+    return patch_hw, [height * width for height, width in patch_hw]
+
+
 def _cat_rope(chunks: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(chunks, dim=0)
 
@@ -82,9 +94,9 @@ class Pixtral2DRotaryEmbedding(nn.Module):
         self.max_patches_per_side = max_patches_per_side
 
         # freq_dim = head_dim // 4 (half for h, half for w in the head_dim//2 space).
-        freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-
-        self.register_buffer("freqs", freqs, persistent=False)
+        # Like LLM RoPE, keep frequencies outside module buffers so Float16Module
+        # cannot cast them to BF16/FP16 before FP32 angle and sin/cos computation.
+        self.freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
 
     def forward(self, h_patches: int, w_patches: int, device: torch.device) -> torch.Tensor:
         """
@@ -92,7 +104,10 @@ class Pixtral2DRotaryEmbedding(nn.Module):
         This is the format mcore's apply_rotary_pos_emb expects for rotary_pos_emb.
         mcore handles cos/sin internally.
         """
-        base_freqs = self.freqs.to(device=device)
+        # Cache the device copy; module.to() does not move this constant tensor.
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device=device)
+        base_freqs = self.freqs
         h = torch.arange(h_patches, device=device, dtype=base_freqs.dtype)
         w = torch.arange(w_patches, device=device, dtype=base_freqs.dtype)
 
@@ -287,9 +302,7 @@ class ViTModel(MegatronModule):
         if dynamic_resolution:
             assert imgs_sizes is not None, "imgs_sizes is required for dynamic-resolution ViTModel"
             assert not self.add_class_token, "dynamic-resolution CLS handling is not implemented"
-            patch_hw, seq_lens = _dynamic_patch_grid(
-                imgs_sizes, self.patch_dim, pixel_values.device
-            )  # pylint: disable=line-too-long
+            patch_hw, seq_lens = _dynamic_patch_grid_lists(imgs_sizes, self.patch_dim)
             x = self.patch_embed.forward_patches(pixel_values)
         else:
             B = pixel_values.shape[0]
@@ -320,7 +333,7 @@ class ViTModel(MegatronModule):
             # RoPE covers patch tokens only; CLS tokens are not rotated.
             if dynamic_resolution:
                 rotary_pos_emb = _cat_rope(
-                    [self.rope(int(h), int(w), pixel_values.device) for h, w in patch_hw.tolist()]
+                    [self.rope(h, w, pixel_values.device) for h, w in patch_hw]
                 )
             else:
                 rotary_pos_emb = self.rope(h_patches, w_patches, pixel_values.device)
@@ -340,13 +353,9 @@ class ViTModel(MegatronModule):
         #    but the Pixtral-Large config has no CLS tokens so we skip that branch.
         if self.merger is not None:
             if dynamic_resolution:
-                chunks = torch.split(x, seq_lens.tolist(), dim=1)
+                chunks = torch.split(x, seq_lens, dim=1)
                 x = torch.cat(
-                    [
-                        self.merger(chunk, int(h), int(w))
-                        for chunk, (h, w) in zip(chunks, patch_hw.tolist())
-                    ],
-                    dim=1,
+                    [self.merger(chunk, h, w) for chunk, (h, w) in zip(chunks, patch_hw)], dim=1
                 )
             else:
                 x = self.merger(x, h_patches, w_patches)
