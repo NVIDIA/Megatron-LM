@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -120,6 +120,53 @@ def embed(monkeypatch):
             # Forget the tool's modules, so that a later import does not find the stand-in.
             for name in [name for name in sys.modules if name.startswith("tools.bert_embedding")]:
                 del sys.modules[name]
+
+
+class _StubGroup:
+    """A process-group stand-in that reports a fixed rank and size."""
+
+    def __init__(self, rank, size=1):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "fallback"])
+def test_get_blocks_by_rank_splits_over_its_group_or_the_warned_global_one(
+    embed, monkeypatch, explicit
+):
+    """`get_blocks_by_rank` splits over the group it is given, also as a positional argument.
+
+    Without one it still splits over the global data-parallel group, as before, and warns that
+    this fallback is deprecated.
+    """
+    group = _StubGroup(rank=1, size=3)
+    monkeypatch.setattr(
+        embed, "get_blocks", lambda *args: SimpleNamespace(existing=[], missing=list(range(6)))
+    )
+    # The split pads the list of each rank to the longest one. Skip that all-reduce.
+    monkeypatch.setattr(embed.torch.cuda, "LongTensor", torch.LongTensor)
+    monkeypatch.setattr(embed.torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    if explicit:
+        _forbid_global_grid(monkeypatch, "get_data_parallel_group")
+        blocks = embed.get_blocks_by_rank("unused", 6, 1, None, None, group)
+    else:
+        monkeypatch.setattr(parallel_state, "get_data_parallel_group", lambda: group)
+        with pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="get_blocks_by_rank was called without `process_group`",
+        ):
+            blocks = embed.get_blocks_by_rank("unused", 6, 1)
+
+    assert blocks.missing == [1, 4]
+    assert blocks.n_missing_world == 6
 
 
 def test_disk_embedder_splits_blocks_over_the_model_data_parallel_group(
