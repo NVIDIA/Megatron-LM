@@ -7,9 +7,10 @@ from itertools import chain
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -19,6 +20,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
 # Each sharded Linear's collective must be large enough that NCCL selects its
@@ -47,6 +50,50 @@ class TinyModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_dbuffer_allgather_registers_separate_symmetric_buffers(distributed_setup):
+    """Separate send and receive allocations must both support symmetric all-gather."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if device.type != "cuda" or world_size < 2:
+        pytest.skip("Requires at least 2 CUDA ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dist.barrier(group=mesh.get_group(), device_ids=[device.index])
+    # Separate pools prevent output registration from also covering the input's segment.
+    allocator = symm_mem.get_mempool_allocator(device)
+    pools = [torch.cuda.MemPool(allocator, no_split=True) for _ in range(2)]
+    with torch.cuda.use_mem_pool(pools[0]):
+        source = DBuffer.empty(
+            mesh, [RowAtomic()], [(world_size * _HIDDEN, _HIDDEN)], torch.bfloat16, device
+        )
+    with torch.cuda.use_mem_pool(pools[1]):
+        out = DBuffer(mesh, [Replicate()], source.layout, source.dtype, device)
+    assert source.is_symmetric_memory and out.is_symmetric_memory
+    source.local_buffer.fill_(mesh.get_local_rank() + 1)
+
+    with torch.profiler.profile() as prof:
+        assert source.allgather(0, out=out) is out
+        torch.cuda.synchronize()
+
+    expected = torch.arange(1, world_size + 1, dtype=source.dtype, device=device)
+    torch.testing.assert_close(
+        out.local_buffer.view(world_size, -1),
+        expected[:, None].expand(world_size, source.local_buffer.numel()),
+        rtol=0,
+        atol=0,
+    )
+    # Retire registered allocations while their communicator is still alive.
+    del source, out, pools
+
+    events = list(
+        chain.from_iterable(collect_linked_event_groups(prof, _ALL_GATHER_OP_NAME_SUBSTRING))
+    )
+    assert events, "No all-gather CUDA events were recorded."
+    assert all(
+        "ncclSymk" in event.name for event in events
+    ), f"Expected symmetric all-gather for separate input/output buffers, observed: {events}"
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 3])
