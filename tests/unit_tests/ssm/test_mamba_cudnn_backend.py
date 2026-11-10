@@ -95,12 +95,7 @@ class TestMambaCudnnBackendParity:
 
     @pytest.mark.parametrize(
         "ngroups, D_has_hdim, packing",
-        [
-            (8, False, None),
-            (2, True, None),
-            (8, False, "seq_idx"),
-            (2, False, "cu_seqlens"),
-        ],
+        [(8, False, None), (2, True, None), (8, False, "seq_idx"), (2, False, "cu_seqlens")],
     )
     def test_matches_triton(self, ngroups, D_has_hdim, packing):
         mixer = _mixer(

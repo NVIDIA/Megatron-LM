@@ -5,7 +5,8 @@ gated-delta-net code paths.
 
 The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this module drives
 the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` kernels behind
-``mamba_chunk_scan_combined_varlen``), the decode-time ``selective_state_update`` and
+``mamba_chunk_scan_combined_varlen``), the cuDNN Mamba-2 training op behind
+``mamba_kernel_backend='cudnn'``, the decode-time ``selective_state_update`` and
 ``causal_conv1d_update``, the ReplaySSM speculative-decode kernels, the varlen causal conv,
 the Gated Delta Product varlen chunk scan
 (``gdp/*`` kernels) and its decode kernels -- single-token and speculative, where a step
@@ -24,6 +25,10 @@ import torch
 
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.ssm.ops.mamba2.cudnn_ssd import (
+    cudnn_mamba2_unsupported_reason,
+    cudnn_mamba_split_conv1d_scan_combined,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
@@ -205,6 +210,68 @@ def test_mamba_chunk_scan_combined_varlen_replays():
         replays=4,
         backward=False,
         what="mamba_chunk_scan_combined_varlen",
+    )
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch-invariant"])
+@pytest.mark.parametrize("packed", [False, True], ids=["batched", "packed"])
+def test_cudnn_mamba_split_conv1d_scan_combined_replays(monkeypatch, packed, batch_invariant):
+    """The ``mamba_kernel_backend='cudnn'`` training op: conv, cuDNN scan and their backward.
+
+    The dt_bias, A and D gradients reduce over every token, and the conv weight and bias
+    gradients over ``batch * ceil(seqlen / 128)`` blocks, so the shapes put many blocks on each.
+    """
+    reason = cudnn_mamba2_unsupported_reason(64, 128)
+    if reason is not None:
+        pytest.skip(reason)
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    seeded()
+    batch, seqlen = (1, 8192) if packed else (2, 4096)
+    nheads, headdim, ngroups, dstate, d_conv = 32, 64, 4, 128, 4
+    d_inner = nheads * headdim
+    conv_dim = d_inner + 2 * ngroups * dstate
+    zxBCdt = torch.randn(
+        batch, seqlen, d_inner + conv_dim + nheads, device="cuda", dtype=torch.bfloat16
+    )
+    conv1d_weight = (0.5 * torch.randn(conv_dim, d_conv, device="cuda")).to(torch.bfloat16)
+    conv1d_bias = (0.1 * torch.randn(conv_dim, device="cuda")).to(torch.bfloat16)
+    dt_bias = torch.rand(nheads, device="cuda") - 4.0
+    A = -torch.rand(nheads, device="cuda") - 1.0
+    D = torch.randn(nheads, device="cuda").to(torch.bfloat16)
+    for t in (zxBCdt, conv1d_weight, conv1d_bias, dt_bias, A, D):
+        t.requires_grad_(True)
+    if packed:
+        cu_seqlens = torch.tensor([0, 1000, 3000, 6500, seqlen], dtype=torch.int32, device="cuda")
+        seq_idx = torch.repeat_interleave(
+            torch.arange(4, dtype=torch.int32, device="cuda"), cu_seqlens.diff()
+        ).unsqueeze(0)
+    else:
+        cu_seqlens = torch.arange(0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device="cuda")
+        seq_idx = None
+    dy = torch.randn(batch, seqlen, d_inner, device="cuda", dtype=torch.bfloat16)
+
+    def fn(zxBCdt, conv1d_weight, conv1d_bias, dt_bias, A, D):
+        return cudnn_mamba_split_conv1d_scan_combined(
+            zxBCdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D,
+            cu_seqlens,
+            headdim,
+            ngroups,
+            seq_idx=seq_idx,
+            batch_invariant=batch_invariant,
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (zxBCdt, conv1d_weight, conv1d_bias, dt_bias, A, D),
+        replays=4,
+        grad_outputs={"out": dy},
+        contention=True,
+        what=f"cudnn_mamba_split_conv1d_scan_combined ({'packed' if packed else 'batched'})",
     )
 
 

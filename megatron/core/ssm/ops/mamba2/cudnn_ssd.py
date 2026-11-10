@@ -58,10 +58,7 @@ def cudnn_mamba2_unsupported_reason(headdim: int, d_state: int) -> Optional[str]
         return "causal_conv1d.cpp_functions (causal-conv1d) is not installed"
     import_error = _cudnn_mamba2_import_error()
     if import_error is not None:
-        return (
-            "the cuDNN Mamba-2 ops need nvidia-cudnn-frontend[cutedsl]>=1.32.0 "
-            f"({import_error})"
-        )
+        return f"the cuDNN Mamba-2 ops need nvidia-cudnn-frontend[cutedsl]>=1.32.0 ({import_error})"
     if not torch.cuda.is_available():
         return "no CUDA device is available"
     major, minor = torch.cuda.get_device_capability()
@@ -77,7 +74,7 @@ def _ensure_stride(t: torch.Tensor) -> torch.Tensor:
 
 
 def _conv1d_silu(xBC, weight, bias, seq_idx, out=None):
-    """Channel-last causal conv1d + SiLU, [b, l, d] -> [b, l, d], into ``out`` if its layout allows."""
+    """Channel-last causal conv1d + SiLU, [b, l, d] -> [b, l, d], into ``out`` if layout allows."""
     xBC = _ensure_stride(xBC)
     if out is None or _causal_conv1d_fwd_cpp is None or out.stride(1) % 8 != 0:
         out = causal_conv1d_fwd_function(
@@ -314,7 +311,8 @@ class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             seq_idx,
             None,
             None,
-            _ensure_stride(dxBC_out).transpose(1, 2), # the conv kernel writes directly into this buffer and returns it in dxBC_in
+            # the conv kernel writes directly into this buffer and returns it in dxBC_in
+            _ensure_stride(dxBC_out).transpose(1, 2),
             False,
             True,
         )

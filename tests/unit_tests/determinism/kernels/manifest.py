@@ -541,6 +541,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "caches and cursors compared.",
     ),
     KernelEntry(
+        name="ssm_mamba2_cudnn",
+        sources=("megatron/core/ssm/ops/mamba2/cudnn_ssd.py",),
+        tests=(K + "test_ssm_kernels.py", C + "test_ssm_conv1d.py"),
+        kind="external-lib",
+        notes="mamba_kernel_backend='cudnn': the cuDNN frontend's CuTe DSL Mamba-2 forward "
+        "(torch.ops.cudnn.mamba2_fwd) and backward (cudnn.pygraph mamba2_bwd) around the "
+        "causal_conv1d channel-last conv, replayed forward and backward, batched and packed, "
+        "with and without batch_invariant. Needs SM100-SM103/SM107 and "
+        "nvidia-cudnn-frontend[cutedsl]; the tests skip on the H100 kernel bucket.",
+    ),
+    KernelEntry(
         name="ssm_common_kernels",
         sources=(
             "megatron/core/ssm/ops/common/causal_conv1d_triton.py",
@@ -803,7 +814,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update, ReplaySSM spec decode). Module-level replay: "
+        "selective_state_update, ReplaySSM spec decode), or the cuDNN Mamba-2 training op "
+        "(ops/mamba2/cudnn_ssd.py). Module-level replay, on both training backends: "
         "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
         "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
