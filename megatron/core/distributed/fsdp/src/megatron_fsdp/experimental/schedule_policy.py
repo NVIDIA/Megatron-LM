@@ -33,12 +33,19 @@ class SchedulePolicy:
             window, including separate GraphTasks and delayed weight gradients.
             None defaults to one callback per owned trainable parameter. The scheduler
             must declare the complete count before sharding the unit.
+        unshard_all_planes_in_backward: Whether backward unshards and prefetches of this
+            module gather MXFP8 rowwise planes along with columnwise ones. Enable it when
+            activations recomputed in backward use this module's MXFP8 weights without
+            re-entering this module's forward hooks, e.g. a checkpointed submodule.
+            Otherwise, backward unshards gather only columnwise planes, and the
+            recomputation fails in Transformer Engine.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
     register_hooks: bool = True
     grad_accumulation_count: int | None = None
+    unshard_all_planes_in_backward: bool = False
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""

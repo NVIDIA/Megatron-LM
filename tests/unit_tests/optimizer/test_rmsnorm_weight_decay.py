@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.training.arguments import _add_regularization_args
 
 
@@ -137,8 +137,9 @@ def test_rmsnorm_decay_follows_global_schedule_and_adamw(monkeypatch, global_wei
 
 @pytest.mark.parametrize("multiplier", [-1.0, float("nan"), float("inf"), -float("inf")])
 def test_rmsnorm_weight_decay_rejects_invalid_multiplier(multiplier):
+    config = OptimizerConfig(rmsnorm_weight_decay_mult=multiplier)
     with pytest.raises(ValueError, match="rmsnorm_weight_decay_mult.*finite nonnegative"):
-        OptimizerConfig(rmsnorm_weight_decay_mult=multiplier)
+        config.validate()
 
 
 def test_rmsnorm_weight_decay_cli():
