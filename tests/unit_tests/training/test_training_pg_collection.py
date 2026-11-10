@@ -164,6 +164,7 @@ class TestTrainingPgCollection:
         with pytest.raises(ValueError, match="--num-distributed-optimizer-instances > 1"):
             training._build_pg_collection_from_parallel_state(args)
 
+    @pytest.mark.usefixtures("run_config")
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
     def test_collection_carries_the_grid_gloo_groups(self, use_gloo_process_groups):
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
