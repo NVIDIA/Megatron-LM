@@ -454,6 +454,67 @@ def test_linear_fp32_output_is_bitwise_exact_for_integer_bf16_operands():
 @pytest.mark.skipif(
     te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
 )
+@pytest.mark.parametrize("frozen_weight", [False, True])
+@pytest.mark.parametrize(
+    "layout", ["input_every_other_row", "input_column_slice", "input_3d_slice", "weight_slice"]
+)
+def test_linear_fp32_output_reads_strided_operands(layout, frozen_weight):
+    """A strided input or weight view gives the product of its values, as torch.matmul does.
+
+    TE's general_gemm reads dense row-major operands, so the fp32-output path must not hand it a
+    view whose rows are not adjacent. Integer operands make every product exact in fp32.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(4321)
+
+        def integers(*shape):
+            values = torch.randint(-8, 9, shape, device="cuda", generator=generator)
+            return values.to(torch.bfloat16)
+
+        tokens, hidden, vocab = 7, 512, 128
+        input_data, weight = integers(tokens, hidden), integers(vocab, hidden)
+        if layout == "input_every_other_row":
+            buffer = integers(2 * tokens, hidden)
+            buffer[::2] = input_data
+            input_data = buffer[::2]
+        elif layout == "input_column_slice":
+            input_data = torch.cat([input_data, integers(tokens, hidden)], dim=-1)[:, :hidden]
+        elif layout == "input_3d_slice":
+            input_3d = torch.cat([input_data, integers(tokens, hidden)], dim=-1).view(tokens, 1, -1)
+            input_data = input_3d[..., :hidden]
+        else:
+            weight = torch.cat([weight, integers(vocab, hidden)], dim=-1)[:, :hidden]
+        assert not (input_data.is_contiguous() and weight.is_contiguous())
+        weight.requires_grad_(not frozen_weight)
+        linear = (
+            linear_with_frozen_weight
+            if frozen_weight
+            else linear_with_grad_accumulation_and_async_allreduce
+        )
+
+        with torch.no_grad():
+            output = linear(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+        reference = torch.nn.functional.linear(input_data.float(), weight.detach().float())
+
+        assert output.dtype == torch.float32 and output.shape == reference.shape
+        assert torch.equal(output.view(torch.int32), reference.contiguous().view(torch.int32))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
 def test_linear_fp32_output_matches_plain_te_general_gemm():
     from transformer_engine.pytorch.cpp_extensions import general_gemm
 
