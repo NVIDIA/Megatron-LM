@@ -362,7 +362,8 @@ def test_batch_invariant_inference_activations_replay():
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_batch_invariant_squared_relu_quantize_replays():
-    """The fused BI activation + MXFP8 quantize replays and equals the two-kernel path."""
+    """The fused BI activation + MXFP8 quantize replays and equals the two-kernel path,
+    including groups at E8M0's smallest scale (2^-127)."""
     from megatron.core.inference.moe import batch_invariant
     from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
 
@@ -371,6 +372,8 @@ def test_batch_invariant_squared_relu_quantize_replays():
     perm, n_used_t = _padded_layout(rows, ffn, n_used)
     probs = torch.rand(rows, device="cuda")
     x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16) * 5
+    # Squared, these rows' groups peak below 448 * 2^-127.
+    x[: rows // 8] *= 2.0**-64
 
     def fn(x):
         out = batch_invariant.squared_relu_with_probs_quantize_mxfp8(x, perm, n_used_t, probs)

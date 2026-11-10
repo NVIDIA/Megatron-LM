@@ -879,6 +879,35 @@ class TestSquaredReluAndQuantizeMxfp8:
             squared_relu_and_quantize_mxfp8(x, _make_permutation_map(128), _vt(128))
 
 
+@pytest.mark.parametrize("clamp_scale", [None, 16.0], ids=["unclamped", "clamped"])
+def test_batch_invariant_squared_relu_quantize_tiny_groups_take_the_smallest_scale(clamp_scale):
+    """The fused batch-invariant squared ReLU + MXFP8 quantize gives activation groups with
+    max <= 448 * 2^-127 E8M0's smallest scale, 2^-127, like the unfused quantizer."""
+    from megatron.core.inference.moe.batch_invariant import (
+        squared_relu_with_probs,
+        squared_relu_with_probs_quantize_mxfp8,
+    )
+
+    torch.manual_seed(42)
+    M, K = 4, 64
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    # Squared and weighted, row r's first group peaks below 2^-(120 + 2r) < 448 * 2^-127.
+    signs = 1 - 2 * (torch.arange(32, device="cuda") % 2)
+    ramp = torch.arange(1, 33, device="cuda") * signs
+    for row in range(M):
+        x[row, :32] = ramp * 2.0 ** -(65 + row)
+    probs = torch.rand(M, device="cuda", dtype=torch.float32) * 0.5 + 0.5
+    perm_map = _make_permutation_map(M)
+
+    fused = squared_relu_with_probs_quantize_mxfp8(x, perm_map, _vt(M), probs, clamp_scale)
+
+    activated = squared_relu_with_probs(x, perm_map, _vt(M), probs, clamp_scale)
+    expected_scales, expected_data = exact_mxfp8(activated)
+    assert not expected_scales[:, 0].any()
+    assert torch.equal(fused.data.view(torch.uint8).cpu(), expected_data.view(torch.uint8))
+    assert torch.equal(fused.scale.view(torch.uint8).cpu(), ref_swizzle(expected_scales))
+
+
 CLAMP_SCALE = 16.0
 
 
