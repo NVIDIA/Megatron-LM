@@ -1029,9 +1029,24 @@ def test_vlm_consumers_reject_incompatible_model_config(
         calls[consumer]()
 
 
-@pytest.mark.parametrize("cp_size,qkv_format", [(1, "sbhd"), (2, "sbhd"), (2, "thd")])
+@pytest.mark.parametrize(
+    "cp_size,qkv_format,decoder_length,expected_model_length",
+    [
+        (1, "sbhd", None, 20),
+        (2, "sbhd", None, 20),
+        (2, "thd", None, 40),
+        (1, "sbhd", 32, 32),
+        (2, "thd", 32, 64),
+    ],
+)
 def test_llava_callback_consumes_its_model_config(
-    monkeypatch, isolated_globals, run_config, cp_size, qkv_format
+    monkeypatch,
+    isolated_globals,
+    run_config,
+    cp_size,
+    qkv_format,
+    decoder_length,
+    expected_model_length,
 ):
     import pretrain_vlm
 
@@ -1042,7 +1057,7 @@ def test_llava_callback_consumes_its_model_config(
     args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
     args.encoder_num_layers = 1
     args.max_position_embeddings, args.padded_vocab_size = 64, 128
-    args.seq_length, args.decoder_seq_length = 16, 32
+    args.seq_length, args.decoder_seq_length = 16, decoder_length
     args.context_parallel_size, args.micro_batch_size = cp_size, 2
     args.params_dtype = torch.float32
     args.ckpt_format = "torch"
@@ -1076,7 +1091,6 @@ def test_llava_callback_consumes_its_model_config(
         "disable_vision_class_token",
         "freeze_LM",
         "freeze_ViT",
-        "decoder_tp_comm_overlap",
     ):
         delattr(args, name)
     pretrain_vlm.model_provider()
@@ -1091,9 +1105,7 @@ def test_llava_callback_consumes_its_model_config(
     assert build.call_args.kwargs["img_w"] == 48
     assert build.call_args.kwargs["patch_dim"] == 8
     assert build.call_args.kwargs["drop_vision_class_token"] is True
-    assert build.call_args.kwargs["language_max_sequence_length"] == (
-        40 if cp_size > 1 and qkv_format == "thd" else 20
-    )
+    assert build.call_args.kwargs["language_max_sequence_length"] == expected_model_length
     build.return_value.freeze.assert_called_once_with(
         freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
     )
@@ -1120,18 +1132,19 @@ def test_vision_objective_preserves_cli_master_switch(enabled, objective):
 
 
 @pytest.mark.parametrize(
-    "global_overlap,decoder_overlap,decoder_length,expected",
+    "overlap,decoder_length,expected",
     [
-        (True, False, None, 2048),
-        (True, False, 4096, 2048),
-        (False, True, 4096, 4096),
-        (True, True, 4096, 4096),
-        (False, False, None, 2048),
+        (True, None, 2050),
+        (True, 4096, 4096),
+        (False, None, 2050),
+        (False, 4096, 4096),
+        (True, 2048, "must be at least"),
+        (False, 4095, "must be divisible"),
     ],
 )
 @pytest.mark.parametrize("explicit_text_length", [False, True])
-def test_mock_vlm_resolves_legacy_padding_before_startup(
-    global_overlap, decoder_overlap, decoder_length, expected, explicit_text_length
+def test_mock_vlm_resolves_padding_before_startup(
+    overlap, decoder_length, expected, explicit_text_length
 ):
     import pretrain_vlm
 
@@ -1146,7 +1159,6 @@ def test_mock_vlm_resolves_legacy_padding_before_startup(
             "256",
             "--patch-dim",
             "16",
-            "--disable-vision-class-token",
             "--dataloader-seq-length",
             "1792",
             "--seq-length",
@@ -1155,18 +1167,22 @@ def test_mock_vlm_resolves_legacy_padding_before_startup(
             "2",
             "--sequence-parallel",
         ]
+        + (["--tp-comm-overlap"] if overlap else [])
+        + (["--decoder-seq-length", str(decoder_length)] if decoder_length is not None else [])
     )
     args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
     args.max_position_embeddings, args.params_dtype = 4096, torch.float32
-    args.tp_comm_overlap, args.decoder_tp_comm_overlap = global_overlap, decoder_overlap
-    args.decoder_seq_length = decoder_length
     if not explicit_text_length:
         # The inference caller does not register the mock-training data-length flag.
         del args.dataloader_seq_length
         args.seq_length = 1792
     model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            pretrain_vlm.set_vlm_sequence_lengths(args, model)
+        return
     pretrain_vlm.set_vlm_sequence_lengths(args, model)
-    assert model.transformer.tp_comm_overlap == (global_overlap or decoder_overlap)
+    assert model.transformer.tp_comm_overlap == overlap
     assert args.dataloader_seq_length == 1792
     assert args.decoder_seq_length == expected
 

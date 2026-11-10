@@ -47,7 +47,11 @@ from pretrain_gpt import loss_func
 
 
 def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) -> None:
-    """Set text and padded decoder lengths before initialization sizes TP user buffers."""
+    """Resolve decoder length before TP user-buffer setup, independently of overlap.
+
+    An explicit decoder length includes image tokens and padding. Otherwise, derive
+    the smallest length that fits the text and image and supports CP/SP splitting.
+    """
     if not isinstance(model_config, LLaVAModelConfig):
         raise TypeError(
             f"Expected LLaVAModelConfig, got {type(model_config).__name__}"
@@ -66,14 +70,21 @@ def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) ->
     )
     decoder_length = args.dataloader_seq_length + image_tokens
     transformer = model_config.transformer
-    args.decoder_seq_length = decoder_length + context_parallel.get_padding(
-        decoder_length,
+    requested_length = args.decoder_seq_length
+    padding = context_parallel.get_padding(
+        decoder_length if requested_length is None else requested_length,
         transformer.context_parallel_size,
         transformer.tensor_model_parallel_size,
         transformer.sequence_parallel,
-        getattr(args, "decoder_tp_comm_overlap", False),
-        args.decoder_seq_length,
     )
+    if requested_length is None:
+        args.decoder_seq_length = decoder_length + padding
+    elif requested_length < decoder_length:
+        raise ValueError(
+            f"--decoder-seq-length must be at least {decoder_length} to fit text and image tokens"
+        )
+    elif padding:
+        raise ValueError("--decoder-seq-length must be divisible by the CP/SP padding factor")
 
 
 def model_provider(
@@ -487,14 +498,6 @@ def add_vlm_extra_args(parser):
         "--dataloader-seq-length",
         type=int,
         help="Make dataloader to produce sequences of specific length.",
-    )
-    group.add_argument(
-        "--decoder-tp-comm-overlap",
-        action="store_true",
-        default=False,
-        help="Enables the overlap of "
-        "Tensor parallel communication and GEMM kernels in Decoder only. "
-        "Please provide decoder-seq-length when using this feature.",
     )
     group.add_argument(
         "--use-packed-sequence", action="store_true", default=False, help="Use packed sequence"

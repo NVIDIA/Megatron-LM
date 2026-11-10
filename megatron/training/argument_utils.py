@@ -828,8 +828,6 @@ def model_config_from_args(
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, BertModelConfig):
         return bert_config_from_args(args, model_config_cls=model_config_cls)
-    if issubclass(model_config_cls, LLaVAModelConfig):
-        return llava_config_from_args(args, model_config_cls=model_config_cls)
     return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
 
 
@@ -844,16 +842,6 @@ def bert_config_from_args(
         kwargs["transformer_layer_spec"] = (
             bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
         )
-    return model_config_cls(**kwargs)
-
-
-def llava_config_from_args(
-    args: Namespace, model_config_cls: type[LLaVAModelConfig] = LLaVAModelConfig
-) -> LLaVAModelConfig:
-    """Resolve shared model fields and legacy decoder overlap at the CLI boundary."""
-    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
-    # Both legacy switches enable decoder overlap. Vision/projection disable it.
-    kwargs["transformer"].tp_comm_overlap |= getattr(args, "decoder_tp_comm_overlap", False)
     return model_config_cls(**kwargs)
 
 
