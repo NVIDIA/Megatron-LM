@@ -143,13 +143,13 @@ def test_gdn_rejects_nondeterministic_backend_in_deterministic_mode():
     """Deterministic mode must not silently replace the configured backend."""
     gdn = _make_gdn_variant_stub("fla", deterministic_mode=True)
 
-    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch' or"):
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend in"):
         GatedDeltaNet._setup_variant_attrs(gdn)
 
 
 def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode():
     """Invalid deterministic GDN backend combinations fail during config construction."""
-    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch' or"):
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend in"):
         TransformerConfig(
             num_layers=1,
             hidden_size=128,
@@ -174,15 +174,7 @@ def test_gdn_accepts_te_backend_in_deterministic_mode(monkeypatch):
     GatedDeltaNet._setup_variant_attrs(gdn)
 
     assert gdn.gdn_backend == "transformer_engine"
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=2,
-        experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=[1],
-        deterministic_mode=True,
-        gdn_kernel_backend="transformer_engine",
-    )
+    config = _make_gdn_config(deterministic_mode=True, gdn_kernel_backend="transformer_engine")
     assert config.gdn_kernel_backend == "transformer_engine"
 
 
@@ -223,6 +215,38 @@ def _make_gdn_config(**overrides):
     }
     config_kwargs.update(overrides)
     return TransformerConfig(**config_kwargs)
+
+
+def _make_te_gdn_config(**overrides):
+    """The small TE-backend GDN config the TE tests share (two value heads, one key head)."""
+    return _make_gdn_config(
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        num_attention_heads=2,
+        num_query_groups=2,
+        gdn_kernel_backend="transformer_engine",
+        **overrides,
+    )
+
+
+def _build_gdn_module(config, pg_collection):
+    """Build a bf16 CUDA GatedDeltaNet from ``config`` with the constructor options tests use."""
+    submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+    gdn = GatedDeltaNet(
+        config,
+        submodules=submodules,
+        layer_number=1,
+        bias=False,
+        conv_bias=False,
+        conv_init=1.0,
+        use_qk_l2norm=True,
+        A_init_range=(1, 16),
+        pg_collection=pg_collection,
+    )
+    return gdn.cuda().bfloat16()
 
 
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
@@ -312,21 +336,7 @@ class TestFusedPreGatedDeltaRule:
             gdn_kernel_backend="torch" if deterministic_mode else "fla",
             gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
         )
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=transformer_config
-        ).submodules
-        gdn = GatedDeltaNet(
-            transformer_config,
-            submodules=gdn_submodules,
-            layer_number=1,
-            bias=False,
-            conv_bias=False,
-            conv_init=1.0,
-            use_qk_l2norm=True,
-            A_init_range=(1, 16),
-            pg_collection=self.pg_collection,
-        )
-        return gdn.cuda().bfloat16()
+        return _build_gdn_module(transformer_config, self.pg_collection)
 
     def _packed_pre_gated_delta_rule_reference(self, gdn, qkvzba, cu_seqlens):
         """Run the unfused pre-GDR path independently on each packed sequence."""
@@ -881,42 +891,8 @@ def test_te_gdn_matches_previous_fla_path():
             tp=parallel_state.get_tensor_model_parallel_group(),
             cp=parallel_state.get_context_parallel_group(),
         )
-        config = TransformerConfig(
-            hidden_size=128,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=64,
-            linear_value_head_dim=64,
-            linear_num_key_heads=1,
-            linear_num_value_heads=2,
-            num_layers=1,
-            normalization="RMSNorm",
-            use_cpu_initialization=True,
-            layernorm_zero_centered_gamma=True,
-            num_attention_heads=2,
-            num_query_groups=2,
-            activation_func=F.silu,
-            bf16=True,
-            experimental_attention_variant="gated_delta_net",
-            gdn_kernel_backend="transformer_engine",
-            linear_attention_freq=[1],
-            transformer_impl="transformer_engine",
-        )
-        submodules = get_experimental_attention_variant_module_spec(config=config).submodules
-        gdn = (
-            GatedDeltaNet(
-                config,
-                submodules=submodules,
-                layer_number=1,
-                bias=False,
-                conv_bias=False,
-                conv_init=1.0,
-                use_qk_l2norm=True,
-                A_init_range=(1, 16),
-                pg_collection=pg_collection,
-            )
-            .cuda()
-            .bfloat16()
-        )
+        config = _make_te_gdn_config()
+        gdn = _build_gdn_module(config, pg_collection)
 
         batch, sequence = 2, 64
         heads = config.linear_num_value_heads
@@ -1287,43 +1263,8 @@ def test_te_gdn_deterministic_mode_replays_bit_exact():
             tp=parallel_state.get_tensor_model_parallel_group(),
             cp=parallel_state.get_context_parallel_group(),
         )
-        config = TransformerConfig(
-            hidden_size=128,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=64,
-            linear_value_head_dim=64,
-            linear_num_key_heads=1,
-            linear_num_value_heads=2,
-            num_layers=1,
-            normalization="RMSNorm",
-            use_cpu_initialization=True,
-            layernorm_zero_centered_gamma=True,
-            num_attention_heads=2,
-            num_query_groups=2,
-            activation_func=F.silu,
-            bf16=True,
-            experimental_attention_variant="gated_delta_net",
-            gdn_kernel_backend="transformer_engine",
-            linear_attention_freq=[1],
-            transformer_impl="transformer_engine",
-            deterministic_mode=True,
-        )
-        submodules = get_experimental_attention_variant_module_spec(config=config).submodules
-        gdn = (
-            GatedDeltaNet(
-                config,
-                submodules=submodules,
-                layer_number=1,
-                bias=False,
-                conv_bias=False,
-                conv_init=1.0,
-                use_qk_l2norm=True,
-                A_init_range=(1, 16),
-                pg_collection=pg_collection,
-            )
-            .cuda()
-            .bfloat16()
-        )
+        config = _make_te_gdn_config(deterministic_mode=True)
+        gdn = _build_gdn_module(config, pg_collection)
         assert gdn.gdn_backend == "transformer_engine"
         hidden_states = torch.randn(
             256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True

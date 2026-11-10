@@ -835,17 +835,23 @@ def test_torch_chunk_gated_delta_rule_cuda_graph(
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
+def _gdn_rule_inputs(B, T, H, K, V=None):
+    """Seeded bf16 q/k/v and fp32 g/beta leaves for a gated-delta-rule kernel, [B, T, H, ...]."""
+    seeded()
+    V = K if V is None else V
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
+    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    return q, k, v, g, beta
+
+
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
     from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
 
-    seeded()
-    B, T, H, K = 2, 2048, 16, 128
-    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
-    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    q, k, v, g, beta = _gdn_rule_inputs(2, 2048, 16, 128)
 
     def fn(q, k, v, g, beta):
         # use_qk_l2norm_in_kernel routes through FLA's l2norm, whose signature differs across
@@ -910,13 +916,7 @@ def test_kda_fp8_opt_out_scope_is_replay_safe():
 )
 def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
     fla_ops = pytest.importorskip("fla.ops.gated_delta_rule")
-    seeded()
-    B, T, H, K = 2, 2048, 16, 128
-    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
-    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    q, k, v, g, beta = _gdn_rule_inputs(2, 2048, 16, 128)
 
     def fn(q, k, v, g, beta):
         o, state = fla_ops.chunk_gated_delta_rule(
@@ -930,8 +930,9 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
 @pytest.mark.parametrize("packed", [False, True], ids=["bshd", "thd"])
 def test_te_gated_delta_net_replays_fwd_bwd(packed):
     """The fused path ``--deterministic-mode`` accepts for GDN: TE's GatedDeltaNetAttention over
-    the cuDNN frontend kernel, replayed under side-stream contention. Packed sequences go
-    through the ``thd`` layout the training mixer uses with ``cu_seqlens``."""
+    the cuDNN frontend kernel, replayed under side-stream contention. The ``thd`` case is
+    kernel-level evidence for packed sequences, which the GDN mixer does not yet enable under
+    deterministic_mode (``GatedDeltaNet.forward_pre_attn_and_core_attn`` asserts)."""
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 
@@ -939,7 +940,6 @@ def test_te_gated_delta_net_replays_fwd_bwd(packed):
         pytest.skip("Transformer Engine GatedDeltaNetAttention is unavailable")
     from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
 
-    seeded()
     H, K, V = 16, 128, 128
     if packed:
         lengths = (2051, 3, 1024, 1018)
@@ -948,11 +948,7 @@ def test_te_gated_delta_net_replays_fwd_bwd(packed):
     else:
         B, T = 2, 2048
         cu_seqlens = None
-    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
-    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    q, k, v, g, beta = _gdn_rule_inputs(B, T, H, K, V)
     module = TEGatedDeltaNetAttention(
         num_attention_heads=H, qk_head_dim=K, value_head_dim=V, layer_number=1
     ).cuda()
