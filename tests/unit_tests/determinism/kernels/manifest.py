@@ -965,6 +965,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
     KernelEntry(
+        name="local_muon_ns_graph_replay",
+        sources=(
+            "megatron/core/optimizer/muon_ns_cuda_graph.py",
+            "megatron/core/optimizer/emerging_optimizers.py",
+        ),
+        tests=(K + "test_muon_ns_graphs.py",),
+        kind="dispatch",
+        notes="Bounded CUDA graph replay of unchanged local Newton-Schulz; compare optimizer "
+        "parameters and momentum bitwise with eager execution and retain independent outputs.",
+    ),
+    KernelEntry(
         name="muon_newton_schulz_dispatch",
         sources=("megatron/core/optimizer/layer_sharded_muon.py",),
         tests=(

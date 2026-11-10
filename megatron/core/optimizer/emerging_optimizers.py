@@ -276,6 +276,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        ns_cuda_graphs: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -285,6 +286,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f"{get_emerging_optimizers_version()} is installed. Upgrade "
                 "emerging_optimizers or drop --muon-use-syrk."
             )
+
+        self._ns_cuda_graph_replay = None
+        if ns_cuda_graphs:
+            if type(self) is not TensorParallelMuon:
+                raise ValueError("ns_cuda_graphs currently supports TensorParallelMuon only.")
+            from megatron.core.optimizer.muon_ns_cuda_graph import MuonNewtonSchulzCudaGraphs
+
+            self._ns_cuda_graph_replay = MuonNewtonSchulzCudaGraphs(newton_schulz_tp)
+        ns_kernel = self._ns_cuda_graph_replay or newton_schulz_tp
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -311,7 +321,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
-            orth_grad = newton_schulz_tp(
+            orth_grad = ns_kernel(
                 grad,
                 steps=num_ns_steps,
                 coefficient_type=coefficient_type,
