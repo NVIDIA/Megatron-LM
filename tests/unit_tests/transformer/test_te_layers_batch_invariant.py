@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import contextlib
 import importlib
 import os
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -27,7 +29,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_lts_ci_image
 
 try:
     import flash_attn_3
@@ -147,6 +149,191 @@ def _random_splits(total, num_parts):
             delta -= 1
         i = (i + 1) % len(lens)
     return lens
+
+
+# DeepGEMM ships only in the dev CI image; there the deepgemm cases fail without it.
+_BI_GEMM_BACKENDS = [
+    "triton",
+    pytest.param(
+        "deepgemm",
+        marks=pytest.mark.skipif(is_lts_ci_image(), reason="DeepGEMM is not in the LTS image."),
+    ),
+]
+
+
+@pytest.mark.parametrize("seq_batch", [(48, 1), (24, 2)], ids=["b1", "b2"])
+@pytest.mark.parametrize("layer_type", ["linear", "layernorm_linear"])
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+def test_te_linear_fused_wgrad_accumulates_over_microbatches(backend, layer_type, seq_batch):
+    """With gradient_accumulation_fusion, a TE linear adds each microbatch's weight gradient
+    into main_grad under batch-invariant mode, as it does without it."""
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            flash_attention_version=_BIK_FA_VERSION,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            attention_backend=AttnBackend.flash,
+            gradient_accumulation_fusion=True,
+        )
+        layer_cls = (
+            TEColumnParallelLinear if layer_type == "linear" else TELayerNormColumnParallelLinear
+        )
+        layer = layer_cls(
+            input_size=cfg.hidden_size,
+            output_size=512,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        torch.manual_seed(9)
+        # TE Linear keeps its saved input at [s, b, in] for the weight-gradient GEMM.
+        inputs = [
+            torch.randn(*seq_batch, cfg.hidden_size, **_device(torch.bfloat16)) for _ in range(2)
+        ]
+        grads = [torch.randn(*seq_batch, 512, **_device(torch.bfloat16)) for _ in range(2)]
+
+        def main_grad_after_two_microbatches(batch_invariant):
+            layer.weight.main_grad = torch.zeros(
+                layer.weight.shape, device="cuda", dtype=torch.float32
+            )
+            mode = (
+                set_batch_invariant_mode(True, backend=backend)
+                if batch_invariant
+                else contextlib.nullcontext()
+            )
+            with mode:
+                for x, dy in zip(inputs, grads):
+                    out, _ = layer(x)
+                    out.backward(dy)
+            return layer.weight.main_grad.clone()
+
+        reference = main_grad_after_two_microbatches(batch_invariant=False)
+        actual = main_grad_after_two_microbatches(batch_invariant=True)
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=5e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+_FP32, _BF16 = torch.float32, torch.bfloat16
+# name: (A shape, B shape, (out shape, dtype) or None for a returned result, calls)
+_GEMM_CASES = {
+    # TE Linear's weight gradient into fp32 main_grad: its saved input stays [s, b, in] (b = 1
+    # and b > 1) and dy is [s * b, out].
+    "linear-wgrad-fp32-b1": (
+        (48, 1, 128),
+        (48, 96),
+        ((96, 128), _FP32),
+        [dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    "linear-wgrad-fp32-b2": (
+        (24, 2, 128),
+        (48, 96),
+        ((96, 128), _FP32),
+        [dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    # The op fuser's BasicLinear: x and dy both [s, b, ...], alpha and beta None.
+    "op-wgrad-fp32-3d": (
+        (24, 2, 128),
+        (24, 2, 96),
+        ((96, 128), _FP32),
+        [dict(accumulate=True, layout="NT", grad=True, alpha=None, beta=None)],
+    ),
+    "op-wgrad-bf16-3d": ((24, 2, 128), (24, 2, 96), None, [dict(layout="NT", grad=True)]),
+    "op-dgrad-3d": ((96, 128), (24, 2, 96), None, [dict(layout="NN", grad=True, alpha=None)]),
+    "forward-3d": ((96, 128), (24, 2, 128), None, [dict(layout="TN")]),
+    # 2D weight gradients into fp32 main_grad.
+    "accumulate-fp32": (
+        (64, 128),
+        (64, 96),
+        ((96, 128), _FP32),
+        [dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    # A tracked first microbatch overwrites main_grad, the next one adds into it.
+    "overwrite-then-accumulate": (
+        (64, 128),
+        (64, 96),
+        ((96, 128), _FP32),
+        [dict(layout="NT", grad=True), dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    # Scaled linear plus bias, added into a scaled bf16 residual.
+    "alpha-beta-bias": (
+        (96, 128),
+        (64, 128),
+        ((64, 96), _BF16),
+        [dict(accumulate=True, alpha=0.5, beta=2.0)],
+    ),
+    "alpha": ((96, 128), (64, 128), ((64, 96), _BF16), [dict(alpha=0.25)]),
+    "alpha-none": ((96, 128), (64, 128), ((64, 96), _BF16), [dict(alpha=None)]),
+}
+
+
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+@pytest.mark.parametrize("case", list(_GEMM_CASES))
+def test_bik_te_general_gemm_honors_accumulate_alpha_beta(backend, case):
+    """The batch-invariant general_gemm computes what TE's computes, with the operand ranks
+    TE's call sites pass (flattened to 2D before the layout's transposes, TE's output shape)
+    and with accumulate, alpha and beta, None included: it adds into out (a weight gradient
+    into fp32 main_grad, a scaled linear into a residual) instead of overwriting it."""
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    torch.manual_seed(5)
+    a_shape, b_shape, out_spec, calls = _GEMM_CASES[case]
+    bf16 = _device(torch.bfloat16)
+    operands = [(torch.randn(*a_shape, **bf16), torch.randn(*b_shape, **bf16)) for _ in calls]
+    out0 = None if out_spec is None else torch.randn(out_spec[0], device="cuda").to(out_spec[1])
+    bias = torch.randn(96, **bf16) if case == "alpha-beta-bias" else None
+
+    def run():
+        out = None if out0 is None else out0.clone()
+        for (A, B), kwargs in zip(operands, calls):
+            out_dtype = _BF16 if out is None else out.dtype
+            result = te_cpp.general_gemm(A, B, out_dtype=out_dtype, out=out, bias=bias, **kwargs)[0]
+            assert out is None or result is out
+        return result
+
+    reference = run()
+    with set_batch_invariant_mode(True, backend=backend):
+        actual = run()
+    assert actual.shape == reference.shape and actual.dtype == reference.dtype
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_batch_invariant_gemm_backends_reject_fp8(backend):
+    """The deepgemm/triton GEMMs take no quantized operands, so FP8 is rejected at
+    construction rather than at the first GEMM."""
+    with pytest.raises(AssertionError, match="batch_invariant_backend"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=_BIK_FA_VERSION,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+        )
 
 
 # ============================================================================
@@ -891,3 +1078,336 @@ def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
         )
 
     assert torch.equal(full, chunks)
+
+
+# ============================================================================
+# TE operation fuser (use_transformer_engine_op_fuser) under batch invariance
+# ============================================================================
+
+
+def _forbid_te_dense_gemm(monkeypatch):
+    """Make TE's cuBLASLt dense GEMM raise, so a bypass of the batch-invariant GEMM fails."""
+    import transformer_engine_torch as tex
+
+    def raise_(*args, **kwargs):
+        raise AssertionError("tex.generic_gemm ran under batch-invariant mode")
+
+    monkeypatch.setattr(tex, "generic_gemm", raise_)
+
+
+def _build_te_fused_mlp(backend, op_fuser=True, **overrides):
+    """A TEFusedMLP (the op fuser's norm, BasicLinear, bias, SwiGLU, BasicLinear), or with
+    op_fuser=False the MLP of a TELayerNormColumnParallelLinear and a TERowParallelLinear."""
+    from megatron.core.extensions.transformer_engine import TEFusedMLP
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.mlp import MLP, MLPSubmodules
+
+    options = dict(
+        num_layers=1,
+        hidden_size=256,
+        ffn_hidden_size=512,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        batch_invariant_mode=True,
+        batch_invariant_backend=backend,
+        flash_attention_version=_BIK_FA_VERSION,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-5,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        attention_backend=AttnBackend.flash,
+        use_transformer_engine_op_fuser=op_fuser,
+    )
+    options.update(overrides)
+    cfg = TransformerConfig(**options)
+    mlp = (
+        (TEFusedMLP if op_fuser else MLP)
+        .as_mlp_submodule(
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            config=cfg,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            is_mtp_layer=False,
+        )
+        .cuda()
+    )
+    return cfg, mlp
+
+
+def test_te_op_fuser_mlp_batch_invariant(monkeypatch):
+    """TEFusedMLP gives a token the same bits whatever its co-batch, and never runs TE's
+    cuBLASLt GEMM. Under triton, whose dense kernel is batch-invariant on its own; the
+    deepgemm dense kernel's invariance is fix/deepgemm-bi-dense's to test."""
+    import transformer_engine.pytorch.ops.basic.rmsnorm as te_ops_rmsnorm
+
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg, mlp = _build_te_fused_mlp("triton")
+        mlp.eval()
+        torch.manual_seed(7)
+        target = torch.randn(8, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+        _forbid_te_dense_gemm(monkeypatch)
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="triton"):
+            assert te_ops_rmsnorm.rmsnorm_fwd is bik._te_rmsnorm_fwd_patched
+            alone, _ = mlp(target)
+            assert alone.abs().max() > 0
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(
+                    left + right, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16
+                )
+                batch = torch.cat([filler[:left], target, filler[left:]])
+                out, _ = mlp(batch)
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        assert te_ops_rmsnorm.rmsnorm_fwd is not bik._te_rmsnorm_fwd_patched
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("normalization", ["RMSNorm", "LayerNorm"])
+@pytest.mark.parametrize("mlp_type", ["op-fuser", "layernorm-linear"])
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+def test_te_op_fuser_mlp_two_microbatch_training(monkeypatch, backend, mlp_type, normalization):
+    """Two training microbatches of [s, b, h] input (b = 2) through an MLP with
+    gradient_accumulation_fusion: TEFusedMLP (the op fuser's norm op and BasicLinear, which
+    passes alpha=None), or the MLP of TE's LayerNormLinear and Linear modules. Forward,
+    backward through the norm, dgrad, and wgrad accumulated into main_grad. The target rows'
+    forward bits match across the two batch compositions (triton; the deepgemm dense
+    kernel's invariance is fix/deepgemm-bi-dense's), main_grad is bit-identical across
+    repeats, and every gradient matches the run without batch-invariant mode within
+    tolerance. TE's cuBLASLt GEMM never runs under the mode."""
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg, mlp = _build_te_fused_mlp(
+            backend,
+            op_fuser=mlp_type == "op-fuser",
+            normalization=normalization,
+            gradient_accumulation_fusion=True,
+        )
+        weights = [mlp.linear_fc1.weight, mlp.linear_fc2.weight]
+        torch.manual_seed(13)
+        hidden, b = cfg.hidden_size, 2
+        target = torch.randn(8, b, hidden, device="cuda", dtype=torch.bfloat16)
+        target_dy = torch.randn(8, b, hidden, device="cuda", dtype=torch.bfloat16)
+        microbatches = []
+        for left, right in ((3, 29), (61, 7)):
+            x = torch.randn(left + 8 + right, b, hidden, device="cuda", dtype=torch.bfloat16)
+            dy = torch.randn_like(x)
+            x[left : left + 8], dy[left : left + 8] = target, target_dy
+            microbatches.append((left, x, dy))
+
+        def train(batch_invariant):
+            for weight in weights:
+                weight.main_grad = torch.zeros(weight.shape, device="cuda", dtype=torch.float32)
+            mode = (
+                set_batch_invariant_mode(True, backend=backend)
+                if batch_invariant
+                else contextlib.nullcontext()
+            )
+            outs, input_grads = [], []
+            with mode:
+                for left, x, dy in microbatches:
+                    x = x.clone().requires_grad_(True)
+                    out, _ = mlp(x)
+                    out.backward(dy)
+                    outs.append(out.detach()[left : left + 8])
+                    input_grads.append(x.grad)
+            return outs, input_grads, [weight.main_grad.clone() for weight in weights]
+
+        ref_outs, ref_input_grads, ref_main_grads = train(batch_invariant=False)
+        _forbid_te_dense_gemm(monkeypatch)
+        outs, input_grads, main_grads = train(batch_invariant=True)
+        _, _, repeat_main_grads = train(batch_invariant=True)
+        if backend == "triton":
+            assert torch.equal(outs[0], outs[1])
+        for actual, repeat in zip(main_grads, repeat_main_grads):
+            assert torch.equal(actual, repeat)
+        for actual, reference in zip(outs + input_grads, ref_outs + ref_input_grads):
+            torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=2e-2)
+        for actual, reference in zip(main_grads, ref_main_grads):
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=5e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("shape", [(6, 64), (3, 2, 64)], ids=["2d", "3d"])
+def test_bik_norm_statistics_are_rows(monkeypatch, shape):
+    """The batch-invariant norms return mu and rsigma of shape [rows] for any input rank, as
+    TE's norm backward expects. TE 2.21 and later pass LayerNormLinear's [s, b, h] input to
+    apply_normalization unflattened. Runs on CPU: torch's mean stands in for mean_dim, and
+    preallocated outputs avoid TE's dtype map."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    monkeypatch.setattr(
+        bik, "mean_dim", lambda t, dim, keepdim=False: t.mean(dim=dim, keepdim=keepdim)
+    )
+    monkeypatch.setattr(bik, "is_batch_invariant_mode_enabled", lambda: True)
+    eps, rows = 1e-5, 6
+    torch.manual_seed(5)
+    x = torch.randn(shape, dtype=torch.bfloat16)
+    w = torch.randn(shape[-1], dtype=torch.bfloat16)
+    b = torch.randn(shape[-1], dtype=torch.bfloat16)
+    x_rows = x.float().reshape(rows, shape[-1])
+    ln_mu = x_rows.mean(-1)
+    ln_rsigma = torch.rsqrt(x_rows.var(-1, unbiased=False) + eps)
+    rms_rsigma = torch.rsqrt(x_rows.pow(2).mean(-1) + eps)
+
+    _, mu, rsigma = bik._te_layernorm_fwd_patched(
+        x, w, b, eps, torch.empty_like(x), None, None, 0, False
+    )
+    torch.testing.assert_close(mu, ln_mu)
+    torch.testing.assert_close(rsigma, ln_rsigma, rtol=1e-4, atol=1e-4)
+    _, mu, rsigma = bik._te_rmsnorm_fwd_patched(
+        x, w, eps, torch.empty_like(x), None, None, 0, False
+    )
+    assert mu is None
+    torch.testing.assert_close(rsigma, rms_rsigma, rtol=1e-4, atol=1e-4)
+    for normalization, bias in (("LayerNorm", b), ("RMSNorm", None)):
+        out, mu, rsigma = bik._te_apply_normalization_patched(
+            x, None, w, bias, eps, None, torch.bfloat16, normalization, 0, False
+        )
+        assert out.shape == x.shape
+        if normalization == "LayerNorm":
+            torch.testing.assert_close(mu, ln_mu)
+            torch.testing.assert_close(rsigma, ln_rsigma, rtol=1e-4, atol=1e-4)
+        else:
+            assert mu is None
+            torch.testing.assert_close(rsigma, rms_rsigma, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("module", ["ops-rmsnorm", "fused-residual-rmsnorm"])
+@pytest.mark.parametrize("zero_centered_gamma", [False, True])
+def test_te_op_fuser_rmsnorm_batch_invariant(module, zero_centered_gamma):
+    """The op fuser's te.ops.RMSNorm, which imports TE's rmsnorm_fwd by name, runs the
+    batch-invariant RMSNorm in forward and still back-propagates through TE's rmsnorm_bwd.
+    TEFusedResidualRMSNorm (fused_residual_rmsnorm, no op fuser needed) runs the same op."""
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.ops.basic.rmsnorm as te_ops_rmsnorm
+
+    from megatron.core.extensions.transformer_engine import TEFusedResidualRMSNorm
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    hidden, eps = 256, 1e-5
+    if module == "ops-rmsnorm":
+        norm = te.ops.RMSNorm(
+            hidden,
+            eps=eps,
+            zero_centered_gamma=zero_centered_gamma,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        run = norm
+    else:
+        norm = TEFusedResidualRMSNorm(
+            normalized_shape=hidden,
+            eps=eps,
+            zero_centered_gamma=zero_centered_gamma,
+            dtype=torch.bfloat16,
+        ).cuda()
+
+        def run(x):
+            normalized, residual = norm(x)
+            assert residual is x or torch.equal(residual, x)
+            return normalized
+
+    torch.manual_seed(11)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(hidden) * 0.1 + (0.0 if zero_centered_gamma else 1.0))
+    target = torch.randn(8, hidden, device="cuda", dtype=torch.bfloat16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        assert te_ops_rmsnorm.rmsnorm_fwd is bik._te_rmsnorm_fwd_patched
+        with torch.no_grad():
+            alone = run(target)
+            expected, _ = bik._rmsnorm_batch_invariant_fp32(
+                target, norm.weight, eps, zero_centered_gamma
+            )
+            assert torch.equal(alone, expected.to(torch.bfloat16))
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(left + right, hidden, device="cuda", dtype=torch.bfloat16)
+                out = run(torch.cat([filler[:left], target, filler[left:]]))
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        x = target.clone().requires_grad_(True)
+        dy = torch.randn_like(target)
+        run(x).backward(dy)
+    assert te_ops_rmsnorm.rmsnorm_fwd is not bik._te_rmsnorm_fwd_patched
+    x64 = target.double().requires_grad_(True)
+    w64 = norm.weight.detach().double() + (1.0 if zero_centered_gamma else 0.0)
+    (x64 * torch.rsqrt(x64.pow(2).mean(-1, keepdim=True) + eps) * w64).backward(dy.double())
+    torch.testing.assert_close(x.grad.double(), x64.grad, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("module", ["ops-layernorm", "te-layernorm", "layernorm-linear"])
+@pytest.mark.parametrize("zero_centered_gamma", [False, True])
+def test_te_layernorm_batch_invariant(module, zero_centered_gamma):
+    """TE's LayerNorm runs the batch-invariant LayerNorm under batch-invariant mode, whether it
+    is the op fuser's te.ops.LayerNorm, TE's LayerNorm module (TENorm), or the norm fused
+    into a LayerNormLinear, and still back-propagates through TE's layernorm_bwd."""
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.ops.basic.layer_norm as te_ops_layer_norm
+
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    hidden, eps, bf16 = 256, 1e-5, torch.bfloat16
+    if module == "ops-layernorm":
+        norm = te.ops.LayerNorm(
+            hidden, eps=eps, zero_centered_gamma=zero_centered_gamma, device="cuda", dtype=bf16
+        )
+        weight, bias, run = norm.weight, norm.bias, norm
+    elif module == "te-layernorm":
+        norm = te.LayerNorm(
+            hidden, eps=eps, zero_centered_gamma=zero_centered_gamma, device="cuda", dtype=bf16
+        )
+        weight, bias, run = norm.weight, norm.bias, norm
+    else:
+        norm = te.LayerNormLinear(
+            hidden,
+            128,
+            eps=eps,
+            normalization="LayerNorm",
+            zero_centered_gamma=zero_centered_gamma,
+            params_dtype=bf16,
+            device="cuda",
+            return_layernorm_output=True,
+        )
+        weight, bias = norm.layer_norm_weight, norm.layer_norm_bias
+
+        def run(x):
+            return norm(x)[1]
+
+    torch.manual_seed(17)
+    with torch.no_grad():
+        weight.copy_(torch.randn(hidden) * 0.1 + (0.0 if zero_centered_gamma else 1.0))
+        bias.copy_(torch.randn(hidden) * 0.1)
+    target = torch.randn(8, hidden, device="cuda", dtype=bf16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        assert te_ops_layer_norm.layernorm_fwd is bik._te_layernorm_fwd_patched
+        with torch.no_grad():
+            alone = run(target)
+            expected, _, _ = bik._layernorm_batch_invariant_fp32(
+                target, weight, bias, eps, zero_centered_gamma
+            )
+            assert torch.equal(alone, expected.to(bf16))
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(left + right, hidden, device="cuda", dtype=bf16)
+                out = run(torch.cat([filler[:left], target, filler[left:]]))
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        if module != "layernorm-linear":
+            x = target.clone().requires_grad_(True)
+            dy = torch.randn_like(target)
+            run(x).backward(dy)
+    assert te_ops_layer_norm.layernorm_fwd is not bik._te_layernorm_fwd_patched
+    if module != "layernorm-linear":
+        x64 = target.double().requires_grad_(True)
+        w64 = weight.detach().double() + (1.0 if zero_centered_gamma else 0.0)
+        reference = torch.nn.functional.layer_norm(x64, (hidden,), w64, bias.detach().double(), eps)
+        reference.backward(dy.double())
+        torch.testing.assert_close(x.grad.double(), x64.grad, rtol=2e-2, atol=2e-2)
