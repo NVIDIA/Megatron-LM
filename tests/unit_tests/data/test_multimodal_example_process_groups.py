@@ -133,6 +133,22 @@ def test_get_batch_reads_the_tp_cp_group_only_for_a_batch_deduplicated_across_cp
         train.get_batch(iter([{}]), 0, 1, pg_collection=pg_collection)
 
 
+def test_get_batch_checks_batch_ownership_only_for_a_cp_deduplicated_dataloader(train, monkeypatch):
+    """The ownership error names CP deduplication, so only such a dataloader can raise it."""
+    groups = _record_broadcasts(monkeypatch)
+
+    # The first rank of the TP x CP group has no dataloader.
+    monkeypatch.setattr(train, "get_args", lambda: _batch_args(True, context_parallel_size=2))
+    with pytest.raises(RuntimeError, match="CP-deduplicated dataloader ownership"):
+        train.get_batch(None, 0, 1, pg_collection=_pg_collection())
+    assert not groups
+
+    # Without CP deduplication the same rank goes on to the broadcast over its TP group.
+    monkeypatch.setattr(train, "get_args", lambda: _batch_args(False, context_parallel_size=2))
+    train.get_batch(None, 0, 1, pg_collection=_pg_collection())
+    assert groups
+
+
 def _packed_batch_broadcasts(monkeypatch):
     """Replace broadcast_data with one that returns a batch packing two samples of 4 tokens."""
     packed = {
