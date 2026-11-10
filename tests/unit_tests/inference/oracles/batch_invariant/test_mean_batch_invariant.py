@@ -252,8 +252,10 @@ def test_rows_do_not_depend_on_the_batch(dtype, where, n):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_batch_invariant_mode_dispatches_mean(backend, monkeypatch):
-    """Every backend installs the override: one-dim means (any spelling) run `mean_dim` and
-    return its bits; full and several-dim means do not run it."""
+    """Every backend installs the override: one-dim means (any spelling) run `mean_dim` once
+    each and return its bits. Full and several-dim means run too; whether they go through
+    `mean_dim` is the override's choice (main sums several dims with `torch.sum`, #9304 runs
+    `mean_dim`)."""
     x = randn((6, 3000), torch.float32, 6)
     expected = bik.mean_dim(x, -1)
     calls = []
@@ -275,7 +277,6 @@ def test_batch_invariant_mode_dispatches_mean(backend, monkeypatch):
         assert len(calls) == len(outs), f"{backend}: mean_dim ran {len(calls)} of {len(outs)}"
         x.mean()
         x.view(6, 30, 100).mean(dim=(1, 2))
-    assert len(calls) == len(outs), f"{backend}: several-dim means ran mean_dim"
     for i, out in enumerate(outs):
         ou.assert_exact(out, expected, what=f"entry point {i} under {backend}")
 
