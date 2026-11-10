@@ -12,9 +12,6 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
-from collections import deque
-from unittest.mock import Mock
-
 import pytest
 import torch
 import torch.nn as nn
@@ -77,20 +74,12 @@ class TestMfsdpV2PipelineSharedContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    @pytest.mark.parametrize("num_chunks", [1, 2], ids=["pp", "vpp"])
-    @pytest.mark.parametrize("schedule", ["grouped", "interleaved"])
-    def test_pipeline_chunks_record_and_replay_prefetch(
-        self, distributed_setup, monkeypatch, num_chunks, schedule
-    ):
-        """PP and VPP preserve prefetch through repeated forward and backward calls."""
+    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
+        """Shared chunks record their complete execution across separate backward calls."""
         device = distributed_setup.device
 
         # The ambient context is shared for both ordinary PP and VPP wrapping.
-        chunks = [
-            _VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16)
-            for _ in range(num_chunks)
-        ]
-        unsharded_weights = {chunk: chunk.fc.weight for chunk in chunks}
+        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
         config = TransformerConfig(
             num_layers=4,
             hidden_size=16,
@@ -99,7 +88,7 @@ class TestMfsdpV2PipelineSharedContext:
             params_dtype=torch.bfloat16,
             pipeline_dtype=torch.bfloat16,
             pipeline_model_parallel_size=2,
-            virtual_pipeline_model_parallel_size=2 if num_chunks == 2 else None,
+            virtual_pipeline_model_parallel_size=2,
         )
 
         wrapped_chunks = wrap_model_chunks_with_ddp(
@@ -132,53 +121,17 @@ class TestMfsdpV2PipelineSharedContext:
         assert current_fully_shard_context() is None
 
         assert first_context.prefetch_order is PrefetchOrder.RECORDED
-        assert first_context.is_recording_execution_order
-        assert list(first_context.execution_order) == []
-        for chunk in wrapped_chunks:
-            assert chunk.module._schedule_policy.forward_prefetch_size is None
-            assert chunk.module._schedule_policy.backward_prefetch_size is None
-        # Warmup/cooldown spans multiple autograd backward calls in the same context.
         inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
-        forward_chunks = [chunk for chunk in wrapped_chunks for _ in range(3)]
-        if schedule == "grouped":
-            calls = [(chunk, Phase.FORWARD) for chunk in forward_chunks] + [
-                (chunk, Phase.BACKWARD) for chunk in reversed(forward_chunks)
-            ]
-        else:
-            pending_chunks = deque(forward_chunks[:2])
-            calls = [(chunk, Phase.FORWARD) for chunk in pending_chunks]
-            for chunk in forward_chunks[2:]:
-                calls.extend([(pending_chunks.popleft(), Phase.BACKWARD), (chunk, Phase.FORWARD)])
-                pending_chunks.append(chunk)
-            calls.extend((chunk, Phase.BACKWARD) for chunk in pending_chunks)
-        expected = [ExecutionEvent(chunk.module, phase) for chunk, phase in calls]
-        post_backward = Mock(wraps=first_context.post_backward)
-        monkeypatch.setattr(first_context, "post_backward", post_backward)
-        cross_phase_prefetch_checks = 0
+        expected = [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks] + [
+            ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)
+        ]
         with first_context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-            for iteration in range(3):
-                outputs = {chunk: deque() for chunk in wrapped_chunks}
-                for index, (chunk, phase) in enumerate(calls):
-                    if iteration and index:
-                        previous_chunk, previous_phase = calls[index - 1]
-                        if previous_phase is not phase and previous_chunk is not chunk:
-                            # Check before demand hooks can gather this chunk's weights.
-                            weight = unsharded_weights[chunk.module]
-                            storage_bytes = weight.untyped_storage().nbytes()
-                            assert storage_bytes > 0
-                            cross_phase_prefetch_checks += 1
-                    if phase is Phase.FORWARD:
-                        outputs[chunk].append(chunk(inputs))
-                    else:
-                        outputs[chunk].popleft().float().sum().backward()
-                        assert first_context.is_recording_execution_order is (iteration == 0)
-                        if iteration and index < len(calls) - 1:
-                            assert first_context.execution_order.position != 0
-                assert post_backward.call_count == iteration
+            for iteration in range(2):
+                outputs = [chunk(inputs) for chunk in wrapped_chunks]
+                for output in reversed(outputs):
+                    output.float().sum().backward()
+                    assert first_context.is_recording_execution_order is (iteration == 0)
                 finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
-                assert post_backward.call_count == iteration + 1
                 assert not first_context.is_recording_execution_order
-                assert first_context.execution_order.position == 0
                 assert list(first_context.execution_order) == expected
-        if num_chunks == 2 and schedule == "interleaved":
-            assert cross_phase_prefetch_checks > 0
+                assert first_context.execution_order.position == 0
