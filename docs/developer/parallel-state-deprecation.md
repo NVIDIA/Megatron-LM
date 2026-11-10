@@ -95,7 +95,7 @@ expert tensor parallelism uses `expt_tp`, which may differ from the dense `tp` g
 | `get_expert_data_parallel_group_gloo(partial_expert_data_parallel=True)` | `intra_expt_dp_gloo` |
 | `get_tensor_and_data_parallel_group(with_context_parallel=True)` | `tp_dp_cp` |
 | `get_amax_reduction_group(with_context_parallel=True, tp_only_amax_red=...)` | `amax_reduction_group(pg_collection, tp_only_amax_red)` from `megatron.core.process_groups_config` |
-| `get_dynamic_data_context_parallel_group_map()`, `get_dynamic_data_context_parallel_groups(group_size=n)`, `get_hybrid_data_context_parallel_groups(group_size=n)` | `dynamic_cp`, `dynamic_cp[n]` |
+| `get_dynamic_data_context_parallel_group_map()`, `get_dynamic_data_context_parallel_groups(group_size=n)` | `dynamic_cp`, `dynamic_cp[n]` |
 | `get_dynamic_tensor_data_context_parallel_group_map()`, `get_dynamic_tensor_data_context_parallel_group(group_size=n)` | `dynamic_tp_cp`, `dynamic_tp_cp[n]` |
 | `get_intra_distributed_optimizer_instance_group()`, `get_inter_distributed_optimizer_instance_group()` | `intra_dist_opt`, `inter_dist_opt` |
 
