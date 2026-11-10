@@ -46,6 +46,17 @@ def resolve_tensor_parallel_weight_shards(
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
 
 
+def normalize_gtp_nccl_ub(value) -> Optional[list[str]]:
+    """Normalize a ``gtp*_remat_nccl_ub`` value: ``None``/``False`` -> ``None`` (off);
+    ``True`` (the old boolean form) or ``[]`` (a bare flag) -> ``["ag", "rs"]``; otherwise the
+    sorted, de-duplicated collectives."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return ["ag", "rs"]
+    return sorted(set(value)) or ["ag", "rs"]
+
+
 @dataclass
 class ModelParallelConfig:
     """Base configuration for Megatron Core
@@ -648,10 +659,8 @@ class ModelParallelConfig:
             tp_field="expert_tensor_parallel_size",
         )
 
-        # The GTP nccl-ub fields used to be booleans; True still means both collectives.
         for name in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
-            if getattr(self, name) is True:
-                setattr(self, name, ["ag", "rs"])
+            setattr(self, name, normalize_gtp_nccl_ub(getattr(self, name)))
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:

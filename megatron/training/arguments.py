@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1401,11 +1402,8 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
-        # A bare flag ([]) means both collectives; after this each value is None (off) or non-empty.
         for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
-            collectives = getattr(args, attr, None)
-            if collectives is not None:
-                setattr(args, attr, sorted(set(collectives)) or ["ag", "rs"])
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
 
         gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
 
@@ -1416,7 +1414,9 @@ def validate_args(args, defaults={}):
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if "rs" in gtp_ub_collectives and args.gtp_remat_reduce_scatter_with_fp32_accumulation:
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
