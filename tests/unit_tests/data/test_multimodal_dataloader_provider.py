@@ -368,6 +368,16 @@ def test_loaders_shard_over_the_data_parallel_group_without_gtp_fields(
     assert (worker_config["rank"], worker_config["world_size"]) == (1, 2)
 
 
+def test_loaders_require_a_data_parallel_group(strict_resume_provider):
+    """Without dp_gtp_remat and dp there is no group to shard the samples over."""
+    pg_collection = ProcessGroupCollection(tp=_Group(0, 2), cp=_Group(0, 2), pp=_Group(0, 1))
+
+    with pytest.raises(ValueError, match="requires pg_collection.dp_gtp_remat or pg_collection.dp"):
+        dataloader_provider.train_valid_test_dataloaders_provider(
+            None, task_encoder=object(), pg_collection=pg_collection
+        )
+
+
 def test_loaders_require_dp_gtp_remat_with_gtp_weight_remat(monkeypatch, strict_resume_provider):
     """The GTP weight-remat peers of a replica read distinct samples, and dp holds only one."""
     monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))

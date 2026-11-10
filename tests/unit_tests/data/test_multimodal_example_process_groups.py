@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from megatron.core import process_groups_config, tensor_parallel
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
@@ -265,6 +265,33 @@ def test_loss_func_sums_over_the_model_context_parallel_group(train, monkeypatch
     assert reduced_over == [pg_collection.cp, pg_collection.cp]
 
 
+def test_loss_func_rejects_a_none_context_parallel_group(train, monkeypatch):
+    """torch.distributed reduces over every rank of the job when the group is None."""
+    monkeypatch.setattr(
+        train,
+        "get_args",
+        lambda: SimpleNamespace(
+            no_calculate_per_token_loss=False, use_loss_scaling=False, context_parallel_size=2
+        ),
+    )
+    reduced_over = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: reduced_over.append(group),
+    )
+
+    pg_collection = ProcessGroupCollection(cp=None)
+
+    with pytest.raises(ValueError, match="requires pg_collection.cp"):
+        train.loss_func(
+            torch.ones(1, 4), torch.ones(1, 4), torch.tensor(1), pg_collection=pg_collection
+        )
+
+    assert not reduced_over
+
+
 def test_forward_step_passes_the_model_groups(train, monkeypatch):
     monkeypatch.setattr(
         train, "get_args", lambda: SimpleNamespace(use_loss_scaling=False, context_parallel_size=1)
@@ -292,6 +319,27 @@ def test_forward_step_passes_the_model_groups(train, monkeypatch):
 
     assert batch_groups == [pg_collection]
     assert loss_function.keywords["pg_collection"] is pg_collection
+
+
+def test_internvit_rms_norm_without_tp_group_warns_and_reads_the_global_group(monkeypatch):
+    """A norm built without tp_group reads the global one, with a warning, once it needs it."""
+    pytest.importorskip("transformer_engine")
+    from examples.multimodal.nvlm import internvit
+
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    global_tp_group = _Group(0, 2)
+    monkeypatch.setattr(internvit, "get_tensor_model_parallel_group", lambda: global_tp_group)
+    config = TransformerConfig(
+        num_layers=1, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+    )
+    norm = internvit.InternViTRMSNorm(config=config, hidden_size=64)
+
+    assert norm.tp_group is None
+    with pytest.warns(
+        ProcessGroupFallbackWarning, match="InternViTRMSNorm was called without `tp_group`"
+    ):
+        assert norm._resolve_tp_group() is global_tp_group
+    assert norm.tp_group is global_tp_group
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
