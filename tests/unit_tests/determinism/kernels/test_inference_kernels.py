@@ -862,6 +862,15 @@ def test_batch_invariant_kernels_replay():
         backward=False,
         what="matmul_persistent",
     )
+    # aten::addmm's other forms: a strided [M, N] bias, beta and alpha.
+    bias_rows = torch.randn(8192, 4096 + 64, device="cuda", dtype=torch.bfloat16)[:, :4096]
+    assert_replays_bit_exact(
+        lambda a, b: bik.matmul_persistent(a, b, bias_rows, beta=0.5, alpha=2.0),
+        (a, b),
+        replays=4,
+        backward=False,
+        what="matmul_persistent with a strided [M, N] bias, beta and alpha",
+    )
     logits = torch.randn(8192, 32768, device="cuda")
     assert_replays_bit_exact(
         lambda x: bik.log_softmax(x, dim=-1),

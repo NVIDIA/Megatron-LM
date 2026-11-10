@@ -928,3 +928,152 @@ def test_bik_router_gating_logits_are_fp32(backend):
     torch.testing.assert_close(full.double(), reference, rtol=1e-4, atol=1e-4)
     for m, rows in logits.items():
         assert torch.equal(rows, full[:m]), f"logits of {m} tokens differ from the full batch's"
+
+
+# ============================================================================
+# aten::addmm under the triton and deepgemm backends
+# ============================================================================
+
+_ADDMM_BACKENDS = [
+    pytest.param("triton", torch.bfloat16, id="triton-bf16"),
+    # fp32 operands run the Triton kernel under the deepgemm backend, bf16 ones DeepGEMM.
+    *(
+        pytest.param(
+            "deepgemm",
+            dtype,
+            id=f"deepgemm-{name}",
+            marks=pytest.mark.skipif(
+                not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable"
+            ),
+        )
+        for name, dtype in (("fp32", torch.float32), ("bf16", torch.bfloat16))
+    ),
+]
+
+
+def _addmm_args(form, m, n, dtype):
+    """(bias, beta/alpha keywords) for one of the forms aten::addmm accepts, with integers in
+    [-4, 4] as the bias. Strided forms hold NaN between their elements, so a read that ignores
+    the strides shows."""
+    values = torch.randint(-4, 5, (m, n), device="cuda").to(dtype)
+    if form == "strided_vector":
+        storage = torch.full((2 * n,), float("nan"), **_device(dtype))
+        storage[::2] = values[0]
+        return storage[::2], {}
+    if form == "strided_matrix":
+        storage = torch.full((m, n + 3), float("nan"), **_device(dtype))
+        storage[:, :n] = values
+        return storage[:, :n], {}
+    if form == "beta_zero":
+        # aten ignores the bias when beta is 0: its NaN must not reach the output.
+        return torch.full((n,), float("nan"), **_device(dtype)), {"beta": 0}
+    bias, scalars = {
+        "vector": (values[0], {}),
+        "row": (values[:1], {}),
+        "column": (values[:, :1], {}),
+        "matrix": (values, {}),
+        "beta": (values[0], {"beta": 0.5}),
+        "alpha": (values[0], {"alpha": 2}),
+    }[form]
+    return bias.contiguous(), scalars
+
+
+@pytest.mark.parametrize("backend,dtype", _ADDMM_BACKENDS)
+@pytest.mark.parametrize(
+    "form",
+    [
+        "vector",
+        "strided_vector",
+        "row",
+        "column",
+        "matrix",
+        "strided_matrix",
+        "beta",
+        "alpha",
+        "beta_zero",
+    ],
+)
+def test_bik_addmm_follows_aten(backend, dtype, form):
+    """`torch.addmm` under the backend returns what aten returns, for every bias aten accepts.
+
+    Operands in {-1, 0, 1} with K = 64 and an integer bias in [-4, 4] keep every product, sum
+    and scaling exact in bf16, so the outputs must match aten's bit for bit.
+    """
+    torch.manual_seed(29)
+    m, k, n = 33, 64, 50
+    a = torch.randint(-1, 2, (m, k), device="cuda").to(dtype)
+    b = torch.randint(-1, 2, (n, k), device="cuda").to(dtype).t()
+    bias, scalars = _addmm_args(form, m, n, dtype)
+    expected = torch.addmm(bias, a, b, **scalars)
+    assert torch.isfinite(expected).all()
+    with set_batch_invariant_mode(True, backend=backend):
+        out = torch.addmm(bias, a, b, **scalars)
+    assert out.shape == (m, n) and out.dtype == dtype
+    assert torch.equal(out, expected), f"{(out != expected).sum()} of {out.numel()} differ"
+
+
+@pytest.mark.parametrize("backend,dtype", _ADDMM_BACKENDS)
+def test_bik_addmm_matrix_bias_rows_do_not_depend_on_batch(backend, dtype):
+    """With an [M, N] bias, scaled by beta and alpha, a row's bits do not depend on M."""
+    torch.manual_seed(31)
+    tokens, k, n = 2048, 1024, 384
+    x = torch.randn(tokens, k, **_device(dtype))
+    weight = torch.randn(n, k, **_device(dtype)) / 32
+    bias = torch.randn(tokens, n, **_device(dtype))
+    with set_batch_invariant_mode(True, backend=backend):
+        full = torch.addmm(bias, x, weight.t(), beta=0.5, alpha=2.0)
+        for m in (1, 7, 129, 1000):
+            rows = torch.addmm(bias[:m], x[:m], weight.t(), beta=0.5, alpha=2.0)
+            assert torch.equal(rows, full[:m]), f"a batch of {m} rows differs from the full one"
+
+
+class _PersistentKernelLaunchSpy:
+    """Stands in for `matmul_kernel_persistent`: records the launch's 64-bit offset flags."""
+
+    def __init__(self):
+        self.flags = None
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.flags = tuple(kwargs[key] for key in ("A_LARGE", "B_LARGE", "C_LARGE"))
+
+        return launch
+
+
+_INT32_LIMIT = 2**31
+_CONTIGUOUS_B = ((4096, 8), (8, 1))
+
+# name: (a, b, bias) as (shape, stride) or None, and the expected (A_LARGE, B_LARGE, C_LARGE).
+_OFFSET_CASES = {
+    # Contiguous operands of 2**31 and 2**31 + 1 elements: the last offset is 2**31 - 1 / 2**31.
+    "contiguous_fits": (((_INT32_LIMIT // 4096, 4096), (4096, 1)), _CONTIGUOUS_B, None),
+    "contiguous_crosses": (((_INT32_LIMIT // 4096 + 1, 4096), (4096, 1)), _CONTIGUOUS_B, None),
+    # Strided views with fewer than 2**31 elements whose offsets reach past 2**31.
+    "a_column_slice": (((300000, 2048), (8192, 1)), ((2048, 8), (8, 1)), None),
+    "b_transposed_slice": (((8, 4096), (4096, 1)), ((4096, 300000), (1, 8192)), None),
+    "strided_bias": (((8, 64), (64, 1)), ((64, 4096), (4096, 1)), ((4096,), (2**20,))),
+}
+_OFFSET_FLAGS = {
+    "contiguous_fits": (False, False, False),
+    "contiguous_crosses": (True, False, False),
+    "a_column_slice": (True, False, False),
+    "b_transposed_slice": (False, True, False),
+    "strided_bias": (False, False, True),
+}
+
+
+@pytest.mark.parametrize("name", list(_OFFSET_CASES))
+def test_bik_matmul_persistent_uses_64_bit_offsets_past_int32(name, monkeypatch):
+    """64-bit offsets exactly for the operands whose element offsets reach 2**31, strided views
+    included. Meta tensors and a launch spy: nothing is allocated or launched."""
+    spy = _PersistentKernelLaunchSpy()
+    monkeypatch.setattr(
+        "megatron.core.transformer.custom_layers.batch_invariant_kernels.matmul_kernel_persistent",
+        spy,
+    )
+    a, b, bias = (
+        None if view is None else torch.empty_strided(*view, device="meta", dtype=torch.bfloat16)
+        for view in _OFFSET_CASES[name]
+    )
+    matmul_persistent(a, b, bias)
+    assert spy.flags == _OFFSET_FLAGS[name], f"(A_LARGE, B_LARGE, C_LARGE) = {spy.flags}"

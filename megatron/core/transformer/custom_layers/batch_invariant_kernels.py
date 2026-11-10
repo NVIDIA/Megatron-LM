@@ -131,6 +131,10 @@ def matmul_kernel_persistent(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_biasm,
+    stride_biasn,
+    alpha,
+    beta,
     BLOCK_SIZE_M: tl.constexpr,  #
     BLOCK_SIZE_N: tl.constexpr,  #
     BLOCK_SIZE_K: tl.constexpr,  #
@@ -140,6 +144,7 @@ def matmul_kernel_persistent(
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    BIAS_PER_ROW: tl.constexpr,
 ):
     """Persistent matmul Triton kernel backing `matmul_persistent`."""
     start_pid = tl.program_id(axis=0)
@@ -190,10 +195,18 @@ def matmul_kernel_persistent(
             offs_cn = offs_cn.to(tl.int64)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        # alpha * (a @ b) + beta * bias in fp32, rounded once, as aten::addmm computes it.
+        accumulator = accumulator * alpha
         if HAS_BIAS:
-            bias_ptrs = bias_ptr + offs_cn
-            bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0).to(tl.float32)
-            accumulator += bias
+            if BIAS_PER_ROW:
+                bias_ptrs = (
+                    bias_ptr + stride_biasm * offs_cm[:, None] + stride_biasn * offs_cn[None, :]
+                )
+                bias = tl.load(bias_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+            else:
+                bias_ptrs = bias_ptr + stride_biasn * offs_cn
+                bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0).to(tl.float32)
+            accumulator += beta * bias
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -222,22 +235,31 @@ def get_compute_units():
     return NUM_SMS
 
 
+def _max_element_offset(t: torch.Tensor) -> int:
+    """The largest element offset from ``t``'s data pointer that a kernel walking ``t`` reaches."""
+    if t.numel() == 0:
+        return 0
+    return sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+
+
 def matmul_persistent(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    *,
+    beta: float = 1.0,
+    alpha: float = 1.0,
 ):
     """Persistent matmul kernel used by batch-invariant GEMM.
 
-    Accumulates in fp32 and rounds once to ``out_dtype`` (default: the inputs' dtype).
+    Computes ``alpha * (a @ b) + beta * bias`` as `aten::addmm` does: accumulates in fp32, adds
+    the bias in fp32 and rounds once to ``out_dtype`` (default: the inputs' dtype). ``bias`` may
+    be any tensor that broadcasts to [M, N] ([N], [1, N], [M, 1], [M, N]), with any strides.
     """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
 
     NUM_SMS = get_compute_units()
     M, K = a.shape
@@ -245,6 +267,15 @@ def matmul_persistent(
     dtype = a.dtype
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
+    if bias is None:
+        bias_strides = (0, 0)
+    else:
+        # A broadcast dimension gets stride 0; the kernel reads the bias through its strides.
+        bias = bias.expand(M, N)
+        bias_strides = bias.stride()
+    # int32 offsets reach 2**31 - 1, and a strided view can reach further than its numel. The
+    # epilogue addresses C and the bias with the same offsets.
+    epilogue_offset = max(_max_element_offset(t) for t in (c, bias) if t is not None)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -292,11 +323,16 @@ def matmul_persistent(
         b.stride(1),  #
         c.stride(0),
         c.stride(1),  #
+        bias_strides[0],
+        bias_strides[1],
+        float(alpha),
+        float(beta),
         NUM_SMS=NUM_SMS,  #
-        A_LARGE=a.numel() > 2**31,
-        B_LARGE=b.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
+        A_LARGE=_max_element_offset(a) >= 2**31,
+        B_LARGE=_max_element_offset(b) >= 2**31,
+        C_LARGE=epilogue_offset >= 2**31,
         HAS_BIAS=bias is not None,
+        BIAS_PER_ROW=bias_strides[0] != 0,
         **configs[dtype],
     )
     return c
@@ -631,18 +667,27 @@ def mm_batch_invariant(a, b, out_dtype: torch.dtype | None = None):
     return matmul_persistent(a, b, out_dtype=out_dtype)
 
 
-def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm`."""
+def addmm_batch_invariant(bias, a, b, *, beta=1, alpha=1):
+    """Batch-invariant replacement for `aten::addmm`: ``beta * bias + alpha * (a @ b)``.
+
+    ``bias`` is any tensor that broadcasts to [M, N]. As in aten, a zero ``beta`` ignores it, so
+    its NaN and inf do not propagate.
+    """
+    if beta == 0:
+        bias = None
     if (
         _BATCH_INVARIANT_BACKEND == "deepgemm"
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
     ):
+        # DeepGEMM rounds the product to bf16; alpha and the bias are applied after that.
         out = _mm_deepgemm(a, b)
+        if alpha != 1:
+            out = out * alpha
         if bias is not None:
-            out = out + bias
+            out = torch.add(out, bias, alpha=beta)
         return out
-    return matmul_persistent(a, b, bias=bias)
+    return matmul_persistent(a, b, bias=bias, beta=beta, alpha=alpha)
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
