@@ -588,6 +588,23 @@ def test_nvfp4_wire_dtypes_require_op_fuser():
 
 
 @pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_reject_first_last_layers_bf16(wire_dtypes):
+    # Layers kept in BF16 run their experts outside the FP4 context, but the dispatcher uses
+    # one global wire recipe, so they would still get NVFP4 payloads; reject the combination.
+    with pytest.raises(ValueError, match="cannot be combined with first_last_layers_bf16"):
+        _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=True, **wire_dtypes)
+
+    config = _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=False, **wire_dtypes)
+    assert not config.first_last_layers_bf16
+
+
+@pytest.mark.parametrize(
     "a2a_dtype, recipe_name",
     [('bf16', None), ('mxfp8', 'MXFP8BlockScaling'), ('nvfp4', 'NVFP4BlockScaling')],
 )

@@ -2669,14 +2669,21 @@ class TransformerConfig(ModelParallelConfig):
                     "BOTH use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized GroupedTensor payload."
                 )
-            if 'nvfp4' in (self.moe_dispatch_fwd_dtype, self.moe_combine_bwd_dtype) and not (
-                self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4
-            ):
-                raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' require fp4 with "
-                    "fp4_recipe='nvfp4': the experts then quantize their inputs and output "
-                    "gradients to NVFP4 anyway."
-                )
+            if 'nvfp4' in (self.moe_dispatch_fwd_dtype, self.moe_combine_bwd_dtype):
+                if not (self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4):
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' require fp4 "
+                        "with fp4_recipe='nvfp4': the experts then quantize their inputs and "
+                        "output gradients to NVFP4 anyway."
+                    )
+                if self.first_last_layers_bf16:
+                    # The dispatcher builds one wire recipe from the global config, so the
+                    # layers kept in BF16 would still get NVFP4 payloads and gradients.
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' cannot be "
+                        "combined with first_last_layers_bf16: the layers kept in BF16 would "
+                        "still receive NVFP4 payloads from the dispatcher."
+                    )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
