@@ -865,6 +865,48 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_gdn_gate_fp32_exp_replays_fwd_bwd(dtype, compiled):
+    """Gate exponentiation stays in FP32 with low-precision parameters, even in eager mode."""
+    from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+
+    batch, seq_len, heads = 2, 3, 4
+    A_log = torch.tensor([0.5, 1.0, -0.5, 1.5], device="cuda", dtype=dtype, requires_grad=True)
+    dt_bias = torch.zeros(heads, device="cuda", dtype=dtype, requires_grad=True)
+    beta = torch.zeros(batch, seq_len, heads, device="cuda", dtype=dtype, requires_grad=True)
+    alpha = torch.zeros_like(beta, requires_grad=True)
+    inputs = (A_log, dt_bias, beta, alpha)
+    compute_gates = GatedDeltaNet._compute_gates
+    compute_gates = getattr(compute_gates, "_torchdynamo_orig_callable", compute_gates)
+    if compiled:
+        compute_gates = torch.compile(compute_gates, fullgraph=True)
+
+    def fn(A_log, dt_bias, beta, alpha):
+        g, gates = compute_gates(None, A_log, dt_bias, batch, seq_len, beta, alpha)
+        return g, gates["beta"]
+
+    reference_inputs = tuple(t.detach().double().requires_grad_() for t in inputs)
+    ref_A_log, ref_dt_bias, ref_beta, ref_alpha = reference_inputs
+    reference = (
+        -ref_A_log.exp() * torch.nn.functional.softplus(ref_alpha + ref_dt_bias),
+        ref_beta.sigmoid(),
+    )
+    actual = fn(*inputs)
+    for output, expected in zip(actual, reference):
+        torch.testing.assert_close(output, expected.float(), rtol=1e-6, atol=1e-7)
+
+    gradients = torch.autograd.grad(actual, inputs, tuple(torch.ones_like(t) for t in actual))
+    reference_gradients = torch.autograd.grad(
+        reference, reference_inputs, tuple(torch.ones_like(t) for t in reference)
+    )
+    for gradient, expected in zip(gradients, reference_gradients):
+        torch.testing.assert_close(gradient, expected.to(dtype), rtol=1e-6, atol=1e-6)
+    assert all(t.dtype == dtype for t in inputs)
+
+    assert_replays_bit_exact(fn, inputs, replays=3, what="GDN gate FP32 exp")
+
+
 def test_kda_gate_jit_path_replays_fwd_bwd():
     """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
     from types import SimpleNamespace
