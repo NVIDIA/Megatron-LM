@@ -9,6 +9,7 @@ import os
 
 import pytest
 import torch
+from torch.distributed.distributed_c10d import _world
 
 from megatron.core.activations import squared_relu
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -264,6 +265,7 @@ def _gather_cp(shard, reference, seq_dim, qkv_format, packed_seq_params, cp_grou
 class TestBatchInvariantA2AContextParallel:
 
     def setup_method(self, method):
+        self._existing_groups = set(_world.pg_map)
         # Inputs are built on "cuda" before the parallel state sets each rank's device.
         torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
         # Pinned kernel configs, so CP=1 and CP>1 shapes cannot autotune to different kernels.
@@ -279,6 +281,19 @@ class TestBatchInvariantA2AContextParallel:
         Utils.destroy_model_parallel()
         set_deterministic_mode(None)
         install(None)
+        if torch.distributed.is_initialized():
+            # Model-parallel teardown drops MCore's references, but PyTorch keeps the NCCL
+            # subgroups of both model setups in every case alive for the rest of the
+            # session. Destroy them in creation order on each rank, keeping WORLD and the
+            # groups that existed before this test.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            for group in list(_world.pg_map):
+                if (
+                    group is not torch.distributed.group.WORLD
+                    and group not in self._existing_groups
+                ):
+                    torch.distributed.destroy_process_group(group)
 
     # Small model: 8 query groups split across CP ranks; 2 split at CP=2 and are gathered at
     # CP=4; 1 (Nano's one K/V head per TP rank at TP2) is always gathered.
