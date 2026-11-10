@@ -12,6 +12,8 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.nn as nn
@@ -119,17 +121,27 @@ class TestMfsdpV2PipelineSharedContext:
 
         assert context.prefetch_order is PrefetchOrder.RECORDED
         inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
-        expected = [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks] + [
-            ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)
-        ]
+        expected = (
+            [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks]
+            + [ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)]
+        ) * 2
         with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-            for iteration in range(2):
-                outputs = [chunk(inputs) for chunk in wrapped_chunks]
-                for output in reversed(outputs):
-                    output.float().sum().backward()
-                    assert context.is_recording_execution_order is (iteration == 0)
+            for _ in range(2):
+                for chunk in wrapped_chunks:
+                    chunk.zero_grad(set_to_none=True)
+                for microbatch in range(2):
+                    with wrapped_chunks[0].no_sync() if microbatch == 0 else nullcontext():
+                        outputs = [chunk(inputs) for chunk in wrapped_chunks]
+                        for output in reversed(outputs):
+                            output.float().sum().backward()
                 context.post_backward()
                 context.finish_grad_sync()
                 assert not context.is_recording_execution_order
                 assert list(context.execution_order) == expected
                 assert context.execution_order.position == 0
+                # Each of two microbatches contributes two to every weight gradient.
+                for chunk in wrapped_chunks:
+                    for parameter in chunk.parameters():
+                        torch.testing.assert_close(
+                            parameter.grad, torch.full_like(parameter.grad, 4), rtol=0, atol=0
+                        )
