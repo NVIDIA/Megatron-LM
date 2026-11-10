@@ -1329,7 +1329,9 @@ def process_mtp_loss(
         # including when a rank has no LM targets but receives a rolled MTP target.
         if cp_size > 1:
             token_counts = torch.stack((original_num_tokens, num_tokens))
-            torch.distributed.all_reduce(token_counts, group=cp_group)
+            torch.distributed.all_reduce(
+                token_counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            )
             normalization_original_tokens, normalization_tokens = token_counts.unbind()
         else:
             normalization_original_tokens = original_num_tokens
