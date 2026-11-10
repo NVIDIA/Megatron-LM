@@ -237,6 +237,40 @@ class TestAmaxReductionGroupOnGrids:
         assert len(groups) == 3
         assert all(group is expected for group in groups)
 
+    @pytest.mark.parametrize("tp_only_amax_red", [False, True])
+    def test_omitted_collection_rejects_a_global_grid_without_the_group(
+        self, tp_only_amax_red, monkeypatch
+    ):
+        """An initialized global grid without the amax group raises instead of passing None."""
+        from megatron.core.extensions import transformer_engine as te_extension
+
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
+        field_name = "tp_cp" if tp_only_amax_red else "tp_dp_cp"
+        # What register_process_groups() leaves for a collection that does not set the field.
+        global_name = (
+            "_TENSOR_AND_CONTEXT_PARALLEL_GROUP"
+            if tp_only_amax_red
+            else "_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP"
+        )
+        monkeypatch.setattr(parallel_state, global_name, None)
+        fp8_config = _config(
+            fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, tp_only_amax_red=tp_only_amax_red
+        )
+        fp4_config = _config(fp4="e2m1", tp_only_amax_red=tp_only_amax_red)
+        qparams = te_quantization_params(tp_only_amax_red, tp_only_amax_red)
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record, record_amax_groups() as groups:
+            with pytest.raises(ValueError, match=field_name):
+                fp8_utils.get_fp8_context(fp8_config)
+            with pytest.raises(ValueError, match=field_name):
+                fp4_utils.get_fp4_context(fp4_config)
+            with pytest.raises(ValueError, match=field_name):
+                te_extension._get_fp8_autocast_for_quant_params(qparams, True, owner=TE_MODULE)
+
+        _assert_fallback_warnings(record)
+        assert groups == []
+
     def test_omitted_collection_without_a_global_grid_passes_no_group(self, monkeypatch):
         """Without a global grid the fallback still warns, and leaves the group to TE."""
         from megatron.core.extensions import transformer_engine as te_extension

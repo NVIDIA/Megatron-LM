@@ -33,6 +33,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
+    model_parallel_is_initialized,
     register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import (
@@ -473,8 +474,10 @@ def _get_fp8_autocast_for_quant_recipe(
         pg_collection: Process groups of the model that owns the module. A quantized autocast
             reduces amaxes over ``amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)``.
             Omitting it is deprecated and emits a ``ProcessGroupFallbackWarning``: the autocast
-            then uses the global amax reduction group of ``parallel_state``, or passes no group,
-            which Transformer Engine reads as its default group, when ``parallel_state`` has none.
+            then uses the global amax reduction group of ``parallel_state``, and raises
+            ``ValueError`` if an initialized ``parallel_state`` has none. When ``parallel_state``
+            is not initialized, it passes no group, which Transformer Engine reads as its default
+            group.
     """
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
@@ -498,7 +501,12 @@ def _get_fp8_autocast_for_quant_recipe(
                 deprecated_in="0.21",
                 removed_in="0.23",
             )
-            amax_group = global_groups.tp_cp if qrecipe.tp_only_amax_red else global_groups.tp_dp_cp
+            # An initialized grid without the group is an error, as it is for a collection.
+            amax_group = (
+                amax_reduction_group(global_groups, qrecipe.tp_only_amax_red)
+                if model_parallel_is_initialized()
+                else None
+            )
         if (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
