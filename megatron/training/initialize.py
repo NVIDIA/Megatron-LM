@@ -567,9 +567,13 @@ def _set_random_seed(
     back to the mpu group when None.
 
     `pg_collection`, the process groups of the model being seeded, supplies
-    every group that is not passed explicitly, and the mpu globals are not
-    read. Its data-parallel group is `dp_gtp_remat`, the data-distribution
-    group that `mpu.get_data_parallel_rank()` uses by default.
+    every group that is not passed explicitly. Its data-parallel group is
+    `dp_gtp_remat`, the data-distribution group that
+    `mpu.get_data_parallel_rank()` uses by default, or `dp` when it does not
+    set `dp_gtp_remat`. The mpu globals are then read only for a group among
+    `tp`, `ep`, `expt_tp`, `gtp_remat` and `expt_gtp_remat` that the
+    collection leaves unset; this is deprecated and warns (see
+    `model_parallel_cuda_manual_seed`).
     """
     if seed_ is not None and seed_ > 0:
         if pg_collection is not None:
@@ -577,9 +581,13 @@ def _set_random_seed(
                 pp_group = pg_collection.pp
             if dp_group is None:
                 dp_group = pg_collection.dp_gtp_remat
+            if dp_group is None:
+                # A collection built without the GTP_remat groups: its replicate group holds
+                # every data-parallel rank.
+                dp_group = pg_collection.dp
             if pp_group is None or (data_parallel_random_init and dp_group is None):
                 raise ValueError(
-                    "pg_collection must set pp, and dp_gtp_remat when "
+                    "pg_collection must set pp, and dp_gtp_remat or dp when "
                     "data_parallel_random_init is set, to seed the random number generators"
                 )
         # Ensure that different pipeline MP stages get different seeds.

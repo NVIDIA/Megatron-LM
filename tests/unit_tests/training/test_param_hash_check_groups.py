@@ -46,6 +46,20 @@ def test_collection_without_expert_groups_passes_no_expert_group():
     assert kwargs["expt_dp_group"] is None
 
 
+def test_collection_without_expert_group_uses_the_group_ddp_built():
+    """DistributedDataParallel builds expert groups for a collection without expt_dp."""
+    pg_collection = ProcessGroupCollection(dp=object(), expt_dp=None)
+    ddp_expt_dp_group = object()
+    wrapped = SimpleNamespace(
+        module=SimpleNamespace(pg_collection=pg_collection), expt_dp_group=ddp_expt_dp_group
+    )
+
+    kwargs = _hash_check_kwargs([wrapped])
+
+    assert kwargs["dp_group"] is pg_collection.dp
+    assert kwargs["expt_dp_group"] is ddp_expt_dp_group
+
+
 def test_model_without_collection_uses_the_global_groups():
     global_pg_collection = ProcessGroupCollection(dp=object(), expt_dp=object())
 
