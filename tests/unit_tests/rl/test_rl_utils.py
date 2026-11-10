@@ -106,6 +106,33 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         pass
 
 
+def test_setup_callback_rejects_dp_alone_with_a_gtp_weight_remat_axis(monkeypatch):
+    """dp does not hold the ranks of a GTP weight-remat axis. on_data_init_start rejects such a
+    collection as prepare_data_for_update() does, instead of sizing the calculator with dp."""
+    run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=False))
+    pg_collection = ProcessGroupCollection(
+        dp=SimpleNamespace(size=lambda: 2), gtp_remat=SimpleNamespace(size=lambda: 2)
+    )
+    reinitialize = MagicMock()
+    # The stand-in groups have a size only for an initialized torch.distributed.
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(training_setup, "get_args", SimpleNamespace)
+    monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: None)
+    monkeypatch.setattr(training_setup, "get_attr_wrapped_model", lambda chunk, name: pg_collection)
+    monkeypatch.setattr(training_setup, "build_rl_inference_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training_setup, "load_reference_state_dict", lambda *args, **kwargs: {})
+    monkeypatch.setattr(training_setup, "reinitialize_grpo_microbatch_calculator", reinitialize)
+    callback = training_setup.RLSetupCallback(RLConfig(), model_provider=None, model_type=None)
+
+    with pytest.raises(ValueError, match="pg_collection to set dp_gtp_remat"):
+        callback.on_data_init_start(
+            CallbackContext(model=["chunk"], optimizer=None, checkpointing_context=None)
+        )
+
+    reinitialize.assert_not_called()
+
+
 @pytest.mark.parametrize("data_parallel_fields", [("dp_gtp_remat", "dp"), ("dp",)])
 @pytest.mark.parametrize(
     "skip_train, rollout_only, optimizer",
@@ -120,7 +147,7 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer, data_p
     """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
     loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
     the run eval-only. The calculator gets the size of the model's dp_gtp_remat group, or of dp
-    for a collection that predates that field."""
+    for a collection that predates that field and has no GTP weight-remat axis."""
     calls = []
     args = SimpleNamespace()
     run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
@@ -133,6 +160,7 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer, data_p
     pg_collection = ProcessGroupCollection(
         **{sized_by: SimpleNamespace(size=lambda: 4)},
         **{field: SimpleNamespace(size=lambda: 2) for field in others},
+        gtp_remat=None,
     )
     monkeypatch.setattr(
         training_setup,

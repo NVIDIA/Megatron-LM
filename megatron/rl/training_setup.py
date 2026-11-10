@@ -14,7 +14,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.utils import get_attr_wrapped_model, get_model_config
 from megatron.rl.inference.disagg import build_disagg_inference_model
-from megatron.rl.rl_utils import inference_model_alloc_context
+from megatron.rl.rl_utils import get_training_data_parallel_group, inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
@@ -222,8 +222,10 @@ class RLSetupCallback(Callback):
                 args,
                 rollout_only=self._rl_config.rl_rollout_only,
             )
-            # The loop's data-parallel size is that of the model's data-parallel group, which
-            # spans the GTP weight-remat axis, as get_data_parallel_world_size() does by default.
-            # Collections that predate the GTP weight-remat fields carry only the replicate group.
-            data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+            # The loop's data-parallel size is that of the group the rollouts are spread over,
+            # which prepare_data_for_update() splits them by. It spans the GTP weight-remat
+            # axis, as get_data_parallel_world_size() does by default. A collection that
+            # predates the GTP weight-remat fields carries only the replicate group, which
+            # serves when there is no such axis.
+            data_parallel_group = get_training_data_parallel_group(pg_collection)
             reinitialize_grpo_microbatch_calculator(args, data_parallel_group.size())
