@@ -354,20 +354,38 @@ class TEQuantizationParams:
 
 
 def _fp4_dense_mxfp8_quant_params(
-    config: TransformerConfig, is_expert: bool, current: Optional[TEQuantizationParams]
+    config: TransformerConfig,
+    is_expert: bool,
+    current: Optional[TEQuantizationParams],
+    fp8_param: bool,
 ) -> Optional[TEQuantizationParams]:
     """MXFP8 quantization override for a non-expert linear of an FP4 model.
 
     With ``config.fp4_dense_mxfp8`` the non-expert linears run in MXFP8 while the routed experts
     keep the FP4 recipe. An explicit per-module override from ``config.quant_recipe`` wins.
+    ``fp8_param`` selects MXFP8 weight storage; see ``_fp4_dense_mxfp8_param_storage``.
     """
     if current is not None or is_expert or not getattr(config, "fp4_dense_mxfp8", False):
         return current
     return TEQuantizationParams(
         training_recipe=TEQuantizationRecipe(
-            fp8_quantization_recipe=Fp8Recipe.mxfp8, fp8_param=config.fp4_dense_mxfp8_param
+            fp8_quantization_recipe=Fp8Recipe.mxfp8, fp8_param=fp8_param
         ),
         evaluation_recipe=None,
+    )
+
+
+def _fp4_dense_mxfp8_param_storage(config: TransformerConfig) -> bool:
+    """Whether a non-expert linear built now should keep MXFP8 weights (fp4_dense_mxfp8_param).
+
+    Only when the enclosing model-init context stores quantized weights: the layers that
+    first_last_layers_bf16 keeps in BF16 open no such context (get_fp4_context(is_init=True)
+    returns a null context for them), so they keep BF16 weights. Must be called while the
+    module is constructed, since GPTModel re-runs finish_init outside any model-init context.
+    """
+    return bool(
+        getattr(config, "fp4_dense_mxfp8_param", False)
+        and FP8GlobalStateManager.with_fp8_parameters()
     )
 
 
@@ -1478,6 +1496,7 @@ class TELinear(te.pytorch.Linear):
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
         self._is_expert_linear = is_expert
+        self._fp4_dense_mxfp8_param = _fp4_dense_mxfp8_param_storage(config)
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1537,7 +1556,7 @@ class TELinear(te.pytorch.Linear):
                 quantization_config, model_config=self.config
             )
         self.te_quant_params = _fp4_dense_mxfp8_quant_params(
-            self.config, self._is_expert_linear, self.te_quant_params
+            self.config, self._is_expert_linear, self.te_quant_params, self._fp4_dense_mxfp8_param
         )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
@@ -1709,6 +1728,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
         self._is_expert_linear = is_expert
+        self._fp4_dense_mxfp8_param = _fp4_dense_mxfp8_param_storage(config)
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1793,7 +1813,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 quantization_config, model_config=self.config
             )
         self.te_quant_params = _fp4_dense_mxfp8_quant_params(
-            self.config, self._is_expert_linear, self.te_quant_params
+            self.config, self._is_expert_linear, self.te_quant_params, self._fp4_dense_mxfp8_param
         )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:

@@ -3314,6 +3314,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # FusedAdam holds the master weights, so shard_fp32_from_float16_groups is all None.
+            raise NotImplementedError(
+                "reuse_grad_buf_for_mxfp8_param_ag is not supported with the precision-aware "
+                "optimizer in this precision mode (use_precision_aware_optimizer without an "
+                "FP8 recipe other than delayed, non-FP32 main params, or optimizer CPU offload)."
+            )
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):

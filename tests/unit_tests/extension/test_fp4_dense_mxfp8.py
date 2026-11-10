@@ -15,16 +15,22 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TEQuantizationParams,
     TEQuantizationRecipe,
+    _fp4_dense_mxfp8_param_storage,
     _fp4_dense_mxfp8_quant_params,
 )
 from megatron.core.fp4_utils import get_fp4_context, is_grouped_nvfp4tensor, is_nvfp4tensor
 from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+if HAVE_TE:
+    from transformer_engine.pytorch.fp8 import fp8_model_init
 
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 10
 
@@ -70,6 +76,64 @@ class TestReuseGradBufForFp4ParamGather:
             )
 
 
+class TestReuseGradBufWithPrecisionAwareOptimizer:
+    """The grad-buffer param all-gather stages FP32 main params that the distributed optimizer
+    does not keep when the precision-aware optimizer holds them."""
+
+    @staticmethod
+    def _optimizer_config(**overrides):
+        kwargs = dict(
+            optimizer="adam",
+            use_distributed_optimizer=True,
+            use_precision_aware_optimizer=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        kwargs.update(overrides)
+        return OptimizerConfig(**kwargs)
+
+    @staticmethod
+    def _ddp_config(**overrides):
+        kwargs = dict(
+            use_distributed_optimizer=True,
+            fp4_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+        )
+        kwargs.update(overrides)
+        return DistributedDataParallelConfig(**kwargs)
+
+    def _validate_run(self, optimizer_config, ddp_config):
+        optimizer_config.validate_run(
+            ddp_config=ddp_config, use_torch_fsdp2=False, ckpt_format="torch_dist"
+        )
+
+    @pytest.mark.parametrize("fp8_recipe", [None, "delayed"])
+    def test_rejects_fp4_run(self, fp8_recipe):
+        """FP4 runs have no FP8 recipe (or the default delayed one) for the optimizer."""
+        config = self._optimizer_config(fp8_recipe=fp8_recipe)
+        assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        with pytest.raises(ValueError, match="reuse_grad_buf_for_mxfp8_param_ag is not supported"):
+            self._validate_run(config, self._ddp_config())
+
+    def test_accepts_mxfp8_recipe_with_fp32_main_params(self):
+        config = self._optimizer_config(fp8_recipe="mxfp8")
+        assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        self._validate_run(config, self._ddp_config(fp4_param_gather=False, fp8_param_gather=True))
+
+    def test_accepts_without_reuse(self):
+        config = self._optimizer_config()
+        self._validate_run(config, self._ddp_config(reuse_grad_buf_for_mxfp8_param_ag=False))
+
+    def test_copy_to_param_buffer_raises(self):
+        """Direct Megatron-Core users that skip the config validation get a clear error before
+        any None main param is copied."""
+        optimizer = SimpleNamespace(
+            ddp_config=self._ddp_config(), config=self._optimizer_config(fp8_recipe=None)
+        )
+        with pytest.raises(NotImplementedError, match="precision-aware optimizer"):
+            DistributedOptimizer._copy_main_params_to_param_buffer(optimizer)
+
+
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
 class TestFp4DenseMxfp8QuantParams:
     """The override applies to non-expert linears only, and an explicit override wins."""
@@ -83,25 +147,43 @@ class TestFp4DenseMxfp8QuantParams:
     @pytest.mark.parametrize("fp8_param", [False, True])
     def test_non_expert_linear_gets_mxfp8(self, fp8_param):
         params = _fp4_dense_mxfp8_quant_params(
-            self._config(fp4_dense_mxfp8_param=fp8_param), is_expert=False, current=None
+            self._config(), is_expert=False, current=None, fp8_param=fp8_param
         )
         assert params.training_recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
         assert params.training_recipe.fp8_param is fp8_param
         assert params.evaluation_recipe is None
 
     def test_expert_linear_keeps_model_recipe(self):
-        assert _fp4_dense_mxfp8_quant_params(self._config(), is_expert=True, current=None) is None
+        params = _fp4_dense_mxfp8_quant_params(
+            self._config(), is_expert=True, current=None, fp8_param=True
+        )
+        assert params is None
 
     def test_disabled(self):
         config = self._config(fp4_dense_mxfp8=False)
-        assert _fp4_dense_mxfp8_quant_params(config, is_expert=False, current=None) is None
+        params = _fp4_dense_mxfp8_quant_params(
+            config, is_expert=False, current=None, fp8_param=True
+        )
+        assert params is None
 
     def test_explicit_override_wins(self):
         explicit = TEQuantizationParams(
             training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
         )
-        params = _fp4_dense_mxfp8_quant_params(self._config(), is_expert=False, current=explicit)
+        params = _fp4_dense_mxfp8_quant_params(
+            self._config(), is_expert=False, current=explicit, fp8_param=True
+        )
         assert params is explicit
+
+    @pytest.mark.parametrize("dense_param", [False, True])
+    @pytest.mark.parametrize("stores_quantized_weights", [False, True])
+    def test_param_storage_follows_model_init_context(self, dense_param, stores_quantized_weights):
+        """MXFP8 weights only inside a model-init context that stores quantized weights, so the
+        layers kept in BF16 by first_last_layers_bf16 (no such context) keep BF16 weights."""
+        config = self._config(fp4_dense_mxfp8_param=dense_param)
+        with fp8_model_init(enabled=stores_quantized_weights):
+            storage = _fp4_dense_mxfp8_param_storage(config)
+        assert storage is (dense_param and stores_quantized_weights)
 
 
 def _bf16_recipe(pattern):
@@ -197,6 +279,38 @@ class TestFp4DenseMxfp8Model:
         expert_weights = [param for name, param in model.named_parameters() if ".experts." in name]
         assert expert_weights
         assert all(is_nvfp4tensor(p) or is_grouped_nvfp4tensor(p) for p in expert_weights)
+
+    def test_first_last_bf16_layers_keep_bf16_weights(self):
+        """With first_last_layers_bf16, the BF16 layers keep BF16 weights (and BF16 experts),
+        while the dense linears of the FP4 layers keep MXFP8 weights."""
+        model = self._model(
+            num_moe_experts=4,
+            num_layers=4,
+            fp4_param=True,
+            fp4_dense_mxfp8_param=True,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+        )
+        bf16_layers = ("decoder.layers.0.", "decoder.layers.3.")
+        dense = self._dense_linears(model)
+        assert any(name.startswith(bf16_layers) for name in dense)
+        for name, module in dense.items():
+            assert name.startswith("decoder.layers."), name
+            # GPTModel re-runs finish_init outside any model-init context; the override must
+            # keep the storage choice made at construction.
+            recipe = module.te_quant_params.training_recipe
+            assert recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8, name
+            assert recipe.fp8_param is (not name.startswith(bf16_layers)), name
+            if name.startswith(bf16_layers):
+                assert not is_mxfp8tensor(module.weight), name
+                assert module.weight.dtype == torch.bfloat16, name
+            else:
+                assert is_mxfp8tensor(module.weight), name
+        for name, param in model.named_parameters():
+            if ".experts." in name:
+                is_nvfp4 = is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param)
+                assert is_nvfp4 is (not name.startswith(bf16_layers)), name
 
     def test_dense_model_runs_mxfp8(self):
         model = self._model()

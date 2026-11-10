@@ -1090,3 +1090,111 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+def _nvfp4_and_mxfp8_supported():
+    try:
+        from transformer_engine.pytorch.fp8 import check_mxfp8_support, check_nvfp4_support
+
+        return check_nvfp4_support()[0] and check_mxfp8_support()[0]
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _nvfp4_and_mxfp8_supported(), reason="Requires NVFP4 and MXFP8 support")
+@pytest.mark.parametrize("reuse_grad_buf_for_mxfp8_param_ag", [True, False])
+def test_fp4_model_mxfp8_and_nvfp4_params_get_separate_buffers(
+    reuse_grad_buf_for_mxfp8_param_ag: bool,
+):
+    """An FP4 model with MXFP8 non-expert params (fp4_dense_mxfp8_param) and experts on the dense
+    data-parallel group (EP=1): NVFP4 and MXFP8 params are both stored as uint8, but need separate
+    buffers. The MXFP8 params also require reuse_grad_buf_for_mxfp8_param_ag."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+    from transformer_engine.pytorch.fp8 import fp8_model_init
+
+    from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+    from megatron.core.fp4_utils import is_nvfp4tensor
+    from megatron.core.fp8_utils import is_mxfp8tensor
+
+    Utils.initialize_model_parallel()
+
+    hidden = 256
+    model = torch.nn.Module()
+    # Experts with EP=1 keep allreduce=True, so they share the dense data-parallel group.
+    with fp8_model_init(enabled=True, recipe=NVFP4BlockScaling()):
+        model.expert_fc = te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+    with fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        model.linear_qkv = te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+    model.norm = torch.nn.LayerNorm(hidden, device="cuda", dtype=torch.bfloat16)
+    nvfp4_params = {model.expert_fc.weight}
+    mxfp8_params = {model.linear_qkv.weight}
+    bf16_params = set(model.norm.parameters())
+    assert all(is_nvfp4tensor(p) for p in nvfp4_params)
+    assert all(is_mxfp8tensor(p) for p in mxfp8_params)
+
+    all_params = [p for p in model.parameters() if p.requires_grad]
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        fp4_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+        bucket_size=None,
+    )
+    full_param_layout = DistributedOptimizer.compute_full_param_layout(
+        all_params,
+        None,
+        parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True, partial_data_parallel=True
+        ),
+        ddp_config,
+    )
+
+    def make_ddp():
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=model,
+            full_param_layout=full_param_layout,
+        )
+
+    if not reuse_grad_buf_for_mxfp8_param_ag:
+        # Without it the optimizer would re-quantize only the NVFP4 params.
+        with pytest.raises(ValueError, match="require reuse_grad_buf_for_mxfp8_param_ag"):
+            make_ddp()
+        Utils.destroy_model_parallel()
+        return
+
+    ddp_model = make_ddp()
+
+    buffer_groups = group_params_for_buffers(all_params, grad_reduce_in_fp32=True)
+    uint8_keys = [key for key in buffer_groups if key.param_dtype == torch.uint8]
+    assert len(uint8_keys) == 2
+    assert {key.is_nvfp4 for key in uint8_keys} == {True, False}
+    for key in uint8_keys:
+        assert set(buffer_groups[key][0]) == (nvfp4_params if key.is_nvfp4 else mxfp8_params)
+
+    assert not ddp_model.expert_parallel_buffers
+    buffers_by_params = {frozenset(buffer.params): buffer for buffer in ddp_model.buffers}
+    assert set(buffers_by_params) == {
+        frozenset(nvfp4_params),
+        frozenset(mxfp8_params),
+        frozenset(bf16_params),
+    }
+    nvfp4_buffer = buffers_by_params[frozenset(nvfp4_params)]
+    mxfp8_buffer = buffers_by_params[frozenset(mxfp8_params)]
+    bf16_buffer = buffers_by_params[frozenset(bf16_params)]
+    assert nvfp4_buffer.param_dtype == mxfp8_buffer.param_dtype == torch.uint8
+    assert nvfp4_buffer.has_nvfp4_params and not nvfp4_buffer.uses_mxfp8_grad_buf_ag
+    assert not mxfp8_buffer.has_nvfp4_params and mxfp8_buffer.uses_mxfp8_grad_buf_ag
+    assert not bf16_buffer.uses_mxfp8_grad_buf_ag
+
+    # Every bucket lands in exactly one bucket group, and the param all-gather chain covers all.
+    grouped_buckets = [bucket for group in ddp_model.bucket_groups for bucket in group.buckets]
+    all_buckets = [bucket for buffer in ddp_model.buffers for bucket in buffer.buckets]
+    assert len(grouped_buckets) == len(all_buckets)
+    assert set(map(id, grouped_buckets)) == set(map(id, all_buckets))
+
+    Utils.destroy_model_parallel()

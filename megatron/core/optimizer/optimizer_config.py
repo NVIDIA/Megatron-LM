@@ -608,6 +608,20 @@ class OptimizerConfig:
                 "must be used in conjunction with `--fp8-recipe delayed`."
             )
 
+        if (
+            (self.reuse_grad_buf_for_mxfp8_param_ag or ddp_config.reuse_grad_buf_for_mxfp8_param_ag)
+            and self.use_distributed_optimizer
+            and self.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        ):
+            # The grad-buffer param all-gather stages FP32 main params from the distributed
+            # optimizer, but in this mode FusedAdam holds them and the distributed optimizer
+            # keeps none.
+            raise ValueError(
+                "reuse_grad_buf_for_mxfp8_param_ag is not supported with "
+                "use_precision_aware_optimizer unless the main params are FP32 and fp8_recipe "
+                "is set to a recipe other than delayed (and optimizer_cpu_offload is off)."
+            )
+
         if self.overlap_param_gather:
             # finalize_optimizer_config() may already have turned use_distributed_optimizer into
             # use_layer_wise_distributed_optimizer (muon / dist_muon), which shares the same

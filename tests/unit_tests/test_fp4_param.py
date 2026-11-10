@@ -254,7 +254,8 @@ class TestFP4Param:
             if fp4_param_gather:
                 assert num_fp4_params > 0
             if args.fp4_dense_mxfp8_param:
-                assert num_mxfp8_params == 2 * args.num_layers
+                # Layers kept in BF16 by first_last_layers_bf16 keep BF16 weights.
+                assert num_mxfp8_params == 2 * fp4_layers
             else:
                 assert num_mxfp8_params == 0
         elif fp4_param_gather:
@@ -424,18 +425,21 @@ class TestFP4Param:
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("dense_param", [False, True])
     @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
-    def test_nvfp4_moe_dense_mxfp8(self, dense_param, dp_overlap):
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    def test_nvfp4_moe_dense_mxfp8(self, dense_param, dp_overlap, ep_size):
         """MXFP8 non-expert linears with NVFP4 routed experts (fp4_dense_mxfp8).
 
         With dense_param, the non-expert linears keep MXFP8 params, all-gathered through the
         grad buffer, next to the NVFP4 expert params on their own param buffer. Losses must match
         BF16 params with the same compute recipes.
         dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        ep_size: with 1, the expert params share the dense data-parallel group, so the NVFP4 and
+        MXFP8 params (both uint8) need separate dense buffers.
         """
         kwargs = {
             "overlap_param_gather": dp_overlap[0],
             "overlap_grad_reduce": dp_overlap[1],
-            "expert_model_parallel_size": 2,
+            "expert_model_parallel_size": ep_size,
             "num_experts": 4,
             "moe_grouped_gemm": True,
             "moe_token_dispatcher_type": "alltoall",
