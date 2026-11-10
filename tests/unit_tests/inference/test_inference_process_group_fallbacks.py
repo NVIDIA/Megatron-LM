@@ -41,6 +41,9 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    forbid_global_process_groups as forbid_global_reads_outside_resolver,
+)
 
 # The groups that inference reads from `InferenceConfig.pg_collection`.
 INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
@@ -439,12 +442,14 @@ class TestComponentsShareOneCollection:
     def test_dynamic_context_resolves_for_wrapper_and_controller(self):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        # The model config says TP=1 and the global grid TP=2: the context takes its sizes from
+        # the collection it resolved, not from the model config.
         model_config = TransformerConfig(
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=8,
             num_attention_heads=4,
-            tensor_model_parallel_size=2,
+            tensor_model_parallel_size=1,
         )
         inference_config = InferenceConfig(
             max_sequence_length=64,
@@ -455,23 +460,16 @@ class TestComponentsShareOneCollection:
             unified_memory_level=0,
         )
 
-        # Apart from the config's warned fallback, the context reads none of the global grid.
-        with contextlib.ExitStack() as stack:
-            for name in (
-                "get_expert_model_parallel_world_size",
-                "get_pipeline_model_parallel_rank",
-            ):
-                stack.enter_context(
-                    mock.patch.object(
-                        parallel_state, name, side_effect=GlobalProcessGroupRead(name)
-                    )
-                )
+        # Apart from the config's warned fallback, which reads the grid inside
+        # process_groups_config.py, the context reads none of the global grid.
+        with forbid_global_reads_outside_resolver(forbid_shim=False):
             with pytest.warns(ProcessGroupFallbackWarning) as record:
                 context = DynamicInferenceContext(model_config, inference_config)
 
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         pg_collection = inference_config.pg_collection
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
+        assert context.tp_size == 2
         assert context.expert_model_parallel_group is pg_collection.ep
         assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
         assert context.expert_tensor_and_model_parallel_group is pg_collection.tp_ep
