@@ -672,7 +672,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         )
 
         # Compute short convolution (single-sequence / non-varlen).
-        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        # Copy to channels-first. Not ``contiguous()``: with one token at batch size 1 the
+        # transposed slice already counts as contiguous, since torch ignores the strides of
+        # size-1 dimensions, and keeps the projection's row pitch as its token stride.
+        # causal_conv1d reads that as its channel-last layout, which needs the pitch to be a
+        # multiple of CHANNEL_LAST_ALIGNMENT (see causal_conv1d.py).
+        xBC = rearrange(xBC, "b l d -> b d l").clone(memory_format=torch.contiguous_format)
         if conv_state is not None:
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
             # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
