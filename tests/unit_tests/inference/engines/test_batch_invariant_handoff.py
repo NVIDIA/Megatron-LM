@@ -154,7 +154,7 @@ def test_batch_invariant_real_nixl_handoff(length):
                 metadata = source_result.disaggregated_params
                 blocks = metadata["block_ids"]
                 assert len(blocks) == (length + 255) // 256
-                refs = engine.context.kv_block_allocator.block_ref_counts[blocks]
+                refs = engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks]
                 assert (refs > 0).all() and engine._pinned_handoff_blocks[101] == blocks
                 state = engine.context.memory_buffer[:, :, blocks].detach().cpu().clone()
                 tail = length % 256
@@ -181,7 +181,9 @@ def test_batch_invariant_real_nixl_handoff(length):
                 pending = engine._pending_kv_imports[0]
                 assert len(pending.continuation_blocks) == int(length == 256)
                 owned = pending.local_blocks + pending.continuation_blocks
-                assert (engine.context.kv_block_allocator.block_ref_counts[owned] > 0).all()
+                assert (
+                    engine.context.kv_block_allocator.pc_state.block_ref_counts[owned] > 0
+                ).all()
                 handle = pending.handle
                 assert handle.xfers and handle.contexts
                 assert (
@@ -219,7 +221,7 @@ def test_batch_invariant_real_nixl_handoff(length):
                 assert result.num_cached_tokens == length
 
         assert engine.context.total_request_count == 0
-        assert (engine.context.kv_block_allocator.block_ref_counts == 0).all()
+        assert (engine.context.kv_block_allocator.pc_state.block_ref_counts == 0).all()
         peer_tail, peer_continuation, peer_keys = _exchange(
             (source_tail_finite, continuation_zero, observed_keys), control
         )
