@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import os
 from dataclasses import dataclass, field
 from typing import Literal
-import os
+
 
 @dataclass(kw_only=True)
 class RNGConfig:

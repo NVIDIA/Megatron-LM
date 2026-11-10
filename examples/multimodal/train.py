@@ -28,9 +28,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_run_config, get_timers, get_tokenizer, pretrain
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.training import (
