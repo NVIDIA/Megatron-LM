@@ -13,8 +13,6 @@ from unittest.mock import patch
 import pytest
 
 from megatron.core.extensions.transformer_engine import te_cross_entropy
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
@@ -23,9 +21,11 @@ from megatron.core.models.backends import (
     get_backend,
     get_backend_from_config,
 )
-from megatron.core.tensor_parallel.cross_entropy import unfused_cross_entropy
+from megatron.core.ops.loss.cross_entropy import unfused_cross_entropy
+from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.ops.norm.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec_for_backend
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -121,7 +121,7 @@ class TestCrossEntropyFollowsTheConfig:
             cuda_graph_impl="full_iteration",
         )
         with (
-            patch("megatron.core.models.backends.is_te_min_version", return_value=False),
+            patch("megatron.core.ops.loss.backends.is_te_min_version", return_value=False),
             patch("megatron.core.utils.get_te_version", return_value="2.6.0"),
         ):
             with pytest.raises(AssertionError, match="TransformerEngine >= 2.7.0"):
@@ -134,7 +134,7 @@ class TestCrossEntropyFollowsTheConfig:
             cross_entropy_fusion_impl="te",
             cuda_graph_impl=cuda_graph_impl,
         )
-        with patch("megatron.core.models.backends.is_te_min_version", return_value=True):
+        with patch("megatron.core.ops.loss.backends.is_te_min_version", return_value=True):
             target = get_backend_from_config(config).vocab_parallel_cross_entropy()
         assert target.keywords["cuda_graph_capturable"] == (cuda_graph_impl == "full_iteration")
 

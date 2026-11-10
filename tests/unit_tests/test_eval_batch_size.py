@@ -10,6 +10,7 @@ from megatron.training.argument_utils import ArgumentGroupFactory, _default_conf
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.global_vars import set_args
+from megatron.training.state import TrainState
 from megatron.training.training import get_train_valid_test_num_samples
 from tests.unit_tests.test_utilities import Utils
 
@@ -271,6 +272,10 @@ class TestEvalBatchSizeDivisibilityWithGTP:
 
 class TestGetTrainValidTestNumSamples:
     """Test that get_train_valid_test_num_samples uses eval_global_batch_size."""
+
+    @pytest.fixture(autouse=True)
+    def train_state(self, monkeypatch):
+        monkeypatch.setattr("megatron.training.global_vars._GLOBAL_TRAIN_STATE", TrainState())
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
