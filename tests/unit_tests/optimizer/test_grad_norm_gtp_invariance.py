@@ -30,7 +30,7 @@ from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig, _get_megatron_optimizer_based_on_param_groups
 from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
-from megatron.core.optimizer.optimizer import MegatronOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
@@ -392,8 +392,9 @@ class TestGradNormWithCollectionGroups:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("chained", [False, True], ids=["single", "chained"])
     @pytest.mark.parametrize("module_tp", ["singleton_group", "off"])
-    def test_axes_off_in_the_collection_ignore_the_global_axes(self, module_tp):
+    def test_axes_off_in_the_collection_ignore_the_global_axes(self, module_tp, chained):
         world_size = Utils.world_size
         if world_size % 4 != 0:
             pytest.skip(f"world size {world_size} must be a multiple of 4 for global TP=2, GTP=2")
@@ -420,9 +421,22 @@ class TestGradNormWithCollectionGroups:
 
         try:
             with _forbid_global_grid_reads():
-                optimizer = _build_optimizer_from_collection(
-                    parameters, pg_collection, grad_stats_group
-                )
+                if chained:
+                    # One optimizer per parameter, as get_megatron_optimizer chains one per
+                    # parameter group. They share the grad-stats group, so the chain filters and
+                    # reduces their gradients together.
+                    optimizer = ChainedOptimizer(
+                        [
+                            _build_optimizer_from_collection(
+                                [parameter], pg_collection, grad_stats_group
+                            )
+                            for parameter in parameters
+                        ]
+                    )
+                else:
+                    optimizer = _build_optimizer_from_collection(
+                        parameters, pg_collection, grad_stats_group
+                    )
                 grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
         finally:
             _destroy_grid(grid)
