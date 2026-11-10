@@ -873,7 +873,9 @@ class TestRLUtils:
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
-        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        # Records the models the interface is requested for.
+        interface.get_interface = MagicMock(return_value=interface)
+        monkeypatch.setattr(rl_utils, "get_inference_interface", interface.get_interface)
         monkeypatch.setattr(
             rl_utils,
             "unwrap_model",
@@ -949,7 +951,7 @@ class TestRLUtils:
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
-        interface, _ = self._patch_rl_inference_mode_deps(
+        interface, loop = self._patch_rl_inference_mode_deps(
             monkeypatch, args, RLConfig(rl_training_cuda_graphs=False), iteration=11
         )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
@@ -974,6 +976,10 @@ class TestRLUtils:
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
+        # The interface serves the inference model; its warmup gets the model being trained.
+        interface.get_interface.assert_called_once_with(
+            args, loop, model, training_model if separate_training_model else model
+        )
         interface.set_generation_epoch.assert_called_once_with(11)
         expected_modules = (
             [
