@@ -14,7 +14,6 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -23,14 +22,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import RuntimePolicy
-
-
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
-
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
+from .runtime_policy import PrefetchOrder, RuntimePolicy
 
 
 class FsdpContext:
@@ -61,26 +53,19 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation, stream, and gradient-synchronization
+            runtime_policy: Communication allocation, stream, prefetch, and gradient-synchronization
                 settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -93,7 +78,7 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.execution_order = ExecutionOrder()
-        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
+        self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
