@@ -23,10 +23,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     RuntimePolicy,
     SchedulePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -133,7 +133,7 @@ def _train_fused_wgrad_model(model, context, optimizer, microbatches, set_to_non
     for _ in range(5):
         optimizer.zero_grad(set_to_none=set_to_none)
         for index, (x, target) in enumerate(microbatches):
-            with microbatch(context, is_last=index == len(microbatches) - 1):
+            with finalize_gradients(context, enabled=index == len(microbatches) - 1):
                 loss = torch.nn.functional.mse_loss(model(x).float(), target)
                 losses.append(loss.detach())
                 (loss / len(microbatches)).backward()

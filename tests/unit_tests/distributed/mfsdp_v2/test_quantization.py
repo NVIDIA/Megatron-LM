@@ -19,10 +19,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
     SchedulePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
@@ -238,7 +238,7 @@ def _check_mxfp8_mlp_matches_reference(
             optimizer.zero_grad(set_to_none=True)
             for index, (x, target) in enumerate(zip(step_inputs, step_targets)):
                 # HSDP/HFSDP reduce gradients across DP-outer only on the last microbatch.
-                with microbatch(context, is_last=index == num_microbatches - 1):
+                with finalize_gradients(context, enabled=index == num_microbatches - 1):
                     with te.autocast(recipe=recipe):
                         output = model(x)
                     loss = (output.float() - target.float()).square().mean()
