@@ -285,11 +285,6 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     assert config.expert_model_parallel_size == 2
 
 
-def test_flashinfer_mxfp8_token_capacity_warns_that_mxfp8_ignores_it():
-    with pytest.warns(UserWarning, match="ignored by FlashInfer routed MXFP8"):
-        _make_bounded_mxfp8_config()
-
-
 def test_flashinfer_mxfp8_config_accepts_batch_invariant_mode():
     config = _make_bounded_mxfp8_config(
         batch_invariant_mode=True,
@@ -559,6 +554,85 @@ def test_quantize_routed_mxfp8_input_matches_the_mcore_quantizer(rows, valid, hi
     assert not scale[:valid, hidden // 32 :].any()
 
 
+def _routed_weight(logical_rows, logical_cols, device="cpu"):
+    padded_rows, padded_cols = -(-logical_rows // 128) * 128, -(-logical_cols // 128) * 128
+    return FlashInferRoutedMXFP8Weight(
+        data=torch.empty(2, padded_rows, padded_cols, dtype=torch.float8_e4m3fn, device=device),
+        scale=torch.empty(2, padded_rows * padded_cols // 32, dtype=torch.uint8, device=device),
+        logical_rows=logical_rows,
+        logical_cols=logical_cols,
+        padded_rows=padded_rows,
+        padded_cols=padded_cols,
+    )
+
+
+@pytest.mark.parametrize(
+    ("token_capacity", "use_bounded_rows", "launched_rows"),
+    [(None, False, 16), (8, False, 16), (8, True, 8)],
+    ids=["no-host-bound", "host-bound-inactive", "host-bound-active"],
+)
+def test_flashinfer_routed_mxfp8_moe_composes_the_host_and_device_bounds(
+    monkeypatch, token_capacity, use_bounded_rows, launched_rows
+):
+    """The host bound sets the rows the kernels launch on; the device count rides along."""
+    rows, valid, topk, hidden, intermediate = 16, 6, 2, 160, 128
+    hidden_states = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    routing_map = torch.randint(0, 8, (rows, topk), dtype=torch.int64)
+    probs = torch.rand(rows, topk)
+    valid_tokens = torch.tensor([valid], dtype=torch.int32)
+    seen = {}
+
+    def fake_quantize(x, padded_cols, count):
+        seen["quantized_rows"], seen["quantize_count"] = x.shape[0], count
+        return torch.empty(x.shape[0], padded_cols, dtype=torch.uint8), torch.empty(x.shape[0], 8)
+
+    def fake_pack(routing, weights, count):
+        seen["packed_rows"], seen["pack_count"] = routing.shape[0], count
+        return torch.empty(routing.shape[0] * topk, dtype=torch.int32)
+
+    def fake_kernel(**kwargs):
+        seen.update(kwargs)
+        kwargs["output"][:valid] = 1.0
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_ROUTED_MXFP8", True)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "quantize_routed_mxfp8_input", fake_quantize)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "pack_routed_mxfp8_routing", fake_pack)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "trtllm_fp8_block_scale_routed_moe", fake_kernel)
+    layout = SimpleNamespace(MajorK=SimpleNamespace(value=0))
+    monkeypatch.setattr(flashinfer_mxfp8_module, "WeightLayout", layout, raising=False)
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "Fp8QuantizationType", SimpleNamespace(MxFp8=None), raising=False
+    )
+    out = torch.full((rows, hidden), 7.0)
+
+    returned = flashinfer_routed_mxfp8_moe(
+        hidden_states,
+        routing_map,
+        probs,
+        _routed_weight(intermediate, hidden),
+        _routed_weight(hidden, intermediate),
+        num_experts=8,
+        local_expert_offset=2,
+        activation_type=6,
+        out=out,
+        token_capacity=token_capacity,
+        use_bounded_rows=use_bounded_rows,
+        valid_tokens=valid_tokens,
+    )
+
+    assert returned is out
+    # Every kernel in the path launches on the host-bounded prefix ...
+    assert seen["quantized_rows"] == seen["packed_rows"] == launched_rows
+    assert seen["hidden_states"].shape[0] == launched_rows
+    assert seen["output"].shape == (launched_rows, hidden)
+    assert seen["output"].data_ptr() == out.data_ptr()
+    if launched_rows == rows:
+        assert seen["output"] is out
+    # ... and every one of them still receives the device count.
+    assert seen["quantize_count"] is seen["pack_count"] is seen["num_active_tokens"] is valid_tokens
+    assert torch.all(out[:valid] == 1.0) and torch.all(out[valid:] == 7.0)
+
+
 @requires_cuda_triton
 def test_flashinfer_routed_mxfp8_moe_hands_the_kernel_live_rows_and_the_device_count(monkeypatch):
     """Quantize and pack only the live rows; the kernel gets the device count and finalizes in place."""
@@ -806,6 +880,7 @@ def test_flashinfer_forward_dispatch(
         _flashinfer_activation_type=activation,
         _activation_clamp_scale=clamp_scale,
         _flashinfer_clamp_limit=clamp_limit if clamp_scale is not None else None,
+        _flashinfer_mxfp8_token_capacity=None,
         _nvls_dispatcher=True,
         num_local_experts=2,
         ep_group=SimpleNamespace(size=lambda: ep_size, rank=lambda: rank),
@@ -824,6 +899,7 @@ def test_flashinfer_forward_dispatch(
         routed = calls["routed"]
         assert output is rsv and set(calls) == {"routed"}
         assert routed["valid_tokens"] is valid_tokens and routed["out"] is rsv
+        assert routed["token_capacity"] is None and routed["use_bounded_rows"] is False
         assert routed["num_experts"] == 2 * ep_size and routed["local_expert_offset"] == 2 * rank
         return
     if mxfp8_format == "cutlass":

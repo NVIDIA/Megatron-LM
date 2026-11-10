@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 
 import torch
@@ -39,6 +40,9 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.utils import null_decorator
+
+logger = logging.getLogger(__name__)
+_LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 try:
     import triton
@@ -599,9 +603,21 @@ def flashinfer_routed_mxfp8_moe(
     local_expert_offset: int,
     activation_type: int,
     out: torch.Tensor | None = None,
+    token_capacity: int | None = None,
+    use_bounded_rows: bool = False,
     valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel on a fixed-size token buffer.
+
+    Two bounds compose.
+    The host bound (token_capacity, applied when the controller marks the current graph safe)
+    fixes the prefix of the buffer the kernels are launched on, so their grids follow it;
+    prefill, mixed steps and too-large decode configurations launch on the full buffer.
+    The device count (valid_tokens) bounds the rows the kernels touch within that prefix.
+
+    The controller enables the host bound only when every EP rank is decoding and the step's token
+    total fits in the capacity, so no live row lies beyond the prefix.
+    The row choice is made when each CUDA graph is built, so graph replay sees fixed shapes.
 
     Args:
         hidden_states: [rows, hidden_size] bf16 gathered tokens; only [0, valid_tokens) are live.
@@ -613,6 +629,8 @@ def flashinfer_routed_mxfp8_moe(
         activation_type: FlashInfer ActivationType value.
         out: optional contiguous fp32 [rows, hidden_size] buffer, e.g. the reduce-scatter
             symmetric buffer; allocated when None.
+        token_capacity: host bound on the rows launched on a bounded decode graph; None -> all.
+        use_bounded_rows: whether the controller marked the current graph safe for the bound.
         valid_tokens: scalar int32 CUDA tensor with the live row count; None -> every row is live.
 
     Returns:
@@ -632,22 +650,48 @@ def flashinfer_routed_mxfp8_moe(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
         )
 
-    rows, hidden_size = hidden_states.shape[0], fc2_weight.logical_rows
+    full_rows, hidden_size = hidden_states.shape[0], fc2_weight.logical_rows
+    active_rows, policy = select_routed_mxfp8_active_rows(
+        full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
+    )
+    if token_capacity is not None:
+        policy_key = (policy, token_capacity, full_rows)
+        if policy_key not in _LOGGED_TOKEN_POLICIES:
+            _LOGGED_TOKEN_POLICIES.add(policy_key)
+            logger.info(
+                "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
+                "configured_capacity=%d",
+                policy,
+                active_rows,
+                full_rows,
+                token_capacity,
+            )
     if valid_tokens is None:
-        valid_tokens = torch.full((1,), rows, dtype=torch.int32, device=hidden_states.device)
+        valid_tokens = torch.full((1,), active_rows, dtype=torch.int32, device=hidden_states.device)
     if out is None:
-        out = torch.empty(rows, hidden_size, dtype=torch.float32, device=hidden_states.device)
-    elif out.shape != (rows, hidden_size) or out.dtype != torch.float32 or not out.is_contiguous():
+        out = torch.empty(full_rows, hidden_size, dtype=torch.float32, device=hidden_states.device)
+    elif (
+        out.shape != (full_rows, hidden_size)
+        or out.dtype != torch.float32
+        or not out.is_contiguous()
+    ):
         raise ValueError(
-            f"out must be a contiguous fp32 [{rows}, {hidden_size}] buffer; got {out.dtype} "
+            f"out must be a contiguous fp32 [{full_rows}, {hidden_size}] buffer; got {out.dtype} "
             f"{tuple(out.shape)}"
         )
 
+    # The host bound sets the problem size the kernels are launched with (their grids follow it);
+    # the device count bounds the rows they touch within it.
+    selected_hidden_states = hidden_states[:active_rows]
+    selected_routing_map = routing_map[:active_rows]
+    selected_probabilities = probabilities[:active_rows]
     quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
-        hidden_states, fc1_weight.padded_cols, valid_tokens
+        selected_hidden_states, fc1_weight.padded_cols, valid_tokens
     )
-    packed_routing = pack_routed_mxfp8_routing(routing_map, probabilities, valid_tokens)
-    return flashinfer_routed_mxfp8_moe_prequantized(
+    packed_routing = pack_routed_mxfp8_routing(
+        selected_routing_map, selected_probabilities, valid_tokens
+    )
+    flashinfer_routed_mxfp8_moe_prequantized(
         quantized_hidden,
         hidden_scale,
         packed_routing,
@@ -655,8 +699,9 @@ def flashinfer_routed_mxfp8_moe(
         fc2_weight,
         num_experts=num_experts,
         local_expert_offset=local_expert_offset,
-        top_k=routing_map.shape[1],
+        top_k=selected_routing_map.shape[1],
         activation_type=activation_type,
-        output=out,
+        output=out if active_rows == full_rows else out[:active_rows],
         num_active_tokens=valid_tokens,
     )
+    return out

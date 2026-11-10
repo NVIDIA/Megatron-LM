@@ -2431,12 +2431,6 @@ class TransformerConfig(ModelParallelConfig):
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
                     )
-                if self.inference_moe_nvfp4_recipe is None:
-                    warnings.warn(
-                        "inference_flashinfer_mxfp8_token_capacity is ignored by FlashInfer routed "
-                        "MXFP8 MoE, which bounds its work by the dispatcher's device-side token "
-                        "count."
-                    )
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend not in (

@@ -1819,6 +1819,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     activation_type=self._flashinfer_activation_type.value,
                     valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
                     out=out,
+                    token_capacity=self._flashinfer_mxfp8_token_capacity,
+                    use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
                 )
             return output, None
         if self._nvfp4_weights is not None:
