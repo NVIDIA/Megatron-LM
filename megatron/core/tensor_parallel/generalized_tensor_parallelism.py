@@ -1550,9 +1550,11 @@ class GTPShardedParam(torch.nn.Parameter):
             # Chain identity above keeps fc1/fc2 apart; parity alternates consecutive
             # blocks between two buffers.
             key = key + (self._double_buffer_parity(),)
-        elif getattr(self, "_buf_parity", None):
+        elif not reduce_scatter and getattr(self, "_buf_parity", None):
             # Set by _ensure_no_shared_buffer_with. Parity 0 keeps the shared buffer, so
             # only the second weight of an adjacent same-key pair costs an extra allocation.
+            # Gather buffers only: an eager RS output is owned by one ticket at a time (see
+            # release), so adjacent reduce-scatters cannot collide.
             key = key + (self._buf_parity,)
         if recompute:
             # Two components, guarding two different collisions:
@@ -2935,10 +2937,10 @@ class GTPWeightCache:
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
         if slot.reduce_scatter:
-            # Another same-key ticket may pop this buffer for an async RS that stays pending
-            # until a later deferred add (MTP's repeated layer keeps one pending across a whole
-            # depth). Writing it through this ticket's kept reference would overwrite that
-            # result, so the next RS on this ticket checks a buffer out of the pool again.
+            # Returning an eager RS output to the pool relinquishes this ticket's ownership.
+            # Clear its reference so the next get() must check out a buffer again. Otherwise,
+            # another ticket can acquire this buffer and leave an RS result pending, while
+            # this ticket reuses its stale reference and overwrites that result.
             slot.buf = None
 
     def clear(self):

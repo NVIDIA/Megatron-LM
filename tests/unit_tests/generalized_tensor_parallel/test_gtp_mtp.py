@@ -204,6 +204,22 @@ def _assert_grouped_chains_used(model, moe):
         assert not grouped_mtp, f"dense variant unexpectedly used grouped chains: {grouped_mtp}"
 
 
+def _assert_eh_proj_shares_rs_key_with_attention_proj(model):
+    """The MTP eh_proj and attention output projection draw RS outputs from one cache key, so
+    the shapes test keeps exercising the buffer collision it guards against."""
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import get_global_GTP_cache
+
+    params = dict(model.named_parameters())
+    eh_proj = [p for n, p in params.items() if n.startswith("mtp.") and "eh_proj" in n]
+    proj = [
+        p for n, p in params.items() if n.startswith("mtp.") and "self_attention.linear_proj" in n
+    ]
+    assert len(eh_proj) == 1 and len(proj) == 1, (sorted(params), eh_proj, proj)
+    slots = get_global_GTP_cache()._slots
+    keys = [slots[p._rs_ticket].key for p in (eh_proj[0], proj[0])]
+    assert keys[0] == keys[1], f"eh_proj and linear_proj RS cache keys differ: {keys}"
+
+
 def _worker_shared_weight_grads(
     rank, world_size, port, repeated_layer=False, moe=False, shapes=None
 ):
@@ -255,6 +271,8 @@ def _worker_shared_weight_grads(
 
             losses[phase] = _forward_backward(model)
             grads[phase] = _gathered_main_grads(model)
+            if shapes is not None and use_async:
+                _assert_eh_proj_shares_rs_key_with_attention_proj(model)
 
             del model
             ps.destroy_model_parallel()
@@ -290,7 +308,7 @@ def _worker_shared_weight_grads(
             max_err, worst = rel, name
     print(f"[mtp-shared] max relative grad error async-vs-sync = {max_err:.3e} (worst: {worst})")
 
-    assert max_err < 2e-2, (
+    assert max_err < 1e-4, (
         f"MTP shared-weight gradient mismatch between the async and sync GTP reduce-scatter "
         f"paths (max rel err {max_err:.3e} on {worst}). A weight consumed more than once per "
         f"forward had one of its wgrad reduce-scatters dropped or overwritten."
@@ -861,8 +879,8 @@ class TestGTPMTP:
     def test_mtp_grads_match_sync_when_eh_proj_shares_rs_buffer(self):
         """eh_proj and the MTP attention output projection with one shape share an RS buffer key.
 
-        As in production (num_heads * kv_channels == 2 * hidden), and with an FFN width unlike
-        eh_proj's so no buffer parity separates eh_proj from its chain predecessor. eh_proj's
+        That needs num_heads * kv_channels == 2 * hidden (asserted on the RS cache keys), and an FFN
+        width unlike eh_proj's so no buffer parity separates eh_proj from its chain predecessor. eh_proj's
         depth-2 reduce-scatter stays pending across the whole depth-1 block, so the projection's
         depth-1 reduce-scatter must not write into that pending output.
         """
