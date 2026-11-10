@@ -2163,6 +2163,11 @@ def pretrain(
     callback_manager.callback_context.scheduler = opt_param_scheduler
     callback_manager.trigger("on_data_init_start")
 
+    if cfg_container.train.moe_grouped_expert_buffers:
+        from megatron.core.ops.moe.grouped_expert_buffers import enable_grouped_expert_buffers
+
+        enable_grouped_expert_buffers()
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
