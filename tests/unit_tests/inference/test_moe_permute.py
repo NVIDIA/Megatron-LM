@@ -1031,3 +1031,43 @@ class TestInt32Limits:
         assert torch.equal(perm_map[claimed.long()].long(), tokens)
         inverse_map[tokens, experts] = -1
         assert torch.count_nonzero(inverse_map != -1).item() == 0, "entries off the routed pairs"
+
+    def test_mok_route_adapter_row_offsets(self):
+        """The MoK route adapter compacts every token's routes, and its backward scatters every
+        router-weight gradient, when tokens x experts pass 2^31 (2^23 + 1 tokens on 256 experts:
+        the last row starts at 2^31).
+
+        The map and the probabilities follow 2^31-entry front guards in the same buffers. The
+        map guard routes every expert and the probability guard is NaN, so a row offset that
+        wraps to -2^31 shows up as wrong experts and weights.
+        """
+        from megatron.core.transformer.moe.megakernel.mok.route_adapter import (
+            routing_map_to_mok_inputs,
+        )
+
+        num_experts, topk, guard = 256, 8, 2**31
+        rows = 2**31 // num_experts + 1
+        size = guard + rows * num_experts
+        _require_free_memory(size * 3 + rows * num_experts * 2 + (4 << 30))
+        map_buffer = torch.ones(size, dtype=torch.bool, device="cuda")
+        probs_buffer = torch.full((size,), float("nan"), dtype=torch.bfloat16, device="cuda")
+        routing_map = map_buffer[guard:].view(rows, num_experts)
+        probs = probs_buffer[guard:].view(rows, num_experts)
+        # Token t routes to experts t % 32 + 32 j (j < topk), in increasing order, and expert e
+        # has probability e + 1 (exact in bf16).
+        slots = torch.arange(topk, device="cuda")
+        experts = torch.arange(rows, device="cuda")[:, None] % 32 + 32 * slots
+        routing_map.zero_()
+        routing_map.scatter_(1, experts, True)
+        probs.copy_(torch.arange(1, num_experts + 1, device="cuda").expand_as(probs))
+        probs.requires_grad_()
+
+        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk)
+        wrong = torch.nonzero((indices != experts).any(dim=1)).flatten()
+        assert wrong.numel() == 0, f"wrong experts for tokens {wrong[:4].tolist()}"
+        assert torch.equal(weights, (experts + 1).float()), "wrong router weights"
+
+        grad_weights = (slots + 1).float().expand(rows, topk)
+        (grad,) = torch.autograd.grad(weights, probs, grad_weights)
+        assert torch.equal(grad.gather(1, experts), grad_weights.to(grad.dtype)), "wrong gradients"
+        assert torch.count_nonzero(grad).item() == rows * topk, "gradient off the routed experts"
