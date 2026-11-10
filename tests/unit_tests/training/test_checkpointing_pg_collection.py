@@ -294,3 +294,156 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
     assert save_dataloader_state.call_args.kwargs["cp_group"] is grid.cp
     # Every rank restores the RNG shard it saved, keyed by its rank in the model's grid.
     assert torch.equal(torch.get_rng_state(), saved_rng)
+
+
+@pytest.fixture
+def ckpt_args(request):
+    """Return the arguments of a checkpoint load, on a TP1 x PP1 global grid.
+
+    The shared fixtures are requested by name, so that no parameter shadows their imports.
+    """
+    request.getfixturevalue("init_model_parallel")
+    return request.getfixturevalue("create_ckpt_load_args")
+
+
+def _legacy_checkpoint_args(args, ckpt_dir):
+    """Set up ``args`` and the run config for legacy checkpoints in ``ckpt_dir``."""
+    args.ckpt_format = "torch"
+    args.use_dist_ckpt = False
+    args.use_distributed_optimizer = False
+    args.fp16 = False
+    args.bf16 = False
+    args.load = str(ckpt_dir)
+    args.save = str(ckpt_dir)
+    args.save_tokenizer_assets = False
+    set_args(args)
+    sync_checkpoint_config(args)
+
+
+def test_data_parallel_groups_left_out_of_a_collection_come_from_the_global_grid(monkeypatch):
+    """A group comes from the argument, then from the collection, then from the global grid.
+
+    Only a collection that sets no field of the group reads the global grid.
+    """
+    given, dp, dp_cp, global_group = object(), object(), object(), object()
+    pg_collection = ProcessGroupCollection(dp=dp, dp_cp=dp_cp, expt_dp=None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    with _no_global_grid():
+        assert checkpointing._data_parallel_group(given, pg_collection, "dp") is given
+        assert checkpointing._data_parallel_group(None, pg_collection, "dp_gtp_remat", "dp") is dp
+        assert (
+            checkpointing._data_parallel_group(None, pg_collection, "dp_cp_gtp_remat", "dp_cp")
+            is dp_cp
+        )
+        # A field that is set to None means that the axis is not used.
+        assert checkpointing._data_parallel_group(None, pg_collection, "expt_dp") is None
+
+    language_model_groups = ProcessGroupCollection(tp=object(), cp=object(), pp=object())
+    with mock.patch.object(
+        ProcessGroupCollection,
+        "use_mpu_process_groups",
+        return_value=ProcessGroupCollection(dp_cp_gtp_remat=global_group),
+    ) as use_mpu_process_groups:
+        group = checkpointing._data_parallel_group(
+            None, language_model_groups, "dp_cp_gtp_remat", "dp_cp"
+        )
+    assert group is global_group
+    use_mpu_process_groups.assert_called_once_with(required_pgs=["dp_cp_gtp_remat"])
+
+    # Without torch.distributed there is no group to read.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    with _no_global_grid():
+        assert checkpointing._data_parallel_group(None, language_model_groups, "dp") is None
+
+
+def test_torch_dist_round_trip_without_data_parallel_groups_in_the_collection(
+    ckpt_args, tmp_path_dist_ckpt
+):
+    """A collection without data-parallel groups saves and loads on those of the global grid."""
+    args = ckpt_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.fp16 = False
+    args.bf16 = False
+    args.world_size = torch.distributed.get_world_size()
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model, restored = MockModel(config), MockModel(config)
+    # The groups that a language model needs.
+    for mock_model in (model, restored):
+        mock_model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp", "pp", "embd"]
+        )
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_torch_dist_round_trip_without_data_parallel_groups", sync=True
+    ) as ckpt_dir:
+        args.load = str(ckpt_dir)
+        args.save = str(ckpt_dir)
+        args.save_tokenizer_assets = False
+        set_args(args)
+        sync_checkpoint_config(args)
+        save_checkpoint(123, [model], None, None, 456)
+        loaded = load_checkpoint([restored], None, None, strict=True)
+
+    assert loaded == (123, 456)
+    global_grid = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["dp_cp_gtp_remat"])
+    assert model._called_metadata[-1]["dp_cp_group"] is global_grid.dp_cp_gtp_remat
+    assert restored._called_metadata[-1]["dp_cp_group"] is global_grid.dp_cp_gtp_remat
+
+
+@pytest.mark.parametrize("dp_rank,expt_dp_rank,writes", [(0, 1, True), (1, 0, True), (1, 1, False)])
+@pytest.mark.parametrize("source", ["collection", "collection without gtp_remat", "global grid"])
+def test_legacy_save_selects_the_data_parallel_groups(
+    ckpt_args, tmp_path, dp_rank, expt_dp_rank, writes, source
+):
+    """The first ranks of the replicate dp and expt_dp groups write a legacy shard.
+
+    Every other data-parallel group holds a rank that would change the writers. A collection
+    without the GTP-remat-inclusive groups uses dp and dp_cp in their place, and one that leaves
+    the data-parallel groups out takes them from the global grid.
+    """
+    _legacy_checkpoint_args(ckpt_args, tmp_path)
+    # The first rank of the job writes the run config next to the shards, also when the
+    # stand-in ranks make it no writer.
+    (tmp_path / "iter_0000005").mkdir()
+    one, other_rank = _StandInGroup(rank=0, size=1), 1 - dp_rank
+    groups = dict(
+        dp=_StandInGroup(dp_rank, 2),
+        expt_dp=_StandInGroup(expt_dp_rank, 2),
+        dp_cp=_StandInGroup(other_rank, 2),
+    )
+    if source != "collection without gtp_remat":
+        groups["dp_gtp_remat"] = _StandInGroup(other_rank, 2)
+        groups["dp_cp_gtp_remat"] = _StandInGroup(other_rank, 2)
+    pg_collection = ProcessGroupCollection(
+        tp=one, pp=one, cp=one, ep=one, **({} if source == "global grid" else groups)
+    )
+
+    def global_grid(required_pgs):
+        assert source == "global grid", f"checkpointing read {required_pgs} from the global grid"
+        return ProcessGroupCollection(**{name: groups[name] for name in required_pgs})
+
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    with (
+        mock.patch.object(checkpointing, "mpu", _GlobalGridForbidden()),
+        mock.patch.object(
+            ProcessGroupCollection, "use_mpu_process_groups", side_effect=global_grid
+        ),
+        mock.patch.object(
+            checkpointing, "get_rng_state", wraps=checkpointing.get_rng_state
+        ) as rng_state,
+        mock.patch.object(checkpointing, "maybe_save_dataloader_state") as save_dataloader_state,
+    ):
+        save_checkpoint(5, [model], None, None, 0, pg_collection=pg_collection)
+
+    shard = tmp_path / "iter_0000005" / "mp_rank_00" / "model_optim_rng.pt"
+    assert shard.exists() == writes
+    assert rng_state.call_args.kwargs["dp_group"] is groups["dp"]
+    assert rng_state.call_args.kwargs["dp_cp_group"] is groups.get(
+        "dp_cp_gtp_remat", groups["dp_cp"]
+    )
+    assert save_dataloader_state.call_args.kwargs["dp_group"] is groups.get(
+        "dp_gtp_remat", groups["dp"]
+    )
