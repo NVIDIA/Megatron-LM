@@ -630,6 +630,13 @@ class TestTransformerLayerWithHyperConnectionRecompute:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
+        # The replay-vs-eager checks below need both passes to run equivalent compiled code. The
+        # passes call the torch.compile'd mHC helpers under different guards (a no-grad record,
+        # detached rebuild inputs), so Dynamo state left by earlier tests in this process can
+        # send them down different code paths. For example, once a helper hits its recompile
+        # limit, calls that match no cached entry run uncompiled, and the rounding difference
+        # can exceed these tolerances. Start every case from an empty compile cache.
+        torch._dynamo.reset()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
