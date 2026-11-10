@@ -584,9 +584,12 @@ def test_int32_offsets(tokens, apply_weights, acc_fp64):
     sample = torch.tensor([0, 1, limit - 1, limit, tokens - 1], device=DEVICE)
     sample = torch.cat([sample, torch.randint(0, tokens, (27,), generator=g, device=DEVICE)])
     sample = sample.clamp(max=tokens - 1).unique()
-    weights = torch.where(local[sample], p[sample].double() if apply_weights else 1.0, 0.0)
-    expected = (row[sample] * weights).sum(dim=1, keepdim=True) * col
-    ou.assert_exact(out[sample], expected.float(), what=f"sampled rows of {tokens} tokens")
+    # The slot-by-slot sum from +0.0, as in the other exact cases: a sum that cancels exactly is
+    # +0.0 (the closed form (row . weights) * col would give -0.0 there for col < 0).
+    xs, ps, ls = x[sample], p[sample], local[sample]
+    require_exact_in_fp32(xs, ps, ls, apply_weights)
+    spec = ou.fp64_reference(reference_sum, xs, ps, ls, apply_weights)
+    ou.assert_exact(out[sample], spec.float(), what=f"sampled rows of {tokens} tokens")
 
 
 @pytest.mark.sanitizer
