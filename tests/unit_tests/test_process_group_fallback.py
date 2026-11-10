@@ -4,11 +4,13 @@
 
 import logging
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core import parallel_state, process_groups_config
+from megatron.core.config_logger import log_config_to_disk
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -371,6 +373,23 @@ def test_mtp_placement_without_mtp_layers_needs_no_pp_group():
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
         assert mtp_on_this_rank(mtp_num_layers=None, ignore_virtual=True) is False
+
+
+def test_config_logger_names_the_groups_a_partial_collection_does_not_set(monkeypatch, tmp_path):
+    # A collection without all six rank groups names the dump by the global ranks, like none.
+    monkeypatch.setattr(parallel_state, "get_all_ranks", lambda: "global_ranks")
+    config = SimpleNamespace(config_logger_dir=str(tmp_path))
+    partial = ProcessGroupCollection(tp=None, pp=None)
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        log_config_to_disk(config, {"key": 1}, prefix="dump", pg_collection=partial)
+        log_config_to_disk(config, {"key": 1}, prefix="dump")
+    # The fields are listed in the order of the rank string: tp_gtp_dp_cp_pp_ep.
+    _fallback_warning(record, "log_config_to_disk", "pg_collection.gtp_remat/dp_gtp_remat/cp/ep")
+    _fallback_warning(record, "log_config_to_disk")
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "dump.rank_global_ranks.iter0.json",
+        "dump.rank_global_ranks.iter1.json",
+    ]
 
 
 class TestGlobalProcessGroupFallbacks:
