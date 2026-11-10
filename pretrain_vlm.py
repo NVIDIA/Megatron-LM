@@ -177,7 +177,11 @@ def model_provider(
         )
 
     # Prepare mask type for any required padding to support CP/SP sequence sharding.
-    if mp_padding_needed > 0:
+    # Local attention generates its causal mask only for AttnMaskType.causal.
+    if (
+        mp_padding_needed > 0
+        and language_transformer_config.transformer_impl == "transformer_engine"
+    ):
         if (
             language_transformer_layer_spec.submodules.self_attention.params.get(
                 'attn_mask_type', ''

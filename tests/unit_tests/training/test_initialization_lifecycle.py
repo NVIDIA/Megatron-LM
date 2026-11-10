@@ -1030,13 +1030,15 @@ def test_vlm_consumers_reject_incompatible_model_config(
 
 
 @pytest.mark.parametrize(
-    "cp_size,qkv_format,decoder_length,expected_model_length",
+    "cp_size,qkv_format,decoder_length,expected_model_length,transformer_impl",
     [
-        (1, "sbhd", None, 20),
-        (2, "sbhd", None, 20),
-        (2, "thd", None, 40),
-        (1, "sbhd", 32, 32),
-        (2, "thd", 32, 64),
+        (1, "sbhd", None, 20, "transformer_engine"),
+        (2, "sbhd", None, 20, "transformer_engine"),
+        (2, "thd", None, 40, "transformer_engine"),
+        (1, "sbhd", 32, 32, "transformer_engine"),
+        (2, "thd", 32, 64, "transformer_engine"),
+        (1, "sbhd", None, 20, "local"),
+        (1, "sbhd", 32, 32, "local"),
     ],
 )
 def test_llava_callback_consumes_its_model_config(
@@ -1047,8 +1049,12 @@ def test_llava_callback_consumes_its_model_config(
     qkv_format,
     decoder_length,
     expected_model_length,
+    transformer_impl,
 ):
     import pretrain_vlm
+    from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.utils import attention_mask_func
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -1061,6 +1067,7 @@ def test_llava_callback_consumes_its_model_config(
     args.context_parallel_size, args.micro_batch_size = cp_size, 2
     args.params_dtype = torch.float32
     args.ckpt_format = "torch"
+    args.transformer_impl = transformer_impl
     cfg = run_config
     cfg.checkpoint.ckpt_format = "torch"
     cfg.model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
@@ -1106,6 +1113,28 @@ def test_llava_callback_consumes_its_model_config(
     assert build.call_args.kwargs["patch_dim"] == 8
     assert build.call_args.kwargs["drop_vision_class_token"] is True
     assert build.call_args.kwargs["language_max_sequence_length"] == expected_model_length
+    mask_type = build.call_args.kwargs[
+        "language_transformer_layer_spec"
+    ].submodules.self_attention.params["attn_mask_type"]
+    if transformer_impl == "local":
+        softmax = FusedScaleMaskSoftmax(
+            input_in_fp16=False,
+            input_in_bf16=False,
+            attn_mask_type=mask_type,
+            scaled_masked_softmax_fusion=False,
+            mask_func=attention_mask_func,
+            softmax_in_fp32=True,
+            scale=None,
+        )
+        probs = softmax(torch.zeros(1, 1, 2, 2, device="cuda"), None)
+        torch.testing.assert_close(
+            probs[0, 0], torch.tensor([[1.0, 0.0], [0.5, 0.5]], device="cuda")
+        )
+        assert mask_type == AttnMaskType.causal
+    else:
+        assert mask_type == (
+            AttnMaskType.padding_causal if decoder_length is not None else AttnMaskType.causal
+        )
     build.return_value.freeze.assert_called_once_with(
         freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
     )
