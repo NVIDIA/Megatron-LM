@@ -114,7 +114,10 @@ def get_ep_layer_offset(
         ep_size: Expert-parallel size of that model. Pass ``ep_rank`` and ``ep_size``
             together; integers keep offline tools that have no process groups working. When
             both are omitted for a model with experts, they are read from the global parallel
-            grid; this fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
+            grid; this fallback is deprecated and emits a ``ProcessGroupFallbackWarning``. It
+            reads the global expert-parallel group: a rank or size set with
+            ``parallel_state.set_expert_model_parallel_rank()`` or
+            ``set_expert_model_parallel_world_size()`` is not used.
 
     Returns:
         The expert layer offset for the current EP rank.
