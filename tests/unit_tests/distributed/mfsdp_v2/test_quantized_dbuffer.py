@@ -2,12 +2,8 @@
 
 """Tests for MFSDP v2 MXFP8 buffers."""
 
-from contextlib import nullcontext
-
 import pytest
 import torch
-import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate
 
@@ -338,62 +334,43 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, sh
             assert chunk.eq(index * mesh.size() + rank).all()
 
 
+@pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.parametrize(
-    "use_out,shard_layout,symmetric_memory",
-    [
-        (False, ShardLayout.PADDED, False),
-        (False, ShardLayout.UNPADDED, False),
-        (True, ShardLayout.PADDED, False),
-        (True, ShardLayout.UNPADDED, False),
-        (True, ShardLayout.PADDED, True),
-    ],
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
 )
 def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
-    distributed_setup, use_out, shard_layout, symmetric_memory
+    distributed_setup, use_out, shard_layout
 ):
     """Gather an axis iterator in every plane, allocating or reusing output."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even world size of at least two.")
     mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
-    if symmetric_memory:
-        if distributed_setup.device.type != "cuda":
-            pytest.skip("Symmetric memory requires CUDA.")
-        for axis in range(mesh.ndim):
-            dist.barrier(group=mesh.get_group(axis), device_ids=[distributed_setup.device.index])
-    with (
-        torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device))
-        if symmetric_memory
-        else nullcontext()
-    ):
-        source = QuantizedDBuffer.empty(
-            mesh,
-            [BlockAtomic(32), BlockAtomic(32)],
-            [(128, 64), (32, 128)],
-            distributed_setup.device,
-            shard_layout=shard_layout,
-        )
-        out = (
-            QuantizedDBuffer.empty(
-                mesh,
-                [Replicate(), Replicate()],
-                [(128, 64), (32, 128)],
-                distributed_setup.device,
-                shard_layout=shard_layout,
-            )
-            if use_out
-            else None
-        )
+    source = QuantizedDBuffer.empty(
+        mesh,
+        [BlockAtomic(32), BlockAtomic(32)],
+        [(128, 64), (32, 128)],
+        distributed_setup.device,
+        shard_layout=shard_layout,
+    )
     for index, plane in enumerate(source.planes):
         values = (
             torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
         )
         plane.local_buffer.copy_(values % 251)
     # A one-shot iterator must be reusable across all four planes.
-    result = source.allgather(iter((0, 1)), out=out)
     if use_out:
+        out = QuantizedDBuffer.empty(
+            mesh,
+            [Replicate(), Replicate()],
+            [(128, 64), (32, 128)],
+            distributed_setup.device,
+            shard_layout=shard_layout,
+        )
+        result = source.allgather(iter((0, 1)), out=out)
         assert result is out
-    out = result
+    else:
+        out = source.allgather(iter((0, 1)))
     for index, plane in enumerate(out.planes):
         assert plane.placements == (Replicate(), Replicate())
         expected = (

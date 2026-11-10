@@ -63,12 +63,13 @@ def test_dbuffer_allgather_registers_separate_symmetric_buffers(distributed_setu
     dist.barrier(group=mesh.get_group(), device_ids=[device.index])
     # Separate pools prevent output registration from also covering the input's segment.
     allocator = symm_mem.get_mempool_allocator(device)
-    pools = [torch.cuda.MemPool(allocator, no_split=True) for _ in range(2)]
-    with torch.cuda.use_mem_pool(pools[0]):
+    input_pool = torch.cuda.MemPool(allocator, no_split=True)
+    output_pool = torch.cuda.MemPool(allocator, no_split=True)
+    with torch.cuda.use_mem_pool(input_pool):
         source = DBuffer.empty(
             mesh, [RowAtomic()], [(world_size * _HIDDEN, _HIDDEN)], torch.bfloat16, device
         )
-    with torch.cuda.use_mem_pool(pools[1]):
+    with torch.cuda.use_mem_pool(output_pool):
         out = DBuffer(mesh, [Replicate()], source.layout, source.dtype, device)
     assert source.is_symmetric_memory and out.is_symmetric_memory
     source.local_buffer.fill_(mesh.get_local_rank() + 1)
@@ -85,7 +86,7 @@ def test_dbuffer_allgather_registers_separate_symmetric_buffers(distributed_setu
         atol=0,
     )
     # Retire registered allocations while their communicator is still alive.
-    del source, out, pools
+    del source, out, input_pool, output_pool
 
     events = list(
         chain.from_iterable(collect_linked_event_groups(prof, _ALL_GATHER_OP_NAME_SUBSTRING))
