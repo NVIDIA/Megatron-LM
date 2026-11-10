@@ -15,11 +15,13 @@ from weakref import WeakKeyDictionary
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
     resolve_mxfp8_backend,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.utils import unwrap_model
 
 from . import build_local_reshard_plan, execute_reshard_plan
@@ -223,13 +225,12 @@ def _unwrap_model_cores(src_model, target_model):
     """Extract (src_core, tgt_core, num_experts) from model arguments.
 
     Handles list-wrapped modules and None (non-collocated) models.
+    Fills in a missing source DP group from the global grid for legacy single-mesh models,
+    with a ProcessGroupFallbackWarning. The fill is deprecated in Megatron Core 0.21 and
+    removed in 0.23, when the source collection must set ``dp``.
 
     Returns:
         (src_core, tgt_core, num_experts)
-
-    Raises:
-        ValueError: If the source model does not declare ``refit_modules`` and its
-            ``pg_collection`` does not set ``dp``.
     """
     src_core = None
     tgt_core = None
@@ -245,10 +246,16 @@ def _unwrap_model_cores(src_model, target_model):
             if pg is None:
                 raise RuntimeError("Source model missing pg_collection required for reshard")
             if getattr(pg, "dp", None) is None:
-                raise ValueError(
-                    "Source model pg_collection must set dp, the data-parallel group that "
-                    "the reshard plan routes over"
+                # Compatibility fallback for legacy single-mesh models: the reshard plan routes
+                # over the global data-parallel group. It warns before it reads the grid or
+                # writes to the collection, so strict mode raises and leaves both untouched.
+                warn_global_process_group_fallback(
+                    "swap_model_weights",
+                    "pg_collection.dp",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
                 )
+                pg.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model

@@ -10,7 +10,7 @@ and matching CUDA graph batch dimensions.
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -453,6 +453,7 @@ class CUDAGraphBatchDimensionBuilder:
         use_cuda_graphs_for_non_decode_steps: bool,
         num_speculative_tokens: int = 0,
         sizing_distribution: "CudaGraphSizingDistribution" = None,
+        extra_prefill_token_counts: Sequence[int] = (),
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -493,6 +494,10 @@ class CUDAGraphBatchDimensionBuilder:
             sizing_distribution: How token counts are spaced. Defaults to HYBRID when None,
                 matching the config default. HYBRID is resolved here into EXPONENTIAL for the
                 prefill/mixed family and LINEAR for the decode-only family.
+            extra_prefill_token_counts: Additional prefill/mixed token counts to capture
+                (64- and TP-aligned): the batch-invariant hybrid prefill budget below
+                ``max_tokens``. Batch-invariant mode only. Counts at or above
+                ``cuda_graph_max_tokens`` are ignored.
 
         Returns:
             Tuple containing:
@@ -573,6 +578,21 @@ class CUDAGraphBatchDimensionBuilder:
                     sizing_distribution=prefill_distribution,
                 )
             )
+
+            # Token counts the caller needs captured exactly: the batch-invariant hybrid
+            # prefill budget below the step capacity, so those steps do not pad to the next rung.
+            assert not extra_prefill_token_counts or _batch_invariant_mode_enabled(), (
+                "extra_prefill_token_counts is used only by batch-invariant hybrid chunked "
+                "prefill"
+            )
+            for count in extra_prefill_token_counts:
+                count = _batch_invariant_token_align(count) // tp_size * tp_size
+                if (
+                    0 < count < cuda_graph_max_tokens
+                    and count not in cuda_graph_prefill_token_counts
+                ):
+                    cuda_graph_prefill_token_counts.append(count)
+            cuda_graph_prefill_token_counts.sort(reverse=True)
 
             # Calculate separate token counts for decode-only graphs.
             cuda_graph_max_tokens_decode = min(
