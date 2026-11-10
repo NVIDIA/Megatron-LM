@@ -13,6 +13,7 @@ from megatron.core.inference.inference_request import (
     PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     DynamicVLMInferenceRequest,
+    Status,
     compute_media_cache_key,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -185,6 +186,18 @@ class MultimodalRequestMixin:
             request = entry.record[-1]
             if isinstance(request, DynamicVLMInferenceRequest):
                 request.image_embeddings = None
+
+    def _refresh_live_vlm_requests(self) -> None:
+        """Refresh the media state of every multimodal request that is still live.
+
+        A failed request stays in `requests` until the next step collects it, but its
+        completion has already released its media from the context, which must not get it
+        back.
+        """
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if isinstance(request, DynamicVLMInferenceRequest) and request.status != Status.FAILED:
+                self._refresh_vlm_request_data(request)
 
     def _refresh_vlm_request_data(self, request: DynamicVLMInferenceRequest) -> None:
         """Rebuild missing media state for a known-multimodal request."""

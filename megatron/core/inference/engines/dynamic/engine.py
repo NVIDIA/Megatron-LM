@@ -996,10 +996,7 @@ class DynamicInferenceEngine(
             # Request records outlive the context buffers. Refresh every stale
             # VLM record, including PERSIST/OFFLOAD requests that need not be
             # re-added below, so no later checkpoint can carry old projections.
-            for entry in self.requests.values():
-                request = entry.record[-1]
-                if isinstance(request, DynamicVLMInferenceRequest):
-                    self._refresh_vlm_request_data(request)
+            self._refresh_live_vlm_requests()
 
             # Re-add requests saved during suspend.
             add_time = time.time()
