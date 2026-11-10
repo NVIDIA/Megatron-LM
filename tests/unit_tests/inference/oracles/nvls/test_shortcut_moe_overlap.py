@@ -253,6 +253,20 @@ def _build_model(wide, dims=None):
     return model
 
 
+def _fresh_dispatcher_buffers():
+    """Drop the dispatcher's symmetric buffers so the next context sizes them for its model.
+
+    `SymmetricMemoryManager.get_buffer` returns an existing buffer by name whatever size the new
+    context asks for, so a wider model after a narrower one would find it too small (pdx 7996349:
+    "symmetric memory init failed" for the Nemotron 3 Nano case). Every rank drops them together.
+    """
+    nu.sync_world()
+    NVLSAllGatherVDispatcher._delete_buffers()
+    SymmetricMemoryManager.destroy()
+    gc.collect()
+    nu.sync_world()
+
+
 def _reset_cuda_graph_state(model):
     """Drop every captured graph, so each run captures its own against its own context."""
     delete_cuda_graphs()
@@ -522,6 +536,7 @@ def _overlap_case(monkeypatch, rank, *, wide, graphs, delayed, dims=None):
     spy = _Spy(monkeypatch)
     if delayed:
         _inject_delays(monkeypatch)
+    _fresh_dispatcher_buffers()
     model = _build_model(wide, dims)
     runs = {}
     # The first run also absorbs one-time effects (Triton autotuning, JIT, allocator warmup), so
@@ -738,6 +753,7 @@ def test_pair_output_matches_fp64_reference(expert_parallel, monkeypatch):
     shared expert on the predecessor's output, post-norm and residual), bounded by a BF16 trusted
     implementation with the model's rounding points. Tokens at a near tie in the routing are left
     out (``TIE_MARGIN``); at least half must remain."""
+    _fresh_dispatcher_buffers()
     model = _build_model(wide=False)
     engine = _build_engine(model, overlap=True, graphs=False)
     recorder = _Recorder(engine)
