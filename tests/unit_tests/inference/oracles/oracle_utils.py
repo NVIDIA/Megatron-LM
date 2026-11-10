@@ -1019,7 +1019,7 @@ def xfail_upstream(
     release fixes the bug. Without the package the mark does nothing (the test's dependency check
     decides). ``reason`` names the drafted upstream patch; ``raises`` narrows the expected
     failure where its type is known. Only for findings no Megatron change can fix (README.md,
-    "Markers"): a Megatron bug keeps a failing test until its fix PR lands.
+    "Markers"): a Megatron bug's case belongs in its fix PR.
     """
     installed = installed_version(package)
     return pytest.mark.xfail(
