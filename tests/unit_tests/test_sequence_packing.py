@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
+from copy import deepcopy
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -19,6 +21,8 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    align_sample_id_groups,
+    compute_schedule_stats,
     create_data_iterator,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
@@ -26,7 +30,432 @@ from megatron.core.datasets.data_schedule_utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
+from megatron.training.logging.packed_sequence_stats import DcpStatsAccumulator
+from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(
+    'schedule,lengths,work,efficiency,counts',
+    [
+        ([[[0], [1]]], {0: 4, 1: 4}, [[16, 16]], 1, {1: 2}),
+        ([[[0], [1]]], {0: 4, 1: 2}, [[16, 4]], 0.625, {1: 2}),
+        ([[[0, 1], [2]]], {0: 3, 1: 4, 2: 5}, [[25, 25]], 1, {1: 3}),
+        ([[[0], [0], [1], [1]]], {0: 4, 1: 2}, [[8, 8, 2, 2]], 0.625, {2: 2}),
+        (
+            [[[0], [0], [1], [2]], [[3], [3], [3], [3]]],
+            {0: 4, 1: 2, 2: 2, 3: 8},
+            [[8, 8, 4, 4], [16, 16, 16, 16]],
+            88 / 96,
+            {1: 2, 2: 1, 4: 1},
+        ),
+        # Alternating hotspots must not cancel across microbatches.
+        ([[[0], [1]], [[2], [3]]], {0: 4, 1: 2, 2: 2, 3: 4}, [[16, 4], [4, 16]], 0.625, {1: 4}),
+        # Unequal microbatch work weights the ratio, rather than their efficiencies.
+        ([[[0], [1]], [[2], [3]]], {0: 2, 1: 0, 2: 4, 3: 4}, [[4, 0], [16, 16]], 0.9, {1: 4}),
+    ],
+)
+def test_dcp_schedule_stats_hand_calculation(schedule, lengths, work, efficiency, counts):
+    original = deepcopy((schedule, lengths))
+    stats = compute_schedule_stats(schedule, lengths)
+    assert stats['rank_work'] == work
+    assert stats['balance_numerator'] / stats['balance_denominator'] == pytest.approx(efficiency)
+    assert stats['cp_sample_counts'] == counts
+    for microbatch, row in zip(schedule, stats['rank_work']):
+        ids = {sid for rank_ids in microbatch for sid in rank_ids}
+        assert sum(row) == pytest.approx(sum(lengths[sid] ** 2 for sid in ids))
+    assert (schedule, lengths) == original
+
+
+@pytest.mark.parametrize(
+    'schedule,lengths', [([], {}), ([[]], {}), ([[[], []]], {}), ([[[0], [0]]], {0: 0})]
+)
+def test_dcp_schedule_stats_empty(schedule, lengths):
+    stats = compute_schedule_stats(schedule, lengths)
+    assert stats['balance_numerator'] == stats['balance_denominator'] == 0
+    window = DcpStatsAccumulator()
+    window.update(stats)
+    assert 'dcp/estimated_attention_balance_efficiency' not in window.metrics()
+    assert window.metrics() == {}
+
+
+def test_dcp_schedule_stats_after_vpp_alignment():
+    schedule = [[[0], [0], [1], [2]]]
+    lengths = [(0, 8), (1, 4), (2, 4)]
+    assert compute_schedule_stats(schedule, lengths)['cp_sample_counts'] == {2: 1, 1: 2}
+    aligned = align_sample_id_groups(deepcopy(schedule), 2)
+    assert len(aligned) == 2
+    stats = compute_schedule_stats(aligned, lengths)
+    assert stats['cp_sample_counts'] == {2: 2, 4: 1}
+    assert stats['rank_work'] == [[16, 16, 16, 16], [8, 8, 8, 8]]
+    assert stats['balance_numerator'] == 96
+    scheduler = DefaultDynamicCPScheduler(4, 4, 1, 2)
+    final = scheduler.get_groups_and_subsamples(lengths)
+    assert compute_schedule_stats(final, lengths)['cp_sample_counts'] == stats['cp_sample_counts']
+
+
+def test_dcp_schedule_stats_window_and_reset():
+    window = DcpStatsAccumulator()
+    first = compute_schedule_stats([[[0], [1]]], {0: 2, 1: 0})
+    second = compute_schedule_stats([[[0], [0]]], {0: 8})
+    window.update(first)
+    # An early stdout print observes the current window without resetting it.
+    assert window.metrics(reset=False)['dcp/estimated_attention_balance_efficiency'] == 0.5
+    window.update(second, skipped=True)
+    window.update(None)
+    window.update(second)
+    metrics = window.metrics()
+    assert metrics['dcp/estimated_attention_balance_efficiency'] == pytest.approx(68 / 72)
+    assert metrics['dcp/cp_size_1_sample_fraction'] == pytest.approx(2 / 3)
+    assert metrics['dcp/cp_size_2_sample_fraction'] == pytest.approx(1 / 3)
+    assert window.metrics() == {}
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_dcp_schedule_stats_tp_metadata(monkeypatch, enabled):
+    monkeypatch.setattr(data_schedule, 'mtp_on_this_pipeline_rank', lambda *a, **k: False)
+    monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
+
+    class Group:
+        def __init__(self, rank=0, size=2):
+            self.rank = lambda: rank
+            self.size = lambda: size
+
+    lengths = [(0, 1048579), (1, 513)]
+    schedule = [[[0], [1]]]
+    expected = compute_schedule_stats(schedule, lengths)
+    samples = [
+        {
+            k: None
+            for k in data_schedule.DpBalancedScheduler(1, 1, 1, None).get_required_sample_keys()
+        }
+    ]
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=None,
+        mtp_num_layers=None,
+        pipeline_model_parallel_layout=None,
+    )
+    monkeypatch.setattr(
+        data_schedule,
+        'get_batch_and_global_seqlens',
+        lambda *a: (samples, lengths, [], [], [x[1] for x in lengths]),
+    )
+    monkeypatch.setattr(data_schedule, 'reroute_samples_to_dcp_ranks', lambda *a, **kw: {})
+    monkeypatch.setattr(data_schedule, 'build_packed_microbatches', lambda *a, **kw: [])
+    monkeypatch.setattr(data_schedule, 'create_data_iterator', lambda *a, **kw: None)
+    wire = []
+
+    def broadcast(values, group, dev, dtype=torch.float32):
+        assert dtype == (torch.float64 if enabled else torch.float32)
+        if group.rank() == 0:
+            wire[:] = values
+        return torch.tensor(wire, dtype=dtype).tolist()
+
+    monkeypatch.setattr(data_schedule, 'broadcast_scalars', broadcast)
+    monkeypatch.setattr(
+        data_schedule, 'compute_schedule_stats', mock.Mock(wraps=compute_schedule_stats)
+    )
+    results = []
+    for rank in (0, 1):
+        scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
+        monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
+        stats = {'stale': 1} if enabled else None
+        result = scheduler.run(
+            iter(samples) if rank == 0 else None,
+            1,
+            Group(),
+            Group(rank),
+            Group(0, 1),
+            Group(),
+            'cpu',
+            config,
+            schedule_stats=stats,
+        )
+        assert len(result) == 4
+        results.append(stats)
+    assert data_schedule.compute_schedule_stats.call_count == int(enabled)
+    if enabled:
+        for stats in results:
+            assert 'stale' not in stats
+            assert stats['balance_numerator'] == expected['balance_numerator']
+            assert stats['balance_denominator'] == expected['balance_denominator']
+            assert stats['cp_sample_counts'] == {1: 2, 2: 0}
+        assert results[0]['rank_work'] == expected['rank_work']
+        assert 'rank_work' not in results[1]
+
+
+def test_dcp_schedule_stats_cli_switch():
+    from argparse import ArgumentParser
+
+    from megatron.training.arguments import _add_logging_args
+
+    parser = _add_logging_args(ArgumentParser())
+    assert parser.parse_args([]).log_dcp_stats is False
+    assert parser.parse_args(['--log-dcp-stats']).log_dcp_stats is True
+
+
+def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config):
+    from megatron.training import training
+
+    run_config.logger.log_dcp_stats = True
+    run_config.validation.eval_global_batch_size = 2
+    run_config.validation.eval_micro_batch_size = 1
+    run_config.validation.eval_iters = 2
+    args = SimpleNamespace(
+        data_parallel_size=1,
+        gtp_weight_remat_size=1,
+        cuda_graph_impl='none',
+        moe_expert_rank_capacity_factor=None,
+        seq_length=8,
+        decoder_seq_length=None,
+    )
+    window = DcpStatsAccumulator()
+    window.update(compute_schedule_stats([[[0], [1]]], {0: 4, 1: 2}))
+    before = window.metrics(reset=False)
+    wrapper = mock.Mock(return_value=(None, 3, 8.0, 64.0))
+    forward = mock.Mock(return_value=[])
+    monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_train_state', lambda: TrainState())
+    monkeypatch.setattr(training, 'get_timers', mock.MagicMock())
+    monkeypatch.setattr(training, 'get_rerun_state_machine', mock.Mock())
+    monkeypatch.setattr(training, 'get_forward_backward_func', lambda **kw: forward)
+    monkeypatch.setattr(
+        training, 'get_attr_wrapped_model', lambda *a: SimpleNamespace(pp=object(), dp_cp=object())
+    )
+    monkeypatch.setattr(training, 'is_pp_last_stage', lambda *a: False)
+    monkeypatch.setattr(training, 'has_nvidia_modelopt', False)
+    monkeypatch.setattr(training, 'ft_integration', mock.Mock())
+    monkeypatch.setattr(training, 'wrap_data_iterator', wrapper)
+    model = mock.Mock()
+    result = training.evaluate(
+        None,
+        object(),
+        [model],
+        None,
+        SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'),
+    )
+    assert not result[2]
+    assert wrapper.call_count == 2
+    assert all('schedule_stats' not in call.kwargs for call in wrapper.call_args_list)
+    assert all(call.kwargs['forward_only'] for call in forward.call_args_list)
+    assert window.metrics() == before
+    model.eval.assert_called_once()
+    model.train.assert_called_once()
+
+
+def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
+    from argparse import ArgumentParser
+
+    from megatron.training import arguments, training
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args(['--micro-batch-size', '1', '--train-iters', '4'])
+    args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
+    args.dsa_indexer_loss_coeff = None
+    run_config.logger.log_interval = 2
+    run_config.train.micro_batch_size = 1
+    run_config.train.train_iters = 4
+    timers = mock.MagicMock()
+    timers.return_value.elapsed.return_value = 1.0
+    writer, wandb, stdout = mock.Mock(), mock.Mock(), mock.Mock()
+    monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_train_state', lambda: TrainState())
+    monkeypatch.setattr(training, 'get_timers', lambda: timers)
+    monkeypatch.setattr(training, 'get_tensorboard_writer', lambda: writer)
+    monkeypatch.setattr(training, 'get_wandb_writer', lambda: wandb)
+    monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
+    monkeypatch.setattr(training, 'one_logger_utils', mock.Mock())
+    monkeypatch.setattr(training, 'print_rank_last', stdout)
+    monkeypatch.setattr(training, 'num_floating_point_operations', lambda *a, **kw: 1.0)
+    monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
+    for getter in ('get_one_logger', 'get_energy_monitor', 'get_telemetry'):
+        monkeypatch.setattr(training, getter, lambda: None)
+    window = DcpStatsAccumulator()
+    losses = {}
+    key = 'dcp/estimated_attention_balance_efficiency'
+    for iteration in range(1, 5):
+        window.update(compute_schedule_stats([[[0], [1]]], {0: iteration, 1: 1}))
+        training.training_log(
+            {},
+            losses,
+            0.01,
+            iteration,
+            1.0,
+            False,
+            0,
+            None,
+            None,
+            None,
+            None,
+            is_first_iteration=iteration == 1,
+            dcp_stats=window,
+        )
+    logged = [call.args for call in writer.add_scalar.call_args_list if call.args[0] == key]
+    assert logged == [(key, 7 / 10, 2), (key, 27 / 50, 4)]
+    wandb_metrics = [call.args for call in wandb.log.call_args_list if key in call.args[0]]
+    assert len(wandb_metrics) == 2
+    assert [call.args[0].count(key) for call in stdout.call_args_list] == [1, 1, 1]
+    assert window.metrics() == {}
+
+
+@pytest.mark.parametrize('outcome', ['exit', 'exception', 'success', 'skipped'])
+def test_dcp_schedule_stats_rerun_and_abort(monkeypatch, outcome, run_config):
+    from megatron.training import training
+
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 1
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        decoder_seq_length=None,
+        vision_pretraining=False,
+        qk_clip=False,
+        log_num_zeros_in_grad=False,
+    )
+    rerun = mock.Mock()
+    rerun.should_run_forward_backward.side_effect = [True, True, False]
+    rerun.should_checkpoint_and_exit.return_value = (False, outcome == 'exit', 0)
+    monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_timers', mock.MagicMock())
+    monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
+    monkeypatch.setattr(training, 'get_rerun_state_machine', lambda: rerun)
+    monkeypatch.setattr(training, 'has_nvidia_modelopt', False)
+    pending = compute_schedule_stats([[[0]]], {0: 8})
+
+    def wrap(*a, pg_collection, schedule_stats):
+        schedule_stats.update(pending)
+        return None, 1, 8.0, 64.0
+
+    wrapper = mock.Mock(side_effect=wrap)
+    monkeypatch.setattr(training, 'wrap_data_iterator', wrapper)
+    forward = mock.Mock(return_value=[])
+    if outcome == 'exception':
+        forward.side_effect = RuntimeError('aborted forward')
+    groups = SimpleNamespace(mp=object(), pp=object(), dp_cp=object())
+    monkeypatch.setattr(training, 'get_attr_wrapped_model', lambda *a: groups)
+    monkeypatch.setattr(training, '_get_samples_seen_in_iteration', lambda *a: 1)
+    monkeypatch.setattr(training, '_get_optimizer_param_scheduler_increment', lambda *a: 1)
+    monkeypatch.setattr(training, 'is_pp_last_stage', lambda *a: False)
+    monkeypatch.setattr(training, 'logical_and_across_model_parallel_group', lambda x, **kw: x)
+    monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
+    stats = {'stale': True}
+    observer = mock.MagicMock()
+    kwargs = dict(
+        forward_step_func=None,
+        data_iterator=object(),
+        model=[SimpleNamespace(zero_grad_buffer=lambda: None, pg_collection=groups)],
+        optimizer=SimpleNamespace(
+            zero_grad=lambda: None, step=lambda: (outcome == 'success', 1.0, None)
+        ),
+        opt_param_scheduler=mock.Mock(),
+        config=SimpleNamespace(
+            sequence_packing_scheduler='default_dynamic_cp',
+            barrier_with_L1_time=False,
+            log_max_attention_logit=False,
+        ),
+        forward_backward_func=forward,
+        iteration=0,
+        schedule_stats=stats,
+        tensor_metric_observer=observer,
+    )
+    if outcome == 'exception':
+        with pytest.raises(RuntimeError, match='aborted forward'):
+            training.train_step(**kwargs)
+    else:
+        training.train_step(**kwargs)
+        assert forward.call_count == 2
+    wrapper.assert_called_once()
+    assert observer.call_count == int(outcome in ('success', 'skipped'))
+    assert observer.observe_forward_backward.call_count == (1 if outcome == 'exception' else 2)
+    assert stats == (pending if outcome == 'success' else {})
+
+
+@pytest.mark.parametrize('vpp', [False, True])
+def test_dcp_schedule_stats_distributed(vpp):
+    """Cover TP/PP replicas with CP2, including the standard eight-rank CI job."""
+    world_size = Utils.world_size
+    if world_size not in (2, 4, 8):
+        pytest.skip('requires two, four or eight ranks')
+    cp_size = 2 if world_size >= 4 else 1
+    Utils.initialize_model_parallel(
+        1 if vpp else world_size // cp_size,
+        world_size // cp_size if vpp else 1,
+        2 if vpp else None,
+        context_parallel_size=cp_size,
+        dynamic_context_parallel=True,
+    )
+    try:
+        config = SimpleNamespace(
+            max_seqlen_per_dp_cp_rank=256,
+            microbatch_group_size_per_vp_stage=2 if vpp else 1,
+            virtual_pipeline_model_parallel_size=2 if vpp else None,
+            sequence_packing_scheduler='default_dynamic_cp',
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+            min_dynamic_context_parallel_size=1,
+        )
+        lengths = [512, 128, 128, 128, 128] if world_size >= 4 else [256, 128, 128]
+        if vpp:
+            if world_size < 4:
+                pytest.skip('VPP alignment case requires at least four ranks')
+            lengths = [512, 256, 128, 128, 256, 128, 128]
+            unaligned = DefaultDynamicCPScheduler(256, 2, 1, None).get_groups_and_subsamples(
+                list(enumerate(lengths))
+            )
+            assert len(unaligned) == 3
+        samples = []
+        for length in lengths:
+            samples.append(
+                dict(
+                    tokens=torch.zeros(length, dtype=torch.int64, device='cuda'),
+                    labels=torch.zeros(length, dtype=torch.int64, device='cuda'),
+                    position_ids=torch.arange(length, device='cuda'),
+                    loss_mask=torch.ones(length, device='cuda'),
+                    original_seq_len=torch.tensor([length], dtype=torch.int32, device='cuda'),
+                    padded_seq_len=torch.tensor([length], dtype=torch.int32, device='cuda'),
+                )
+            )
+        stats = {}
+        source = parallel_state.get_tensor_model_parallel_rank() == 0
+        data_iterator = iter(samples) if source else None
+        if vpp:
+            data_iterator = [data_iterator, None]
+        result = wrap_data_iterator(
+            data_iterator,
+            config,
+            len(lengths),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            schedule_stats=stats,
+        )
+        assert len(result) == 4
+        summaries = [None] * world_size
+        summary = {key: value for key, value in stats.items() if key != 'rank_work'}
+        torch.distributed.all_gather_object(summaries, summary)
+        assert all(s == summary for s in summaries)
+        assert summary['balance_numerator'] == sum(length**2 for length in lengths)
+        assert bool('rank_work' in stats) == source
+        if world_size >= 4:
+            assert stats['cp_sample_counts'][1] > 0 and stats['cp_sample_counts'][2] > 0
+        if vpp:
+            assert result[1] == 4
+            assert (
+                stats['cp_sample_counts']
+                != compute_schedule_stats(unaligned, dict(enumerate(lengths)))['cp_sample_counts']
+            )
+            # DP*CP is two, although four processes participate in PP2 training.
+            assert stats['balance_denominator'] == 2 * sum(max(row) for row in stats['rank_work'])
+        window = DcpStatsAccumulator()
+        window.update(stats)
+        assert sum(window.cp_sample_counts.values()) == len(lengths)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
