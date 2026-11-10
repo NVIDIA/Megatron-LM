@@ -550,6 +550,33 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
 @pytest.mark.launch_on_gb200
 @requires_blackwell
 @requires_flashinfer_nvfp4
+def test_prepare_routed_nvfp4_weights_keeps_nan_weights_visible():
+    """A NaN expert weight dequantizes to NaN, as it does in BF16 and MXFP8 experts.
+
+    E2M1 codes cannot hold a NaN and FlashInfer's block maxima skip it, so the expert's alpha,
+    which scales every one of its dequantized weights, must carry it. The other expert
+    quantizes as it does without the NaN.
+    """
+    from megatron.core.inference.moe.flashinfer_nvfp4 import prepare_routed_nvfp4_weights
+
+    torch.manual_seed(0)
+    fc1 = (torch.randn(2, 256, 256, device="cuda") * 0.05).bfloat16()
+    fc2 = (torch.randn(2, 256, 256, device="cuda") * 0.05).bfloat16()
+    clean = prepare_routed_nvfp4_weights(fc1, fc2)
+    fc1[1, 10, 37] = float("nan")
+
+    weights = prepare_routed_nvfp4_weights(fc1, fc2)
+
+    alpha = weights.fc1_alpha
+    assert torch.isnan(alpha[1]), f"the NaN weight's expert dequantizes with alpha {alpha[1]}"
+    assert torch.equal(alpha[0], clean.fc1_alpha[0])
+    assert torch.equal(weights.fc1_data[0], clean.fc1_data[0])
+    assert torch.equal(weights.fc1_scale_swizzled[:256], clean.fc1_scale_swizzled[:256])
+
+
+@pytest.mark.launch_on_gb200
+@requires_blackwell
+@requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
 @pytest.mark.parametrize("mode", ["deterministic", "batch_invariant"])
 @pytest.mark.parametrize("local_expert_offset", [0, 2, 4, 6])
