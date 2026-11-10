@@ -500,6 +500,22 @@ def test_backward_tile_halves_rows_at_production_width():
     assert _streamwise_backward_block_config(24_576, 3072) == (16, 512, 4)
 
 
+@pytest.mark.parametrize("batch", [1, 4096])
+def test_tiles_are_powers_of_two_at_every_eligible_width(batch):
+    """Triton builds only power-of-two tiles, and the dispatch accepts every width from 64."""
+
+    for stream_width in range(64, 2049):
+        for config in (
+            _streamwise_block_config(batch, stream_width),
+            _streamwise_backward_block_config(batch, stream_width),
+        ):
+            block_batch, block_width, _ = config
+            assert block_batch & (block_batch - 1) == 0, (stream_width, config)
+            assert block_width & (block_width - 1) == 0, (stream_width, config)
+            # The column mask never skips more than half a tile.
+            assert block_width < 2 * stream_width, (stream_width, config)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
     reason="Direct streamwise Triton kernels require CUDA and Triton.",
@@ -1019,6 +1035,83 @@ def test_decode_sized_forward_only_fuses_and_matches_reference(context_factory, 
     )
     assert _relative_l2(read_value, reference_read) <= 0.02
     assert _relative_l2(output_value, reference_output) <= 0.02
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+@pytest.mark.parametrize("mode", ["inference", "training"])
+@pytest.mark.parametrize("stream_width", [65, 96, 127])
+def test_fused_cuda_widths_below_column_tile_match_reference(stream_width, mode):
+    """Widths between 64 and the 128-column tile that are not powers of two run fused.
+
+    The dispatch accepts every width from 64, for a decode-sized inference forward and for
+    training, whose backward kernels share the forward tile at these widths.
+    """
+
+    torch.manual_seed(1618)
+    num_streams = 3
+    max_forget = 0.2
+    read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
+    write_logits = _padded_logits(torch.tensor([-0.01, 0.0, 0.01], device="cuda"))
+    retention_logits = _padded_logits(torch.tensor([4.8, 4.9, 5.0], device="cuda"))
+
+    if mode == "inference":
+        residual_source = torch.randn(
+            33, num_streams * stream_width, device="cuda", dtype=torch.bfloat16
+        )
+        update_source = torch.randn(33, stream_width, device="cuda", dtype=torch.bfloat16)
+        with InferenceMode.active(), torch.inference_mode():
+            residual = residual_source.clone()
+            update = update_source.clone()
+            assert _can_use_streamwise_triton(
+                residual, read_logits, num_streams, stream_width, enforce_training_limits=False
+            )
+            read = streamwise_sigmoid_read(residual, read_logits, num_streams)
+            output = streamwise_sigmoid_writeback(
+                residual,
+                update,
+                write_logits,
+                num_streams,
+                retention_logits=retention_logits,
+                retention_max_forget=max_forget,
+            )
+            read_value = read.clone()
+            output_value = output.clone()
+
+        reference_read = _reference_read(
+            residual_source, torch.sigmoid(read_logits[:num_streams].float())
+        )
+        reference_output = _reference_writeback(
+            residual_source,
+            update_source,
+            2.0 * torch.sigmoid(write_logits[:num_streams].float()),
+            1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float()),
+        )
+        torch.testing.assert_close(read_value, reference_read.detach())
+        torch.testing.assert_close(output_value, reference_output.detach())
+        return
+
+    residual = torch.randn(256, num_streams * stream_width, device="cuda", dtype=torch.float32)
+    update = torch.randn(256, stream_width, device="cuda", dtype=torch.float32)
+    grad_output = torch.randn_like(residual)
+    source_inputs = (residual, update, read_logits, write_logits, retention_logits)
+    assert _can_use_streamwise_triton(residual, read_logits, num_streams, stream_width)
+    fused_leaves = [value.detach().clone().requires_grad_() for value in source_inputs]
+    reference_leaves = [value.detach().clone().requires_grad_() for value in source_inputs]
+
+    fused_output, fused_gradients = _run_fused_cuda_case(*fused_leaves, grad_output)
+    reference_output, reference_gradients = _run_reference_cuda_case(*reference_leaves, grad_output)
+
+    assert type(fused_output.grad_fn).__name__ == "_StreamwiseSigmoidWritebackBackward"
+    assert _relative_l2(fused_output, reference_output) <= 2.0e-5
+    for index, (fused_gradient, reference_gradient) in enumerate(
+        zip(fused_gradients, reference_gradients)
+    ):
+        assert _relative_l2(fused_gradient, reference_gradient) <= (2.0e-5 if index < 2 else 5.0e-4)
+    for gradient in fused_gradients[2:]:
+        assert torch.count_nonzero(gradient[num_streams:]) == 0
 
 
 @pytest.mark.skipif(
