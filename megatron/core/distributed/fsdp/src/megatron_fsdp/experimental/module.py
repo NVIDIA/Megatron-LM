@@ -458,29 +458,27 @@ class FsdpModule:
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
             buffers = []
-            try:
-                for group in self._parameter_groups:
-                    if not group.requires_grad:
-                        continue
+            for group in self._parameter_groups:
+                if not group.requires_grad:
+                    continue
 
-                    if group.requires_inner_reduction:
-                        self._reduce_inner_gradients(group, buffers)
-                    else:
-                        self._accumulate_local_gradients(group)
+                if group.requires_inner_reduction:
+                    self._reduce_inner_gradients(group, buffers)
+                else:
+                    self._accumulate_local_gradients(group)
 
-                    if not context.finalize_gradients:
-                        continue
-                    # Finalize the DP-outer reduction. When overlap is enabled its stream is
-                    # distinct, so it overlaps the following group's DP-inner reduce; the
-                    # persistent accumulator and its optimizer-layout view stay alive across
-                    # the handoff. When disabled the stream aliases inner_reduction_stream and
-                    # this stays serialized.
-                    if context.outer_reduction_stream is not inner_reduction_stream:
-                        context.outer_reduction_stream.wait_stream(inner_reduction_stream)
-                    with torch.cuda.stream(context.outer_reduction_stream):
-                        group.reduce_outer_gradients()
-            finally:
-                context._retain_grad_buffers(buffers, current_stream)
+                if not context.finalize_gradients:
+                    continue
+                # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                # distinct, so it overlaps the following group's DP-inner reduce; the
+                # persistent accumulator and its optimizer-layout view stay alive across
+                # the handoff. When disabled the stream aliases inner_reduction_stream and
+                # this stays serialized.
+                if context.outer_reduction_stream is not inner_reduction_stream:
+                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                with torch.cuda.stream(context.outer_reduction_stream):
+                    group.reduce_outer_gradients()
+            context._retain_grad_buffers(buffers, current_stream)
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
