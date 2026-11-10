@@ -68,6 +68,7 @@ if HAVE_TE:
     from megatron.core.models.vision.vit_model import KimiViTModel, QwenVLViTModel, ViTModel
 
 VERSIONS = "deprecated since Megatron Core 0.21 and will be removed in 0.23"
+NO_GRID = "which is not initialized, so the tp groups it returns are None"
 _FALLBACK_MESSAGE = re.compile(r"^(.+) was called without `([^`]+)`")
 
 needs_tp2 = pytest.mark.skipif(
@@ -101,6 +102,23 @@ def owner_groups(tp2_grid):
     yield groups
     for group in groups:
         torch.distributed.destroy_process_group(group)
+
+
+@pytest.fixture
+def no_grid(tp2_grid, monkeypatch):
+    """parallel_state as before initialize_model_parallel; yields a DP x CP group to pass in."""
+    _, dp_cp_group = tp2_grid
+    # Restore the grid before tp2_grid destroys it.
+    with monkeypatch.context() as patch:
+        for name in (
+            "_TENSOR_MODEL_PARALLEL_GROUP",
+            "_PIPELINE_MODEL_PARALLEL_GROUP",
+            "_DATA_PARALLEL_GROUP",
+            "_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+        ):
+            patch.setattr(parallel_state, name, None)
+        assert not parallel_state.model_parallel_is_initialized()
+        yield dp_cp_group
 
 
 @contextlib.contextmanager
@@ -301,6 +319,27 @@ class TestMegatronModuleTensorParallelGroup:
         assert _shard_ids(sharded_state_dict) == expected
         assert _fallbacks(record) == [("_Leaf.sharded_state_dict", "tp_group")]
 
+    def test_module_without_groups_or_a_grid_warns_and_is_not_tensor_parallel(self, no_grid):
+        dp_cp_group = no_grid
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dict = _Leaf(_config()).sharded_state_dict(
+                metadata={'dp_cp_group': dp_cp_group}
+            )
+
+        assert _fallbacks(record) == [("_Leaf.sharded_state_dict", "tp_group")]
+        assert any(NO_GRID in str(warning.message) for warning in record)
+        assert sorted(sharded_state_dict) == ['linear.bias', 'linear.weight', 'weight']
+        for entry in sharded_state_dict.values():
+            assert entry.replica_id == (0, 0, dp_cp_group.rank())
+
+    def test_module_without_groups_a_grid_or_metadata_still_asserts(self, no_grid):
+        # Only the tensor-parallel fallback works without a grid; the DP x CP one needs it.
+        with pytest.warns(ProcessGroupFallbackWarning, match=NO_GRID):
+            with pytest.raises(AssertionError, match="data parallel group with CP"):
+                _Leaf(_config()).sharded_state_dict()
+
     def test_missing_metadata_warning_names_the_module_class(self, tp2_grid):
         tp_group, dp_cp_group = tp2_grid
 
@@ -370,6 +409,19 @@ class TestExtendedRMSNormTensorParallelGroup:
         assert norm.tp_group is tp_group
         assert sharded_state_dict['weight'].global_offset == (tp_group.rank() * 8,)
         assert _fallbacks(record) == [("ExtendedRMSNorm.sharded_state_dict", "tp_group")]
+
+    def test_omitted_group_without_a_grid_warns_and_is_not_tensor_parallel(self, no_grid):
+        norm = self._norm()
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dict = norm.sharded_state_dict(metadata={'dp_cp_group': no_grid})
+
+        assert _fallbacks(record) == [("ExtendedRMSNorm.sharded_state_dict", "tp_group")]
+        assert any(NO_GRID in str(warning.message) for warning in record)
+        assert norm.tp_group is None
+        assert sharded_state_dict['weight'].global_offset == (0,)
+        assert sharded_state_dict['weight'].global_shape == (8,)
 
 
 def _mhc_config():
