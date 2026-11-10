@@ -1,15 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Model module declarations add ownership and matching names to ordinary refit."""
 
-import contextlib
 import gc
+import warnings
 import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.resharding import refit
 from megatron.core.resharding.planner import _extract_module_metadata, _find_source_metadata
 from megatron.core.resharding.refit import (
@@ -81,25 +82,34 @@ def test_ordinary_models_require_root_groups(explicit_none):
 
 
 @pytest.mark.parametrize("dp", ["missing", "none"])
-def test_ordinary_source_without_dp_is_rejected(monkeypatch, dp):
-    """Refit never fills a missing dp from the global grid into the model's collection."""
+def test_ordinary_source_without_dp_is_filled_with_a_warning(monkeypatch, dp):
+    """Until the fallback is removed, refit fills a missing source dp from the global grid and
+    warns. When the warning is an error, it reads no global group and writes nothing."""
+    global_group = SimpleNamespace(name="global data-parallel group")
+    reads = []
     monkeypatch.setattr(
         "megatron.core.parallel_state.get_data_parallel_group",
-        lambda **kwargs: SimpleNamespace(name="global data-parallel group"),
+        lambda **kwargs: reads.append(kwargs) or global_group,
     )
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     model = MegatronModule(SimpleNamespace(num_moe_experts=None))
     model.pg_collection = ProcessGroupCollection(tp=(0,), pp=(0,))
     if dp == "none":
         model.pg_collection.dp = None
     before = dict(vars(model.pg_collection))
-    with contextlib.suppress(ValueError):
-        _unwrap_model_cores(model, None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        with pytest.raises(ProcessGroupFallbackWarning, match="pg_collection.dp"):
+            _unwrap_model_cores(model, None)
     # Later readers of the collection, such as checkpointing, must not see another grid's group.
     assert vars(model.pg_collection) == before
-    with pytest.raises(ValueError, match="pg_collection must set dp"):
-        _unwrap_model_cores(model, None)
-    with pytest.raises(ValueError, match="pg_collection must set dp"):
-        refit.prepare_swap_model_weights(model, None)
+    assert reads == []
+    with pytest.warns(
+        ProcessGroupFallbackWarning, match="swap_model_weights .*`pg_collection.dp`.* 0.23"
+    ):
+        assert _unwrap_model_cores(model, None) == (model, None, None)
+    assert model.pg_collection.dp is global_group
+    assert reads == [{"with_gtp_remat": False}]
 
 
 def test_ordinary_source_with_dp_reads_no_global_group(monkeypatch):
