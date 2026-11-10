@@ -7,6 +7,8 @@ main-gradient dtype when it is unset, independently of the compute-gradient dtyp
 training must still track an unsharded baseline in either reduction dtype.
 """
 
+from copy import deepcopy
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -45,6 +47,19 @@ class TinyModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
         return self.fc2(torch.relu(self.fc1(x)))
+
+
+class MixedLayer(nn.Module):
+    """Two dtype groups in one owner, both computing in FP32."""
+
+    def __init__(self, device) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(8, device=device) / 2)
+        self.bias = nn.Parameter(torch.zeros(8, device=device, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        """Round the compute bias to BF16 while retaining an FP32 master in the reference."""
+        return nn.functional.linear(x, self.weight, self.bias.to(torch.bfloat16).float())
 
 
 def _default_placements() -> Placements:
@@ -237,6 +252,103 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
     torch.testing.assert_close(
         torch.stack(sharded_losses), torch.stack(baseline_losses), rtol=0, atol=atol
     )
+
+
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
+def test_gradient_staging_matches_reference(distributed_setup, monkeypatch, capture):
+    """Delayed RS and allocator reuse preserve mixed-group gradients and optimizer updates."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(*(MixedLayer(device) for _ in range(3)))
+    reference = deepcopy(model).float()
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
+    ) as context:
+        for layer in model:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=_default_placements(),
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    main_params_dtype=torch.float32,
+                    main_grads_dtype=torch.float32,
+                    grad_comm_dtype=torch.float32,
+                ),
+            )
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    torch.manual_seed(73 + distributed_setup.rank)
+    inputs = torch.randn(3, 4, 8, device=device)
+    reduce_gradients = FsdpParameterGroup.reduce_inner_gradients
+
+    def delayed_reduce(group, partial_grad):
+        torch.cuda._sleep(1_000_000)
+        return reduce_gradients(group, partial_grad)
+
+    monkeypatch.setattr(FsdpParameterGroup, "reduce_inner_gradients", delayed_reduce)
+
+    def train():
+        optimizer.zero_grad(set_to_none=False)
+        losses = []
+        for mb, x in enumerate(inputs):
+            with finalize_gradients(context, enabled=mb == len(inputs) - 1):
+                loss = model(x).square().mean() / len(inputs)
+                loss.backward()
+            losses.append(loss.detach())
+            # Reuse small compute-stream blocks while reduction inputs are still in flight.
+            for _ in range(8):
+                torch.empty(64, device=device).fill_(1.0e6)
+        context.finish_grad_sync()
+        assert not context._pending_grad_buffers
+        optimizer.step()
+        return torch.stack(losses)
+
+    def check(actual_losses):
+        reference_optimizer.zero_grad(set_to_none=False)
+        expected_losses = []
+        for x in inputs:
+            loss = reference(x).square().mean() / len(inputs)
+            loss.backward()
+            expected_losses.append(loss.detach())
+        for parameter in reference.parameters():
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+        torch.testing.assert_close(
+            actual_losses, torch.stack(expected_losses), rtol=1e-5, atol=1e-6
+        )
+        reference_optimizer.step()
+        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
+            torch.testing.assert_close(
+                actual.grad.full_tensor(), expected.grad, rtol=1e-5, atol=1e-6
+            )
+            torch.testing.assert_close(
+                actual.detach().full_tensor(), expected.detach(), rtol=1e-5, atol=1e-6
+            )
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    for _ in range(2):
+        with torch.cuda.stream(stream):
+            losses = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(losses)
+        stream.wait_stream(torch.cuda.current_stream(device))
+
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            losses = train()
+    for _ in range(3):
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            if capture:
+                graph.replay()
+            else:
+                losses = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(losses)
 
 
 @pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])

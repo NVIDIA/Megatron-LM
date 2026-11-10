@@ -7,6 +7,7 @@ CUDA graph capture and replay.
 """
 
 import logging
+from weakref import ref
 
 import pytest
 import torch
@@ -76,6 +77,34 @@ def _zero2_placements() -> Placements:
 
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
+
+
+def test_grad_buffer_release_orders_reuse_on_allocation_stream(distributed_setup):
+    """Retain inputs, then order reuse on their allocator even when release runs elsewhere."""
+    device = distributed_setup.device
+    context = FsdpContext(device=device)
+    allocation_stream = torch.cuda.Stream(device)
+    allocation_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(allocation_stream):
+        source = torch.full((4096,), 7.0, device=device)
+        result = torch.empty_like(source)
+    context.inner_reduction_stream.wait_stream(allocation_stream)
+    with torch.cuda.stream(context.inner_reduction_stream):
+        torch.cuda._sleep(10_000_000)
+        result.copy_(source)
+    context._retain_grad_buffers([source], allocation_stream)
+    source_ref = ref(source)
+    del source
+    assert source_ref() is not None
+
+    context._release_grad_buffers()
+    assert source_ref() is None
+    with torch.cuda.stream(allocation_stream):
+        replacement = torch.empty_like(result)
+        replacement.fill_(-9.0)
+    torch.cuda.current_stream(device).wait_stream(allocation_stream)
+    torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
+    torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
 
 
 def test_shared_layer_releases_storage(distributed_setup):
