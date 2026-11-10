@@ -697,6 +697,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.expert_model_parallel_size > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
+        # Set by setup_kv_transfer. Disaggregated handoffs can hold recurrent-state
+        # slots outside request rows, so admission must not assume one slot per row.
+        self.kv_transfer_enabled = False
         reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
@@ -3678,15 +3681,29 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             prefill_chunk_length (Optional[int]): Prompt tokens in the chunk to admit.
                 Defaults to the whole remaining prompt.
         """
-        # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
-        # A handoff is the exception: it keeps its live recurrent-state slot after
-        # its request row is removed, so both capacities must be checked independently.
-        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
-            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
+        # Hybrid models also need a free recurrent-state slot. The slot pool has one
+        # entry per request row, but with KV transfer slots can be held by state that
+        # owns no row: a prefill engine keeps a finished handoff's slot until the
+        # decode peer has read it, and a decode engine reserves a slot for each
+        # incoming handoff before that request is admitted. A free row therefore does
+        # not imply a free slot, and add_request would fail mid-allocation without
+        # this check. Without KV transfer, the only slot held outside the counted rows
+        # is a chunked prefill request's between chunks: update_requests hides its row
+        # past total_request_count until the next chunk re-adds it, but keeps its slot.
+        if self.is_hybrid_model:
+            has_free_mamba_slot = self.mamba_metadata.mamba_state_free_slot_count > 0
+            if not self.kv_transfer_enabled and request_can_be_added:
+                assert has_free_mamba_slot or (
+                    self.chunked_prefill_request_id != -1
+                    and self.get_index_of_chunked_prefill_request(safe=True) == -1
+                ), (
+                    "A free request row has no free Mamba state slot, but only KV transfer "
+                    "or a hidden chunked prefill request may hold slots outside request rows"
+                )
+            request_can_be_added &= has_free_mamba_slot
 
         if prefill_chunk_length is None:
             prefill_chunk_length = req.remaining_prompt_length
