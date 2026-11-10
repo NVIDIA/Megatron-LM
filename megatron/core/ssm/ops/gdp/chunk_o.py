@@ -74,7 +74,9 @@ def chunk_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
 ):
     """Emit one chunk of output from the chunk-boundary state plus local attention."""
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # int64 sequence and head indices, so the base offsets below are int64 products: GDP's
+    # Householder-expanded keys reach 2**31 elements at 174763 tokens of M 3, 32 heads, K 128.
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:

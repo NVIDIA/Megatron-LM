@@ -76,7 +76,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
 ):
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # int64 sequence and head indices, so the base offsets below are int64 products: a step's
+    # chunk states reach 2**31 elements at 262144 tokens of 32 heads with K = V = 128.
+    i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
@@ -139,7 +141,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     # main recurrence
     for i_t in range(NT):
         if i_t % num_householder == 0:
-            i_t_true = i_t // num_householder
+            # int64: a sequence's chunk states reach 2**31 elements at 4096 chunks of H 32,
+            # K = V = 128. tl.cast, not .to: under TRITON_INTERPRET i_t is a Python int.
+            i_t_true = tl.cast(i_t // num_householder, tl.int64)
             p_h1 = tl.make_block_ptr(
                 h + i_t_true * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
             )
