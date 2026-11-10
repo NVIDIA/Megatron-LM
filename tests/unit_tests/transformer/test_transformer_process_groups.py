@@ -401,6 +401,15 @@ class TestMultiTokenPrediction:
         # Without a layout, all MTP layers sit on the last stage.
         assert expected == (1 if pp_rank == 1 else 0)
 
+    @pytest.mark.parametrize("layout", [None, [['embedding', 'decoder', 'decoder', 'mtp', 'loss']]])
+    def test_layer_count_of_a_single_stage_needs_no_pp_rank(self, monkeypatch, layout):
+        # No grid is initialized: the only stage has rank 0, so nothing is read or deprecated.
+        config = _config(num_layers=2, mtp_num_layers=1, pipeline_model_parallel_layout=layout)
+        _forbid_global_process_groups(monkeypatch)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            assert get_mtp_num_layers_to_build(config) == 1
+
     @requires_two_ranks
     def test_layer_offset_without_pp_rank_warns_and_uses_the_global_rank(self):
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
