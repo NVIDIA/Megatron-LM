@@ -54,7 +54,9 @@ def test_decode_attention_preserves_batch_invariant_token_padding(
     """Only batch-invariant token-only rows bypass the attention kernel."""
     attention = object.__new__(SelfAttention)
     torch.nn.Module.__init__(attention)
-    attention.config = SimpleNamespace(window_size=None, window_attn_skip_freq=None)
+    attention.config = SimpleNamespace(
+        window_size=None, window_attn_skip_freq=None, attn_logit_softcapping=None
+    )
     attention.layer_number = 1
     attention.batch_invariant_mode = batch_invariant_mode
     attention.flash_attention_version = 4

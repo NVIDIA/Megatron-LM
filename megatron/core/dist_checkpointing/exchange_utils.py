@@ -2,6 +2,7 @@
 
 """Utilities for exchanging data between ranks."""
 
+import hashlib
 import logging
 import os
 import pickle
@@ -18,7 +19,7 @@ from megatron.core._rank_utils import safe_get_rank
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
-from .utils import _sharded_tensor_shard_id, _ShardId, debug_time
+from .utils import _quantized_storage_tensors, _sharded_tensor_shard_id, _ShardId, debug_time
 
 # TODO: remove TE references once the TE bug is fixed
 # Check if Transformer Engine has Float8Tensor class
@@ -179,7 +180,8 @@ def distribute_shards_to_ranks(
 PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
 
 # Process-global in-memory cache of the per-group distributions, keyed by the
-# resolved cache file path (which uniquely identifies a (cache dir, group) pair).
+# resolved cache file path (which uniquely identifies a (cache dir, group) pair,
+# because the file name is derived from the group's ordered global ranks).
 # Each entry holds the full {ignore_groups: ShardDistribution} map, so a single
 # entry serves both the save and load variants. This memoization makes
 # `determine_main_replica_uniform_distribution` idempotent within a job:
@@ -299,16 +301,23 @@ def _pg_dist_cache_file_path(
 ) -> str:
     """Returns the cache file path holding the distributions for a given group.
 
-    The file is keyed by the minimum global rank of the parallelization group.
+    The file is keyed by a SHA-256 digest of the group's ordered global ranks.
     Decision rationale:
-      * Parallelization groups partition the world, so ``min(global ranks)`` is
-        a unique, collision-free identifier of each group.
+      * The distribution depends on the group's exact membership and rank order,
+        so the key must identify both. ``min(global ranks)`` alone is not
+        unique: distinct groups can share a minimum rank (for example a
+        data-parallel group over ranks [0, 1, 2, 3] and an expert-data-parallel
+        group over [0, 2]), and they would then read or overwrite each other's
+        distributions.
       * It is computed from purely local metadata
         (``get_process_group_ranks``), so the filename is derivable without any
         collective — essential for the zero-communication read path.
       * Every member of a group maps to the same file (one file per group rather
         than one per rank): far fewer files at scale and a single read per rank,
         with duplicate reads absorbed by the FS page cache.
+
+    Cache files written under the earlier ``pg_dist_<min rank>.pkl`` naming are
+    not read; regenerate them with ``--ckpt-pg-tensors-cache-create``.
 
     Args:
         cache_path (str): directory holding the cache files.
@@ -318,7 +327,8 @@ def _pg_dist_cache_file_path(
         str: absolute-or-relative path of the group's cache file.
     """
     ranks = torch.distributed.get_process_group_ranks(parallelization_group)
-    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{min(ranks)}.pkl")
+    group_key = hashlib.sha256(",".join(map(str, ranks)).encode("ascii")).hexdigest()
+    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{group_key}.pkl")
 
 
 def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
@@ -764,12 +774,147 @@ def exchange_loaded_tensors_broadcast(
     return all_loaded_tensors
 
 
+_QUANTIZED_STORAGE_PART_ALIGNMENT = 16
+
+
+def _aligned_nbytes(nbytes: int) -> int:
+    return -(-nbytes // _QUANTIZED_STORAGE_PART_ALIGNMENT) * _QUANTIZED_STORAGE_PART_ALIGNMENT
+
+
+def _quantized_storage_nbytes(tensor: torch.Tensor) -> int:
+    """Size of the packed quantized storage of a TE quantized tensor (see `_pack_...`)."""
+    return sum(
+        _aligned_nbytes(part.numel() * part.element_size())
+        for part in _quantized_storage_tensors(tensor)
+    )
+
+
+def _pack_quantized_storage(tensor: torch.Tensor) -> torch.Tensor:
+    """Packs the raw storage of a TE quantized tensor (codes and scales) into one byte buffer.
+
+    Exchanging the raw storage instead of the dequantized values keeps the loading rank's
+    encoding bit for bit on the receivers (re-quantizing dequantized values can pick different
+    block scales) and halves the exchanged bytes. Parts are 16-byte aligned so that every part
+    can be viewed in place with its own dtype.
+    """
+    buf = torch.empty(_quantized_storage_nbytes(tensor), dtype=torch.uint8, device=tensor.device)
+    offset = 0
+    for part in _quantized_storage_tensors(tensor):
+        nbytes = part.numel() * part.element_size()
+        buf[offset : offset + nbytes].view(part.dtype).view(part.shape).copy_(part)
+        offset += _aligned_nbytes(nbytes)
+    return buf
+
+
+def _unpack_quantized_storage(buf: torch.Tensor, tensor: torch.Tensor) -> None:
+    """Inverse of `_pack_quantized_storage`, writing into the storage of `tensor`."""
+    offset = 0
+    for part in _quantized_storage_tensors(tensor):
+        nbytes = part.numel() * part.element_size()
+        part.copy_(buf[offset : offset + nbytes].view(part.dtype).view(part.shape))
+        offset += _aligned_nbytes(nbytes)
+    if offset != buf.numel():
+        raise CheckpointingException(
+            f'Packed quantized storage ({buf.numel()} bytes) does not match the destination'
+            f' ({offset} bytes)'
+        )
+
+
+def exchange_loaded_tensors_broadcast_quantized(
+    loaded_tensors: Dict[_ShardId, torch.Tensor],
+    unloaded_shards: Dict[_ShardId, ShardedTensor],
+    shard_distribution: ShardDistribution,
+    parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Dict[_ShardId, torch.Tensor]:
+    """`exchange_loaded_tensors_broadcast` for state dicts with quantized destinations.
+
+    Used by the streaming dequantize load, which loads quantized destinations in place on the
+    loading rank. Such tensors are broadcast as their packed raw storage (see
+    `_pack_quantized_storage`) and unpacked straight into the receivers' destinations, so that
+    every rank ends up with the loading rank's encoding and no high-precision copy is created.
+    Other tensors are exchanged as by `exchange_loaded_tensors_broadcast`.
+
+    Args: see `exchange_loaded_tensors_broadcast`.
+    """
+    from ..fp8_utils import is_float8tensor  # Avoid circular import
+
+    main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = shard_distribution
+    local_rank = torch.distributed.get_rank(group=parallelization_group)
+
+    # Ranks that do not need a shard still take part in its broadcast and must know the size of
+    # its packed storage, which only the loading rank knows: gather the sizes once up front.
+    local_nbytes = {
+        shard_id: _quantized_storage_nbytes(tensor)
+        for shard_id, tensor in loaded_tensors.items()
+        if is_float8tensor(tensor)
+    }
+    all_nbytes = [None] * torch.distributed.get_world_size(group=parallelization_group)
+    torch.distributed.all_gather_object(all_nbytes, local_nbytes, group=parallelization_group)
+    quantized_nbytes = {k: v for rank_nbytes in all_nbytes for k, v in rank_nbytes.items()}
+
+    if not quantized_nbytes:
+        return exchange_loaded_tensors_broadcast(
+            loaded_tensors, unloaded_shards, shard_distribution, parallelization_group
+        )
+
+    plain_loaded_tensors = {k: v for k, v in loaded_tensors.items() if k not in quantized_nbytes}
+    plain_distribution = ShardDistribution(
+        {k: v for k, v in main_rank_for_shard.items() if k not in quantized_nbytes},
+        shard_distribution.shards_in_this_group,
+        shard_to_metadata,
+        all_ranks_for_shard,
+    )
+    all_loaded_tensors = exchange_loaded_tensors_broadcast(
+        plain_loaded_tensors, unloaded_shards, plain_distribution, parallelization_group
+    )
+
+    for shard_id, rank in main_rank_for_shard.items():
+        if shard_id not in quantized_nbytes:
+            continue
+        nbytes = quantized_nbytes[shard_id]
+        if rank == local_rank:
+            all_loaded_tensors[shard_id] = loaded_tensors[shard_id]
+        if len(all_ranks_for_shard[shard_id]) == 1:
+            # Only the loading rank needs this tensor, no exchange needed.
+            continue
+        if rank == local_rank:
+            quantized = loaded_tensors[shard_id]
+            buf = _pack_quantized_storage(quantized)
+        else:
+            quantized = unloaded_shards[shard_id].data if shard_id in unloaded_shards else None
+            if quantized is not None and (
+                not is_float8tensor(quantized) or _quantized_storage_nbytes(quantized) != nbytes
+            ):
+                raise CheckpointingException(
+                    f'Shard {shard_id} was loaded as a quantized tensor on rank {rank} but its'
+                    f' destination on rank {local_rank} does not have the same quantized storage'
+                )
+            buf = torch.empty(nbytes, dtype=torch.uint8, device='cuda')
+        global_src_rank = (
+            rank
+            if parallelization_group is None
+            else torch.distributed.get_global_rank(parallelization_group, rank)
+        )
+        torch.distributed.broadcast(buf, src=global_src_rank, group=parallelization_group)
+        if rank != local_rank and quantized is not None:
+            with torch.no_grad():
+                _unpack_quantized_storage(buf, quantized)
+            # Hand back a view rather than the destination object itself: `load_state_dict`
+            # copies the loaded tensor into the param, and TE's generic quantized `copy_`
+            # cannot copy a tensor onto itself (it detaches the source storage first).
+            all_loaded_tensors[shard_id] = quantized.view(quantized.shape)
+        del buf
+
+    return all_loaded_tensors
+
+
 def exchange_by_distribution(
     loaded_tensors: Dict[_ShardId, torch.Tensor],
     unloaded_shards: Dict[_ShardId, ShardedTensor],
     shard_distribution: ShardDistribution,
     parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     exchange_algo="broadcast",
+    exchange_quantized_storage: bool = False,
 ) -> Dict[_ShardId, torch.Tensor]:
     """Exchange tensors loaded by different ranks using the specified exchange_algo.
 
@@ -783,6 +928,10 @@ def exchange_by_distribution(
             distribution. Tensors will be exchanged within this group
         exchange_algo (str): The algorithm used for performing exchanges.
             Defaults to 'broadcast'.
+        exchange_quantized_storage (bool): with the 'broadcast' algorithm, exchange quantized
+            tensors as their raw storage and unpack them into the receivers' quantized
+            destinations (streaming dequantize load), see
+            `exchange_loaded_tensors_broadcast_quantized`.
 
     Returns:
         Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
@@ -796,7 +945,11 @@ def exchange_by_distribution(
     elif exchange_algo == "gather_rounds":
         exchange_fn = exchange_loaded_tensors_gather_rounds
     elif exchange_algo == "broadcast":
-        exchange_fn = exchange_loaded_tensors_broadcast
+        exchange_fn = (
+            exchange_loaded_tensors_broadcast_quantized
+            if exchange_quantized_storage
+            else exchange_loaded_tensors_broadcast
+        )
     else:
         raise NotImplementedError(f"Unrecognized gather algorithm: {exchange_algo}")
     return exchange_fn(loaded_tensors, unloaded_shards, shard_distribution, parallelization_group)

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import math
 import weakref
 from contextlib import contextmanager
 from typing import Optional
@@ -106,6 +107,22 @@ class DistributedDataParallel(_BaseDataParallel):
 
     """
 
+    @staticmethod
+    def _validate_config(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> None:
+        """Validate model settings that depend on the data-parallel configuration."""
+        if config.moe_virtual_expert_load_balance and config.fp8:
+            if not ddp_config.fp8_param_gather:
+                raise ValueError(
+                    "MoonEP with MXFP8 requires fp8_param_gather=True (--fp8-param-gather)."
+                )
+            if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                raise ValueError(
+                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
+                    "(--reuse-grad-buf-for-mxfp8-param-ag)."
+                )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -115,6 +132,7 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
     ):
+        self._validate_config(config, ddp_config)
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -152,6 +170,12 @@ class DistributedDataParallel(_BaseDataParallel):
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
+
+        # GTP weight-shard axes, None when GTP-remat is inactive. The buffers use these to
+        # elect one rank per module for layout logging; every peer on these axes holds a
+        # replica of the same buffer and would otherwise repeat the whole dump.
+        self.gtp_remat_group = process_group_dict.get('gtp_remat_group')
+        self.expt_gtp_remat_group = process_group_dict.get('expt_gtp_remat_group')
 
         # Set inter_dist_opt_group if multiple optimizer instances
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -292,7 +316,12 @@ class DistributedDataParallel(_BaseDataParallel):
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
-        pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
+        pg_collection = ProcessGroupCollection(
+            tp=self.tp_group,
+            dp_cp=self.dp_cp_group,
+            gtp_remat=self.gtp_remat_group,
+            expt_gtp_remat=self.expt_gtp_remat_group,
+        )
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
@@ -306,15 +335,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
-                        assert (
-                            scaling_factor / data_parallel_group.size()
-                            == target_gradient_scaling_factor
+                        assert math.isclose(
+                            scaling_factor / data_parallel_group.size(),
+                            target_gradient_scaling_factor,
+                            rel_tol=1e-9,
                         )
                     else:
                         # For non-expert parameters, gradient_scaling_factor is 1.
                         # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
-                        assert (scaling_factor == 1) or (
-                            scaling_factor == (self.expt_dp_group.size() / self.dp_cp_group.size())
+                        assert math.isclose(scaling_factor, 1, rel_tol=1e-9) or math.isclose(
+                            scaling_factor,
+                            self.expt_dp_group.size() / self.dp_cp_group.size(),
+                            rel_tol=1e-9,
                         )
                 else:
                     # Expert params carry the extra egtp/gtp correction folded into
@@ -322,7 +354,9 @@ class DistributedDataParallel(_BaseDataParallel):
                     # matching non-expert params).
                     if buffer_key.is_expert_parallel:
                         target_gradient_scaling_factor *= expert_gtp_correction
-                    assert scaling_factor == target_gradient_scaling_factor
+                    assert math.isclose(
+                        scaling_factor, target_gradient_scaling_factor, rel_tol=1e-9
+                    )
 
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
@@ -699,7 +733,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.free_overlap_buffers()
 
-    def scale_gradients(self, scaling_factor: float):
+    def scale_gradients(self, scaling_factor: torch.Tensor):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
@@ -748,12 +782,49 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() before freeing.
             empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
+
+        Registered gradient storage is deregistered and its private pool is
+        destroyed after the storage is released. Parameter pools remain live.
+        If deregistration fails, no gradient storage is released, but earlier
+        deregistrations are not rolled back. Abort the run; do not retry offload
+        or reuse the model with potentially partial registration state.
+
+        Raises:
+            RuntimeError: If registered gradient storage was not constructed
+                with an offload-capable separate pool, or pool deregistration fails.
         """
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        buffers = self.buffers + self.expert_parallel_buffers
+        # Only registered buffers own pools that need collective deregistration and release;
+        # every buffer still offloads its gradient storage in the full buffers loop below.
+        registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
+        if any(not buffer.nccl_grad_pool_is_separate for buffer in registered_buffers):
+            raise RuntimeError(
+                "Gradient-buffer offload requires a separate NCCL gradient pool; construct "
+                "DistributedDataParallel with grad_buffer_offload=True."
+            )
+
+        # Deregister all pools before releasing any storage. If one fails,
+        # storage remains intact, but earlier deregistrations are not undone.
+        # The caller must abort the run rather than retry or reuse the model.
+        try:
+            for buffer in registered_buffers:
+                buffer.deregister_grad_pool_for_offload()
+        except RuntimeError as error:
+            error.add_note(
+                "Gradient-buffer offload failed during NCCL pool deregistration. "
+                "Registration state may be partial; abort this run and do not retry "
+                "offload or reuse this model."
+            )
+            raise
+
+        for buffer in buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
+
+        for buffer in registered_buffers:
+            buffer.release_offloaded_grad_pool()
 
         if empty_cache:
             torch.cuda.empty_cache()
@@ -770,7 +841,10 @@ class DistributedDataParallel(_BaseDataParallel):
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reload_from_cpu(move_params=False, move_grads=True)
+            if buffer.nccl_grad_pool_is_separate and buffer.nccl_mem_pool is None:
+                buffer.reload_grad_buffer_into_nccl_pool()
+            else:
+                buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:
             torch.cuda.synchronize()

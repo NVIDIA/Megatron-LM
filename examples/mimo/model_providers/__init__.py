@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -17,6 +17,7 @@ class MimoProvider:
 
     encoder_module_names: modality-encoder module names this provider defines.
     language_spec / encoder_specs: ``(args, pg_collection, grid) -> ModuleSpec`` factories.
+    language_input_projection_specs: optional projector factories for the first language stage.
     special_token_ids: ``(args) -> {module_name: token_id}``.
     build_communicator: ``(args, topology) -> MultiModulePipelineCommunicator``.
     """
@@ -26,6 +27,7 @@ class MimoProvider:
     encoder_specs: Mapping[str, Callable]
     special_token_ids: Callable
     build_communicator: Callable
+    language_input_projection_specs: Mapping[str, Callable] = field(default_factory=dict)
 
 
 def resolve_provider(args: "argparse.Namespace") -> MimoProvider:

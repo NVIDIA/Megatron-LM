@@ -13,7 +13,11 @@ Test groups
 - TestSymmBackwardNumerics  - symm-flagged backward produces the same main_grad as plain GTP
 - TestRealPoolRegistration  - register_gtp_symm_pool + gtp_symm_pool_ctx + a
                               collective on pool memory; skips where NCCL window
-                              registration is unsupported
+                              registration is unsupported. Proves ncclCommWindowRegister
+                              accepts the VMM allocator's current-device-only memory
+- TestVmmAllocatorModule / TestSymmPoolBackend
+                            - the VMM allocator extension (build caching, pool
+                              alloc/recycle, granularity) and pool-backend wiring
 
 The buffer-routing tests monkeypatch ``is_gtp_symm_pool_registered`` in BOTH consuming
 namespaces
@@ -31,6 +35,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
@@ -124,6 +129,119 @@ class TestRegisterVersionGuard:
             gtp_symm.register_gtp_symm_pool(_StubGroup(size=2))
 
 
+def _vmm_pool_or_skip():
+    import shutil
+
+    import megatron.core.allocator.vmm_symm_allocator as vmm_alloc
+
+    # Preflight only: skip where the extension cannot possibly build, but let a real
+    # build failure FAIL the test (a broad skip would turn compiler regressions green).
+    if shutil.which("nvcc") is None:
+        pytest.skip("nvcc unavailable; cannot build the VMM allocator extension")
+    return vmm_alloc.create_vmm_mem_pool()
+
+
+class TestVmmAllocatorModule:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
+    def test_build_is_cached(self):
+        import megatron.core.allocator.vmm_symm_allocator as vmm_alloc
+
+        _vmm_pool_or_skip()
+        first = vmm_alloc._allocator
+        _vmm_pool_or_skip()
+        assert first is not None and vmm_alloc._allocator is first
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
+    def test_pool_alloc_write_read_recycle(self):
+        pool = _vmm_pool_or_skip()
+        with torch.cuda.use_mem_pool(pool):
+            t = torch.full((1024,), 3.0, device="cuda")
+        segments_after_alloc = pool.snapshot()
+        assert segments_after_alloc, "pool has no segments after an allocation"
+        # The hook's contract: segment base and size are granularity-multiples
+        # (recommended VMM granularity is at least 2 MiB on supported GPUs).
+        granularity = 2 * 1024 * 1024
+        assert segments_after_alloc[0]["address"] % granularity == 0
+        assert segments_after_alloc[0]["total_size"] % granularity == 0
+        assert torch.equal(t.cpu(), torch.full((1024,), 3.0))
+        segments = len(pool.snapshot())
+        del t
+        # Same-size realloc must recycle the cached segment, not map a new slab.
+        with torch.cuda.use_mem_pool(pool):
+            t2 = torch.empty(1024, device="cuda")
+        assert len(pool.snapshot()) == segments
+        del t2
+        torch.cuda.synchronize()
+
+
+class TestSymmPoolBackend:
+    def test_pools_are_vmm_backed(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", lambda: calls.append("init"))
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "create_vmm_mem_pool",
+            lambda: calls.append("pool") or object(),
+        )
+        try:
+            gtp_symm._get_gtp_symm_pool(_StubGroup(name="backend_default_group"))
+            assert calls == ["init", "pool"]
+        finally:
+            gtp_symm._pools.pop("backend_default_group", None)
+
+    def test_falls_back_to_nccl_when_vmm_unavailable(self, monkeypatch):
+        calls = []
+
+        def _boom():
+            raise RuntimeError("extension failed to build")
+
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
+        monkeypatch.setattr(gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init"))
+        monkeypatch.setattr(
+            gtp_symm.nccl_allocator,
+            "create_nccl_mem_pool",
+            lambda symmetric: calls.append("nccl_pool") or object(),
+        )
+        try:
+            gtp_symm._get_gtp_symm_pool(_StubGroup(name="fallback_group"))
+            assert calls == ["nccl_init", "nccl_pool"]
+        finally:
+            gtp_symm._pools.pop("fallback_group", None)
+
+
+@pytest.mark.parametrize("symmetric", [False, True], ids=["plain", "symmetric"])
+def test_wgrad_pool_fences_cross_stream_reuse(monkeypatch, symmetric):
+    """Recycling scratch must not let the next writer clobber an outstanding reader."""
+    monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
+    pool, group = RegisteredLIFOPool(), _StubGroup()
+
+    def alloc():
+        if symmetric:
+            return pool.alloc((1024,), torch.bfloat16, "cuda", group)
+        return gtp_module._wgrad_pool_get((1024,), torch.bfloat16, "cuda")
+
+    buf = alloc()
+    buf.fill_(1)
+    observed = torch.empty_like(buf)
+    reader = torch.cuda.Stream()
+    reader.wait_stream(torch.cuda.current_stream())
+    ready = torch.cuda.Event()
+    with torch.cuda.stream(reader):
+        torch.cuda._sleep(50_000_000)
+        observed.copy_(buf)
+        ready.record()
+    if symmetric:
+        pool.free(buf, ready_event=ready)
+    else:
+        gtp_module._wgrad_pool_put(buf, ready_event=ready)
+    reused = alloc()
+    assert reused.data_ptr() == buf.data_ptr()
+    reused.fill_(17)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(observed, torch.ones_like(observed))
+    torch.testing.assert_close(reused, torch.full_like(reused, 17))
+
+
 class TestRegisteredLIFOPool:
     def test_alloc_returns_tagged_view(self):
         pool = RegisteredLIFOPool()
@@ -164,6 +282,29 @@ class TestRegisteredLIFOPool:
         pool = RegisteredLIFOPool()
         pool.free(torch.empty(8, device="cuda"))
         assert not pool._free  # nothing entered the free lists
+
+    def test_has_free_reports_whether_alloc_would_grow_the_pool(self):
+        # has_free is what lets a caller tell "recycling a buffer" from "raising the
+        # high-water mark", so it must answer per bucket, not per pool.
+        pool = RegisteredLIFOPool()
+        group = _StubGroup()
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # empty bucket
+        buf = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # checked out, not free
+        pool.free(buf)
+        assert pool.has_free((8, 4), torch.bfloat16, group)  # back on the free list
+
+    def test_has_free_keys_on_numel_dtype_and_group(self):
+        # Same keying as alloc: a free buffer must not be claimed to serve a different
+        # bucket, or the caller would skip the wait and then allocate anyway.
+        pool = RegisteredLIFOPool()
+        g1, g2 = _StubGroup("g1"), _StubGroup("g2")
+        pool.free(pool.alloc((8,), torch.bfloat16, "cuda", g1))
+        assert pool.has_free((8,), torch.bfloat16, g1)
+        assert pool.has_free((4, 2), torch.bfloat16, g1)  # 1-D key: same numel
+        assert not pool.has_free((8,), torch.float32, g1)  # different dtype
+        assert not pool.has_free((16,), torch.bfloat16, g1)  # different numel
+        assert not pool.has_free((8,), torch.bfloat16, g2)  # different group
 
     def test_capture_guard_raises_on_empty_bucket(self, monkeypatch):
         pool = RegisteredLIFOPool()
@@ -425,6 +566,154 @@ def _worker_real_pool_registration(rank, world_size, port):
 
 
 class TestRealPoolRegistration:
+    def test_repeated_wgrad_reuses_one_buffer_in_full_iteration_capture(self, monkeypatch):
+        """MTP-style repeated backwards must not need extra registered storage at capture."""
+        _requires_multi_gpu(4)
+        monkeypatch.setattr("megatron.core.full_cuda_graph.get_all_rng_states", lambda: {})
+        monkeypatch.setattr(GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(GTP_CONFIG, "calculate_per_token_loss", False)
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", True)
+        _run_distributed(_worker_repeated_wgrad_full_iteration, 4)
+
+    def test_full_iteration_reuses_registered_scratch_after_warmup(self, monkeypatch):
+        """Warmup fences retire, captured RS-to-overwrite dependencies survive replay, and the
+        fence a capture leaves on the slot never reaches an eager wait (graph reset) or query
+        (the next capture's reset)."""
+        _requires_multi_gpu(4)
+        monkeypatch.setattr("megatron.core.full_cuda_graph.get_all_rng_states", lambda: {})
+        _run_distributed(_worker_full_iteration_registered_scratch, 4)
+
     def test_register_alloc_collective_deregister(self):
+        """The VMM round trip: it proves ncclCommWindowRegister accepts
+        current-device-only mapped VMM memory."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_real_pool_registration, 4)
+
+
+def _worker_repeated_wgrad_full_iteration(rank, world_size, port):
+    group = dist.new_group(list(range(world_size)))
+    register_gtp_symm_pool(group)
+    layer = _make_gtp_linear(64, 128, group)
+    gtp_module.classify_gtp_chains(layer)
+    weight = layer.weight
+    weight.prev_w = object()  # Keep each reduction asynchronous until the next use.
+    weight.main_grad = torch.zeros(weight.shape, dtype=torch.float32, device="cuda")
+    source = torch.full(weight._unsharded_shape, float(rank), device="cuda")
+    pointers = []
+
+    def forward_backward_func(**_):
+        weight.main_grad.zero_()
+        for _ in range(3):
+            buffer = weight.get_wgrad_tensor()
+            pointers.append(buffer.data_ptr())
+            buffer.copy_(source)
+            weight.wgrad_reduce_scatter(buffer)
+        weight._wait_reduce_scatter(finalize_grad=True)
+        # Like training's gradient finalization, join the whole RS stream,
+        # including the main_grad addition after the send-buffer reuse event.
+        torch.cuda.current_stream().wait_stream(weight._cached_rs_stream)
+        return [{"loss": weight.main_grad}]
+
+    wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+    wrapper.reset_cuda_graph()
+    kwargs = dict(
+        model=[torch.nn.Identity()],
+        data_iterator=None,
+        num_microbatches=1,
+        seq_length=1,
+        forward_only=False,
+    )
+    try:
+        wrapper(**kwargs)
+        wrapper(**kwargs)
+        assert len(set(pointers)) == 1
+        for step in range(10):
+            source.fill_(rank + step)
+            result = wrapper(**kwargs)
+            torch.cuda.synchronize()
+            expected = 3 * (step + (world_size - 1) / 2)
+            torch.testing.assert_close(
+                result[0]["loss"], torch.full_like(weight.main_grad, expected), atol=0, rtol=0
+            )
+        assert len(pointers) == 6, "Replay must not call the Python buffer allocator"
+    finally:
+        torch.cuda.synchronize()
+        wrapper.reset_cuda_graph()
+        deregister_and_clear_gtp_symm_pools()
+        dist.destroy_process_group(group)
+
+
+def _worker_full_iteration_registered_scratch(rank, world_size, port):
+    """One registered send buffer through warmup, capture, replays, a graph reset with an eager
+    iteration and a recapture, then a forward-only validation capture. The slot a capture frees
+    keeps a fence recorded inside the graph: an eager wait on it fails with cudaErrorInvalidValue,
+    so reset_cuda_graph must drop it before eager iterations, and the next capture's reset must
+    drop it without querying it."""
+    group = dist.new_group(list(range(world_size)))
+    register_gtp_symm_pool(group)
+    count = 262144
+    source = torch.full((count * world_size,), float(rank), device="cuda")
+    output = torch.empty(count, device="cuda")
+    rs_stream = torch.cuda.Stream()
+    events = []  # keep every fence alive, as rs_event is in production
+    pointers = []
+
+    def forward_backward_func(forward_only=False, **_):
+        if forward_only:
+            # Validation mirrors production: forward only, no wgrad, no pool traffic.
+            output.copy_(source[:count])
+            return [{"loss": output}]
+        buf = symmetric_wgrad_pool.alloc(source.shape, source.dtype, source.device, group)
+        pointers.append(buf.data_ptr())
+        buf.copy_(source)
+        rs_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(rs_stream):
+            torch.cuda._sleep(500000)
+            dist.reduce_scatter_tensor(output, buf, group=group, async_op=True).wait()
+            ready = torch.cuda.Event()
+            ready.record()
+        events.append(ready)
+        symmetric_wgrad_pool.free(buf, ready_event=ready)
+        reused = symmetric_wgrad_pool.alloc(source.shape, source.dtype, source.device, group)
+        # This overwrite must remain behind the captured reduce-scatter reading the same buffer.
+        reused.zero_()
+        symmetric_wgrad_pool.free(reused, ready_event=ready)
+        return [{"loss": output}]
+
+    wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+    wrapper.reset_cuda_graph()
+    common = dict(model=[torch.nn.Identity()], data_iterator=None, num_microbatches=1, seq_length=1)
+
+    def run(value, forward_only=False):
+        source.fill_(rank + value)
+        result = wrapper(forward_only=forward_only, **common)
+        torch.cuda.synchronize()
+        if forward_only:
+            expected = float(rank + value)
+        else:
+            expected = world_size * value + world_size * (world_size - 1) / 2
+        torch.testing.assert_close(
+            result[0]["loss"], torch.full_like(output, expected), atol=0, rtol=0
+        )
+
+    try:
+        run(0)  # eager warmup
+        run(1)  # capture + replay
+        assert len(set(pointers)) == 1, "Capture must preserve the warmed registered address"
+        for step in range(2, 12):
+            run(step)
+        assert len(pointers) == 2, "Replay must not call the Python buffer allocator"
+        wrapper.reset_cuda_graph()  # back to eager; the slot still carries the captured fence
+        run(12)  # eager alloc: fails without the drop in reset_cuda_graph
+        run(13)  # recapture
+        run(14)  # replay
+        run(15, forward_only=True)  # eager validation warmup, no pool traffic
+        run(16, forward_only=True)  # validation capture: its reset sees captured fences
+        run(17, forward_only=True)  # replay
+        run(18)  # the training graph is still valid
+        assert len(pointers) == 4 and len(set(pointers)) == 1, pointers
+    finally:
+        torch.cuda.synchronize()
+        wrapper.reset_cuda_graph()
+        deregister_and_clear_gtp_symm_pools()
+        dist.destroy_process_group(group)

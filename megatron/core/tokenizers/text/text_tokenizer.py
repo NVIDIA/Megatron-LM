@@ -251,6 +251,16 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         return self._tokenizer.eod
 
     @property
+    def generation_config(self):
+        """Model generation_config attached to the underlying library tokenizer, if any.
+
+        HF library tokenizers read `generation_config.json` (which may declare an
+        `eos_token_id` list); expose it here so inference can honor every eos token.
+        Returns None for libraries that don't attach one.
+        """
+        return getattr(self._tokenizer, "generation_config", None)
+
+    @property
     def bos(self) -> int:
         """Returns id of beginning of sentence token."""
         return self._tokenizer.bos_id

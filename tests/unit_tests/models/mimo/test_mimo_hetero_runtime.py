@@ -21,6 +21,7 @@ from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
@@ -30,6 +31,29 @@ from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
+
+
+def _mimo_build_config(*, init_model_with_meta_device=False, **kwargs):
+    from examples.mimo.training.builder import MimoBuildConfig
+
+    return MimoBuildConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            init_model_with_meta_device=init_model_with_meta_device,
+        ),
+        seq_length=8,
+        vocab_size=128,
+        **kwargs,
+    )
+
+
+@pytest.fixture(autouse=True)
+def runtime_config(mimo_run_config):
+    mimo_run_config.rng.seed = 1234
+    mimo_run_config.model = _mimo_build_config()
+    return mimo_run_config
 
 
 def _args(**overrides):
@@ -152,6 +176,35 @@ def test_supplied_ddp_config_wins_over_global_args(mocker):
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
+def test_freezing_language_model_keeps_language_projection_trainable(mocker):
+    language_model = torch.nn.Linear(4, 4)
+    projection = torch.nn.Linear(8, 4)
+    projections = torch.nn.ModuleDict({ENCODER: projection})
+    mimo_model = SimpleNamespace(
+        language_model=language_model,
+        language_model_input_projections=projections,
+        modality_submodules={},
+    )
+    topology = SimpleNamespace(module_pgs={MIMO_LANGUAGE_MODULE_KEY: mocker.Mock()})
+    mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[language_model],
+    )
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.Mock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+
+    wrap_active_modules_with_ddp(
+        _args(freeze_lm=True, freeze_projection=False),
+        mimo_model,
+        topology,
+        DistributedDataParallelConfig(),
+    )
+
+    assert not language_model.weight.requires_grad
+    assert not language_model.bias.requires_grad
+    assert all(parameter.requires_grad for parameter in projection.parameters())
+
+
 def _eight_gpu_topology():
     """Encoder dp=4 at ranks 0-3; language dp=4 at ranks 4-7 (non-colocated, tiles world)."""
     return create_topology(
@@ -164,17 +217,15 @@ def _eight_gpu_topology():
 
 def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     """The non-colocated builder seeds the one active role and sets the model contract."""
-    from examples.mimo.training.builder import (
-        _LANGUAGE_SEED_OFFSET,
-        MimoBuildConfig,
-        MimoModelBuilder,
-    )
+    from examples.mimo.training.builder import _LANGUAGE_SEED_OFFSET, MimoModelBuilder
 
     args = _args(init_model_with_meta_device=True)
     groups = mocker.Mock()
     model = SimpleNamespace(language_model=mocker.Mock(), modality_submodules={})
     topology = mocker.Mock()
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology))
+    builder = MimoModelBuilder(
+        _mimo_build_config(_topology=topology, init_model_with_meta_device=True)
+    )
     mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
         "examples.mimo.training.builder._resolve_role",
@@ -216,16 +267,12 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
 
 def test_builder_encoder_role_sets_encoder_contract(mocker):
     """On an encoder-only rank the builder seeds/labels with the encoder role."""
-    from examples.mimo.training.builder import (
-        _ENCODER_SEED_OFFSET,
-        MimoBuildConfig,
-        MimoModelBuilder,
-    )
+    from examples.mimo.training.builder import _ENCODER_SEED_OFFSET, MimoModelBuilder
 
     args = _args(init_model_with_meta_device=False)
     encoder_pg = mocker.Mock()
     model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: mocker.Mock()})
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    builder = MimoModelBuilder(_mimo_build_config(_topology=mocker.Mock()))
     mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
         "examples.mimo.training.builder._resolve_role", return_value=(ENCODER, False, encoder_pg)
@@ -244,9 +291,9 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
 
 @pytest.mark.parametrize("fsdp_kwarg", ["use_megatron_fsdp", "use_torch_fsdp2"])
 def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import MimoModelBuilder
 
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    builder = MimoModelBuilder(_mimo_build_config(_topology=mocker.Mock()))
 
     with pytest.raises(NotImplementedError, match="has not been tested yet"):
         builder.build_distributed_models(
@@ -274,7 +321,7 @@ def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):
 
 def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     """Outer MIMO hooks surround preparation (pre -> wrap -> configure -> post) with replacement."""
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import MimoModelBuilder
 
     events = []
     original_model = SimpleNamespace()
@@ -293,7 +340,7 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
         return [post_replacement]
 
     groups = mocker.Mock()
-    config = MimoBuildConfig(
+    config = _mimo_build_config(
         _topology=mocker.Mock(), pre_wrap_hooks=[pre_hook], post_wrap_hooks=[post_hook]
     )
     builder = MimoModelBuilder(config)
@@ -329,12 +376,12 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
 )
 def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, model_count):
     """MIMO outer hooks must preserve the builder's single-model contract."""
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import MimoModelBuilder
 
     replacement_models = [SimpleNamespace() for _ in range(model_count)]
     hook_kwargs = {"pre_wrap_hooks": [], "post_wrap_hooks": []}
     hook_kwargs[f"{hook_stage}_wrap_hooks"] = [lambda _models: replacement_models]
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), **hook_kwargs))
+    builder = MimoModelBuilder(_mimo_build_config(_topology=mocker.Mock(), **hook_kwargs))
     mocker.patch(
         "examples.mimo.training.builder.get_args",
         return_value=_args(init_model_with_meta_device=False),
@@ -353,6 +400,43 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
     ):
         builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+
+
+def test_configure_module_rng_forwards_rng_tracker_options(mocker, run_config):
+    run_config.rng.te_rng_tracker = True
+    run_config.rng.inference_rng_tracker = True
+    run_config.model.transformer.cuda_graph_impl = "local"
+    pg_collection = SimpleNamespace(
+        pp=object(),
+        dp=object(),
+        tp=object(),
+        ep=object(),
+        expt_tp=object(),
+        gtp_remat=object(),
+        expt_gtp_remat=object(),
+    )
+    set_random_seed = mocker.patch("examples.mimo.training.runtime._set_random_seed")
+
+    configure_module_rng(
+        _args(te_rng_tracker=False, inference_rng_tracker=False, cuda_graph_impl="none"),
+        pg_collection,
+        role_seed_offset=10,
+        data_parallel_random_init=True,
+    )
+
+    assert set_random_seed.call_args.args == (1244, True)
+    assert set_random_seed.call_args.kwargs == {
+        "te_rng_tracker": True,
+        "inference_rng_tracker": True,
+        "use_cudagraphable_rng": True,
+        "pp_group": pg_collection.pp,
+        "dp_group": pg_collection.dp,
+        "tp_group": pg_collection.tp,
+        "ep_group": pg_collection.ep,
+        "etp_group": pg_collection.expt_tp,
+        "gtp_remat_group": pg_collection.gtp_remat,
+        "egtp_remat_group": pg_collection.expt_gtp_remat,
+    }
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")

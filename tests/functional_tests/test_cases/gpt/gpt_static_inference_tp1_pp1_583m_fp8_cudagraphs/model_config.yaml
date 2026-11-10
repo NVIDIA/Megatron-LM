@@ -33,6 +33,7 @@ MODEL_ARGS:
   --fp8-recipe: tensorwise
   --fp8-format: hybrid
   --fp8-param-gather: true
+  --stream-ckpt-dequant: true
   --first-last-layers-bf16: true
   --log-memory-to-tensorboard: true
   --log-num-zeros-in-grad: true

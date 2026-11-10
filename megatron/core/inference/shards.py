@@ -158,6 +158,14 @@ def build_inference_pg_collection(
         tp_ep_pp=tp_ep_pp_group,
         dp_cp=dp_cp_group,
         tp_dp_cp=tp_dp_cp_group,
+        # Declare the GTP_remat axes OFF rather than leaving them unset. An inference
+        # layout never rematerializes weights, and `resolve_gtp_remat_group` falls back
+        # to the MPU globals for a field that is absent from `vars(pg_collection)` --
+        # which would hand this collection the *training* GTP layout and build a
+        # GTP-sharded inference model. Passing None explicitly puts the field in
+        # `vars()`, so the fallback is not taken.
+        gtp_remat=None,
+        expt_gtp_remat=None,
     )
 
 
@@ -178,12 +186,15 @@ class InferenceShard:
             the collective process-group creation for every shard
             (``dist.new_group`` is world-collective); only members get a usable
             handle.
+        process_group: Group spanning every rank in this shard, used for
+            shard-scoped operations such as checkpoint metadata validation.
     """
 
     spec: InferenceShardSpec
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
+    process_group: Optional[dist.ProcessGroup] = None
 
 
 def build_inference_pg_collections_for_shards(
@@ -235,6 +246,7 @@ def build_inference_pg_collections_for_shards(
             use_tp_pp_dp_mapping=use_tp_pp_dp_mapping,
             rank_offset=offset,
         )
+        shard_group = dist.new_group(ranks=list(range(offset, offset + shard_world)))
         in_shard = offset <= rank < offset + shard_world
         results.append(
             InferenceShard(
@@ -242,6 +254,7 @@ def build_inference_pg_collections_for_shards(
                 rank_offset=offset,
                 world_size=shard_world,
                 pg_collection=pgc if in_shard else None,
+                process_group=shard_group if in_shard else None,
             )
         )
         offset += shard_world

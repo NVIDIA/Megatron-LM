@@ -1,0 +1,39 @@
+diff --git a/csrc/kernels/configs.cuh b/csrc/kernels/configs.cuh
+index 6c35c3c..4900d1d 100644
+--- a/csrc/kernels/configs.cuh
++++ b/csrc/kernels/configs.cuh
+@@ -28,0 +29,7 @@
++// Ensure NVSHMEM device symbols use extern declarations when NVSHMEM is enabled.
++#ifndef DISABLE_NVSHMEM
++#ifndef __CUDACC_RDC__
++#define __CUDACC_RDC__ // NOLINT(*-reserved-identifier)
++#endif
++#endif
++
+diff --git a/csrc/kernels/ibgda_device.cuh b/csrc/kernels/ibgda_device.cuh
+index 7fab70c..ad9b9da 100644
+--- a/csrc/kernels/ibgda_device.cuh
++++ b/csrc/kernels/ibgda_device.cuh
+@@ -9,0 +10,2 @@
++#include <type_traits>
++
+@@ -75,0 +78,14 @@ nvshmemi_ibgda_device_state_t* ibgda_get_state() {
++template <typename StateType>
++__device__ static __forceinline__
++nvshmemi_ibgda_device_qp_t* ibgda_get_rc_impl(StateType* state, int pe, int id) {
++    const auto num_rc_per_pe = state->num_rc_per_pe;
++
++    if constexpr (std::is_same_v<StateType, nvshmemi_ibgda_device_state_v1>) {
++        return &state->globalmem.rcs[
++            pe * num_rc_per_pe * state->num_devices_initialized
++            + id % (num_rc_per_pe * state->num_devices_initialized)];
++    } else {
++        return &state->globalmem.rcs[pe + nvshmemi_device_state_d.npes * id];
++    }
++}
++
+@@ -78,3 +94 @@ nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
+-    auto state = ibgda_get_state();
+-    const auto num_rc_per_pe = ibgda_get_state()->num_rc_per_pe;
+-    return &state->globalmem.rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
++    return ibgda_get_rc_impl(ibgda_get_state(), pe, id);

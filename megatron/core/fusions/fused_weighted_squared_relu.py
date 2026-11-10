@@ -110,23 +110,62 @@ def weighted_clamped_squared_relu_back(
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+@jit_fuser
+def clamped_squared_relu(x: torch.Tensor, clamp_scale: float) -> torch.Tensor:
+    """Tanh-soft-clamped squared-ReLU without token weights.
+
+    This matches ``squared_relu(tanh_soft_clamp(x, clamp_scale))``. The clamped
+    pre-activation and the square stay in FP32 and only the result is rounded back to
+    the input dtype.
+    """
+    out_dtype = x.dtype
+    clamped = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
+    return torch.pow(clamped, 2).to(out_dtype)
+
+
+@jit_fuser
+def clamped_squared_relu_back(g: torch.Tensor, x: torch.Tensor, clamp_scale: float):
+    """Backward for tanh-soft-clamped squared-ReLU, recomputed from the raw input."""
+    tanh_value = _tanh_relu_over_scale(x, clamp_scale)
+    clamped = clamp_scale * tanh_value
+    input_grad = (1 - torch.pow(tanh_value, 2)) * (2 * clamped) * g
+    return input_grad.to(x.dtype)
+
+
 class WeightedSquaredReLUFunction(torch.autograd.Function):
-    """Autograd wrapper around the weighted Squared-ReLU fused kernels."""
+    """Autograd wrapper around the (optionally weighted, optionally clamped) Squared-ReLU
+    fused kernels.
+
+    Only the raw input (and the weights, when given) is saved for backward. The unfused
+    ``squared_relu(tanh_soft_clamp(x))`` ordering saves both ``x`` and the clamped
+    intermediate, doubling the activation memory kept alive for this op.
+    """
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input: torch.Tensor, weights: torch.Tensor, clamp_scale: Optional[float]):
+    def forward(
+        ctx, input: torch.Tensor, weights: Optional[torch.Tensor], clamp_scale: Optional[float]
+    ):
         """forward method for `WeightedSquaredReLUFunction`
 
         Args:
             ctx : context object to store intermediate tensors.
             input (torch.Tensor): input tensor.
-            weights (torch.Tensor): weight tensor.
+            weights (Optional[torch.Tensor]): optional per-token weight tensor.
             clamp_scale (Optional[float]): if set, soft-clamp the input with
                 ``clamp_scale * tanh(input / clamp_scale)`` before the activation.
         """
-        ctx.save_for_backward(input, weights)
+        assert weights is not None or clamp_scale is not None, (
+            "weighted_squared_relu_impl needs weights and/or clamp_scale; "
+            "use squared_relu directly otherwise."
+        )
         ctx.clamp_scale = clamp_scale
+        ctx.has_weights = weights is not None
+        if weights is None:
+            ctx.save_for_backward(input)
+            return clamped_squared_relu(input, clamp_scale)
+
+        ctx.save_for_backward(input, weights)
         if clamp_scale is None:
             return weighted_squared_relu(input, weights)
         return weighted_clamped_squared_relu(input, weights, clamp_scale)
@@ -140,6 +179,10 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
             ctx : context object to store intermediate tensors.
             grad_output (torch.Tensor): gradient of the output of the forward function.
         """
+        if not ctx.has_weights:
+            (input,) = ctx.saved_tensors
+            return clamped_squared_relu_back(grad_output, input, ctx.clamp_scale), None, None
+
         input, weights = ctx.saved_tensors
         if ctx.clamp_scale is None:
             inp_grad, w_grad = weighted_squared_relu_back(grad_output, input, weights)
@@ -151,16 +194,20 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
 
 
 def weighted_squared_relu_impl(
-    input: torch.Tensor, weights: torch.Tensor, clamp_scale: Optional[float] = None
+    input: torch.Tensor, weights: Optional[torch.Tensor] = None, clamp_scale: Optional[float] = None
 ) -> torch.Tensor:
-    """Token-wise weighted Squared-ReLU fusion with optional FP8 storage.
+    """Squared-ReLU fusion with optional per-token weights and optional tanh soft clamping.
 
     Args:
         input (torch.Tensor): Input tensor of shape ``(B, *, hidden_size)`` where ``*`` can be
             the sequence dimension.
-        weights (torch.Tensor): Per-token weights broadcastable to the output of
-            ``squared_relu``.
-        clamp_scale (Optional[float]): if set, precondition the input with the tanh soft-clamp.
+        weights (Optional[torch.Tensor]): Optional per-token weights broadcastable to the
+            output of ``squared_relu`` once ``input`` is flattened to ``(-1, hidden_size)``.
+            When ``None``, the clamped squared-ReLU is applied and only ``input`` is saved for
+            backward.
+        clamp_scale (Optional[float]): if set, precondition the input with the tanh soft-clamp
+            ``clamp_scale * tanh(input / clamp_scale)``. At least one of ``weights`` and
+            ``clamp_scale`` must be given.
 
     Returns:
         torch.Tensor: Output tensor with the same shape as ``input`` except that the hidden

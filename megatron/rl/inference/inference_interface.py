@@ -4,7 +4,7 @@ import asyncio
 
 from pydantic import BaseModel
 
-from ..__init__ import GenericGenerationArgs
+from .. import GenericGenerationArgs
 from ..inference.api import (
     InferenceRequest,
     InferenceResponse,
@@ -25,7 +25,7 @@ class InferenceInterface(BaseModel):
         return InferenceRequest(prompt=prompt, generation_args=generation_args)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-        assert NotImplementedError("Direct Inference Classes must implement the base_generate method.")
+        raise NotImplementedError("Direct Inference Classes must implement the base_generate method.")
 
     async def agenerate(
         self, request: InferenceRequest

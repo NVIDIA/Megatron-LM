@@ -20,6 +20,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
+from megatron.training.global_vars import get_run_config
 
 
 def get_default_sampling_params(termination_id: int = None):
@@ -154,8 +155,9 @@ def get_cli_requests(
 ) -> list[Request]:
 
     # Get time offsets.
+    cfg = get_run_config()
     t_offsets = get_time_offsets(
-        args.seed,
+        cfg.rng.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
         len(args.prompts),
@@ -170,10 +172,11 @@ def get_synthetic_requests(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
     """Get example requests."""
+    cfg = get_run_config()
 
     # Get time offsets.
     time_offsets = get_time_offsets(
-        args.seed,
+        cfg.rng.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
@@ -205,6 +208,7 @@ def get_requests_from_file(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
     """Get requests from a file."""
+    cfg = get_run_config()
     if not args.prompt_file:
         raise ValueError("Prompt file is required to read requests from a file.")
 
@@ -229,7 +233,7 @@ def get_requests_from_file(
 
     # Get time offsets.
     time_offsets: list[float] = get_time_offsets(
-        args.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
+        cfg.rng.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
     )
 
     # Init requests.
@@ -349,7 +353,7 @@ def escape_str(s: str) -> str:
 def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -> None:
     """Print unique prompts and their outputs in gpt_dynamic_inference.py format.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records returned
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects returned
     by ``MegatronLLM.generate`` / ``MegatronAsyncLLM.generate``.
     """
     print("~~~~ Unique prompts + outputs. ~~~~")
@@ -404,9 +408,9 @@ def dump_inference_results_to_json(
 ) -> None:
     """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records.
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects.
     Note: ``latency`` is currently always ``None`` in direct mode because the
-    low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
+    low-level engine doesn't populate it when completing a request;
     will be populated once that field is wired up upstream.
 
     Args:

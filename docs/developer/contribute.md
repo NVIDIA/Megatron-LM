@@ -32,13 +32,17 @@ File any bugs you find, keeping the following in mind:
 
 ### Do
 
-- Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
+- Follow the [repository style guide](https://github.com/NVIDIA/Megatron-LM/blob/main/style-guide.md). The guide is newly introduced; older code may not conform and can remain as-is if unmodified.
+- Run the configured formatting and lint checks using [tools/autoformat.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh).
 - Use the docstring style and format [the documentation generator is configured for](../conf.py): [Google style](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) with [MyST format](https://mystmd.org/).
 - Split your changes into separate, atomic commits, that is, a commit per feature or fix.
 - Make sure your commits are rebased on the `main` branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
 - Check the spelling of your code, comments, and commit messages.
+- Put new operation implementations and kernel backends under `megatron/core/ops`, following
+  [the operations guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/ops/README.md) (how to add an operation, how to add
+  a backend kernel to an existing one).
 
 ### Don't
 
@@ -47,6 +51,25 @@ File any bugs you find, keeping the following in mind:
 - Iterate excessively on your design across multiple commits.
 - Include commented-out code.
 - Attempt large architectural changes without first opening an issue to discuss.
+
+### Process groups in `megatron/core`
+
+`megatron.core.parallel_state` is being deprecated. It holds the process groups for a single,
+global parallel grid; Megatron-Core is moving to explicit passing via `ProcessGroupCollection`.
+
+- **New features must not call** `parallel_state.get_*_group()`, `get_*_rank()`, or
+  `get_*_world_size()` in `megatron/core`. Accept a `ProcessGroupCollection` or an explicit
+  `torch.distributed.ProcessGroup` from the caller and pass it through.
+- **Do not introduce global-state fallbacks for new features.** A `None` default that reads
+  `parallel_state` can select a different model's grid or fail if the globals are uninitialized.
+- **`ProcessGroupCollection.use_mpu_process_groups()` is not a migration target.** It reads the
+  same global state. Bootstrap code and explicitly commented compatibility fallbacks may use
+  it while existing callers migrate.
+- **Bug fixes may leave existing calls alone.** Process-group plumbing changes belong in their own
+  PR.
+
+Full guidance, including the tier breakdown and reviewer notes:
+[parallel-state-deprecation.md](parallel-state-deprecation.md).
 
 ## Signing Your Work
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +18,36 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_language_rank_projection_uses_legacy_quantization_path():
+    from megatron.core.models.mimo.model.base import MimoModel
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(quant_recipe=object())
+            self.selected_recipe = None
+
+        def finish_init(self, recipe):
+            self.selected_recipe = recipe
+
+    projection = Projection()
+    model = SimpleNamespace(
+        modality_submodules=torch.nn.ModuleDict(),
+        language_model_input_projections=torch.nn.ModuleDict({"images": projection}),
+    )
+    selected_recipe = object()
+    with patch(
+        "megatron.core.models.mimo.model.base.get_quant_config_or_none",
+        return_value=selected_recipe,
+    ) as get_quant_config:
+        MimoModel._finish_init_quantization(model)
+
+    get_quant_config.assert_called_once_with(
+        "modality_submodules.images.input_projections.0", projection.config.quant_recipe
+    )
+    assert projection.selected_recipe is selected_recipe
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")

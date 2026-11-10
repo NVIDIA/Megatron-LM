@@ -339,16 +339,22 @@ def _init_sorted_ids_kernel(
     expert_ids_ptr,
     max_sorted,
     max_blocks,
+    pre_initialized_output_buffer_ptr,
+    num_local_experts,
     SENTINEL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1."""
+    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1.
+
+    Also zero the local-expert counters.
+    """
     pid = tl.program_id(0)
     block_start = pid * BLOCK
     if block_start < max_sorted or block_start < max_blocks:
         offs = block_start + tl.arange(0, BLOCK)
         tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
         tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
+        tl.store(pre_initialized_output_buffer_ptr + offs, 0, mask=offs < num_local_experts)
 
 
 @triton.jit
@@ -443,14 +449,29 @@ def _moe_align_block_size_cuda_graphable(
     )
     expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
 
+    pre_initialized_output_buffer = torch.empty(num_local_experts, dtype=torch.int32, device=device)
     INIT_BLOCK = 1024
+    # max_sorted exceeds num_local_experts, so this grid also covers the counters.
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
     _init_sorted_ids_kernel[(init_grid,)](
-        sorted_token_ids, expert_ids, max_sorted, max_blocks, SENTINEL=sentinel, BLOCK=INIT_BLOCK
+        sorted_token_ids,
+        expert_ids,
+        max_sorted,
+        max_blocks,
+        pre_initialized_output_buffer,
+        num_local_experts,
+        SENTINEL=sentinel,
+        BLOCK=INIT_BLOCK,
     )
 
+    # A separate, stream-ordered launch is necessary before atomic counting.
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        valid_tokens,
+        persistent=True,
+        pre_initialized_output_buffer=pre_initialized_output_buffer,
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size
@@ -837,11 +858,13 @@ def vllm_fused_moe(
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
         intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
-    # already applied routing weights at the activation to match training;
-    # ordinary inference applies them in the reduction kernel.
-    # Only local-expert blocks are processed; non-local positions are left
-    # undefined and skipped by _moe_sum (which checks the routing map).
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Ordinary inference
+    # multiplies each row by its routing probability in the GEMM epilogue, on
+    # the fp32 accumulator before the bf16 store (as upstream vLLM does).
+    # Batch-invariant mode already applied the probabilities at the activation
+    # to match training. Only local-expert blocks are processed; non-local
+    # positions are left undefined and skipped by _moe_sum (which checks the
+    # routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
         "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
     )
@@ -853,23 +876,19 @@ def vllm_fused_moe(
         sorted_token_ids,
         expert_ids,
         num_post_padded,
-        mul_routed_weight=False,
+        mul_routed_weight=not batch_invariant_mode,
         top_k=1,
         config=config,
         grid_size=grid_size_fc2,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
-    # Applies routing weights and accumulates in fp32, writes directly to
-    # out (if provided), zeros rows beyond valid_tokens, and skips non-local
-    # expert slots.
-    apply_routing_weights = True
-    accumulate_in_fp64 = False
-    if batch_invariant_mode:
-        # Probabilities were applied at the activation to mirror training. Use
-        # training's invariant within-rank accumulation for the unweighted sum.
-        apply_routing_weights = False
-        accumulate_in_fp64 = True
+    # The routing probabilities are already applied (FC2 epilogue, or the
+    # activation in batch-invariant mode), so this is an unweighted sum. It
+    # accumulates in fp32, writes directly to out (if provided), and skips
+    # non-local expert slots. Batch-invariant mode uses training's invariant
+    # within-rank accumulation (fp64).
+    accumulate_in_fp64 = batch_invariant_mode
 
     return _moe_sum(
         intermediate3,
@@ -882,6 +901,6 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
-        apply_weights=apply_routing_weights,
+        apply_weights=False,
         acc_fp64=accumulate_in_fp64,
     )

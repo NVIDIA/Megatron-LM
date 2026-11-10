@@ -125,6 +125,9 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
         optimizer=MagicMock(),
         _copy_main_params_to_model_params=MagicMock(),
         _copy_main_params_to_param_buffer=MagicMock(),
+        # step_with_ready_grads calls this hook on the real class; the stub has
+        # to carry it too, even though this test is about the copy path.
+        _post_optimizer_step=MagicMock(),
     )
 
     assert MixedPrecisionOptimizer.step_with_ready_grads(optimizer)
@@ -145,6 +148,7 @@ def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker):
         ddp_config=SimpleNamespace(
             overlap_param_gather=True, num_distributed_optimizer_instances=1
         ),
+        parameters=lambda: iter((SimpleNamespace(requires_grad=True),)),
     )
     grid = SimpleNamespace(is_current_rank_in_grid=lambda: True)
     mimo_model = SimpleNamespace(

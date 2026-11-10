@@ -194,6 +194,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1; see the matching
+                # comment in NVLSAllGatherVDispatcher.token_dispatch.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -386,7 +391,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         per_rank_worst_case_token_count: int,
         topk: int,
         hidden_size: int,
-        ep_group: torch.distributed.ProcessGroup,
+        tp_ep_group: torch.distributed.ProcessGroup,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -399,11 +404,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 computed by the context as round_up_tokens(max_tokens) // tp_size.
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
-            ep_group: Expert parallel process group.
+            tp_ep_group: Expert tensor and model parallel process group (the EP
+                group when expert tensor parallelism is 1).
         """
-        ep_size = get_pg_size(ep_group)
+        tp_ep_size = get_pg_size(tp_ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
-        global_max = per_rank_worst_case_token_count * ep_size
+        global_max = per_rank_worst_case_token_count * tp_ep_size
         device = torch.cuda.current_device()
 
         # Each buffer self-sizes from its exact tensor footprint so non-default
@@ -419,27 +425,27 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_r_shape = [global_max, topk]
         agv_p_shape = [global_max, topk]
         rsv_shape = [global_max, hidden_size]
-        meta_shape = [ep_size]
+        meta_shape = [tp_ep_size]
 
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
+            "ep_agv_h", process_group=tp_ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
         ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
+            "ep_agv_r", process_group=tp_ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
         ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
+            "ep_agv_p", process_group=tp_ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+            "ep_rsv", process_group=tp_ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
         ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
+            "ep_meta", process_group=tp_ep_group, size_mb=_size_mb(meta_shape, torch.int32)
         ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
@@ -469,22 +475,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata update; invoked from the first instance's token_dispatch.
 
-        Fires the fused NVLS allgather+reduce to publish
-        [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
-        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
-        valid_tokens are ignored by the GEMM; the AGV below overwrites
-        [0, valid_tokens) in-place.
+        For FlashInfer, first masks the routing buffer with -1 so rows beyond
+        valid_tokens are ignored by the GEMM. The fused NVLS metadata update then
+        provides the cross-rank fence which prevents a late local clear from erasing
+        an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
             local_tokens=local_tokens,
             local_buf=cls._symm_metadata["tensor"],
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
-        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
-            cls._symm_agv_routing["tensor"].fill_(-1)
+        # self.tp_size is the expert-TP size: the AGV spans the tp_ep group.
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = (
+            local_tokens * self.tp_size * self.ep_size
+        )
 
     def __init__(
         self,
@@ -556,32 +564,47 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             (hidden_states, probs) gathered to [global_max, *] shape.
             Also updates self.routing_map to [global_max, topk] int64.
         """
-        if self.ep_size == 1:
-            if self._runs_metadata_sync:
-                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
-            return hidden_states, probs
-
-        if self._runs_metadata_sync:
-            self.update_metadata(hidden_states.shape[0])
-
-        # Mask out CUDA-graph padding rows of the local routing map so the AGV
-        # propagates -1 into agv_r for those slots; padding tokens then route
-        # to no expert. _real_token_count_tensor is wired by the context and
-        # holds the *global* unpadded token count, so we pass self.sp_rank to
-        # shift local rows into the global frame for the comparison. When unset
-        # (standalone dispatcher use without a context) all rows are real, so
-        # skip the mask.
+        # Mask out CUDA-graph padding rows of the local routing map so padding
+        # tokens route to no expert. At ep_size > 1 this also makes the AGV
+        # propagate -1 into agv_r for those slots. _real_token_count_tensor is
+        # wired by the context and holds the *global* unpadded token count, so
+        # we pass self.sp_rank to shift local rows into the global frame for the
+        # comparison. When unset (standalone dispatcher use without a context)
+        # all rows are real, so skip the mask.
+        #
+        # Runs before the ep_size == 1 early-out: the padding rows are just as
+        # real at ep_size == 1, and leaving them unmasked sends every one of
+        # them through a full expert GEMM. That is correct -- the results are
+        # discarded downstream -- but it scales the MoE cost with the CUDA-graph
+        # bucket rather than the live batch, which is most of the bucket
+        # whenever the batch is draining.
         if self.__class__._real_token_count_tensor is not None:
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )
+
+        if self.tp_size * self.ep_size == 1:
+            if self._runs_metadata_sync:
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1. Set explicitly
+                # rather than left to vllm_fused_moe's `else max_tokens`
+                # fallback: that fallback sizes the launch config and grid from
+                # whatever buffer it was handed, which is the contract this hint
+                # exists to avoid relying on.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
+            return hidden_states, probs
+
+        if self._runs_metadata_sync:
+            self.update_metadata(hidden_states.shape[0])
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
         agv_p = self.__class__._symm_agv_probs
 
         per_rank_max = self._per_rank_worst_case_token_count
-        global_max = per_rank_max * self.ep_size
+        global_max = per_rank_max * self.tp_size * self.ep_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
@@ -631,7 +654,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
         """
-        if self.ep_size == 1:
+        if self.tp_size * self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
