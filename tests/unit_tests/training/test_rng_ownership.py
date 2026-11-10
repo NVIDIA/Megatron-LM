@@ -12,7 +12,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, checkpointing, global_vars, initialize
@@ -316,6 +319,34 @@ def test_initialization_seeds_from_the_model_collection(monkeypatch, run_config)
         allow_no_cuda=True, skip_dependency_compilation=True, seed_pg_collection=pg_collection
     )
     assert seed.call_args.kwargs["pg_collection"] is pg_collection
+
+
+@pytest.mark.parametrize("multi_module", [False, True])
+def test_pretrain_seeds_from_its_collection(monkeypatch, run_config, multi_module):
+    """pretrain() seeds from a plain collection; a multi-module one is seeded by its builder."""
+    from megatron.training import training
+
+    class BeforeInitialization(Exception):
+        pass
+
+    initialize_megatron = Mock(side_effect=BeforeInitialization)
+    monkeypatch.setattr(training, "initialize_megatron", initialize_megatron)
+    monkeypatch.setattr(training.ft_integration, "setup", Mock())
+    # pretrain() finalizes the container before fault-tolerance setup; that needs the
+    # registered args, which this check stops short of.
+    monkeypatch.setattr(run_config, "finalize", Mock())
+    pg_collection = ProcessGroupCollection()
+    if multi_module:
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"llm": pg_collection}, language_model_module_name="llm"
+        )
+
+    with pytest.raises(BeforeInitialization):
+        training.pretrain(run_config, Mock(), None, Mock(), pg_collection=pg_collection)
+
+    seeding = initialize_megatron.call_args.kwargs
+    assert seeding["skip_random_seed"] is multi_module
+    assert seeding["seed_pg_collection"] is (None if multi_module else pg_collection)
 
 
 @pytest.mark.parametrize("source", ["grid", "model", "none"])
