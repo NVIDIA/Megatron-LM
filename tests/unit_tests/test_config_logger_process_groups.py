@@ -6,6 +6,7 @@ When the caller passes no complete collection, it warns and names the dump by th
 global parallel state, as before.
 """
 
+import json
 import os
 import warnings
 from types import SimpleNamespace
@@ -134,3 +135,24 @@ class TestConfigLoggerRankString:
 
         log_config.assert_called_once()
         assert log_config.call_args.kwargs["pg_collection"] is pg_collection
+
+    def test_optimizer_dump_holds_its_collection(self, tmp_path):
+        """An optimizer built on a collection writes its dump, with the collection in it."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.optimizer import FP32Optimizer
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = OptimizerConfig(config_logger_dir=str(tmp_path))
+
+        # A stub optimizer (None) is enough: the dump is logged before any parameter is touched.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            FP32Optimizer(None, config, None, pg_collection=pg_collection)
+
+        (name,) = os.listdir(tmp_path)
+        assert name.startswith("FP32Optimizer.rank_") and name.endswith(".iter0.json")
+        with open(tmp_path / name) as dump_file:
+            dump = json.load(dump_file)
+        # The process groups cannot be copied into the dump, so the collection is dumped as
+        # its repr, which names the groups it sets and their sizes.
+        assert dump["pg_collection"] == repr(pg_collection)

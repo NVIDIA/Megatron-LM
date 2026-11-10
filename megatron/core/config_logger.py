@@ -91,6 +91,10 @@ class JSONEncoderWithMcoreTypes(json.JSONEncoder):
                 return str(o)
         if type(o).__name__ in ['ABCMeta', 'type', 'AttnMaskType']:
             return str(o)
+        # A ProcessGroupCollection is a dataclass, but asdict() would deep-copy its process
+        # groups, which cannot be copied. Its repr names the groups it sets and their sizes.
+        if type(o).__name__ == 'ProcessGroupCollection':
+            return repr(o)
         if dataclasses.is_dataclass(o) or type(o).__name__ in ['ModuleSpec', 'TransformerConfig']:
             return dataclasses.asdict(o)
         try:
