@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for batch-invariant MoE grouped GEMM."""
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     _bf16_grouped_gemm_contiguous,
     _m_splits_to_m_indices,
     _offs_to_m_indices,
+    grouped_gemm_batch_invariant,
+    grouped_gemm_batch_invariant_alignment,
     set_batch_invariant_mode,
 )
 
@@ -123,6 +126,101 @@ def test_grouped_gemm_per_expert_token_count_invariance():
     # The 8 rows assigned to expert 1 inside y_B must match y_A bitwise.
     y_B_target = y_B[16 : 16 + 8]
     assert torch.equal(y_A, y_B_target)
+
+
+# ---------------------------------------------------------------------------
+# Inference entry point: the offsets contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_offs", [1, 3], ids=["fewer_than_experts", "more_than_experts"])
+def test_grouped_gemm_rejects_offsets_not_one_per_expert(num_offs):
+    """offs must hold one end row per expert of the weights, checked before DeepGEMM runs."""
+    align = grouped_gemm_batch_invariant_alignment()
+    a = torch.randn(align, 64, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
+    # Every block past the first is empty, so no row is assigned past the weights' experts.
+    offs = torch.full((num_offs,), align, device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError, match="one end row per expert"):
+        grouped_gemm_batch_invariant(a, w, offs=offs, offs_alignment=align, m_total=align)
+
+
+@pytest.mark.parametrize("built_with", ["raw_counts", "torch_grouped_mm", "half", "zero"])
+def test_grouped_gemm_rejects_offsets_built_with_another_alignment(built_with):
+    """Offsets declared with an alignment DeepGEMM cannot use fail before DeepGEMM runs.
+
+    Built from raw cumulative counts (alignment 1) or with torch grouped_mm's 16, expert 1's
+    block would start inside a tile and silently take expert 0's weights.
+    """
+    align = grouped_gemm_batch_invariant_alignment()
+    offs_alignment = {"raw_counts": 1, "torch_grouped_mm": 16, "half": align // 2, "zero": 0}[
+        built_with
+    ]
+    counts = [align + 5, align]
+    block = max(offs_alignment, 1)
+    blocks = [-(-count // block) * block for count in counts]
+    m_total = sum(blocks)
+    a = torch.randn(m_total, 64, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
+    offs = torch.tensor([blocks[0], m_total], device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError, match="must start at a multiple of"):
+        grouped_gemm_batch_invariant(
+            a, w, offs=offs, offs_alignment=offs_alignment, m_total=m_total
+        )
+
+
+def test_inference_moe_aligns_every_expert_block(monkeypatch):
+    """The inference MoE hands the grouped GEMM the aligned expert blocks it declares.
+
+    grouped_gemm_batch_invariant checks the declared alignment but cannot check the offset
+    values without a host sync, so this pins the caller: expert counts around the alignment
+    must reach both grouped GEMMs as aligned blocks, declared with DeepGEMM's alignment.
+    """
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+
+    torch.manual_seed(3)
+    align = grouped_gemm_batch_invariant_alignment()
+    counts = [align + 5, 1, 0, 2 * align + 1]
+    num_experts, hidden_size, ffn = len(counts), 128, 128
+    routes = torch.repeat_interleave(
+        torch.arange(num_experts, device="cuda"), torch.tensor(counts, device="cuda")
+    )
+    num_tokens = routes.numel()
+    routing_map = routes[torch.randperm(num_tokens, device="cuda")].unsqueeze(1)
+    probs = torch.rand(num_tokens, 1, device="cuda")
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    fc1 = torch.randn(num_experts, ffn, hidden_size, device="cuda", dtype=torch.bfloat16)
+    fc2 = torch.randn(num_experts, hidden_size, ffn, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor([num_tokens], device="cuda", dtype=torch.int32)
+
+    seen = []
+    grouped_gemm = batch_invariant.grouped_gemm_batch_invariant
+
+    def recording_grouped_gemm(a, b, *, offs, offs_alignment, m_total):
+        seen.append((offs.clone(), offs_alignment))
+        return grouped_gemm(a, b, offs=offs, offs_alignment=offs_alignment, m_total=m_total)
+
+    monkeypatch.setattr(batch_invariant, "grouped_gemm_batch_invariant", recording_grouped_gemm)
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        mcore_fused_moe(
+            x,
+            probs,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            valid_tokens,
+            routing_map,
+        )
+
+    blocks = torch.tensor([-(-count // align) * align for count in counts])
+    expected = blocks.cumsum(0).to(device="cuda", dtype=torch.int32)
+    assert len(seen) == 2, f"expected FC1 and FC2 grouped GEMMs, got {len(seen)} calls"
+    for offs, offs_alignment in seen:
+        assert offs_alignment == align, f"offs declared with alignment {offs_alignment}"
+        assert torch.equal(offs, expected), f"offs {offs.tolist()} != {expected.tolist()}"
 
 
 # ---------------------------------------------------------------------------
