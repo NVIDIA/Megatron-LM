@@ -37,6 +37,10 @@ pass on the probe tree that merges the fix):
   ETP 2 passes ``main``'s global 128-alignment check; the 192-wide shards raise at the first
   forward. With the fix the config is rejected when it is built.
 
+``test_routed_mxfp8_topk_equal_to_experts`` also fails on ``main``: finding ETP-N1 (routed MXFP8
+with top-k = number of experts is accepted, then FlashInfer rejects it at the first forward), no
+fix PR yet.
+
 Hardware: GB200, 2 and 4 GPUs in one NVLink domain (NVLS multicast), FlashInfer 0.7.2.post1.
 """
 
@@ -186,6 +190,10 @@ def test_matches_fp64_reference(env, case):
     """Every real token against the fp64 MoE of the unsharded (lossless) weights."""
     layout, kind = env.layout, case["kind"]
     topk = E // layout.ep if case["topk"] == "local" else int(case["topk"])
+    if kind == "mxfp8-routed" and topk >= E:
+        # TRT-LLM's routed MoE needs num_experts > top_k (ETP-N1, its own test below); E - 2
+        # keeps the probability rows 8-byte aligned for main's NVLS gather.
+        topk = E - 2
     problem = etp.lossless_problem(E, H, FFN, topk, KINDS[kind]["activation"], case["seed"])
     counts = etp.replica_counts(case["counts"], layout, M)
     tokens = etp.lossless_tokens(problem, sum(n for n, _ in counts), case["seed"] + 1, ep=layout.ep)
@@ -337,6 +345,41 @@ def test_cutlass_mxfp8_unaligned_expert_shard(env):
         layout.etp,
         trusted_fn=_trusted(layout),
         what=f"{layout.name} rank {env.rank} unaligned CUTLASS MXFP8 shard",
+    )
+
+
+@pytest.mark.parametrize("env", ["w2-tp1-etp2-ep1"], indirect=True, scope="module")
+def test_routed_mxfp8_topk_equal_to_experts(env):
+    """Routed MXFP8 with top-k equal to the number of experts: reject when built, or serve it.
+
+    Finding ETP-N1 (packet etp): ``TransformerConfig`` accepts ``moe_router_topk ==
+    num_moe_experts`` with the FlashInfer routed MXFP8 backend, and the first forward raises
+    FlashInfer's ``Check failed: args->num_experts > args->top_k (8 vs. 8)`` (a host-side check,
+    on every rank alike, after the gather; nothing faults). Not specific to expert TP: any EP.
+    No fix PR yet; this test fails on ``main``.
+    """
+    layout = env.layout
+    problem = etp.lossless_problem(E, H, FFN, E, "squared_relu", seed=601)
+    try:
+        config = _config(problem, layout, "mxfp8-routed")
+        layer = _build(config, problem, env, "mxfp8-routed")
+    except ValueError as exc:
+        assert "top" in str(exc).lower(), str(exc)
+        return
+    counts = etp.replica_counts("uneven", layout, M)
+    tokens = etp.lossless_tokens(problem, sum(n for n, _ in counts), seed=602, ep=layout.ep)
+    batch = etp.rank_batch(tokens, counts, env, padding_hidden=PADDING)
+    etp.allocate_nvls(env, M, E, H)
+    with _fp8_context(config):
+        out = etp.run_step(env, layer, problem, batch, flashinfer=True)
+    etp.check_output(
+        out,
+        batch,
+        tokens,
+        problem,
+        layout.etp,
+        trusted_fn=_trusted(layout, "mxfp8-routed"),
+        what=f"{layout.name} rank {env.rank} routed MXFP8 top-k = E",
     )
 
 
