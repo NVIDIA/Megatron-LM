@@ -1086,11 +1086,13 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
 
-    moe_grouped_gemm: bool = False
-    """Use grouped GEMM to execute multiple local MoE experts together.
+    moe_grouped_gemm: bool = True
+    """Use grouped GEMM to execute multiple local MoE experts together (enabled by default).
 
     The concrete implementation is selected by Transformer Engine. Set
     ``moe_use_grouped_tensor=True`` to use its CUDA-graph-safe GroupedTensor path.
+    Setting this to False selects the deprecated SequentialMLP on the TE backend.
+    The local backend still uses SequentialMLP regardless of this setting.
     """
 
     moe_use_grouped_tensor: bool = False
@@ -1127,8 +1129,8 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'.
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "alltoall"
+    """The type of token dispatcher to use. The default is 'alltoall'.
     Options are 'allgather','alltoall' and 'flex'."""
 
     moe_enable_deepep: bool = False
@@ -1527,6 +1529,16 @@ class TransformerConfig(ModelParallelConfig):
     channels on B200), deterministic and batch-invariant, with better scaling
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
+
+    moe_ep_invariant_combine: bool = False
+    """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
+    reduction tree over the expert ids (moe/ep_invariant_combine.py) instead of per-EP-rank
+    partials added in rank order, so MoE outputs are bitwise identical at every power-of-two
+    expert-parallel size dividing num_moe_experts (e.g. training and inference with
+    different EP). Covers the training AllToAll combine and the inference NVLS combine of
+    the 'torch' and 'vllm' grouped-GEMM backends, which use the ordered fp32 combine
+    (whatever the batch-invariant collective). With expert tensor parallelism, inference
+    sums each expert row over expert TP before the combine, as training does."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4862,6 +4874,23 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
+
+        if self.moe_ep_invariant_combine:
+            if not self.batch_invariant_mode:
+                raise ValueError("moe_ep_invariant_combine requires batch_invariant_mode=True.")
+            if self.num_moe_experts:
+                from megatron.core.transformer.moe.ep_invariant_combine import check_ep_size
+
+                check_ep_size(self.num_moe_experts, self.expert_model_parallel_size)
+            if self.transformer_impl == "inference_optimized" and (
+                self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+            ):
+                raise ValueError(
+                    "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
+                    "'torch' or 'vllm' for inference-optimized MoE: FlashInfer sums a "
+                    "token's routes inside its kernel."
+                )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
