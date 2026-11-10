@@ -4270,6 +4270,45 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert serialized_event_tokens == merged.generated_tokens
 
 
+@pytest.mark.parametrize("keep_stop", [False, True], ids=["strip", "keep"])
+def test_stop_word_across_resumed_generation_keeps_routing(keep_stop):
+    """A stop that starts in a resumed generation and ends in its continuation keeps the
+    routing the resumed segment carries aligned with its tokens, so the result keeps it."""
+    # Routing of [1, 2, 3, 10, 8, 9]: every token but the last ran forward.
+    rows = np.arange(5 * 2, dtype=np.int32).reshape(5, 1, 2)
+    first = DynamicInferenceRequest(
+        request_id=33,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=8, termination_id=-1, detokenize_stop_sequence=keep_stop
+        ),
+        stop_word_ids=[[8, 9]],
+    )
+    # A snapshot taken after [10, 8] carries the routing of [1, 2, 3, 10].
+    resumed = ResumedGeneration([10, 8], 8, routing_indices=rows[:4])
+    record = DynamicInferenceRequestRecord.from_resumed_generation(
+        first, resumed, generation_epoch=None
+    )
+    current = record[-1]
+    current.generated_tokens.append(9)
+    engine = types.SimpleNamespace(num_speculative_tokens=0)
+
+    hit, pending_trim, _ = DynamicInferenceEngine._check_stop_words_for_request_post_append(
+        engine, current, record=record, num_new_tokens=1
+    )
+    # Completion reconstructs the continuation's rows from its blocks, for its trimmed length.
+    current.routing_indices = rows[: len(current.prompt_tokens) + len(current.generated_tokens) - 1]
+    merged = record.merge()
+
+    assert hit and pending_trim == 1 - keep_stop
+    visible = len(merged.prompt_tokens) + len(merged.generated_tokens)
+    assert merged.generated_tokens == ([10, 8, 9] if keep_stop else [10])
+    assert merged.routing_indices is not None
+    assert merged.routing_indices.tolist() == rows[: visible - 1].tolist()
+    # A reply serializes only routing that matches its sequence.
+    merged.serialize()
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
