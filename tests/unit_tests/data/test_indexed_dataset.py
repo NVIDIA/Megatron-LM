@@ -10,7 +10,10 @@ def test_sequence_pointers():
     cases = (
         ([], []),
         ([1, 2, 3], [0, 4, 12]),
-        (numpy.array([(1 << 31) - 100, 123], dtype=numpy.int32), [0, 8_589_934_192]),
+        (
+            numpy.array([(1 << 31) - 100, 123, 1], dtype=numpy.int32),
+            [0, 8_589_934_192, 8_589_934_684],
+        ),
     )
 
     for sequence_lengths, expected in cases:
