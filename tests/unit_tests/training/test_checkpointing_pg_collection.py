@@ -83,8 +83,8 @@ class _StandInGroup:
 def _grid_unlike_the_global_one():
     """Return a TP2 x PP2 x DP(world/4) collection with the tensor ranks fastest.
 
-    The replica-id group (``dp_cp_gtp_remat``) is a separate communicator over the data-parallel
-    ranks, so the tests can tell it apart from the replicate group.
+    Each data-parallel field is a separate communicator over the data-parallel ranks, so the
+    tests can tell which field a group was taken from.
     """
     world_size = torch.distributed.get_world_size()
     dp_size = world_size // 4
@@ -97,7 +97,6 @@ def _grid_unlike_the_global_one():
         return group
 
     dp_ranks = [[global_rank(t, p, d) for d in range(dp_size)] for p in range(2) for t in range(2)]
-    dp = subgroup(dp_ranks)
     single = subgroup([[rank] for rank in range(world_size)])
     return ProcessGroupCollection(
         tp=subgroup(
@@ -108,11 +107,11 @@ def _grid_unlike_the_global_one():
         ),
         cp=single,
         ep=single,
-        dp=dp,
-        dp_gtp_remat=dp,
-        dp_cp=dp,
+        dp=subgroup(dp_ranks),
+        dp_gtp_remat=subgroup(dp_ranks),
+        dp_cp=subgroup(dp_ranks),
         dp_cp_gtp_remat=subgroup(dp_ranks),
-        expt_dp=dp,
+        expt_dp=subgroup(dp_ranks),
     )
 
 
@@ -265,6 +264,11 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
             mock.patch.object(
                 checkpointing, "get_rng_state", wraps=checkpointing.get_rng_state
             ) as save_rng_state,
+            mock.patch.object(
+                checkpointing,
+                "maybe_save_dataloader_state",
+                wraps=checkpointing.maybe_save_dataloader_state,
+            ) as save_dataloader_state,
         ):
             save_checkpoint(123, [model], None, None, 456)
 
@@ -285,5 +289,8 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
         assert rng_state_call.kwargs["dp_cp_group"] is grid.dp_cp_gtp_remat
     assert model._called_metadata[-1]["dp_cp_group"] is grid.dp_cp_gtp_remat
     assert restored._called_metadata[-1]["dp_cp_group"] is grid.dp_cp_gtp_remat
+    # The dataloader state is indexed over the group that spans the GTP-remat axis.
+    assert save_dataloader_state.call_args.kwargs["dp_group"] is grid.dp_gtp_remat
+    assert save_dataloader_state.call_args.kwargs["cp_group"] is grid.cp
     # Every rank restores the RNG shard it saved, keyed by its rank in the model's grid.
     assert torch.equal(torch.get_rng_state(), saved_rng)
