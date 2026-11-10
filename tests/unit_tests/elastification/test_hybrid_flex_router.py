@@ -21,7 +21,6 @@ import megatron.training as _megatron_training
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import get_pg_rank
 from megatron.elastification.router.hybrid_flex_router import FlextronRouter
 from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
 
@@ -273,10 +272,10 @@ def _source_rank(router):
 
 @pytest.mark.internal
 @pytest.mark.parametrize("pipeline_model_parallel_size", [1, 2])
-def test_router_weights_are_synced_per_tensor_parallel_shard(
+def test_router_weights_come_from_global_rank_0_on_the_standard_grid(
     monkeypatch, pipeline_model_parallel_size
 ):
-    """Each TP shard comes from the lowest of its PP x DP-CP replicas, not from global rank 0."""
+    """Every rank of the standard grid, on every TP shard, starts from rank 0's weights."""
     tp_size = 2
     model_parallel_size = tp_size * pipeline_model_parallel_size
     if Utils.world_size < 4 or Utils.world_size % model_parallel_size:
@@ -290,20 +289,10 @@ def test_router_weights_are_synced_per_tensor_parallel_shard(
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         router = _router_with_rank_weights(monkeypatch, pg_collection)
 
-        router._sync_router_weights()
+        with forbid_global_process_groups():
+            router._sync_router_weights()
 
-        holders = [None] * Utils.world_size
-        torch.distributed.all_gather_object(
-            holders, (get_pg_rank(pg_collection.tp), _source_rank(router))
-        )
-        for tp_rank in range(tp_size):
-            replicas = [
-                rank for rank, (held_tp_rank, _) in enumerate(holders) if held_tp_rank == tp_rank
-            ]
-            # Every replica of the shard holds the weights of the lowest replica.
-            assert {holders[rank][1] for rank in replicas} == {min(replicas)}
-        # The TP ranks keep different shards.
-        assert len({source for _, source in holders}) == tp_size
+        assert _source_rank(router) == 0
     finally:
         Utils.destroy_model_parallel()
 
@@ -324,6 +313,8 @@ def test_router_weights_sync_stays_inside_the_model_groups(monkeypatch):
         pg_collection.dp_cp, _ = torch.distributed.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
         )
+        # The models have no GTP-remat axis, so the GTP-remat-inclusive group is the same one.
+        pg_collection.dp_cp_gtp_remat = pg_collection.dp_cp
         router = _router_with_rank_weights(monkeypatch, pg_collection)
 
         with forbid_global_process_groups():

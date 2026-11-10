@@ -12,8 +12,9 @@ import torch
 
 import megatron.core.parallel_state as ps
 from megatron.core import mpu
+from megatron.core.ops.loss import cross_entropy
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
-from megatron.core.tensor_parallel import cross_entropy, vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel import vocab_parallel_cross_entropy
 from tests.unit_tests.test_utilities import (
     Utils,
     build_test_pg_collection,

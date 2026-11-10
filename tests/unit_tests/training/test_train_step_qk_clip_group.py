@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import process_groups_config
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training as training_mod
 
@@ -107,6 +107,8 @@ def test_clip_qk_uses_dp_cp_with_a_warning_when_the_collection_has_no_gtp_remat_
     run_config, monkeypatch
 ):
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    # The global parallel state, which decides for such a collection, has no GTP weight remat.
+    monkeypatch.setattr(parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: None)
     pg_collection = ProcessGroupCollection(dp_cp=object())
 
     with pytest.warns(

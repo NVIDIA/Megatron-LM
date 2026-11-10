@@ -100,8 +100,13 @@
     ],
     "megatron/core/pipeline_parallel/schedules.py": [
       "_build_default_pg_collection:guarded:resolve_process_groups",
+      "forward_step_calc_loss:accessor:parallel_state.get_context_parallel_world_size:warned",
+      "forward_step_calc_loss:function:parallel_state.is_pipeline_last_stage:warned",
       "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size:warned",
-      "get_forward_backward_func:function:parallel_state.get_virtual_pipeline_model_parallel_world_size:warned"
+      "get_forward_backward_func:function:parallel_state.get_virtual_pipeline_model_parallel_world_size:warned",
+      "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_rank:warned",
+      "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_world_size:warned",
+      "get_pp_rank_microbatches:function:parallel_state.get_virtual_pipeline_model_parallel_world_size:warned"
     ],
     "megatron/core/resharding/refit.py": [
       "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group:warned"
@@ -208,5 +213,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 102
+  "total": 107
 }

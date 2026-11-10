@@ -194,6 +194,48 @@ def test_training_log_reports_memory_on_rank_0_of_its_data_parallel_group(
     assert _owners(record) == ([] if pass_collection else ["training_log"])
 
 
+@pytest.mark.parametrize("pass_collection", [True, False], ids=["collection", "omitted"])
+def test_training_log_passes_its_own_argument_to_the_moe_metrics_tracker(
+    monkeypatch, run_config, pass_collection
+):
+    # Without a collection the tracker keeps its own fallback groups. The collection that
+    # training_log builds for its other reductions would move the tracker's data-parallel
+    # average from the DP group without CP to dp_cp_gtp_remat.
+    run_config.model.transformer.num_moe_experts = 2
+    run_config.train.micro_batch_size = 1
+    report = mock.Mock(side_effect=_GlobalRead)  # ends training_log at the MoE report
+    monkeypatch.setattr(training, "get_moe_metrics_tracker", lambda: mock.Mock(report=report))
+    monkeypatch.setattr(
+        training, "get_args", lambda: SimpleNamespace(seq_length=8, freeze_all_layers=False)
+    )
+    monkeypatch.setattr(training, "get_train_state", TrainState)
+    monkeypatch.setattr(training, "get_timers", mock.Mock())
+    for getter in (
+        "get_tensorboard_writer",
+        "get_wandb_writer",
+        "get_one_logger",
+        "get_energy_monitor",
+    ):
+        monkeypatch.setattr(training, getter, lambda: None)
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "one_logger_utils", mock.Mock())
+    monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", lambda x, **kw: x)
+    monkeypatch.setattr(
+        ProcessGroupCollection,
+        "use_mpu_process_groups",
+        classmethod(lambda cls, required_pgs=None: ProcessGroupCollection()),
+    )
+    pg_collection = ProcessGroupCollection() if pass_collection else None
+
+    with _record_fallbacks() as record, pytest.raises(_GlobalRead):
+        training.training_log(
+            {}, {}, 0.01, 1, 1.0, False, 0, None, None, None, None, pg_collection=pg_collection
+        )
+
+    assert report.call_args.kwargs["pg_collection"] is pg_collection
+    assert _owners(record) == ([] if pass_collection else ["training_log"])
+
+
 def test_get_model_without_a_collection_warns_and_builds_one(monkeypatch, run_config):
     args = SimpleNamespace(
         virtual_pipeline_model_parallel_size=None, init_model_with_meta_device=False

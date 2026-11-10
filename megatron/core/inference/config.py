@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Unio
 import torch
 
 from megatron.core.process_groups_config import (
+    _FALLBACK_REMOVED_IN,
     ProcessGroupCollection,
     require_process_groups,
     resolve_process_groups,
+    warn_process_group_deprecation,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, unwrap_model
@@ -506,21 +508,44 @@ _INFERENCE_PROCESS_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "exp
 # that inference reads, None means that the axis is off.
 _INFERENCE_COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
 
+# The groups that only the disaggregated coordinator setup and the Dynamo engine service read, and
+# only for their sizes. An unset field reads as None there, which means that the axis is off, as
+# it did before these groups were checked. A configured collection may therefore still omit them
+# until Megatron Core 0.23, with a warning. The model's collection and the global fallback always
+# set them; see `InferenceConfig.resolve_pg_collection`.
+_INFERENCE_SIZE_ONLY_GROUPS = ("cp", "expt_tp", "expt_dp")
+
 
 def _check_inference_process_groups(pg_collection: ProcessGroupCollection, owner: str) -> None:
     """Raise if `pg_collection` cannot run inference.
+
+    A collection without a group in `_INFERENCE_SIZE_ONLY_GROUPS` is deprecated: the group is
+    treated as None, with a FutureWarning, and becomes an error in Megatron Core 0.23.
 
     Args:
         pg_collection: The collection that inference would run on.
         owner: Name of the class that resolves it, used in error messages.
 
     Raises:
-        ValueError: A group in `_INFERENCE_PROCESS_GROUPS` is absent, or a group in
+        ValueError: Another group in `_INFERENCE_PROCESS_GROUPS` is absent, or a group in
             `_INFERENCE_COMMUNICATION_GROUPS` is None.
         TypeError: `pg_collection` is a `MultiModuleProcessGroupCollection`.
     """
-    require_process_groups(pg_collection, _INFERENCE_PROCESS_GROUPS, owner=owner)
     groups = vars(pg_collection)
+    omitted = [name for name in _INFERENCE_SIZE_ONLY_GROUPS if name not in groups]
+    # Also rejects a multi-module collection, before the warning below.
+    require_process_groups(
+        pg_collection,
+        [name for name in _INFERENCE_PROCESS_GROUPS if name not in omitted],
+        owner=owner,
+    )
+    if omitted:
+        warn_process_group_deprecation(
+            f"{owner} was given a pg_collection that does not set {', '.join(omitted)}. "
+            "Inference treats an unset group as None, which means that its axis is off. Set "
+            "these groups explicitly, to None when the axis is off; an unset one becomes an "
+            f"error in Megatron Core {_FALLBACK_REMOVED_IN}."
+        )
     unset = [name for name in _INFERENCE_COMMUNICATION_GROUPS if groups[name] is None]
     if unset:
         raise ValueError(
@@ -958,7 +983,9 @@ class InferenceConfig:
 
         The collection, configured or not, must set every one of these groups except tp_ep, and
         tp, pp, dp and mp must be process groups rather than None, because inference runs
-        collectives on them.
+        collectives on them. A configured collection that leaves cp, expt_tp or expt_dp unset is
+        deprecated: inference treats the group as None, which means that its axis is off, and
+        warns with a FutureWarning. That becomes an error in Megatron Core 0.23.
 
         See ``docs/developer/parallel-state-deprecation.md``.
 
@@ -969,8 +996,8 @@ class InferenceConfig:
             The collection, which is also stored in `pg_collection`.
 
         Raises:
-            ValueError: The collection lacks a group that inference reads other than tp_ep, or
-                sets tp, pp, dp or mp to None.
+            ValueError: The collection lacks tp, pp, dp, mp or ep, or sets tp, pp, dp or mp to
+                None.
             TypeError: The collection is a `MultiModuleProcessGroupCollection`.
         """
         pg_collection = self.pg_collection

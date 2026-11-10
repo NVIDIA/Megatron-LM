@@ -193,8 +193,9 @@ def _warn_deprecated_call(name: str, message: str, caller) -> None:
         warnings.warn(message, ParallelStateDeprecationWarning, stacklevel=3)
     finally:
         in_progress.discard(call_site)
-    # Recorded once the warning is shown: a warning that a filter turns into an error leaves no
-    # record, so it raises at every call, in every thread.
+    # Recorded once warnings.warn() returns, whether a filter showed the warning or ignored it. A
+    # warning that a filter turns into an error leaves no record, so it raises at every call, in
+    # every thread.
     _warned_accessor_call_sites.add(call_site)
 
 
@@ -2393,8 +2394,11 @@ def create_all_gather_groups(
             group, so any rank order is supported. Those groups of all ranks' collections must
             partition the ranks that have one, as a parallel grid's do. Omitting it is
             deprecated: the groups then come from the global parallel state, with a
-            ProcessGroupFallbackWarning, and the expert groups support only the default
-            tp-cp-ep-dp-pp rank order without a rank offset.
+            ProcessGroupFallbackWarning. That form needs the grid's
+            ``StandardGridExtras.weight_replica_rank_sets``, which a grid registered without
+            ``extras`` does not have, and its expert groups support only the default
+            tp-cp-ep-dp-pp rank order, without a rank offset and without expert GTP weight
+            rematerialization.
 
     Returns:
         tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
@@ -3077,7 +3081,7 @@ def get_pipeline_model_parallel_rank():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+    return get_pipeline_model_parallel_group().rank()
 
 
 @_deprecated_accessor(

@@ -262,6 +262,7 @@ class LLaVAModel(MegatronModule):
 
         self.language_model = None
         self.sound_model = sound_model
+        self._give_tp_group_to(sound_model)
         self.sound_projection = sound_projection
         if self.add_decoder:
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
@@ -270,6 +271,7 @@ class LLaVAModel(MegatronModule):
                 self.language_model = build_hf_model(
                     language_transformer_config, language_transformer_config.language_model_type
                 )
+                self._give_tp_group_to(self.language_model)
             elif is_hybrid_language_model:
                 self.language_model = HybridModel(
                     config=language_transformer_config,
@@ -506,6 +508,7 @@ class LLaVAModel(MegatronModule):
                 self.vision_model = build_hf_model(
                     vision_transformer_config, vision_transformer_config.vision_model_type
                 )
+                self._give_tp_group_to(self.vision_model)
             else:
                 raise ValueError(
                     "Vision model "
@@ -592,6 +595,21 @@ class LLaVAModel(MegatronModule):
         if self.add_decoder:
             return self.language_model.shared_embedding_or_output_weight()
         return None
+
+    def _give_tp_group_to(self, module: Optional[torch.nn.Module]) -> None:
+        """Give a submodule that was built without process groups this model's TP group.
+
+        A HuggingFace wrapper or a sound model takes no process groups. Its weights are
+        replicated across this model's tensor-parallel group, which sets their checkpoint
+        replica ids. A submodule with a group or a collection of its own keeps it.
+        """
+        if (
+            isinstance(module, MegatronModule)
+            and not hasattr(module, 'tp_group')
+            and getattr(module, 'pg_collection', None) is None
+            and 'tp' in vars(self.pg_collection)
+        ):
+            module.tp_group = self.pg_collection.tp
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata=None):
         """Build a sharded state dict, optionally targeting an LLM-only checkpoint."""
