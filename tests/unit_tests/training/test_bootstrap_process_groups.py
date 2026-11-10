@@ -500,13 +500,21 @@ class TestLazyMpuInit:
 class TestTrainLoop:
     """train() updates the timeout of the run's groups once, after its first iteration."""
 
-    def test_timeout_update_gets_the_collection_of_the_run(self, monkeypatch, run_config):
+    @pytest.mark.parametrize("multi_module", [False, True])
+    def test_timeout_update_gets_the_collection_of_the_run(
+        self, monkeypatch, run_config, multi_module
+    ):
         parser = ArgumentParser()
         arguments.add_megatron_arguments(parser)
         args = parser.parse_args([])
         run_config.train.train_iters, run_config.train.micro_batch_size = 3, 1
         run_config.dist.distributed_timeout_seconds_after_init = 7
         pg_collection = ProcessGroupCollection(dp=_Group())
+        if multi_module:
+            # train() gives its single-grid helpers no collection in a multi-module run.
+            pg_collection = MultiModuleProcessGroupCollection(
+                module_pgs={"llm": pg_collection}, language_model_module_name="llm"
+            )
         train_state = TrainState()
         updates = []
         # Stand-ins for what train() calls around an iteration, with the value each returns.
