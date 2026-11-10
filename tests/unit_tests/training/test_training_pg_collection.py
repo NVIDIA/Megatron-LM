@@ -58,13 +58,14 @@ class TestTrainingPgCollection:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.usefixtures("run_config")
     @pytest.mark.parametrize("create_all_gather_group", [False, True])
-    def test_collection_carries_all_gather_groups_when_requested(self, create_all_gather_group):
+    def test_collection_carries_all_gather_groups_when_requested(
+        self, run_config, create_all_gather_group
+    ):
         Utils.initialize_model_parallel(expert_model_parallel_size=2)
-        args = SimpleNamespace(
-            create_all_gather_group=create_all_gather_group, expert_model_parallel_size=2
-        )
+        # The expert all-gather group follows the model config's expert-parallel size.
+        run_config.model.transformer.expert_model_parallel_size = 2
+        args = SimpleNamespace(create_all_gather_group=create_all_gather_group)
 
         pg_collection = training._build_pg_collection_from_parallel_state(args)
 
@@ -91,7 +92,7 @@ class TestTrainingPgCollection:
         monkeypatch.setattr(
             training, "create_all_gather_groups", lambda **kwargs: all_gather_groups
         )
-        args = SimpleNamespace(create_all_gather_group=True, expert_model_parallel_size=2)
+        args = SimpleNamespace(create_all_gather_group=True)
 
         with pytest.raises(ValueError, match="all-gather groups whose ranks differ"):
             training._build_pg_collection_from_parallel_state(args)
