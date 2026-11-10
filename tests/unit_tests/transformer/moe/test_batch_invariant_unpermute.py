@@ -105,6 +105,20 @@ def test_unpermute_without_ep_size_or_global_ep_group_raises(monkeypatch):
         _unpermute()
 
 
+def test_unpermute_without_ep_size_ignores_the_ep_size_override(monkeypatch):
+    """A size set with set_expert_model_parallel_world_size() does not stand in for ep_size."""
+    _global_ep_group(monkeypatch, None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    # What set_expert_model_parallel_world_size(2) stores; monkeypatch restores it.
+    monkeypatch.setattr(parallel_state, "_MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE", 2)
+    with (
+        set_batch_invariant_mode(True),
+        pytest.warns(ProcessGroupFallbackWarning),
+        pytest.raises(ValueError, match="ep_size"),
+    ):
+        _unpermute()
+
+
 class TestAlltoAllDispatcherBatchInvariantCombine:
     """The AlltoAll dispatcher combines by the size of its own EP group."""
 
