@@ -43,10 +43,21 @@ class _Group:
 
 
 def _import_script(name):
-    """Import an example script whose ModelOpt imports need a recent ModelOpt release."""
+    """Import an example script whose ModelOpt imports need a recent ModelOpt release.
+
+    The test is skipped only when ModelOpt lacks the module, name or attribute the script asks
+    for. Every other import error fails the test, such as a Megatron name the script imports.
+    """
     try:
         return importlib.import_module(name)
     except (ImportError, AttributeError) as error:
+        if isinstance(error, ImportError):
+            missing_from = error.name or ""
+        else:
+            # convert_model.py reads attributes of ModelOpt modules while it is imported.
+            missing_from = getattr(getattr(error, "obj", None), "__name__", "")
+        if missing_from.split(".")[0] != "modelopt":
+            raise
         pytest.skip(f"{name}.py needs a newer ModelOpt: {error}")
 
 
