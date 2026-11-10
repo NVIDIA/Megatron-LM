@@ -512,11 +512,9 @@ def test_train_step_debug_dumps_use_the_model_collection(monkeypatch, run_config
     run_config.checkpoint.save_wgrads_interval = 1
     _run_train_step(model=model, pg_collection=schedule_pg_collection)
 
-    assert dumps == {
-        "activations": model_pg_collection,
-        "dgrads": model_pg_collection,
-        "wgrads": model_pg_collection,
-    }
+    assert set(dumps) == {"activations", "dgrads", "wgrads"}
+    # By identity: two empty collections compare equal, also the schedule's and the model's.
+    assert all(dump is model_pg_collection for dump in dumps.values())
 
 
 @requires_four_rank_multiple
