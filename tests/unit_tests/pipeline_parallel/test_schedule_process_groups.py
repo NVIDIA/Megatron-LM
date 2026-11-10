@@ -216,16 +216,39 @@ def test_pipelined_schedule_takes_both_groups_or_neither(owner, given):
         _run_schedule(owner, ModelParallelConfig(), **{given: groups[given]})
 
 
-def test_get_pp_rank_microbatches_requires_a_communicator():
-    with pytest.raises(TypeError, match="p2p_communicator"):
-        schedule.get_pp_rank_microbatches(8, 1, 1)
+def test_get_pp_rank_microbatches_reads_the_communicator():
     p2p_communicator = SimpleNamespace(
         pp_group=_FakeGroup(rank=1, size=4), virtual_pipeline_model_parallel_size=None
     )
-    with _forbid_global_process_groups():
-        microbatches = schedule.get_pp_rank_microbatches(8, 1, 1, p2p_communicator=p2p_communicator)
+    with _forbid_global_process_groups(), warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        by_keyword = schedule.get_pp_rank_microbatches(8, 1, 1, p2p_communicator=p2p_communicator)
+        # The communicator keeps the positional slot it was released in.
+        by_position = schedule.get_pp_rank_microbatches(8, 1, 1, False, False, p2p_communicator)
     # Total, all in warmup, warmup (stages after this one), remaining.
-    assert microbatches == (8, False, 2, 6)
+    assert by_keyword == by_position == (8, False, 2, 6)
+
+
+@requires_4_ranks
+def test_get_pp_rank_microbatches_without_a_communicator_warns_once():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=4)
+    try:
+        p2p_communicator = SimpleNamespace(
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
+            virtual_pipeline_model_parallel_size=None,
+        )
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            default_microbatches = [schedule.get_pp_rank_microbatches(8, 1, 1) for _ in range(2)]
+        _assert_one_fallback_warning(record, "get_pp_rank_microbatches", "p2p_communicator")
+
+        with _forbid_global_process_groups():
+            microbatches = schedule.get_pp_rank_microbatches(
+                8, 1, 1, p2p_communicator=p2p_communicator
+            )
+        assert default_microbatches == [microbatches, microbatches]
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @requires_4_ranks
