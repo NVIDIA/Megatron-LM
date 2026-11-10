@@ -92,9 +92,11 @@ class TestDataParallelGroup:
         assert _owners(record) == []
 
     def test_without_gtp_remat_fields_the_replicate_group_serves_with_a_warning(
-        self, with_context_parallel
+        self, monkeypatch, with_context_parallel
     ):
-        # A collection that predates the GTP weight-remat fields keeps the replicate group.
+        # A collection that predates the GTP weight-remat fields keeps the replicate group when
+        # the global parallel state, which the model's layers then ask, has no such axis.
+        monkeypatch.setattr(parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: None)
         name, replicate_name = _FIELDS[with_context_parallel]
         pg_collection = ProcessGroupCollection(**{replicate_name: _Group()})
 
@@ -106,6 +108,28 @@ class TestDataParallelGroup:
         assert group is vars(pg_collection)[replicate_name]
         assert _owners(record) == ["owner"]
         assert f"`pg_collection.{name}`" in str(record[0].message)
+
+    def test_without_gtp_remat_fields_an_active_global_gtp_remat_is_rejected(
+        self, monkeypatch, with_context_parallel
+    ):
+        # The model's layers shard over the global GTP weight-remat group for such a collection,
+        # so the replicate group holds only a part of the ranks that read distinct data.
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: _Group(size=2)
+        )
+        name, replicate_name = _FIELDS[with_context_parallel]
+        pg_collection = ProcessGroupCollection(**{replicate_name: _Group()})
+
+        with (
+            _record_fallbacks() as record,
+            pytest.raises(ValueError, match=f"owner requires pg_collection to set {name}"),
+        ):
+            training._get_data_parallel_group(
+                pg_collection, with_context_parallel=with_context_parallel, owner="owner"
+            )
+
+        assert _owners(record) == ["owner"]
 
     def test_active_gtp_remat_requires_the_gtp_inclusive_group(
         self, monkeypatch, with_context_parallel

@@ -3010,8 +3010,11 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
 
     - A collection that sets ``gtp_remat`` to None, or to a group of one rank, has no GTP
       weight-remat axis, so the replicate group is the same group.
-    - A collection that does not set ``gtp_remat`` does not say whether it has that axis. It
-      gets the replicate group with a ProcessGroupFallbackWarning; this is deprecated.
+    - A collection that does not set ``gtp_remat`` does not say whether it has that axis, so
+      the global parallel state decides, as it does for the model's layers
+      (``resolve_gtp_remat_group``), with a ProcessGroupFallbackWarning; this is deprecated.
+      The replicate group serves when the global GTP weight-remat group is unset or has one
+      rank.
 
     Args:
         pg_collection: Process groups to take the group from. Omitting it is deprecated: the
@@ -3020,9 +3023,10 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
         owner: Name of the function that needs the group, used in the warnings and errors.
 
     Raises:
-        ValueError: ``pg_collection`` does not set the GTP-inclusive group and either sets
-            ``gtp_remat`` to a group of more than one rank, so that the replicate group misses
-            ranks that read distinct data, or does not set the replicate group either.
+        ValueError: ``pg_collection`` does not set the GTP-inclusive group and either has a GTP
+            weight-remat axis of more than one rank (its own ``gtp_remat``, or the global one
+            when it does not set ``gtp_remat``), so that the replicate group misses ranks that
+            read distinct data, or does not set the replicate group either.
     """
     if pg_collection is None:
         warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
@@ -3050,6 +3054,16 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
         warn_global_process_group_fallback(
             owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
         )
+        # The model's layers take the GTP weight-remat axis of such a collection from the
+        # global parallel state, so the replicate group serves only when that axis is off.
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+
+        if get_pg_size(resolve_gtp_remat_group(pg_collection, is_expert=False, owner=None)) > 1:
+            raise ValueError(
+                f"{owner} requires pg_collection to set {name}: pg_collection does not set "
+                "gtp_remat and the global parallel state has GTP weight remat, so "
+                f"{replicate_name} does not hold every rank that reads distinct data"
+            )
     return groups[replicate_name]
 
 

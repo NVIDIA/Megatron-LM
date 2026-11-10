@@ -335,8 +335,11 @@ class TestTrainingLoopPgCollection:
     def test_train_step_observes_tensor_metrics_on_the_run_collection(
         self, monkeypatch, run_config
     ):
-        # The model carries no collection, so every read in train_step uses the run's.
-        pg_collection = ProcessGroupCollection(mp=object(), pp=object(), dp_cp=object())
+        # The model carries no collection, so every read in train_step uses the run's. It has
+        # no GTP weight-remat axis; left unset, the global parallel state would be asked.
+        pg_collection = ProcessGroupCollection(
+            mp=object(), pp=object(), dp_cp=object(), gtp_remat=None
+        )
         model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
         optimizer = SimpleNamespace(zero_grad=lambda: None, step=lambda: (True, 1.0, 0))
         args = SimpleNamespace(
