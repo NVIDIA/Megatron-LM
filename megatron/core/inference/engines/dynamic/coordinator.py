@@ -1006,6 +1006,9 @@ class CoordinatorMixin:
                 ), f"Received STOP in state {self.state}"
                 if self.state == EngineState.SUSPENDED:
                     self._state_events[EngineState.SUSPENDED].clear()
+                    # The engine stops without a resume; its context must not be discarded
+                    # with a paused memory region that the next context would reuse.
+                    self.context.resume_memory_region_before_discard()
                 self.state = EngineState.STOPPING
 
             else:
