@@ -96,6 +96,9 @@
     "megatron/core/models/multimodal/llava_model.py": [
       "LLaVAModel.__init__:shim:use_mpu_process_groups"
     ],
+    "megatron/core/ops/loss/cross_entropy.py": [
+      "_VocabParallelCrossEntropy.forward:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
     "megatron/core/optimizer/__init__.py": [
       "get_megatron_optimizer:shim:use_mpu_process_groups"
     ],
@@ -111,11 +114,11 @@
       "_build_default_pg_collection:guarded:resolve_process_groups",
       "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size"
     ],
+    "megatron/core/resharding/refit.py": [
+      "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group"
+    ],
     "megatron/core/ssm/mamba_mixer.py": [
       "ExtendedRMSNorm.sharded_state_dict:guarded:resolve_process_groups"
-    ],
-    "megatron/core/tensor_parallel/cross_entropy.py": [
-      "_VocabParallelCrossEntropy.forward:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/tensor_parallel/generalized_tensor_parallelism.py": [
       "gtp_replica_rank:guarded:resolve_process_groups"
@@ -204,5 +207,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 108
+  "total": 109
 }
