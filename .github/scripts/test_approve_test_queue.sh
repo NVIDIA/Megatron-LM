@@ -11,7 +11,7 @@ readonly SERIALIZED_RUNS='  cancel-in-progress: false'
 readonly INTERNAL_SERVICE_ACCOUNT='          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}'
 readonly INTERNAL_SERVICE_ACCOUNT_CHECK='              return login in INTERNAL_SERVICE_ACCOUNTS or any('
 readonly RUN_ALL_TESTS_VARIABLE='          ALLOW_PR_RUN_ALL_TESTS: ${{ vars.ALLOW_PR_RUN_ALL_TESTS }}'
-readonly RUN_ALL_TESTS_LABELS='          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}'
+readonly RUN_ALL_TESTS_LABELS='          RUN_ALL_TESTS_LABELS = FUNCTIONAL_TEST_LABELS | {RUN_TESTS_LABEL}'
 readonly RUN_ALL_TESTS_GUARD='              if not ALLOW_PR_RUN_ALL_TESTS and workflow_labels & RUN_ALL_TESTS_LABELS:'
 
 if [[ $(/usr/bin/grep -c -F "$EXTERNAL_QUEUE" "$WORKFLOW") -ne 1 ]]; then
@@ -127,6 +127,9 @@ workflow = Path(sys.argv[1]).read_text()
 start = workflow.index('          # Headers for GitHub API')
 end = workflow.index('          # Get current running and queued workflows', start)
 helpers_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
+start = workflow.index('          FUNCTIONAL_TEST_LABEL =')
+end = workflow.index('          ALLOW_PR_RUN_ALL_TESTS =', start)
+labels_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
 
 
 class RequestException(Exception):
@@ -180,6 +183,7 @@ def load(responses):
         "time": fake_time,
         "exit": fail_exit,
     }
+    exec(labels_code, state.ns)
     exec(helpers_code, state.ns)
     return state
 
@@ -240,6 +244,12 @@ assert len(state.requests) == 1
 assert state.ns["get_pr_base_branch"](run_2)[0] == "dev"
 assert len(state.requests) == 2
 
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
+    state = load([pr(1, labels=(label,))])
+    assert state.ns["has_functional_test_label"](run_1)
+    assert label in state.ns["RUN_ALL_TESTS_LABELS"]
+assert not load([pr(1, labels=("Run tests",))]).ns["has_functional_test_label"](run_1)
+
 # A failed lookup is not cached, and non-PR runs make no request.
 state = load([Response(404), pr(1)])
 assert state.ns["get_pr_base_branch"](run_1) == (None, None)
@@ -267,7 +277,8 @@ source = Path(sys.argv[1]).read_text()
 source = textwrap.dedent(source.split('        shell: python\n        run: |\n', 1)[1].split('\n  notify:', 1)[0])
 
 
-def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor="internal", limit=20):
+def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor="internal", limit=20,
+              labels=None, allow_full=True):
     runs = {}
     approved = []
     by_status = {}
@@ -290,7 +301,8 @@ def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor
         if "/pulls/" in url:
             number = int(url.rsplit("/", 1)[1])
             author, base = prs[number]
-            return response({"number": number, "user": {"login": author}, "base": {"ref": base}, "labels": []})
+            pr_labels = [{"name": label} for label in (labels or {}).get(number, ())]
+            return response({"number": number, "user": {"login": author}, "base": {"ref": base}, "labels": pr_labels})
         if url.endswith("/pending_deployments"):
             return response([{"id": 1, "environment": {"id": 1}}])
         raise AssertionError(url)
@@ -304,7 +316,7 @@ def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor
            "CONTRIBUTOR_TYPE": contributor, "MAX_CONCURRENCY": str(limit * 2),
            "MAX_CONCURRENCY_EXTERNAL": str(limit), "SSO_USERS_FILE": "sso.json",
            "TARGET_BRANCH": branch,
-           "ALLOW_PR_RUN_ALL_TESTS": "true"}
+           "ALLOW_PR_RUN_ALL_TESTS": str(allow_full).lower()}
     with patch.dict(os.environ, env), patch.dict(sys.modules, {"requests": SimpleNamespace(get=get, post=post)}), \
          patch("builtins.open", mock_open(read_data=json.dumps(sso))), contextlib.redirect_stdout(io.StringIO()):
         try:
@@ -330,5 +342,12 @@ release_prs = {n: (author, "release/a" if base == "main" else "release/b")
 assert approvals(release_prs, running=[1, 2], waiting=[3, 4, 5], branch="others") == [4, 5]
 # The existing queue-wide limit still applies.
 assert approvals(prs, waiting=[1, 2, 4], limit=2) == [1, 2]
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
+    assert approvals(prs, waiting=[1, 4], labels={1: [label], 4: [label]}) == [1]
+    assert approvals(prs, waiting=[1, 4], labels={1: [label]}, allow_full=False) == [4]
+    for other_label in ("Run functional tests", "Run Merge-Queue jobs"):
+        labels = {5: [label], 4: [other_label]}
+        assert approvals(prs, queued=[5], waiting=[4], labels=labels) == []
+        assert approvals(prs, running=[5], waiting=[4], labels=labels) == []
 print("Approve Test Queue limits each author to two active PRs per base branch")
 PY

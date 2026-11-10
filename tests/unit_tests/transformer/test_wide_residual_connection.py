@@ -637,10 +637,10 @@ class TestWideResidualStaticConstruction:
         assert type(layer) is WideResidualTransformerLayer
         for operation in ("read", "write"):
             connections = {
-                "self_attention": layer._get_self_attention_residual_connection(
+                "self_attention": layer._get_residual_connection_for_self_attention(
                     operation=operation
                 ),
-                "mlp": layer._get_mlp_residual_connection(operation=operation),
+                "mlp": layer._get_residual_connection_for_mlp(operation=operation),
             }
             for branch_name, connection in connections.items():
                 if branch_name in expected_connections:

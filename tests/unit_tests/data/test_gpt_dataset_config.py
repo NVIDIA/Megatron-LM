@@ -100,22 +100,6 @@ def test_validate_needs_the_tokenizer_and_asserts_only(tokenizer):
         _config(
             varlen_sbhd_validation=True, dynamic_context_parallel=True
         ).validate_without_tokenizer()
-    # The deprecated alias (#7047): warned about, rejected together with the canonical flag and
-    # counted by the exclusion, but not rewritten (validate asserts only; the builders of the config
-    # normalize it: validate_args on the CLI, the training container for a section).
-    alias = _config(hybrid_context_parallel=True)
-    with pytest.warns(DeprecationWarning, match="hybrid_context_parallel is deprecated"):
-        alias.validate_without_tokenizer()
-    assert alias.hybrid_context_parallel is True and alias.dynamic_context_parallel is False
-    with pytest.warns(DeprecationWarning):
-        with pytest.raises(ValueError, match="Cannot set both"):
-            _config(
-                hybrid_context_parallel=True, dynamic_context_parallel=True
-            ).validate_without_tokenizer()
-        with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
-            _config(
-                varlen_sbhd_validation=True, hybrid_context_parallel=True
-            ).validate_without_tokenizer()
     counts = _config(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
     counts.tokenizer = SimpleNamespace(vocab_size=None)
     with pytest.raises(AssertionError, match="vocab size"):

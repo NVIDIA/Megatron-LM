@@ -146,16 +146,18 @@ class TestTrainingLoopPgCollection:
         group = _subgroup(_pairs())
         _forbid_global_reads(monkeypatch, training)
 
-        args = SimpleNamespace(gtp_weight_remat_size=2, gtp_remat_num_sequence_shards=1)
+        # The model settings of the run config; the sequence-shard count is derived there.
+        transformer = SimpleNamespace(gtp_weight_remat_size=2, gtp_remat_num_sequence_shards=1)
+        cfg = SimpleNamespace(model=SimpleNamespace(transformer=transformer))
         assert (
-            training._get_data_parallel_world_size(ProcessGroupCollection(dp_gtp_remat=group), args)
+            training._get_data_parallel_world_size(ProcessGroupCollection(dp_gtp_remat=group), cfg)
             == 2
         )
         # Without the sample group, the weight replicas times the GTP weight-remat size.
-        assert training._get_data_parallel_world_size(ProcessGroupCollection(dp=group), args) == 4
-        args.gtp_remat_num_sequence_shards = 2
+        assert training._get_data_parallel_world_size(ProcessGroupCollection(dp=group), cfg) == 4
+        transformer.gtp_remat_num_sequence_shards = 2
         with pytest.raises(ValueError, match="dp_gtp_remat"):
-            training._get_data_parallel_world_size(ProcessGroupCollection(dp=group), args)
+            training._get_data_parallel_world_size(ProcessGroupCollection(dp=group), cfg)
 
     @_needs_4_ranks
     def test_dummy_train_step_reads_batches_on_the_collection(self, monkeypatch, run_config):
@@ -168,12 +170,12 @@ class TestTrainingLoopPgCollection:
         args = SimpleNamespace(
             sft=False,
             dataloader_inter_document_masking=False,
-            dynamic_context_parallel=False,
             create_attention_mask_in_dataloader=False,
-            context_parallel_size=1,
             seq_length=8,
-            pipeline_model_parallel_size=2,
         )
+        run_config.model.transformer.dynamic_context_parallel = False
+        run_config.model.transformer.context_parallel_size = 1
+        run_config.model.transformer.pipeline_model_parallel_size = 2
         run_config.train.micro_batch_size = 1
         tp_calls, cp_calls = [], []
         monkeypatch.setattr(training, "get_args", lambda: args)
