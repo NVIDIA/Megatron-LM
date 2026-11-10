@@ -47,6 +47,7 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
     make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
 )
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
@@ -299,6 +300,39 @@ class TestMegatronModuleTensorParallelGroup:
 
         assert _shard_ids(sharded_state_dict) == expected
         assert _fallbacks(record) == [("_Leaf.sharded_state_dict", "tp_group")]
+
+    def test_missing_metadata_warning_names_the_module_class(self, tp2_grid):
+        tp_group, dp_cp_group = tp2_grid
+
+        class _First(_Leaf):
+            pass
+
+        class _Second(_Leaf):
+            pass
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dicts = []
+            for module_class in (_First, _Second):
+                module = module_class(_config())
+                module.tp_group = tp_group
+                sharded_state_dicts.append(module.sharded_state_dict())
+            sharded_state_dicts.append(
+                sharded_state_dict_default(torch.nn.Linear(2, 2), tp_group=tp_group)
+            )
+
+        for sharded_state_dict in sharded_state_dicts:
+            for entry in sharded_state_dict.values():
+                assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
+        # One warning per class, not one for the method that every module inherits.
+        assert _fallbacks(record) == [
+            (f"ensure_metadata_has_dp_cp_group (from {owner})", "dp_cp_group")
+            for owner in (
+                "_First.sharded_state_dict",
+                "_Second.sharded_state_dict",
+                "sharded_state_dict_default(Linear)",
+            )
+        ]
 
 
 @needs_tp2
