@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 import torch
 
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer, _GDPRuntimeCP
 
 
 @pytest.mark.parametrize("cutedsl", [False, True])
@@ -26,7 +26,17 @@ def test_beta_sigmoid_forward_and_backward(cutedsl: bool) -> None:
         training=False,
         config=SimpleNamespace(gdp_cutedsl_kernel=cutedsl),
     )
-    beta, _ = GatedDeltaProductMixer._compute_gating(cast(GatedDeltaProductMixer, mixer), ba)
+    runtime_cp = _GDPRuntimeCP(
+        group=SimpleNamespace(size=lambda: 1),
+        helper=None,
+        chunkwise=True,
+        d_inner=2,
+        nheads=2,
+        ngroups=2,
+    )
+    beta, _ = GatedDeltaProductMixer._compute_gating(
+        cast(GatedDeltaProductMixer, mixer), ba, runtime_cp=runtime_cp
+    )
     expected_shape = (2, 6) if cutedsl else (2, 3, 2)
     torch.testing.assert_close(beta, logits.sigmoid().reshape(expected_shape), rtol=0, atol=0)
     assert beta.dtype == torch.bfloat16

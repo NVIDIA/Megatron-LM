@@ -23,11 +23,14 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
+    _resolve_dynamic_cp_group_for_batch,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
 from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.utils import packed_seq_utils
 from pretrain_hybrid import get_batch
@@ -70,8 +73,6 @@ def initialize_test_environment(
     args.create_attention_mask_in_dataloader = create_attention_mask
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
-    args.vocab_size = 1024
-    args.tokenizer_type = "NullTokenizer"
     args.num_layers = 4
     args.hidden_size = 512
     args.num_attention_heads = 8
@@ -81,7 +82,9 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.tokenizer = TokenizerConfig(vocab_size=1024, tokenizer_type="NullTokenizer")
+    set_global_variables(args, cfg, build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,

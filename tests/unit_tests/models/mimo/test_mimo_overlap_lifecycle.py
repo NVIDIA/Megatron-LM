@@ -127,6 +127,9 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
         _layer_wise_non_distopt_child=False,
         _copy_main_params_to_model_params=MagicMock(),
         _copy_main_params_to_param_buffer=MagicMock(),
+        # step_with_ready_grads calls this hook on the real class; the stub has
+        # to carry it too, even though this test is about the copy path.
+        _post_optimizer_step=MagicMock(),
     )
 
     assert MixedPrecisionOptimizer.step_with_ready_grads(optimizer)

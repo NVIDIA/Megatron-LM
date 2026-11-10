@@ -2376,8 +2376,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
         """A resident request's expert routing, read from its blocks as its completion reads it."""
-        allocator = self.context.kv_block_allocator
-        if not allocator.block_routing:  # routing replay off: nothing was recorded
+        routing_replay = self.context.kv_block_allocator.routing_replay
+        if not routing_replay.has_data():  # routing replay off: nothing was recorded
             return None
         if not hasattr(self.context, "request_ids"):
             return None
@@ -2385,7 +2385,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if index < 0:
             return None
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        return allocator.reconstruct_routing_from_blocks(
+        return routing_replay.reconstruct_routing_from_blocks(
             self.context.get_committed_kv_block_ids(index), total_tokens - 1
         )
 
@@ -3302,8 +3302,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+                block_ref_counts = block_allocator.pc_state.block_ref_counts
+                blocks_hashed_active = int((block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -3542,10 +3543,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                        routing_replay = self.context.kv_block_allocator.routing_replay
+                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -4245,6 +4245,25 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._cg_admission_check(req, candidate)
         return self._matches_cg_admission(candidate)
 
+    def _chunked_prefill_token_budget(self) -> int:
+        """Return how many more prompt tokens this step can admit.
+
+        The step capacity is `context.max_tokens`. Batch-invariant hybrid models also
+        bound the prefill tokens alone by `context.max_prefill_tokens`, which leaves
+        the rest of the capacity to this step's decode tokens.
+        """
+        context = self.context
+        token_budget = context.max_tokens - context.active_token_count
+        if context.max_prefill_tokens < context.max_tokens:
+            assert context.batch_invariant_mode, (
+                "max_prefill_tokens below max_tokens is set only for batch-invariant hybrid "
+                "chunked prefill"
+            )
+            decode_token_count = context.num_decode_requests * (context.num_speculative_tokens + 1)
+            prefill_token_count = context.active_token_count - decode_token_count
+            token_budget = min(token_budget, context.max_prefill_tokens - prefill_token_count)
+        return token_budget
+
     def _can_schedule_chunked_prefill(self, req) -> bool:
         """Return whether the queue-head request can admit at least one prompt token.
 
@@ -4258,7 +4277,7 @@ class DynamicInferenceEngine(AbstractEngine):
             req, prefill_chunk_length=1
         )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
-        token_capacity_available = self.context.active_token_count < self.context.max_tokens
+        token_capacity_available = self._chunked_prefill_token_budget() > 0
         return (
             (is_continuing_chunk or request_can_be_added)
             and kv_cache_available
@@ -4334,7 +4353,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -4538,7 +4557,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self._can_schedule_chunked_prefill(req):
                 # How many tokens we can admit this step.
-                token_budget = self.context.max_tokens - self.context.active_token_count
+                token_budget = self._chunked_prefill_token_budget()
 
                 # Prefix-cache skip: on a request's first chunk, the tokens covered
                 # by a cached prefix are reused rather than recomputed, so they do
@@ -4627,7 +4646,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
 
                 if prefill_chunk_length >= remaining_len:
@@ -5109,7 +5128,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # where Mamba state is still cached).
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
-                    len(kv_alloc.kv_hash_to_block_id),
+                    len(self.context.prefix_cache_registry.kv_hash_to_block_id),
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )

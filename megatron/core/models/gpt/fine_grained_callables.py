@@ -663,7 +663,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 padding_mask: Optional[Tensor] = None,
             ):
                 attention_kwargs = dict(
-                    hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     rotary_pos_cos=rotary_pos_cos,
@@ -674,7 +673,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if is_hyper_connection_layer:
                     attention_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-                hidden_states, _ = layer._forward_attention(**attention_kwargs)
+                hidden_states, _ = layer._forward_attention(hidden_states, **attention_kwargs)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 if is_mhc_layer:

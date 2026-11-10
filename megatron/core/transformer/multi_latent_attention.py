@@ -992,6 +992,8 @@ class MLASelfAttention(MultiLatentAttention):
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        assert runtime_cp_group is not None, "MLA requires a context-parallel group"
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -1122,7 +1124,7 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
@@ -1130,7 +1132,7 @@ class MLASelfAttention(MultiLatentAttention):
                 k_pos_emb,
                 rotary_pos_emb,
                 config=self.config,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
 
@@ -1174,7 +1176,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and use_fused_rope
                 and self.config.q_lora_rank is not None
                 and q_compressed.ndim == 3
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
             )
 
             if use_fused_q_uproj:
@@ -1244,7 +1246,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and not self.checkpoint_core_attention
                 and kv.ndim == 4
                 and cu_seqlens_kv is None
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
                 and kv.shape[0] % 128 == 0
                 and kv.dtype == torch.bfloat16
                 and k_pos_emb.dtype == torch.bfloat16
@@ -1288,8 +1290,8 @@ class MLASelfAttention(MultiLatentAttention):
                 )
                 key = torch.cat([k_no_pe, k_pos_emb.expand(*k_no_pe.shape[:-1], -1)], dim=-1)
             elif use_fused_rope:
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = runtime_cp_group.rank()
+                cp_size = runtime_cp_group.size()
                 if not use_fused_q_uproj:
                     query = fused_apply_mla_rope_for_q(
                         q,
@@ -1325,7 +1327,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif not thd_packed_seq or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or runtime_cp_group.size() == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -1355,7 +1357,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
@@ -1366,7 +1368,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )

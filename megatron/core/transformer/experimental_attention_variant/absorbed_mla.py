@@ -522,7 +522,8 @@ class AbsorbedMLASelfAttention(Attention):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Retain this microbatch's group when the up-projection checkpoint replays
         # after forward restores pg_collection.cp or another microbatch changes it.
-        effective_cp_group = self.pg_collection.cp
+        effective_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        assert effective_cp_group is not None, "Absorbed MLA requires a context-parallel group"
 
         # =========================================
         # Prepare RoPE and seqlen related params

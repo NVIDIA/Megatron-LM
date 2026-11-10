@@ -254,7 +254,10 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
     def forward(
         self,
+        # PyTorch full-backward hooks only track positional inputs. Pass the
+        # activation positionally so MFSDP can release weights promptly.
         hidden_states: Tensor,
+        /,
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer

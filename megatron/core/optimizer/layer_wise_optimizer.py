@@ -383,6 +383,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            # The shard is the fullest bin, so one outsized param forces every shard to
+            # its size however well the rest pack. Log the largest to tell those apart.
+            sizes = sorted((p.data.nelement() for p in chunk_params if p is not None), reverse=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
+                f"real={sum(sizes)}, largest={sizes[:3]}",
+            )
             bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
@@ -670,6 +679,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
+        # Mark all main weights as DP-sharded so parameter norms count only owners.
+        if config.bf16:
+            for optimizer in optimizers:
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if param.requires_grad and param.type() in [
+                            'torch.cuda.HalfTensor',
+                            'torch.cuda.BFloat16Tensor',
+                        ]:
+                            param.main_param_sharded = True
+
         # Decouple path keeps whole-matrix ping-pong ownership (Newton-Schulz runs on whole
         # matrices on one rank; param sync via ``allgather_params``). ``model_chunks`` lets the
         # ping-pong fallback break equal-numel ties by a rank-independent identity (see below).

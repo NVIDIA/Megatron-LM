@@ -115,7 +115,6 @@ def checkpointed_forward(
                 # an explicit capability flag so this module does not need to import
                 # hybrid_block (which would create a circular import).
                 layer_kwargs = dict(
-                    hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
                     context_mask=context_mask,
@@ -135,7 +134,7 @@ def checkpointed_forward(
                     )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(hidden_states, **layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata
                         # consumed by wrapped MoE layers, but not cross-attention kwargs
@@ -151,7 +150,7 @@ def checkpointed_forward(
                             layer_kwargs["packed_sequence_cp_metadata"] = (
                                 packed_sequence_cp_metadata
                             )
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(hidden_states, **layer_kwargs)
                     else:  # An unwrapped layer with a narrower interface, e.g. MambaLayer.
                         for k in (
                             "context",
@@ -169,7 +168,7 @@ def checkpointed_forward(
                             layer_kwargs["packed_sequence_cp_metadata"] = (
                                 packed_sequence_cp_metadata
                             )
-                        hidden_states = layer(**layer_kwargs)
+                        hidden_states = layer(hidden_states, **layer_kwargs)
                         context = None
 
                 # Some layer paths may still return a tuple (defensive).

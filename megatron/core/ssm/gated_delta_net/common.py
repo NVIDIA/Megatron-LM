@@ -26,7 +26,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -285,6 +285,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
+        # Chunkwise KDA partitions tokens and keeps all TP-local heads, so only
+        # headwise variants require divisibility by the selected CP group size.
+        if not (isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise"):
+            _validate_dynamic_cp_head_geometry(
+                config,
+                self.pg_collection,
+                head_counts={
+                    "GDN key heads": self.num_k_heads_local_tp,
+                    "GDN value heads": self.num_v_heads_local_tp,
+                },
+            )
+            self._validate_runtime_cp_size(self.cp_size)
+
         attrs_to_check = (
             "dt_bias_dim",
             "a_log_dim",
@@ -415,28 +428,17 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         return out, out_bias
 
-    def _gated_norm_and_a2a(
-        self,
-        core_attn_out: torch.Tensor,
-        gate: torch.Tensor,
-        thd_cp_a2a_inv: torch.Tensor | None,
-        batch: int,
-        seq_len: int,
-        packed_seq_params: PackedSeqParams | None = None,
-    ) -> torch.Tensor:
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
-        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
-
-        return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
-        )
+    def _validate_runtime_cp_size(self, cp_size: int) -> None:
+        """Require a nonempty integer key/value head shard for the runtime topology."""
+        for name, count in (
+            ("key", self.num_k_heads_local_tp),
+            ("value", self.num_v_heads_local_tp),
+        ):
+            if count < 1 or count % cp_size:
+                raise ValueError(
+                    f"GDN TP-local {name} head count {count} must be positive and "
+                    f"divisible by runtime CP size {cp_size}"
+                )
 
     def supports_two_stage_attention(self) -> bool:
         """Use the split path only when the variant exposes a compatible static stage."""
@@ -550,6 +552,29 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             **kwargs,
         )
         return self.forward_post_core_attn(norm_out)
+
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(norm_out_hp, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -1044,7 +1069,7 @@ def a2a_cp_to_hp(
     qkvzba: torch.Tensor,
     in_proj_split_sections: tuple[int, ...],
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     cu_seqlens_q: torch.Tensor | None,
     seq_len: int,
     packed_seq_params: PackedSeqParams | None,
@@ -1093,7 +1118,7 @@ def a2a_cp_to_hp(
 def a2a_hp_to_cp(
     norm_out: torch.Tensor,
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     packed_seq_params: PackedSeqParams | None,
     thd_cp_a2a_inv: torch.Tensor | None,
 ) -> torch.Tensor:
