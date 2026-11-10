@@ -23,15 +23,6 @@ class DistributedSetup:
     device: torch.device
 
 
-@pytest.fixture(scope="session", autouse=True)
-def select_symmetric_memory_backend() -> None:
-    # Checkpoint tests do not use distributed_setup. Select the backend before
-    # any test creates a DBuffer: even is_symm_mem_tensor() on ordinary tensors
-    # locks in the current backend and prevents switching it later.
-    if torch.cuda.is_available():
-        symm_mem.set_backend("NCCL")
-
-
 def _release_symmetric_memory_pools() -> None:
     """Drop the cached symmetric-memory pools so the next test starts from an empty pool."""
     # symm_mem.get_mem_pool() and its process-wide pool cache are new in PyTorch 2.10.
@@ -60,6 +51,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        # is_symm_mem_tensor() marks the current symmetric-memory backend as in use,
+        # even for ordinary tensors, so select NCCL before any DBuffer test calls it.
+        symm_mem.set_backend("NCCL")
     else:
         device = torch.device("cpu")
 
