@@ -222,6 +222,10 @@ class FsdpContext:
         Wrap both forward and backward. The scope itself does not launch reductions
         or wait on entry or exit.
 
+        Nested scopes are allowed. Disallowing nesting could make mode selection
+        clearer, but requires substantial changes to pipeline-parallel synchronization
+        scopes and is deferred to a separate PR.
+
         Args:
             mode: Outer reduction and completion-wait behavior within the scope.
         """
