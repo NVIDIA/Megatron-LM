@@ -4228,6 +4228,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """Returns whether chunked prefill is enabled."""
         return self.enable_chunked_prefill
 
+    def release_chunked_prefill_request(self) -> None:
+        """Drop the chunked prefill request between its chunks, releasing what it holds.
+
+        Between steps that request's row is parked just past the active rows, holding the KV
+        blocks of its finished chunks (including prefix-cache references) and, for hybrid
+        models, its Mamba state. Its row is released like a finished request's, and the
+        chunked-prefill state is cleared. Must not be called while a forward pass holds the row.
+        """
+        request_idx = self.get_index_of_chunked_prefill_request(safe=False)
+        assert request_idx >= self.total_request_count, "chunked prefill row must be parked"
+        self.release_memory_blocks_from_request_indexes(torch.tensor([request_idx]))
+        self.chunked_prefill_request_id = -1
+        self.mtp_metadata.invalidate_chunk_boundary()
+
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
         """Release memory blocks used by the given request idxs.
 

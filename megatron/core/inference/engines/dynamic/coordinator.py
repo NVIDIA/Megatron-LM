@@ -927,10 +927,9 @@ class CoordinatorMixin:
                         )
                     if not self._is_disaggregated_role("prefill"):
                         self._notify_request_aborted(request_id, source_safe=True)
-                        if (
-                            request_id in self.waiting_request_ids
-                            and request_id != self.context.chunked_prefill_request_id
-                        ):
+                        if request_id == self.context.chunked_prefill_request_id:
+                            self._aborted_chunked_prefill_request_id = request_id
+                        elif request_id in self.waiting_request_ids:
                             self._finish_aborted_queued_request(request_id)
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
@@ -1016,6 +1015,7 @@ class CoordinatorMixin:
             else:
                 raise UnknownHeaderError(header)
 
+        self._end_aborted_chunked_prefill()
         self._collect_failed_requests()
         return len(all_messages)
 
@@ -1036,6 +1036,26 @@ class CoordinatorMixin:
         request.status = Status.COMPLETED
         self._set_finish_reason(request)
         self._complete_request(entry, reply_now=True)
+
+    def _end_aborted_chunked_prefill(self) -> None:
+        """End an aborted request that is part-way through a chunked prefill.
+
+        The scheduler gives such a request no further chunk. Between steps its context row is
+        parked, unless async scheduling still has its latest chunk in flight; it then ends here
+        after the step that consumes that forward pass. Its partial prefill is released, and
+        it ends like an aborted queued request.
+        """
+        request_id = self._aborted_chunked_prefill_request_id
+        if request_id is None:
+            return
+        if request_id == self.context.chunked_prefill_request_id:
+            if self.context.get_index_of_chunked_prefill_request(safe=True) != -1:
+                return
+            self.context.release_chunked_prefill_request()
+        if request_id in self.waiting_request_ids:
+            self._finish_aborted_queued_request(request_id)
+        if request_id not in self.requests:
+            self._aborted_chunked_prefill_request_id = None
 
     def _prepare_submit_request_message(self, message: List[bytes]) -> List[bytes]:
         """Resolve a prompt once on MP rank zero before broadcasting the request.

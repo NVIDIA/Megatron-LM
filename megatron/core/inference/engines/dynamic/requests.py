@@ -959,6 +959,9 @@ class RequestIntakeMixin:
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
             req = self.get_request(self.waiting_request_ids[0])
+            if req.request_id == self._aborted_chunked_prefill_request_id:
+                # Its abort ends it between steps, without another chunk.
+                break
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request

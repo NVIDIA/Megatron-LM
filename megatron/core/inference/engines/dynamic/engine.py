@@ -173,6 +173,7 @@ class DynamicInferenceEngine(
     # Immutable so instances never share one task set; __init__ installs a mutable one.
     _staging_tasks: Set[asyncio.Task] = frozenset()
     _staging_tasks_peak: int = 0
+    _aborted_chunked_prefill_request_id: Optional[int] = None
     # Instances created without __init__ run in the default gc mode whatever the config default
     # is, so their suspend, resume, step and idle hooks leave Python GC unchanged.
     gc_mode: str = "default"
@@ -479,6 +480,8 @@ class DynamicInferenceEngine(
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
+        # An aborted request part-way through a chunked prefill, until it is ended between steps.
+        self._aborted_chunked_prefill_request_id: Optional[int] = None
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
