@@ -40,9 +40,11 @@ class TestAmaxReductionGroupHelper:
         assert amax_reduction_group(pg_collection, tp_only_amax_red=False) is tp_dp_cp
 
     @pytest.mark.parametrize("tp_only_amax_red", [False, True])
-    def test_rejects_an_unset_or_none_field(self, tp_only_amax_red):
+    def test_rejects_an_unset_or_none_field(self, tp_only_amax_red, monkeypatch):
         from megatron.core.process_groups_config import amax_reduction_group
 
+        # This class does not initialize torch.distributed, which the check depends on.
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         field_name = "tp_cp" if tp_only_amax_red else "tp_dp_cp"
         other_name = "tp_dp_cp" if tp_only_amax_red else "tp_cp"
         for pg_collection in (
@@ -51,6 +53,22 @@ class TestAmaxReductionGroupHelper:
         ):
             with pytest.raises(ValueError, match=field_name):
                 amax_reduction_group(pg_collection, tp_only_amax_red)
+
+    @pytest.mark.parametrize("tp_only_amax_red", [False, True])
+    def test_passes_no_group_without_torch_distributed(self, tp_only_amax_red, monkeypatch):
+        """A single-process model built on None groups opens its context without a group."""
+        from megatron.core.process_groups_config import amax_reduction_group
+
+        pg_collection = ProcessGroupCollection(tp=None, cp=None, pp=None, embd=None)
+        config = _config(
+            fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, tp_only_amax_red=tp_only_amax_red
+        )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        assert amax_reduction_group(pg_collection, tp_only_amax_red) is None
+        with record_amax_groups() as groups:
+            fp8_utils.get_fp8_context(config, 0, pg_collection=pg_collection)
+        assert groups == [None]
 
 
 class TestAmaxReductionGroupOnGrids:
