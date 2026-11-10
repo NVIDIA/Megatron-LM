@@ -107,6 +107,35 @@ on some workloads have shown performance gains from this overlap, so consolidati
 communication onto one stream may trade away performance for lower allocator fragmentation.
 The trade-off is workload- and system-dependent and should be measured.
 
+## Recorded cross-microbatch weight retention
+
+With `PrefetchOrder.RECORDED`, caller-managed gradient synchronization records all
+microbatches through `finish_grad_sync()`. An optional `weight_retain_distance`
+records actual weight uses and releases separately from speculative prefetches.
+After ranks agree on the trace and configuration, a release is omitted when the
+next operation on the same module is a use within the configured number of weight
+lifecycle events. Zero disables retention. Recompute's rowwise-only releases are
+barriers rather than retain candidates.
+
+Reshard still restores sharded parameter bindings. A retained buffer keeps its
+readiness events, so the next unshard restores full bindings without repeating
+an already satisfied gather. MXFP8 phases still gather any missing planes.
+`finish_grad_sync()` forces all weights back to their sharded state before the
+optimizer updates them; retention never wraps across optimizer steps.
+
+Retaining the weights removes the gather dependency before the next microbatch's
+compute. Existing gradient reduction can then overlap independent compute according
+to the normal FSDP stream schedule. Gradient packing, reduction, accumulation and
+buffer allocation/release remain unchanged; this optimization does not merge RS
+operations or require a separate gradient-lifetime manager.
+
+MCore enables full-step recording with `--fsdp-weight-retain-distance N` for
+MFSDP v2. It requires one complete eager recording step, a fixed repeating schedule
+and ordinary module hooks; combined 1F1B expert overlap is not supported by this
+initial integration. Increasing the distance can retain more full weights and
+raise peak memory. CUDA Graph capture replays the compiled plan without querying
+GPU completion or running consensus collectives.
+
 ## Prefetching via Delayed Execution
 
 [PR #5124](https://github.com/NVIDIA/Megatron-LM/pull/5124) implements prefetching via

@@ -985,6 +985,13 @@ def validate_args(args, defaults={}):
     if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
+    if args.fsdp_weight_retain_distance < 0:
+        raise ValueError('--fsdp-weight-retain-distance must be non-negative.')
+    if args.fsdp_weight_retain_distance and (
+        not args.use_megatron_fsdp or args.megatron_fsdp_version != 2
+    ):
+        raise ValueError('--fsdp-weight-retain-distance requires Megatron-FSDP v2.')
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -3026,6 +3033,10 @@ def _add_distributed_args(parser):
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--fsdp-weight-retain-distance', type=int, default=0,
+                       help='MFSDP v2: retain weights when the next recorded use is within this '
+                            'many weight lifecycle events. Zero disables retention. Records one '
+                            'complete eager optimizer step before replay; requires a fixed schedule.')
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

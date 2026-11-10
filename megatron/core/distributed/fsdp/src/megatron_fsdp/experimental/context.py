@@ -15,11 +15,15 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
+import hashlib
 from collections.abc import Callable
-from weakref import WeakKeyDictionary
+from typing import Literal, NamedTuple
+from weakref import WeakKeyDictionary, ref
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed import ProcessGroup
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
@@ -31,6 +35,14 @@ class PrefetchOrder(enum.Enum):
 
     REGISTRATION = enum.auto()
     RECORDED = enum.auto()
+
+
+class _WeightEvent(NamedTuple):
+    """An actual weight use or release, independent of speculative prefetches."""
+
+    module: ref[nn.Module]
+    operation: Literal["unshard", "reshard", "reshard_rowwise"]
+    phase: Phase | None
 
 
 class FsdpContext:
@@ -62,6 +74,8 @@ class FsdpContext:
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
+        prefetch_process_group: ProcessGroup | None = None,
+        weight_retain_distance: int = 0,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -77,10 +91,16 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
+                module calls until the first ``post_backward()``. Caller-managed gradient
+                synchronization records the full step through ``finish_grad_sync()`` instead.
+                Subsequent passes must repeat the complete sequence, including microbatch count.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
+            prefetch_process_group: Ranks agreeing on the recorded execution and weight plan.
+                Required when weight retention is enabled.
+            weight_retain_distance: Maximum distance in actual weight lifecycle events from
+                release to next use of the same module. Zero disables retention. Requires
+                RECORDED order; all retained weights are released before optimizer updates.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -89,9 +109,22 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
+        if weight_retain_distance < 0:
+            raise ValueError("weight_retain_distance must be non-negative.")
+        if weight_retain_distance and (
+            prefetch_order is not PrefetchOrder.RECORDED or prefetch_process_group is None
+        ):
+            raise ValueError("Weight retention requires recorded order and a process group.")
+
         self.finalize_gradients = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = prefetch_order
+        self._prefetch_process_group = prefetch_process_group
+        self.weight_retain_distance = weight_retain_distance
+        self._weight_events: list[_WeightEvent] = []
+        self._weight_position = 0
+        self._weight_retain_plan: dict[int, int] = {}
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
@@ -217,15 +250,19 @@ class FsdpContext:
         # materializes fresh weights. All backward work, including delayed wgrad,
         # must be complete here.
         for module in self._module_names:
-            module.reshard()
+            module.reshard(force=True)
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
+        if self.caller_managed_grad_sync:
+            self._finish_execution_order()
+
     def post_backward(self) -> None:
         """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
+        if not self.caller_managed_grad_sync:
+            self._finish_execution_order()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
@@ -233,6 +270,86 @@ class FsdpContext:
         if not self.caller_managed_grad_sync and self.finalize_gradients:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
+
+    def _weight_event(
+        self,
+        module: nn.Module,
+        operation: Literal["unshard", "reshard", "reshard_rowwise"],
+        phase: Phase | None = None,
+    ) -> bool:
+        """Record actual uses/releases, or replay whether this release can be omitted."""
+        if not self.weight_retain_distance or not module.training:
+            return False
+        event = _WeightEvent(ref(module), operation, phase)
+        if self._recording_execution_order:
+            self._weight_events.append(event)
+            return False
+        position = self._weight_position
+        if position >= len(self._weight_events) or self._weight_events[position] != event:
+            raise RuntimeError(f"FSDP weight lifecycle diverged at occurrence {position}.")
+        self._weight_position += 1
+        return position in self._weight_retain_plan
+
+    def _compile_weight_retain_plan(self) -> None:
+        """Eliminate close release/use pairs within one recorded optimizer step."""
+        next_events = {}
+        for position in reversed(range(len(self._weight_events))):
+            event = self._weight_events[position]
+            next_position = next_events.get(event.module)
+            if (
+                event.operation == "reshard"
+                and next_position is not None
+                and self._weight_events[next_position].operation == "unshard"
+                and next_position - position <= self.weight_retain_distance
+            ):
+                self._weight_retain_plan[position] = next_position
+            next_events[event.module] = position
+
+    def _finish_execution_order(self) -> None:
+        """Compile once, then validate complete replay at the optimizer-step boundary."""
+        if self._recording_execution_order:
+            if self.execution_order.peek() is not None:
+                self._agree_on_recorded_order()
+                self._compile_weight_retain_plan()
+                self._recording_execution_order = False
+        elif self.prefetch_order is PrefetchOrder.RECORDED and self.execution_order.position != 0:
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+        elif self.weight_retain_distance and self._weight_position != len(self._weight_events):
+            raise RuntimeError(
+                "FSDP weight lifecycle ended before the recorded order was complete."
+            )
+        self._weight_position = 0
+
+    def _agree_on_recorded_order(self) -> None:
+        """Reject rank differences before any retained gather can change collective order."""
+        group = self._prefetch_process_group
+        if group is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Recorded weight retention requires one eager recording step.")
+        events = list(self.execution_order)
+        indices = {module: index for index, module in enumerate(self._module_names)}
+        signature = repr(
+            (
+                [(indices[event.module], event.phase.name) for event in events],
+                [
+                    (indices[event.module()], event.operation, event.phase)
+                    for event in self._weight_events
+                ],
+                self.weight_retain_distance,
+            )
+        )
+        digest = int.from_bytes(hashlib.sha256(signature.encode()).digest()[:8], "little")
+        digest &= (1 << 62) - 1
+        header = torch.tensor(
+            [len(events), -len(events), digest, -digest],
+            dtype=torch.int64,
+            device=self.allgather_stream.device,
+        )
+        dist.all_reduce(header, op=dist.ReduceOp.MIN, group=group)
+        values = header.tolist()
+        if values[0] != -values[1] or values[2] != -values[3]:
+            raise RuntimeError("Recorded FSDP execution or weight retention differs across ranks.")
 
     def _run_delayed_post_backward_callbacks(self) -> None:
         """Run deferred module completion callbacks once."""

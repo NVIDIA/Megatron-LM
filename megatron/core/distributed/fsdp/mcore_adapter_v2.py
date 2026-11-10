@@ -46,6 +46,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -271,9 +272,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
+                    prefetch_order=(
+                        PrefetchOrder.RECORDED
+                        if ddp_config.fsdp_weight_retain_distance
+                        else PrefetchOrder.REGISTRATION
+                    ),
+                    prefetch_process_group=pg_collection.dp_cp,
+                    weight_retain_distance=ddp_config.fsdp_weight_retain_distance,
                 )
             )
         else:
+            if (
+                ddp_config.fsdp_weight_retain_distance
+                and active_context.weight_retain_distance != ddp_config.fsdp_weight_retain_distance
+            ):
+                raise ValueError("The shared FSDP context must use the requested weight retention.")
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "

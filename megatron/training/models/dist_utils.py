@@ -40,6 +40,7 @@ except ImportError:
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -394,7 +395,14 @@ def _ddp_wrap(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
-                    )
+                    ),
+                    prefetch_order=(
+                        PrefetchOrder.RECORDED
+                        if ddp_config.fsdp_weight_retain_distance
+                        else PrefetchOrder.REGISTRATION
+                    ),
+                    prefetch_process_group=pg_collection.dp_cp,
+                    weight_retain_distance=ddp_config.fsdp_weight_retain_distance,
                 )
             )
             if is_mfsdp_v2

@@ -484,6 +484,8 @@ class FsdpParameterGroup:
         requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
         missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
         if not missing_phases:
+            # Retention keeps storage/readiness while reshard restores DTensor bindings.
+            self.bind_unsharded_parameters()
             return
 
         if self._model_weight_is_stale:
