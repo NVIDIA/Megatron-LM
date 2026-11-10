@@ -9,10 +9,15 @@ LOG_DIR=$4
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 case "$BUCKET" in
-    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py) RANKS=4 NIXL=1 ;;
-    tests/unit_tests/inference/test_disagg_transfer_pairwise.py) RANKS=6 NIXL=0 ;;
+    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/core/inference/engines/test_disagg_coordinator_pairwise.py) RANKS=4 NIXL=1 ;;
+    tests/unit_tests/inference/test_disagg_transfer_pairwise.py|tests/unit_tests/core/inference/test_disagg_transfer_pairwise.py) RANKS=6 NIXL=0 ;;
     *) echo "Unsupported disaggregation bucket: $BUCKET" >&2; exit 1 ;;
 esac
+TEST_TARGET="$BUCKET"
+if [[ ! -f "$TEST_TARGET" ]]; then
+    TEST_TARGET=$(python tests/unit_tests/find_test_cases.py "$BUCKET" h100 --targets)
+    [[ -f "$TEST_TARGET" ]]
+fi
 case "$ENVIRONMENT" in
     dev) MARKER="not flaky_in_dev" ;;
     lts) MARKER="not flaky" ;;
@@ -38,7 +43,7 @@ for ((iteration = 1; iteration <= REPEAT; iteration++)); do
         --no-python bash -c '
             exec uv run --no-sync python -m coverage run --parallel-mode --source=megatron/core \
                 -m pytest -vs --experimental "$2" -m "$3" --junitxml="$1/rank-$RANK.xml"
-        ' bash "$result" "$BUCKET" "$MARKER"
+        ' bash "$result" "$TEST_TARGET" "$MARKER"
     # Empty collection and wrong-world-size skips must not look like coverage.
     uv run --no-sync python - "$result" "$RANKS" <<'PY'
 import sys

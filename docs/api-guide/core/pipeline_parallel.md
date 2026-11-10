@@ -59,5 +59,5 @@ existing full-recompute and selective-mHC-recompute/offload restrictions still
 apply.
 
 For validation coverage, see
-`tests/unit_tests/pipeline_parallel/test_pp_mhc_compatibility.py` and the
+`tests/unit_tests/core/pipeline_parallel/test_pp_mhc_compatibility.py` and the
 `hybrid_mhc_tp2_pp2_mtp` / `hybrid_mhc_tp1_pp2_vpp2_empty_mtp` functional recipes.

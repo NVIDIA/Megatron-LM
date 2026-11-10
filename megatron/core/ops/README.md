@@ -191,7 +191,7 @@ Say you are adding a gated linear recurrence called `foo`.
    implement them with the operation's real tensor contract before wiring it
    into a model. No extension of `BackendSpecProvider` is needed for this recipe.
 
-8. **Tests** (`tests/unit_tests/ops/` and the family's test directory):
+8. **Tests** (`tests/unit_tests/core/ops/` and the family's test directory):
    - the selector imports only the selected library (monkeypatch
      `megatron.core.ops._backends.import_module` and assert what was asked for);
    - a missing library fails at construction with a message naming the operation,
@@ -328,7 +328,7 @@ reference path silently.
 
 When moving a module, keep its old path as a forwarder built on
 `megatron.core.ops._compat.deprecated_module` and register the mapping in
-`tests/unit_tests/ops/deprecated_paths.py`. Paths absent from that table retain
+`tests/unit_tests/core/ops/deprecated_paths.py`. Paths absent from that table retain
 their existing ownership.
 
 A forwarder provides the following compatibility behavior:
@@ -365,7 +365,7 @@ old-to-new table to drive the migration-specific regression tests.
 
 ## Tests
 
-`tests/unit_tests/ops/test_deprecated_imports.py` tests the compatibility helper
+`tests/unit_tests/core/ops/test_deprecated_imports.py` tests the compatibility helper
 with synthetic modules, independently of any migration entries. It covers
 warnings, lazy imports, private and wildcard exports, multiple targets, package
 child imports, write-through patching and re-exported names. The same file checks
@@ -374,5 +374,5 @@ pickle round trips, import-path resolution, that canonical package `__init__`
 files re-export nothing, and in-tree use of canonical paths as operations move.
 
 Add selector and dependency-check tests alongside the family that uses them.
-Family behavior tests live under `tests/unit_tests/ssm/` and
-`tests/unit_tests/transformer/`.
+Family behavior tests live under `tests/unit_tests/core/ssm/` and
+`tests/unit_tests/core/transformer/`.

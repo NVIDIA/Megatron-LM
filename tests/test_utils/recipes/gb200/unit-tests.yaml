@@ -83,6 +83,8 @@ spec:
 # Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
 # Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
 # symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
+# Bucket IDs retain the main CI groups. Latest test paths are resolved through
+# tests/unit_tests/ci_buckets.yaml; legacy checkouts retain their original paths.
 products:
   # Run the same runtime-CP regressions on four ranks, outside the catch-all bucket.
   - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]

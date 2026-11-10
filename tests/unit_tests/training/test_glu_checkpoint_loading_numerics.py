@@ -17,9 +17,11 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.training import checkpointing
 from megatron.training.global_vars import get_args, get_train_state, set_args
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
-from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.core.dist_checkpointing import TempNamedDir
+from tests.unit_tests.core.transformer.moe import (
+    test_moe_single_grouped_weight_numerics as numerics,
+)
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
-from tests.unit_tests.transformer.moe import test_moe_single_grouped_weight_numerics as numerics
 
 # The GB200 CI selector scans this file's text before pytest resolves inherited marks.
 pytestmark = [pytest.mark.launch_on_gb200, *numerics.pytestmark]

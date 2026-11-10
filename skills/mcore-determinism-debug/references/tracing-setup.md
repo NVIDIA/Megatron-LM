@@ -29,7 +29,7 @@ tracer on its main branch — it has existed only on feature branches — so the
 normal case is that you supply it. Three options, cheapest first:
 
 1. **Skip tracing entirely.** If the break reproduces in
-   `tests/unit_tests/determinism/`, you have a faster loop and a regression test
+   `tests/unit_tests/core/determinism/`, you have a faster loop and a regression test
    in one; take it.
 2. **Port a tracer onto your branch** from wherever the current implementation
    lives — §2 and §3 describe what it has to do.

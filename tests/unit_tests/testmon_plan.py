@@ -25,46 +25,26 @@ def _bucket_files(
     root: Path, bucket: str, recipe_platform: str, changed: list[str]
 ) -> tuple[set[str], list[str]]:
     import yaml
-    from find_test_cases import (
-        PLATFORM_EXCLUSIONS,
-        PLATFORM_MARKERS,
-        expand_pattern,
-        file_has_marker,
-        is_child_of_bucket,
-    )
+    from find_test_cases import BUCKET_MANIFEST, resolve_bucket
     from testmon_mandatory import load_mappings, mandatory_files, triggered_patterns
 
-    recipe_path = Path(PLATFORMS[recipe_platform]["recipe"])
+    platform = Path(PLATFORMS[recipe_platform]["recipe"]).parent.name
     try:
-        recipe = yaml.safe_load((root / recipe_path).read_text())
+        tests = set(resolve_bucket(bucket, platform, root))
         mappings = load_mappings(root / "tests/unit_tests/testmon_mandatory_tests.yaml")
     except yaml.YAMLError as error:
         raise ValueError(f"invalid mandatory-test configuration: {error}") from error
-    all_buckets = [case for product in recipe["products"] for case in product["test_case"]]
-    bucket_files = set(expand_pattern(str(root / bucket)))
-    ignored = {str(root / path) for path in PLATFORM_EXCLUSIONS.get(recipe_path.parent.name, ())}
-    for test_case in all_buckets:
-        if test_case != bucket and is_child_of_bucket(test_case, bucket):
-            ignored.update(expand_pattern(str(root / test_case)))
-    marker = PLATFORM_MARKERS.get(recipe_path.parent.name)
-    if marker:
-        ignored.update(
-            path
-            for path in bucket_files
-            if Path(path).name.startswith("test_") and not file_has_marker(path, marker)
-        )
     _, patterns = triggered_patterns(mappings, changed, recipe_platform)
-    tests = {
-        str(Path(path).relative_to(root))
-        for path in bucket_files - ignored
-        if Path(path).name.startswith("test_")
-    }
-    mandatory = [
-        str(Path(path).relative_to(root))
-        for path in mandatory_files(
-            [str(root / pattern) for pattern in patterns], str(root / bucket), ignored
-        )
-    ]
+    if (root / BUCKET_MANIFEST).is_file():
+        mandatory = mandatory_files(patterns, bucket, set(), platform=platform, root=root)
+    else:
+        mandatory = [
+            str(Path(path).relative_to(root))
+            for path in mandatory_files(
+                [str(root / pattern) for pattern in patterns], str(root / bucket), set()
+            )
+            if str(Path(path).relative_to(root)) in tests
+        ]
     return tests, mandatory
 
 
@@ -133,6 +113,8 @@ def select(
         "phases": {},
     }
     try:
+        from find_test_cases import resolve_bucket
+
         identity = cache_identity(root, bucket, recipe_platform)
         validate_cache(cache_dir, identity, matched_key)
         changed_files = _changed_files(pr_files_dir, source_sha)
@@ -144,7 +126,10 @@ def select(
             affected_files.update(
                 _select_phase(root, cache_dir / phase / ".testmondata", test_files)
             )
-        phases = {phase: sorted(affected_files) for phase in PHASES}
+        selected = [
+            path for path in resolve_bucket(bucket, recipe_platform, root) if path in affected_files
+        ]
+        phases = {phase: selected for phase in PHASES}
         plan.update(
             mode="selected",
             reason="selected on CPU from the compatible main baseline",

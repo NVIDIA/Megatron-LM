@@ -622,7 +622,7 @@ def test_shared_rank_predicate_reads_the_registered_model_config(monkeypatch):
 
 def test_rank_rule_gates_on_tensor_parallel_rank():
     """With one pipeline stage every branch of the rule reduces to "tensor-parallel rank 0
-    builds"; the stage logic runs on 8 GPUs in tests/unit_tests/data/test_get_batch.py."""
+    builds"; the stage logic runs on 8 GPUs in tests/unit_tests/test_get_batch.py."""
     from megatron.core import mpu
 
     Utils.initialize_model_parallel(2, 1)

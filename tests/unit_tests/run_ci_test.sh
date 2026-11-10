@@ -134,10 +134,27 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
+# Historical checkouts keep their own selector helper, which can ignore this
+# variable while newer helpers exclude buckets from the other suite version.
+export UNIT_TEST_TAG="$TAG"
 IGNORE_ARGS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
+if [[ "$TAG" == "latest" ]]; then
+    # Resolve exclusions before passing explicit files to pytest: --ignore does
+    # not suppress a file also supplied as a positional collection target.
+    TARGET_LIST=$(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM" --targets)
+    if [[ -z "$TARGET_LIST" ]]; then
+        echo "No test files selected for $BUCKET on $PLATFORM" >&2
+        exit 1
+    fi
+    mapfile -t TEST_TARGETS <<< "$TARGET_LIST"
+else
+    # Historical checkouts use their own directory selectors and helper API.
+    IGNORE_LIST=$(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
+    done <<< "$IGNORE_LIST"
+    TEST_TARGETS=("${BUCKET%/\*\*/\*.py}")
+fi
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -162,10 +179,9 @@ export ONE_LOGGER_JOB_CATEGORY=test
 # contain no matching tests; treat pytest's "no tests collected" (exit 5) as a
 # pass there instead of aborting the job under `set -e`.
 run_test_cmd() {
-    local cmd="$1"
     local rc=0
     set +e
-    eval "$cmd"
+    "$@"
     rc=$?
     set -e
     if [[ "$rc" -eq 5 && "$PLATFORM" == "gb200" ]]; then
@@ -180,24 +196,21 @@ run_test_cmd() {
 run_full_tests() {
     for i in $(seq $UNIT_TEST_REPEAT); do
         echo "Running prod test suite."
-        CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
             -m coverage run \
             --data-file=.coverage.unit_tests \
             --source=megatron/core \
             -m pytest \
             -vs \
-            ${IGNORE_ARGS[@]} \
-            -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-        run_test_cmd "$CMD"
+            "${IGNORE_ARGS[@]}" \
+            -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
 
         if [[ "$TAG" == "latest" ]]; then
-            CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
+            run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" -m pytest \
                 -vs \
                 --experimental \
-                 ${IGNORE_ARGS[@]} \
-                -m "'experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-
-            run_test_cmd "$CMD"
+                "${IGNORE_ARGS[@]}" \
+                -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
         fi
 
     done
@@ -246,16 +259,14 @@ run_testmon_phase() {
 
 run_baseline_tests() {
     local cache_root="${UNIT_TESTMON_CACHE_DIR:?}"
-    local target
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     rm -rf -- "$cache_root/prod" "$cache_root/experimental" "$cache_root/.testmon-work"
     rm -f -- "$cache_root/summary.md"
     mkdir -p "$cache_root"
 
     run_testmon_phase baseline prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
+        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
     run_testmon_phase baseline experimental \
-        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
+        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}"
     write_testmon_summary "baseline produced"
 }
 
@@ -335,8 +346,7 @@ run_selected_phase() {
 }
 
 run_enforced_tests() {
-    local target prod_count experimental_count mandatory_count
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    local prod_count experimental_count mandatory_count
     if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
         # Consume the CPU decision without running selection again on GPU.
         if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
@@ -349,11 +359,11 @@ run_enforced_tests() {
     else
         rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
         if ! run_testmon_phase select prod \
-            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}" \
             || ! merge_rank_selections prod \
             || ! apply_mandatory_tests prod \
             || ! run_testmon_phase select experimental \
-                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "${TEST_TARGETS[@]}" \
             || ! merge_rank_selections experimental \
             || ! apply_mandatory_tests experimental; then
             write_testmon_summary "full fallback: Testmon selection failed"
