@@ -5787,12 +5787,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def current_image_embeddings(self) -> Optional[Tensor]:
         """Concatenate image embeddings for active requests.
 
-        Each per-request embedding has shape [seq_img_i, 1, hidden] where
-        seq_img_i may vary across requests under dynamic resolution. Each is
-        flattened to [seq_img_i, hidden], concatenated along dim 0, and
-        unsqueezed to [sum(seq_img_i), 1, hidden]. The downstream consumer
-        does ``permute(1, 0, 2).reshape(-1, hidden)`` to yield the flat
-        [total_image_tokens, hidden] array indexed by
+        Each per-request embedding has shape [seq_img_i, num_tiles_i, hidden]:
+        num_tiles_i is 1 under dynamic resolution, and static tiling gives each
+        tile one column of seq_img_i embeddings. Each is flattened tile by tile
+        to [seq_img_i * num_tiles_i, hidden], the order in which the prompt
+        expansion numbers media positions and LLaVA places them, concatenated
+        along dim 0, and unsqueezed to [total_image_tokens, 1, hidden]. The
+        downstream consumer does ``permute(1, 0, 2).reshape(-1, hidden)`` to
+        yield the flat [total_image_tokens, hidden] array indexed by
         :meth:`current_image_token_mask`.
 
         Returns tensor of shape [total_image_tokens, 1, hidden] or None.
@@ -5817,7 +5819,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         for request_id in active_request_ids:
             emb = self._request_to_image_embeddings.get(request_id, None)
             if emb is not None:
-                parts.append(emb.reshape(-1, emb.shape[-1]))
+                parts.append(emb.transpose(0, 1).reshape(-1, emb.shape[-1]))
         if not parts:
             return None
         return torch.cat(parts, dim=0).unsqueeze(1)

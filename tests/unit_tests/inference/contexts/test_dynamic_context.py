@@ -83,6 +83,50 @@ def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
     assert context.is_decode_only() is False
 
 
+def test_media_positions_read_static_tiles_in_prompt_order():
+    """Each media position reads the embedding its mask index names, tile by tile.
+
+    The vision encoder returns static-tiling embeddings as `[per_tile, tiles, hidden]`,
+    while prompt expansion numbers media positions tile by tile, as LLaVA's own forward
+    places them. A text-only request, a two-tile request and a one-tile request share the
+    prefill step.
+    """
+    hidden, per_tile = 3, 2
+    # Embedding value 100 * request + 10 * tile + position within the tile.
+    tiled = torch.tensor(
+        [[[810 + p] * hidden for p in (0, 10)], [[811 + p] * hidden for p in (0, 10)]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    assert tiled.shape == (per_tile, 2, hidden)
+    single = torch.tensor([[[900] * hidden], [[901] * hidden]], dtype=torch.float32, device="cuda")
+    masks = {
+        8: torch.tensor([-1, 0, 1, 2, 3, -1], device="cuda"),
+        9: torch.tensor([0, 1, -1], device="cuda"),
+    }
+    expected = {8: [810, 811, 820, 821], 9: [900, 901]}
+
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context._request_to_image_embeddings = {}
+    context._request_to_image_token_mask = {}
+    context._request_to_image_token_count = {}
+    context.add_vlm_request_data(8, image_embeddings=tiled, image_token_mask=masks[8])
+    context.add_vlm_request_data(9, image_embeddings=single, image_token_mask=masks[9])
+    context.paused_request_count = 0
+    context.total_request_count = 3
+    context.request_ids = torch.tensor([7, 8, 9], device="cuda")
+    context.request_query_lengths = torch.tensor([2, 6, 3], device="cuda")
+    context.request_kv_length_offsets = torch.zeros(3, dtype=torch.long, device="cuda")
+    context.padded_active_token_count = 11
+    context.is_decode_only = lambda: False
+
+    mask = context.current_image_token_mask()[0]
+    embeddings = context.current_image_embeddings()
+    flat = embeddings.permute(1, 0, 2).reshape(-1, hidden)[:, 0]
+    read = flat[mask[mask >= 0]].tolist()
+    assert read == expected[8] + expected[9]
+
+
 def _processed_rows_context(sampling_and_counts, num_sampled=None):
     """Build a sampling context and final-row indices for expected processed log-probs.
 
