@@ -13,6 +13,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
+    destroy_copied_amax_groups,
     forbid_global_amax_group,
     global_amax_group,
     record_amax_groups,
@@ -74,6 +75,10 @@ class TestAmaxReductionGroupHelper:
 class TestAmaxReductionGroupOnGrids:
 
     def teardown_method(self, method):
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if getattr(self, "grid", None) is not None:
+            self.grid.destroy()
+        destroy_copied_amax_groups()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
@@ -155,7 +160,7 @@ class TestAmaxReductionGroupOnGrids:
         # Global grid: TP=1 and PP=2, so the global amax group is the DP group of a stage.
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
         # Custom grid: PP is the fastest dimension, so its TP groups cross the global stages.
-        grid = HyperCommGrid([2, world_size // 2, 1, 1], ["pp", "tp", "cp", "dp"])
+        grid = self.grid = HyperCommGrid([2, world_size // 2, 1, 1], ["pp", "tp", "cp", "dp"])
         pg_collection = ProcessGroupCollection(
             tp_cp=grid.create_pg(["tp", "cp"]), tp_dp_cp=grid.create_pg(["tp", "cp", "dp"])
         )

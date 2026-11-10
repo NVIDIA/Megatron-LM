@@ -2755,10 +2755,12 @@ class TestCudaGraphManagerProcessGroups:
         _CudagraphGlobalRecord._disable_saved_tensors_observer()
         CudaGraphManager.global_mempool = None
         torch.cuda.set_stream(torch.cuda.default_stream())
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if getattr(self, "model_pp_group", None) is not None:
+            torch.distributed.destroy_process_group(self.model_pp_group)
         Utils.destroy_model_parallel()
 
-    @staticmethod
-    def _model_pipeline_group(global_pp):
+    def _model_pipeline_group(self, global_pp):
         """Initialize a global grid with `global_pp` stages and return the model's PP group.
 
         The model's pipeline size differs from the global one: under a global PP of 1 the model
@@ -2772,8 +2774,8 @@ class TestCudaGraphManagerProcessGroups:
         if global_pp == 2:
             return None
         pairs = [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
-        group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
-        return group
+        self.model_pp_group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
+        return self.model_pp_group
 
     @pytest.mark.parametrize("global_pp", [1, 2])
     def test_function_manager_follows_module_pipeline_group(self, monkeypatch, global_pp):
