@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
+from .moe_routing_replay import MoERoutingReplayCache
 from .prefix_cache_block_state import (  # noqa: F401 # pylint: disable=unused-import
     MAX_CACHED_PROMPT_TOP_N_LOGPROBS,
     PrefixCacheBlockState,
@@ -24,7 +25,7 @@ class KVBlockAllocator:
 
     - The free-pool stack (`block_bag`, `pool_avail`).
     - Allocation, release, retain, and reset orchestration.
-    - The MoE routing-replay per-block storage.
+    - The MoE routing-replay per-block storage (`routing_replay`).
 
     Args:
         context (DynamicInferenceContext): Dynamic inference context.
@@ -74,8 +75,10 @@ class KVBlockAllocator:
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
         self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
 
-        # Per-block MoE routing storage (populated when routing replay is enabled)
-        self.block_routing: Dict[int, np.ndarray] = {}
+        # MoE routing-replay storage.
+        self.routing_replay = MoERoutingReplayCache(
+            block_size_tokens=context.block_size_tokens, dummy_block_idx=self.dummy_block_idx
+        )
 
     @property
     def enable_prefix_caching(self) -> bool:
@@ -180,9 +183,10 @@ class KVBlockAllocator:
             self.pc_state.on_allocate(block_ids, self.context.prefix_cache_lru_clock)
 
         # Clear stale per-block data for re-allocated blocks.
-        for bid in block_ids.tolist():
-            self.block_routing.pop(bid, None)
-            if self.pc_state is not None:
+        block_ids_list = block_ids.tolist()
+        self.routing_replay.clear_for_reallocated(block_ids_list)
+        if self.pc_state is not None:
+            for bid in block_ids_list:
                 self.pc_state.block_prompt_logprobs.pop(bid, None)
 
         return block_ids
@@ -247,7 +251,7 @@ class KVBlockAllocator:
             self.registry.clear_kv()
 
         # Clear per-block storage.
-        self.block_routing.clear()
+        self.routing_replay.reset()
 
     def _push_to_pool(self, blocks: Tensor) -> None:
         """Push blocks back onto the free-pool stack."""
@@ -387,124 +391,6 @@ class KVBlockAllocator:
         self._push_to_pool(victims)
         self._notify_deregistered(victims, hashes)
         return True
-
-    # =========================================================================
-    # Per-block routing storage methods (for MoE routing replay)
-    # =========================================================================
-
-    def store_routing_per_block(
-        self, flat_routing: np.ndarray, block_ids: np.ndarray, positions: np.ndarray
-    ) -> None:
-        """Scatter flat routing indices into per-block storage.
-
-        Matched prefix-cache blocks already contain routing from the original
-        request and are absent from this forward's token layout.
-
-        Args:
-            flat_routing: ndarray of shape [active_token_count, num_layers, topk]
-                aligned with the supplied token layout.
-            block_ids: KV-block ID for each routing row.
-            positions: Position within the KV block for each routing row.
-        """
-        token_count = flat_routing.shape[0]
-        if token_count == 0:
-            return
-
-        assert block_ids.shape == (
-            token_count,
-        ), f"Routing block IDs shape {block_ids.shape} != ({token_count},)"
-        assert positions.shape == (
-            token_count,
-        ), f"Routing positions shape {positions.shape} != ({token_count},)"
-
-        dummy = self.dummy_block_idx
-
-        # Group tokens by block_id using sort for efficient scatter
-        unique_blocks, inverse, counts = np.unique(
-            block_ids, return_inverse=True, return_counts=True
-        )
-        sorted_indices = np.argsort(inverse, kind='stable')
-        sorted_positions = positions[sorted_indices]
-        sorted_routing = flat_routing[sorted_indices]
-
-        offset = 0
-        for bid, count in zip(unique_blocks, counts):
-            bid = int(bid)
-            count = int(count)
-            if bid == dummy:
-                offset += count
-                continue
-            block_pos = sorted_positions[offset : offset + count]
-            block_rout = sorted_routing[offset : offset + count]
-            self.store_block_routing(bid, block_pos, block_rout)
-            offset += count
-
-    def reconstruct_routing_from_blocks(
-        self, block_ids: list[int], total_routing_tokens: int
-    ) -> Optional[np.ndarray]:
-        """Reconstruct routing indices from per-block storage.
-
-        Concatenates per-block routing ndarrays in block order, trimming the
-        last block to exactly ``total_routing_tokens`` entries.
-
-        Args:
-            block_ids: Ordered list of block IDs for the request.
-            total_routing_tokens: Expected number of routing tokens
-                (total_tokens - 1, since the last generated token has no
-                forward-pass routing).
-
-        Returns:
-            ndarray [total_routing_tokens, num_layers, topk] or None if any
-            required block is missing routing data.
-        """
-        block_size = self.context.block_size_tokens
-        routing_parts = []
-        tokens_collected = 0
-
-        for bid in block_ids:
-            # Speculative preparation can add a trailing block the result does not need.
-            remaining = total_routing_tokens - tokens_collected
-            if remaining <= 0:
-                break
-            routing = self.get_block_routing(bid)
-            if routing is None:
-                return None  # Missing routing data for this block
-            take = min(block_size, remaining)
-            routing_parts.append(routing[:take])
-            tokens_collected += take
-
-        if not routing_parts or tokens_collected != total_routing_tokens:
-            return None
-
-        return np.concatenate(routing_parts, axis=0)
-
-    def store_block_routing(
-        self, block_id: int, positions: np.ndarray, routing: np.ndarray
-    ) -> None:
-        """Store routing indices for specific token positions in a block.
-
-        Args:
-            block_id: The block ID.
-            positions: ndarray of token positions within the block (1D, int).
-            routing: ndarray of routing data [num_positions, num_layers, topk].
-        """
-        if block_id not in self.block_routing:
-            self.block_routing[block_id] = np.zeros(
-                (self.context.block_size_tokens, routing.shape[-2], routing.shape[-1]),
-                dtype=routing.dtype,
-            )
-        self.block_routing[block_id][positions] = routing
-
-    def get_block_routing(self, block_id: int) -> Optional[np.ndarray]:
-        """Get routing indices for a block.
-
-        Args:
-            block_id: The block ID.
-
-        Returns:
-            ndarray [block_size_tokens, num_layers, topk] or None if not stored.
-        """
-        return self.block_routing.get(block_id)
 
     # =========================================================================
     # Per-block prompt log-prob storage (for prefix-cached prompt scoring)
