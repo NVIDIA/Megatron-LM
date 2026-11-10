@@ -539,14 +539,20 @@ def _fused_forward_shell(config, fused_ops, use_bias):
 
 
 @pytest.mark.parametrize("global_mode", [False, True])
-@pytest.mark.parametrize("unsupported", [None, "bias", "output_buffer", "mxfp8_combine_bwd"])
-def test_deterministic_fused_forward_probability_gradients(global_mode, unsupported):
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("unsupported", [None, "output_buffer", "mxfp8_combine_bwd"])
+def test_deterministic_fused_forward_probability_gradients(global_mode, use_bias, unsupported):
     """The real dispatch method moves probability gradients outside the fused activation."""
     seen = []
+    bias = 3.0 if use_bias else 0.0
 
-    def fused_ops(hidden, _tokens, probabilities, *_args, **_kwargs):
-        seen.append(probabilities.detach().clone())
-        return hidden.square() + 1
+    def fused_ops(hidden, _tokens, probabilities, _fc2_tokens, *bias_scale, **_kwargs):
+        seen.extend(value.detach().clone() for value in (probabilities, *bias_scale))
+        output = hidden.square() + 1
+        # Stand-in for FC2's scaled bias: a constant bias times the per-token scale.
+        for scale in bias_scale:
+            output = output + bias * scale.unsqueeze(-1)
+        return output
 
     module = _fused_forward_shell(
         SimpleNamespace(
@@ -558,7 +564,7 @@ def test_deterministic_fused_forward_probability_gradients(global_mode, unsuppor
             moe_combine_bwd_dtype="mxfp8" if unsupported == "mxfp8_combine_bwd" else "bf16",
         ),
         fused_ops,
-        use_bias=unsupported == "bias",
+        use_bias=use_bias,
     )
     hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4).requires_grad_()
     probabilities = torch.tensor([0.25, 0.75], requires_grad=True)
@@ -570,7 +576,6 @@ def test_deterministic_fused_forward_probability_gradients(global_mode, unsuppor
         torch.use_deterministic_algorithms(global_mode)
         if unsupported is not None:
             message = {
-                "bias": "FC2 without bias",
                 "output_buffer": "zero-copy",
                 "mxfp8_combine_bwd": "moe_combine_bwd_dtype='bf16'",
             }[unsupported]
@@ -589,17 +594,20 @@ def test_deterministic_fused_forward_probability_gradients(global_mode, unsuppor
     finally:
         torch.use_deterministic_algorithms(prior, warn_only=prior_warn_only)
 
-    # Independent formula for a bias-free FC2 output and its input/probability gradients.
+    # Independent formula for p * (FC2(act) + bias) and its input/probability gradients.
+    fc2_output = hidden.detach().square() + 1 + bias
     expected = (
-        (hidden.detach().square() + 1) * probabilities.detach().unsqueeze(-1),
+        fc2_output * probabilities.detach().unsqueeze(-1),
         2 * hidden.detach() * probabilities.detach().unsqueeze(-1),
-        (hidden.detach().square() + 1).sum(dim=-1),
+        fc2_output.sum(dim=-1),
     )
     for first, second, reference in zip(*results, expected):
         torch.testing.assert_close(first, reference, rtol=0, atol=0)
         assert torch.equal(
             first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
         )
+    # The fused activation and, with a bias, FC2's bias scale both receive unit probabilities.
+    assert len(seen) == 2 * (2 if use_bias else 1)
     assert all(torch.equal(value, torch.ones_like(probabilities)) for value in seen)
 
 

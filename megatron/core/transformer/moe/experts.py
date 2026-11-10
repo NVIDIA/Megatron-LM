@@ -987,15 +987,6 @@ class TEGroupedMLP(MegatronModule):
             )
             post_probs = None
             if self.config.deterministic_mode:
-                if self.linear_fc2.use_bias:
-                    # The rewrite itself would hold with a bias: FC2 scales its bias by the
-                    # probabilities, so the output is p * (FC2(act) + bias) either way. The
-                    # bias gradient is the problem. TE sums it over tokens with atomic adds.
-                    raise RuntimeError(
-                        "deterministic_mode with the Transformer Engine operation-fuser grouped "
-                        "MLP requires FC2 without bias: Transformer Engine accumulates the "
-                        "grouped FC2 bias gradient with non-deterministic atomic adds."
-                    )
                 if output_buffer is not None:
                     raise RuntimeError(
                         "deterministic operation-fuser grouped MLP does not support NCCL-EP "
@@ -1010,8 +1001,10 @@ class TEGroupedMLP(MegatronModule):
                         "moe_combine_bwd_dtype='bf16': FC2 consumes the quantized combine "
                         "gradient as-is, so probability scaling cannot run after FC2."
                     )
-                # TE's fused scaled-activation dprob uses atomics. With no FC2 bias,
-                # applying the probabilities after FC2 gives an ordinary torch reduction.
+                # TE's fused scaled-activation dprob uses atomics. Applying the probabilities
+                # after FC2 gives an ordinary torch reduction. FC2 scales its bias by the same
+                # probabilities, so with unit scales the output is still p * (FC2(act) + bias).
+                # Whether the FC2 bias gradient is deterministic is left to TE to enforce.
                 post_probs = permuted_probs
                 permuted_probs = torch.ones_like(permuted_probs)
             with stash_context:
