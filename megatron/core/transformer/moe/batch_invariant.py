@@ -9,6 +9,7 @@ from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
+from megatron.core.transformer.moe.ep_invariant_combine import tree_combine
 
 try:
     import triton
@@ -327,6 +328,7 @@ def unpermute(
     probs: Optional[torch.Tensor],
     num_experts: int,
     inverse_map: torch.Tensor,
+    ep_invariant: bool = False,
     ep_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Batch-invariant MoE unpermute.
@@ -340,7 +342,14 @@ def unpermute(
     deprecated: the size of the global expert-parallel group is used, with a
     ``ProcessGroupFallbackWarning``. A size set with
     ``parallel_state.set_expert_model_parallel_world_size()`` is not used.
+
+    With ``ep_invariant`` (``moe_ep_invariant_combine``) the token's rows are summed
+    over the fixed combine tree of ``ep_invariant_combine`` instead, which gives the
+    same bits at every EP size.
     """
+    if ep_invariant:
+        out = tree_combine(permuted_tokens, inverse_map[0], inverse_map[1], num_experts, probs)
+        return out.view(restore_shape).to(permuted_tokens.dtype)
     if ep_size is None:
         # Deprecated fallback for callers that do not pass their dispatcher's EP size.
         ep_group = resolve_process_groups(
