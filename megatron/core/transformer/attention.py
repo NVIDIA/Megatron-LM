@@ -338,6 +338,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 # SelfAttention.run_realtime_tests compares the Q/K layernorm parameters across
                 # the data-parallel group as well.
                 required_pgs.append('dp_gtp_remat')
+            # The Transformer Engine linears built below reduce FP8/FP4 amaxes over these groups.
+            required_pgs += ['tp_cp', 'tp_dp_cp']
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
             groups = vars(pg_collection)

@@ -52,7 +52,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     no_sync_func,
     total_num_tokens,
     check_first_val_step,
-    cp_group_size,
+    cp_group_size=None,
 ):
     """Scheduler for 1f1b with no pipelining.
 
@@ -70,8 +70,13 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
 
     Every microbatch runs on the last (only) pipeline stage; ``cp_group_size`` is the
-    context-parallel size used to scale its loss.
+    context-parallel size used to scale its loss. Omitting it is deprecated: the loss step then
+    warns and reads the context-parallel size and the last stage from the global grid in
+    parallel_state.
     """
+
+    # Without a CP size, forward_step_calc_loss falls back to the global grid for both values.
+    is_last_stage = True if cp_group_size is not None else None
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
     fsdp_wrapper = find_megatron_fsdp(model)
@@ -96,7 +101,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         None,  # b_output_tensor_grad
         config,
         cp_group_size=cp_group_size,
-        is_last_stage=True,
+        is_last_stage=is_last_stage,
         collect_non_loss_data=collect_non_loss_data,
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
@@ -121,7 +126,7 @@ def combined_1f1b_schedule_for_no_pipelining(
                 output_tensor_grad,  # b_output_tensor_grad
                 config,
                 cp_group_size=cp_group_size,
-                is_last_stage=True,
+                is_last_stage=is_last_stage,
                 collect_non_loss_data=collect_non_loss_data,
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
@@ -144,7 +149,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor_grad,  # b_output_tensor_grad
         config,
         cp_group_size=cp_group_size,
-        is_last_stage=True,
+        is_last_stage=is_last_stage,
         fsdp_wrapper=fsdp_wrapper,
     )
     return forward_data_store, total_num_tokens
@@ -166,14 +171,15 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     check_first_val_step,
     is_first_microbatch_for_model_chunk,
     collect_non_loss_data,
-    cp_group_size,
-    pp_group,
     f_virtual_microbatch_id=None,
     b_virtual_microbatch_id=None,
     pre_forward=None,
     pre_backward=None,
     post_forward=None,
     post_backward=None,
+    *,
+    cp_group_size=None,
+    pp_group=None,
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
@@ -190,6 +196,9 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
           - pre_forward, pre_backward, post_forward, post_backward
           - cp_group_size: the context-parallel size, used to scale the loss
           - pp_group: the pipeline-parallel group, used to find the last stage
+            Pass both or neither. Omitting both is deprecated: the loss step then warns and
+            reads the context-parallel size and the last stage from the global grid in
+            parallel_state.
         - Callables for the forward_step_helper() and backward_step_helper()
           - forward_step_helper_preprocess, forward_step_helper_postprocess
           - backward_step_helper_preprocess, backward_step_helper_postprocess
@@ -219,6 +228,12 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 # backward_step_helper_postprocess()
     """
 
+    if (cp_group_size is None) != (pp_group is None):
+        raise ValueError(
+            "combined_1f1b_schedule_for_interleaved_pipelining: provide both cp_group_size and "
+            "pp_group, or neither."
+        )
+
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
 
     # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
@@ -236,14 +251,16 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     f_model_chunk_id = None
     f_microbatch_id = None
     input_tensor = None
-    is_last_stage = False
+    # Without a pipeline group, forward_step_calc_loss falls back to the global grid.
+    is_last_stage = None
     if f_virtual_microbatch_id is not None:
         f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
     if f_virtual_microbatch_id is not None:
         f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
-        is_last_stage = is_vp_last_stage(
-            vp_stage=f_model_chunk_id, vp_size=config.virtual_pipeline_model_parallel_size
-        ) and is_pp_last_stage(pp_group)
+        if pp_group is not None:
+            is_last_stage = is_vp_last_stage(
+                vp_stage=f_model_chunk_id, vp_size=config.virtual_pipeline_model_parallel_size
+            ) and is_pp_last_stage(pp_group)
         input_tensor = forward_step_helper_preprocess(
             f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
         )
@@ -315,8 +332,6 @@ def combined_forward_backward_step(
     b_output_tensor,
     b_output_tensor_grad,
     config,
-    cp_group_size,
-    is_last_stage,
     f_model_chunk_id=None,
     pre_forward=None,
     pre_backward=None,
@@ -328,6 +343,9 @@ def combined_forward_backward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
     fsdp_wrapper=None,
+    *,
+    cp_group_size=None,
+    is_last_stage=None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -337,7 +355,9 @@ def combined_forward_backward_step(
             an input of schedule_chunk_1f1b function.
         cp_group_size (int): The context-parallel size, used to scale the forward loss.
         is_last_stage (bool): Whether the forward model chunk is the last pipeline stage,
-            counting virtual stages; only the last stage computes the loss.
+            counting virtual stages; only the last stage computes the loss. Omitting both
+            cp_group_size and is_last_stage is deprecated: forward_step_calc_loss then warns
+            and reads both from the global grid in parallel_state.
 
         Only exists in 1f1b steady state with p2p overlap.
             pre_forward (callable): The function to call before the forward_step.

@@ -33,7 +33,7 @@ from megatron.training import global_vars, training
 from megatron.training.arguments import parse_args
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.dist_checkpointing.utils import init_basic_mock_args
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 pytestmark = pytest.mark.skipif(
     Utils.world_size < 4 or Utils.world_size % 2 != 0, reason="Requires an even world of 4+ ranks"
@@ -57,9 +57,15 @@ def _config():
     return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1, bf16=True)
 
 
+# Groups the tests create outside parallel_state; teardown_method destroys them.
+_test_groups = []
+
+
 def _same_ranks(group):
-    """A new communicator over the ranks of ``group``."""
-    return torch.distributed.new_group(ranks=torch.distributed.get_process_group_ranks(group))
+    """A new communicator over the ranks of ``group``, destroyed when the test ends."""
+    new_group = torch.distributed.new_group(ranks=torch.distributed.get_process_group_ranks(group))
+    _test_groups.append(new_group)
+    return new_group
 
 
 def _ranks(group):
@@ -97,6 +103,12 @@ class _OptimizerBuilt(Exception):
 class TestTrainingPgCollection:
 
     def teardown_method(self, method):
+        if _test_groups:
+            # Every rank finishes its collectives before any communicator goes away.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            while _test_groups:
+                torch.distributed.destroy_process_group(_test_groups.pop())
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("create_all_gather_group", [False, True])
@@ -113,6 +125,10 @@ class TestTrainingPgCollection:
         if not create_all_gather_group:
             assert pg_collection.dp_cp_ag is None and pg_collection.expt_dp_ag is None
             return
+        # A missing group would pass the comparisons below: None is not dp_cp, and the ranks of
+        # None are those of the default group, which dp_cp spans on this grid.
+        assert pg_collection.dp_cp_ag is not None
+        assert pg_collection.expt_dp_ag is not None
         # Separate communicators over the data-parallel ranks that Megatron-FSDP gathers over.
         assert pg_collection.dp_cp_ag is not pg_collection.dp_cp
         assert _ranks(pg_collection.dp_cp_ag) == _ranks(pg_collection.dp_cp)
@@ -139,6 +155,16 @@ class TestTrainingPgCollection:
             training._build_pg_collection_from_parallel_state(args)
 
     @pytest.mark.usefixtures("run_config")
+    def test_all_gather_groups_reject_several_optimizer_instances(self):
+        # Megatron-FSDP then shards over the intra-instance group, which has half of the
+        # data-parallel ranks that the all-gather group spans.
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
+        args = SimpleNamespace(create_all_gather_group=True)
+
+        with pytest.raises(ValueError, match="--num-distributed-optimizer-instances > 1"):
+            training._build_pg_collection_from_parallel_state(args)
+
+    @pytest.mark.usefixtures("run_config")
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
     def test_collection_carries_the_grid_gloo_groups(self, use_gloo_process_groups):
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
@@ -162,7 +188,7 @@ class TestTrainingPgCollection:
 
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
     def test_setup_builds_the_optimizer_on_the_collection(
-        self, monkeypatch, run_config, use_gloo_process_groups
+        self, request, monkeypatch, run_config, use_gloo_process_groups
     ):
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
         run_config.dist.use_gloo_process_groups = use_gloo_process_groups
@@ -173,12 +199,18 @@ class TestTrainingPgCollection:
         if use_gloo_process_groups:
             # Distinct Gloo communicators over the data-parallel ranks (every rank on this grid),
             # so the optimizer holds them only if it takes its Gloo groups from the collection.
-            pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(
-                ranks=_ranks(pg_collection.dp_cp), backend="gloo"
+            gloo_groups = ProcessGroupCollection(
+                intra_dp_cp_gloo=torch.distributed.new_group(
+                    ranks=_ranks(pg_collection.dp_cp), backend="gloo"
+                ),
+                intra_expt_dp_gloo=torch.distributed.new_group(
+                    ranks=_ranks(pg_collection.expt_dp), backend="gloo"
+                ),
             )
-            pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(
-                ranks=_ranks(pg_collection.expt_dp), backend="gloo"
-            )
+            # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+            request.addfinalizer(lambda: destroy_test_pg_collection(gloo_groups))
+            pg_collection.intra_dp_cp_gloo = gloo_groups.intra_dp_cp_gloo
+            pg_collection.intra_expt_dp_gloo = gloo_groups.intra_expt_dp_gloo
         config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
         model = DistributedDataParallel(
             config,
@@ -297,6 +329,7 @@ class TestTrainingPgCollection:
         pp_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
         )
+        _test_groups.append(pp_group)
         pg_collection = ProcessGroupCollection(pp=pp_group)
 
         def schedule(vp_size):

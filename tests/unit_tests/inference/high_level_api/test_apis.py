@@ -141,6 +141,30 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
             MegatronLLM(model=model, tokenizer=MagicMock(), use_coordinator=False)
 
+    @pytest.mark.parametrize("owner", ["model", "inference_config"])
+    @pytest.mark.parametrize("fields", [{}, {"ep": None}], ids=["absent", "none"])
+    def test_collection_without_ep_group_needs_no_coordinator(self, mock_pipeline, owner, fields):
+        """A collection that leaves ``ep`` unset, or sets it to None, has no expert parallelism,
+        so direct mode is allowed. The global EP size is not read."""
+        pg_collection = ProcessGroupCollection(**fields)
+        if owner == "model":
+            model = MagicMock()
+            model.config = MagicMock()
+            model.pg_collection = pg_collection
+            inference_config = None
+        else:
+            model = MagicMock(spec=["config"])
+            inference_config = InferenceConfig(pg_collection=pg_collection)
+
+        llm = MegatronLLM(
+            model=model,
+            tokenizer=MagicMock(),
+            inference_config=inference_config,
+            use_coordinator=False,
+        )
+
+        assert llm._use_coordinator is False
+
     def test_ep_group_of_inference_config(self, mock_pipeline):
         """A collection set on the inference config, which the engine runs on, is checked
         before the model's."""
