@@ -7,6 +7,8 @@ main-gradient dtype when it is unset, independently of the compute-gradient dtyp
 training must still track an unsharded baseline in either reduction dtype.
 """
 
+from copy import deepcopy
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -32,6 +34,196 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
     QuantizedDBuffer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+
+
+class FusedLayer(nn.Module):
+    """Mix fused wgrad with ordinary gradients, including a shared embedding/head."""
+
+    def __init__(self, kind, device):
+        super().__init__()
+        kwargs = dict(
+            device=device,
+            params_dtype=torch.bfloat16,
+            fuse_wgrad_accumulation=True,
+            init_method=nn.init.eye_,
+        )
+        self.kind = kind
+        if kind == "grouped":
+            self.linear = te.GroupedLinear(2, 16, 16, **kwargs)
+        else:
+            self.linear = te.Linear(16, 16, **kwargs)
+        self.scale = nn.Parameter(torch.ones(16, device=device, dtype=torch.bfloat16))
+        if kind == "tied":
+            self.embedding = nn.Embedding(16, 16, device=device, dtype=torch.bfloat16)
+            self.embedding.weight = self.linear.weight
+
+    def forward(self, x):
+        """Exercise repeated fused writes and real autograd writes to the same weight."""
+        if self.kind == "grouped":
+            output = self.linear(x, [16, 16])
+        else:
+            output = self.linear(x)
+        if self.kind == "tied":
+            output = output + self.linear(x / 2)
+            output = output + self.embedding(torch.arange(x.shape[0], device=x.device) % 16)
+        return output * self.scale
+
+
+@pytest.mark.parametrize("kind", ["linear", "grouped", "tied"])
+@pytest.mark.parametrize(
+    ("strategy", "comm_dtype", "capture"),
+    [
+        pytest.param("optim", torch.float32, False, id="zero1"),
+        pytest.param("optim_grads_params", torch.float32, False, id="zero3"),
+        pytest.param("optim_grads_params", torch.bfloat16, False, id="zero3-cast"),
+        pytest.param("optim_grads_params", torch.float32, True, id="zero3-graph"),
+    ],
+)
+def test_fused_wgrad_matches_fp32_accumulation(
+    distributed_setup, monkeypatch, kind, strategy, comm_dtype, capture
+):
+    """Match fused FP32 gradients and SGD updates while RS inputs outlive their TE aliases."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(123)
+    model = nn.Sequential(*(FusedLayer(kind, device) for _ in range(3)))
+    reference = deepcopy(model)
+    expected_weights = {
+        name: p.detach().float().clone() for name, p in reference.named_parameters()
+    }
+    # TE's zero placeholders must preserve the embedding's ordinary gradient contribution.
+    for layer in reference:
+        if kind == "tied":
+            layer.linear.weight.zero_out_wgrad = True
+    sharded = strategy == "optim_grads_params"
+    placements = Placements(
+        dp_axes=[0],
+        parameter=[Shard(0) if sharded else Replicate()],
+        gradient=[Shard(0) if sharded else Partial("avg")],
+        optimizer=[Shard(0)],
+    )
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
+    ) as context:
+        for layer in model:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=placements,
+                grad_scale=0.5,
+                gradient_accumulation_fusion=True,
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    main_params_dtype=torch.float32,
+                    main_grads_dtype=torch.float32,
+                    grad_comm_dtype=comm_dtype,
+                ),
+            )
+        fully_shard(model, mesh=mesh, placements=placements)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    torch.manual_seed(37 + distributed_setup.rank)
+    inputs = torch.randn(3, 32, 16, device=device, dtype=torch.bfloat16)
+    allocate = FsdpParameterGroup.allocate_partial_grad_buffer
+    reduce_inner = FsdpParameterGroup.reduce_inner_gradients
+
+    def checked_allocate(group):
+        partial = allocate(group)
+        assert group.fused_grad_buffer is not None
+        assert (partial is group.fused_grad_buffer) == (comm_dtype == torch.float32)
+        return partial
+
+    def delayed_reduce(group, partial):
+        assert group.fused_grad_buffer is None
+        assert all(p.unsharded.main_grad is None for p in group.fsdp_parameters)
+        torch.cuda._sleep(100_000)
+        return reduce_inner(group, partial)
+
+    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", checked_allocate)
+    monkeypatch.setattr(FsdpParameterGroup, "reduce_inner_gradients", delayed_reduce)
+
+    def train():
+        optimizer.zero_grad(set_to_none=False)
+        losses = []
+        for mb, x in enumerate(inputs):
+            with finalize_gradients(context, enabled=mb == len(inputs) - 1):
+                loss = model(x).float().square().mean() / len(inputs)
+                loss.backward()
+            losses.append(loss.detach())
+            for layer in model:
+                assert all(group.fused_grad_buffer is None for group in layer.parameter_groups)
+                assert any(
+                    parameter.unsharded.grad_added_to_main_grad
+                    for group in layer.parameter_groups
+                    for parameter in group.fsdp_parameters
+                )
+            for _ in range(8):
+                torch.empty(256, device=device).fill_(1.0e6)
+        context.finish_grad_sync()
+        assert not context._pending_grad_buffers
+        optimizer.step()
+        return torch.stack(losses)
+
+    @torch.no_grad()
+    def check(actual_losses):
+        gradients = {name: torch.zeros_like(value) for name, value in expected_weights.items()}
+        losses = []
+        for x in inputs:
+            reference.zero_grad(set_to_none=True)
+            for p in reference.parameters():
+                p.main_grad = torch.zeros_like(p, dtype=torch.float32)
+                p.grad_added_to_main_grad = False
+            with torch.enable_grad():
+                loss = reference(x).float().square().mean() / len(inputs)
+                loss.backward()
+            losses.append(loss.detach())
+            for name, p in reference.named_parameters():
+                grad = p.main_grad
+                if not p.grad_added_to_main_grad or getattr(p, "zero_out_wgrad", False):
+                    grad = grad + p.grad
+                grad = grad.to(comm_dtype)
+                dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+                gradients[name].add_(grad, alpha=0.5)
+        torch.testing.assert_close(actual_losses, torch.stack(losses), rtol=1e-4, atol=1e-6)
+        for name, p in reference.named_parameters():
+            expected_weights[name].add_(gradients[name], alpha=-0.01)
+            p.copy_(expected_weights[name])
+        for layer_index, layer in enumerate(model):
+            for group in layer.parameter_groups:
+                for index, parameter in enumerate(group.fsdp_parameters):
+                    name = f"{layer_index}.{parameter.fqns[0]}"
+                    owned = group.main_weight._get_owned_range(index)
+                    if owned is None:
+                        continue
+                    for actual, expected in (
+                        (parameter.sharded.grad.to_local(), gradients[name]),
+                        (group.main_weight.get_tensor_view(index), expected_weights[name]),
+                    ):
+                        shard = expected.flatten().narrow(
+                            0, owned.tensor_relative_offset, owned.numel
+                        )
+                        torch.testing.assert_close(actual.flatten(), shard, rtol=1e-4, atol=1e-6)
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    for _ in range(2):
+        with torch.cuda.stream(stream):
+            losses = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(losses)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            losses = train()
+    for _ in range(3):
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            if capture:
+                graph.replay()
+            else:
+                losses = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(losses)
 
 
 class TinyModel(nn.Module):

@@ -251,6 +251,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
+            gradient_accumulation_fusion=config.gradient_accumulation_fusion,
             schedule_policy=schedule_policy,
             shard_layout=(
                 ShardLayout.PADDED
@@ -420,8 +421,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
                 "num_distributed_optimizer_instances > 1."
             )
-        if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1

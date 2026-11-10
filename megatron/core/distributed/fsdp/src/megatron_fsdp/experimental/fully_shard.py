@@ -96,6 +96,7 @@ def fully_shard(
     grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    gradient_accumulation_fusion: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -128,6 +129,9 @@ def fully_shard(
             ``ShardLayout.PADDED`` (default) pads every group to equal shards;
             ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
             boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
+        gradient_accumulation_fusion: Bind full FP32 gradient views for Transformer Engine
+            to write directly into FSDP's reduction input. Requires FP32 main gradients
+            and a TE version that reads ``weight.main_grad`` during backward.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -159,6 +163,7 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             shard_layout=shard_layout,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
     except Exception:
         module.__class__ = original_cls
