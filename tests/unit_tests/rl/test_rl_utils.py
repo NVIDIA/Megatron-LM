@@ -174,6 +174,55 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
 
 
+def test_build_rl_inference_model_forwards_the_training_collection(monkeypatch):
+    """The inference grid takes the sizes that the RL config leaves unset from the trained
+    model's collection, and the inference model is built on the collection of that grid."""
+    seen = {}
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=SimpleNamespace(context_parallel_size=1)),
+        dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+    )
+    inference_model = [MagicMock()]
+
+    def build_grid(world_size, **kwargs):
+        seen["grid"] = (world_size, kwargs)
+        return "inference_pg_collection"
+
+    def get_model(model_provider, model_type, **kwargs):
+        seen["model"] = (model_provider, model_type, kwargs)
+        return inference_model
+
+    monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "safe_get_world_size", lambda: 8)
+    monkeypatch.setattr(training_setup, "build_inference_pg_collection", build_grid)
+    monkeypatch.setattr(training_setup, "inference_model_alloc_context", nullcontext)
+    monkeypatch.setattr(training_setup, "get_model", get_model)
+    training_pg_collection = object()
+
+    built = training_setup.build_rl_inference_model(
+        RLConfig(rl_inference_tensor_model_parallel_size=2),
+        SimpleNamespace(inference_shards=None),
+        SimpleNamespace(tensor_model_parallel_size=1),
+        "provider",
+        "type",
+        training_pg_collection=training_pg_collection,
+    )
+
+    assert built is inference_model
+    world_size, grid_kwargs = seen["grid"]
+    assert world_size == 8
+    assert grid_kwargs["training_pg_collection"] is training_pg_collection
+    # Only the TP size is set; the grid takes the others from the training collection.
+    assert grid_kwargs["tp_size"] == 2
+    assert [grid_kwargs[name] for name in ("pp_size", "cp_size", "ep_size", "expt_tp_size")] == [
+        None
+    ] * 4
+    model_provider, model_type, model_kwargs = seen["model"]
+    assert (model_provider, model_type) == ("provider", "type")
+    assert model_kwargs["pg_collection"] == "inference_pg_collection"
+    assert model_kwargs["config"].tensor_model_parallel_size == 2
+
+
 @pytest.mark.parametrize(
     "optimizer, packing, correction, offload",
     [(None, True, False, True), ("optimizer", False, True, False)],
