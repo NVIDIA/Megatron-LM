@@ -315,7 +315,7 @@ def multimem_reduce_scatter_v(
         f"{row_bytes} bytes is not 16-byte aligned; RSV requires 128-bit alignment."
     )
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.grid_limit())
     MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
     WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
@@ -581,7 +581,7 @@ def multimem_all_gather_v(
     )
     bits = 128 if row_bytes % 16 == 0 else 64
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.grid_limit())
     MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
     WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
@@ -705,7 +705,7 @@ def multimem_all_gatherv_3tensor(
         symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.grid_limit())
     MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
     WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
