@@ -78,8 +78,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
     # Value tiles and (sequence, head) pairs share grid axis 0, the value tile varying fastest:
     # CUDA caps axes 1 and 2 at 65535 programs, which N * H passes from 2048 sequences of 32
-    # heads. int64 sequence and head indices, so the base offsets below are int64 products: a
-    # step's chunk states reach 2**31 elements at 262144 tokens of 32 heads with K = V = 128.
+    # heads. int64 sequence and head indices and sequence starts, so the base offsets below are
+    # int64 products: a step's chunk states reach 2**31 elements at 262144 tokens of 32 heads
+    # with K = V = 128, and bos * H itself at 2**31 / H expanded tokens.
     i_v = tl.program_id(0) % tl.cdiv(V, BV)
     i_nh = (tl.program_id(0) // tl.cdiv(V, BV)).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
@@ -89,6 +90,8 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        # T stays int32: the block pointers below take int32 offsets.
+        bos, boh = bos.to(tl.int64), boh.to(tl.int64)
     else:
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
