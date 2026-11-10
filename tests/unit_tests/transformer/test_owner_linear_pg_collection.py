@@ -3,8 +3,8 @@
 """Owners build their linear projections with their own process-group collection.
 
 MLA (plain, fused and absorbed), cross-attention, the DSA, simplified DSA and CSA indexers, the CSA
-compressor and GDN hold a collection and pass it, with its TP group, to every linear they build. A
-Transformer Engine linear reads its GTP replica group and the amax group of a per-module
+compressor, GDN and KDA hold a collection and pass it, with its TP group, to every linear they
+build. A Transformer Engine linear reads its GTP replica group and the amax group of a per-module
 quantization recipe from that collection, and falls back to the global groups without one.
 
 An owner built without a collection falls back to one from the global grid. That collection
@@ -12,7 +12,7 @@ carries the GTP weight-remat groups that the owner's linears read, if any, so th
 fall back for them as well: with GTP off, the omission warns once.
 
 Without CUDA, the local-spec owners build on CPU in one process with a gloo group; the Transformer
-Engine and GDN owners need GPUs.
+Engine, GDN and KDA owners need GPUs.
 """
 
 import re
@@ -35,7 +35,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import (
+    HAVE_FLA,
+    HAVE_FLA_KDA,
+    GatedDeltaNet,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction
@@ -652,6 +659,50 @@ class TestTransformerEngineOwnersPassTheirCollection:
             assert isinstance(linear, te_classes)
             assert linear.given_pg_collection is owner_pg_collection
             assert linear._pg_collection is owner_pg_collection
+
+    @pytest.mark.skipif(not HAVE_FLA_KDA, reason="KDA needs FLA with KDA support")
+    def test_kda_passes_its_collection(self, monkeypatch, owner_pg_collection):
+        """KDA's beta and two-stage gate projections get its collection, so none falls back."""
+        config = KDALayerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            kda_two_stage_gates=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+        )
+        submodules = KimiDeltaAttentionSubmodules(
+            in_proj=TEColumnParallelLinear,
+            beta_proj=TEColumnParallelLinear,
+            f_a_proj=TELinear,
+            f_b_proj=TEColumnParallelLinear,
+            g_a_proj=TELinear,
+            g_b_proj=TEColumnParallelLinear,
+            out_norm=TENorm,
+            out_proj=TERowParallelLinear,
+        )
+        te_classes = self._te_linear_classes()
+        _record_given_collections(monkeypatch, te_classes)
+        # A linear that an earlier test built without a collection must not hide the warning.
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            kda = KimiDeltaAttention(
+                config, submodules, layer_number=1, pg_collection=owner_pg_collection
+            )
+
+        for name in ("beta_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"):
+            linear = getattr(kda, name)
+            assert isinstance(linear, te_classes), name
+            assert linear.given_pg_collection is owner_pg_collection, name
+            assert linear._pg_collection is owner_pg_collection, name
 
     def test_split_layernorm_linear_keeps_the_collection(self, owner_pg_collection):
         """MLA's latent cache splits linear_kv_up_proj; the split linear keeps its collection."""
