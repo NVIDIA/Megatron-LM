@@ -2754,6 +2754,24 @@ def _build_pg_collection_from_parallel_state(args, config=None, owner="pretrain"
             timeout=timeout,
             pg_collection=pg_collection,
         )
+        # The all-gather groups mirror the full data-parallel groups. Megatron-FSDP shards its
+        # parameters over the intra-instance groups, which are the full groups only with one
+        # distributed optimizer instance.
+        for ag_group, group in (
+            (dp_cp_ag, pg_collection.intra_dp_cp),
+            (expt_dp_ag, pg_collection.intra_expt_dp),
+        ):
+            if (
+                ag_group is not None
+                and group is not None
+                and torch.distributed.get_process_group_ranks(ag_group)
+                != torch.distributed.get_process_group_ranks(group)
+            ):
+                raise ValueError(
+                    "--create-all-gather-group built all-gather groups whose ranks differ from "
+                    "the data-parallel groups Megatron-FSDP shards over. It does not support "
+                    "--num-distributed-optimizer-instances > 1."
+                )
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
 
