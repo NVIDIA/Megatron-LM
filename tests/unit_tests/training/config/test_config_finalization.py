@@ -278,14 +278,17 @@ def test_finalization_resolves_layer_wise_ddp_flag(
 
 
 @pytest.mark.parametrize(
-    "version, disable_symmetric_registration", [(1, False), (1, True), (2, False)]
+    "version, disable_symmetric_registration, model_overrides",
+    [(1, False, True), (1, True, True), (2, False, True), (2, False, False)],
 )
 def test_megatron_fsdp_finalization(
-    monkeypatch, run_config, version, disable_symmetric_registration
+    monkeypatch, run_config, caplog, version, disable_symmetric_registration, model_overrides
 ):
     monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    transformer.gradient_accumulation_fusion = model_overrides
+    transformer.deallocate_pipeline_outputs = model_overrides
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.checkpoint.ckpt_format = "fsdp_dtensor"
@@ -304,6 +307,7 @@ def test_megatron_fsdp_finalization(
         run_config.validate()
         assert run_config.to_dict() == before
         run_config.finalize()
+        assert not ddp.use_custom_fsdp
         assert ddp.fsdp_manual_registration is (version == 1)
         assert ddp.fsdp_double_buffer is (version == 1)
         assert ddp.average_in_collective is (version != 1 or disable_symmetric_registration)
@@ -316,6 +320,13 @@ def test_megatron_fsdp_finalization(
             assert not transformer.gradient_accumulation_fusion
             assert not transformer.deallocate_pipeline_outputs
             assert not ddp.fsdp_all_gather_in_start_param_sync
+    for field in ("gradient_accumulation_fusion", "deallocate_pipeline_outputs"):
+        warnings = [
+            message
+            for message in caplog.messages
+            if f"Disabling model.transformer.{field}" in message
+        ]
+        assert len(warnings) == int(version == 2 and model_overrides)
 
 
 @pytest.mark.parametrize("expert_override", [None, "no_shard"])

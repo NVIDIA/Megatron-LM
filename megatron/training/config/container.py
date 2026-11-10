@@ -584,7 +584,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                     raise ValueError(
                         "Megatron FSDP does not support single grouped MoE parameters."
                     )
-                if transformer.hybrid_context_parallel or transformer.dynamic_context_parallel:
+                if transformer.dynamic_context_parallel:
                     raise ValueError("Megatron FSDP does not support dynamic context parallelism.")
                 sharding = {
                     self.ddp.data_parallel_sharding_strategy,
@@ -689,11 +689,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "it unset."
             )
         dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
-        # The deprecated hybrid_context_parallel alias counts as the canonical flag here (Core
-        # warns about it in validate_without_tokenizer()); finalize() folds it and clears it.
-        if (
-            dataset.dynamic_context_parallel or dataset.hybrid_context_parallel
-        ) and not dynamic_context_parallel:
+        if dataset.dynamic_context_parallel and not dynamic_context_parallel:
             raise ValueError(
                 "data.dataset.dynamic_context_parallel=True disagrees with "
                 "model.transformer.dynamic_context_parallel=False; the container writes this field "
@@ -747,9 +743,19 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
-            if is_te_min_version("2.0.0"):
+            if self.ddp.fp8_param_gather and is_te_min_version("2.0.0"):
+                logger.warning(
+                    "Disabling ddp.fp8_param_gather: Torch FSDP2 does not support FP8 "
+                    "parameter gathering with Transformer Engine >= 2.0.0; "
+                    "falling back to unquantized parameter gathering."
+                )
                 self.ddp.fp8_param_gather = False
-            if not is_te_min_version("2.7.0.dev0"):
+            if self.ddp.fp4_param_gather and not is_te_min_version("2.7.0.dev0"):
+                logger.warning(
+                    "Disabling ddp.fp4_param_gather: Torch FSDP2 requires Transformer Engine "
+                    ">= 2.7.0.dev0 for FP4 parameter gathering; "
+                    "falling back to unquantized parameter gathering."
+                )
                 self.ddp.fp4_param_gather = False
         self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
         self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
@@ -759,7 +765,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.ddp.reduce_scatter_with_fp32_accumulation = False
             self.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation = False
         if self.ddp.use_megatron_fsdp:
-            self.ddp.use_custom_fsdp = True
             self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
             self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
             if self.ddp.megatron_fsdp_version == 1:
@@ -793,7 +798,17 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.ddp.align_param_gather = False
             if self.ddp.use_megatron_fsdp:
                 if self.ddp.megatron_fsdp_version == 2:
+                    if transformer.gradient_accumulation_fusion:
+                        logger.warning(
+                            "Disabling model.transformer.gradient_accumulation_fusion: "
+                            "Megatron FSDP v2 does not support gradient accumulation fusion."
+                        )
                     transformer.gradient_accumulation_fusion = False
+                    if transformer.deallocate_pipeline_outputs:
+                        logger.warning(
+                            "Disabling model.transformer.deallocate_pipeline_outputs: "
+                            "Megatron FSDP v2 requires pipeline output storage for autograd."
+                        )
                     transformer.deallocate_pipeline_outputs = False
                 if transformer.cuda_graph_impl != "none":
                     self.ddp.megatron_fsdp_cuda_graph_mode = True
@@ -816,9 +831,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
-            # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
-            # from the validation config, the layout from the required model config (the
-            # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
+            # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the required model config.
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size
@@ -829,7 +843,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             dataset.dynamic_context_parallel = bool(
                 getattr(transformer, "dynamic_context_parallel", False)
             )
-            dataset.hybrid_context_parallel = False
         self.data.finalize()
         if self.rl.requires_grad_buffer_offload:
             self.ddp.grad_buffer_offload = True

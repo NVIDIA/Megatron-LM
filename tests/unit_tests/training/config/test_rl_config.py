@@ -479,10 +479,17 @@ def test_ddp_finalization_rejects_aliasing_before_mutation(run_config):
     assert dataclasses.asdict(ddp) == before
 
 
-def test_ddp_finalization_preserves_subclass_fields(monkeypatch, run_config):
+@pytest.mark.parametrize("gather_precision", [None, "fp8", "fp4"])
+def test_ddp_finalization_preserves_subclass_fields(
+    monkeypatch, run_config, caplog, gather_precision
+):
     from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 
     monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    # Exercise the TE range where Torch FSDP2 falls back for both precisions.
+    monkeypatch.setattr(
+        "megatron.training.config.container.is_te_min_version", lambda version: version == "2.0.0"
+    )
     run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     ddp = TorchFullyShardedDataParallelConfig(reshard_after_forward=False)
     run_config.ddp = ddp
@@ -490,11 +497,24 @@ def test_ddp_finalization_preserves_subclass_fields(monkeypatch, run_config):
     run_config.train.global_batch_size = 8
     run_config.model.transformer.gradient_accumulation_fusion = False
     run_config.model.share_embeddings_and_output_weights = False
+    if gather_precision is not None:
+        setattr(ddp, f"{gather_precision}_param_gather", True)
+        setattr(
+            run_config.model.transformer,
+            gather_precision,
+            "hybrid" if gather_precision == "fp8" else "nvfp4",
+        )
     run_config.validate()
+    run_config.finalize()
     run_config.finalize()
     assert type(ddp) is TorchFullyShardedDataParallelConfig
     assert not ddp.reshard_after_forward
     assert ddp.grad_buffer_offload
+    assert not ddp.fp8_param_gather and not ddp.fp4_param_gather
+    warnings = [message for message in caplog.messages if "Disabling ddp.fp" in message]
+    assert len(warnings) == int(gather_precision is not None)
+    if gather_precision is not None:
+        assert f"ddp.{gather_precision}_param_gather" in warnings[0]
 
 
 @pytest.mark.parametrize("native_builder", [False, True])
