@@ -886,7 +886,7 @@ class TestHybridQKLayernorm:
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
-        from megatron.core.transformer.torch_norm import L2Norm
+        from megatron.core.ops.norm.torch_norm import L2Norm
 
         model = self._build_model(qk_l2_norm=True)
         attn = self._get_attention_layer(model)
@@ -1505,8 +1505,8 @@ class TestHybridWithDynamicInference:
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
-            hybrid_layer_pattern="M*",
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),  # 1 Mamba, 1 attention
+            hybrid_layer_pattern="M*",  # 1 Mamba, 1 attention
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.model = Float16Module(self.model.config, self.model)
 
