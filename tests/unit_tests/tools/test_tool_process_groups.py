@@ -3,6 +3,8 @@
 """The inference and embedding tools take their process groups from the model they run."""
 
 import importlib
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -95,14 +97,35 @@ def test_static_engine_pipeline_flag_follows_the_wrapper_group(pipeline_group, m
     assert engine.controller.inference_wrapped_model.model_is_pipeline_parallel is expected
 
 
-def test_disk_embedder_splits_blocks_over_the_model_data_parallel_group(monkeypatch, tmp_path):
-    """The block split uses the embedding model's data-parallel group, not the global one."""
-    pytest.importorskip("h5py")
+@pytest.fixture
+def embed(monkeypatch):
+    """The BERT embedding tool, imported with a stand-in for h5py where h5py is not installed.
+
+    h5py is not a dependency of this repository, and the tests here open no block file, so they
+    must not skip without it.
+    """
     pytest.importorskip("transformers")
+    have_h5py = True
+    try:
+        importlib.import_module("h5py")
+    except ImportError:
+        have_h5py = False
+        monkeypatch.setitem(sys.modules, "h5py", types.ModuleType("h5py"))
     # The embedding tool imports the BERT example's model provider as a top-level module.
     monkeypatch.syspath_prepend(str(_REPO_ROOT / "examples" / "bert"))
-    embed = importlib.import_module("tools.bert_embedding.embed")
+    try:
+        yield importlib.import_module("tools.bert_embedding.embed")
+    finally:
+        if not have_h5py:
+            # Forget the tool's modules, so that a later import does not find the stand-in.
+            for name in [name for name in sys.modules if name.startswith("tools.bert_embedding")]:
+                del sys.modules[name]
 
+
+def test_disk_embedder_splits_blocks_over_the_model_data_parallel_group(
+    embed, monkeypatch, tmp_path
+):
+    """The block split uses the embedding model's data-parallel group, not the global one."""
     data_parallel_group = object()
     block_split_calls = []
 
