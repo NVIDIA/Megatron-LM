@@ -105,31 +105,31 @@ class TestMfsdpV2PipelineSharedContext:
 
         # The whole point of the feature: all chunks share ONE context, so each chunk
         # must report the same context object as the first one.
-        first_context = wrapped_chunks[0].module.context
+        context = wrapped_chunks[0].module.context
         for wrapped_chunk in wrapped_chunks:
-            assert wrapped_chunk.module.context is first_context
+            assert wrapped_chunk.module.context is context
 
         # The shared context was finalized exactly once after the loop, so it is
         # ready to drive forward/backward without an extra finalize.
-        first_context.ensure_finalized()
+        context.ensure_finalized()
 
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
 
-        assert first_context.prefetch_order is PrefetchOrder.RECORDED
+        assert context.prefetch_order is PrefetchOrder.RECORDED
         inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
         expected = [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks] + [
             ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)
         ]
-        with first_context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+        with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
             for iteration in range(2):
                 outputs = [chunk(inputs) for chunk in wrapped_chunks]
                 for output in reversed(outputs):
                     output.float().sum().backward()
-                    assert first_context.is_recording_execution_order is (iteration == 0)
-                first_context.post_backward()
-                first_context.finish_grad_sync()
-                assert not first_context.is_recording_execution_order
-                assert list(first_context.execution_order) == expected
-                assert first_context.execution_order.position == 0
+                    assert context.is_recording_execution_order is (iteration == 0)
+                context.post_backward()
+                context.finish_grad_sync()
+                assert not context.is_recording_execution_order
+                assert list(context.execution_order) == expected
+                assert context.execution_order.position == 0
