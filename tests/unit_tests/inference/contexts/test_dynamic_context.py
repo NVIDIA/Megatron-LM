@@ -4792,6 +4792,58 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer log-probs need CUDA")
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [
+        ([5, 5], [0.0, 0.0]),  # top-k only
+        ([5, 0], [0.0, 0.0]),  # mixed with an unfiltered row
+        ([5, 0], [0.0, 0.9]),  # mixed with a top-p row
+    ],
+)
+def test_flashinfer_processed_log_probs_keep_kept_tokens_finite(top_k, top_p):
+    """A token top-k keeps has a finite processed log-probability, as with the torch
+    sampler, even when its fp32 probability underflows.
+
+    At temperature 0.05 the row's logits 9 and 4 scale to 180 and 80, so the four kept
+    runners-up have log-probability -100, below fp32's smallest normal probability.
+    """
+    pytest.importorskip("flashinfer")
+    n, vocab_size = len(top_k), 64
+    logits = torch.zeros(n, vocab_size, device="cuda", dtype=torch.float32)
+    logits[:, 1:5] = 4.0
+    logits[:, 50] = 9.0
+    temperature = torch.full((n,), 0.05)
+    top_k = torch.tensor(top_k, dtype=torch.int32)
+    top_p = torch.tensor(top_p)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=temperature.cuda(), top_k=top_k.cuda(), top_p=top_p.cuda()
+        ),
+        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        total_request_count=n,
+        paused_request_count=0,
+    )
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
+
+    log_probs = FlashInferSampling(vocab_size, torch.Generator(device="cuda")).log_probs_kernel(
+        logits, context
+    )
+    for row in range(n):
+        expected = torch.log_softmax(
+            TorchSampling.filter_logits(
+                logits[row : row + 1], 0.05, int(top_k[row]), float(top_p[row])
+            ),
+            dim=-1,
+        )[0]
+        assert torch.equal(torch.isfinite(log_probs[row]), torch.isfinite(expected)), row
+        kept = torch.isfinite(expected)
+        assert torch.allclose(log_probs[row][kept], expected[kept], atol=1e-4), row
+    assert torch.allclose(log_probs[0, 1:5], torch.full((4,), -100.0, device="cuda"), atol=1e-4)
+
+
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [
