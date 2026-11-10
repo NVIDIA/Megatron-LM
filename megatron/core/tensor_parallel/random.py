@@ -588,70 +588,111 @@ def model_parallel_cuda_manual_seed(
     Ranks and world sizes that are not passed explicitly come from ``pg_collection``, the
     process groups of the model being seeded, when it is given: ``tp``, ``ep``, ``expt_tp``
     (the expert tensor-parallel group, which can differ from ``tp``), ``gtp_remat`` and
-    ``expt_gtp_remat``. The collection must set all five; a group set to None means that
-    axis is off (rank 0, world size 1). The tracker is shared by the whole process, so its
+    ``expt_gtp_remat``. The collection should set all five; a group set to None means that
+    axis is off (rank 0, world size 1). A group that it leaves unset is deprecated: its rank
+    and world size then come from the global parallel state, with a
+    ``ProcessGroupFallbackWarning``. The tracker is shared by the whole process, so its
     states can follow the layout of only one model per process.
 
     Without ``pg_collection``, the ranks and world sizes that are not passed come from the
     global parallel state. This fallback is deprecated and emits a
-    ``ProcessGroupFallbackWarning``. It resolves the GTP_remat groups as the layers do without
-    a collection (``resolve_gtp_remat_group``), so those axes are off when the global parallel
-    state has no GTP_remat groups. A ``tp_rank``, ``ep_rank`` or ``etp_rank`` that is not passed
-    needs its global group: when the global parallel state is not initialized, this raises
-    ``RuntimeError`` instead of seeding every rank as rank 0.
+    ``ProcessGroupFallbackWarning``. Both fallbacks resolve the GTP_remat groups as the layers
+    do without a collection (``resolve_gtp_remat_group``), so those axes are off when the
+    global parallel state has no GTP_remat groups. A ``tp_rank``, ``ep_rank`` or ``etp_rank``
+    that is neither passed nor given by the collection needs its global group: when the global
+    parallel state is not initialized, this raises ``RuntimeError`` instead of seeding every
+    rank as rank 0.
     """
     if pg_collection is not None:
-        seed_groups = ("tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat")
-        missing = [name for name in seed_groups if name not in vars(pg_collection)]
-        if missing:
-            raise ValueError(
-                f"model_parallel_cuda_manual_seed: pg_collection must set {missing}; "
-                "set a group to None when its axis is off"
-            )
-        tp_group, ep_group, etp_group = pg_collection.tp, pg_collection.ep, pg_collection.expt_tp
-        gtp_remat_group = pg_collection.gtp_remat
-        egtp_remat_group = pg_collection.expt_gtp_remat
-    else:
-        # The ranks and world sizes that are not passed come from the global grid. A group left
-        # None here belongs to a rank or world size that was passed, and is not read below.
-        tp_group = ep_group = etp_group = gtp_remat_group = egtp_remat_group = None
-        if None in (tp_rank, ep_rank, etp_rank):
-            global_groups = resolve_process_groups(
-                None,
-                owner="model_parallel_cuda_manual_seed",
-                required=("tp", "ep", "expt_tp"),
+
+        def collection_sets(name: str) -> bool:
+            """Whether the collection sets the group; if not, warn that the global one is read."""
+            if name in vars(pg_collection):
+                return True
+            # Migration fallback: collections built before seeding read them, for example
+            # without the GTP_remat groups, keep the ranks of the global parallel state.
+            warn_global_process_group_fallback(
+                "model_parallel_cuda_manual_seed",
+                f"pg_collection.{name}",
                 deprecated_in="0.21",
                 removed_in="0.23",
             )
-            tp_group, ep_group, etp_group = (
-                global_groups.tp,
-                global_groups.ep,
-                global_groups.expt_tp,
+            return False
+
+        if tp_rank is None and collection_sets("tp"):
+            tp_rank = get_pg_rank(pg_collection.tp)
+        if ep_rank is None and collection_sets("ep"):
+            ep_rank = get_pg_rank(pg_collection.ep)
+        if etp_rank is None and collection_sets("expt_tp"):
+            etp_rank = get_pg_rank(pg_collection.expt_tp)
+        if (gtp_remat_rank is None or gtp_remat_world_size is None) and collection_sets(
+            "gtp_remat"
+        ):
+            if gtp_remat_rank is None:
+                gtp_remat_rank = get_pg_rank(pg_collection.gtp_remat)
+            if gtp_remat_world_size is None:
+                gtp_remat_world_size = get_pg_size(pg_collection.gtp_remat)
+        if (egtp_remat_rank is None or egtp_remat_world_size is None) and collection_sets(
+            "expt_gtp_remat"
+        ):
+            if egtp_remat_rank is None:
+                egtp_remat_rank = get_pg_rank(pg_collection.expt_gtp_remat)
+            if egtp_remat_world_size is None:
+                egtp_remat_world_size = get_pg_size(pg_collection.expt_gtp_remat)
+    # Ranks and world sizes that were neither passed nor given by the collection come from the
+    # global grid. A group left None here belongs to a rank or world size that is known by now,
+    # and is not read below.
+    tp_group = ep_group = etp_group = gtp_remat_group = egtp_remat_group = None
+    if None in (tp_rank, ep_rank, etp_rank):
+        if pg_collection is None:
+            argument = "pg_collection"
+        else:
+            # collection_sets() has warned about each group that the collection leaves unset.
+            # The fallback warns once per argument, so naming the first of them again here
+            # reads the global groups without a second warning.
+            unset = "tp" if tp_rank is None else "ep" if ep_rank is None else "expt_tp"
+            argument = f"pg_collection.{unset}"
+        global_groups = resolve_process_groups(
+            None,
+            owner="model_parallel_cuda_manual_seed",
+            required=("tp", "ep", "expt_tp"),
+            argument=argument,
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, ep_group, etp_group = global_groups.tp, global_groups.ep, global_groups.expt_tp
+        # get_pg_rank(None) is 0, so without a global grid every rank would seed as rank 0
+        # and the ranks of a group would share one RNG stream.
+        missing = [
+            f"{rank_name} (no global {group_name} group)"
+            for rank_name, rank, group_name, group in (
+                ("tp_rank", tp_rank, "tp", tp_group),
+                ("ep_rank", ep_rank, "ep", ep_group),
+                ("etp_rank", etp_rank, "expt_tp", etp_group),
             )
-            # get_pg_rank(None) is 0, so without a global grid every rank would seed as rank 0
-            # and the ranks of a group would share one RNG stream.
-            missing = [
-                f"{rank_name} (no global {group_name} group)"
-                for rank_name, rank, group_name, group in (
-                    ("tp_rank", tp_rank, "tp", tp_group),
-                    ("ep_rank", ep_rank, "ep", ep_group),
-                    ("etp_rank", etp_rank, "expt_tp", etp_group),
-                )
-                if rank is None and group is None
-            ]
-            if missing:
+            if rank is None and group is None
+        ]
+        if missing:
+            if pg_collection is None:
                 raise RuntimeError(
                     "model_parallel_cuda_manual_seed was called without pg_collection and "
                     f"without {', '.join(missing)}: the global parallel state is not "
                     "initialized, so there is no group to read the rank from. Pass "
                     "pg_collection, the process groups of the model being seeded, or the ranks."
                 )
-        if None in (gtp_remat_rank, egtp_remat_rank, gtp_remat_world_size, egtp_remat_world_size):
+            raise RuntimeError(
+                f"model_parallel_cuda_manual_seed was called without {', '.join(missing)} and "
+                "with a pg_collection that leaves these groups unset: the global parallel "
+                "state is not initialized, so there is no group to read the rank from. Set "
+                "them in pg_collection, to None when an axis is off, or pass the ranks."
+            )
+    if None in (gtp_remat_rank, egtp_remat_rank, gtp_remat_world_size, egtp_remat_world_size):
+        if pg_collection is None:
             warn_global_process_group_fallback(
                 "model_parallel_cuda_manual_seed", deprecated_in="0.21", removed_in="0.23"
             )
-            gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False, owner=None)
-            egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True, owner=None)
+        gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False, owner=None)
+        egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True, owner=None)
     if tp_rank is None:
         tp_rank = get_pg_rank(tp_group)
     if ep_rank is None:

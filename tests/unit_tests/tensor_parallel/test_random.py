@@ -1,12 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import warnings
 
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    enable_strict_process_group_fallbacks,
+)
 from megatron.core.tensor_parallel import random as random_module
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
@@ -326,14 +331,53 @@ def test_model_parallel_cuda_manual_seed_uses_pg_collection_groups(monkeypatch):
         Utils.destroy_model_parallel()
 
 
-def test_model_parallel_cuda_manual_seed_requires_pg_collection_groups(monkeypatch):
-    """A collection that leaves a seeding group unset is an error, not a global fallback."""
-    group = object()
-    pg_collection = ProcessGroupCollection(tp=group, ep=group, expt_tp=group)
-    with monkeypatch.context() as patch:
-        _forbid_global_process_groups(patch)
-        with pytest.raises(ValueError, match=r"\['gtp_remat', 'expt_gtp_remat'\]"):
+def test_model_parallel_cuda_manual_seed_falls_back_for_unset_pg_collection_groups(monkeypatch):
+    """A group that the collection leaves unset warns and keeps the rank of the global grid."""
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("needs a world size that is a multiple of 4")
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, gtp_remat_size=2)
+    try:
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        expected = _tracker_states()
+        assert get_gtp_remat_rng_tracker_name() in expected
+
+        # A collection from before seeding read the GTP_remat groups: it does not set them.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "ep", "expt_tp"]
+        )
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
             model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
+        actual = _tracker_states()
+        fallbacks = [
+            str(w.message) for w in record if issubclass(w.category, ProcessGroupFallbackWarning)
+        ]
+        assert len(fallbacks) == 2
+        assert "without `pg_collection.gtp_remat`" in fallbacks[0]
+        assert "without `pg_collection.expt_gtp_remat`" in fallbacks[1]
+        assert actual.keys() == expected.keys()
+        for name, state in expected.items():
+            assert torch.equal(actual[name], state), name
+
+        with warnings.catch_warnings():
+            enable_strict_process_group_fallbacks()
+            with pytest.raises(ProcessGroupFallbackWarning, match=r"pg_collection\.gtp_remat"):
+                model_parallel_cuda_manual_seed(
+                    1234, force_reset_rng=True, pg_collection=pg_collection
+                )
+            # Nothing is read from the global grid, so nothing warns, when the ranks and world
+            # sizes of the unset groups are passed.
+            model_parallel_cuda_manual_seed(
+                1234,
+                force_reset_rng=True,
+                gtp_remat_rank=0,
+                egtp_remat_rank=0,
+                gtp_remat_world_size=1,
+                egtp_remat_world_size=1,
+                pg_collection=pg_collection,
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_model_parallel_cuda_manual_seed_needs_a_global_grid_for_omitted_ranks():
