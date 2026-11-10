@@ -1625,7 +1625,10 @@ def validate_args(args, defaults={}):
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
     if args.fake_process_group:
-        assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
+        if args.moe_token_dispatcher_type == "flex":
+            from megatron.core.ops.moe.fake_deepep import validate_fake_flex_config
+
+            validate_fake_flex_config(args)
         # Disable gloo process groups for fake process group
         args.use_gloo_process_groups = False
         warn_rank_0('use_gloo_process_groups is set to False for fake process group.')

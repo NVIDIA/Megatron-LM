@@ -6325,6 +6325,11 @@ def build_train_valid_test_data_loaders(
     else:
         do_train, do_valid, do_test = False, False, False
 
+    if args.fake_process_group and not cfg.validation.skip_train:
+        # FakePG cannot broadcast rank 0's availability flag. Secondary TP
+        # ranks still need to run the requested memory-probe training steps.
+        do_train = (cfg.train.train_iters or 0) > 0
+
     broadcast_data_flags(do_train=do_train, do_valid=do_valid, do_test=do_test)
     return train_dataloader, valid_dataloaders, test_dataloader
 
