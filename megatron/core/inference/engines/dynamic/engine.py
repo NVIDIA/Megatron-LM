@@ -178,6 +178,9 @@ class DynamicInferenceEngine(
     gc_mode: str = "default"
     _in_custom_gc_mode: bool = False
     _gc_freeze_pending: bool = False
+    # Immutable so instances never share one set; reset() installs a mutable one. Read by
+    # suspend(), which tests also run on engines built via __new__.
+    stop_word_finished_request_ids: Set[int] = frozenset()
 
     @deprecate_args(
         *DEPRECATED_ARGS,
