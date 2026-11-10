@@ -346,8 +346,9 @@ def test_strided_hidden_states(
 
     Finding O8a-P1 (H100 dfw 21627808): on main the fp32 path reshapes such a view to [M, H]
     without a copy and hands it to TE's `general_gemm`, which reads it as contiguous: every row
-    but the first holds another row's logits. Expected to fail on main (expect-fail task); the
-    model call sites pass contiguous hidden states (reach in the packet doc)."""
+    but the first holds another row's logits. Fails on main (expect-fail task), passes with
+    s4m-lm-head-fp32-contiguous (`fix/lm-head-fp32-contiguous`); the model call sites pass
+    contiguous hidden states (reach in the packet doc)."""
     x2d, w = operands(tokens, hidden, vocab, "integer", seed=vocab + tokens)
     head = build_head(make_config(hidden), w, frozen=frozen)
     runtime_w = None
@@ -791,7 +792,8 @@ def test_batch_invariant_fp32_residual_stream(parallel, kind, monkeypatch):
     batch-invariant mode (triton) the forward must run alike, and the inference logits must be
     the training logits upcast, bit for bit.
 
-    Suspected finding O8a-P2: the batch-invariant TE RMSNorm returns its input's dtype (fp32),
+    Finding O8a-P2 (fails on main, passes with s4m-bi-rmsnorm-dtype, `fix/bi-rmsnorm-dtype`):
+    the batch-invariant TE RMSNorm returns its input's dtype (fp32),
     so the head's `torch.matmul` gets an fp32 input and a bf16 weight and
     `matmul_persistent` raises "Incompatible dtypes" (first seen with an fp32 learned position
     table, dfw 21627808). Focused case:

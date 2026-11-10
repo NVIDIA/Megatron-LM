@@ -367,15 +367,17 @@ def test_sanitizer_case():
 
 @pytest.mark.parametrize("backend", ["triton", "deepgemm"])
 def test_te_rmsnorm_module_output_dtype_follows_te(backend):
-    """TE's RMSNorm module returns its activation dtype (the parameter dtype) whatever the
-    input's: an fp32 residual stream into a bf16 norm gives bf16. The batch-invariant forward
-    that replaces it must return the same dtype and values within the bound of that output.
+    """TE's RMSNorm module converts its input to its activation dtype (the parameter dtype
+    outside autocast) and normalizes that: an fp32 residual stream into a bf16 norm gives bf16.
+    The batch-invariant forward that replaces it must return the same dtype and TE's values,
+    within the bound of the norm of the converted input.
 
-    Suspected finding O8a-P2 (post-audit batch): `_te_rmsnorm_forward_patched` returns the
-    input's dtype (`BatchInvariantRMSNormFn` casts back to `x.dtype`), so under triton/deepgemm
-    an fp32 residual stream (a learned fp32 position embedding, `fp32_residual_connection`)
-    reaches the next GEMM in fp32. The LM head's `torch.matmul` then fails ("Incompatible dtypes"
-    in `matmul_persistent`), see `test_lm_head_fp32_logits.py`."""
+    Finding O8a-P2 (dfw 21628724, hsg 8809176): on main `_te_rmsnorm_forward_patched` returns
+    the input's dtype (`BatchInvariantRMSNormFn` casts back to `x.dtype`), so under
+    triton/deepgemm an fp32 residual stream (`fp32_residual_connection`, a learned fp32 position
+    table) reaches the next GEMM in fp32, and the LM head's `torch.matmul` fails ("Incompatible
+    dtypes" in `matmul_persistent`), see `test_lm_head_fp32_logits.py`. Fails on main, passes
+    with s4m-bi-rmsnorm-dtype (`fix/bi-rmsnorm-dtype`)."""
     x, w = inputs(65, 1024, torch.float32, seed=9)
     w = w.to(torch.bfloat16)
     module = te_rmsnorm(1024, w, 1e-5, False)
@@ -386,10 +388,11 @@ def test_te_rmsnorm_module_output_dtype_follows_te(backend):
     assert (
         out.dtype == native.dtype
     ), f"{backend}: {out.dtype}, TE's own forward gives {native.dtype}"
+    converted = x.to(native.dtype)
     ou.assert_close_to_reference(
         out,
-        ou.fp64_reference(rmsnorm_reference, x, w, 1e-5, False),
-        trusted_rmsnorm(x, w, 1e-5, False).to(native.dtype),
+        ou.fp64_reference(rmsnorm_reference, converted, w, 1e-5, False),
+        trusted_rmsnorm(converted, w, 1e-5, False),
         dim=-1,
         what=f"TE RMSNorm on fp32 input under {backend}",
     )
