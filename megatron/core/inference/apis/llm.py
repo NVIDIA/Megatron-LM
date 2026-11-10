@@ -163,13 +163,19 @@ class MegatronLLM(_MegatronLLMBase):
         self._loop_manager.run_sync(self._resume_impl())
 
     def shutdown(self) -> None:
-        """Tear down the engine and runtime. Idempotent. Direct mode is a no-op."""
+        """Tear down the engine and runtime. Idempotent.
+
+        Direct mode has no runtime to stop; it only restores the process's garbage
+        collection, which the engine's ``gc_mode`` freezes and may disable while it serves.
+        """
         if self._shutdown_called:
             return
         self._shutdown_called = True
         self._stop_frontend_if_started()
         if not self._use_coordinator:
-            return  # direct mode: nothing to tear down
+            # The engine loop's shutdown does this in coordinator mode.
+            self._engine._exit_custom_gc_mode()
+            return
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._shutdown_impl())
         # Sync caller already on its own thread; no need for to_thread.

@@ -123,16 +123,28 @@ class TestLifecycleGuards:
         with pytest.raises(RuntimeError, match="use_coordinator=True"):
             getattr(llm, method)()
 
-    def test_sync_shutdown_is_noop_and_idempotent_in_direct_mode(
+    def test_sync_shutdown_restores_gc_and_is_idempotent_in_direct_mode(
         self, mock_pipeline, fake_model_and_tokenizer
     ):
+        """Direct mode has no runtime to stop, but its engine's ``gc_mode`` leaves the
+        heap frozen and may disable automatic collection; shutdown restores both once."""
         model, tok = fake_model_and_tokenizer
         llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
         llm.shutdown()
         assert llm._shutdown_called is True
+        llm._engine._exit_custom_gc_mode.assert_called_once_with()
         llm.shutdown()  # second call is a no-op
         assert llm._shutdown_called is True
+        llm._engine._exit_custom_gc_mode.assert_called_once_with()
         llm.wait_for_shutdown()  # also a no-op
+
+    def test_context_exit_restores_gc_in_direct_mode(
+        self, mock_pipeline, fake_model_and_tokenizer
+    ):
+        model, tok = fake_model_and_tokenizer
+        with MegatronLLM(model=model, tokenizer=tok, use_coordinator=False) as llm:
+            llm._engine._exit_custom_gc_mode.assert_not_called()
+        llm._engine._exit_custom_gc_mode.assert_called_once_with()
 
     def test_sync_generate_raises_on_worker_rank(self):
         llm = _make_worker_instance(MegatronLLM)
