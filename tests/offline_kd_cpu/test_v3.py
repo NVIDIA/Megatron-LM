@@ -59,7 +59,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "writer_mbs": mbs,
         "attention_mode": "causal",
         "prefix_stable": True,
-        "tokenizer": {"sha256": "test", "size": 3, "eod_id": 2},
+        "tokenizer": {"sha256": "test", "eod_id": 2},
         "logprob_vocab_size": 1 << 17,
     }
     noted = {
@@ -69,7 +69,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "data": {"kind": "blend", "blend": [[1.0, "corpus"]]},
         "split": "99,1,0",
         "seed": 7,
-        "num_samples": 1024,
+        "train_samples": 1024,
         "builder": "GPTDataset",
     }
     for key, value in (contract or {}).items():
@@ -511,7 +511,7 @@ def test_target_encoder_rejects_invalid_ids(index, value):
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
         {"logprob_vocab_size": 0},
-        {"tokenizer": {"size": 3}},
+        {"tokenizer": {"eod_id": 2}},
         {"writers": 0},
         {"first_sample": -1},
     ],
@@ -593,7 +593,7 @@ def test_tokenizer_fingerprint_is_canonical():
             return 3
 
     identity = codec.hf_tokenizer_identity(HF(), eod_id=2)
-    assert identity == {"sha256": first, "size": 3, "eod_id": 2}
+    assert identity == {"sha256": first, "eod_id": 2}
     assert codec.hf_tokenizer_identity(HF(), eod_id=0)["sha256"] == first  # EOD is not hashed.
 
 
@@ -1354,7 +1354,7 @@ def test_corpus_metadata_requires_the_epoch_size(tmp_path, runtime_environment):
     runtime.validate_options(args)
     args.kd_corpus_samples = 20
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
-    assert metadata["contract"]["num_samples"] == 20 and "num_samples" not in metadata["recorded"]
+    assert metadata["contract"]["num_samples"] == 20 and "train_samples" not in metadata["recorded"]
     assert "split" not in metadata["recorded"]
     metadata["contract"]["first_sample"] = 0
     codec.validate_metadata(metadata, corpus=True)
@@ -1399,7 +1399,7 @@ blend = importlib.import_module(f"{_namespace}.format.blend")
 def corpus_source(root, name, *, samples, iterations, base=0, contract=None):
     """Write a corpus source whose sample ``i`` has tokens (base + i) * 100 + position."""
     metadata = settings(contract=contract)
-    metadata["recorded"].pop("num_samples")
+    metadata["recorded"].pop("train_samples")
     metadata["contract"]["num_samples"] = samples  # Required for corpus sources.
     write_cache(
         root / name,
@@ -1574,22 +1574,65 @@ def test_corpus_blend_validation(tmp_path, runtime_environment, change, message)
 hf = importlib.import_module(f"{_namespace}.format.hf")
 
 
+class StudentTokenizer:
+    """A minimal Hugging Face tokenizer for the HF reference consumer."""
+
+    bos_token_id, eos_token_id, pad_token_id, unk_token_id = None, 2, None, None
+
+    def __init__(self, size=3):
+        self.size = size
+
+    def get_vocab(self):
+        return {chr(ord("a") + i): i for i in range(self.size)}
+
+    def __len__(self):
+        return self.size
+
+
+def hf_sources(root):
+    """Two corpus sources fingerprinted with :class:`StudentTokenizer`."""
+    two_sources(root, tokenizer=codec.hf_tokenizer_identity(StudentTokenizer(), eod_id=2))
+    return blend.plan(blend_config(root), budget=40)
+
+
+def test_hf_stream_checks_the_student_tokenizer(tmp_path):
+    manifest = hf_sources(tmp_path)
+    with pytest.raises(ValueError, match="tokenizer differs"):
+        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(4))
+    with pytest.raises(ValueError, match="smaller than the tokenizer"):
+        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(), student_vocab_size=2)
+
+
 def test_hf_stream_yields_a_ranks_samples_in_megatron_order(tmp_path):
-    two_sources(tmp_path)
-    manifest = blend.plan(blend_config(tmp_path), budget=40)
-    stream = hf.CorpusStream(str(tmp_path), manifest, rank=1, world_size=2, micro_batch_size=2)
+    manifest = hf_sources(tmp_path)
+    stream = hf.CorpusStream(
+        str(tmp_path),
+        manifest,
+        tokenizer=StudentTokenizer(),
+        rank=1,
+        world_size=2,
+        micro_batch_size=2,
+    )
     ids = [sample["sample_id"] for sample in stream]
     assert ids == [p for p in range(40) if (p % 4) // 2 == 1]
     resumed = hf.CorpusStream(
-        str(tmp_path), manifest, rank=1, world_size=2, micro_batch_size=2, start=20
+        str(tmp_path),
+        manifest,
+        tokenizer=StudentTokenizer(),
+        rank=1,
+        world_size=2,
+        micro_batch_size=2,
+        start=20,
     )
     assert [sample["sample_id"] for sample in resumed] == [p for p in ids if p >= 20]
 
 
 def test_hf_collate_aligns_labels_and_targets(tmp_path):
-    two_sources(tmp_path)
-    manifest = blend.plan(blend_config(tmp_path), budget=40)
-    samples = list(hf.CorpusStream(str(tmp_path), manifest, micro_batch_size=2))[:3]
+    manifest = hf_sources(tmp_path)
+    stream = hf.CorpusStream(
+        str(tmp_path), manifest, tokenizer=StudentTokenizer(), micro_batch_size=2
+    )
+    samples = list(stream)[:3]
     short = dict(samples[1])  # A shorter sample: its first 5 tokens and their target rows.
     rows = int((short["loss_mask"][:5] != 0).sum())
     for key in codec.TOKEN_FIELDS:
@@ -1658,7 +1701,7 @@ def test_teacher_identity_and_precision_are_recorded(
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
     assert metadata["provenance"]["teacher_precision"] == expected
     assert metadata["recorded"]["teacher"] == f"{tmp_path}@2000"
-    assert metadata["recorded"]["num_samples"] == args.train_iters * args.global_batch_size
+    assert metadata["recorded"]["train_samples"] == args.train_iters * args.global_batch_size
 
 
 def test_format_contract_imports_without_megatron():

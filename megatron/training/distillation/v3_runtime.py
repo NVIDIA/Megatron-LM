@@ -152,7 +152,12 @@ def _tokenizer_attr(tokenizer: Any, name: str) -> Any:
 
 
 def tokenizer_identity() -> dict[str, Any]:
-    """Describe the tokenizer with the format's canonical fingerprint.
+    """Describe the tokenizer with the format's canonical fingerprint."""
+    return _tokenizer_identity_and_size()[0]
+
+
+def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
+    """Return the tokenizer setting and the true (non-padded) vocabulary size.
 
     Hugging Face tokenizers (wrapped by Megatron) are fingerprinted exactly as a
     non-Megatron producer would, from ``get_vocab()`` and HF special-token IDs.
@@ -169,7 +174,7 @@ def tokenizer_identity() -> dict[str, Any]:
             and hasattr(candidate, "get_vocab")
             and hasattr(candidate, "__len__")
         ):
-            return hf_tokenizer_identity(candidate, eod_id=eod)
+            return hf_tokenizer_identity(candidate, eod_id=eod), len(candidate)
     try:
         vocab = tokenizer.vocab
     except NotImplementedError:
@@ -179,11 +184,8 @@ def tokenizer_identity() -> dict[str, Any]:
     if not isinstance(vocab, dict):
         raise ValueError("Offline KD v3 requires a tokenizer exposing its vocabulary mapping")
     special_ids = {role: _tokenizer_attr(tokenizer, role) for role in ("bos", "eos", "pad", "unk")}
-    return {
-        "sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab)),
-        "size": len(vocab),
-        "eod_id": eod,
-    }
+    identity = {"sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab)), "eod_id": eod}
+    return identity, len(vocab)
 
 
 def student_padding_divisor(args: Any) -> int:
@@ -307,7 +309,7 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             "data": _blend_identifiers(args),
             "split": getattr(args, "split", None),
             "seed": args.seed,
-            "num_samples": args.train_samples or args.train_iters * args.global_batch_size,
+            "train_samples": args.train_samples or args.train_iters * args.global_batch_size,
             "builder": (
                 "SFTDataset"
                 if args.sft
@@ -327,7 +329,7 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
     }
     if getattr(args, "kd_corpus_dump", None):
         # A corpus source's extent is part of its contract: it defines completeness.
-        settings["recorded"].pop("num_samples")
+        settings["recorded"].pop("train_samples")
         settings["contract"]["num_samples"] = args.kd_corpus_samples
         settings["recorded"].pop("split")  # A corpus source is never split.
         # A basename is useful provenance for replay, but insufficient to identify a
@@ -450,17 +452,18 @@ def initialize_dump_metadata(saver: Any) -> dict:
 def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = True) -> None:
     validate_metadata(metadata, replay=replay, blend=not replay)
     contract = metadata["contract"]
-    student_tokenizer = tokenizer_identity()
+    student_tokenizer, student_tokenizer_size = _tokenizer_identity_and_size()
     if contract["tokenizer"]["sha256"] != student_tokenizer["sha256"]:
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
     if contract["attention_mode"] == "causal_eod_reset" and contract["tokenizer"][
         "eod_id"
     ] != student_tokenizer.get("eod_id"):
         raise ValueError("Offline KD v3 EOD attention-boundary token mismatch")
-    if args.padded_vocab_size < contract["tokenizer"]["size"]:
+    # Matching fingerprints imply the same tokenizer, hence the same true size.
+    if args.padded_vocab_size < student_tokenizer_size:
         raise ValueError(
             f"Student vocabulary ({args.padded_vocab_size}) is smaller than the tokenizer "
-            f"({contract['tokenizer']['size']})"
+            f"({student_tokenizer_size})"
         )
     mode = attention_mode_for_layout(
         sft=args.sft,

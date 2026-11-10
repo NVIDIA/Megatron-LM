@@ -42,7 +42,7 @@ RECORDED_KEYS = (
     "data",
     "split",
     "seed",
-    "num_samples",
+    "train_samples",
     "builder",
 )
 
@@ -176,10 +176,8 @@ def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[
     special_ids = {
         role: getattr(tokenizer, f"{role}_token_id", None) for role in ("bos", "eos", "pad", "unk")
     }
-    size = len(tokenizer)
     return {
-        "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, size),
-        "size": size,
+        "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, len(tokenizer)),
         "eod_id": eod_id,
     }
 

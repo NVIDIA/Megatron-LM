@@ -2,6 +2,7 @@
 
 """Reference consumer of a planned corpus blend for Hugging Face-style training (torch only).
 
+- :func:`check_student` rejects a student tokenizer that differs from the teacher's.
 - :class:`CorpusStream` yields one data-parallel rank's samples of a manifest (see
   :mod:`.blend`) in Megatron's order, so each lane is read by one rank when the lane
   count is a multiple of world size × micro batch size.
@@ -23,7 +24,21 @@ from typing import Any, Iterator
 import torch
 
 from ..v3_replay import CorpusReader
-from .contract import LOGPROB_SENTINEL
+from .contract import LOGPROB_SENTINEL, hf_tokenizer_identity
+
+
+def check_student(manifest: dict, tokenizer: Any, *, vocab_size: int | None = None) -> None:
+    """Require the student's Hugging Face tokenizer to be the teacher's.
+
+    ``vocab_size``, when given, is the student's output (logit) width; it must cover
+    every real token.
+    """
+    if hf_tokenizer_identity(tokenizer)["sha256"] != manifest["contract"]["tokenizer"]["sha256"]:
+        raise ValueError("Offline KD student tokenizer differs from the teacher's")
+    if vocab_size is not None and vocab_size < len(tokenizer):
+        raise ValueError(
+            f"Student vocabulary ({vocab_size}) is smaller than the tokenizer ({len(tokenizer)})"
+        )
 
 
 def rank_positions(
@@ -40,6 +55,8 @@ def rank_positions(
 class CorpusStream(torch.utils.data.IterableDataset):
     """One rank's samples, resumable from a global position; at most one loader worker.
 
+    ``tokenizer`` is the student's Hugging Face tokenizer, checked with
+    :func:`check_student` (against ``student_vocab_size`` too, when given).
     This stream already assigns DP ranks. Do not apply another distributed dataset
     sharder (for example Trainer/Accelerate's automatic sharding) on top of it.
     """
@@ -49,12 +66,14 @@ class CorpusStream(torch.utils.data.IterableDataset):
         root: str,
         manifest: dict,
         *,
+        tokenizer: Any,
         rank: int = 0,
         world_size: int = 1,
         micro_batch_size: int = 1,
         start: int = 0,
         **reader_options: Any,
     ):
+        check_student(manifest, tokenizer, vocab_size=reader_options.get("student_vocab_size"))
         self.root, self.manifest = root, manifest
         self.rank, self.world_size, self.micro_batch_size = rank, world_size, micro_batch_size
         self.start = start
@@ -225,4 +244,4 @@ def topk_kl(
     return (kl * loss_weights).sum() / loss_weights.sum().clamp(min=1.0)
 
 
-__all__ = ["CorpusStream", "collate", "rank_positions", "topk_kl"]
+__all__ = ["CorpusStream", "check_student", "collate", "rank_positions", "topk_kl"]

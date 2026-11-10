@@ -128,8 +128,8 @@ targets, and does not build the original training split.
 
 Use the same tokenizer as the teacher (checked by fingerprint, see
 [Tokenizer fingerprint](#tokenizer-fingerprint)) and settings that reproduce the cache's
-`attention_mode`. The student's padded vocabulary must be at least the tokenizer size; it
-need not equal the teacher's. Target entries whose index is beyond the student vocabulary
+`attention_mode`. The student's padded vocabulary must be at least its tokenizer's size
+(identical to the teacher's once the fingerprints match); it need not equal the teacher's. Target entries whose index is beyond the student vocabulary
 (teacher padding rows) are masked into the ghost bucket, counted, and reported when they
 exceed 0.01% of entries. Stored labels, loss weights and positions are replayed exactly.
 The teacher's dataset settings are recorded rather than checked against the student;
@@ -183,7 +183,9 @@ Outside Megatron, `format/blend.py` plans the same schedule and `format/hf.py` i
 torch-only reference consumer: `CorpusStream` yields one rank's samples in Megatron's
 order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `labels`
 and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
-bucket as Megatron. Stored labels are already shifted to line up with the logits at the
+bucket as Megatron. `CorpusStream` requires the student's Hugging Face tokenizer and
+rejects one whose fingerprint differs from the blend's (`check_student`); pass
+`student_vocab_size` to also check that the model's output width covers the tokenizer. Stored labels are already shifted to line up with the logits at the
 same position.
 
 `CorpusStream` already assigns samples to DP ranks; do not wrap it in another distributed
@@ -389,7 +391,6 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
   "contract": {
     "tokenizer": {
       "sha256": "<canonical tokenizer SHA-256>",
-      "size": 128256,
       "eod_id": 128001
     },
     "logprob_vocab_size": 128512,
@@ -439,9 +440,8 @@ and pins each file's normalization size:
 
 | Key | Meaning and reason for storing it |
 | --- | --- |
-| `tokenizer` | Object describing the token-ID space through the three fields below. Stored token IDs and targets must have the same meaning for the student. |
+| `tokenizer` | Object describing the token-ID space through the two fields below. Stored token IDs and targets must have the same meaning for the student. |
 | `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
-| `tokenizer.size` | True, non-padded vocabulary size. Lets a reader check that the student's output vocabulary can represent every real token; this number cannot be recovered from the fingerprint. |
 | `tokenizer.eod_id` | Document-boundary ID for `causal_eod_reset`; required to reconstruct that attention mode and must match the student's EOD ID. Unused for the other modes and excluded from cross-source comparisons for them. |
 | `logprob_vocab_size` | Size of the teacher's normalization domain, including any padding entries. Bounds valid target IDs and determines/checks `u16` versus `u16+u8` index encoding. Sources in a blend may differ. It is not used to recompute or adjust the stored probabilities. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
@@ -490,7 +490,7 @@ place is not detected; use a new source directory for a revised dataset.
 | `data` | Replay's path-agnostic blend description, or corpus's full source path/URI, or mock identity. A corpus guard against appending another source under the same source name. Students read the stored inputs rather than reopening this path. |
 | `split` | Replay-only original dataset partition (`--split`), for warnings and provenance. Not needed to load saved samples. Omitted from corpus files, whose source is unsplit. |
 | `seed` | Teacher dataset construction and corpus-permutation seed. A corpus guard: using another permutation for a later range can duplicate some original samples and omit others. Students use their own scheduling seed. |
-| `num_samples` | Replay-only requested teacher sample budget, for provenance/warnings. It does not determine published availability. Omitted from corpus `recorded`; the essential corpus epoch size lives in `contract.num_samples`. |
+| `train_samples` | Replay-only requested teacher sample budget (`--train-samples`, or train iterations × global batch size), for provenance/warnings. It does not determine published availability. Omitted from corpus files, whose epoch size is `contract.num_samples`. |
 | `builder` | Producer's dataset-construction label. Megatron currently writes the hard-coded labels `GPTDataset`, `MockGPTDataset`, or `SFTDataset` (including mock SFT). A coarse corpus guard within one source; other producers need not use Megatron class names, and separate sources may differ. It does not fingerprint every preprocessing option. |
 
 The `data` object has a `kind` tag and one of these representations:
@@ -572,6 +572,9 @@ rows back at their positions; positions without a row get sentinel targets.
   They are never renormalized over K. Producers must supply raw T=1 targets; V3 has no
   separate temperature field and cannot identify arbitrary temperature scaling from the
   probabilities alone.
+- The order of a row's K entries is unspecified (Megatron happens to write them in
+  descending order). A consumer that keeps fewer than K entries must select them by
+  value and fold the rest into the tail: `tail_k = logaddexp(tail_K, logsumexp(dropped))`.
 - Every row has exactly K entries. A logprob of `-1000` marks a masked or unavailable
   entry; its decoded index must be ignored. Rows with fewer than K available entries are
   filled with it. K is fixed within an Arrow file; files from different sources may use
