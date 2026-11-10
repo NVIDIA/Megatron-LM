@@ -344,7 +344,9 @@ def test_optimizer_names_experts_by_the_model_expert_layout(
     )
 
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False), [model]
+        OptimizerConfig(lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False),
+        [model],
+        pg_collection=process_group_collection,
     )
 
     assert isinstance(optimizer, FullyShardedOptimizer)
