@@ -1673,7 +1673,14 @@ def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Batch-invariant RMSNorm requires affine weight.")
     eps = getattr(self, "eps", 1e-5)
     zero_centered_gamma = getattr(self, "zero_centered_gamma", False)
-    return BatchInvariantRMSNormFn.apply(x, weight, eps, zero_centered_gamma)
+    # Follow TE's RMSNorm dtype contract: it converts the input and weight to its activation dtype
+    # (the autocast dtype under autocast, else the weight's) and returns that dtype, so an fp32
+    # residual stream into a bf16 norm yields bf16, as the next GEMM expects.
+    if torch.is_autocast_enabled(x.device.type):
+        dtype = torch.get_autocast_dtype(x.device.type)
+    else:
+        dtype = weight.dtype
+    return BatchInvariantRMSNormFn.apply(x.to(dtype), weight.to(dtype), eps, zero_centered_gamma)
 
 
 def is_batch_invariant_mode_enabled():
