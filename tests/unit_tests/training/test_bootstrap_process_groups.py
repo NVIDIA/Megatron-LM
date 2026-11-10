@@ -84,6 +84,12 @@ GRIDS = [
 # differ from expt_dp, and with expert GTP they name ranks outside the world.
 EXPERT_GRIDS = [
     ("ep2", dict(expert_model_parallel_size=2), 2),
+    # With context parallelism, dp_cp has more ranks than dp.
+    (
+        "cp2_ep2_etp1",
+        dict(context_parallel_size=2, expert_model_parallel_size=2, expert_tensor_parallel_size=1),
+        2,
+    ),
     ("ep2_egtp2", dict(expert_model_parallel_size=2, expert_gtp_remat_size=2), 4),
     (
         "tp2_pp2_ep2_tp_pp_dp_order",
