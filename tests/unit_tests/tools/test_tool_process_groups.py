@@ -97,6 +97,48 @@ def test_static_engine_pipeline_flag_follows_the_wrapper_group(pipeline_group, m
     assert engine.controller.inference_wrapped_model.model_is_pipeline_parallel is expected
 
 
+class _StubGroup:
+    """A process-group stand-in that reports a fixed rank and size."""
+
+    def __init__(self, rank, size=1):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize(
+    "pp_rank, tp_rank, ep_rank, runs_server",
+    [(0, 0, 0, True), (1, 0, 0, False), (0, 1, 0, False), (0, 0, 1, False)],
+)
+def test_text_generation_server_rank_follows_the_model_groups(
+    monkeypatch, pp_rank, tp_rank, ep_rank, runs_server
+):
+    """The HTTP server runs on the first TP and EP rank of the model's first pipeline stage."""
+    import tools.run_text_generation_server as server
+
+    # The rank of a pipeline group counts only once torch.distributed is initialized.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    _forbid_global_grid(
+        monkeypatch,
+        "is_pipeline_first_stage",
+        "get_pipeline_model_parallel_rank",
+        "get_tensor_model_parallel_rank",
+        "get_expert_model_parallel_rank",
+    )
+    pg_collection = ProcessGroupCollection(
+        pp=_StubGroup(pp_rank), tp=_StubGroup(tp_rank), ep=_StubGroup(ep_rank)
+    )
+    # The collection is found through wrappers such as Float16Module.
+    model = SimpleNamespace(module=SimpleNamespace(pg_collection=pg_collection))
+
+    assert server._is_server_rank(model) is runs_server
+
+
 @pytest.fixture
 def embed(monkeypatch):
     """The BERT embedding tool, imported with a stand-in for h5py where h5py is not installed.
@@ -120,20 +162,6 @@ def embed(monkeypatch):
             # Forget the tool's modules, so that a later import does not find the stand-in.
             for name in [name for name in sys.modules if name.startswith("tools.bert_embedding")]:
                 del sys.modules[name]
-
-
-class _StubGroup:
-    """A process-group stand-in that reports a fixed rank and size."""
-
-    def __init__(self, rank, size=1):
-        self._rank = rank
-        self._size = size
-
-    def rank(self):
-        return self._rank
-
-    def size(self):
-        return self._size
 
 
 @pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "fallback"])
