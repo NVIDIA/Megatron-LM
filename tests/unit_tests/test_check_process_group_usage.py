@@ -1448,5 +1448,81 @@ class TestTree(unittest.TestCase):
         )
 
 
+def _testmon_mappings(text):
+    """Return ``[(source_dirs, {platform: tests})]`` for testmon_mandatory_tests.yaml.
+
+    The file is read line by line: the job that runs this file by path has no YAML parser.
+    """
+    mappings, items = [], None
+    for line in text.splitlines():
+        entry = line.strip()
+        if entry.startswith("#"):
+            continue
+        if entry == "- source_dirs:":
+            items = []
+            mappings.append((items, {}))
+        elif entry.endswith(":") and mappings and entry != "test_buckets:":
+            items = mappings[-1][1].setdefault(entry[:-1], [])
+        elif entry.startswith("- ") and items is not None:
+            items.append(entry[2:])
+    return mappings
+
+
+class TestTestmonMapping(unittest.TestCase):
+    """A selective unit-test run adds the stdlib checks when a file that they scan changes.
+
+    The checks read the source as text, so Testmon never selects them for a source change:
+    tests/unit_tests/testmon_mandatory_tests.yaml maps the folders they scan and the top-level
+    scripts to them. tests/test_utils/test_unit_testmon_mandatory.py tests that mapping with the
+    code that applies it, but no CI job runs that folder. This test reads the mapping as text, so
+    the workflow step that runs this file fails when a scanned folder or a top-level script has
+    no entry.
+    """
+
+    CHECKS = (
+        "test_check_process_group_usage.py",
+        "test_global_memory_buffer_imports.py",
+        "test_parallel_state_accessor_uses.py",
+        "test_removal_versions.py",
+    )
+
+    def test_a_change_of_a_scanned_file_selects_the_checks(self):
+        unit_tests = REPO_ROOT / "tests" / "unit_tests"
+        folders = {
+            path.relative_to(checker.REPO_ROOT).parts[0]
+            for path in (checker.SCAN_ROOT, checker.ALLOWLIST)
+        }
+        # The checker's test scans what the checker does; each other check names its folders.
+        for name in self.CHECKS[1:]:
+            spec = importlib.util.spec_from_file_location(name[:-3], unit_tests / name)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            folders.update(module.SCANNED_FOLDERS)
+        changed = [f"{folder}/example.py" for folder in sorted(folders)]
+        changed += sorted(path.name for path in REPO_ROOT.glob("*.py"))
+
+        text = (unit_tests / "testmon_mandatory_tests.yaml").read_text(encoding="utf-8")
+        mappings = _testmon_mappings(text)
+        checks = {f"tests/unit_tests/{name}" for name in self.CHECKS}
+        unmapped = {}
+        for path in changed:
+            # A source entry that is not a glob matches itself and the files under it.
+            selected = {
+                test
+                for sources, buckets in mappings
+                if any(path == source or path.startswith(source + "/") for source in sources)
+                for test in buckets.get("dgx_h100", ())
+            }
+            if checks - selected:
+                unmapped[path] = sorted(checks - selected)
+        self.assertEqual(
+            unmapped,
+            {},
+            "tests/unit_tests/testmon_mandatory_tests.yaml does not add these checks to a "
+            "selective H100 run that changes the file: list its folder, or the top-level "
+            "script, under the source_dirs of the mapping that holds the checks.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

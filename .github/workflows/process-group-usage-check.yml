@@ -51,7 +51,9 @@ jobs:
       # classifies the reads in megatron/core: one that is neither warned nor guarded fails this
       # step, apart from those its UNWARNED_READS lists, whether or not the allowlist holds it. A
       # use of a private parallel_state attribute is never warned or guarded, even in a fallback;
-      # the deprecated _set_global_memory_buffer() counts as a deprecated function.
+      # the deprecated _set_global_memory_buffer() counts as a deprecated function. The file also
+      # checks that testmon_mandatory_tests.yaml adds the stdlib checks of the unit-test bucket to
+      # a selective run that changes a folder they scan or a top-level script.
       - name: Test the process-group usage checker
         run: python tests/unit_tests/test_check_process_group_usage.py
 

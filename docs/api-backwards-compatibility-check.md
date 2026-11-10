@@ -205,8 +205,9 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   the allowlist, and each read that the checker counts in Megatron Core's code, is warned or
   guarded, apart from those the test lists (none now), and that the checker counts every helper of
   `process_groups_config.py` that reads the grid. A new unwarned read in Megatron Core therefore
-  fails the job. It also fails when `tests/unit_tests/test_removal_versions.py` fails (see
-  *Removal*). The job then runs
+  fails the job. So does a folder that the checks scan, or a top-level script, that the Testmon
+  mapping described below leaves out. The job also fails when
+  `tests/unit_tests/test_removal_versions.py` fails (see *Removal*). It then runs
   `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
   as report-only steps (`continue-on-error`): they list every new call in Megatron Core, warned
   and guarded ones included, every call that lost its warning, and every deprecated call outside
