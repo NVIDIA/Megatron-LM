@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     GradientFinalizationMode,
@@ -43,8 +42,6 @@ class _VirtualPipelineChunk(nn.Module):
     def __init__(self, dim: int = 16) -> None:
         super().__init__()
         self.fc = nn.Linear(dim, dim, bias=False)
-        self.pre_process = False
-        self.share_embeddings_and_output_weights = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
@@ -131,7 +128,8 @@ class TestMfsdpV2PipelineSharedContext:
                 for output in reversed(outputs):
                     output.float().sum().backward()
                     assert first_context.is_recording_execution_order is (iteration == 0)
-                finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
+                first_context.post_backward()
+                first_context.finish_grad_sync()
                 assert not first_context.is_recording_execution_order
                 assert list(first_context.execution_order) == expected
                 assert first_context.execution_order.position == 0
