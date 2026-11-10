@@ -55,11 +55,17 @@ class _LaunchRecorder:
         (2, 8192, 16),
         (2, 16384, 64),
         (8, 4096, 4096),
+        # Rows of 1 to 16 lanes, one token per rank: the shard-sized launch gave these blocks
+        # num_warps = 0, which Triton rejects.
+        (2, 8, 2),
+        (4, 64, 4),
+        (8, 128, 8),
+        (2, 128, 2),
     ],
 )
 def test_launch_runs_one_token_per_block(monkeypatch, world_size, hidden, tokens):
-    """Each block covers one token's row, and up to max_num_blocks tokens per rank get a
-    block each."""
+    """Each block covers one token's row, up to max_num_blocks tokens per rank get a block
+    each, and a block of a row narrower than a warp still gets one warp."""
     pytest.importorskip("triton")
     recorder = _LaunchRecorder()
     monkeypatch.setattr(fused_collectives, "_multimem_reduce_scatter_residual_add_kernel", recorder)
