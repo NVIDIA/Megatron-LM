@@ -15,6 +15,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
+    destroy_copied_amax_groups,
     forbid_global_amax_group,
     record_amax_groups,
     with_copied_amax_groups,
@@ -37,6 +38,7 @@ class TestHybridStackAmaxReductionGroup:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
+        destroy_copied_amax_groups()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("quantization", list(QUANTIZATION))

@@ -581,7 +581,8 @@ def unpermute(
         ep_size (int, optional): Expert-parallel size of the calling token dispatcher. The
             batch-invariant path combines the experts of each EP rank in rank order. Omitting
             it there is deprecated: the size of the global expert-parallel group is used, with
-            a ``ProcessGroupFallbackWarning``.
+            a ``ProcessGroupFallbackWarning``. A size set with
+            ``parallel_state.set_expert_model_parallel_world_size()`` is not used.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.

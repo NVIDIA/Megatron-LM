@@ -2734,7 +2734,7 @@ def get_pipeline_model_parallel_rank():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+    return get_pipeline_model_parallel_group().rank()
 
 
 def is_pipeline_first_stage(ignore_virtual=True, vp_stage=None):

@@ -67,17 +67,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         # Resolved once at the inference-config boundary; during RL this may be the training
         # collection rather than an inference-specific one. A config without a collection takes
-        # the one the model was built with.
+        # the one the model was built with. The boundary rejects an unset or None tp or pp group,
+        # which torch.distributed would take as the world group and the pipeline-stage helpers as
+        # the global pipeline stage.
         pg_collection = self.inference_context.config.resolve_pg_collection(self.model)
-
-        # An unset group reads as None, which torch.distributed takes as the world group and the
-        # pipeline-stage helpers as the global pipeline stage.
-        missing = [name for name in ("tp", "pp") if vars(pg_collection).get(name) is None]
-        if missing:
-            raise ValueError(
-                f"{type(self).__name__} needs the {', '.join(missing)} process group(s); set "
-                "them in InferenceConfig.pg_collection"
-            )
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)

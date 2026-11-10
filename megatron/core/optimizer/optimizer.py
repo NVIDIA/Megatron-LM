@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -48,9 +48,8 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..process_groups_config import (
-    _FALLBACK_WARNING_SKIP_PREFIXES,
     ProcessGroupCollection,
-    ProcessGroupFallbackWarning,
+    _warn_fallback_once,
     require_process_groups,
     resolve_gtp_remat_group,
     resolve_process_groups,
@@ -329,19 +328,36 @@ def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection
 
     An optimizer whose groups are not set this way filters duplicates by the global grid.
 
+    A collection that does not set ``tp`` is deprecated and emits a
+    ``ProcessGroupFallbackWarning``. The filters then read the global grid for every group that
+    is unset or ``None``, as they did before the groups came from the collection.
+
     Args:
         optimizer: The optimizer, or a child optimizer that runs the filters itself.
         pg_collection: The collection of the model whose parameters ``optimizer`` updates.
 
     Raises:
-        ValueError: If ``pg_collection`` does not set ``tp``.
+        ValueError: If ``pg_collection`` does not set ``tp`` and the global parallel state, which
+            the filters would fall back to, is not initialized.
     """
     groups = vars(pg_collection)
     if 'tp' not in groups:
-        raise ValueError(
-            "pg_collection must set tp, the tensor-parallel group of the optimizer's "
-            "parameters; set it to None only if tensor parallelism is off"
+        if not parallel_state.model_parallel_is_initialized():
+            raise ValueError(
+                "pg_collection must set tp, the tensor-parallel group of the optimizer's "
+                "parameters; set it to None only if tensor parallelism is off"
+            )
+        warn_global_process_group_fallback(
+            "get_megatron_optimizer", "pg_collection.tp", deprecated_in="0.21", removed_in="0.23"
         )
+        # The groups as they were read before: the filters fall back to the global grid, and
+        # warn, for each one that is None.
+        optimizer.tp_group = None
+        optimizer.expert_tp_group = groups.get('expt_tp')
+        optimizer.gtp_group = groups.get('gtp_remat')
+        optimizer.expert_gtp_group = groups.get('expt_gtp_remat')
+        optimizer.duplicate_filter_groups_from_collection = False
+        return
     optimizer.tp_group = groups['tp']
     optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
     optimizer.gtp_group = resolve_gtp_remat_group(
@@ -357,9 +373,6 @@ def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection
 _GRAD_STATS_FALLBACK_DEPRECATED_IN = "0.21"
 _GRAD_STATS_FALLBACK_REMOVED_IN = "0.23"
 
-# Owners that have warned, in this process, that they reduce gradient statistics over WORLD.
-_warned_world_grad_stats_owners: Set[str] = set()
-
 
 def _warn_grad_stats_reduced_over_world(owner: str) -> None:
     """Warn, once per ``owner``, that its gradient statistics are reduced over WORLD.
@@ -370,26 +383,23 @@ def _warn_grad_stats_reduced_over_world(owner: str) -> None:
     replicated across optimizer instances or data-parallel ranks, or mix in other models, and
     ranks that run no optimizer step leave the reduction waiting.
 
-    As with ``warn_global_process_group_fallback``, the category is
-    ``ProcessGroupFallbackWarning``, and a warning that a filter turns into an error is not
-    recorded, so under an ``error`` filter every fallback raises.
+    The warning is a ``ProcessGroupFallbackWarning`` and is recorded with those of
+    ``warn_global_process_group_fallback``. A warning that a filter turns into an error is not
+    recorded, so under an ``error`` filter every fallback raises, and
+    ``enable_strict_process_group_fallbacks`` makes an owner that already warned raise too.
 
     Args:
         owner: Name of the optimizer class whose grad-stats group is ``None``.
     """
-    if owner in _warned_world_grad_stats_owners:
-        return
-    warnings.warn(
+    _warn_fallback_once(
+        (owner, "grad_stats_parallel_group", "world"),
         f"{owner} has no grad_stats_parallel_group, so it reduces the gradient norm, the zero "
-        "count and the found-inf flag over the default (WORLD) process group. This fallback is "
-        f"deprecated since Megatron Core {_GRAD_STATS_FALLBACK_DEPRECATED_IN} and will be "
-        f"removed in {_GRAD_STATS_FALLBACK_REMOVED_IN}; set the group explicitly, for example "
-        "to pg_collection.intra_dist_opt for a distributed optimizer or to pg_collection.mp for "
-        "a non-distributed one.",
-        ProcessGroupFallbackWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        "count and the found-inf flag over the default (WORLD) process group. Set the group, "
+        "for example to pg_collection.intra_dist_opt for a distributed optimizer or to "
+        "pg_collection.mp for a non-distributed one.",
+        deprecated_in=_GRAD_STATS_FALLBACK_DEPRECATED_IN,
+        removed_in=_GRAD_STATS_FALLBACK_REMOVED_IN,
     )
-    _warned_world_grad_stats_owners.add(owner)
 
 
 class MegatronOptimizer(ABC):

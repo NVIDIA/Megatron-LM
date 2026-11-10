@@ -170,24 +170,27 @@ class TestBuildersOnTheirOwnPipelineGrid:
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
         grid = HyperCommGrid([1, 1, PP_SIZE, Utils.world_size // PP_SIZE], ["tp", "cp", "pp", "dp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
-        )
-        pp_rank = pg_collection.pp.rank()
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
+            )
+            pp_rank = pg_collection.pp.rank()
 
-        if forbid_global_pipeline_rank:
+            if forbid_global_pipeline_rank:
 
-            def forbidden():
-                raise RuntimeError("the global pipeline rank was read")
+                def forbidden():
+                    raise RuntimeError("the global pipeline rank was read")
 
-            monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", forbidden)
-        model = build(_heterogeneous_config(), pg_collection, monkeypatch)
+                monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", forbidden)
+            model = build(_heterogeneous_config(), pg_collection, monkeypatch)
 
-        layers = [
-            (layer.layer_number, not isinstance(layer.mlp, IdentityOp))
-            for layer in model.decoder.layers
-        ]
-        assert layers == STAGE_LAYERS[pp_rank], f"{pp_rank=}"
+            layers = [
+                (layer.layer_number, not isinstance(layer.mlp, IdentityOp))
+                for layer in model.decoder.layers
+            ]
+            assert layers == STAGE_LAYERS[pp_rank], f"{pp_rank=}"
+        finally:
+            grid.destroy()
 
 
 @pytest.mark.parametrize(
