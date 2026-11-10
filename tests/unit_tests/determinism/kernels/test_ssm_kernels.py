@@ -492,6 +492,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
         if gate_in_kernel
         else {}
     )
+    if gate_in_kernel:
+        # Raw gates on both sides of the in-kernel softplus's threshold (20).
+        g = torch.randn(B, 1, H, device="cuda") * 12
 
     def fn(q, k, v, g, beta, initial_state):
         return fused_recurrent_gated_delta_rule_update(

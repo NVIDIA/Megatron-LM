@@ -545,7 +545,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
         "replayed both for one token per request and for a speculative step of several draft "
         "tokens, where the recurrence also writes per-draft-token state snapshots for rollback; "
-        "prefill-prepare is replayed for a single token and for a full 4096-token step.",
+        "prefill-prepare is replayed for a single token and for a full 4096-token step. The "
+        "fused recurrent kernel's in-kernel gate (GDN decode), which shares common.softplus with "
+        "the prepare kernels, replays with raw gates on both sides of the softplus threshold.",
     ),
     KernelEntry(
         name="gated_delta_net",
