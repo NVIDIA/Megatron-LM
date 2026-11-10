@@ -13,11 +13,16 @@ from megatron.core.extensions.transformer_engine import (
     TELMHeadColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
     forbid_global_amax_group,
+    global_amax_group,
     record_amax_groups,
     te_quantization_params,
     with_copied_amax_groups,
@@ -197,3 +202,46 @@ class TestTEWrapperAmaxReductionGroup:
             module(x)
 
         assert len(groups) == 1 and groups[0] is self.pg_collection.tp_dp_cp
+
+
+class TestAttentionFallbackAmaxReductionGroup:
+
+    def setup_method(self, method):
+        # TP and CP are off, so tp_cp holds this rank alone and tp_dp_cp holds every rank.
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("linear_name", ["linear_qkv", "linear_proj"])
+    def test_linear_of_attention_without_collection_uses_the_global_groups(self, linear_name):
+        """Attention's fallback collection carries the amax groups of the linears it builds."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+        )
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+        ).cuda()
+        linear = getattr(attention, linear_name)
+        # Training reduces over TP x DP x CP and evaluation only over TP x CP.
+        linear.te_quant_params = te_quantization_params(
+            training_tp_only=False, evaluation_tp_only=True
+        )
+        x = torch.randn(TOKENS, 1, HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        with record_amax_groups() as groups:
+            linear.train()
+            linear(x)
+            linear.eval()
+            linear(x)
+
+        assert len(groups) == 2
+        assert groups[0] is global_amax_group(False)
+        assert groups[1] is global_amax_group(True)
