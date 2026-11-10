@@ -248,6 +248,21 @@ def _pipeline_pg_collection():
     return pg_collection
 
 
+def _rank_pairs_group():
+    """This rank's group when all ranks are split into the pairs (1, 2), (3, 4), ..., (last, 0).
+
+    The pairs differ from the DP groups of _pipeline_pg_collection() at every world size: those
+    hold one rank each on 4 ranks and the pairs (0, 1), (2, 3), ... on 8 ranks. Creating groups is
+    collective: call on every rank. _destroy_created_groups() destroys the group.
+    """
+    world_size = dist.get_world_size()
+    group, _ = dist.new_subgroups_by_enumeration(
+        [[rank, (rank + 1) % world_size] for rank in range(1, world_size, 2)]
+    )
+    _CREATED_GROUPS.append(group)
+    return group
+
+
 def _stage_config(sync_replicated_params=False, **kwargs):
     config = TransformerConfig(
         num_layers=1, hidden_size=8, num_attention_heads=1, use_cpu_initialization=True, **kwargs
@@ -436,7 +451,10 @@ class TestFinalizeModelGradsProcessGroups:
     def test_global_batch_quantile_balancing_reads_only_collection(self):
         """Global-batch quantile balancing pools router histograms over pg_collection.tp_dp_cp."""
         pg_collection = _pipeline_pg_collection()
-        pg_collection.tp_dp_cp = pg_collection.dp_cp
+        # Two ranks at every world size, and not the ranks of the TP, DP or PP group: pooling the
+        # histograms of no other rank, or of the ranks of one of those groups, gives another bias.
+        pg_collection.tp_dp_cp = _rank_pairs_group()
+        assert pg_collection.tp_dp_cp.size() == 2
         config = _stage_config(**_GLOBAL_BATCH_QB)
         chunk = _StageChunk(config, pg_collection.pp)
         router = torch.nn.Module()
