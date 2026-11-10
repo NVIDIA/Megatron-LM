@@ -231,22 +231,32 @@ class TestTrainingLoopPgCollection:
         assert sample_count == (first_rank_of_pair + 1) + (first_rank_of_pair + 2)
 
     @_needs_4_ranks
-    def test_logits_saver_attaches_on_the_model_last_stage(self, monkeypatch, run_config):
-        pp_group = _subgroup(_strided_pairs())
-        model = [SimpleNamespace(pg_collection=ProcessGroupCollection(pp=pp_group))]
+    @pytest.mark.parametrize("model_carries_collection", [True, False])
+    def test_logits_hooks_attach_on_the_model_last_stage(
+        self, monkeypatch, run_config, model_carries_collection
+    ):
+        pp_group, dp_group = _subgroup(_strided_pairs()), _subgroup(_pairs())
+        pg_collection = ProcessGroupCollection(pp=pp_group, dp=dp_group)
+        # The model's own collection decides; a model without one runs on the run's collection.
+        if model_carries_collection:
+            model = [SimpleNamespace(pg_collection=pg_collection)]
+            run_pg_collection = ProcessGroupCollection()
+        else:
+            model, run_pg_collection = [SimpleNamespace()], pg_collection
         args = SimpleNamespace(
             logits_save_dir="unused",
             logits_save_top_k=1,
             logits_save_top_p=None,
             logits_save_top_p_min_k=None,
             logits_save_dtype=None,
-            logits_load_dir=None,
+            logits_load_dir="unused",
             moe_use_upcycling=False,
             load=None,
             pretrained_checkpoint=None,
             ckpt_convert_format=None,
         )
         attached, saver_pg_collections = [], []
+        captured, reported = [], []
 
         class _LogitsSaverHooks:
             def __init__(self, **kwargs):
@@ -255,8 +265,15 @@ class TestTrainingLoopPgCollection:
             def attach_hooks(self, model_chunk):
                 attached.append(model_chunk)
 
+        class _StudentLogitsCapture:
+            def attach_hooks(self, model_chunk):
+                captured.append(model_chunk)
+
         run_config.validation.skip_train = True
         monkeypatch.setattr("megatron.training.distillation.LogitsSaverHooks", _LogitsSaverHooks)
+        monkeypatch.setattr(
+            "megatron.training.distillation.StudentLogitsCapture", _StudentLogitsCapture
+        )
         monkeypatch.setattr(training, "get_args", lambda: args)
         monkeypatch.setattr(training, "get_timers", Mock())
         monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -266,21 +283,24 @@ class TestTrainingLoopPgCollection:
         monkeypatch.setattr(training, "get_model", Mock(return_value=model))
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
         monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
-        # The model's collection has no data-parallel group, so the setup memory report would
-        # read the global grid.
-        monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            training, "report_memory", lambda name, process_group: reported.append(process_group)
+        )
         _forbid_global_reads(monkeypatch, training)
 
-        # The run's collection has no pipeline parallelism; the model's own collection decides.
         training.setup_model_and_optimizer(
-            None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
+            None, lambda: None, cfg_container=run_config, pg_collection=run_pg_collection
         )
 
-        assert attached == (model if pp_group.rank() == 1 else [])
+        on_last_stage = pp_group.rank() == 1
+        assert attached == (model if on_last_stage else [])
+        assert captured == (model if on_last_stage else [])
         # The saver runs on the groups that decided its stage.
         assert [id(groups) for groups in saver_pg_collections] == (
-            [id(model[0].pg_collection)] if pp_group.rank() == 1 else []
+            [id(pg_collection)] if on_last_stage else []
         )
+        # The setup memory reports gate their print on the same collection's ranks.
+        assert reported and all(group is dp_group for group in reported)
 
     @_needs_4_ranks
     def test_full_validation_lengths_come_from_the_collection(self, monkeypatch, run_config):
