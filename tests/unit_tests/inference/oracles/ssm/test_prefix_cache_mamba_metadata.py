@@ -730,6 +730,10 @@ def test_prefix_cache_metadata_matches_reference(model_parallel, monkeypatch, na
     reference, over block-size edges, partial-block and whole-prompt hits, chunked-prefill
     continuations and eviction."""
     scenario = SCENARIOS[name]
+    # The unit-test conftest pins the TE attention backend through NVTE_* variables; the model's
+    # config sets them itself (flash-attn 2), and monkeypatch restores them after the test.
+    for variable in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.delenv(variable, raising=False)
     model = _build_model(scenario.graphs)
     engine = _build_engine(model, scenario)
     if scenario.durable_slots is not None:
@@ -777,6 +781,13 @@ def test_prefix_cache_metadata_matches_reference(model_parallel, monkeypatch, na
 
 SSM_BLOCK_N = 1024  # columns per program, intermediate_extraction.py:scatter_intermediate_ssm
 CONV_BLOCK_C = 128  # channels per program, intermediate_extraction.py:scatter_intermediate_conv
+NEMOTRON_H_8B_SSM_STATE = (
+    128,
+    64,
+    128,
+)  # heads, head dim, state dim of a Nemotron-H 8B Mamba layer
+NEMOTRON_H_8B_CONV_DIM = 10240  # d_inner 8192 + 2 x 8 groups x 128 state
+TEST_MODEL_CONV_DIM = 3072  # the engine cases' layer: d_inner 1024 + 2 x 8 groups x 128 state
 CHUNK_ROWS = [7, 0, 8, 3]  # scratch slot -> source chunk row: out of order, first and last rows
 
 
@@ -816,21 +827,30 @@ def _conv_case(conv_dim, d_conv, real, strided, generator):
 @ou.requires_sm(ou.HOPPER)
 @pytest.mark.parametrize(
     "state_shape",
-    [(1, 1, SSM_BLOCK_N - 1), (1, 1, SSM_BLOCK_N), (1, 1, SSM_BLOCK_N + 1), (16, 64, 128)],
-    ids=["1023", "1024", "1025", "production"],
+    [
+        (1, 1, SSM_BLOCK_N - 1),
+        (1, 1, SSM_BLOCK_N),
+        (1, 1, SSM_BLOCK_N + 1),
+        (16, 64, 128),
+        NEMOTRON_H_8B_SSM_STATE,
+    ],
+    ids=["1023", "1024", "1025", "test-model", "nemotron-h-8b"],
 )
 @pytest.mark.parametrize("real", [0, 1, 4])
 @pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_scatter_intermediate_ssm_gathers_rows(state_shape, real, source_dtype):
     """Slot i < real holds row chunk_indices[i] of the states converted to the cache dtype
     (exact); slots past real are not written; nothing outside the scratch is written. Widths
-    around the 1024-column program; the production layer is 16 heads x 64 x 128."""
+    around the 1024-column program; the engine cases' layer (16 heads x 64 x 128) and a
+    Nemotron-H 8B layer (128 x 64 x 128, a million elements per state)."""
     _ssm_case(state_shape, real, source_dtype, ou.make_generator(device="cuda"))
 
 
 @ou.requires_sm(ou.HOPPER)
 @pytest.mark.parametrize(
-    "conv_dim", [CONV_BLOCK_C - 1, CONV_BLOCK_C, CONV_BLOCK_C + 1, 1280], ids=str
+    "conv_dim",
+    [CONV_BLOCK_C - 1, CONV_BLOCK_C, CONV_BLOCK_C + 1, TEST_MODEL_CONV_DIM, NEMOTRON_H_8B_CONV_DIM],
+    ids=str,
 )
 @pytest.mark.parametrize("d_conv", [2, 4])
 @pytest.mark.parametrize("real", [0, 1, 4])
@@ -838,8 +858,9 @@ def test_scatter_intermediate_ssm_gathers_rows(state_shape, real, source_dtype):
 def test_scatter_intermediate_conv_gathers_windows(conv_dim, d_conv, real, strided):
     """Slot i < real holds the inputs at positions [end_i - d_conv, end_i), transposed to
     (conv_dim, d_conv) (exact), including windows ending at d_conv and at the last token; slots
-    past real are not written. Channels around the 128-channel program; 1280 is the production
-    layer's conv width; the strided source is the mixer's split view of the projection."""
+    past real are not written. Channels around the 128-channel program, the engine cases' layer
+    (3072) and a Nemotron-H 8B layer (10240); the strided source is the mixer's split view of the
+    projection."""
     _conv_case(conv_dim, d_conv, real, strided, ou.make_generator(device="cuda"))
 
 
