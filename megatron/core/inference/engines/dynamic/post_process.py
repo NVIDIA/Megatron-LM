@@ -975,8 +975,9 @@ class StepPostProcessingMixin:
             # A resumed segment carries the routing of every token but its last.
             # Keep it aligned with the tokens, or the merged result cannot cover
             # the visible sequence and drops its routing.
-            if segment.routing_indices is not None:
-                segment.routing_indices = segment.routing_indices[:-trim]
+            routing_indices = getattr(segment, "routing_indices", None)
+            if routing_indices is not None:
+                segment.routing_indices = routing_indices[:-trim]
 
             generated_event_indexes = [
                 idx
