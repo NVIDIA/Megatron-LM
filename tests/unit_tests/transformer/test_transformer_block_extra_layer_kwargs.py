@@ -23,7 +23,7 @@ class _AdaLNLayer(torch.nn.Module, BaseTransformerLayer):
         self.modulation = torch.nn.Linear(config.hidden_size, 2 * config.hidden_size)
         self.received_condition = []
 
-    def forward(self, hidden_states, condition_emb=None, **kwargs):
+    def forward(self, hidden_states, /, condition_emb=None, **kwargs):
         self.received_condition.append(condition_emb)
         if condition_emb is None:
             return hidden_states + 1, None
@@ -39,8 +39,8 @@ class _AdaLNTransformerLayer(TransformerLayer):
         super().__init__(config, *args, **kwargs)
         self.modulation = torch.nn.Linear(config.hidden_size, 2 * config.hidden_size)
 
-    def forward(self, *args, condition_emb=None, **kwargs):
-        output, context = super().forward(*args, **kwargs)
+    def forward(self, hidden_states, /, *args, condition_emb=None, **kwargs):
+        output, context = super().forward(hidden_states, *args, **kwargs)
         if condition_emb is not None:
             scale, shift = self.modulation(condition_emb).chunk(2, dim=-1)
             output = output * (1 + scale) + shift
@@ -67,6 +67,7 @@ class _InnerLayerWrapper(torch.nn.Module, BaseTransformerLayer):
     def forward(
         self,
         hidden_states,
+        /,
         attention_mask=None,
         rotary_pos_emb=None,
         inference_context=None,
@@ -74,7 +75,7 @@ class _InnerLayerWrapper(torch.nn.Module, BaseTransformerLayer):
         padding_mask=None,
     ):
         return self.inner_layer(
-            hidden_states=hidden_states,
+            hidden_states,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
