@@ -54,7 +54,10 @@ except Exception:
 
 # Delayed scaling is rejected by the streaming load (its scale is only known once
 # `load_state_dict` restores the fp8 metadata); these are the supported recipes.
-RECIPES = ["current", "mxfp8", "blockwise", "nvfp4"]
+# MXFP8 and NVFP4 need Blackwell, so their cases also run in the GB200 unit tests.
+MXFP8 = pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)
+NVFP4 = pytest.param("nvfp4", marks=pytest.mark.launch_on_gb200)
+RECIPES = ["current", MXFP8, "blockwise", NVFP4]
 GEOMETRIES = [(0, 0), (0, 1), (1, 0)]
 SENTINEL = 99.0
 # Storage attributes holding element codes. Scale arrays are compared through the dequantized
@@ -468,7 +471,7 @@ class TestStreamCkptDequant:
         assert len(captured) == 1
         assert captured[0]._stream_dequant_buffers == {}
 
-    @pytest.mark.parametrize('recipe', ["current", "mxfp8"])
+    @pytest.mark.parametrize('recipe', ["current", MXFP8])
     @_print_rank_failures
     def test_peak_memory(self, tmp_path_dist_ckpt, recipe):
         """The upfront path holds a high-precision copy of every quantized tensor at once; the

@@ -959,6 +959,7 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     assert torch.isfinite(out).all(), "MXFP8 GTP (unaligned) output has non-finite values"
 
 
+@pytest.mark.launch_on_gb200
 class TestMXFP8LinearGTP:
     def test_forward_backward(self):
         _requires_mxfp8()

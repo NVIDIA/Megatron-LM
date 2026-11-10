@@ -236,7 +236,9 @@ def _worker_high_precision_init_val(rank, world_size, port, gtp_remat_size):
 
 
 class TestGTPCpuInitialization:
-    @pytest.mark.parametrize("fp8_param", [False, True])
+    @pytest.mark.parametrize(
+        "fp8_param", [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)]
+    )
     @pytest.mark.parametrize("gtp_remat_size", GTP_SIZES)
     def test_cpu_init_is_gtp_invariant(self, gtp_remat_size, fp8_param):
         _requires_multi_gpu(WORLD)
@@ -244,6 +246,7 @@ class TestGTPCpuInitialization:
             _requires_mxfp8()
         _run_distributed(_worker_cpu_init_is_gtp_invariant, WORLD, fp8_param, gtp_remat_size)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("gtp_remat_size", [1, *GTP_SIZES])
     def test_high_precision_init_val_refreshed(self, gtp_remat_size):
         """Also covered at GTP=1: the stale snapshot is a plain cpu-init + fp8_param bug, and

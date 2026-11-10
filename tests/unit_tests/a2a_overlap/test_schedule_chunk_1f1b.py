@@ -514,6 +514,7 @@ class TestA2AOverlap:
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    # The Blackwell-only MXFP8 flags carry launch_on_gb200 (see get_valid_fp8_flags).
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
     def test_1f1b_schedule_model_chunk(

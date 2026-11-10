@@ -760,7 +760,13 @@ class TestDistributedOptimizer:
     @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'dp_zero_gather_scatter'])
     @pytest.mark.parametrize('legacy_keys', [False, True])
     @pytest.mark.parametrize(
-        ('precision', 'recipe'), [('fp8', 'delayed'), ('fp8', 'mxfp8'), ('fp4', 'nvfp4')]
+        ('precision', 'recipe'),
+        [
+            ('fp8', 'delayed'),
+            # MXFP8 and NVFP4 storage needs Blackwell.
+            pytest.param('fp8', 'mxfp8', marks=pytest.mark.launch_on_gb200),
+            pytest.param('fp4', 'nvfp4', marks=pytest.mark.launch_on_gb200),
+        ],
     )
     def test_optimizer_checkpoint_key_compatibility_quantized_params(
         self, tmp_path_dist_ckpt, sharding_type, legacy_keys, precision, recipe

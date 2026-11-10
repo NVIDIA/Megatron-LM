@@ -202,6 +202,7 @@ class TestGTPMuonDCP:
 
                 check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
 
+    @pytest.mark.launch_on_gb200
     def test_gtp_muon_moe_native_fp8_save_load(self, tmp_path_dist_ckpt):
         """GTP + Muon (LayerWise) + native-FP8 (fp8_model_init / mxfp8) checkpoint roundtrip.
 
