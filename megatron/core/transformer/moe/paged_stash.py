@@ -15,10 +15,8 @@ from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     GLOBAL_MAX_BLOCKS,
     paged_stash_copy_kernel,
-    paged_stash_copy_mx_kernel,
     paged_stash_copy_page_kernel,
     paged_stash_pop_kernel,
-    paged_stash_pop_mx_kernel,
     paged_stash_pop_page_kernel,
 )
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
@@ -52,49 +50,6 @@ SCALE_INV_BLOCK_SIZE = 32
 PAGE_COPY_CHUNK_BYTES = 16384
 PAGE_COPY_MAX_PROGRAMS = 4096
 PAGE_COPY_NUM_WARPS = 4
-
-# MXFP8 stash of BF16 activations (moe_paged_stash_mxfp8_activations): one E8M0 scale per
-# MXFP8_BLOCK_SIZE elements, maximum rows per program tile (in elements), maximum programs per
-# launch and warps per program.
-MXFP8_BLOCK_SIZE = 32
-MXFP8_MAX_TILE_ELEMS = 8192
-MXFP8_MAX_PROGRAMS = 4096
-MXFP8_NUM_WARPS = 8
-
-
-def _mxfp8_stash_row_bytes(hidden_size: int) -> int:
-    """Bytes of one MXFP8 stash row: hidden_size E4M3 values and hidden_size / 32 E8M0 scales."""
-    return hidden_size + hidden_size // MXFP8_BLOCK_SIZE
-
-
-def _can_stash_as_mxfp8(dtype: torch.dtype, hidden_size: int) -> bool:
-    """Whether rows of ``dtype`` and ``hidden_size`` can be stashed as MXFP8.
-
-    The kernels quantize whole rows in 32-element blocks and need a power-of-two row length.
-    """
-    return (
-        dtype == torch.bfloat16
-        and hidden_size >= MXFP8_BLOCK_SIZE
-        and hidden_size & (hidden_size - 1) == 0
-    )
-
-
-def _is_mxfp8_stash(dtype: torch.dtype, hidden_size: int, buffer: "PagedStashBuffer") -> bool:
-    """Whether ``buffer`` holds rows of (``dtype``, ``hidden_size``) MXFP8-encoded."""
-    return (
-        _can_stash_as_mxfp8(dtype, hidden_size)
-        and buffer.dtype == torch.uint8
-        and buffer.hidden_size == _mxfp8_stash_row_bytes(hidden_size)
-    )
-
-
-def _mxfp8_launch(page_size: int, hidden_size: int, max_rows: int):
-    """Rows per work item (a power of two dividing the page) and grid of the MXFP8 kernels."""
-    rows = 1
-    while page_size % (rows * 2) == 0 and rows * 2 * hidden_size <= MXFP8_MAX_TILE_ELEMS:
-        rows *= 2
-    max_pages = (max_rows + page_size - 1) // page_size
-    return rows, (max(1, min(max_pages * (page_size // rows), MXFP8_MAX_PROGRAMS)),)
 
 
 def _page_copy_launch(page_size: int, hidden_size: int, element_size: int, max_rows: int):
@@ -305,9 +260,7 @@ class PagedTensor:
 
         ``block_size`` is the number of elements each program copies per inner-loop iteration
         (a power of two) and ``max_blocks`` the maximum number of programs per launch.
-        ``page_copy`` selects the page-contiguous copy kernel (bit-identical results). A buffer
-        allocated for MXFP8 rows (see ``moe_paged_stash_mxfp8_activations``) always uses the
-        MXFP8 kernel.
+        ``page_copy`` selects the page-contiguous copy kernel (bit-identical results).
         """
         # The copy kernels write every page_record slot that the pop kernels read and always
         # write spilled_to_host, so the metadata needs no zeroing beforehand.
@@ -347,19 +300,7 @@ class PagedTensor:
             new_free_list_head,
         )
 
-        if _is_mxfp8_stash(self.dtype, self.hidden_size, paged_stash_buffer):
-            assert not self.is_columnwise_scale_inv
-            rows, grid = _mxfp8_launch(self.page_size, self.hidden_size, max_num_tokens)
-            paged_stash_copy_mx_kernel[grid](
-                tensor_to_copy,
-                *common_args,
-                PAGE_SIZE=self.page_size,
-                HIDDEN_SIZE=self.hidden_size,
-                ROWS=rows,
-                HAS_HOST_BUFFER=has_host,
-                num_warps=MXFP8_NUM_WARPS,
-            )
-        elif page_copy:
+        if page_copy:
             chunk, grid = _page_copy_launch(
                 self.page_size,
                 self.hidden_size,
@@ -438,20 +379,7 @@ class PagedTensor:
             paged_stash_buffer.free_list_capacity,
             new_free_list_tail,
         )
-        if _is_mxfp8_stash(self.dtype, self.hidden_size, paged_stash_buffer):
-            assert not self.is_columnwise_scale_inv
-            rows, grid = _mxfp8_launch(self.page_size, self.hidden_size, max_num_tokens)
-            paged_stash_pop_mx_kernel[grid](
-                paged_stash_buffer.cuda_buffer,
-                host_src,
-                self._tensor,
-                *meta_args,
-                PAGE_SIZE=self.page_size,
-                HIDDEN_SIZE=self.hidden_size,
-                ROWS=rows,
-                num_warps=MXFP8_NUM_WARPS,
-            )
-        elif page_copy:
+        if page_copy:
             chunk, grid = _page_copy_launch(
                 self.page_size,
                 self.hidden_size,
@@ -632,9 +560,8 @@ class PagedStashManager:
         # paged_stash_reset)
         self.copy_block_size = GLOBAL_BLOCK_SIZE
         self.copy_max_blocks = GLOBAL_MAX_BLOCKS
-        # Kernel selection (defaults; overwritten from config in paged_stash_reset)
+        # Kernel selection (default; overwritten from config in paged_stash_reset)
         self.page_copy = False
-        self.mxfp8_activations = False
 
     @property
     def pack_stream(self):
@@ -815,19 +742,14 @@ class PagedStashManager:
                 if host_tokens_dict is not None and (dtype, hidden_size) in host_tokens_dict
                 else 0
             )
-            buffer_dtype = _stash_buffer_dtype(dtype)
-            buffer_hidden_size = hidden_size
-            if self.mxfp8_activations and _can_stash_as_mxfp8(dtype, hidden_size):
-                buffer_dtype = torch.uint8
-                buffer_hidden_size = _mxfp8_stash_row_bytes(hidden_size)
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
-                buffer_hidden_size,
+                hidden_size,
                 self.page_size,
                 self.device,
                 self.overflow,
                 self.host_spill,
-                buffer_dtype,
+                _stash_buffer_dtype(dtype),
                 num_tokens_host=num_tokens_host,
             )
             sb = self.stash_buffers[dtype][hidden_size]
@@ -1105,8 +1027,8 @@ def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
     config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu,
-    moe_paged_stash_page_size, moe_paged_stash_page_copy and moe_paged_stash_mxfp8_activations are
-    read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    moe_paged_stash_page_size and moe_paged_stash_page_copy are read from it. Otherwise defaults
+    to 1.10 (CUDA), 0.0 (CPU).
     Copy launch sizes are fixed for the current device: 4096/8192 on Rubin (SM107),
     1024/2048 elsewhere.
     """
@@ -1116,8 +1038,6 @@ def paged_stash_reset(enabled=True, config=None):
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size
         stash_manager.page_copy = config.moe_paged_stash_page_copy
-        # Only takes effect when the stash buffers are allocated.
-        stash_manager.mxfp8_activations = config.moe_paged_stash_mxfp8_activations
     # current layer and microbatch for each vp stage for forward pass
     stash_manager.current_schedule_index = 0
 
