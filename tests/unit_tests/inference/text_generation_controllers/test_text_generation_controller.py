@@ -405,6 +405,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
+    controller._overlap_gc = False
     controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
     controller._dummy_forward_done_event = mock.Mock()
