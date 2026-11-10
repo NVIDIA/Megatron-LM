@@ -28,28 +28,27 @@ the exact contract; the trusted implementation is torch with the FlashInfer desi
 rounding points (bf16 route outputs accumulated in bf16 per rank, fp32 reduce-scatter, bf16
 output); per row, factor 2. Memory: NaN-payload poison in the NVLS buffers, 0xA5 bytes past them.
 
-Cases that fail on ``main`` because of a bug an open fix PR fixes (expect-fail tasks there; they
-pass on the probe tree that merges the fix):
-- ``test_bounded_rows_hold_every_replica``: R03-F2, fixed by #8876 (t3-etp). With TP 1, ETP 2,
-  EP 2, 64 requests and capacity 128, ``main`` bounds the rows by ``64 * EP = 128`` while the
-  gather holds four replicas' 256 decode rows; tp_ep ranks 2 and 3 get stale rows.
-- ``test_cutlass_mxfp8_unaligned_expert_shard``: R03-F4, fixed by #8877 (t3-r03f4). FFN 384 at
-  ETP 2 passes ``main``'s global 128-alignment check; the 192-wide shards raise at the first
-  forward. With the fix the config is rejected when it is built.
-
-``test_routed_mxfp8_topk_equal_to_experts`` also fails on ``main``: finding ETP-N1 (routed MXFP8
-with top-k = number of experts is accepted, then FlashInfer rejects it at the first forward), no
-fix PR yet.
+Layouts that fail on ``main`` are left to the fix PRs, which test them:
+- R03-F2: with TP 1, ETP 2, EP 2, 64 requests and capacity 128, ``main`` bounds the rows by
+  ``64 * EP = 128`` while the gather holds four replicas' 256 decode rows; tp_ep ranks 2 and 3
+  get stale rows. #8876 (``fix/etp-ep-wide-decisions``) tests it in
+  ``test_flashinfer_moe_bounded_rows.py``
+  (``test_decode_steps_bound_rows_only_when_every_replica_fits``).
+- R03-F4: FFN 384 at ETP 2 passes ``main``'s global 128-alignment check, and the 192-wide CUTLASS
+  MXFP8 shards raise at the first forward. #8877 (``fix/cutlass-mxfp8-etp-alignment``) rejects the
+  config and tests it in ``test_flashinfer_mxfp8.py``
+  (``test_flashinfer_cutlass_mxfp8_rejects_unaligned_expert_tp_shards``).
+- ETP-N1: routed MXFP8 with top-k = number of experts is accepted, then FlashInfer rejects it at
+  the first forward. #9317 (``fix/flashinfer-routed-topk``) rejects the config and tests it in
+  ``test_flashinfer_mxfp8.py``
+  (``test_routed_mxfp8_config_rejects_routing_flashinfer_cannot_launch``).
 
 Hardware: GB200, 2 and 4 GPUs in one NVLink domain (NVLS multicast), FlashInfer 0.7.2.post1.
 """
 
 import contextlib
-import gc
-from types import SimpleNamespace
 
 import pytest
-import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.etp import etp_moe as etp
@@ -191,8 +190,8 @@ def test_matches_fp64_reference(env, case):
     layout, kind = env.layout, case["kind"]
     topk = E // layout.ep if case["topk"] == "local" else int(case["topk"])
     if kind == "mxfp8-routed" and topk >= E:
-        # TRT-LLM's routed MoE needs num_experts > top_k (ETP-N1, its own test below); E - 2
-        # keeps the probability rows 8-byte aligned for main's NVLS gather.
+        # TRT-LLM's routed MoE needs num_experts > top_k (ETP-N1, #9317); E - 2 keeps the
+        # probability rows 8-byte aligned for main's NVLS gather.
         topk = E - 2
     problem = etp.lossless_problem(E, H, FFN, topk, KINDS[kind]["activation"], case["seed"])
     counts = etp.replica_counts(case["counts"], layout, M)
@@ -213,173 +212,6 @@ def test_matches_fp64_reference(env, case):
         layout.etp,
         trusted_fn=_trusted(layout, kind),
         what=f"{layout.name} rank {env.rank} {kind}",
-    )
-
-
-@pytest.mark.parametrize("kind", ["mxfp8-routed", "nvfp4-relu2"])
-@pytest.mark.parametrize("env", ["w4-tp1-etp2-ep2"], indirect=True, scope="module")
-def test_bounded_rows_hold_every_replica(env, kind):
-    """A decode-only step with bounded FlashInfer rows must still compute every gathered token.
-
-    TP 1, ETP 2, EP 2: the tp_ep group holds four replicas. Each serves 64 decode requests
-    (``max_requests``), so the gather holds 256 rows; the token capacity is 128. Each rank's
-    ``DynamicInferenceContext`` sets up the step and the controller's
-    ``_dynamic_step_forward_logits`` decides the bounded rows, then runs the real MoE layer as
-    the model. Fails on ``main`` (R03-F2: the bound counts EP replicas only, 64 * 2 = 128, so
-    rows [128, 256) -- tp_ep ranks 2 and 3 -- keep stale reduce-scatter rows); passes with #8876.
-    """
-    from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-    from megatron.core.inference.config import InferenceConfig
-    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-        TextGenerationController,
-    )
-    from megatron.core.inference.utils import InferenceMode
-
-    layout, requests, capacity = env.layout, 64, 128
-    problem = etp.lossless_problem(E, H, FFN, 2, "squared_relu", seed=301)
-    config = _config(problem, layout, kind, inference_flashinfer_mxfp8_token_capacity=capacity)
-    etp.release_buffers()
-    env.nvls_dims = None
-    context = DynamicInferenceContext(
-        model_config=config,
-        inference_config=InferenceConfig(
-            max_sequence_length=512,
-            buffer_size_gb=0.05,
-            block_size_tokens=256,
-            max_tokens=256,
-            max_requests=requests,
-            unified_memory_level=0,
-        ),
-    )
-    try:
-        layer = _build(config, problem, env, kind)
-        counts = [(requests, requests)] * layout.replicas
-        tokens = etp.lossless_tokens(problem, requests * layout.replicas, seed=302, ep=layout.ep)
-        batch = etp.rank_batch(tokens, counts, env)
-        context.add_dummy_requests_for_cudagraph_capture(
-            InferenceBatchDimensions(
-                token_count=requests, prefill_req_count=0, decode_req_count=requests
-            )
-        )
-        context.initialize_attention_state()
-        assert int(context.gpu_view.real_token_count.item()) == requests
-
-        step = {}
-        x, probs, routing = batch.x.clone(), batch.probs.clone(), batch.routing.clone()
-        etp.bypass_router(layer, probs, routing)
-
-        def model_forward(inference_input):
-            step["bounded"] = InferenceMode.use_bounded_mxfp8_rows()
-            out, _ = layer(x.view(requests, 1, H))
-            step["out"] = out.view(requests, H)
-            return torch.zeros(1, 1, 1, device="cuda")
-
-        controller = SimpleNamespace(  # the attributes the controller's forward reads
-            inference_wrapped_model=SimpleNamespace(
-                inference_context=context, run_one_forward_step=model_forward
-            ),
-            model_config=config,
-            num_speculative_tokens=0,
-            model_is_pipeline_parallel=False,
-            _enable_cuda_graph=False,
-            _overlap_gc=False,
-            _select_async_sched_routing_buffer=lambda: None,
-        )
-        stale = etp.local_expert_range(problem, env)[0]
-        etp.poison_nvls(stale)
-        with torch.no_grad(), InferenceMode.active(), _fp8_context(config):
-            TextGenerationController._dynamic_step_forward_logits(controller, None, None)
-        etp.check_nvls(
-            etp.gathered_rows(env, requests), stale, flashinfer=True, what=f"{layout.name}"
-        )
-        etp.check_output(
-            step["out"],
-            batch,
-            tokens,
-            problem,
-            layout.etp,
-            trusted_fn=_trusted(layout),
-            what=(
-                f"{layout.name} tp_ep rank {env.tp_ep_rank} {kind} (bounded rows"
-                f" {step['bounded']}, capacity {capacity}, gathered rows"
-                f" {requests * layout.tp_ep})"
-            ),
-        )
-    finally:
-        del context
-        gc.collect()
-        etp.release_buffers()
-        env.nvls_dims = None
-
-
-@pytest.mark.parametrize("env", ["w2-tp1-etp2-ep1"], indirect=True, scope="module")
-def test_cutlass_mxfp8_unaligned_expert_shard(env):
-    """FFN 384 at ETP 2 on the CUTLASS MXFP8 path: reject at construction, or serve correctly.
-
-    Each rank's FFN shard is 192 wide; the CUTLASS MXFP8 packing needs 128-aligned rows and
-    columns. Either ``TransformerConfig`` or the experts must reject the layout when built, or
-    the layer must compute the reference. Fails on ``main`` (R03-F4: accepted, then the first
-    forward raises in ``prepare_cutlass_mxfp8_weights``, on every rank alike, after the gather);
-    passes with #8877, which rejects the config.
-    """
-    layout = env.layout
-    problem = etp.lossless_problem(E, H, 384, 2, "clamp", seed=401)
-    try:
-        config = _config(problem, layout, "mxfp8-cutlass")
-        layer = _build(config, problem, env, "mxfp8-cutlass")
-    except ValueError as exc:
-        assert "128" in str(exc) and "expert" in str(exc).lower(), str(exc)
-        return
-    counts = etp.replica_counts("uneven", layout, M)
-    tokens = etp.lossless_tokens(problem, sum(n for n, _ in counts), seed=402, ep=layout.ep)
-    batch = etp.rank_batch(tokens, counts, env, padding_hidden=PADDING)
-    etp.allocate_nvls(env, M, 2, H)
-    with _fp8_context(config):
-        out = etp.run_step(env, layer, problem, batch, flashinfer=True)
-    etp.check_output(
-        out,
-        batch,
-        tokens,
-        problem,
-        layout.etp,
-        trusted_fn=_trusted(layout),
-        what=f"{layout.name} rank {env.rank} unaligned CUTLASS MXFP8 shard",
-    )
-
-
-@pytest.mark.parametrize("env", ["w2-tp1-etp2-ep1"], indirect=True, scope="module")
-def test_routed_mxfp8_topk_equal_to_experts(env):
-    """Routed MXFP8 with top-k equal to the number of experts: reject when built, or serve it.
-
-    Finding ETP-N1 (packet etp): ``TransformerConfig`` accepts ``moe_router_topk ==
-    num_moe_experts`` with the FlashInfer routed MXFP8 backend, and the first forward raises
-    FlashInfer's ``Check failed: args->num_experts > args->top_k (8 vs. 8)`` (a host-side check,
-    on every rank alike, after the gather; nothing faults). Not specific to expert TP: any EP.
-    No fix PR yet; this test fails on ``main``.
-    """
-    layout = env.layout
-    problem = etp.lossless_problem(E, H, FFN, E, "squared_relu", seed=601)
-    try:
-        config = _config(problem, layout, "mxfp8-routed")
-        layer = _build(config, problem, env, "mxfp8-routed")
-    except ValueError as exc:
-        assert "top" in str(exc).lower(), str(exc)
-        return
-    counts = etp.replica_counts("uneven", layout, M)
-    tokens = etp.lossless_tokens(problem, sum(n for n, _ in counts), seed=602, ep=layout.ep)
-    batch = etp.rank_batch(tokens, counts, env, padding_hidden=PADDING)
-    etp.allocate_nvls(env, M, E, H)
-    with _fp8_context(config):
-        out = etp.run_step(env, layer, problem, batch, flashinfer=True)
-    etp.check_output(
-        out,
-        batch,
-        tokens,
-        problem,
-        layout.etp,
-        trusted_fn=_trusted(layout, "mxfp8-routed"),
-        what=f"{layout.name} rank {env.rank} routed MXFP8 top-k = E",
     )
 
 

@@ -33,9 +33,11 @@ Inputs derived from the structure: layouts TP 1/2 x ETP 1/2/4 x EP 1/2 (ETP < TP
 tp_ep spanning 1, 2 or 4 replicas); per-replica token counts 1, uneven odd, capacity - 1 beside
 capacity, every rank at capacity (the gather buffer full), graph-bucket padding with 0, 1 and odd
 real tokens; FFN shard widths 64, 96 (a partial 64-column vLLM tile) and 128 (vLLM BLOCK_SIZE_N 64
-and 128); top-k 2 and E/EP (top-1 and top-3, odd, in their own test: they fail on main
-until #8562); routing to one EP rank only, with an empty expert, with a hot
-expert; SwiGLU, squared ReLU and the tanh clamp; batch-invariant mode on and off; CUDA-graph
+and 128); top-k 2 and E/EP (odd top-k fails on main: the NVLS all-gather-v refuses 4- and
+12-byte fp32 probability rows; #8562 (``fix/d4-d9-inference-router-shape``) adds a 32-bit path
+and tests top-1 through the layer in ``test_moe_dispatching_and_routing.py``); routing to one EP
+rank only, with an empty expert, with a hot expert; SwiGLU, squared ReLU and the tanh clamp;
+batch-invariant mode on and off; CUDA-graph
 replay with the real count moving; production shapes (Nemotron 3 Nano and Qwen3-30B-A3B experts).
 
 Hardware: H100, 2 and 4 GPUs with NVLink and NVLS multicast. Layout ``w<N>-...`` needs a
@@ -133,37 +135,6 @@ def test_matches_fp64_reference(env, case):
         layout.etp,
         probs_at_activation=bi,
         what=f"{layout.name} rank {env.rank} {backend}",
-    )
-
-
-ODD_TOPK_LAYOUTS = ["w2-tp1-etp1-ep2", "w2-tp1-etp2-ep1", "w2-tp2-etp2-ep1", "w4-tp1-etp2-ep2"]
-
-
-@pytest.mark.parametrize("routing", ["random", "one-rank"])
-@pytest.mark.parametrize("topk", [1, 3])
-@pytest.mark.parametrize("backend", ["vllm", "torch"])
-@pytest.mark.parametrize("env", ODD_TOPK_LAYOUTS, indirect=True, scope="module")
-def test_odd_topk_matches_fp64_reference(env, backend, topk, routing):
-    """Top-1 and top-3: the gathered fp32 probability rows are 4 and 12 bytes.
-
-    Fails on ``main``: the NVLS all-gather-v moves 8- or 16-byte lanes only and asserts
-    "Row size (... x 4 bytes) ... is not 8-byte aligned; cannot use NVLS." before any kernel
-    launch, on every rank alike. #8562 (d4-d9) adds the 32-bit path; with it these cases must
-    match the fp64 reference like the rest.
-    """
-    layout = env.layout
-    if routing == "one-rank" and topk > E // layout.ep:
-        routing = "random"
-    activation = "squared_relu" if topk == 1 else "swiglu"
-    problem = etp.random_problem(E, H, 128 * layout.etp, topk, activation, seed=201 + topk)
-    counts = etp.replica_counts("padded", layout, M)
-    tokens = etp.make_tokens(problem, sum(n for n, _ in counts), 202, routing, layout.ep)
-    batch = etp.rank_batch(tokens, counts, env)
-    etp.allocate_nvls(env, M, topk, H)
-    layer = etp.build_layer(etp.make_config(problem, layout, backend), problem, env)
-    out = etp.run_step(env, layer, problem, batch)
-    etp.check_output(
-        out, batch, tokens, problem, layout.etp, what=f"{layout.name} rank {env.rank} top-{topk}"
     )
 
 
