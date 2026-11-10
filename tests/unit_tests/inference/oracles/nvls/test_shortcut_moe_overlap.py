@@ -541,3 +541,190 @@ def test_overlap_is_bitwise_invariant(expert_parallel, monkeypatch, graphs, wide
 def test_overlap_with_delayed_streams(expert_parallel, monkeypatch, graphs):
     """As above, with each stream delayed in turn: a missing fork or join changes the output."""
     _overlap_case(monkeypatch, expert_parallel, wide=False, graphs=graphs, delayed=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# fp64 per-token reference of a whole pair, with the overlap on
+# ---------------------------------------------------------------------------------------------
+
+TIE_MARGIN = 1e-3
+"""Tokens whose fp64 top-k selection is decided by less than this score margin are left out: the
+kernel's router reads a BF16-rounded norm output, so it may pick the other expert of a near tie.
+The routing scores are sigmoid outputs of logits of size ~0.2, so the BF16 perturbation of a score
+is ~1e-4."""
+
+
+def _rms_norm(x, weight, eps, exact):
+    """RMSNorm as the model's norm computes it: fp32 math rounded to BF16 (or fp64 throughout)."""
+    if exact:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+    y = x.float()
+    return (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).bfloat16()
+
+
+def _mlp(x, fc1, fc2, exact):
+    """Squared-ReLU MLP: fp64, or BF16 GEMMs (fp32 accumulation) with the activation in fp32."""
+    if exact:
+        return torch.relu(x @ fc1.T).pow(2) @ fc2.T
+    hidden = torch.relu((x @ fc1.T).float()).pow(2).bfloat16()
+    return hidden @ fc2.T
+
+
+def _pair_reference(h, c, params, selection, exact):
+    """The pair's output for pair inputs ``h`` and predecessor outputs ``c`` ([T, H]).
+
+    The contract of a shortcut pair in inference: the router and the routed experts read the
+    shortcut, RMSNorm_s(h); the shared expert reads RMSNorm_pre(c); their sum passes the post-norm
+    and is added to the residual c. Sigmoid routing: scores sigmoid(W_r x); the top-k of scores +
+    expert bias are selected (``selection``, from the fp64 scores); their scores, normalized to
+    sum 1 and scaled by the top-k scaling factor, weight the experts. ``exact``: fp64 (the
+    reference); otherwise BF16 storage with fp32 router math and fp32 expert accumulation, the
+    precision the model runs at (the trusted implementation).
+    """
+    p = params
+    dtype = torch.float64 if exact else torch.bfloat16
+    acc = torch.float64 if exact else torch.float32
+    h, c = h.to(dtype), c.to(dtype)
+    w = {name: t.to(dtype) for name, t in p["weights"].items()}
+    shortcut = _rms_norm(h, w["shortcut_norm"], p["eps"], exact)
+    scores = torch.sigmoid(shortcut.to(acc) @ w["router"].to(acc).T)
+    chosen = scores.gather(1, selection)
+    probs = chosen / chosen.sum(-1, keepdim=True) * p["scaling"]
+    routed = torch.zeros(h.shape, dtype=acc, device=h.device)
+    for expert in range(w["fc1"].shape[0]):
+        rows, slots = (selection == expert).nonzero(as_tuple=True)
+        if rows.numel():
+            out = _mlp(shortcut[rows], w["fc1"][expert], w["fc2"][expert], exact)
+            routed.index_add_(0, rows, out.to(acc) * probs[rows, slots].unsqueeze(-1))
+    routed = routed.to(dtype)
+    shared = _mlp(
+        _rms_norm(c, w["pre_norm"], p["eps"], exact), w["shared_fc1"], w["shared_fc2"], exact
+    )
+    return c + _rms_norm(routed + shared, w["post_norm"], p["eps"], exact)
+
+
+def _pair_params(block):
+    """The pair's weights, with every rank's local experts gathered in global expert order."""
+    moe = block.moe_layer.mlp
+    experts = moe.experts
+    local = len(moe.local_expert_indices)
+
+    def gathered(linear):
+        stacked = torch.stack([getattr(linear, f"weight{i}").detach() for i in range(local)])
+        parts = [torch.empty_like(stacked) for _ in range(dist.get_world_size())]
+        dist.all_gather(parts, stacked.contiguous())
+        indices = [None] * dist.get_world_size()
+        dist.all_gather_object(indices, list(moe.local_expert_indices))
+        order = [e for rank_indices in indices for e in rank_indices]
+        assert sorted(order) == list(range(NUM_EXPERTS)), f"expert placement {order}"
+        full = torch.cat(parts)
+        return full[torch.tensor(order).argsort().to(full.device)]
+
+    router = moe.router
+    bias = getattr(router, "expert_bias", None)
+    return dict(
+        eps=block.config.layernorm_epsilon,
+        scaling=block.config.moe_router_topk_scaling_factor,
+        topk=block.config.moe_router_topk,
+        bias=None if bias is None else bias.detach().double(),
+        weights=dict(
+            shortcut_norm=block.shortcut_pre_mlp_layernorm.weight.detach(),
+            router=router.weight.detach(),
+            fc1=gathered(experts.linear_fc1),
+            fc2=gathered(experts.linear_fc2),
+            pre_norm=block.moe_layer.pre_mlp_layernorm.weight.detach(),
+            shared_fc1=moe.shared_experts.linear_fc1.weight.detach(),
+            shared_fc2=moe.shared_experts.linear_fc2.weight.detach(),
+            post_norm=block.shortcut_post_norm.weight.detach(),
+        ),
+    )
+
+
+def _capture_pairs(model, engine, recorder):
+    """Record each pair's real-token input, predecessor output and output on every real step."""
+    captured = {id(b): [] for b in model.modules() if isinstance(b, ShortcutMoEBlock)}
+    pending = {}
+    handles = []
+    for block in model.modules():
+        if not isinstance(block, ShortcutMoEBlock):
+            continue
+
+        def compute_hook(module, args, output, key=id(block)):
+            pending[key] = output[0] if isinstance(output, tuple) else output
+
+        def block_hook(module, args, kwargs, output, key=id(block)):
+            if recorder.dummy:
+                return
+            n = engine.context.active_token_count
+            hidden = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+            captured[key].append(
+                tuple(t[:n].reshape(n, -1).detach().clone() for t in (hidden, pending[key], output))
+            )
+
+        handles.append(block.compute_layer.register_forward_hook(compute_hook))
+        handles.append(block.register_forward_hook(block_hook, with_kwargs=True))
+    return captured, handles
+
+
+def _check_pair(block, tokens, params):
+    h = torch.cat([t[0] for t in tokens])
+    c = torch.cat([t[1] for t in tokens])
+    out = torch.cat([t[2] for t in tokens])
+    w = params["weights"]
+    shortcut64 = _rms_norm(h.double(), w["shortcut_norm"].double(), params["eps"], True)
+    scores64 = torch.sigmoid(shortcut64 @ w["router"].double().T)
+    ranked = scores64 + (0 if params["bias"] is None else params["bias"])
+    top = ranked.topk(params["topk"] + 1, dim=-1)
+    selection = top.indices[:, : params["topk"]]
+    shortcut16 = _rms_norm(h, w["shortcut_norm"], params["eps"], False)
+    ranked16 = torch.sigmoid(shortcut16.float() @ w["router"].float().T).double()
+    ranked16 = ranked16 + (0 if params["bias"] is None else params["bias"])
+    same_set = (
+        ranked16.topk(params["topk"], dim=-1).indices.sort(-1).values == selection.sort(-1).values
+    ).all(-1)
+    margin = top.values[:, params["topk"] - 1] - top.values[:, params["topk"]]
+    keep = same_set & (margin > TIE_MARGIN)
+    assert (
+        int(keep.sum()) * 2 >= keep.numel()
+    ), f"only {int(keep.sum())} of {keep.numel()} tokens have a clear top-{params['topk']}"
+    ref = ou.fp64_reference(
+        lambda hh, cc: _pair_reference(hh, cc, params, selection[keep], True), h[keep], c[keep]
+    )
+    trusted = _pair_reference(h[keep], c[keep], params, selection[keep], False)
+    ou.assert_close_to_reference(
+        out[keep], ref, trusted, dim=-1, what=f"pair (layer {block.layer_number}) output"
+    )
+    return int(keep.sum()), keep.numel()
+
+
+@gpu_test
+def test_pair_output_matches_fp64_reference(expert_parallel, monkeypatch):
+    """With the option on (eager), every real token of both pairs matches an fp64 per-token
+    reference of the pair (shortcut norm, sigmoid top-k routing over all ranks' experts, the
+    shared expert on the predecessor's output, post-norm and residual), bounded by a BF16 trusted
+    implementation with the model's rounding points. Tokens at a near tie in the routing are left
+    out (``TIE_MARGIN``); at least half must remain."""
+    model = _build_model(wide=False)
+    engine = _build_engine(model, overlap=True, graphs=False)
+    recorder = _Recorder(engine)
+    captured, handles = _capture_pairs(model, engine, recorder)
+    try:
+        _drive(engine, expert_parallel, recorder)
+    finally:
+        for handle in handles:
+            handle.remove()
+    blocks = [b for b in model.modules() if isinstance(b, ShortcutMoEBlock)]
+    params = [_pair_params(block) for block in blocks]
+    counts = nu.agree(
+        lambda: [
+            _check_pair(block, captured[id(block)], p)
+            for block, p in zip(blocks, params)
+            if captured[id(block)]
+        ],
+        "Shortcut MoE pair output vs fp64",
+    )
+    checked = sum(k for k, _ in counts)
+    assert checked > 0 or not any(captured.values()), "no token was checked"
+    del engine, recorder
+    _reset_cuda_graph_state(model)
+    nu.sync_world()
