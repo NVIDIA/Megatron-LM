@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -389,6 +391,43 @@ def load_residual_state(
             if key.startswith(prefix + legacy):
                 state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
+
+
+def has_legacy_residual_keys(checkpoint_keys) -> bool:
+    """Whether a distributed checkpoint names residual tensors by their combined-module keys.
+
+    Args:
+        checkpoint_keys: ShardedTensor keys of the checkpoint, e.g.
+            dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys().
+    """
+    legacy_prefixes = tuple(legacy for _, legacy in _RESIDUAL_STATE_PREFIXES)
+    return any(
+        key.startswith(legacy) or f".{legacy}" in key
+        for key in checkpoint_keys
+        for legacy in legacy_prefixes
+    )
+
+
+def apply_legacy_residual_keys(
+    sharded_state_dict: ShardedStateDict, prefix: str, metadata: dict | None
+) -> None:
+    """Address a layer's residual tensors by a legacy checkpoint's combined-module keys.
+
+    Distributed checkpoints saved before the read/write split store residual_connection{suffix}
+    tensors. The loader sets metadata['legacy_residual_keys'] for such checkpoints; new
+    checkpoints keep the residual_read{suffix} / residual_write{suffix} keys.
+
+    Args:
+        sharded_state_dict: The layer's sharded state dict, renamed in place.
+        prefix: The layer's state dict prefix.
+        metadata: Sharded state dict metadata from the checkpoint load, or None.
+    """
+    if not metadata or not metadata.get('legacy_residual_keys'):
+        return
+    apply_prefix_mapping(
+        sharded_state_dict,
+        {f"{prefix}{current}": f"{prefix}{legacy}" for current, legacy in _RESIDUAL_STATE_PREFIXES},
+    )
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):
