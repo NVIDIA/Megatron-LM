@@ -54,13 +54,15 @@ class TestFullyShardedOptimizerExpertNames:
         world_size, rank = Utils.world_size, torch.distributed.get_rank()
         model = expert_model(NUM_LOCAL_EXPERTS, num_moe_experts=NUM_LOCAL_EXPERTS * world_size)
         # The model's own EP group spans every rank.
-        model.pg_collection = ProcessGroupCollection(
-            ep=torch.distributed.new_group(ranks=list(range(world_size)))
-        )
+        ep_group = torch.distributed.new_group(ranks=list(range(world_size)))
+        model.pg_collection = ProcessGroupCollection(ep=ep_group)
         local_experts = model.decoder.layers[0].mlp.experts.local_experts
 
-        with forbid_global_expert_parallel_reads():
-            optimizer = build_optimizer(model)
+        try:
+            with forbid_global_expert_parallel_reads():
+                optimizer = build_optimizer(model)
+        finally:
+            torch.distributed.destroy_process_group(ep_group)
 
         offset = NUM_LOCAL_EXPERTS * rank
         assert [optimizer._param_to_fqn[expert.weight] for expert in local_experts] == [

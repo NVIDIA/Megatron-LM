@@ -359,6 +359,14 @@ def _build_optimizer_from_collection(parameters, pg_collection, grad_stats_group
     )
 
 
+def _destroy_grid(grid):
+    """Destroy the process groups of ``grid``; call on every rank."""
+    # Every rank finishes its collectives before any communicator goes away.
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    grid.destroy()
+
+
 def _norm_and_counted_elements(optimizer, parameters):
     """Gradient norm, then the number of gradient elements the optimizer counts.
 
@@ -410,11 +418,14 @@ class TestGradNormWithCollectionGroups:
         weight_grad, bias_grad = _logical_layer_grads(torch.distributed.get_rank())
         parameters = [_parameter_with_grad(weight_grad), _parameter_with_grad(bias_grad)]
 
-        with _forbid_global_grid_reads():
-            optimizer = _build_optimizer_from_collection(
-                parameters, pg_collection, grad_stats_group
-            )
-            grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        try:
+            with _forbid_global_grid_reads():
+                optimizer = _build_optimizer_from_collection(
+                    parameters, pg_collection, grad_stats_group
+                )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
 
         elements_per_layer = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT + COLUMNS_PER_WEIGHT
         assert counted_elements == world_size * elements_per_layer
@@ -460,11 +471,14 @@ class TestGradNormWithCollectionGroups:
             _parameter_with_grad(expert_grad, allreduce=False),
         ]
 
-        with _forbid_global_grid_reads():
-            optimizer = _build_optimizer_from_collection(
-                parameters, pg_collection, grad_stats_group
-            )
-            grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        try:
+            with _forbid_global_grid_reads():
+                optimizer = _build_optimizer_from_collection(
+                    parameters, pg_collection, grad_stats_group
+                )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
 
         dense_elements = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT + COLUMNS_PER_WEIGHT
         expert_elements = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT

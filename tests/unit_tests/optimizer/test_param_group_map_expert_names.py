@@ -40,7 +40,8 @@ class TestParamGroupMapExpertNames:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # An expert-parallel layout that differs from the global one (EP=1).
-        pg_collection.ep = torch.distributed.new_group(ranks=list(range(world_size)))
+        ep_group = torch.distributed.new_group(ranks=list(range(world_size)))
+        pg_collection.ep = ep_group
 
         named = []
 
@@ -51,13 +52,16 @@ class TestParamGroupMapExpertNames:
         monkeypatch.setattr(optimizer_module, 'get_global_unique_param_name', record_name)
         monkeypatch.setattr(torch.distributed.checkpoint, 'save', lambda **kwargs: None)
 
-        get_megatron_optimizer(
-            OptimizerConfig(optimizer='adam', lr=1e-3),
-            [model],
-            use_gloo_process_groups=False,
-            pg_collection=pg_collection,
-            dump_param_to_param_group_map='unused',
-        )
+        try:
+            get_megatron_optimizer(
+                OptimizerConfig(optimizer='adam', lr=1e-3),
+                [model],
+                use_gloo_process_groups=False,
+                pg_collection=pg_collection,
+                dump_param_to_param_group_map='unused',
+            )
+        finally:
+            torch.distributed.destroy_process_group(ep_group)
 
         layout = {'ep_rank': rank, 'ep_size': world_size}
         # The expert weight is the parameter whose name depends on the expert-parallel layout.
