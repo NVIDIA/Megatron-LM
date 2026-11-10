@@ -346,37 +346,45 @@ def _legacy_checkpoint_args(args, ckpt_dir):
 def test_data_parallel_groups_left_out_of_a_collection_come_from_the_global_grid(monkeypatch):
     """A group comes from the argument, then from the collection, then from the global grid.
 
-    Only a collection that sets no field of the group reads the global grid.
+    Only a collection that sets no field of the group reads the global grid, after a warning.
     """
     given, dp, dp_cp, global_group = object(), object(), object(), object()
     pg_collection = ProcessGroupCollection(dp=dp, dp_cp=dp_cp, expt_dp=None)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    with _no_global_grid():
-        assert checkpointing._data_parallel_group(given, pg_collection, "dp") is given
-        assert checkpointing._data_parallel_group(None, pg_collection, "dp_gtp_remat", "dp") is dp
-        assert (
-            checkpointing._data_parallel_group(None, pg_collection, "dp_cp_gtp_remat", "dp_cp")
-            is dp_cp
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    def data_parallel_group(group, pg_collection, *fields):
+        return checkpointing._data_parallel_group(
+            group, pg_collection, *fields, owner="save_checkpoint"
         )
+
+    with _no_global_grid():
+        assert data_parallel_group(given, pg_collection, "dp") is given
+        assert data_parallel_group(None, pg_collection, "dp_gtp_remat", "dp") is dp
+        assert data_parallel_group(None, pg_collection, "dp_cp_gtp_remat", "dp_cp") is dp_cp
         # A field that is set to None means that the axis is not used.
-        assert checkpointing._data_parallel_group(None, pg_collection, "expt_dp") is None
+        assert data_parallel_group(None, pg_collection, "expt_dp") is None
 
     language_model_groups = ProcessGroupCollection(tp=object(), cp=object(), pp=object())
-    with mock.patch.object(
-        ProcessGroupCollection,
-        "use_mpu_process_groups",
-        return_value=ProcessGroupCollection(dp_cp_gtp_remat=global_group),
-    ) as use_mpu_process_groups:
-        group = checkpointing._data_parallel_group(
-            None, language_model_groups, "dp_cp_gtp_remat", "dp_cp"
-        )
+    with (
+        mock.patch.object(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            return_value=ProcessGroupCollection(dp_cp_gtp_remat=global_group),
+        ) as use_mpu_process_groups,
+        pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="save_checkpoint was called without `pg_collection.dp_cp_gtp_remat`",
+        ),
+    ):
+        group = data_parallel_group(None, language_model_groups, "dp_cp_gtp_remat", "dp_cp")
     assert group is global_group
     use_mpu_process_groups.assert_called_once_with(required_pgs=["dp_cp_gtp_remat"])
 
     # Without torch.distributed there is no group to read.
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     with _no_global_grid():
-        assert checkpointing._data_parallel_group(None, language_model_groups, "dp") is None
+        assert data_parallel_group(None, language_model_groups, "dp") is None
 
 
 def test_torch_dist_round_trip_without_data_parallel_groups_in_the_collection(
@@ -419,14 +427,15 @@ def test_torch_dist_round_trip_without_data_parallel_groups_in_the_collection(
 @pytest.mark.parametrize("dp_rank,expt_dp_rank,writes", [(0, 1, True), (1, 0, True), (1, 1, False)])
 @pytest.mark.parametrize("source", ["collection", "collection without gtp_remat", "global grid"])
 def test_legacy_save_selects_the_data_parallel_groups(
-    ckpt_args, tmp_path, dp_rank, expt_dp_rank, writes, source
+    monkeypatch, ckpt_args, tmp_path, dp_rank, expt_dp_rank, writes, source
 ):
     """The first ranks of the replicate dp and expt_dp groups write a legacy shard.
 
     Every other data-parallel group holds a rank that would change the writers. A collection
     without the GTP-remat-inclusive groups uses dp and dp_cp in their place, and one that leaves
-    the data-parallel groups out takes them from the global grid.
+    the data-parallel groups out takes them from the global grid, with a warning for each.
     """
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     _legacy_checkpoint_args(ckpt_args, tmp_path)
     # The first rank of the job writes the run config next to the shards, also when the
     # stand-in ranks make it no writer.
@@ -458,9 +467,24 @@ def test_legacy_save_selects_the_data_parallel_groups(
             checkpointing, "get_rng_state", wraps=checkpointing.get_rng_state
         ) as rng_state,
         mock.patch.object(checkpointing, "maybe_save_dataloader_state") as save_dataloader_state,
+        warnings.catch_warnings(record=True) as record,
     ):
+        warnings.simplefilter("always")
         save_checkpoint(5, [model], None, None, 0, pg_collection=pg_collection)
 
+    fallbacks = [
+        str(warning.message)
+        for warning in record
+        if issubclass(warning.category, ProcessGroupFallbackWarning)
+    ]
+    assert fallbacks == [
+        f"save_checkpoint was called without `pg_collection.{name}` and falls back to the global "
+        "process groups in megatron.core.parallel_state. This fallback is deprecated since "
+        "Megatron Core 0.21 and will be removed in 0.23; pass the owning model's process groups "
+        "explicitly."
+        for name in ("dp", "dp_gtp_remat", "dp_cp_gtp_remat", "expt_dp")
+        if source == "global grid"
+    ]
     shard = tmp_path / "iter_0000005" / "mp_rank_00" / "model_optim_rng.pt"
     assert shard.exists() == writes
     assert rng_state.call_args.kwargs["dp_group"] is groups["dp"]
