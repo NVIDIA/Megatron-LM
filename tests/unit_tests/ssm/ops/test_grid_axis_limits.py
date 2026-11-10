@@ -8,6 +8,10 @@ batch: requests x heads for the decode recurrence, sequences x heads for the chu
 recurrence, chunks for the chunk output, token blocks for the varlen causal conv. The last
 request's results must be bitwise those of the same request launched alone: the arithmetic is
 identical, and only the program that computes it differs.
+
+The ``large`` cases (opt-in, ``-m large``; 9 to 26 GiB each) cover offsets that pass 2**31 at
+sizes the axis-0 grids now launch: the decode's token rows, its dense state rows, and the conv's
+token index, each with a control one size smaller.
 """
 
 import pytest
@@ -183,5 +187,140 @@ def test_varlen_conv_token_blocks(conv_smallest_token_block, blocks):
     )
     alone = causal_conv1d_varlen.causal_conv1d_varlen_fn(
         x[-TAIL:].contiguous(), weight, bias, _cu_seqlens([TAIL]), states[1:].contiguous()
+    )
+    assert torch.equal(out[-TAIL:], alone), f"conv of the last request of {tokens} tokens differs"
+
+
+# Offsets that pass 2**31 at sizes the axis-0 grids now launch (`large`, opt-in with -m large;
+# each case with a control one size smaller).
+
+
+def _requires_free_memory(nbytes):
+    free = torch.cuda.mem_get_info()[0]
+    if free < nbytes:
+        pytest.skip(f"needs {nbytes / 2**30:.1f} GiB of free GPU memory, {free / 2**30:.1f} free")
+
+
+@pytest.mark.large
+@pytest.mark.parametrize(
+    "requests",
+    [
+        pytest.param(2**31 // (HEADS * 128), id="fits"),
+        pytest.param(2**31 // (HEADS * 128) + 1, id="past-int32"),
+    ],
+)
+def test_decode_token_offsets_past_int32(requests):
+    """GDP/GDN decode with a slot-indexed cache: the last request's query and key rows start at
+    (request * T * H + head) * K, which passes 2**31 from 524289 requests of one token at 32 heads
+    of 128 (from 4855 requests of 27 steps at 64 heads of 256). Every other request is padding."""
+    _requires_cuda()
+    H, K, V = HEADS, 128, 8
+    _requires_free_memory(requests * H * (4 * K + 4 * V + 8) + (1 << 30))
+    gen = torch.Generator(device="cuda").manual_seed(1234)
+    q = torch.zeros(requests, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.zeros_like(q), q.new_zeros(requests, 1, H, V)
+    g = q.new_zeros(requests, 1, H, dtype=torch.float32)
+    beta = q.new_zeros(requests, 1, H)
+    for x in (q, k, v):
+        x[-1] = _randn(gen, *x.shape[1:])
+    g[-1] = -torch.rand(*g.shape[1:], generator=gen, device="cuda")
+    beta[-1] = torch.rand(*beta.shape[1:], generator=gen, device="cuda")
+    initial = _randn(gen, 2, H, K, V, dtype=torch.float32, scale=1.0)
+    slots = torch.full((requests,), -1, dtype=torch.int32, device="cuda")
+    slots[-1] = 1
+
+    def decode(rows):
+        state = initial.clone()
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q[rows],
+            k[rows],
+            v[rows],
+            g=g[rows],
+            beta=beta[rows],
+            state=state,
+            state_indices=slots[rows],
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out[-1], state[1]
+
+    expected = decode(slice(requests - 1, requests))
+    actual = decode(slice(None))
+    for name, a, e in zip(("output", "state"), actual, expected):
+        assert torch.equal(a, e), f"{name} of the last of {requests} requests differs"
+
+
+@pytest.mark.large
+@pytest.mark.parametrize(
+    "sequences",
+    [
+        pytest.param(2**31 // (HEADS * 128 * 128), id="fits"),
+        pytest.param(2**31 // (HEADS * 128 * 128) + 1, id="past-int32"),
+    ],
+)
+def test_dense_state_offsets_past_int32(sequences):
+    """The recurrence with a dense state (``state`` without slot indices, one row per sequence):
+    the last sequence's state starts at (sequence * HV + head) * K * V, which passes 2**31 from
+    4097 sequences of 32 heads of 128 x 128 (8.6 GB of fp32 state)."""
+    _requires_cuda()
+    H, K, V = HEADS, 128, 128
+    _requires_free_memory(2 * sequences * H * K * V * 4 + (1 << 30))
+    gen = torch.Generator(device="cuda").manual_seed(1234)
+    q, k = _randn(gen, sequences, 1, H, K), _randn(gen, sequences, 1, H, K)
+    v = _randn(gen, sequences, 1, H, V)
+    g = -torch.rand(sequences, 1, H, generator=gen, device="cuda")
+    beta = torch.rand(sequences, 1, H, generator=gen, device="cuda").bfloat16()
+    state = torch.zeros(sequences, H, K, V, device="cuda")
+    state[-1] = _randn(gen, H, K, V, dtype=torch.float32, scale=1.0)
+    alone = state[-1:].clone()
+    last = slice(sequences - 1, sequences)
+    alone_out, _ = fused_recurrent_gated_delta_rule_update(
+        q[last],
+        k[last],
+        v[last],
+        g=g[last],
+        beta=beta[last],
+        state=alone,
+        use_qk_l2norm_in_kernel=True,
+    )
+    out, _ = fused_recurrent_gated_delta_rule_update(
+        q, k, v, g=g, beta=beta, state=state, use_qk_l2norm_in_kernel=True
+    )
+    assert torch.equal(out[-1], alone_out[0]), f"output of the last of {sequences} differs"
+    assert torch.equal(state[-1], alone[0]), f"state of the last of {sequences} differs"
+
+
+@pytest.mark.large
+@pytest.mark.parametrize(
+    "tokens", [pytest.param(2**31 - 64, id="fits"), pytest.param(2**31 + 8, id="past-int32")]
+)
+def test_varlen_conv_tokens_past_int32(tokens):
+    """Varlen causal conv over one channel: the last request's tokens run past index 2**31, which
+    the axis-0 grid now launches (26 GiB with the per-token request metadata)."""
+    _requires_cuda()
+    _requires_free_memory(tokens * 12 + (1 << 30))
+    gen = torch.Generator(device="cuda").manual_seed(1234)
+    conv_dim, width = 1, 4
+    weight, bias = _randn(gen, conv_dim, width, scale=1.0), _randn(gen, conv_dim, scale=1.0)
+    states = _randn(gen, 2, conv_dim, width - 1, scale=1.0)
+    tail = _randn(gen, TAIL, conv_dim, scale=1.0)
+    # Alone first, so the autotuner's choice for this conv_dim is the one the step reuses.
+    alone = causal_conv1d_varlen.causal_conv1d_varlen_fn(
+        tail, weight, bias, _cu_seqlens([TAIL]), states[1:].contiguous()
+    )
+    x = torch.zeros(tokens, conv_dim, device="cuda", dtype=torch.bfloat16)
+    x[-TAIL:] = tail
+    seq_idx = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+    seq_idx[-TAIL:] = 1
+    seq_start = torch.zeros_like(seq_idx)
+    seq_start[-TAIL:] = tokens - TAIL
+    out = causal_conv1d_varlen.causal_conv1d_varlen_fn(
+        x,
+        weight,
+        bias,
+        # Only its length is read with precomputed metadata; int64, since tokens pass 2**31.
+        torch.tensor([0, tokens - TAIL, tokens], device="cuda"),
+        states,
+        precomputed_seq_idx=seq_idx,
+        precomputed_seq_start=seq_start,
     )
     assert torch.equal(out[-TAIL:], alone), f"conv of the last request of {tokens} tokens differs"

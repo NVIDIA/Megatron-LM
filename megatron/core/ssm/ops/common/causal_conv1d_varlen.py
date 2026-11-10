@@ -53,8 +53,9 @@ def _causal_conv1d_varlen_kernel(
     """
     # Channel and token blocks share grid axis 0, the channel block varying fastest: CUDA caps
     # axes 1 and 2 at 65535 programs, which the token blocks pass from 524281 tokens at BLOCK_T 8.
+    # The token block is int64, so the token indices are: the grid now reaches 2**31 tokens.
     pid_c = tl.program_id(0) % tl.cdiv(conv_dim, BLOCK_C)
-    pid_t = tl.program_id(0) // tl.cdiv(conv_dim, BLOCK_C)
+    pid_t = (tl.program_id(0) // tl.cdiv(conv_dim, BLOCK_C)).to(tl.int64)
 
     c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)  # (BLOCK_C,)
     c_mask = c_off < conv_dim
