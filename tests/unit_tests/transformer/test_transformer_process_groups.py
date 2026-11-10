@@ -318,9 +318,11 @@ class TestFloat16ModuleCollection:
     """Float16Module converts on the pipeline stages of the wrapped module's own groups."""
 
     class _Recorder(torch.nn.Module):
+        """Records the dtype of its input and returns it in the model precision."""
+
         def forward(self, x):
             self.input_dtype = x.dtype
-            return x
+            return x.to(torch.bfloat16)
 
     class _StageGroup:
         """A pipeline group of which this rank is ``rank`` out of ``size``."""
@@ -334,17 +336,19 @@ class TestFloat16ModuleCollection:
         def size(self):
             return self._size
 
+    # Every row feeds float32, so the dtype that the wrapped module sees tells whether the inputs
+    # were converted: only the first stage converts them.
     @pytest.mark.parametrize(
-        "rank, size, input_dtype, converted_input, output_dtype",
+        "rank, size, module_input, output_dtype",
         [
-            (0, 1, torch.float32, torch.bfloat16, torch.float32),  # only stage
-            (0, 2, torch.float32, torch.bfloat16, torch.bfloat16),  # first stage
-            (1, 3, torch.bfloat16, torch.bfloat16, torch.bfloat16),  # middle stage
-            (1, 2, torch.bfloat16, torch.bfloat16, torch.float32),  # last stage
+            (0, 1, torch.bfloat16, torch.float32),  # only stage
+            (0, 2, torch.bfloat16, torch.bfloat16),  # first stage
+            (1, 3, torch.float32, torch.bfloat16),  # middle stage
+            (1, 2, torch.float32, torch.float32),  # last stage
         ],
     )
     def test_explicit_collection_selects_the_stage(
-        self, monkeypatch, rank, size, input_dtype, converted_input, output_dtype
+        self, monkeypatch, rank, size, module_input, output_dtype
     ):
         Utils.initialize_model_parallel()
         config = _config(bf16=True, pipeline_model_parallel_size=size)
@@ -354,8 +358,8 @@ class TestFloat16ModuleCollection:
         with warnings.catch_warnings():
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             wrapper = Float16Module(config, recorder, pg_collection=pg_collection)
-            output = wrapper(torch.ones(2, dtype=input_dtype, device="cuda"))
-        assert recorder.input_dtype == converted_input
+            output = wrapper(torch.ones(2, dtype=torch.float32, device="cuda"))
+        assert recorder.input_dtype == module_input
         assert output.dtype == output_dtype
 
     def test_argument_takes_precedence_over_the_module_collection(self):
@@ -367,7 +371,8 @@ class TestFloat16ModuleCollection:
         wrapper = Float16Module(config, recorder, pg_collection=pg_collection)
         assert wrapper.pg_collection is pg_collection
         # The last stage of two converts outputs but not inputs.
-        assert wrapper(torch.ones(2, dtype=torch.bfloat16, device="cuda")).dtype == torch.float32
+        assert wrapper(torch.ones(2, dtype=torch.float32, device="cuda")).dtype == torch.float32
+        assert recorder.input_dtype == torch.float32
 
     def test_module_collection_without_pp_raises_under_pipeline_parallelism(self):
         Utils.initialize_model_parallel()
