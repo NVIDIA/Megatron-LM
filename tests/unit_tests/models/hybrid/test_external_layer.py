@@ -299,9 +299,13 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
     output = actual(
         actual_input, attention_mask=None, input_ids=token_ids.index_select(1, positions)
     )
+    # Both ranks contribute to the same global mean loss as the unsharded reference.
+    expected.square().mean().backward()
+    (output.square().sum() / expected.numel()).backward()
+    # Finish collectives before assertions so a failure cannot strand another rank.
+    for parameter in actual.parameters():
+        torch.distributed.all_reduce(parameter.grad, group=groups.cp)
     torch.testing.assert_close(output, expected.index_select(0, positions))
-    expected.square().sum().backward()
-    output.square().sum().backward()
     torch.testing.assert_close(actual_input.grad, reference_input.grad.index_select(0, positions))
     for layer, layout in zip(actual.layers, layouts, strict=True):
         inner = layer.inner_layer if with_mhc else layer
@@ -310,8 +314,11 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
         )
     for name, parameter in actual.named_parameters():
         assert parameter.grad is not None, name
-        torch.distributed.all_reduce(parameter.grad, group=groups.cp)
-        torch.testing.assert_close(parameter.grad, reference.get_parameter(name).grad, msg=name)
+        torch.testing.assert_close(
+            parameter.grad,
+            reference.get_parameter(name).grad,
+            msg=lambda message: f"{name}: {message}",
+        )
 
 
 @pytest.mark.parametrize("recompute_mode", [None, "uniform", "block", "mhc"])
