@@ -26,12 +26,12 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig, _get_megatron_optimizer_based_on_param_groups
 from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 # Row count of every logical weight. Must stay divisible by each GTP size under test.
@@ -476,14 +476,41 @@ class TestGradNormWithCollectionGroups:
             squared_norm += expert_grad.double().pow(2).sum().item()
         assert grad_norm == pytest.approx(squared_norm**0.5, rel=1e-5)
 
-    def test_collection_without_tp_is_rejected(self):
-        """The TP group comes from the collection; an unset ``tp`` is an error, not a fallback."""
+    def test_collection_without_tp_warns_and_filters_by_the_global_grid(self, monkeypatch):
+        """An unset ``tp`` is deprecated: the filters still read the global TP rank, and warn."""
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        # This test observes the first fallback warning of every owner.
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+        # One bias, replicated across each TP pair of the global grid.
+        _, bias_grad = _logical_layer_grads(0)
+        parameters = [_parameter_with_grad(bias_grad)]
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            optimizer = _build_optimizer_from_collection(
+                parameters,
+                ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None),
+                parallel_state.get_model_parallel_group(),
+            )
+            grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+
+        owner = "get_megatron_optimizer was called without `pg_collection.tp`"
+        assert any(str(warning.message).startswith(owner) for warning in record)
+        # The grad-stats group is one TP pair, which counts its bias on TP rank 0 only.
+        assert counted_elements == COLUMNS_PER_WEIGHT
+        assert grad_norm == pytest.approx(bias_grad.double().norm().item(), rel=1e-5)
+
+    def test_collection_without_tp_is_rejected_without_a_global_grid(self):
+        """Without a global grid to fall back to, an unset ``tp`` is an error."""
         Utils.initialize_model_parallel()
+        Utils.destroy_model_parallel()
         weight_grad, _ = _logical_layer_grads(0)
 
         with pytest.raises(ValueError, match="must set tp"):
             _build_optimizer_from_collection(
                 [_parameter_with_grad(weight_grad)],
                 ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None),
-                parallel_state.get_model_parallel_group(),
+                torch.distributed.group.WORLD,
             )
