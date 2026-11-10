@@ -27,6 +27,7 @@ from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_checkpointing import (
     MockModel,
+    MockState,
     create_args,
     create_ckpt_load_args,
     init_model_parallel,
@@ -484,3 +485,72 @@ def test_legacy_load_reads_the_shard_of_the_stand_in_ranks(ckpt_args, tmp_path_d
             loaded = load_checkpoint([restored], None, None, pg_collection=pg_collection)
             assert loaded == (123, 456)
             assert torch.all(restored.l.weight == tp_rank + 1)
+
+
+class _LayerWiseOptimizer(MockState):
+    """Records the files that a layer-wise distributed optimizer saves to and loads from."""
+
+    def __init__(self):
+        super().__init__({"optimizer": "optimizer_state"})
+        self.files = []
+
+    def save_state_dict_to_file(self, filename):
+        self.files.append(filename)
+
+    load_state_dict_from_file = save_state_dict_to_file
+
+
+def test_layer_wise_optimizer_file_is_named_by_the_dp_gtp_remat_rank(
+    ckpt_args, tmp_path_dist_ckpt, run_config
+):
+    """A rank saves and loads the layer-wise optimizer file of its rank in dp_gtp_remat."""
+    run_config.optimizer.use_layer_wise_distributed_optimizer = True
+    pg_collection = _stand_in_collection(dp_gtp_remat=_StandInGroup(rank=3, size=4))
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    optimizer = _LayerWiseOptimizer()
+    with (
+        TempNamedDir(
+            tmp_path_dist_ckpt / "test_layer_wise_optimizer_file_is_named_by_the_dp_gtp_remat_rank",
+            sync=True,
+        ) as ckpt_dir,
+        _no_global_grid(),
+    ):
+        _legacy_checkpoint_args(ckpt_args, ckpt_dir)
+        save_checkpoint(123, [model], optimizer, None, 456, pg_collection=pg_collection)
+        load_checkpoint(
+            [model], optimizer, None, restore_training_state=True, pg_collection=pg_collection
+        )
+
+    shard_dir = os.path.join(str(ckpt_dir), "iter_0000123", "mp_rank_00")
+    assert optimizer.files == [os.path.join(shard_dir, "layer_wise_optimizer_3.pt")] * 2
+
+
+@pytest.mark.parametrize("process_group,field", [("dp", "dp_cp_gtp_remat"), ("ep_dp", "expt_dp")])
+def test_fully_parallel_save_runs_over_the_group_of_the_collection(
+    ckpt_args, tmp_path, process_group, field
+):
+    """A fully parallel save spreads its shards over dp_cp_gtp_remat, or over expt_dp."""
+    args = ckpt_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.ckpt_fully_parallel_save = True
+    args.ckpt_fully_parallel_save_process_group = process_group
+    args.ckpt_fully_parallel_load_process_group = process_group
+    args.save = str(tmp_path)
+    args.save_tokenizer_assets = False
+    set_args(args)
+    sync_checkpoint_config(args)
+    pg_collection = _stand_in_collection(
+        dp_cp_gtp_remat=_StandInGroup(0, 2), expt_dp=_StandInGroup(0, 2)
+    )
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    with (
+        _no_global_grid(),
+        mock.patch.object(checkpointing, "FullyParallelSaveStrategyWrapper") as wrapper,
+        mock.patch.object(checkpointing.dist_checkpointing, "save", return_value=None) as save,
+    ):
+        save_checkpoint(5, [model], None, None, 0, pg_collection=pg_collection)
+
+    assert wrapper.call_args.args[1] is getattr(pg_collection, field)
+    assert save.call_args.args[2] is wrapper.return_value
