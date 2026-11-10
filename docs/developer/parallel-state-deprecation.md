@@ -378,7 +378,15 @@ A framework that builds the engine itself with
 `megatron.core.inference.engine_factory.build_dynamic_inference_engine()` sets
 `InferenceConfig(pg_collection=...)`. Left unset, inference uses the collection that the model
 was built with, when it sets every group that inference reads (`tp`, `pp`, `dp`, `mp`, `ep`,
-`cp`, `expt_tp` and `expt_dp`), and otherwise falls back to the global grid with a warning.
+`cp`, `expt_tp`, `expt_dp` and `tp_ep`), and otherwise falls back to the global grid with a
+`ProcessGroupFallbackWarning`. A `DynamicInferenceContext` that is built directly on a config
+without a collection does not hold the model, so it always takes that fallback.
+
+Whichever collection inference runs on, `tp`, `pp`, `dp` and `mp` must be process groups, because
+inference runs collectives on them: one that is `None` raises `ValueError` instead of falling
+back, so use a single-rank group for an axis of size 1. A collection set in `InferenceConfig`
+must also set `ep`. It may leave `cp`, `expt_tp` and `expt_dp` unset until 0.23, with a
+`FutureWarning`; set them to `None` when the axis is off.
 
 **3. Read sizes, ranks and stages from the collection.** Replace each accessor with the field
 from [Select the matching group](#select-the-matching-group):
