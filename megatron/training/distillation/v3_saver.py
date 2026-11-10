@@ -39,8 +39,10 @@ class PairedLogitsSaver(LogitsSaverHooks):
         """Initialize metadata after checkpoint restoration, once per run."""
         if self._initialized:
             return
-        from .v3_runtime import initialize_dump_metadata
+        from .v3_runtime import initialize_dump_metadata, tokenizer_vocab_size
 
+        # Targets are normalized over the tokenizer's vocabulary, excluding padding.
+        self._real_vocab_size = tokenizer_vocab_size()
         self.metadata_dict = initialize_dump_metadata(self)
         self._meta_bytes = json.dumps(self.metadata_dict, sort_keys=True).encode()
         self._initialized = True
@@ -164,7 +166,7 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 "start": start,
                 "end": end,
                 "batch": samples_batch(
-                    inputs, values, indices, tail, vocab_size=contract["logprob_vocab_size"]
+                    inputs, values, indices, tail, vocab_size=self._real_vocab_size
                 ),
             }
         self._captured.clear()

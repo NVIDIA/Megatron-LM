@@ -212,6 +212,9 @@ class LogitsSaverHooks:
     """
 
     _max_vocab_size = 2 ** 17  # V1/V2 use 17-bit vocabulary indices.
+    # When set, IDs at or above it (vocabulary padding) are excluded from the softmax
+    # and the top-K selection, so targets are a distribution over real tokens only.
+    _real_vocab_size: Optional[int] = None
 
     _DTYPE_MAP = {
         'fp16': torch.float16,
@@ -550,13 +553,26 @@ class LogitsSaverHooks:
             f"Global vocab size {global_vocab_size} exceeds maximum supported {max_vocab_size}"
         )
 
-        effective_k = min(self.k, global_vocab_size)
+        real_vocab_size = self._real_vocab_size or global_vocab_size
+        effective_k = min(self.k, real_vocab_size)
         local_k = min(effective_k, local_vocab_size)
 
-        # Convert to fp32 to lessen precision issues
-        logits = logits.float()
+        # Padding sits at the end of the vocabulary, so excluding it is a view of this
+        # shard's real entries (possibly none), not a copy. Convert to fp32 to lessen
+        # precision issues.
+        real = min(local_vocab_size, max(0, real_vocab_size - self.tp_rank * local_vocab_size))
+        logits = logits[..., :real].float()
 
-        local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
+        local_logit_vals, local_indices = torch.topk(logits, min(local_k, real), dim=-1)
+        if real < local_k:
+            # Keep every rank's candidate count equal for the gather; -inf is never chosen
+            # because effective_k does not exceed the number of real entries.
+            missing = local_k - real
+            padding = local_logit_vals.new_full((*logits.shape[:-1], missing), -torch.inf)
+            local_logit_vals = torch.cat((local_logit_vals, padding), dim=-1)
+            local_indices = torch.cat(
+                (local_indices, local_indices.new_zeros((*logits.shape[:-1], missing))), dim=-1
+            )
 
         # Local log-sum-exp via PyTorch's fused CUDA kernel
         local_lse = torch.logsumexp(logits, dim=-1, keepdim=True)

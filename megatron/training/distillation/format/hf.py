@@ -56,7 +56,8 @@ class CorpusStream(torch.utils.data.IterableDataset):
     """One rank's samples, resumable from a global position; at most one loader worker.
 
     ``tokenizer`` is the student's Hugging Face tokenizer, checked with
-    :func:`check_student` (against ``student_vocab_size`` too, when given).
+    :func:`check_student`; ``model_vocab_size``, the model's output width, is checked
+    too when given. Every stored target index must be a token of the tokenizer.
     This stream already assigns DP ranks. Do not apply another distributed dataset
     sharder (for example Trainer/Accelerate's automatic sharding) on top of it.
     """
@@ -71,9 +72,11 @@ class CorpusStream(torch.utils.data.IterableDataset):
         world_size: int = 1,
         micro_batch_size: int = 1,
         start: int = 0,
+        model_vocab_size: int | None = None,
         **reader_options: Any,
     ):
-        check_student(manifest, tokenizer, vocab_size=reader_options.get("student_vocab_size"))
+        check_student(manifest, tokenizer, vocab_size=model_vocab_size)
+        reader_options["vocab_size"] = len(tokenizer)
         self.root, self.manifest = root, manifest
         self.rank, self.world_size, self.micro_batch_size = rank, world_size, micro_batch_size
         self.start = start

@@ -238,17 +238,14 @@ class _BlockReader:
         targets: bool,
         decode_threads: int,
         prefetch_depth: int,
-        student_vocab_size: int | None,
+        vocab_size: int | None,
     ):
         self.contract = contract
         self.prefix_stable = contract["prefix_stable"]
         self.isolated = contract["attention_mode"] == "isolated_segments"
         self.targets = targets
-        self.student_vocab_size = student_vocab_size
-        # Entries whose index the student vocabulary lacks are masked into the ghost bucket.
-        self.masked_entries = 0
-        self.target_entries = 0
-        self._masking_warned = False
+        # The tokenizer's size: every valid target index must be below it.
+        self.vocab_size = vocab_size
         self.prefetch_depth = max(1, prefetch_depth)
         self.pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, decode_threads), thread_name_prefix="offline-kd-v3-decode"
@@ -260,10 +257,7 @@ class _BlockReader:
     ) -> tuple[dict, tuple | None]:
         """Decode and validate one block."""
         batch = read_block(index, block, raw, inputs_only=not self.targets)
-        # Normalization domain and index encoding belong to this file, not the blend.
-        inputs, targets = decode_block(
-            batch, vocab_size=file_meta(index)["contract"]["logprob_vocab_size"]
-        )
+        inputs, targets = decode_block(batch, vocab_size=self.vocab_size)
         if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
             raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
         inputs["segment_offsets"] = torch.cat(
@@ -274,36 +268,7 @@ class _BlockReader:
         inputs["target_offsets"] = torch.cat(
             (torch.zeros(1, dtype=torch.int64), torch.cumsum(scored.long(), 0))
         )
-        if targets is not None:
-            targets = self._mask_unknown_indices(*targets)
         return inputs, targets
-
-    def _mask_unknown_indices(
-        self, values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        valid = values != LOGPROB_SENTINEL
-        self.target_entries += int(valid.sum())
-        if self.student_vocab_size is None:
-            return values, indices, tail
-        unknown = valid & (indices >= self.student_vocab_size)
-        count = int(unknown.sum())
-        if count:
-            self.masked_entries += count
-            # Entries the student cannot represent join the tail bucket.
-            masked = values.float().masked_fill(~unknown, -torch.inf).logsumexp(-1)
-            tail = torch.logaddexp(tail, masked)
-            values = values.masked_fill(unknown, LOGPROB_SENTINEL)
-            indices = indices.masked_fill(unknown, 0)
-            fraction = self.masked_entries / max(1, self.target_entries)
-            if fraction > 1e-4 and not self._masking_warned:
-                self._masking_warned = True
-                print(
-                    f"WARNING: offline KD v3 masked {self.masked_entries} teacher target entries "
-                    f"({fraction:.2%}) with indices beyond the student vocabulary "
-                    f"({self.student_vocab_size}); check the teacher/student vocabularies",
-                    flush=True,
-                )
-        return values, indices, tail
 
     def slice_sample(self, inputs: dict, targets: tuple | None, row: int, sample_id: int) -> dict:
         """Cut one sample (and its target rows) out of a decoded block."""
@@ -341,7 +306,7 @@ class ReplayReader(_BlockReader):
         passes: int = 1,
         decode_threads: int = 4,
         prefetch_depth: int = 2,
-        student_vocab_size: int | None = None,
+        vocab_size: int | None = None,
     ):
         validate_metadata(metadata)
         super().__init__(
@@ -349,7 +314,7 @@ class ReplayReader(_BlockReader):
             targets=targets,
             decode_threads=decode_threads,
             prefetch_depth=prefetch_depth,
-            student_vocab_size=student_vocab_size,
+            vocab_size=vocab_size,
         )
         self.storage = storage
         self.metadata = metadata
@@ -515,14 +480,14 @@ class CorpusReader(_BlockReader):
         targets: bool = True,
         decode_threads: int = 4,
         prefetch_depth: int = 2,
-        student_vocab_size: int | None = None,
+        vocab_size: int | None = None,
     ):
         super().__init__(
             manifest["contract"],
             targets=targets,
             decode_threads=decode_threads,
             prefetch_depth=prefetch_depth,
-            student_vocab_size=student_vocab_size,
+            vocab_size=vocab_size,
         )
         self.root = root
         self.manifest = manifest
@@ -564,8 +529,6 @@ class CorpusReader(_BlockReader):
         contract = metadata["contract"]
         shared = blend_contract(contract)
         differing = [key for key in self.contract if shared.get(key) != self.contract[key]]
-        if contract["logprob_vocab_size"] != entry["logprob_vocab_size"]:
-            differing.append("logprob_vocab_size")
         if differing:
             raise ValueError(
                 f"Offline KD corpus file {entry['folder']}/{name.data} differs from the blend on "

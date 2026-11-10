@@ -320,7 +320,8 @@ def decode_block(
 
     Inputs carry ``sample_offsets``, the token-aligned columns, ``segment_lengths`` and
     ``segment_counts``. Every sample's segments must cover its tokens and its target
-    rows must match its nonzero loss weights.
+    rows must match its nonzero loss weights. ``vocab_size``, the tokenizer's size,
+    bounds every valid target index.
     """
     names = set(batch.schema.names)
     missing = [name for name in INPUT_COLUMNS if name not in names]
@@ -351,7 +352,7 @@ def decode_block(
     _, low = _flat(batch.column("indices_low"))
     high = _flat(batch.column("indices_high"))[1] if "indices_high" in names else None
     if vocab_size is not None and (high is None) != (index_encoding_for_vocab(vocab_size) == "u16"):
-        raise ValueError("Offline KD target index encoding disagrees with logprob_vocab_size")
+        raise ValueError("Offline KD target index encoding disagrees with the tokenizer size")
     tail = _flat(batch.column("tail"))[1] if "tail" in names else None
     scored = np.concatenate(([0], np.cumsum(_numpy(inputs["loss_mask"]) != 0)))[offsets]
     if not np.array_equal(row_offsets, scored):

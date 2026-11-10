@@ -22,11 +22,9 @@ LOGPROB_SENTINEL = -1000.0
 MASS_TOLERANCE = 0.05
 ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 
-# Required by every reader: what token IDs mean, how target indices decode, which
-# attention the inputs assume, and whether a prefix of a sample keeps its targets.
-REQUIRED_KEYS = ("tokenizer", "logprob_vocab_size", "attention_mode", "prefix_stable")
-# Corpus sources may use different normalization domains and index encodings.
-BLEND_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
+# Required by every reader: what token IDs mean (which also bounds target indices),
+# which attention the inputs assume, and whether a prefix of a sample keeps its targets.
+REQUIRED_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
 # Replay dumps also need the writer layout that maps a global sample to its file and row.
 REPLAY_KEYS = ("writers", "writer_mbs", "first_sample")
 # A corpus source also needs its epoch size, which defines when it is complete.
@@ -54,23 +52,17 @@ def index_encoding_for_vocab(vocab_size: int) -> str:
     return "u16" if vocab_size <= 1 << 16 else "u16+u8"
 
 
-def validate_metadata(
-    meta: dict[str, Any], *, replay: bool = True, corpus: bool = False, blend: bool = False
-) -> None:
+def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool = False) -> None:
     """Reject metadata a reader cannot interpret.
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
-    optional ``recorded`` and ``provenance`` dictionaries. A blend manifest carries
-    shared semantics only (``blend=True, replay=False``), not file decoding settings.
+    optional ``recorded`` and ``provenance`` dictionaries. A blend manifest carries the
+    shared settings only (``replay=False``), not a writer layout.
     """
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")
     contract = meta.get("contract")
-    keys = (
-        (BLEND_KEYS if blend else REQUIRED_KEYS)
-        + (REPLAY_KEYS if replay else ())
-        + (CORPUS_KEYS if corpus else ())
-    )
+    keys = REQUIRED_KEYS + (REPLAY_KEYS if replay else ()) + (CORPUS_KEYS if corpus else ())
     missing = [key for key in keys if not isinstance(contract, dict) or key not in contract]
     if missing:
         raise ValueError(f"Offline KD metadata is missing required settings: {', '.join(missing)}")
@@ -80,8 +72,6 @@ def validate_metadata(
     tokenizer = contract["tokenizer"]
     if not isinstance(tokenizer, dict) or not isinstance(tokenizer.get("sha256"), str):
         raise ValueError("Offline KD metadata tokenizer must carry a sha256 fingerprint")
-    if not blend:
-        index_encoding_for_vocab(contract["logprob_vocab_size"])
     if contract["attention_mode"] not in ATTENTION_MODES:
         raise ValueError(f"Unsupported offline KD attention_mode {contract['attention_mode']!r}")
     if type(contract["prefix_stable"]) is not bool:
@@ -116,8 +106,8 @@ def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> tuple
 
 
 def blend_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    """Return the shared semantics of corpus sources, excluding per-file decoding."""
-    return {key: contract[key] for key in BLEND_KEYS}
+    """Return the settings every corpus source of a blend shares, excluding writer layout."""
+    return {key: contract[key] for key in REQUIRED_KEYS}
 
 
 def mismatched_corpus_order(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
@@ -220,7 +210,10 @@ def check_targets(
     if values.ndim != 2 or values.shape != indices.shape or not values.is_floating_point():
         raise ValueError("Malformed offline KD target values")
     if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
-        raise ValueError("Offline KD target vocabulary index is out of range")
+        raise ValueError(
+            f"Offline KD target index is not a token of the {vocab_size}-entry tokenizer; "
+            "targets must exclude vocabulary padding"
+        )
     if tail is None:
         return values, indices, tail_logprob(values)
     if tail.dtype != torch.float32 or tail.shape != values.shape[:1] or tail.isnan().any():

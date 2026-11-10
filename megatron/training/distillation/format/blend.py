@@ -170,14 +170,7 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
             raise ValueError(f"Corpus source {name} differs on {', '.join(differing)}")
         offset = len(files)
         files += [
-            {
-                "folder": folder,
-                "dp_rank": f.dp_rank,
-                "start": f.start,
-                "end": f.end,
-                "size": size,
-                "logprob_vocab_size": meta["contract"]["logprob_vocab_size"],
-            }
+            {"folder": folder, "dp_rank": f.dp_rank, "start": f.start, "end": f.end, "size": size}
             for f, size in zip(source_files, sizes)
         ]
         chosen, passes = _select(pieces, targets[name], seed, name)

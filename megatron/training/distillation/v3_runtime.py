@@ -156,6 +156,11 @@ def tokenizer_identity() -> dict[str, Any]:
     return _tokenizer_identity_and_size()[0]
 
 
+def tokenizer_vocab_size() -> int:
+    """The tokenizer's true (non-padded) vocabulary size, which bounds stored indices."""
+    return _tokenizer_identity_and_size()[1]
+
+
 def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
     """Return the tokenizer setting and the true (non-padded) vocabulary size.
 
@@ -287,7 +292,6 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         "format_version": FORMAT_VERSION,
         "contract": {
             "tokenizer": tokenizer_identity(),
-            "logprob_vocab_size": args.padded_vocab_size,
             "attention_mode": attention_mode_for_layout(
                 sft=args.sft,
                 inter_document_masking=args.dataloader_inter_document_masking,
@@ -448,7 +452,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
 
 def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = True) -> None:
-    validate_metadata(metadata, replay=replay, blend=not replay)
+    validate_metadata(metadata, replay=replay)
     contract = metadata["contract"]
     student_tokenizer, student_tokenizer_size = _tokenizer_identity_and_size()
     if contract["tokenizer"]["sha256"] != student_tokenizer["sha256"]:
@@ -754,12 +758,14 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = args.context_parallel_size
 
+    vocab_size = tokenizer_vocab_size()  # Every stored index is a real token.
+
     def source_factory() -> ReplayIterator:
         options = dict(
             targets=mpu.is_pipeline_last_stage(),
             decode_threads=args.logits_load_decode_threads,
             prefetch_depth=args.logits_load_msc_prefetch_depth,
-            student_vocab_size=args.padded_vocab_size,
+            vocab_size=vocab_size,
         )
         if _PLAN.get("corpus"):
             manifest = _PLAN["manifest"]

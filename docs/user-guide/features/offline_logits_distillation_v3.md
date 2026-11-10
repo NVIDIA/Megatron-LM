@@ -129,9 +129,9 @@ targets, and does not build the original training split.
 Use the same tokenizer as the teacher (checked by fingerprint, see
 [Tokenizer fingerprint](#tokenizer-fingerprint)) and settings that reproduce the cache's
 `attention_mode`. The student's padded vocabulary must be at least its tokenizer's size
-(identical to the teacher's once the fingerprints match); it need not equal the teacher's. Target entries whose index is beyond the student vocabulary
-(teacher padding rows) are masked into the ghost bucket, counted, and reported when they
-exceed 0.01% of entries. Stored labels, loss weights and positions are replayed exactly.
+(identical to the teacher's once the fingerprints match); it need not equal the teacher's.
+Stored targets never point at vocabulary padding (see [Target contract](#target-contract)),
+so every target is representable by the student. Stored labels, loss weights and positions are replayed exactly.
 The teacher's dataset settings are recorded rather than checked against the student;
 `--logits-load-ignore-hash` is unnecessary for V3. Readers check file sizes, schemas and
 input/target row alignment. V3 does not store content checksums or recompute hashes of
@@ -171,9 +171,7 @@ The manifest does not store another `weight` field per source: requested weights
 in its copy of the blend configuration.
 
 The sources must share tokenizer identity, attention mode and prefix stability. Their
-normalization vocabulary sizes, index encodings and top-K widths may differ: decoding
-uses each file's vocabulary size, and collation pads K to the batch maximum with masked
-entries. Teacher identity is recorded per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
+top-K widths may differ: collation pads K to the batch maximum with masked entries. Teacher identity is recorded per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
 file table or sample schedule. Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
 LM loss only; to hold data out of a blend, dump it as its own source and leave it out.
@@ -184,7 +182,7 @@ order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `
 and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
 bucket as Megatron. `CorpusStream` requires the student's Hugging Face tokenizer and
 rejects one whose fingerprint differs from the blend's (`check_student`); pass
-`student_vocab_size` to also check that the model's output width covers the tokenizer. Stored labels are already shifted to line up with the logits at the
+`model_vocab_size` to also check that the model's output width covers the tokenizer. Stored labels are already shifted to line up with the logits at the
 same position.
 
 `CorpusStream` already assigns samples to DP ranks; do not wrap it in another distributed
@@ -197,9 +195,6 @@ of loss weights. Use a standard-attention HF model/backend that honors custom ma
 (`eager` or `sdpa`); FlashAttention and recurrent/linear attention require a dedicated
 boundary adapter. The reference mask uses quadratic memory. Plain causal samples retain
 the usual 2D padding mask. A hand-built sample without `segments` is one causal segment.
-
-The HF loss uses the actual student logit width to move unsupported teacher target IDs
-into the residual bucket, even if `student_vocab_size` was not supplied to the reader.
 
 ### Reordering, subsets, and growing dumps
 
@@ -389,7 +384,6 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
   "format_version": 3,
   "contract": {
     "tokenizer": {"sha256": "<canonical tokenizer SHA-256>"},
-    "logprob_vocab_size": 128512,
     "attention_mode": "causal",
     "prefix_stable": true,
     "writers": 2,
@@ -429,16 +423,14 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
 
 Every file stores its inputs next to its targets, so a file is self-consistent on its
 own. Settings needed to interpret a file are required (`contract`). Files in one replay
-cache or corpus source must agree on them. Across sources in a corpus blend, only token
-identity, attention mode and prefix stability must agree; normalization domain and writer
-layout remain per source/file. The blend manifest records its shared contract separately
-and pins each file's normalization size:
+cache or corpus source must agree on them. Across sources in a corpus blend, token
+identity, attention mode and prefix stability must agree; writer layout remains per
+source/file. The blend manifest records its shared contract separately:
 
 | Key | Meaning and reason for storing it |
 | --- | --- |
 | `tokenizer` | Object describing the token-ID space through the field below. Stored token IDs and targets must have the same meaning for the student. |
 | `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
-| `logprob_vocab_size` | Size of the teacher's normalization domain, including any padding entries. Bounds valid target IDs and determines/checks `u16` versus `u16+u8` index encoding. Sources in a blend may differ. It is not used to recompute or adjust the stored probabilities. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
 | `prefix_stable` | Whether a retained prefix preserves the teacher's distributions. False for length-dependent position scaling such as dynamic NTK RoPE or LongRoPE's short/long switch. Megatron currently writes true. Shortening a longer sample requires true. |
 | `writers` | Teacher DP writer count. Defines which ranks must publish each complete group and participates in mapping global sample IDs to writer files. The student may use a different DP size. |
@@ -456,14 +448,6 @@ For example, if the only available ranges are `[100, 200)` and `[200, 300)`,
 `first_sample=0` means the initial `[0, 100)` range is missing. `first_sample=100`
 means those same files form a valid start. File names alone cannot distinguish the two
 intentions. Student replay positions start at zero even for a nonzero teacher start.
-
-`logprob_vocab_size` is a validation and interpretation field, not a student vocabulary
-matching requirement. A Megatron source normalized over 128,512 entries and a vLLM
-source normalized over 128,256 entries can share a blend if their true tokenizer
-identities match. Their original distributions are retained; V3 performs no correction
-for the different normalization domains. Retained IDs outside the student's output
-vocabulary join the ghost bucket. Arrow's schema also exposes the index encoding, but
-the declared vocabulary size additionally detects IDs outside the teacher's domain.
 
 `format_version` 3 implies T=1 log probabilities and stripped padding (see
 [Stored records](#stored-records)).
@@ -561,8 +545,12 @@ rows back at their positions; positions without a row get sentinel targets.
 - Target row `t` stores the distribution from the output-layer logits at input position
   `t`, predicting the next token. Producers using prompt-token scores (e.g. vLLM
   `prompt_logprobs`, which score token `t` given the prefix) shift by one.
-- Values are full-vocabulary-normalized log probabilities at **T=1** over
-  `logprob_vocab_size` entries, followed by top-K selection and optional top-P masking.
+- Values are log probabilities at **T=1** normalized over the tokenizer's vocabulary
+  (`len(tokenizer)` entries), followed by top-K selection and optional top-P masking.
+  Vocabulary padding is excluded: Megatron pads its output layer (for example 128,512
+  entries for a 128,256-token tokenizer at TP=8) and drops those logits before the
+  softmax and top-K, so every stored index is a real token and producers that pad
+  differently describe the same distribution.
   They are never renormalized over K. Producers must supply raw T=1 targets; V3 has no
   separate temperature field and cannot identify arbitrary temperature scaling from the
   probabilities alone.
@@ -584,8 +572,7 @@ rows back at their positions; positions without a row get sentinel targets.
   `sum(exp(retained)) + exp(tail)` is within 0.05 of 1 for every row. Without the field,
   readers derive the tail from the stored values.
 - The loss uses the tail as the teacher's ghost bucket against the student's mass outside
-  the same entries. Entries a student cannot represent (indices beyond its vocabulary)
-  are moved into the tail.
+  the same entries.
 
 | Target column | Encoding (per sample, one entry per target row) | Purpose |
 | --- | --- | --- |
@@ -594,11 +581,11 @@ rows back at their positions; positions without a row get sentinel targets.
 | `indices_high` | `fixed_size_list<uint8, K>`; present for `u16+u8` encoding | Bits 16–23, required to represent IDs above 65535. Sentinel entries' decoded IDs are ignored. |
 | `tail` | float32, optional; always written by Megatron | Teacher probability mass outside retained entries for the mandatory ghost bucket. Preserves the residual calculated before value rounding; absent tails are reconstructed from stored values. |
 
-The index encoding is derived from `logprob_vocab_size`: `u16` up to 65536, else `u16+u8`
-(up to `2**24`). There is no separately stored `index_encoding` metadata key.
+The index encoding is derived from the tokenizer size: `u16` up to 65536 tokens, else
+`u16+u8` (up to `2**24`). There is no separately stored `index_encoding` metadata key.
 
 The `-1` selection sentinel encodes as all ones. Readers validate the row counts, the
-encoding against `logprob_vocab_size`, and that valid entries index below it. TP gathering
+encoding against the tokenizer size, and that valid entries index below it. TP gathering
 in the Megatron saver uses FP32 transport, exact for every supported index. V1/V2 keep
 their 17-bit encoding.
 
@@ -687,12 +674,12 @@ row, but its final label is then the sampled token rather than a data label.
 - A student checks each pack against its own length after re-padding every segment to
   its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
   students you expect; record the headroom you used as `padding_divisor`.
-- Set `logprob_vocab_size` to the actual number of vocabulary entries included in the
-  raw log-softmax (normally `config.vocab_size`, not a rounded embedding allocation),
-  and fingerprint the tokenizer with `hf_tokenizer_identity`. A Megatron source may
-  normalize over additional padding entries; this does not prevent blending the sources
-  when their true tokenizer identities match. Unsupported retained IDs join the student's
-  residual bucket rather than being reassigned to real tokens.
+- Fingerprint the tokenizer with `hf_tokenizer_identity`, and store only indices below
+  `len(tokenizer)`. vLLM already removes its own tensor-parallel padding, but its
+  log-softmax covers the checkpoint's `config.vocab_size`, which can exceed the
+  tokenizer (Qwen2.5-0.5B: 151,936 vs 151,665 tokens). Drop retained entries at or
+  above the tokenizer size and add their probability to the tail. Their remaining mass
+  in the normalization is negligible for a trained model.
 - Set `prefix_stable` to false when the model's `rope_scaling` depends on the sequence
   length (`"dynamic"`, or `"longrope"` when sequences may exceed
   `original_max_position_embeddings`), true otherwise.
@@ -737,14 +724,13 @@ field.
 | `budget` | Requested student sample count before rounding up to whole lanes. Descriptive once the schedule has been built. |
 | `lanes` | Number of streams, `L`. Global sample position `p` maps to lane `p % L` and offset `p // L`, independently of student DP. |
 | `lane_samples` | Equal number of samples assigned to each lane. Total planned capacity is `lanes * lane_samples`, at least the requested budget. |
-| `contract` | Shared tokenizer, attention mode and prefix stability. Per-file normalization size and writer layout are excluded. |
+| `contract` | Shared tokenizer, attention mode and prefix stability. Writer layout is excluded. |
 | `files` | Array resolving scheduled file IDs to source folders, writer/range names and planned file properties. |
 | `sources` | Per-source reporting and provenance summaries. Not needed to execute an already built schedule. |
 | `segments` | Integer array of schedule pieces `(lane, file_id, block, first_row, end_row)`. These pieces select sample rows; they are unrelated to the attention `segments` column stored inside Arrow. |
 | `hash` | SHA-256 over the canonical shared contract, file table, lane count, lane length and schedule-piece bytes. Checkpointed to detect a changed plan on resume. |
 
-The hash covers file names, sizes and declared normalization domains, but not file
-contents. It is not a corruption checksum. The absolute corpus root and descriptive
+The hash covers file names and sizes, but not file contents. It is not a corruption checksum. The absolute corpus root and descriptive
 reporting fields are excluded, allowing the same file layout and schedule to be read
 from a replacement root. Resume still requires equivalent data in that replacement.
 
@@ -766,7 +752,6 @@ from a replacement root. Resume still requires equivalent data in that replaceme
 | `start` | Inclusive global sample-range start in the original source dump. |
 | `end` | Exclusive global sample-range end in the original source dump. |
 | `size` | Expected Arrow file length when planning. Checked again when consuming the file. |
-| `logprob_vocab_size` | Expected per-file normalization domain. Duplicates the file contract to pin/check that decoding setting in the planned snapshot. |
 
 Within a schedule piece, `file_id` is an index into this table and `block` is an index
 into that file's `index.blocks`. `first_row` is inclusive and `end_row` exclusive,

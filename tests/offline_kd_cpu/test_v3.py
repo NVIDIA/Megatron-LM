@@ -60,7 +60,6 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "attention_mode": "causal",
         "prefix_stable": True,
         "tokenizer": {"sha256": "test"},
-        "logprob_vocab_size": 1 << 17,
     }
     noted = {
         "teacher": "/teacher@100",
@@ -111,6 +110,8 @@ def make_record(captured, contract, logprobs=False):
 
 # Small blocks so every file has several and block boundaries are exercised.
 TEST_BLOCK_BYTES = 256
+# The test tokenizer's vocabulary: large enough for the u16+u8 index encoding.
+TEST_VOCAB = {f"t{i}": i for i in range(1 << 17)}
 
 
 def write_flush(
@@ -125,6 +126,7 @@ def write_flush(
     source=None,
     logprobs=False,
     block_bytes=TEST_BLOCK_BYTES,
+    vocab_size=len(TEST_VOCAB),
 ):
     """Write one writer's flush exactly as the saver does."""
     contract = metadata["contract"]
@@ -140,8 +142,7 @@ def write_flush(
         batch = (source or inputs)(ids, packed=packed)
         batches.append(
             arrow.samples_batch(
-                *make_record(codec.capture_batch(batch), contract, logprobs),
-                vocab_size=contract["logprob_vocab_size"],
+                *make_record(codec.capture_batch(batch), contract, logprobs), vocab_size=vocab_size
             )
         )
     data, index = arrow.write_file(batches, metadata, block_bytes=block_bytes)
@@ -163,6 +164,7 @@ def write_cache(
     start=0,
     source=None,
     logprobs=False,
+    vocab_size=len(TEST_VOCAB),
 ):
     storage = Storage(str(root))
     if metadata is None:
@@ -185,6 +187,7 @@ def write_cache(
                     packed=packed,
                     source=source,
                     logprobs=logprobs,
+                    vocab_size=vocab_size,
                 )
     return storage, metadata
 
@@ -427,23 +430,20 @@ def test_targets_are_stored_only_where_loss_is_applied():
     assert (batch["_kd_values"][0].reshape(-1)[[0, 1, 4, 5, 7]] == codec.LOGPROB_SENTINEL).all()
 
 
-def test_entries_beyond_the_student_vocabulary_join_the_tail(tmp_path):
-    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
-    full = reader(storage, metadata)
-    small = reader(storage, metadata, student_vocab_size=104)
+def test_targets_outside_the_tokenizer_are_rejected(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True, vocab_size=4096)
+    full = reader(storage, metadata, vocab_size=4096)
     try:
-        exact, masked = full.samples([1], 2)[0], small.samples([0, 1], 2)[1]
+        assert full.samples([1], 2)[0]["teacher_values"].min() > -1000
     finally:
         full.close()
+    # Sample 1's targets are tokens 101..107, which a 104-entry tokenizer lacks (both u16).
+    small = reader(storage, metadata, vocab_size=104)
+    try:
+        with pytest.raises(ValueError, match="not a token of the 104-entry tokenizer"):
+            small.samples([0, 1], 2)
+    finally:
         small.close()
-    # Sample 1's rows are tokens 101..107; the student cannot represent 104 and up.
-    gone = exact["teacher_indices"].reshape(-1) >= 104
-    assert (masked["teacher_values"].reshape(-1)[gone] == codec.LOGPROB_SENTINEL).all()
-    moved = exact["teacher_values"].reshape(-1)[gone]
-    assert torch.allclose(
-        masked["teacher_tail"][gone], torch.logaddexp(exact["teacher_tail"][gone], moved)
-    )
-    assert torch.equal(masked["teacher_tail"][~gone], exact["teacher_tail"][~gone])
 
 
 @pytest.mark.parametrize(
@@ -485,8 +485,8 @@ def test_index_encoding_rejects_invalid_vocab_size(vocab_size):
 @pytest.mark.parametrize("case", ["bounds", "shape", "high_shape", "integer_values"])
 def test_malformed_targets_rejected(case):
     values, indices = torch.zeros(1, 2), torch.tensor([[0, 65538]])
-    if case == "bounds":  # ID 65538 exceeds the declared vocabulary.
-        with pytest.raises(ValueError, match="out of range"):
+    if case == "bounds":  # ID 65538 is not a token of a 65537-entry tokenizer.
+        with pytest.raises(ValueError, match="not a token"):
             codec.check_targets(values, indices, None, vocab_size=65537)
     elif case == "shape":
         with pytest.raises(ValueError, match="Malformed"):
@@ -510,7 +510,6 @@ def test_target_encoder_rejects_invalid_ids(index, value):
     [
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
-        {"logprob_vocab_size": 0},
         {"tokenizer": {}},
         {"writers": 0},
         {"first_sample": -1},
@@ -1162,7 +1161,7 @@ def runtime_environment(monkeypatch):
     training.get_args = lambda: args
     training.get_tensorboard_writer = lambda: None
     training.get_tokenizer = lambda: types.SimpleNamespace(
-        vocab={"a": 0, "b": 1, "c": 2}, vocab_size=3, eod=2, pad=-1, bos=None, eos=None
+        vocab=TEST_VOCAB, vocab_size=len(TEST_VOCAB), eod=2, pad=-1, bos=None, eos=None
     )
     core = types.ModuleType("megatron.core")
     core.parallel_state = types.SimpleNamespace(
@@ -1577,11 +1576,11 @@ class StudentTokenizer:
 
     bos_token_id, eos_token_id, pad_token_id, unk_token_id = None, 2, None, None
 
-    def __init__(self, size=3):
+    def __init__(self, size=len(TEST_VOCAB)):
         self.size = size
 
     def get_vocab(self):
-        return {chr(ord("a") + i): i for i in range(self.size)}
+        return {f"t{i}": i for i in range(self.size)}
 
     def __len__(self):
         return self.size
@@ -1598,7 +1597,7 @@ def test_hf_stream_checks_the_student_tokenizer(tmp_path):
     with pytest.raises(ValueError, match="tokenizer differs"):
         hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(4))
     with pytest.raises(ValueError, match="smaller than the tokenizer"):
-        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(), student_vocab_size=2)
+        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(), model_vocab_size=2)
 
 
 def test_hf_stream_yields_a_ranks_samples_in_megatron_order(tmp_path):
@@ -2128,23 +2127,6 @@ def test_blocks_need_every_input_column_and_the_vocabulary_index_width(column):
         arrow.decode_block(batch, vocab_size=1 << 17)
 
 
-def test_targets_beyond_the_student_vocabulary_are_masked(tmp_path, capsys):
-    storage, metadata = write_cache(tmp_path, iterations=2)
-    exact = reader(storage, metadata, student_vocab_size=1 << 17)
-    assert exact.samples([0], 1)[0]["teacher_values"].min() > -1000
-    exact.close()
-    # Token IDs are id*100+position, so sample 1's targets (100..107) exceed a 104-entry vocab.
-    small = reader(storage, metadata, student_vocab_size=104)
-    sample = small.samples([0, 1], 2)[1]
-    small.close()
-    masked = sample["teacher_indices"].reshape(-1) >= 0
-    values = sample["teacher_values"].reshape(-1)
-    # Position 0 has no row (zero loss weight); rows 101..103 survive, 104..107 are masked.
-    assert (values[3:] == -1000).all() and (values[:3] > -1000).all()
-    assert small.masked_entries > 0 and masked.all()
-    assert "beyond the student vocabulary" in capsys.readouterr().out
-
-
 def eod_sample():
     """One stored EOD-reset sample of three documents: [5], [6, 7], [8]."""
     return {
@@ -2374,10 +2356,8 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
     saver.cp_size = saver.dp_size = 1
     saver._initialized = True
-    saver.metadata_dict = {
-        "published_through": 0,
-        "contract": {"attention_mode": "causal", "logprob_vocab_size": 1 << 17},
-    }
+    saver.metadata_dict = {"published_through": 0, "contract": {"attention_mode": "causal"}}
+    saver._real_vocab_size = 1 << 17
     saver._captured = []
     saver._pending_writes = collections.OrderedDict()
     saver._process_single_microbatch = lambda logits: (
@@ -2609,10 +2589,12 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     method = helpers["_process_single_microbatch"]
     saver = types.SimpleNamespace(
         tp_size=1,
+        tp_rank=0,
         k=2,
         p=None,
         _save_dtype=torch.float32,
         _max_vocab_size=helpers["_max_vocab_size"],
+        _real_vocab_size=None,
     )
     saver._topk_logprobs = types.MethodType(helpers["_topk_logprobs"], saver)
     logits = torch.arange((1 << 17) + 1, dtype=torch.float32).reshape(1, 1, -1)
@@ -2653,6 +2635,75 @@ def test_tp_transport_preserves_wide_indices(local_vocab_size, monkeypatch):
     assert values.dtype == torch.float32
 
 
+@pytest.mark.parametrize("tp,real", [(1, 5), (2, 5), (2, 4)])
+def test_saver_excludes_vocabulary_padding(tp, real, monkeypatch):
+    """Padded IDs are never selected and carry no probability mass, under TP too.
+
+    With TP=2 the second shard holds one real entry (``real=5``) or none (``real=4``).
+    """
+    helpers = legacy_saver_methods()
+    full = torch.tensor([[[2.0, 5.0, 1.0, 4.0, 3.0, 9.0, 9.0, 9.0]]])  # IDs 5..7: padding.
+    shards = full.chunk(tp, dim=-1)
+    current, local_lses, candidates = [0], [], {}
+
+    def saver(rank):
+        ns = types.SimpleNamespace(
+            tp_size=tp,
+            tp_rank=rank,
+            tp_group=object(),
+            _tp_dst_rank_global=0,
+            _max_vocab_size=helpers["_max_vocab_size"],
+            _real_vocab_size=real,
+            k=3,
+            p=None,
+            min_k=1,
+            _save_dtype=torch.float32,
+            _topp_kept_counts=[],
+        )
+        for name in ("_topk_logprobs", "_compute_global_topk"):
+            setattr(ns, name, types.MethodType(helpers[name], ns))
+        return ns
+
+    def run(rank):
+        current[0] = rank
+        return helpers["_process_single_microbatch"](saver(rank), shards[rank])
+
+    def record(tensor, op, group):
+        if op == torch.distributed.ReduceOp.MAX:
+            local_lses.append(tensor.clone())
+
+    def no_gather(tensor, outputs, dst, group):
+        for output in outputs or []:
+            output.zero_()
+
+    if tp > 1:
+        # First learn each shard's local log-sum-exp, then run the real collectives.
+        monkeypatch.setattr(torch.distributed, "all_reduce", record)
+        monkeypatch.setattr(torch.distributed, "gather", no_gather)
+        for rank in range(tp):
+            run(rank)
+        lses = torch.stack(local_lses)
+        maximum = lses.max(0).values
+
+        def reduce(tensor, op, group):
+            maximum_op = op == torch.distributed.ReduceOp.MAX
+            tensor.copy_(maximum if maximum_op else (lses - maximum).exp().sum(0))
+
+        def gather(tensor, outputs, dst, group):
+            candidates[current[0]] = tensor.clone()
+            for rank, output in enumerate(outputs or []):
+                output.copy_(candidates[rank])
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+        monkeypatch.setattr(torch.distributed, "gather", gather)
+        for rank in reversed(range(1, tp)):
+            assert run(rank) is None
+    values, indices = run(0)
+    expected = full[..., :real].log_softmax(-1).topk(3, dim=-1)
+    assert indices.tolist() == expected.indices.tolist()
+    assert torch.allclose(values, expected.values)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     helpers = legacy_saver_methods()
@@ -2684,6 +2735,7 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
         tp_group=object(),
         _tp_dst_rank_global=7,
         _max_vocab_size=helpers["_max_vocab_size"],
+        _real_vocab_size=None,
         k=4,
         p=0.7,
         min_k=2,
@@ -2816,11 +2868,9 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     saver.cp_group = object()
     saver._cp_dst_rank_global = 9
     saver.metadata_dict = {
-        "contract": {
-            "attention_mode": "isolated_segments" if packed else "causal",
-            "logprob_vocab_size": 1 << 17,
-        }
+        "contract": {"attention_mode": "isolated_segments" if packed else "causal"}
     }
+    saver._real_vocab_size = 1 << 17
     saver._captured = [(captured, maps[0], *mapped[0])]
     saver._serialize_attempt()
     values, indices, tail = batch_targets(saver._iteration_records["batch"])
@@ -3070,11 +3120,11 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 FIXTURE_VARIANTS = {
     # name: (write_cache kwargs)
-    "u16_causal": dict(contract={"logprob_vocab_size": 4096}),  # No stored tail.
+    "u16_causal": dict(vocab_size=4096),  # No stored tail.
     "u16u8_packed_stripped": dict(
         packed=True, contract={"padding_divisor": 2}, source=tail_masked, gbs=4, mbs=1
     ),
-    "u16_logprobs_with_tail": dict(contract={"logprob_vocab_size": 4096}, logprobs=True),
+    "u16_logprobs_with_tail": dict(vocab_size=4096, logprobs=True),
 }
 
 
