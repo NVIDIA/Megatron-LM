@@ -503,15 +503,10 @@ class MegatronLLMEngine(LLMEngine):
                 log_probs = all_log_probs[completion_tokens:]
                 self._validate_log_probs(tokens, log_probs, params)
                 completion_tokens = len(all_tokens)
-                max_tokens = params.num_tokens_to_generate
                 chunk: GenerateChunk = {
                     "token_ids": tokens,
                     "index": 0,
-                    "finish_reason": (
-                        "length"
-                        if max_tokens is not None and completion_tokens >= max_tokens
-                        else "stop"
-                    ),
+                    "finish_reason": self._finish_reason(final, completion_tokens, params),
                     "completion_usage": {
                         "prompt_tokens": len(prompt_token_ids),
                         "completion_tokens": completion_tokens,
@@ -539,6 +534,23 @@ class MegatronLLMEngine(LLMEngine):
         finally:
             if not completed:
                 await stream.aclose()
+
+    @staticmethod
+    def _finish_reason(
+        final: dict[str, Any], completion_tokens: int, params: SamplingParams
+    ) -> str:
+        """Report the termination cause the engine recorded.
+
+        The engine knows whether a stop token or sequence ended the request, including on
+        its last budgeted token, and the budget it clamped to the context length or
+        resolved when none was requested. Replies without that record fall back to the
+        requested budget.
+        """
+        reason = final.get("finish_reason")
+        if reason in ("stop", "length"):
+            return reason
+        max_tokens = params.num_tokens_to_generate
+        return "length" if max_tokens is not None and completion_tokens >= max_tokens else "stop"
 
     @staticmethod
     def _validate_log_probs(
