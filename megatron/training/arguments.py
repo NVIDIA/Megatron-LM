@@ -153,7 +153,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
                 'Triton autotune CLI arguments cannot be combined with --yaml-cfg; '
                 'set triton_autotune in the YAML configuration instead.'
             )
-        if _wide_residual_config_from_args(args) is not None:
+        if (
+            _wide_residual_config_from_args(args) is not None
+            or args.moe_shortcut_wide_residual_norm_fusion
+        ):
             raise ValueError(
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
                 'YAML model configuration replaces argparse model arguments.'
@@ -905,6 +908,15 @@ def validate_args(args, defaults={}):
         "FSDP is not supported with --moe-shortcut-connection: the shortcut block bypasses the "
         "per-layer FSDP parameter all-gather hooks, leaving the paired attention and MoE layer "
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
+    )
+    # With fused residual seams a layer returns its unwritten input residual (the next layer's
+    # seam applies its write), so the per-layer residual metrics cannot be observed.
+    residual_metrics = {"layer-residual-accumulator-l2", "layer-residual-contribution-l2"}
+    requested = {spec.strip().rpartition(":")[0] for spec in getattr(args, "tensor_metrics", ())}
+    assert not (args.moe_shortcut_wide_residual_norm_fusion and requested & residual_metrics), (
+        f"--moe-shortcut-wide-residual-norm-fusion does not support the tensor metrics "
+        f"{sorted(requested & residual_metrics)}: a fused layer's output is its unwritten "
+        "input residual."
     )
 
     if args.use_torch_fsdp2:
