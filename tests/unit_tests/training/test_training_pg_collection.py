@@ -44,9 +44,15 @@ def _config():
     return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1, bf16=True)
 
 
+# Groups the tests create outside parallel_state; teardown_method destroys them.
+_test_groups = []
+
+
 def _same_ranks(group):
-    """A new communicator over the ranks of ``group``."""
-    return torch.distributed.new_group(ranks=torch.distributed.get_process_group_ranks(group))
+    """A new communicator over the ranks of ``group``, destroyed when the test ends."""
+    new_group = torch.distributed.new_group(ranks=torch.distributed.get_process_group_ranks(group))
+    _test_groups.append(new_group)
+    return new_group
 
 
 def _ranks(group):
@@ -56,6 +62,12 @@ def _ranks(group):
 class TestTrainingPgCollection:
 
     def teardown_method(self, method):
+        if _test_groups:
+            # Every rank finishes its collectives before any communicator goes away.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            while _test_groups:
+                torch.distributed.destroy_process_group(_test_groups.pop())
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("create_all_gather_group", [False, True])
@@ -169,6 +181,7 @@ class TestTrainingPgCollection:
         pp_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
         )
+        _test_groups.append(pp_group)
         pg_collection = ProcessGroupCollection(pp=pp_group)
 
         def schedule(vp_size):

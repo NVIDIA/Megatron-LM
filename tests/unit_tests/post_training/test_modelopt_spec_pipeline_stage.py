@@ -213,14 +213,17 @@ class TestModelOptBuildersOnTheirOwnPipelineGrid:
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
         grid = HyperCommGrid([1, 1, PP_SIZE, Utils.world_size // PP_SIZE], ["tp", "cp", "pp", "dp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
-        )
-        pp_rank = pg_collection.pp.rank()
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
+            )
+            pp_rank = pg_collection.pp.rank()
 
-        if forbid_global_pipeline_rank:
-            _forbid_global_pipeline_rank(monkeypatch)
-        model = build(_dense_config(), pg_collection, monkeypatch)
+            if forbid_global_pipeline_rank:
+                _forbid_global_pipeline_rank(monkeypatch)
+            model = build(_dense_config(), pg_collection, monkeypatch)
 
-        layer_numbers = [layer.layer_number for layer in model.decoder.layers]
-        assert layer_numbers == DENSE_STAGE_LAYER_NUMBERS[pp_rank], f"{pp_rank=}"
+            layer_numbers = [layer.layer_number for layer in model.decoder.layers]
+            assert layer_numbers == DENSE_STAGE_LAYER_NUMBERS[pp_rank], f"{pp_rank=}"
+        finally:
+            grid.destroy()
