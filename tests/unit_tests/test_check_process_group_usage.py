@@ -543,6 +543,26 @@ class TestDetection(unittest.TestCase):
         for case, body in unwarned.items():
             with self.subTest(case=case):
                 self.assertEqual(self.hits(prefix + body), ["f:" + checker.SILENT_GTP_READ])
+        # The rule holds however the resolver and the warning are reached.
+        star = "from megatron.core.process_groups_config import *\n"
+        module = "from megatron.core import process_groups_config as pgc\n"
+        by_name = "getattr(pgc, 'resolve_gtp_remat_group')(None, False, owner=None)"
+        self.assertEqual(
+            self.hits(star + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n"), guarded
+        )
+        self.assertEqual(
+            self.hits(module + WARN_IMPORT + f"def f():\n    {WARN}\n    {by_name}\n"), guarded
+        )
+        followed = {
+            "through a star import": star + f"def f():\n    {SILENT_GTP_CALL}\n",
+            "through getattr()": module + f"def f():\n    {by_name}\n",
+            "in a lambda after a warning": (
+                prefix + f"def f():\n    {WARN}\n    return lambda: {SILENT_GTP_CALL}\n"
+            ),
+        }
+        for case, source in followed.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), ["f:" + checker.SILENT_GTP_READ])
         # A named owner warns for itself, and only the constant None is recognized.
         for owner in ("'Model'", "name"):
             with self.subTest(owner=owner):
