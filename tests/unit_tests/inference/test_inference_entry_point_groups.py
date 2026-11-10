@@ -78,14 +78,15 @@ def _forbid_the_shim(monkeypatch):
 
 @pytest.fixture
 def inference(monkeypatch):
-    """Stand-ins for the arguments, the model builder and the checkpoint loader."""
+    """Stand-ins for the arguments, the run config, the model builder and the checkpoint loader."""
     args = SimpleNamespace(
-        load="checkpoint",
         inference_ckpt_non_strict=False,
         transformer_impl="local",
         fp8_recipe=None,
         modelopt_enabled=False,
     )
+    # The checkpoint to load is a setting of the run config's checkpoint section.
+    run_config = SimpleNamespace(tokenizer=Mock(), checkpoint=SimpleNamespace(load="checkpoint"))
     built, loaded = [], []
 
     class Builder:
@@ -94,7 +95,7 @@ def inference(monkeypatch):
             return [_Model()]
 
     monkeypatch.setattr(utils, "get_args", lambda: args)
-    monkeypatch.setattr(utils, "get_run_config", lambda: SimpleNamespace(tokenizer=Mock()))
+    monkeypatch.setattr(utils, "get_run_config", lambda: run_config)
     monkeypatch.setattr(
         utils, "get_model_builder", lambda args, tokenizer_config, pg_collection: Builder()
     )
@@ -231,7 +232,8 @@ def test_the_vlm_server_builds_its_model_on_the_registered_collection(monkeypatc
     _forbid_the_shim(monkeypatch)
     registered = _groups()
     monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
-    args = SimpleNamespace(load="checkpoint", inference_ckpt_non_strict=False)
+    args = SimpleNamespace(inference_ckpt_non_strict=False)
+    run_config = SimpleNamespace(checkpoint=SimpleNamespace(load="checkpoint"))
     if is_mimo:
         args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
     providers = ModuleType("model")
@@ -248,6 +250,7 @@ def test_the_vlm_server_builds_its_model_on_the_registered_collection(monkeypatc
         return [_Model()]
 
     monkeypatch.setattr(vlm_dynamic_inference, "get_args", lambda: args)
+    monkeypatch.setattr(vlm_dynamic_inference, "get_run_config", lambda: run_config)
     monkeypatch.setattr(vlm_dynamic_inference, "_get_model", get_model)
     monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint", Mock())
     monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", Mock())

@@ -388,7 +388,7 @@ class TestBootstrapReads:
     def test_pretrain_builds_its_collection_from_the_registry(self, monkeypatch):
         registered = _register(**_data_parallel_groups(), tp=_Group(), pp=_Group())
         self._forbid_the_shim(monkeypatch)
-        args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+        args = SimpleNamespace(create_all_gather_group=False)
 
         with _recorded_warnings() as record:
             enable_strict_process_group_fallbacks()
@@ -585,16 +585,18 @@ class TestStandardGrid:
             )
         ]
 
-    @pytest.mark.usefixtures("run_config", "fresh_fallback_record")
+    @pytest.mark.usefixtures("fresh_fallback_record")
     @pytest.mark.parametrize(
         "grid", [grid[1:] for grid in EXPERT_GRIDS], ids=[grid[0] for grid in EXPERT_GRIDS]
     )
-    def test_training_builds_all_gather_groups_in_any_rank_order(self, grid):
+    def test_training_builds_all_gather_groups_in_any_rank_order(self, run_config, grid):
         """--create-all-gather-group supported experts only in the default order without EGTP."""
         kwargs, num_ranks = grid
         _require_divisible(num_ranks)
         Utils.initialize_model_parallel(**kwargs)
-        args = SimpleNamespace(create_all_gather_group=True, expert_model_parallel_size=2)
+        # The expert all-gather group follows the model config's expert-parallel size.
+        run_config.model.transformer.expert_model_parallel_size = 2
+        args = SimpleNamespace(create_all_gather_group=True)
 
         with _recorded_warnings() as record:
             pg_collection = training._build_pg_collection_from_parallel_state(args)

@@ -175,9 +175,13 @@ def _make_saver(
 
 def _load_model_shards(loader, model_provider, load_checkpoint=None):
     """Run the loader's model construction without reading any checkpoint."""
+    # initialize_megatron_env registers the run config; loading sets its checkpoint section to
+    # fail on a missing checkpoint.
+    run_config = SimpleNamespace(checkpoint=SimpleNamespace())
     with (
         mock.patch.object(checkpointing, "load_checkpoint", side_effect=load_checkpoint),
         mock.patch("megatron.training.get_train_state", return_value=TrainState()),
+        mock.patch("megatron.training.global_vars.get_run_config", return_value=run_config),
     ):
         all_models, _, _ = loader.load_model_shards(model_provider, torch.float32)
     return all_models
