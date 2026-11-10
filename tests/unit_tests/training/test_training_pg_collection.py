@@ -72,6 +72,10 @@ class TestTrainingPgCollection:
         if not create_all_gather_group:
             assert pg_collection.dp_cp_ag is None and pg_collection.expt_dp_ag is None
             return
+        # A missing group would pass the comparisons below: None is not dp_cp, and the ranks of
+        # None are those of the default group, which dp_cp spans on this grid.
+        assert pg_collection.dp_cp_ag is not None
+        assert pg_collection.expt_dp_ag is not None
         # Separate communicators over the data-parallel ranks that Megatron-FSDP gathers over.
         assert pg_collection.dp_cp_ag is not pg_collection.dp_cp
         assert _ranks(pg_collection.dp_cp_ag) == _ranks(pg_collection.dp_cp)
