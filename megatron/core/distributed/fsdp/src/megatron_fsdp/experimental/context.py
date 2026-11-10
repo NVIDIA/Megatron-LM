@@ -291,7 +291,7 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        if self.grad_staging_on_compute_stream:
+        if self._pending_grad_buffers:
             self._release_grad_buffers()
 
     def _retain_grad_buffers(
