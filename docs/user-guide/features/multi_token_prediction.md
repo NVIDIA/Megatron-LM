@@ -55,4 +55,7 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 ## Unsupported Combinations
 
-Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported
+with MTP. Static and dynamic context parallelism are supported with packed data;
+dynamic CP requires per-token loss. See [dynamic context parallelism](context_parallel.md#dynamic-context-parallelism)
+for runtime group requirements and the per-token gradient and logging behavior.
