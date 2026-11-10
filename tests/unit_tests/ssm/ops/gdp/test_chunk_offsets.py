@@ -9,9 +9,11 @@ chunks of its own (from a zero initial state, which zero tokens leave unchanged)
 states, corrected values, final state and outputs must be bitwise those of the same sequence
 launched alone: the arithmetic is identical, and only the addresses differ.
 
-The ``large`` cases (opt-in, ``-m large``; 8-12 GiB each) choose ``lead`` so that one base offset
-reaches 2**31 elements; a dynamic-batching prefill step reaches them from 174763 tokens (GDP
-800m's expanded keys) or 262144 tokens (GDN's chunk states).
+The ``large`` cases (opt-in, ``-m large``; 8 to 70 GiB each, 140 GiB for the chunk-state
+``start-times-heads`` pair, which only a GB200 holds) choose ``lead`` so that one base offset, or
+the sequence start times the heads, reaches 2**31 elements; a dynamic-batching prefill step
+reaches the base offsets from 174763 tokens (GDP 800m's expanded keys) or 262144 tokens (GDN's
+chunk states).
 """
 
 import pytest
@@ -24,20 +26,24 @@ from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE
 TAIL = CHUNK_SIZE + 1
 """Tokens of the checked sequence: a full chunk and a one-token chunk."""
 
-# name: (K, V, lead, layout). Layouts: "after" puts the sequence after one sequence of `lead`
+# name: (H, K, V, lead, layout). Layouts: "after" puts the sequence after one sequence of `lead`
 # zero chunks, "within" after `lead` zero chunks of its own, "many" after `lead` one-token
 # sequences. The large leads put one offset at 2**31 elements:
 CHUNK_H_LARGE = {
     # the chunk-state base row lead * K * V
-    "states": (256, 256, 2**31 // (256 * 256), "after"),
+    "states": (1, 256, 256, 2**31 // (256 * 256), "after"),
     # the chunk-state row within the sequence
-    "states-within": (256, 256, 2**31 // (256 * 256), "within"),
+    "states-within": (1, 256, 256, 2**31 // (256 * 256), "within"),
     # the key and w base token lead * CHUNK_SIZE * K
-    "keys": (256, 16, 2**31 // (CHUNK_SIZE * 256), "after"),
+    "keys": (1, 256, 16, 2**31 // (CHUNK_SIZE * 256), "after"),
     # the value and corrected-value base token lead * CHUNK_SIZE * V
-    "values": (32, 256, 2**31 // (CHUNK_SIZE * 256), "after"),
+    "values": (1, 32, 256, 2**31 // (CHUNK_SIZE * 256), "after"),
     # the initial-state row lead * K * V
-    "initial-states": (256, 256, 2**31 // (256 * 256), "many"),
+    "initial-states": (1, 256, 256, 2**31 // (256 * 256), "many"),
+    # the sequence start times the heads, bos * H (head dim 8; about 130 GiB, so GB200 only),
+    # and a control one chunk earlier
+    "start-times-heads": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128), "after"),
+    "start-times-heads-fits": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128) - 1, "after"),
 }
 # name: (H, K, V, M, lead). The output kernel launches one program per chunk on grid axis 1,
 # which CUDA caps at 65535, so these use 32 heads to reach 2**31 in fewer chunks.
@@ -48,6 +54,10 @@ CHUNK_O_LARGE = {
     "values": (32, 16, 128, 1, 2**31 // (CHUNK_SIZE * 32 * 128)),
     # GDP 800m's Householder-expanded keys, lead * CHUNK_SIZE * M * H * K past 2**31
     "expanded-keys": (32, 128, 64, 3, -(-(2**31) // (CHUNK_SIZE * 3 * 32 * 128))),
+    # the sequence start times the expanded heads, bos * M * H (head dim 8, about 70 GiB), and a
+    # control one chunk earlier
+    "start-times-heads": (128, 8, 8, 16, 2**31 // (CHUNK_SIZE * 16 * 128)),
+    "start-times-heads-fits": (128, 8, 8, 16, 2**31 // (CHUNK_SIZE * 16 * 128) - 1),
 }
 
 
@@ -83,24 +93,24 @@ def _embed(x, rows):
     return out
 
 
-def _run_chunk_h(K, V, lead, layout):
+def _run_chunk_h(K, V, lead, layout, H=1):
     g0 = torch.Generator(device="cuda").manual_seed(1234)
 
     def randn(*shape, scale=0.1):
         return torch.randn(*shape, generator=g0, device="cuda") * scale
 
-    k, w = randn(1, TAIL, 1, K).bfloat16(), randn(1, TAIL, 1, K).bfloat16()
-    u = randn(1, TAIL, 1, V).bfloat16()
+    k, w = randn(1, TAIL, H, K).bfloat16(), randn(1, TAIL, H, K).bfloat16()
+    u = randn(1, TAIL, H, V).bfloat16()
     # Within-chunk cumulative base-2 log decays.
-    g = -torch.rand(1, TAIL, 1, generator=g0, device="cuda").mul(0.05)
+    g = -torch.rand(1, TAIL, H, generator=g0, device="cuda").mul(0.05)
     g[:, :CHUNK_SIZE] = g[:, :CHUNK_SIZE].cumsum(1)
-    h0 = randn(1, 1, K, V, scale=1.0).bfloat16()
+    h0 = randn(1, H, K, V, scale=1.0).bfloat16()
     if layout == "within":
         # Zero tokens leave a zero state unchanged, whatever their decay rounds to.
         h0.zero_()
 
     def run(k, w, u, g, h0, lengths, slot_indices):
-        state = torch.full((2, 1, K, V), float("nan"), device="cuda")
+        state = torch.full((2, H, K, V), float("nan"), device="cuda")
         h, v_new, _ = chunk_gated_delta_product_fwd_h(
             k=k,
             w=w,
@@ -119,7 +129,7 @@ def _run_chunk_h(K, V, lead, layout):
     lengths = _lengths(lead, layout)
     tokens = sum(lengths)
     k, w, u, g = (_embed(x, tokens) for x in (k, w, u, g))
-    h0 = torch.cat([h0.new_zeros(len(lengths) - 1, 1, K, V), h0]) if len(lengths) > 1 else h0
+    h0 = torch.cat([h0.new_zeros(len(lengths) - 1, H, K, V), h0]) if len(lengths) > 1 else h0
     actual = run(k, w, u, g, h0, lengths, [-1] * (len(lengths) - 1) + [1])
     for name, a, e in zip(("chunk states", "corrected values", "final state"), actual, expected):
         assert torch.equal(a, e), f"{name} of the sequence after {lead} {layout} differ"
@@ -176,12 +186,14 @@ def test_outputs_after_other_tokens(M):
 @pytest.mark.parametrize("case", list(CHUNK_H_LARGE))
 def test_chunk_states_past_int32_offsets(case):
     _requires_cuda()
-    K, V, lead, layout = CHUNK_H_LARGE[case]
+    H, K, V, lead, layout = CHUNK_H_LARGE[case]
     lengths = _lengths(lead, layout)
-    # bf16 k, w, u, v_new, chunk states (lead + 2 rows) and initial states, and temporaries.
+    # bf16 k, w, u, v_new, chunk states (lead + 2 rows) and initial states, fp32 decays, and
+    # temporaries.
     states = lead + 2 + len(lengths)
-    _requires_free_memory(4 * sum(lengths) * (K + V) + 2 * states * K * V + (1 << 30))
-    _run_chunk_h(K, V, lead, layout)
+    elements = 4 * sum(lengths) * H * (K + V + 1) + 2 * states * H * K * V
+    _requires_free_memory(elements + (1 << 30))
+    _run_chunk_h(K, V, lead, layout, H=H)
 
 
 @pytest.mark.large
@@ -190,7 +202,7 @@ def test_outputs_past_int32_offsets(case):
     _requires_cuda()
     H, K, V, M, lead = CHUNK_O_LARGE[case]
     tokens = lead * CHUNK_SIZE + TAIL
-    # bf16 q, k, v, o and chunk states, and temporaries.
-    elements = tokens * H * (K + M * K + M * V + V) + (lead + 2) * H * K * V
+    # bf16 q, k, v, o and chunk states, fp32 decays, and temporaries.
+    elements = tokens * H * (K + M * K + M * V + V + 2) + (lead + 2) * H * K * V
     _requires_free_memory(2 * elements + (1 << 30))
     _run_chunk_o(H, K, V, M, lead)

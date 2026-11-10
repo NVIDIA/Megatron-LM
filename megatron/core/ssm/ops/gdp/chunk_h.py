@@ -76,8 +76,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
 ):
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
-    # int64 sequence and head indices, so the base offsets below are int64 products: a step's
-    # chunk states reach 2**31 elements at 262144 tokens of 32 heads with K = V = 128.
+    # int64 sequence and head indices and sequence starts, so the base offsets below are int64
+    # products: a step's chunk states reach 2**31 elements at 262144 tokens of 32 heads with
+    # K = V = 128, and bos * H itself at 2**31 / H expanded tokens.
     i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
@@ -86,6 +87,8 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        # T stays int32: the block pointers below take int32 offsets.
+        bos, boh = bos.to(tl.int64), boh.to(tl.int64)
     else:
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
