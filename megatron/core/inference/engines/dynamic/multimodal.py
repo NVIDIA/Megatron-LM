@@ -176,9 +176,9 @@ class MultimodalRequestMixin:
         self._vision_embedding_cache.clear()
         self._vision_embedding_cache_bytes = 0
 
-    def _invalidate_vision_state(self) -> None:
+    def _invalidate_vision_state(self, *, force: bool = False) -> None:
         """Mark cached and request-local projected media as weight-stale."""
-        if getattr(self, "allow_stale_multimodal_embeddings", False):
+        if not force and getattr(self, "allow_stale_multimodal_embeddings", False):
             return
         self.clear_vision_embedding_cache()
         for entry in self.requests.values():

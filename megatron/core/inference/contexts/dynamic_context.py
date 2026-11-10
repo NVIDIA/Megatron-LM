@@ -1091,14 +1091,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
 
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
-
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
         usable_blocks = pool_size - 1
@@ -1765,6 +1757,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ),
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
+
+        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
+        # so it can mask out CUDA-graph padding tokens during routing. The
+        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
+        # dispatcher requires equal token counts across ranks already.
+        # Bound here, not in __init__: a RECOMPUTE resume rebuilds gpu_view.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         if self.cache_dsa_indexer_keys:
             self.dsa_metadata = DSAMetadata(

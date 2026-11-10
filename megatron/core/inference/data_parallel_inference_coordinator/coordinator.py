@@ -156,6 +156,8 @@ class DataParallelInferenceCoordinator:
                 balancing and to gate media affinity on spare capacity.
             initial_state (CoordinatorState): State the control-signal machine starts in.
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
+                It must match the engines' start state: RESUME is honored only from SUSPENDED,
+                so engines built suspended behind a RUNNING coordinator never resume.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -819,7 +821,8 @@ class DataParallelInferenceCoordinator:
             vision_embedding_cache_enabled (bool): Whether engines retain
                 reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank.
-            initial_state (CoordinatorState): RUNNING or SUSPENDED for engines with no init weights.
+            initial_state (CoordinatorState): State the control-signal machine starts in.
+                RUNNING by default; SUSPENDED when the engines are constructed without weights.
         """
         coordinator = cls(
             pipe_connection,

@@ -290,7 +290,7 @@ class _MegatronLLMBase:
         if disaggregated and not use_coordinator:
             raise ValueError("disaggregated inference requires use_coordinator=True")
         if inference_config.start_suspended and not use_coordinator:
-            raise ValueError("start_suspended requires use_coordinator=True.")
+            raise ValueError("start_suspended requires use_coordinator=True")
 
         if not use_coordinator:
             from megatron.core import parallel_state
