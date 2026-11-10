@@ -1098,6 +1098,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/models/engram/test_engram_numerics.py",
             "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
             "tests/unit_tests/models/engram/test_distributed_lookup.py",
+            "tests/unit_tests/models/engram/test_table_sharding.py",
+            "tests/unit_tests/models/engram/test_table_sharding_optimizer.py",
         ),
         kind="torch-op",
         notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
@@ -1108,7 +1110,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
         "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
         "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
-        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet.",
+        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet. "
+        "test_table_sharding checks the lookup and owner-side gradients with the rows sharded "
+        "over DP x CP against the EP layout and a full-table FP32 reference, bit for bit with "
+        "integer gradients, and that the source stays byte-identical to PR 8225's; "
+        "test_table_sharding_optimizer trains both layouts through DDP and the distributed "
+        "optimizer and compares them bit for bit.",
     ),
     KernelEntry(
         name="dsa_dispatch",

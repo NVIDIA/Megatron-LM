@@ -422,6 +422,99 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _validate_engram_parallel_size(args):
+    """Check the setup that --engram-parallel-size shards the Engram tables in.
+
+    The tables then form a parameter domain of their own: DDP reduces their gradients over their
+    replica group, and a DistributedOptimizer without a Gloo group shards their state (see
+    megatron/core/models/engram/table_sharding.py).
+    """
+    parallel_size = args.engram_parallel_size
+    assert getattr(
+        args, 'engram_enabled', False
+    ), '--engram-parallel-size requires Engram (--engram-vocab-sizes).'
+    assert parallel_size > 0, f'--engram-parallel-size must be positive, got {parallel_size}.'
+    sharding = {
+        'tensor_model_parallel_size': args.tensor_model_parallel_size,
+        'expert_tensor_parallel_size': getattr(args, 'expert_tensor_parallel_size', 1),
+        'gtp_weight_remat_size': getattr(args, 'gtp_weight_remat_size', 1),
+        'expert_gtp_weight_remat_size': getattr(args, 'expert_gtp_weight_remat_size', 1),
+    }
+    unsupported = [f'{name}={size}' for name, size in sharding.items() if size != 1]
+    assert not unsupported, (
+        '--engram-parallel-size shards the tables over the data- and context-parallel group, '
+        'which requires tensor and expert tensor parallel sizes of 1 and no GTP weight remat '
+        f'(--tensor-parallel-num-weight-shards); got {", ".join(unsupported)}.'
+    )
+    dp_cp_size = args.data_parallel_size * args.context_parallel_size
+    assert dp_cp_size % parallel_size == 0, (
+        f'--engram-parallel-size ({parallel_size}) must divide the data-parallel size times the '
+        f'context-parallel size ({dp_cp_size}).'
+    )
+    # The run config turns --use-distributed-optimizer into the layer-wise distributed optimizer
+    # for the emerging optimizers only later (OptimizerConfig.finalize_optimizer_config), and the
+    # deprecated dist_muon alias selects it by itself.
+    assert (
+        args.use_distributed_optimizer
+        or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        or args.optimizer == 'dist_muon'
+    ), (
+        '--engram-parallel-size requires --use-distributed-optimizer: the tables get a '
+        'DistributedOptimizer of their own.'
+    )
+    # With an emerging optimizer that DistributedOptimizer sits next to the layer-wise one, in the
+    # split that the precomputed layer-wise layout builds. The legacy single-buffer layer-wise
+    # path has no such split.
+    assert args.optimizer in ('sgd', 'adam') or getattr(
+        args, 'use_layer_wise_param_layout', True
+    ), (
+        '--engram-parallel-size with an emerging optimizer requires the precomputed layer-wise '
+        'parameter layout; remove --no-use-layer-wise-param-layout.'
+    )
+    assert args.num_distributed_optimizer_instances == 1, (
+        '--engram-parallel-size requires --num-distributed-optimizer-instances 1, got '
+        f'{args.num_distributed_optimizer_instances}.'
+    )
+    # validate_args rejects FSDP with Engram in every layout before it gets here; the table
+    # domain needs the standard DDP even without that check.
+    assert not (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ), '--engram-parallel-size does not support Megatron-FSDP or Torch FSDP2.'
+    assert not getattr(
+        args, 'overlap_param_gather_with_optimizer_step', False
+    ), '--engram-parallel-size does not support --overlap-param-gather-with-optimizer-step.'
+    assert not getattr(args, 'tensor_metrics', None), (
+        '--engram-parallel-size does not support --tensor-metrics: the tensor-metric observer '
+        'does not know the parameter domain of the tables.'
+    )
+    # The checkpoint modes that gather the distributed optimizer state over Gloo cannot save the
+    # tables' optimizer, which has no Gloo group. A conversion run also saves once in
+    # --ckpt-convert-format, so both formats are checked.
+    for flag, ckpt_format in (
+        ('--ckpt-format', args.ckpt_format),
+        ('--ckpt-convert-format', getattr(args, 'ckpt_convert_format', None)),
+    ):
+        assert (
+            ckpt_format != 'torch'
+        ), f'--engram-parallel-size requires a distributed checkpoint format, not {flag} torch.'
+    assert not (
+        args.dist_ckpt_optim_fully_reshardable
+        and args.distrib_optim_fully_reshardable_mem_efficient
+    ), (
+        '--engram-parallel-size does not support --distrib-optim-fully-reshardable-mem-efficient '
+        'with --dist-ckpt-optim-fully-reshardable.'
+    )
+    # A fake process group gathers every rank's own object, so the creation of the table groups
+    # sees only this rank's dp_cp group; that one spans the world only with one pipeline stage.
+    assert not (
+        getattr(args, 'fake_process_group', False) and args.pipeline_model_parallel_size > 1
+    ), (
+        '--engram-parallel-size with --fake-process-group requires '
+        '--pipeline-model-parallel-size 1: the fake group cannot exchange the dp_cp groups of '
+        'the other pipeline stages that the Engram table groups are split from.'
+    )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
@@ -1650,6 +1743,9 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+    if getattr(args, "engram_parallel_size", None) is not None:
+        _validate_engram_parallel_size(args)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3491,6 +3587,17 @@ def _add_engram_args(parser):
         action='store_true',
         help='Keep the n-gram hash-embedding tables fixed (no gradient, no optimizer state); '
         'the dense part of the n-gram memory still trains.',
+    )
+    group.add_argument(
+        '--engram-parallel-size',
+        type=int,
+        default=None,
+        help='Shard the rows of every Engram table over this many consecutive ranks of the '
+        'data- times context-parallel group of each pipeline stage, and replicate each shard '
+        'over the others; it must divide that group size. By default the rows are sharded over '
+        'the expert-parallel group. Requires --use-distributed-optimizer (also with Muon), '
+        'tensor and expert tensor parallel sizes of 1, no GTP, one distributed optimizer '
+        'instance and a distributed checkpoint format.',
     )
     return parser
 

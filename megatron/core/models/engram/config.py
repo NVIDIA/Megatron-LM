@@ -292,6 +292,14 @@ class EngramConfig:
     so they get no gradient buffer or optimizer state and the lookup's backward exchange is
     skipped. The dense half (projections, norms, short convolution) still trains."""
 
+    parallel_size: int | None = None
+    """Number of ranks the rows of every hash-embedding table are sharded over, taken from the
+    data- and context-parallel (dp_cp) group of each pipeline stage; each row shard is replicated
+    over the other size(dp_cp) / parallel_size shards. It must divide size(dp_cp) (checked when
+    initialize_engram_parallel_state creates the groups) and requires tensor and expert tensor
+    parallel sizes of 1 and no GTP weight remat. None shards the rows over the expert-parallel
+    group and replicates them over expert data parallelism."""
+
     variant_spec: EngramVariant = field(init=False, repr=False)
     """Conventions of the selected variant, resolved from variant."""
 
@@ -356,6 +364,7 @@ class EngramConfig:
             embedding_lr_multiplier=args.engram_embedding_lr_multiplier,
             embedding_weight_decay=args.engram_embedding_weight_decay,
             freeze_embedding=getattr(args, "engram_freeze_embedding", False),
+            parallel_size=getattr(args, "engram_parallel_size", None),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(
@@ -439,6 +448,13 @@ class EngramConfig:
             raise ValueError("engram_embedding_lr_multiplier must be positive.")
         if self.embedding_weight_decay < 0:
             raise ValueError("engram_embedding_weight_decay must be nonnegative.")
+        if self.parallel_size is not None and (
+            type(self.parallel_size) is not int or self.parallel_size <= 0
+        ):
+            raise ValueError(
+                "engram_parallel_size must be a positive integer or None, got "
+                f"{self.parallel_size!r}."
+            )
         if self.variant_spec.uses_tokenizer_artifact:
             if not self.tokenizer_map_path:
                 raise ValueError(
@@ -609,6 +625,8 @@ class EngramConfig:
     def _validate_parallelism(
         self, transformer_config: Any, sequence_length: int | None, packed_sequences: bool = False
     ) -> None:
+        if self.parallel_size is not None:
+            self._validate_sharded_layout(transformer_config)
         if (
             transformer_config.expert_tensor_parallel_size
             != transformer_config.tensor_model_parallel_size
@@ -673,6 +691,36 @@ class EngramConfig:
                     f"{sequence_length} over {tensor_parallel_size} ranks gives "
                     f"{local_sequence_length}."
                 )
+
+    def _validate_sharded_layout(self, transformer_config: Any) -> None:
+        """Reject the parallel layouts that parallel_size cannot shard the tables in.
+
+        The tables are sharded over dp_cp, which holds the expert-parallel grid of a pipeline
+        stage only without tensor, expert-tensor and GTP sharding. Under expert TP, the row
+        groups would also give distinct rows to ranks of different expert-TP ranks, which the
+        gradient and parameter norms skip: they count the tables (``allreduce=False``) on
+        expert-TP rank 0 only.
+        """
+        tensor_parallel_size = transformer_config.tensor_model_parallel_size
+        sizes = {
+            "tensor_model_parallel_size": tensor_parallel_size,
+            "expert_tensor_parallel_size": (
+                getattr(transformer_config, "expert_tensor_parallel_size", None)
+                or tensor_parallel_size
+            ),
+            "gtp_weight_remat_size": getattr(transformer_config, "gtp_weight_remat_size", 1),
+            "expert_gtp_weight_remat_size": getattr(
+                transformer_config, "expert_gtp_weight_remat_size", 1
+            ),
+        }
+        unsupported = [f"{name}={size}" for name, size in sizes.items() if size != 1]
+        if unsupported:
+            raise ValueError(
+                "engram_parallel_size shards the tables over the data- and context-parallel "
+                "group, which requires tensor_model_parallel_size, expert_tensor_parallel_size, "
+                "gtp_weight_remat_size and expert_gtp_weight_remat_size of 1; got "
+                f"{', '.join(unsupported)}."
+            )
 
     def _validate_packed_sequences(self, transformer_config: Any, packed_sequences: bool) -> None:
         if not packed_sequences:

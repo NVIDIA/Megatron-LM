@@ -37,6 +37,7 @@ from .cp_layout import (
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .table_sharding import ENGRAM_PARAMETER_DOMAIN, resolve_engram_groups, tag_engram_tables
 
 logger = logging.getLogger(__name__)
 
@@ -331,15 +332,23 @@ class Engram(MegatronModule):
             persistent=False,
         )
 
+        # The rows are sharded over the expert-parallel group (EP layout) or over a slice of
+        # dp_cp (engram_config.parallel_size); the embedding takes either through its EP and
+        # expert-DP arguments.
+        row_group, replica_group, parameter_domain = resolve_engram_groups(
+            pg_collection, engram_config
+        )
         self.embedding = EPShardedMultiTableEmbedding(
             config=config,
             table_sizes=table_sizes,
             embedding_dim=engram_config.head_dim,
             init_method=config.init_method,
-            ep_group=pg_collection.ep,
+            ep_group=row_group,
             tp_group=pg_collection.tp,
-            expt_dp_group=pg_collection.expt_dp,
+            expt_dp_group=replica_group,
         )
+        if parameter_domain == ENGRAM_PARAMETER_DOMAIN:
+            tag_engram_tables(self.embedding)
         if engram_config.freeze_embedding:
             for table in self.embedding.tables:
                 table.weight.requires_grad_(False)
@@ -416,21 +425,18 @@ class Engram(MegatronModule):
     def _log_allocation(self) -> None:
         """Emit one machine-readable ownership record per instantiated module and rank."""
         global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        ep_rank = (
-            torch.distributed.get_rank(self.pg_collection.ep)
-            if torch.distributed.is_initialized() and self.pg_collection.ep is not None
-            else 0
-        )
+        # Rank in the group the rows are sharded over: EP, or the dp_cp row group.
+        row_rank = get_pg_rank(self.embedding.ep_group)
         local_rows = [table.local_num_embeddings for table in self.embedding.tables]
         row_ranges = [(table.row_start, table.row_end) for table in self.embedding.tables]
         # DEBUG: one record per rank and layer is far too chatty for large jobs at INFO.
         logger.debug(
-            "[Engram allocation] rank=%s layer=%s ep_rank=%s local_rows=%s "
+            "[Engram allocation] rank=%s layer=%s row_rank=%s local_rows=%s "
             "row_ranges=%s global_rows=%s local_sparse_parameters=%s "
             "global_sparse_parameters=%s",
             global_rank,
             self.layer_number,
-            ep_rank,
+            row_rank,
             local_rows,
             row_ranges,
             list(self.embedding.table_sizes),
