@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +70,8 @@ def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) ->
             deterministic_mode=deterministic_mode,
             gdn_kernel_backend=backend,
             gdn_pre_gated_delta_rule_fusion=False,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
         ),
         num_value_heads=2,
         qk_dim_local_tp=64,
@@ -160,22 +163,67 @@ def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode():
         )
 
 
+class _FakeTEGatedDeltaNetAttention:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _inside_frost_envelope(monkeypatch, *, capability=(10, 0), cutlass_installed=True):
+    """Make the build-time envelope check see an SM100-class device, with or without CuTe DSL."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    real_find_spec = importlib.util.find_spec
+    if not cutlass_installed:
+        stub = None
+    elif real_find_spec("cutlass") is None:
+        stub = object()  # hermetic: the envelope check only tests for presence
+    else:
+        return
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *args: stub if name == "cutlass" else real_find_spec(name, *args),
+    )
+
+
 def test_gdn_accepts_te_backend_in_deterministic_mode(monkeypatch):
-    """The cuDNN fused kernel behind TE replays bit-exactly, so deterministic mode keeps it."""
-
-    class FakeTEGatedDeltaNetAttention:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
+    """Inside the FROST envelope the cuDNN fused kernel behind TE replays bit-exactly, so
+    deterministic mode keeps it."""
     monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
-    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", FakeTEGatedDeltaNetAttention)
+    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", _FakeTEGatedDeltaNetAttention)
+    _inside_frost_envelope(monkeypatch)
     gdn = _make_gdn_variant_stub("transformer_engine", deterministic_mode=True)
 
     GatedDeltaNet._setup_variant_attrs(gdn)
 
     assert gdn.gdn_backend == "transformer_engine"
-    config = _make_gdn_config(deterministic_mode=True, gdn_kernel_backend="transformer_engine")
+    config = _make_te_gdn_config(deterministic_mode=True)
     assert config.gdn_kernel_backend == "transformer_engine"
+
+
+@pytest.mark.parametrize("reason", ["head_dims", "compute_capability", "cutlass_missing"])
+def test_gdn_rejects_te_backend_outside_frost_envelope(monkeypatch, reason):
+    """Outside the FROST envelope cuDNN would fall back to its cuTile engine, which is not verified
+    deterministic; the TE backend is rejected with the torch backend as the way out."""
+    if reason == "head_dims":
+        with pytest.raises(ValueError, match="cuTile"):
+            _make_te_gdn_config(
+                deterministic_mode=True, linear_key_head_dim=256, linear_value_head_dim=128
+            )
+        return
+
+    monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
+    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", _FakeTEGatedDeltaNetAttention)
+    if reason == "compute_capability":
+        _inside_frost_envelope(monkeypatch, capability=(9, 0))
+        expected = "compute capability"
+    else:
+        _inside_frost_envelope(monkeypatch, cutlass_installed=False)
+        expected = "nvidia-cutlass-dsl"
+    gdn = _make_gdn_variant_stub("transformer_engine", deterministic_mode=True)
+
+    with pytest.raises(ValueError, match=expected):
+        GatedDeltaNet._setup_variant_attrs(gdn)
 
 
 @pytest.mark.parametrize("backend", ["auto", "unsupported"])
@@ -219,7 +267,7 @@ def _make_gdn_config(**overrides):
 
 def _make_te_gdn_config(**overrides):
     """The small TE-backend GDN config the TE tests share (two value heads, one key head)."""
-    return _make_gdn_config(
+    kwargs = dict(
         linear_conv_kernel_dim=4,
         linear_key_head_dim=64,
         linear_value_head_dim=64,
@@ -228,8 +276,9 @@ def _make_te_gdn_config(**overrides):
         num_attention_heads=2,
         num_query_groups=2,
         gdn_kernel_backend="transformer_engine",
-        **overrides,
     )
+    kwargs.update(overrides)
+    return _make_gdn_config(**kwargs)
 
 
 def _build_gdn_module(config, pg_collection):
@@ -1248,6 +1297,8 @@ def test_te_gdn_deterministic_mode_replays_bit_exact():
     """deterministic_mode keeps the TE fused kernel and the whole GDN layer replays bit-exactly."""
     if not gdn_module.HAVE_TE_GDN:
         pytest.skip("Transformer Engine GatedDeltaNetAttention is unavailable")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("FROST envelope: deterministic TE GDN is verified on SM100/103/107 only")
     from tests.unit_tests.determinism.kernels.harness import (
         assert_module_replays_bit_exact,
         deterministic_algorithms,

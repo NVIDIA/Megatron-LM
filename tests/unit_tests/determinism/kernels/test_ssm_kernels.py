@@ -938,6 +938,9 @@ def test_te_gated_delta_net_replays_fwd_bwd(packed):
 
     if not HAVE_TE_GDN:
         pytest.skip("Transformer Engine GatedDeltaNetAttention is unavailable")
+    if torch.cuda.get_device_capability()[0] != 10:
+        # This bypasses Megatron's envelope guard; elsewhere cuDNN would run its cuTile engine.
+        pytest.skip("FROST envelope: deterministic TE GDN is verified on SM100/103/107 only")
     from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
 
     H, K, V = 16, 128, 128

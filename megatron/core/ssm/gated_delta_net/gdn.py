@@ -113,7 +113,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         backend = self.config.gdn_kernel_backend
         # Checked again here: deterministic_mode may be set after TransformerConfig.__post_init__.
-        check_deterministic_gdn_backend(self.config)
+        # A device is at hand here, so the FROST envelope (SM, CuTe DSL) is checked too.
+        check_deterministic_gdn_backend(self.config, check_device=True)
 
         if backend == "torch":
             self.gdn_backend = "torch"
