@@ -2817,6 +2817,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
             gtp_remat_group = pg_collection.expt_gtp_remat
+            # TE finalizes GTP-sharded weight gradients inside backward, so their GEMM cannot
+            # be deferred: TE >= 2.21 raises there, and older TE finalized unwritten buffers.
+            if (
+                self.delay_wgrad_compute
+                and gtp_remat_group is not None
+                and gtp_remat_group.size() > 1
+            ):
+                raise ValueError(
+                    "delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad are "
+                    "not supported with GTP-sharded grouped expert weights. Disable them or "
+                    "expert GTP weight sharding."
+                )
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 

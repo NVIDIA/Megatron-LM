@@ -1016,6 +1016,39 @@ class TestGTPRematPgCollectionWithoutParallelState:
             assert gtp_remat_group is None
 
 
+@pytest.mark.parametrize(
+    "flag", ["delay_wgrad_compute", "overlap_dispatch_backward_with_experts_wgrad"]
+)
+def test_te_grouped_linear_rejects_delayed_wgrad_with_gtp_sharding(flag):
+    """TE cannot defer the weight-gradient GEMM of GTP-sharded grouped expert weights."""
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import init_method_normal
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    config = TransformerConfig(
+        num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
+    )
+    setattr(config, flag, True)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection.expt_gtp_remat = _FakeGroup(size=2)
+
+    with pytest.raises(ValueError, match="GTP-sharded grouped expert weights"):
+        TEGroupedLinear(
+            2,
+            4,
+            4,
+            parallel_mode=None,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+            pg_collection=pg_collection,
+        )
+
+
 # ---------------------------------------------------------------------------
 # weight_prefetch=False: forward still produces correct output
 # ---------------------------------------------------------------------------
