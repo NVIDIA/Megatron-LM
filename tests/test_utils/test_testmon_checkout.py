@@ -2,10 +2,12 @@
 """Exercise baseline checkout preparation with real Git objects and bundles."""
 
 import argparse
+import datetime
 import importlib.util
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -246,3 +248,94 @@ def test_dev_baseline_lookup_requires_a_published_dev_producer(monkeypatch, case
 def test_baseline_lookup_rejects_targets_without_a_producer():
     with pytest.raises(ValueError, match="No trusted Testmon baseline producer"):
         checkout.latest_baseline("core_r0.16.0")
+
+
+NOW = datetime.datetime(2026, 11, 10, 12, tzinfo=datetime.timezone.utc)
+
+
+def started(hours):
+    return (NOW - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize(
+    ("lookup", "record", "reason"),
+    [
+        ("missing", True, "No successful first-attempt dev Testmon baseline found"),
+        ("recent", False, "baseline 250-1 started 3.0h ago"),
+        ("old", True, "newest baseline 250-1 started 25.0h ago"),
+        ("api-error", True, "no recent trusted baseline"),
+        ("malformed", True, "no recent trusted baseline"),
+    ],
+)
+def test_dev_records_at_most_one_baseline_a_day(monkeypatch, lookup, record, reason):
+    def latest_producer(target_branch):
+        assert target_branch == "dev"
+        if lookup == "missing":
+            raise ValueError("No successful first-attempt dev Testmon baseline found")
+        if lookup == "api-error":
+            raise subprocess.CalledProcessError(1, ["gh", "api"])
+        if lookup == "malformed":
+            return {"id": 250}
+        return {"id": 250, "created_at": started({"recent": 3, "old": 25}[lookup])}
+
+    monkeypatch.setattr(checkout, "latest_producer", latest_producer)
+    decision, message = checkout.recording_due("dev", datetime.timedelta(hours=24), NOW)
+    assert decision is record
+    assert reason in message
+
+
+@pytest.mark.parametrize(("hours", "record"), [(30, True), (5, False)])
+def test_daily_clock_ignores_pushes_that_skipped_recording(monkeypatch, hours, record):
+    """Only a run that published baselines starts the next 24-hour window."""
+    tip, inside = "e" * 40, "1" * 40
+    trusted = {
+        "event": "push",
+        "head_repository": {"full_name": checkout.REPOSITORY},
+        "head_branch": "dev",
+        "path": checkout.PRODUCER,
+        "run_attempt": 1,
+        "head_sha": inside,
+    }
+    runs = [
+        {**trusted, "id": 260, "created_at": started(1)},
+        {**trusted, "id": 250, "created_at": started(hours)},
+    ]
+    artifacts = {
+        260: ["logs-tests-unit_tests-models-260"],
+        250: ["unit-testmon-v1-dev-dgx_h100-0123456789abcdef-250-1"],
+    }
+
+    def fake_run(*args):
+        endpoint = next(arg for arg in args[2:] if not arg.startswith("--"))
+        if endpoint.endswith("runs?branch=dev&status=success&per_page=100"):
+            return json.dumps({"workflow_runs": runs})
+        if endpoint == f"repos/{checkout.REPOSITORY}/git/ref/heads/dev":
+            return (tip + "\n").encode()
+        if "/compare/" in endpoint:
+            return b"ahead\n"
+        run_id = int(endpoint.split("/actions/runs/")[1].split("/")[0])
+        return "".join(f"{name}\n" for name in artifacts[run_id]).encode()
+
+    monkeypatch.setattr(checkout, "run", fake_run)
+    decision, message = checkout.recording_due("dev", datetime.timedelta(hours=24), NOW)
+    assert decision is record
+    assert message.endswith(f"baseline 250-1 started {hours:.1f}h ago")
+
+
+@pytest.mark.parametrize("record", [True, False])
+def test_due_command_reports_the_decision_to_actions(monkeypatch, tmp_path, capsys, record):
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+
+    def recording_due(target_branch, interval, now):
+        assert (target_branch, interval) == ("dev", datetime.timedelta(hours=24))
+        assert now.tzinfo is datetime.timezone.utc
+        return record, "baseline 250-1 started 3.0h ago"
+
+    monkeypatch.setattr(checkout, "recording_due", recording_due)
+    arguments = ["testmon_checkout.py", "due", "--target-branch", "dev", "--max-age-hours", "24"]
+    monkeypatch.setattr(sys, "argv", arguments)
+    checkout.main()
+    assert output.read_text() == f"record={str(record).lower()}\n"
+    action = "Recording" if record else "Skipping"
+    assert f"::notice::{action} Testmon baselines: baseline 250-1" in capsys.readouterr().out

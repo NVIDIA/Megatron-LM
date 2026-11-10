@@ -26,7 +26,7 @@ PLATFORMS = {
 }
 # PR target branch -> how its trusted producer publishes baselines. PR pushes can
 # read Actions caches only from their own branch and the default branch, so main
-# saves caches while each push to dev uploads artifacts from its producer run.
+# saves caches while dev's producer runs (at most one push a day) upload artifacts.
 BASELINE_BRANCHES = {"main": "cache", "dev": "artifact"}
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}

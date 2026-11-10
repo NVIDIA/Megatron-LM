@@ -3,6 +3,7 @@
 """Apply a complete PR diff to a trusted Testmon baseline for unit-test CI."""
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -15,7 +16,8 @@ from pathlib import Path
 REPOSITORY = "NVIDIA/Megatron-LM"
 PRODUCER = ".github/workflows/populate-build-cache.yml"
 # Producer events whose Testmon generations each PR target may pin. Main records on
-# its schedule or a dispatch; dev has no schedule and records each push as artifacts.
+# its schedule or a dispatch; dev has no schedule and records at most one push a day
+# (or a dispatch) as artifacts.
 PRODUCER_EVENTS = {"main": {"schedule", "workflow_dispatch"}, "dev": {"push", "workflow_dispatch"}}
 
 
@@ -69,8 +71,8 @@ def published_dev_baseline(candidate: dict, tip: str) -> bool:
     return any(generation.fullmatch(name) for name in names.split())
 
 
-def latest_baseline(target_branch: str = "main") -> tuple[str, str]:
-    """Find a successful trusted producer of the PR target with a common cache generation."""
+def latest_producer(target_branch: str = "main") -> dict:
+    """Find the newest successful trusted producer run that published the target's baseline."""
     if target_branch not in PRODUCER_EVENTS:
         raise ValueError(f"No trusted Testmon baseline producer for {target_branch}")
     response = json.loads(
@@ -103,8 +105,47 @@ def latest_baseline(target_branch: str = "main") -> tuple[str, str]:
                 )
                 if not published_dev_baseline(candidate, tip):
                     continue
-            return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
+            return candidate
     raise ValueError(f"No successful first-attempt {target_branch} Testmon baseline found")
+
+
+def latest_baseline(target_branch: str = "main") -> tuple[str, str]:
+    """Find a successful trusted producer of the PR target with a common cache generation."""
+    candidate = latest_producer(target_branch)
+    return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
+
+
+def recording_due(
+    target_branch: str, interval: datetime.timedelta, now: datetime.datetime
+) -> tuple[bool, str]:
+    """Record unless the newest trusted baseline was produced within the interval."""
+    try:
+        candidate = latest_producer(target_branch)
+        created = datetime.datetime.fromisoformat(candidate["created_at"].replace("Z", "+00:00"))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError) as error:
+        # Without a usable lookup, refresh: a stale baseline is never extended silently.
+        return True, f"no recent trusted baseline ({error})"
+    age = now - created
+    hours = f"{age.total_seconds() / 3600:.1f}h"
+    if age < interval:
+        return False, f'baseline {candidate["id"]}-1 started {hours} ago'
+    return True, f'newest baseline {candidate["id"]}-1 started {hours} ago'
+
+
+def due(args: argparse.Namespace) -> None:
+    """Tell the producer whether this run records the target's Testmon baselines."""
+    record, reason = recording_due(
+        args.target_branch,
+        datetime.timedelta(hours=args.max_age_hours),
+        datetime.datetime.now(datetime.timezone.utc),
+    )
+    action = "Recording" if record else "Skipping"
+    sys.stdout.write(f"::notice::{action} Testmon baselines: {reason}\n")
+    result = f"record={str(record).lower()}\n"
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+            stream.write(result)
+    sys.stdout.write(result)
 
 
 def outputs(manifest: dict[str, str]) -> None:
@@ -220,7 +261,7 @@ def restore(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Dispatch preparation or restoration from the workflow CLI."""
+    """Dispatch preparation, restoration or the recording decision from the workflow CLI."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare")
@@ -230,8 +271,11 @@ def main() -> None:
     restore_parser = commands.add_parser("restore")
     restore_parser.add_argument("--directory", required=True)
     restore_parser.add_argument("--expected-sha", required=True)
+    due_parser = commands.add_parser("due")
+    due_parser.add_argument("--target-branch", required=True)
+    due_parser.add_argument("--max-age-hours", type=float, default=24)
     args = parser.parse_args()
-    (prepare if args.command == "prepare" else restore)(args)
+    {"prepare": prepare, "restore": restore, "due": due}[args.command](args)
 
 
 if __name__ == "__main__":

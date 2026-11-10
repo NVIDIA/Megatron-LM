@@ -80,8 +80,12 @@ def _artifact_baselines(
         and SHA.fullmatch(str(run.get("head_sha")))
     ]
     baselines: dict[str, dict] = {}
-    # A newer producer run's generation wins for each bucket it published.
-    for run in sorted(runs, key=lambda run: run["id"], reverse=True)[:PRODUCER_RUNS]:
+    published = 0
+    # A newer producer run's generation wins for each bucket it published. Pushes
+    # that skipped recording publish nothing and do not count toward the limit.
+    for run in sorted(runs, key=lambda run: run["id"], reverse=True):
+        if published == PRODUCER_RUNS:
+            break
         # A tag or other ref can share the branch name; require the branch's history.
         status = _gh(
             "api",
@@ -121,6 +125,8 @@ def _artifact_baselines(
                     "run_id": run["id"],
                     "source_sha": run["head_sha"],
                 }
+        if found:
+            published += 1
         for prefix, baseline in found.items():
             baselines.setdefault(prefix, baseline)
     return baselines

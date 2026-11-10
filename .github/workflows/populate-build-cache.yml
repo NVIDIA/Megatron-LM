@@ -18,7 +18,8 @@ run-name: Populate CI build and Testmon caches from ${{ github.ref_name }}
 # Each baseline branch runs its own copy of this workflow. Main's copy refreshes
 # Testmon on its schedule and publishes Actions caches. Schedules run only on
 # the default branch, and dev-target PR pushes cannot read dev-branch caches, so
-# dev's copy records dev pushes and publishes the baselines as run artifacts.
+# dev's copy records at most one dev push a day and publishes the baselines as
+# run artifacts.
 on:
   push:
     branches:
@@ -67,12 +68,46 @@ jobs:
       verify-cache: true
       publish-target-cache: true
 
+  decide-unit-testmon:
+    name: Decide Testmon recording
+    needs: validate-source
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      record: ${{ steps.decide.outputs.record }}
+    steps:
+      - name: Checkout cache source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+      - name: Record dev at most once a day
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Main records on its schedule, and a dispatch always records. Dev has no
+          # schedule: while selective unit tests are enabled, a dev push records
+          # only if no trusted dev baseline was produced in the last 24 hours.
+          # Runs are serialized, so the previous producer run has finished.
+          if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "record=true" | tee -a "$GITHUB_OUTPUT"
+          elif [[ "$SOURCE_REF" != "refs/heads/dev" || "$SELECTIVE_UNIT_TESTS" != "true" ]]; then
+            echo "record=false" | tee -a "$GITHUB_OUTPUT"
+          else
+            python3 .github/scripts/testmon_checkout.py due --target-branch dev --max-age-hours 24
+          fi
+
   parse-unit-tests:
     name: Select Testmon cache buckets
-    needs: populate-build-cache
-    # Main records on its schedule. Dev has no schedule and records each push
-    # while selective unit tests are enabled; a dispatch on dev always records.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/dev' && vars.ENABLE_SELECTIVE_UNIT_TESTS == 'true')
+    needs: [populate-build-cache, decide-unit-testmon]
+    if: needs.decide-unit-testmon.outputs.record == 'true'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}

@@ -251,35 +251,70 @@ def _evaluate(value: str, context: dict[str, str]):
 
 
 @pytest.mark.parametrize(
-    ("event", "ref", "enabled", "records"),
+    ("event", "ref", "enabled", "record"),
     [
-        ("push", "refs/heads/dev", "true", True),
-        ("push", "refs/heads/dev", "false", False),
-        ("push", "refs/heads/dev", "", False),
-        ("workflow_dispatch", "refs/heads/dev", "false", True),
-        ("schedule", "refs/heads/main", "false", True),
-        ("workflow_dispatch", "refs/heads/main", "true", True),
-        ("push", "refs/heads/main", "true", False),
+        # None: a dev push asks the daily lookup, stubbed to report a recent baseline.
+        ("push", "refs/heads/dev", "true", None),
+        ("push", "refs/heads/dev", "false", "false"),
+        ("push", "refs/heads/dev", "", "false"),
+        ("workflow_dispatch", "refs/heads/dev", "false", "true"),
+        ("schedule", "refs/heads/main", "false", "true"),
+        ("workflow_dispatch", "refs/heads/main", "true", "true"),
+        ("push", "refs/heads/main", "true", "false"),
     ],
 )
-def test_dev_producer_records_each_dev_push(
-    event: str, ref: str, enabled: str, records: bool
+def test_dev_producer_records_at_most_once_a_day(
+    tmp_path: Path, event: str, ref: str, enabled: str, record: str | None
 ) -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
     triggers = workflow[True]
-    # Scheduled workflows run only from main; dev records every push without path filters.
+    # Scheduled workflows run only from main; dev checks every push without path filters.
     assert triggers["push"] == {"branches": ["dev"]}
     assert "schedule" not in triggers and "workflow_dispatch" in triggers
+    # Serialized runs let each decision see the previous producer run's result.
     assert workflow["concurrency"] == {
         "group": "populate-ci-caches-${{ github.ref_name }}",
         "cancel-in-progress": False,
     }
-    context = {
-        "github.event_name": event,
-        "github.ref": ref,
-        "vars.ENABLE_SELECTIVE_UNIT_TESTS": enabled,
-    }
-    assert _evaluate(workflow["jobs"]["parse-unit-tests"]["if"], context) is records
+    decide = workflow["jobs"]["decide-unit-testmon"]
+    assert decide["permissions"] == {"actions": "read", "contents": "read"}
+    assert decide["outputs"] == {"record": "${{ steps.decide.outputs.record }}"}
+    parse = workflow["jobs"]["parse-unit-tests"]
+    assert parse["needs"] == ["populate-build-cache", "decide-unit-testmon"]
+    for value in ("true", "false"):
+        context = {"needs.decide-unit-testmon.outputs.record": value}
+        assert _evaluate(parse["if"], context) is (value == "true")
+    step = next(step for step in decide["steps"] if step.get("id") == "decide")
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    lookup = binaries / "python3"
+    lookup.write_text(
+        '#!/bin/sh\necho "$*" >> "$LOOKUP_LOG"\necho "record=false" >> "$GITHUB_OUTPUT"\n'
+    )
+    lookup.chmod(0o755)
+    log = tmp_path / "lookup.log"
+    result, values = _run(
+        step["run"],
+        tmp_path,
+        {
+            "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+            "LOOKUP_LOG": str(log),
+            "EVENT_NAME": event,
+            "SOURCE_REF": ref,
+            "SELECTIVE_UNIT_TESTS": enabled,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    if record is None:
+        assert log.read_text() == (
+            ".github/scripts/testmon_checkout.py due --target-branch dev --max-age-hours 24\n"
+        )
+        assert values == {"record": "false"}
+    else:
+        # Dispatches, main's schedule and disabled or non-dev pushes need no lookup.
+        assert not log.exists()
+        assert values == {"record": record}
     producer = workflow["jobs"]["populate-testmon-cache"]["steps"][-1]["with"]
     assert producer["unit_testmon_mode"] == "baseline"
     assert producer["unit_testmon_target_branch"] == "${{ github.ref_name }}"
@@ -1402,6 +1437,7 @@ def test_action_restores_and_publishes_each_transport_once(transport: str) -> No
     "scenario",
     [
         "trusted",
+        "throttled",
         "listing-error",
         "download-error",
         "pinned",
@@ -1550,7 +1586,11 @@ print(json.dumps(keys))
         run(250, older, event="workflow_dispatch"),
         run(240, older, id="240"),
     ]
+    # Newer trusted pushes that skipped the daily recording publish nothing.
+    skipped = set(range(261, 266)) if scenario == "throttled" else set()
+    runs += [run(run_id, newer) for run_id in sorted(skipped, reverse=True)]
     artifacts = {
+        **{run_id: [] for run_id in skipped},
         270: [artifact(27, keys["selected/dev/270-1"], 270, outside)],
         260: [
             artifact(26, keys["empty/dev/260-1"], 260, newer),
@@ -1598,7 +1638,7 @@ print(json.dumps(keys))
                 return json.dumps(pinned) + "\n"
             run_id = int(endpoint.split("/actions/runs/")[1].split("/")[0])
             assert query == ".artifacts[] | @json" and "--paginate" in args
-            assert run_id in {270, 260, 250}, f"untrusted run {run_id} was inspected"
+            assert run_id in {270, 260, 250} | skipped, f"untrusted run {run_id} was inspected"
             return "".join(json.dumps(entry) + "\n" for entry in artifacts[run_id])
         raise AssertionError(f"unexpected gh command: {args}")
 
@@ -1690,7 +1730,7 @@ print(json.dumps(keys))
         "baseline_source_sha": older,
     }
     assert {key: matrix["selected"][key] for key in baseline} == baseline
-    if scenario == "trusted":
+    if scenario in {"trusted", "throttled"}:
         assert matrix["selected"]["mode"] == "preselected"
         assert plans["selected"]["phases"] == {
             "prod": ["tests/unit_tests/selected/test_case.py"],

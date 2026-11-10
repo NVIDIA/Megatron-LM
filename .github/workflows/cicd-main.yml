@@ -455,8 +455,8 @@ jobs:
           fi
 
           # Only main and dev publish trusted baselines: main as scheduled Actions
-          # caches, dev as artifacts of each dev push. PRs only read them; a
-          # missing or incompatible baseline runs the full bucket without
+          # caches, dev as artifacts of at most one dev push a day. PRs only read
+          # them; a missing or incompatible baseline runs the full bucket without
           # recording a database. Other target branches always run in full.
           case "${TARGET_BRANCH:-}" in
             main) UNIT_TESTMON_BASELINE=main-actions-cache ;;
