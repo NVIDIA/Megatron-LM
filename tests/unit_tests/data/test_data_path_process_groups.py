@@ -266,6 +266,13 @@ def _strided_tp_group(world_size):
     return tp_group
 
 
+def _destroy_group(group):
+    """Destroy this rank's ``group`` once every rank has finished its collectives."""
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group(group)
+
+
 def _sample(value, micro_batch_size, seq_length):
     shape = (micro_batch_size, seq_length)
     return {
@@ -282,6 +289,7 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
     if world_size < 4 or world_size % 2:
         pytest.skip("needs an even world size of at least 4")
     Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    tp_group = None
     try:
         tp_group = _strided_tp_group(world_size)
         pgs = ProcessGroupCollection(
@@ -335,6 +343,8 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
         expected = _sample(source_rank, micro_batch_size, seq_length)["tokens"]
         torch.testing.assert_close(tokens.cpu(), expected)
     finally:
+        if tp_group is not None:
+            _destroy_group(tp_group)
         Utils.destroy_model_parallel()
 
 
@@ -474,6 +484,7 @@ def test_data_iterators_use_the_run_groups(monkeypatch, run_config):
     if world_size < 4 or world_size % 2:
         pytest.skip("needs an even world size of at least 4")
     Utils.initialize_model_parallel()
+    pair_group = None
     try:
         rank = torch.distributed.get_rank()
         # Pairs of adjacent ranks; the global data-parallel group spans every rank here.
@@ -504,4 +515,6 @@ def test_data_iterators_use_the_run_groups(monkeypatch, run_config):
         # Full validation runs as many iterations as the longest loader of the pair.
         assert run_config.validation.eval_iters == rank // 2 * 2 + 2
     finally:
+        if pair_group is not None:
+            _destroy_group(pair_group)
         Utils.destroy_model_parallel()
