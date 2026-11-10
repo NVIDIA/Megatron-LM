@@ -3,6 +3,7 @@
 """Deprecated global process-group fallbacks keep working and warn once per owner."""
 
 import logging
+import threading
 import warnings
 
 import pytest
@@ -123,6 +124,41 @@ def test_warning_hook_that_reaches_the_same_fallback_does_not_recurse():
         warn_global_process_group_fallback("Owner")
     assert len(shown) == 1
     assert "Owner was called without `pg_collection`" in shown[0]
+
+
+def test_an_error_filter_raises_in_a_thread_while_another_raises_for_the_same_fallback(monkeypatch):
+    # A fallback is recorded only once its warning has been shown, so a call that comes while
+    # another thread's warning is raising for the same fallback raises as well.
+    worker_is_warning = threading.Event()
+    main_call_done = threading.Event()
+    warn = warnings.warn
+
+    def warn_slowly_in_the_worker(*args, **kwargs):
+        if threading.current_thread() is worker:
+            worker_is_warning.set()
+            main_call_done.wait(timeout=10)
+        warn(*args, **kwargs)
+
+    def run_worker():
+        with pytest.raises(ProcessGroupFallbackWarning) as raised:
+            warn_global_process_group_fallback("Owner")
+        raised_in_worker.append(raised.value)
+
+    raised_in_worker = []
+    worker = threading.Thread(target=run_worker)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        monkeypatch.setattr(warnings, "warn", warn_slowly_in_the_worker)
+        worker.start()
+        try:
+            assert worker_is_warning.wait(timeout=10)
+            with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+                warn_global_process_group_fallback("Owner")
+        finally:
+            main_call_done.set()
+            worker.join()
+
+    assert len(raised_in_worker) == 1
 
 
 def test_strict_mode_turns_every_fallback_into_an_error():
