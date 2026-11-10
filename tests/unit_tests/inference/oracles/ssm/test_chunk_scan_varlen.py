@@ -89,9 +89,7 @@ def production_metadata(lengths, padded_requests, padded_tail_tokens, chunk_size
     real_tokens = sum(lengths)
     padded_tokens = real_tokens + padded_tail_tokens
     metadata = MambaMetadata(
-        max_requests=padded_count,
-        max_tokens=padded_tokens,
-        mamba_chunk_size=chunk_size,
+        max_requests=padded_count, max_tokens=padded_tokens, mamba_chunk_size=chunk_size
     )
     max_chunks = padded_tokens // chunk_size + padded_count
     i32 = dict(dtype=torch.int32)
