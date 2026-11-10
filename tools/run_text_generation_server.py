@@ -82,6 +82,20 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     )
 
 
+def _is_server_rank(model: MegatronModule) -> bool:
+    """Whether this rank runs the HTTP server.
+
+    The server runs on the first rank of the model's tensor- and expert-parallel groups on the
+    first pipeline stage.
+    """
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    return (
+        is_pp_first_stage(pg_collection.pp)
+        and pg_collection.tp.rank() == 0
+        and pg_collection.ep.rank() == 0
+    )
+
+
 def add_text_generate_args(parser):
     """Adds text generation arguments to parser."""
     group = parser.add_argument_group(title='text generation')
@@ -183,14 +197,7 @@ def main(model_type: str = "gpt"):
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
         )
 
-    # The HTTP server runs on the first rank of the model's tensor- and expert-parallel groups
-    # on the first pipeline stage.
-    model_pg_collection = get_attr_wrapped_model(model, "pg_collection")
-    if (
-        is_pp_first_stage(model_pg_collection.pp)
-        and model_pg_collection.tp.rank() == 0
-        and model_pg_collection.ep.rank() == 0
-    ):
+    if _is_server_rank(model):
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)
 

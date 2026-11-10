@@ -688,6 +688,15 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    quantile_balancing = config.moe_router_load_balancing_type == "quantile_balancing"
+    # Global-batch quantile balancing reduces its router histograms over tp_dp_cp, or over tp
+    # and then the DP x CP group when gtp_remat is active; micro-batch quantile balancing
+    # reduces its router bias over the DP x CP group.
+    qb_uses_tp_dp_cp = (
+        quantile_balancing
+        and config.moe_router_quantile_balancing_estimation_scope == "global_batch"
+        and config.gtp_weight_remat_size <= 1
+    )
     tp_dp_cp_group = None
     if pg_collection is not None:
         for name, group in (('tp', pg_collection.tp), ('pp', pg_collection.pp)):
@@ -708,15 +717,6 @@ def finalize_model_grads(
         # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
         # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
         dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
-        quantile_balancing = config.moe_router_load_balancing_type == "quantile_balancing"
-        # Global-batch quantile balancing reduces its router histograms over tp_dp_cp, or over tp
-        # and then the DP x CP group when gtp_remat is active; micro-batch quantile balancing
-        # reduces its router bias over the DP x CP group.
-        qb_uses_tp_dp_cp = (
-            quantile_balancing
-            and config.moe_router_quantile_balancing_estimation_scope == "global_batch"
-            and config.gtp_weight_remat_size <= 1
-        )
         # A collective with group=None runs over every rank in the job, and the global-batch
         # quantile-balancing reduction skips a None group.
         if dp_cp_group is None and (
@@ -752,6 +752,15 @@ def finalize_model_grads(
         tp_dp_cp_group = pg_collection.tp_dp_cp
         gtp_remat_group = pg_collection.gtp_remat
         egtp_remat_group = pg_collection.expt_gtp_remat
+        # The fallback collection holds None for a group that the grid does not have, and the
+        # global-batch quantile-balancing reduction skips a None group: each rank would update
+        # its routers from its own histograms.
+        if tp_dp_cp_group is None and (config.moe_router_enable_expert_bias or qb_uses_tp_dp_cp):
+            raise ValueError(
+                "finalize_model_grads: the global parallel grid has no TP x DP x CP group "
+                "(tp_dp_cp), which moe_router_enable_expert_bias and global-batch quantile "
+                "balancing without gtp_remat need. Pass pg_collection with tp_dp_cp set."
+            )
 
     # A missing group would silently skip the gtp_remat-axis reduction below and train on
     # wrong gradients, so fail loudly whenever the config says the axis is active.

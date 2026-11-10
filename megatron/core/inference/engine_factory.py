@@ -41,7 +41,9 @@ def build_dynamic_inference_engine(
         model: Distributed Megatron model to serve.
         tokenizer: Tokenizer consumed by the text generation controller.
         inference_config: Runtime inference configuration. Defaults to
-            :class:`InferenceConfig`.
+            :class:`InferenceConfig`. If its ``pg_collection`` is unset, it is
+            resolved with ``model`` (see
+            :meth:`InferenceConfig.resolve_pg_collection`).
         inference_wrapper_cls: Model inference wrapper implementation.
         engine_cls: Optional engine implementation override. A disaggregated
             config requires a subclass of :class:`DisaggDynamicInferenceEngine`.
@@ -67,6 +69,10 @@ def build_dynamic_inference_engine(
     inference_config.reserve_recurrent_state_dummy_slot = (
         engine_cls.requires_recurrent_state_dummy_slot
     )
+    # The context is built first and does not hold the model. Resolve the process groups here, so
+    # that a config without a collection takes the one the model was built with, and the context,
+    # wrapper, controller and engine share it.
+    inference_config.resolve_pg_collection(model)
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = inference_wrapper_cls(model, context)
     controller = TextGenerationController(

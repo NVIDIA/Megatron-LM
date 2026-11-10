@@ -6,6 +6,7 @@ Each test either makes every global parallel_state accessor fail, or gives the c
 layout differs from the global grid, so a read of the global grid cannot pass unnoticed.
 """
 
+import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -151,6 +152,32 @@ def test_omitted_group_warns_and_uses_the_global_group(monkeypatch, collectives)
     assert "deprecated since Megatron Core 0.21" in message
     assert "removed in 0.23" in message
     assert collectives.all_reduce == [global_tp_group]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        pytest.param(SimpleNamespace(training=True), id="no-collection-attribute"),
+        pytest.param(SimpleNamespace(training=True, pg_collection=None), id="none"),
+    ],
+)
+def test_loss_func_for_a_model_without_a_collection_computes_the_plain_loss(
+    monkeypatch, collectives, model
+):
+    """A loss that is not split needs no group, so a model without a collection may compute it."""
+    _forbid_global_process_groups(monkeypatch)
+    monkeypatch.setattr(loss_func_module, "get_args", _loss_args)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        loss, num_tokens, report = loss_func_module.loss_func(
+            torch.ones(1, 3), torch.tensor([[1.0, 2.0, 4.0]]), model
+        )
+
+    assert loss.item() == pytest.approx(7.0)
+    assert num_tokens.item() == 3
+    assert report["lm loss"][0].item() == pytest.approx(7.0)
+    assert collectives.all_reduce == [] and collectives.all_gather == []
 
 
 def _kd_model(pg_collection):

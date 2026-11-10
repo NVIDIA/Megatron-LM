@@ -220,6 +220,7 @@ def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
 
 
 if HAVE_TE:
+    from megatron.core import parallel_state
 
     def get_fp4_recipe(config: TransformerConfig):
         """Return fp4 recipe."""
@@ -268,9 +269,10 @@ if HAVE_TE:
                 context reduces amaxes over
                 ``amax_reduction_group(pg_collection, config.tp_only_amax_red)``. Omitting it is
                 deprecated and emits a ``ProcessGroupFallbackWarning``: the context then uses
-                the global amax reduction group of ``parallel_state``, or passes no group, which
-                Transformer Engine reads as its default group, when ``parallel_state`` has none.
-                Unused by fp8_model_init, which does not reduce amaxes.
+                the global amax reduction group of ``parallel_state``, and raises ``ValueError``
+                if an initialized ``parallel_state`` has none. When ``parallel_state`` is not
+                initialized, it passes no group, which Transformer Engine reads as its default
+                group. Unused by fp8_model_init, which does not reduce amaxes.
         """
         num_bf16_layers_at_start = (
             config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
@@ -302,8 +304,11 @@ if HAVE_TE:
                         deprecated_in="0.21",
                         removed_in="0.23",
                     )
+                    # An initialized grid without the group is an error, as it is for a collection.
                     fp4_group = (
-                        global_groups.tp_cp if config.tp_only_amax_red else global_groups.tp_dp_cp
+                        amax_reduction_group(global_groups, config.tp_only_amax_red)
+                        if parallel_state.model_parallel_is_initialized()
+                        else None
                     )
                 # TE currently uses fp8_autocast for fp8 and fp4 quantization.
                 fp4_context = transformer_engine.pytorch.fp8_autocast(

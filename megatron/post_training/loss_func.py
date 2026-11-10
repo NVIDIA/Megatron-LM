@@ -64,14 +64,21 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         output_tensor (Tensor): The tensor with the losses
         model (GPTModel): The model (can be wrapped). Distillation losses split across
             tensor-parallel ranks are reduced over the tensor-parallel group of its
-            ``pg_collection``. It may be None when knowledge distillation is off; a split loss
-            then falls back to the global tensor-parallel group with a deprecation warning.
+            ``pg_collection``. It may be None when knowledge distillation is off. Without a
+            model, or for a model that carries no ``pg_collection``, a split loss falls back to
+            the global tensor-parallel group with a deprecation warning.
     """
     args = get_args()
 
     # Unwrap for both Distillation and LANA
     model = unwrap_model(model)
-    tp_group = None if model is None else get_attr_wrapped_model(model, "pg_collection").tp
+    try:
+        pg_collection = None if model is None else get_attr_wrapped_model(model, "pg_collection")
+    except RuntimeError:
+        # Compatibility for model classes that carry no collection: _mask_loss falls back to
+        # the global group, with a warning, when a loss needs it.
+        pg_collection = None
+    tp_group = None if pg_collection is None else pg_collection.tp
 
     # Standard lm loss
     loss_lm = _mask_loss(output_tensor, loss_mask, tp_group=tp_group)

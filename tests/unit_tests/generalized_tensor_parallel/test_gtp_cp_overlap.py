@@ -6,6 +6,8 @@ Run with torchrun on both four and eight GPUs to cover all TP/CP/GTP layouts.
 The reference uses ordinary CP and replicated weights, with identical tokens.
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -176,7 +178,8 @@ def _step(model, optimizer, pg, step):
     )
 
 
-def test_replica_all_gather_group_uses_weight_layout(monkeypatch):
+@pytest.mark.parametrize("with_collection", [False, True])
+def test_replica_all_gather_group_uses_weight_layout(monkeypatch, with_collection):
     """Optimizer AG must use the same replicas as its gradient reduction."""
     if dist.get_world_size() not in (4, 8):
         pytest.skip("Requires four or eight ranks")
@@ -189,9 +192,16 @@ def test_replica_all_gather_group_uses_weight_layout(monkeypatch):
             gtp_remat_num_sequence_shards=2,
         )
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        # Without a collection, the deprecated form reads the global grid.
-        with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
-            all_gather, _ = ps.create_all_gather_groups()
+        if with_collection:
+            # The form that training uses: the group mirrors the collection's, with no fallback.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                all_gather, _ = ps.create_all_gather_groups(pg_collection=pg)
+        else:
+            # Without a collection, the deprecated form reads the global grid.
+            with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
+                all_gather, _ = ps.create_all_gather_groups()
+        assert all_gather is not pg.dp_cp
         assert dist.get_process_group_ranks(all_gather) == dist.get_process_group_ranks(pg.dp_cp)
         assert pg.dp_gtp_remat.size() == 1
         assert pg.dp_cp.size() == dist.get_world_size() // 2

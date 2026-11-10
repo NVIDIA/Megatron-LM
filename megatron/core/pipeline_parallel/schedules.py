@@ -330,14 +330,15 @@ def forward_step_calc_loss(
     collect_non_loss_data,
     num_microbatches,
     forward_data_store,
-    cp_group_size,
-    is_last_stage,
+    cp_group_size=None,
+    is_last_stage=None,
 ):
     """Calculate the loss and number of tokens for forward_step()
 
     ``is_last_stage`` says whether this model chunk is the last pipeline stage, counting virtual
     stages; only the last stage computes the loss. ``cp_group_size`` is the context-parallel size
-    that scales the loss; it may be ``None`` on the other stages.
+    that scales the loss; it may be ``None`` on the other stages. Omitting both is deprecated: the
+    function then warns and reads both from the global grid in parallel_state.
     """
 
     model_vp_stage = getattr(model, "vp_stage", None)
@@ -346,6 +347,18 @@ def forward_step_calc_loss(
             vp_stage == model_vp_stage
         ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
 
+    if cp_group_size is None and is_last_stage is None:
+        # Compatibility fallback for callers that pass neither value yet.
+        warn_global_process_group_fallback(
+            "forward_step_calc_loss",
+            "cp_group_size/is_last_stage",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        cp_group_size = parallel_state.get_context_parallel_world_size()
+        is_last_stage = parallel_state.is_pipeline_last_stage(
+            ignore_virtual=False, vp_stage=vp_stage
+        )
     if is_last_stage is None:
         raise ValueError("forward_step_calc_loss: is_last_stage must be True or False")
     if is_last_stage and cp_group_size is None:
@@ -985,17 +998,28 @@ def get_pp_rank_microbatches(
     microbatch_group_size_per_vp_stage,
     forward_only=False,
     overlap_moe_expert_parallel_comm=False,
-    *,
-    p2p_communicator: P2PCommunicator,
+    p2p_communicator: Optional[P2PCommunicator] = None,
 ):
     """Get the number of total, warmup, and remaining microbatches in PP scheduling.
 
     ``p2p_communicator`` is the schedule's communicator; its pipeline group and virtual-pipeline
-    size give this rank's stage and the number of stages.
+    size give this rank's stage and the number of stages. Omitting it is deprecated: the function
+    then warns and reads the pipeline rank and sizes of the global grid in parallel_state.
     """
-    pipeline_parallel_size = p2p_communicator.pp_group.size()
-    pipeline_parallel_rank = p2p_communicator.pp_group.rank()
-    virtual_pipeline_parallel_size = p2p_communicator.virtual_pipeline_model_parallel_size
+    if p2p_communicator is not None:
+        pipeline_parallel_size = p2p_communicator.pp_group.size()
+        pipeline_parallel_rank = p2p_communicator.pp_group.rank()
+        virtual_pipeline_parallel_size = p2p_communicator.virtual_pipeline_model_parallel_size
+    else:
+        # Compatibility fallback for callers that do not pass a communicator yet.
+        warn_global_process_group_fallback(
+            "get_pp_rank_microbatches", "p2p_communicator", deprecated_in="0.21", removed_in="0.23"
+        )
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+        virtual_pipeline_parallel_size = (
+            parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        )
 
     total_num_microbatches = num_microbatches * num_model_chunks
     are_all_microbatches_in_warmup = False

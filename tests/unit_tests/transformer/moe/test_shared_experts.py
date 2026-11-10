@@ -22,7 +22,11 @@ from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, S
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, new_group_with_same_ranks
+from tests.unit_tests.transformer.test_sharded_state_dict_dp_cp_group import (
+    forbid_global_dp_cp_group,
+    shard_ids,
+)
 
 
 class _FakeTELinear(torch.nn.Module):
@@ -837,3 +841,33 @@ class TestSharedExperts:
         assert sharded_sd.keys() == expected_sd.keys()
         for key, expected in expected_sd.items():
             assert sharded_sd[key].replica_id == expected.replica_id, key
+
+    def test_sharded_state_dict_fills_the_dp_cp_group_of_its_collection(self):
+        """Metadata without a dp_cp_group gets the module's DP x CP group, not the global one."""
+        tp_size = 2 if Utils.world_size % 2 == 0 else 1
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # The ranks of the global DP x CP group on a communicator of the module's own.
+        dp_cp_group = new_group_with_same_ranks(pg_collection.dp_cp)
+        try:
+            pg_collection.dp_cp_gtp_remat = dp_cp_group
+            shared_expert = SharedExpertMLP(
+                self.config,
+                MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+                gate=True,
+                pg_collection=pg_collection,
+            )
+            expected = shard_ids(
+                shared_expert.sharded_state_dict(metadata={"dp_cp_group": dp_cp_group})
+            )
+
+            metadata = {}
+            with forbid_global_dp_cp_group():
+                without_metadata = shared_expert.sharded_state_dict(metadata=None)
+                without_group = shared_expert.sharded_state_dict(metadata=metadata)
+
+            assert metadata["dp_cp_group"] is dp_cp_group
+            assert shard_ids(without_metadata) == expected
+            assert shard_ids(without_group) == expected
+        finally:
+            torch.distributed.destroy_process_group(dp_cp_group)

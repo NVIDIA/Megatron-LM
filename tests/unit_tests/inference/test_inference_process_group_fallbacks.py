@@ -40,7 +40,10 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
+from tests.unit_tests.test_utilities import (
+    forbid_global_process_groups as forbid_global_reads_outside_resolver,
+)
 
 # The groups that inference reads from `InferenceConfig.pg_collection`.
 INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
@@ -48,6 +51,9 @@ INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
 COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
 # The groups whose None means that the axis is off.
 AXIS_GROUPS = ("ep", "cp", "expt_tp", "expt_dp")
+# The axis groups that only the disaggregated coordinator setup and the Dynamo engine service read,
+# for their sizes. A configured collection may omit them until Megatron Core 0.23, with a warning.
+SIZE_ONLY_GROUPS = ("cp", "expt_tp", "expt_dp")
 # The dynamic context and engine also read tp_ep. A configured collection may leave it unset; the
 # model's collection and the global fallback set it.
 RESOLVED_GROUPS = (*INFERENCE_GROUPS, "tp_ep")
@@ -127,6 +133,28 @@ def no_fallback_warnings():
 def fresh_warning_registry(monkeypatch):
     """Each test observes the first fallback warning of every owner."""
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+@pytest.fixture
+def build_tp2_collection():
+    """Return a function that builds a collection for a TP=2 grid without the global grid.
+
+    `Utils.destroy_model_parallel` destroys only the groups of `parallel_state`, so the groups
+    of every collection built here are destroyed after the test, on every rank.
+    """
+    built = []
+
+    def build():
+        built.append(
+            build_inference_pg_collection(
+                Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
+            )
+        )
+        return built[-1]
+
+    yield build
+    for pg_collection in built:
+        destroy_test_pg_collection(pg_collection)
 
 
 def _fallback_warnings(record):
@@ -367,15 +395,43 @@ class TestInferenceConfigBoundary:
             ):
                 config.resolve_pg_collection()
 
-    @pytest.mark.parametrize("name", AXIS_GROUPS)
-    def test_configured_collection_requires_every_group_inference_reads(self, name):
-        config = InferenceConfig(pg_collection=_stand_in_collection(**{name: _ABSENT}))
+    def test_configured_collection_requires_ep(self):
+        # The dynamic context and engine read ep; unset, it would read as expert parallelism off.
+        config = InferenceConfig(pg_collection=_stand_in_collection(ep=_ABSENT))
 
         with forbid_global_process_groups(), no_fallback_warnings():
             with pytest.raises(
-                ValueError, match=rf"InferenceConfig requires pg_collection to set {name}\."
+                ValueError, match=r"InferenceConfig requires pg_collection to set ep\."
             ):
                 config.resolve_pg_collection()
+
+    @pytest.mark.parametrize(
+        "omitted", [("cp",), ("expt_tp",), ("expt_dp",), SIZE_ONLY_GROUPS], ids="-".join
+    )
+    def test_configured_collection_without_size_only_groups_warns(self, omitted):
+        # An unset cp, expt_tp or expt_dp reads as None where it is read, which means that the
+        # axis is off, so the collection still resolves. The last case leaves the groups that a
+        # dynamic engine without disaggregation reads: tp, pp, dp, mp, ep and tp_ep.
+        configured = _stand_in_collection(**dict.fromkeys(omitted, _ABSENT))
+        config = InferenceConfig(pg_collection=configured)
+
+        with forbid_global_process_groups(), pytest.warns(FutureWarning) as record:
+            assert config.resolve_pg_collection() is configured
+
+        assert config.pg_collection is configured
+        assert not set(omitted) & set(vars(configured))
+        future_warnings = [w for w in record if issubclass(w.category, FutureWarning)]
+        assert len(future_warnings) == 1, [str(w.message) for w in record]
+        # Not a fallback to the global grid, so strict fallback mode does not turn it into an error.
+        assert future_warnings[0].category is FutureWarning
+        message = str(future_warnings[0].message)
+        assert (
+            f"InferenceConfig was given a pg_collection that does not set {', '.join(omitted)}. "
+            in message
+        )
+        assert "becomes an error in Megatron Core 0.23" in message
+        # The warning points at the code that configured the collection, not at Megatron Core.
+        assert future_warnings[0].filename == __file__
 
     def test_configured_collection_rejects_non_member_groups(self):
         non_member = torch.distributed.GroupMember.NON_GROUP_MEMBER
@@ -408,12 +464,14 @@ class TestComponentsShareOneCollection:
     def test_dynamic_context_resolves_for_wrapper_and_controller(self):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        # The model config says TP=1 and the global grid TP=2: the context takes its sizes from
+        # the collection it resolved, not from the model config.
         model_config = TransformerConfig(
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=8,
             num_attention_heads=4,
-            tensor_model_parallel_size=2,
+            tensor_model_parallel_size=1,
         )
         inference_config = InferenceConfig(
             max_sequence_length=64,
@@ -424,23 +482,16 @@ class TestComponentsShareOneCollection:
             unified_memory_level=0,
         )
 
-        # Apart from the config's warned fallback, the context reads none of the global grid.
-        with contextlib.ExitStack() as stack:
-            for name in (
-                "get_expert_model_parallel_world_size",
-                "get_pipeline_model_parallel_rank",
-            ):
-                stack.enter_context(
-                    mock.patch.object(
-                        parallel_state, name, side_effect=GlobalProcessGroupRead(name)
-                    )
-                )
+        # Apart from the config's warned fallback, which reads the grid inside
+        # process_groups_config.py, the context reads none of the global grid.
+        with forbid_global_reads_outside_resolver(forbid_shim=False):
             with pytest.warns(ProcessGroupFallbackWarning) as record:
                 context = DynamicInferenceContext(model_config, inference_config)
 
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         pg_collection = inference_config.pg_collection
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
+        assert context.tp_size == 2
         assert context.expert_model_parallel_group is pg_collection.ep
         assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
         assert context.expert_tensor_and_model_parallel_group is pg_collection.tp_ep
@@ -456,18 +507,12 @@ class TestComponentsShareOneCollection:
         assert controller.pp_group is pg_collection.pp
         assert controller.dp_group is pg_collection.dp
 
-    def test_dynamic_context_rejects_collection_without_mp(self):
+    def test_dynamic_context_rejects_collection_without_mp(self, build_tp2_collection):
         # The engine built on this context would broadcast on mp and call barrier(mp); without mp
         # both would run on the world group.
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
-        groups = dict(
-            vars(
-                build_inference_pg_collection(
-                    Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-                )
-            )
-        )
+        groups = dict(vars(build_tp2_collection()))
         del groups["mp"]
         model_config = TransformerConfig(
             params_dtype=torch.float32,
@@ -492,13 +537,11 @@ class TestComponentsShareOneCollection:
             ):
                 DynamicInferenceContext(model_config, inference_config)
 
-    def test_static_context_takes_collection_of_model(self):
+    def test_static_context_takes_collection_of_model(self, build_tp2_collection):
         _require_world_size_multiple_of(2)
         # The global grid has TP=1; the model runs on its own TP=2 groups.
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-        pg_collection = build_inference_pg_collection(
-            Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-        )
+        pg_collection = build_tp2_collection()
         model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
         model = SimpleNamespace(config=model_config, vocab_size=16, pg_collection=pg_collection)
 
@@ -516,12 +559,10 @@ class TestComponentsShareOneCollection:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_static_engine_shares_collection_of_model(self):
+    def test_static_engine_shares_collection_of_model(self, build_tp2_collection):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-        pg_collection = build_inference_pg_collection(
-            Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-        )
+        pg_collection = build_tp2_collection()
         model_parallel_cuda_manual_seed(123)
         vocab_size = 100
         model = GPTModel(
