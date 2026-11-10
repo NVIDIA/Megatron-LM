@@ -16,6 +16,8 @@ from megatron.training import training as training_mod
 @pytest.fixture(autouse=True)
 def training_config(run_config):
     run_config.train.micro_batch_size = 1
+    # train_step reads the QK-clip switch from the model's transformer config.
+    run_config.model.transformer.qk_clip = True
 
 
 class _StopAfterClip(Exception):
@@ -50,7 +52,6 @@ def _clip_qk_call(model_pg_collection):
         decoder_seq_length=None,
         empty_unused_memory_level=0,
         vision_pretraining=False,
-        qk_clip=True,
     )
     model = [
         SimpleNamespace(

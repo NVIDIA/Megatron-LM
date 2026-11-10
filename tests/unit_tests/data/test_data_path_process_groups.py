@@ -126,17 +126,17 @@ def batch_entrypoint(request, monkeypatch):
     _forbid_global_process_groups(monkeypatch)
     _use_fake_groups(monkeypatch)
     args = SimpleNamespace(
-        sequence_packing_scheduler=None,
-        dynamic_context_parallel=False,
-        context_parallel_size=1,
         sft=False,
         dataloader_inter_document_masking=False,
         create_attention_mask_in_dataloader=False,
         micro_batch_size=1,
         seq_length=8,
-        pipeline_model_parallel_size=2,
     )
     config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=2,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
@@ -146,7 +146,9 @@ def batch_entrypoint(request, monkeypatch):
         attention_cp_layout="zigzag",
     )
     monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    monkeypatch.setattr(
+        module, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+    )
 
     def broadcast(batch, **kwargs):
         return {**dict.fromkeys(module.BATCH_KEYS), **batch}
@@ -290,17 +292,17 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
         source_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
         micro_batch_size, seq_length = 2, 8
         args = SimpleNamespace(
-            sequence_packing_scheduler=None,
-            dynamic_context_parallel=False,
-            context_parallel_size=1,
             sft=False,
             dataloader_inter_document_masking=False,
             create_attention_mask_in_dataloader=False,
             micro_batch_size=micro_batch_size,
             seq_length=seq_length,
-            pipeline_model_parallel_size=1,
         )
         config = SimpleNamespace(
+            sequence_packing_scheduler=None,
+            dynamic_context_parallel=False,
+            context_parallel_size=1,
+            pipeline_model_parallel_size=1,
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
             virtual_pipeline_model_parallel_size=None,
@@ -319,7 +321,11 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
         with monkeypatch.context() as patch:
             _forbid_global_process_groups(patch)
             patch.setattr(module, "get_args", lambda: args)
-            patch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+            patch.setattr(
+                module,
+                "get_run_config",
+                lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+            )
             result = module.get_batch(data_iterator, pg_collection=pgs)
 
         if module is pretrain_gpt:

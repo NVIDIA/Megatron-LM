@@ -31,7 +31,7 @@ from tests.unit_tests.test_checkpointing import (
     create_ckpt_load_args,
     init_model_parallel,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -191,10 +191,11 @@ def test_legacy_checkpoint_round_trip_on_model_grid(
     with TempNamedDir(
         tmp_path_dist_ckpt / "test_legacy_checkpoint_round_trip_on_model_grid", sync=True
     ) as ckpt_dir:
-        args.load = ckpt_dir
-        args.save = ckpt_dir
+        args.load = str(ckpt_dir)
+        args.save = str(ckpt_dir)
         args.save_tokenizer_assets = False
         set_args(args)
+        sync_checkpoint_config(args)
 
         # Data-parallel replicas of one shard share its RNG state.
         torch.manual_seed(1000 + 10 * tp_rank + pp_rank)
@@ -227,6 +228,8 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
     args.use_distributed_optimizer = False
     args.fp16 = False
     args.bf16 = False
+    # A load requests the RNG shards only when the job size matches the saved arguments.
+    args.world_size = torch.distributed.get_world_size()
 
     grid = _grid_unlike_the_global_one()
     config = TransformerConfig(num_layers=1, kv_channels=1)
@@ -237,10 +240,11 @@ def test_torch_dist_checkpoint_round_trip_on_model_grid(
     with TempNamedDir(
         tmp_path_dist_ckpt / "test_torch_dist_checkpoint_round_trip_on_model_grid", sync=True
     ) as ckpt_dir:
-        args.load = ckpt_dir
-        args.save = ckpt_dir
+        args.load = str(ckpt_dir)
+        args.save = str(ckpt_dir)
         args.save_tokenizer_assets = False
         set_args(args)
+        sync_checkpoint_config(args)
 
         torch.manual_seed(1000 + torch.distributed.get_rank())
         saved_rng = torch.get_rng_state().clone()
