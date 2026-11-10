@@ -62,6 +62,10 @@ def _cross_entropy_mxfp8_grad_format(config: TransformerConfig) -> str:
     """
     from transformer_engine.common.recipe import Format, MXFP8BlockScaling
 
+    if not config.fp8 and getattr(config, "fp4", None):
+        # An FP4 model has no FP8 recipe: its MXFP8 LM head runs under its own
+        # MXFP8BlockScaling(fp8_format=E4M3) autocast, whose backward expects E4M3 gradients.
+        return "e4m3"
     recipe = get_fp8_recipe(config)
     if not isinstance(recipe, MXFP8BlockScaling):
         raise ValueError(

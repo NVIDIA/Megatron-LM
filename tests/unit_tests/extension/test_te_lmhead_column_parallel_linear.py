@@ -235,6 +235,11 @@ class TestCrossEntropyMxfp8GradFormat:
         with pytest.raises(ValueError, match="E4M3 and HYBRID"):
             _cross_entropy_mxfp8_grad_format(config)
 
+    def test_fp4_model_uses_e4m3(self):
+        # An FP4 model's MXFP8 LM head runs under its own E4M3 MXFP8 autocast (no FP8 recipe).
+        config = SimpleNamespace(fp8=None, fp4="e2m1")
+        assert _cross_entropy_mxfp8_grad_format(config) == "e4m3"
+
 
 class TestCrossEntropyMxfp8GradConfig:
     """cross_entropy_mxfp8_grad validation."""
