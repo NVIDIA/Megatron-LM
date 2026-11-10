@@ -1086,11 +1086,13 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
 
-    moe_grouped_gemm: bool = False
-    """Use grouped GEMM to execute multiple local MoE experts together.
+    moe_grouped_gemm: bool = True
+    """Use grouped GEMM to execute multiple local MoE experts together (enabled by default).
 
     The concrete implementation is selected by Transformer Engine. Set
     ``moe_use_grouped_tensor=True`` to use its CUDA-graph-safe GroupedTensor path.
+    Setting this to False selects the deprecated SequentialMLP on the TE backend.
+    The local backend still uses SequentialMLP regardless of this setting.
     """
 
     moe_use_grouped_tensor: bool = False
@@ -1127,8 +1129,8 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'.
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "alltoall"
+    """The type of token dispatcher to use. The default is 'alltoall'.
     Options are 'allgather','alltoall' and 'flex'."""
 
     moe_enable_deepep: bool = False
