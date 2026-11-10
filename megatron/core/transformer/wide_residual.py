@@ -709,31 +709,19 @@ def seam_connections(layer) -> tuple[nn.Module, nn.Module]:
 def mxfp8_linear_eligible(linear, config) -> bool:
     """Construction time: whether ``linear`` may take a seam's reader zero directly as MXFP8.
 
-    Its layer's precision is MXFP8 (Megatron fixes precision per layer) at a hidden size the
-    kernel quantizes, and it is a TELinear taking its input whole (no TP, no userbuffer overlap
-    or quantized parameters).
+    Its layer's precision is MXFP8 (Megatron fixes precision per layer; TransformerConfig rejects
+    MXFP8 fusion at unsupported hidden sizes, with TP or userbuffer overlap) on a qualified GB300,
+    and it is a TELinear without a per-module quantization override.
     """
     from megatron.core.extensions.transformer_engine import TELinear
-    from megatron.core.fusions.wide_residual_shortcut.kernel_utils import WIDTHS, qualified_device
+    from megatron.core.fusions.wide_residual_shortcut.kernel_utils import qualified_device
 
     return bool(
         config.fp8
         and config.fp8_recipe == "mxfp8"
-        and config.hidden_size in WIDTHS
         and qualified_device(torch.cuda.get_device_properties(torch.cuda.current_device()))
         and isinstance(linear, TELinear)
         and getattr(linear, "te_quant_params", None) is None
-        and getattr(linear, "tp_size", 1) == 1
-        and not any(
-            getattr(linear, name, False)
-            for name in (
-                "ub_overlap_ag_fprop",
-                "ub_overlap_ag_dgrad",
-                "ub_overlap_rs_dgrad",
-                "ub_bulk_dgrad",
-                "ub_bulk_wgrad",
-            )
-        )
     )
 
 
@@ -760,13 +748,7 @@ def _install_mxfp8_unpack(tensor, output, linear):
     reader = reader_for(tensor)
     if reader is None or not torch.is_grad_enabled():
         return
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-
-    recipe = FP8GlobalStateManager.get_fp8_recipe()
-    if not FP8GlobalStateManager.is_fp8_enabled() or not recipe.mxfp8():
-        raise RuntimeError("shortcut MXFP8 input requires an MXFP8 TE linear consumer")
-    if getattr(recipe, "backward_override", None) is not None:
-        raise RuntimeError("shortcut MXFP8 handoff requires ordinary MXFP8 backward")
+    # The seam that emitted the operand ran under its MXFP8 context (check_mxfp8_call).
     if reader.consumer() is not linear:
         raise RuntimeError("a seam's MXFP8 operand must be consumed only by its declared Linear")
     output = output[0] if isinstance(output, tuple) else output

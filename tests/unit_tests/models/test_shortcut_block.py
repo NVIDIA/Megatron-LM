@@ -1121,6 +1121,11 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
         ({"add_bias_linear": True}, "add_bias_linear"),
         ({"wide_residual": WideResidualConfig(num_streams=7)}, "num_streams"),
         ({"residual_stream_recompute_num_layers": 2, "cuda_graph_impl": "local"}, "CUDA graphs"),
+        ({"fp8": "e4m3", "fp8_recipe": "mxfp8", "hidden_size": 1536}, "MXFP8 at a hidden_size"),
+        (
+            {"fp8": "e4m3", "fp8_recipe": "mxfp8", "tensor_model_parallel_size": 2},
+            "MXFP8 with tensor_model_parallel_size",
+        ),
         (
             {
                 "cuda_graph_impl": "local",

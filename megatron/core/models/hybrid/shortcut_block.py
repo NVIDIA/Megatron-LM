@@ -538,6 +538,7 @@ class ShortcutMoEBlock(MegatronModule):
         self,
         hidden_states,
         *,
+        shortcut_input=None,
         attention_mask,
         inference_context,
         rotary_pos_emb,
@@ -554,6 +555,9 @@ class ShortcutMoEBlock(MegatronModule):
         main stream. Routing, dispatch, experts and combine run on the MoE
         stream. CUDA graphs capture the input-ready fork and the join before
         the residual write.
+
+        With a fused shortcut read, ``forward`` has already produced the read and normed
+        ``shortcut_input`` on the main stream; routing consumes it instead of reading again.
         """
         if attn_recompute_context is not None or moe_recompute_context is not None:
             raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")
@@ -563,7 +567,7 @@ class ShortcutMoEBlock(MegatronModule):
             raise RuntimeError(
                 "Shortcut MoE overlap with speculative decoding requires further testing"
             )
-        shortcut_hidden = hidden_states
+        shortcut_hidden = hidden_states if shortcut_input is None else shortcut_input
         if not isinstance(self.compute_layer, (MambaLayer, TransformerLayer)):
             raise RuntimeError(
                 "Shortcut MoE inference overlap requires a Mamba or Transformer layer"
@@ -582,9 +586,10 @@ class ShortcutMoEBlock(MegatronModule):
             padding_mask.record_stream(shortcut_stream)
         with torch.cuda.stream(shortcut_stream):
             with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
-                shortcut_hidden = self._read_shortcut_hidden(
-                    shortcut_hidden, recompute_context=None
-                )
+                if shortcut_input is None:
+                    shortcut_hidden = self._read_shortcut_hidden(
+                        shortcut_hidden, recompute_context=None
+                    )
                 route_input, route_probs = self._moe_router_preprocess(
                     shortcut_hidden=shortcut_hidden,
                     padding_mask=padding_mask,
@@ -684,6 +689,7 @@ class ShortcutMoEBlock(MegatronModule):
         ):
             return self._forward_inference_overlap(
                 hidden_states,
+                shortcut_input=shortcut_input if self.fused_shortcut_read else None,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
