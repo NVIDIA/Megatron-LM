@@ -3,10 +3,12 @@
 from dataclasses import fields
 
 import pytest
+import torch
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import clear_nvte_env_vars
 from tools.checkpoint.utils import (
@@ -46,7 +48,8 @@ def test_fake_groups_support_default_process_group_collection(fake_groups):
 def test_fake_groups_satisfy_language_module(mocker, fake_groups, explicit_collection):
     """A collection resolved from the registered fake groups passes LanguageModule's checks when
     passed explicitly. A model built without a collection in a converter process, for example
-    by a model provider that takes none, resolves the same groups with a deprecation warning."""
+    by a model provider that accepts ``pg_collection`` but does not pass it to its model,
+    resolves the same groups with a deprecation warning."""
     clear_nvte_env_vars()
     mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
     mocker.patch('torch.distributed.is_initialized', return_value=True)
@@ -141,7 +144,33 @@ def test_model_ranks_select_one_model(converter_groups):
     # Global accessors that ask a group for its own rank or size follow the collection.
     assert parallel_state.get_tensor_model_parallel_rank() == 3
     assert parallel_state.get_tensor_model_parallel_world_size() == 4
+    assert parallel_state.get_pipeline_model_parallel_rank() == 1
     assert parallel_state.get_pipeline_model_parallel_world_size() == 2
+    assert parallel_state.is_pipeline_last_stage()
+    assert not parallel_state.is_pipeline_first_stage()
+
+
+@pytest.mark.parametrize('pipeline_rank,num_layers', [(0, 4), (1, 2)])
+def test_global_pipeline_rank_fallback_follows_the_selected_model(
+    mocker, converter_groups, pipeline_rank, num_layers
+):
+    """Library code that is not given the stage reads the global pipeline rank, with a
+    deprecation warning, and gets the stage of the model that the converter selected."""
+    mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
+    config = TransformerConfig(
+        num_layers=6,
+        hidden_size=16,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        num_layers_in_first_pipeline_stage=4,
+    )
+    set_checkpoint_converter_model_ranks(
+        converter_groups, pipeline_rank=pipeline_rank, tensor_rank=0
+    )
+
+    with pytest.warns(ProcessGroupFallbackWarning, match='get_num_layers_to_build'):
+        assert get_num_layers_to_build(config) == num_layers
 
 
 def test_registering_twice_is_an_error(converter_groups):

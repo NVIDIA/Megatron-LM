@@ -35,6 +35,21 @@ VIRTUAL_PIPELINE = {
     "virtual_pipeline_model_parallel_size": 2,
     "moe_layer_freq": [1, 0, 0, 1],
 }
+# Three layers and the embedding (or the loss) as one more unit of the split, over two pipeline
+# stages with two virtual stages each: one unit per virtual stage, so the chunk that holds the
+# embedding (or the loss) builds no layer. Layers 1 and 3 are MoE.
+EMBEDDING_IN_SPLIT = {
+    "num_layers": 3,
+    "virtual_pipeline_model_parallel_size": 2,
+    "account_for_embedding_in_pipeline_split": True,
+    "moe_layer_freq": [1, 0, 1],
+}
+LOSS_IN_SPLIT = {
+    "num_layers": 3,
+    "virtual_pipeline_model_parallel_size": 2,
+    "account_for_loss_in_pipeline_split": True,
+    "moe_layer_freq": [1, 0, 1],
+}
 
 # Layer numbers each pipeline rank builds for three dense layers split 1 + 2.
 DENSE_STAGE_LAYER_NUMBERS = [[1], [2, 3]]
@@ -77,6 +92,10 @@ def _is_moe(layer_spec):
         pytest.param(VIRTUAL_PIPELINE, 0, 1, [False], id="virtual-vp0-pp1"),
         pytest.param(VIRTUAL_PIPELINE, 1, 0, [False], id="virtual-vp1-pp0"),
         pytest.param(VIRTUAL_PIPELINE, 1, 1, [True], id="virtual-vp1-pp1"),
+        pytest.param(EMBEDDING_IN_SPLIT, 0, 0, [], id="embedding-vp0-pp0"),
+        pytest.param(EMBEDDING_IN_SPLIT, 1, 0, [False], id="embedding-vp1-pp0"),
+        pytest.param(LOSS_IN_SPLIT, 0, 1, [False], id="loss-vp0-pp1"),
+        pytest.param(LOSS_IN_SPLIT, 1, 1, [], id="loss-vp1-pp1"),
     ],
 )
 def test_modelopt_spec_keeps_the_layers_of_the_given_stage(
@@ -213,14 +232,17 @@ class TestModelOptBuildersOnTheirOwnPipelineGrid:
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
         grid = HyperCommGrid([1, 1, PP_SIZE, Utils.world_size // PP_SIZE], ["tp", "cp", "pp", "dp"])
-        pg_collection = ProcessGroupCollection(
-            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
-        )
-        pp_rank = pg_collection.pp.rank()
+        try:
+            pg_collection = ProcessGroupCollection(
+                tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=grid.create_pg("pp"), embd=None
+            )
+            pp_rank = pg_collection.pp.rank()
 
-        if forbid_global_pipeline_rank:
-            _forbid_global_pipeline_rank(monkeypatch)
-        model = build(_dense_config(), pg_collection, monkeypatch)
+            if forbid_global_pipeline_rank:
+                _forbid_global_pipeline_rank(monkeypatch)
+            model = build(_dense_config(), pg_collection, monkeypatch)
 
-        layer_numbers = [layer.layer_number for layer in model.decoder.layers]
-        assert layer_numbers == DENSE_STAGE_LAYER_NUMBERS[pp_rank], f"{pp_rank=}"
+            layer_numbers = [layer.layer_number for layer in model.decoder.layers]
+            assert layer_numbers == DENSE_STAGE_LAYER_NUMBERS[pp_rank], f"{pp_rank=}"
+        finally:
+            grid.destroy()

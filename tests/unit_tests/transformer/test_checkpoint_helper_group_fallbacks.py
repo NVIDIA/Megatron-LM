@@ -23,7 +23,9 @@ from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.extensions.transformer_engine import HAVE_TE, _gtp_replica_group
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.huggingface.module import HuggingFaceModule
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -45,6 +47,7 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
     make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
 )
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
@@ -65,6 +68,7 @@ if HAVE_TE:
     from megatron.core.models.vision.vit_model import KimiViTModel, QwenVLViTModel, ViTModel
 
 VERSIONS = "deprecated since Megatron Core 0.21 and will be removed in 0.23"
+NO_GRID = "which is not initialized, so the tp groups it returns are None"
 _FALLBACK_MESSAGE = re.compile(r"^(.+) was called without `([^`]+)`")
 
 needs_tp2 = pytest.mark.skipif(
@@ -98,6 +102,23 @@ def owner_groups(tp2_grid):
     yield groups
     for group in groups:
         torch.distributed.destroy_process_group(group)
+
+
+@pytest.fixture
+def no_grid(tp2_grid, monkeypatch):
+    """parallel_state as before initialize_model_parallel; yields a DP x CP group to pass in."""
+    _, dp_cp_group = tp2_grid
+    # Restore the grid before tp2_grid destroys it.
+    with monkeypatch.context() as patch:
+        for name in (
+            "_TENSOR_MODEL_PARALLEL_GROUP",
+            "_PIPELINE_MODEL_PARALLEL_GROUP",
+            "_DATA_PARALLEL_GROUP",
+            "_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+        ):
+            patch.setattr(parallel_state, name, None)
+        assert not parallel_state.model_parallel_is_initialized()
+        yield dp_cp_group
 
 
 @contextlib.contextmanager
@@ -298,6 +319,60 @@ class TestMegatronModuleTensorParallelGroup:
         assert _shard_ids(sharded_state_dict) == expected
         assert _fallbacks(record) == [("_Leaf.sharded_state_dict", "tp_group")]
 
+    def test_module_without_groups_or_a_grid_warns_and_is_not_tensor_parallel(self, no_grid):
+        dp_cp_group = no_grid
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dict = _Leaf(_config()).sharded_state_dict(
+                metadata={'dp_cp_group': dp_cp_group}
+            )
+
+        assert _fallbacks(record) == [("_Leaf.sharded_state_dict", "tp_group")]
+        assert any(NO_GRID in str(warning.message) for warning in record)
+        assert sorted(sharded_state_dict) == ['linear.bias', 'linear.weight', 'weight']
+        for entry in sharded_state_dict.values():
+            assert entry.replica_id == (0, 0, dp_cp_group.rank())
+
+    def test_module_without_groups_a_grid_or_metadata_still_asserts(self, no_grid):
+        # Only the tensor-parallel fallback works without a grid; the DP x CP one needs it.
+        with pytest.warns(ProcessGroupFallbackWarning, match=NO_GRID):
+            with pytest.raises(AssertionError, match="data parallel group with CP"):
+                _Leaf(_config()).sharded_state_dict()
+
+    def test_missing_metadata_warning_names_the_module_class(self, tp2_grid):
+        tp_group, dp_cp_group = tp2_grid
+
+        class _First(_Leaf):
+            pass
+
+        class _Second(_Leaf):
+            pass
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dicts = []
+            for module_class in (_First, _Second):
+                module = module_class(_config())
+                module.tp_group = tp_group
+                sharded_state_dicts.append(module.sharded_state_dict())
+            sharded_state_dicts.append(
+                sharded_state_dict_default(torch.nn.Linear(2, 2), tp_group=tp_group)
+            )
+
+        for sharded_state_dict in sharded_state_dicts:
+            for entry in sharded_state_dict.values():
+                assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
+        # One warning per class, not one for the method that every module inherits.
+        assert _fallbacks(record) == [
+            (f"ensure_metadata_has_dp_cp_group (from {owner})", "dp_cp_group")
+            for owner in (
+                "_First.sharded_state_dict",
+                "_Second.sharded_state_dict",
+                "sharded_state_dict_default(Linear)",
+            )
+        ]
+
 
 @needs_tp2
 @pytest.mark.skipif(not HAVE_MAMBA_SSM, reason="mamba_ssm is not installed")
@@ -335,6 +410,19 @@ class TestExtendedRMSNormTensorParallelGroup:
         assert sharded_state_dict['weight'].global_offset == (tp_group.rank() * 8,)
         assert _fallbacks(record) == [("ExtendedRMSNorm.sharded_state_dict", "tp_group")]
 
+    def test_omitted_group_without_a_grid_warns_and_is_not_tensor_parallel(self, no_grid):
+        norm = self._norm()
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            sharded_state_dict = norm.sharded_state_dict(metadata={'dp_cp_group': no_grid})
+
+        assert _fallbacks(record) == [("ExtendedRMSNorm.sharded_state_dict", "tp_group")]
+        assert any(NO_GRID in str(warning.message) for warning in record)
+        assert norm.tp_group is None
+        assert sharded_state_dict['weight'].global_offset == (0,)
+        assert sharded_state_dict['weight'].global_shape == (8,)
+
 
 def _mhc_config():
     return _config(
@@ -356,6 +444,14 @@ class _WrappedLayer(MegatronModule):
         super().__init__(config)
         self.layer_number = 1
         self.tp_group = tp_group
+
+
+class _HuggingFaceStub(HuggingFaceModule):
+    """A HuggingFace wrapper: no state of its own, around a model without a sharded_state_dict."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = torch.nn.Linear(2, 2)
 
 
 @needs_tp2
@@ -405,6 +501,46 @@ class TestOwnersPassTheirTensorParallelGroup:
 
         assert layer.hyper_connection.tp_group is tp_group
         assert any(key.startswith('hyper_connection.') for key in sharded_state_dict)
+        for entry in sharded_state_dict.values():
+            assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
+
+    def test_llava_submodules_built_without_groups(self, owner_groups, monkeypatch):
+        tp_group, dp_cp_group = owner_groups
+        monkeypatch.setattr(
+            "megatron.core.models.huggingface.module.build_hf_model",
+            lambda config, model_path: _HuggingFaceStub(config),
+        )
+        language_config, vision_config = _config(), _config()
+        language_config.language_model_type = "hf://stub"
+        vision_config.vision_model_type = "clip"
+        # Without an encoder, the model holds the wrapped language model and the sound model.
+        model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=None,
+            language_vocab_size=32,
+            language_max_sequence_length=8,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=None,
+            drop_vision_class_token=False,
+            vision_projection_config=_config(),
+            vision_projection_layer_spec=None,
+            add_encoder=False,
+            pg_collection=ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group),
+            sound_model=_Leaf(_config()),
+        )
+
+        with forbid_global_process_groups(), _no_fallback():
+            sharded_state_dict = model.sharded_state_dict()
+
+        assert model.language_model.tp_group is tp_group
+        assert model.sound_model.tp_group is tp_group
+        assert sorted(sharded_state_dict) == [
+            'language_model.model.bias',
+            'language_model.model.weight',
+            'sound_model.linear.bias',
+            'sound_model.linear.weight',
+            'sound_model.weight',
+        ]
         for entry in sharded_state_dict.values():
             assert entry.replica_id == (0, tp_group.rank(), dp_cp_group.rank())
 

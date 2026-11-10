@@ -29,7 +29,8 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
 )
 
 # Fallbacks that have already warned in this process: (owner, argument) for a fallback to the
-# global grid, and (owner, argument, "uninitialized") for one that found the grid uninitialized.
+# global grid, (owner, argument, "uninitialized") for one that found the grid uninitialized, and
+# (owner, "grad_stats_parallel_group", "world") for an optimizer that reduces over WORLD.
 _warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
 
 
@@ -1035,7 +1036,7 @@ def resolve_gtp_remat_group(
 
 def amax_reduction_group(
     pg_collection: ProcessGroupCollection, tp_only_amax_red: bool
-) -> torch.distributed.ProcessGroup:
+) -> Optional[torch.distributed.ProcessGroup]:
     """Return the FP8/FP4 amax reduction group from a model's process-group collection.
 
     This is the collection counterpart of
@@ -1048,13 +1049,19 @@ def amax_reduction_group(
         tp_only_amax_red: Reduce amaxes only across the tensor- and context-parallel ranks.
 
     Returns:
-        The group to pass to Transformer Engine as the amax reduction group.
+        The group to pass to Transformer Engine as the amax reduction group. None if the
+        selected group is not set or is None and ``torch.distributed`` is not initialized: a
+        single process has no ranks to reduce over, as in offline model construction.
 
     Raises:
-        ValueError: If the selected group is not set in ``pg_collection`` or is None.
+        ValueError: If ``torch.distributed`` is initialized and the selected group is not set
+            in ``pg_collection`` or is None.
     """
     group = pg_collection.tp_cp if tp_only_amax_red else pg_collection.tp_dp_cp
     if group is None:
+        if not torch.distributed.is_initialized():
+            # No process group exists, so Transformer Engine reduces over nothing.
+            return None
         field_name = 'tp_cp' if tp_only_amax_red else 'tp_dp_cp'
         raise ValueError(
             f"FP8/FP4 amax reduction with tp_only_amax_red={tp_only_amax_red} needs "

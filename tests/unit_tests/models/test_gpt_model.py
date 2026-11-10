@@ -192,6 +192,40 @@ class TestGPTModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
 
+    def test_config_logger_dumps_are_named_by_the_model_collection(self):
+        """The constructor, init-checkpoint and forward dumps pass the model's process groups."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            config_logger_dir="unused",
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        data = torch.arange(4, dtype=torch.int64).repeat((2, 1)).cuda()
+
+        with patch('megatron.core.models.gpt.gpt_model.log_config_to_disk') as log_config:
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+                pg_collection=pg_collection,
+            ).cuda()
+            model.forward(
+                input_ids=data,
+                position_ids=data,
+                attention_mask=torch.ones((2, 1, 4, 4), dtype=bool).cuda(),
+            )
+
+        calls = log_config.call_args_list
+        assert [call.kwargs["prefix"] for call in calls] == [
+            "GPTModel",
+            "GPTModel_init_ckpt",
+            "input_and_logits",
+        ]
+        assert all(call.kwargs["pg_collection"] is pg_collection for call in calls)
+
     @pytest.mark.internal
     def test_output_processor_forward(self):
         config: TransformerConfig = self.gpt_model.config
