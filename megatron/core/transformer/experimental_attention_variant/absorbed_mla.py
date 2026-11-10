@@ -21,6 +21,7 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import CpPartitionModeConverter
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.jit import jit_fuser
@@ -31,7 +32,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
-from megatron.core.packed_seq_params import resolve_cp_group
+from megatron.core.packed_seq_params import resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -651,6 +652,47 @@ class AbsorbedMLASelfAttention(Attention):
             kv_compressed = gather_from_sequence_parallel_region(kv_compressed, group=self.tp_group)
 
         # =========================================
+        # Context-parallel layout conversion (minimum volume)
+        # =========================================
+        # The up-projection RoPE and the DSA/CSA core attention consume the zigzag CP layout.
+        # When the caller supplies a different global cp_partition_mode (e.g. 'contiguous', the
+        # native layout for the KDA layers of a hybrid Kimi-K3 / K3.1 stack), convert the
+        # DOWN-PROJECTED LATENTS to zigzag here -- q_compressed (q_lora_rank) + kv_compressed
+        # (kv_lora_rank) + k_pos_emb (qk_pos_emb_head_dim) -- instead of the full hidden_states
+        # (hidden_size). The down-projection is per-token (pointwise in the sequence dim), so
+        # converting the latents is numerically identical to converting hidden_states before
+        # the projection, while moving far less data over the all-to-all (~kv_lora_rank +
+        # q_lora_rank + qk_pos_emb_head_dim channels vs hidden_size). AbsorbedMLASelfAttention
+        # forward() converts the attention output back to the caller's layout.
+        if (
+            thd_packed_seq
+            and effective_cp_group is not None
+            and get_pg_size(effective_cp_group) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            cp_latent_converter = CpPartitionModeConverter(
+                cp_group=effective_cp_group,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode=packed_seq_params.cp_partition_mode,
+                target_partition_mode="zigzag",
+                config=self.config,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+                ),
+            )
+            # q_compressed may still be sequence-parallel sharded (rides the fused TP x CP
+            # route); kv_compressed and k_pos_emb were gathered to the full TP sequence above,
+            # so they ride the CP-only route. The converter sets packed_seq_params to zigzag.
+            q_compressed = cp_latent_converter.convert(
+                q_compressed, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+            kv_compressed = cp_latent_converter.convert(
+                kv_compressed, seq_dim=0, sequence_parallel=False
+            )
+            k_pos_emb = cp_latent_converter.convert(k_pos_emb, seq_dim=0, sequence_parallel=False)
+
+        # =========================================
         # QKV up projection and RoPE apply
         # =========================================
 
@@ -1011,16 +1053,22 @@ class AbsorbedMLASelfAttention(Attention):
         _orig_cp_group = self.pg_collection.cp
         self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-        if (
-            thd_packed_seq
-            and self.pg_collection.cp is not None
-            and get_pg_size(self.pg_collection.cp) > 1
-            and packed_seq_params.cp_partition_mode != "zigzag"
-        ):
-            raise ValueError(
-                "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag'. "
-                "CP partition conversion must be handled before entering AbsorbedMLA."
+        # The up-projection RoPE and the DSA/CSA core attention consume the zigzag CP layout.
+        # When the caller supplies a different global cp_partition_mode (e.g. 'contiguous', the
+        # native layout for the KDA layers of a hybrid Kimi-K3 / K3.1 stack),
+        # get_query_key_value_tensors converts the down-projected latents to zigzag at minimum
+        # all-to-all volume, and we convert the attention output back to the caller's layout
+        # below. Capture the caller's layout now, before get_query_key_value_tensors mutates
+        # packed_seq_params.cp_partition_mode to 'zigzag'.
+        source_cp_partition_mode = (
+            packed_seq_params.cp_partition_mode
+            if (
+                thd_packed_seq
+                and self.pg_collection.cp is not None
+                and get_pg_size(self.pg_collection.cp) > 1
             )
+            else None
+        )
 
         # =====================
         # Query, Key, and Value
@@ -1098,6 +1146,26 @@ class AbsorbedMLASelfAttention(Attention):
             assert self.qkv_up_checkpoint is not None
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
+
+        # Convert the attention output back to the caller's CP layout (the inverse of the
+        # latent conversion in get_query_key_value_tensors). Doing it here -- before the output
+        # gate and linear_proj -- keeps the gate (which reads the caller-layout hidden_states)
+        # and the residual add in the caller's native layout without a second hidden-width
+        # conversion. core_attn_out is TP-gathered (full over the TP sequence dim) at this
+        # point, so it rides the CP-only route. Placed after the up-proj recompute registration
+        # so the recomputed (zigzag) core_attn_out matches the registered trigger.
+        if source_cp_partition_mode is not None and source_cp_partition_mode != "zigzag":
+            core_attn_out = CpPartitionModeConverter(
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode="zigzag",
+                target_partition_mode=source_cp_partition_mode,
+                config=self.config,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+                ),
+            ).convert(core_attn_out, seq_dim=0, sequence_parallel=False)
 
         if self.linear_gate is not None:
             core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, hidden_states)

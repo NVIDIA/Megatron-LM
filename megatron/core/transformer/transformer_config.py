@@ -2645,7 +2645,19 @@ class TransformerConfig(ModelParallelConfig):
             self.ffn_hidden_size = 4 * self.hidden_size
 
         if self.kv_channels is None:
-            self.kv_channels = self.hidden_size // self.num_attention_heads
+            if (
+                getattr(self, "multi_latent_attention", False)
+                and getattr(self, "qk_head_dim", None) is not None
+            ):
+                # MLA head dim is set by qk_head_dim / qk_pos_emb_head_dim and need not satisfy
+                # hidden_size % num_attention_heads == 0 (e.g. Kimi-K3 / K3.1). kv_channels is
+                # unused by the MLA forward but must be sane for the MuP softmax scale and the
+                # simplified-DSA indexer default, so derive it from the MLA query head dim
+                # rather than the standard hidden_size // num_attention_heads (which would be a
+                # meaningless truncated value when the heads do not divide hidden_size).
+                self.kv_channels = self.qk_head_dim + (getattr(self, "qk_pos_emb_head_dim", 0) or 0)
+            else:
+                self.kv_channels = self.hidden_size // self.num_attention_heads
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
@@ -2793,15 +2805,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
-                # MultiLatentAttention converts its input to the zigzag layout internally,
-                # like Attention, so it no longer restricts cp_partition_mode.
-                if self.experimental_attention_variant != "dsv4_hybrid" and not (
-                    is_gated_delta_net_variant(self.experimental_attention_variant)
-                ):
+                # MultiLatentAttention and AbsorbedMLASelfAttention (the 'dsa' variant's
+                # full-attention layers) convert their input to the zigzag layout internally,
+                # like Attention, so they no longer restrict cp_partition_mode.
+                if self.experimental_attention_variant not in (
+                    "dsv4_hybrid",
+                    "dsa",
+                ) and not is_gated_delta_net_variant(self.experimental_attention_variant):
                     raise ValueError(
                         "cp_partition_mode='contiguous' with context parallelism currently "
-                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
-                        "or 'kda'."
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'dsa', "
+                        "'gdn', or 'kda'."
                     )
                 if (
                     is_gated_delta_net_variant(self.experimental_attention_variant)
@@ -3224,25 +3238,34 @@ class TransformerConfig(ModelParallelConfig):
                             "build or set dsa_kernel_backend='none'."
                         )
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
-            "gdn",
-            "kda",
+        # The GDN/KDA pre/post fusions are applied PER GDN/KDA layer (kda.py / gdn.py read the
+        # flag per module; other layer types ignore it). A hybrid model whose GLOBAL variant is
+        # something else -- e.g. 'dsa' for a KDA + DSA stack like Kimi-K3.1 -- still has KDA ('K')
+        # layers that want them, so allow the flags when is_hybrid_model is True; a pure
+        # non-hybrid model with a non-GDN/KDA variant still rejects them.
+        if (
+            self.gdn_pre_gated_delta_rule_fusion
+            and self.experimental_attention_variant not in ("gdn", "kda")
+            and not self.is_hybrid_model
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn' or 'kda'."
+                "experimental_attention_variant='gdn' or 'kda', or a hybrid model whose pattern "
+                "contains GDN/KDA layers (the fusion is applied per GDN/KDA layer)."
             )
         # Explicit allow-list: GDN_ATTENTION_VARIANTS also contains "gdn2", which has no
         # fused gated output norm. The deprecated "gated_delta_net" alias is already
         # normalized to "gdn" above.
-        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant not in (
-            "gdn",
-            "kda",
+        if (
+            self.gdn_gated_output_norm_fusion
+            and self.experimental_attention_variant not in ("gdn", "kda")
+            and not self.is_hybrid_model
         ):
             raise ValueError(
                 "gdn_gated_output_norm_fusion is only supported with "
                 "experimental_attention_variant='gdn' or 'kda' "
-                "or deprecated alias experimental_attention_variant='gated_delta_net'."
+                "or deprecated alias experimental_attention_variant='gated_delta_net', or a "
+                "hybrid model whose pattern contains GDN/KDA layers (applied per GDN/KDA layer)."
             )
 
         if self.fp8:
