@@ -5083,7 +5083,8 @@ class MLATransformerConfig(TransformerConfig):
     for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
     query before attention, instead of writing BF16 key and value that attention then
     quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA (with fp4, Transformer
-    Engine's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling, checked at run time), zero attention
+    Engine's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling and NVTE_DPA_FP8_FORMAT=HYBRID or E4M3, checked
+    at run time; custom recipes use the unfused path), zero attention
     dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
     above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
     NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
