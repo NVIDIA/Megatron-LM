@@ -136,32 +136,42 @@ def test_config_rejects_flashinfer_probs_on_input():
         )
 
 
+# Expert activations that InferenceGroupedMLP has no kernel for, with the error it raises.
+_ACTIVATIONS_WITHOUT_INFERENCE_KERNEL = {
+    "gelu": (
+        dict(activation_func=torch.nn.functional.gelu, gated_linear_unit=False),
+        "support only squared-ReLU",
+    ),
+    "silu": (
+        dict(activation_func=torch.nn.functional.silu, gated_linear_unit=False),
+        "support only squared-ReLU",
+    ),
+    "geglu": (
+        dict(activation_func=torch.nn.functional.gelu, gated_linear_unit=True),
+        "support only squared-ReLU",
+    ),
+    "situ_glu": (
+        dict(
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            activation_func_tanh_clamp_scale=2.0,
+        ),
+        "SiTU-GLU",
+    ),
+}
+
+
 @pytest.mark.parametrize("backend", ["torch", "vllm"])
-@pytest.mark.parametrize(
-    ("activation", "error"),
-    [
-        (dict(activation_func=torch.nn.functional.gelu), "supports only squared-ReLU"),
-        (dict(activation_func=torch.nn.functional.silu), "supports only squared-ReLU"),
-        (
-            dict(activation_func=torch.nn.functional.gelu, gated_linear_unit=True),
-            "supports only squared-ReLU",
-        ),
-        (
-            dict(
-                activation_func=torch.nn.functional.silu,
-                gated_linear_unit=True,
-                activation_func_tanh_clamp_scale=2.0,
-            ),
-            "SiTU-GLU",
-        ),
-    ],
-    ids=["gelu", "silu", "geglu", "situ_glu"],
-)
-def test_config_rejects_activations_without_inference_kernel(backend, activation, error):
-    """Activations InferenceGroupedMLP cannot compute fail at config time, not at
-    construction or at the first forward."""
-    with pytest.raises(ValueError, match=error):
-        _make_base_config(inference_grouped_gemm_backend=backend, **activation)
+@pytest.mark.parametrize("activation", list(_ACTIVATIONS_WITHOUT_INFERENCE_KERNEL))
+def test_config_leaves_expert_activations_to_the_experts(backend, activation):
+    """The config accepts activations the inference experts cannot compute: activation_func
+    also drives dense MLP layers, and a config with num_moe_experts set need not build
+    InferenceGroupedMLP (a hybrid pattern without MoE layers). The experts reject them when
+    they are built (TestInferenceGroupedMLPMatchesTraining)."""
+    overrides, _ = _ACTIVATIONS_WITHOUT_INFERENCE_KERNEL[activation]
+    config = _make_base_config(inference_grouped_gemm_backend=backend, **overrides)
+
+    assert config.activation_func is overrides["activation_func"]
 
 
 @pytest.mark.parametrize("grouped_tensor", [False, True])
@@ -1388,6 +1398,16 @@ class TestInferenceGroupedMLPMatchesTraining:
             plain.load_state_dict(experts.state_dict())
             plain_expected = self._training_forward(plain, hidden, probs, routing_map)
             assert self._rel_err(plain_expected, expected) >= self.min_option_effect
+
+    @pytest.mark.parametrize("activation", list(_ACTIVATIONS_WITHOUT_INFERENCE_KERNEL))
+    @pytest.mark.parametrize("backend", ["vllm", "torch"])
+    def test_rejects_activations_without_inference_kernel(self, backend, activation):
+        """Activations the experts cannot compute fail when the experts are built, not at
+        the first forward."""
+        _skip_unless_inference_backend(backend)
+        overrides, error = _ACTIVATIONS_WITHOUT_INFERENCE_KERNEL[activation]
+        with pytest.raises(ValueError, match=error):
+            self._make_experts(backend, **overrides)
 
 
 # ──────────────────────────────────────────────────────────────────────

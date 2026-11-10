@@ -2364,30 +2364,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
-            # The torch and vLLM backends implement squared ReLU (optionally tanh-clamped),
-            # gated squared ReLU and SwiGLU experts; InferenceGroupedMLP has no kernel for
-            # any other activation, nor for the tanh-clamped gated form (SiTU-GLU).
-            if self.inference_grouped_gemm_backend in (
-                InferenceGroupedGemmBackend.TORCH,
-                InferenceGroupedGemmBackend.VLLM,
-            ):
-                if self.activation_func not in (
-                    (squared_relu, F.silu) if self.gated_linear_unit else (squared_relu,)
-                ):
-                    raise ValueError(
-                        "--inference-grouped-gemm-backend "
-                        f"'{self.inference_grouped_gemm_backend.value}' supports only "
-                        "squared-ReLU experts (activation_func=squared_relu, with or without "
-                        "gated_linear_unit) and SwiGLU experts (activation_func=F.silu with "
-                        f"gated_linear_unit=True), got activation_func={self.activation_func} "
-                        f"with gated_linear_unit={self.gated_linear_unit}."
-                    )
-                if self.gated_linear_unit and self.activation_func_tanh_clamp_scale is not None:
-                    raise ValueError(
-                        "activation_func_tanh_clamp_scale with gated_linear_unit (SiTU-GLU) has "
-                        "no inference kernel in the torch and vllm grouped-GEMM backends."
-                    )
-
             if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                 and (mxfp8_enabled or self.activation_func_tanh_clamp_scale is not None)
