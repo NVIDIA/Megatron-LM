@@ -277,8 +277,10 @@ class TestBuildInferencePgCollection:
             )
 
         sizes = {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS}
-        assert sizes == {"tp": 2, "cp": 1, "pp": 1, "ep": 1, "expt_tp": 2}
+        # Utils.destroy_model_parallel destroys only the groups of parallel_state.
+        destroy_test_pg_collection(pg_collection)
         destroy_test_pg_collection(training_pg_collection)
+        assert sizes == {"tp": 2, "cp": 1, "pp": 1, "ep": 1, "expt_tp": 2}
 
     def test_fallback_uses_global_sizes(self):
         _require_even_world_size()
@@ -294,7 +296,9 @@ class TestBuildInferencePgCollection:
         with pytest.warns(ProcessGroupFallbackWarning) as record, _reads_only_through_resolver():
             pg_collection = build_inference_pg_collection(Utils.world_size)
 
-        assert {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS} == expected
+        sizes = {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS}
+        destroy_test_pg_collection(pg_collection)
+        assert sizes == expected
         _check_fallback_warnings(
             record, ("build_inference_pg_collection", "training_pg_collection")
         )

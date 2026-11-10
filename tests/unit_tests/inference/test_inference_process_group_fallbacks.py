@@ -40,7 +40,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 from tests.unit_tests.test_utilities import (
     forbid_global_process_groups as forbid_global_reads_outside_resolver,
 )
@@ -133,6 +133,28 @@ def no_fallback_warnings():
 def fresh_warning_registry(monkeypatch):
     """Each test observes the first fallback warning of every owner."""
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+@pytest.fixture
+def build_tp2_collection():
+    """Return a function that builds a collection for a TP=2 grid without the global grid.
+
+    `Utils.destroy_model_parallel` destroys only the groups of `parallel_state`, so the groups
+    of every collection built here are destroyed after the test, on every rank.
+    """
+    built = []
+
+    def build():
+        built.append(
+            build_inference_pg_collection(
+                Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
+            )
+        )
+        return built[-1]
+
+    yield build
+    for pg_collection in built:
+        destroy_test_pg_collection(pg_collection)
 
 
 def _fallback_warnings(record):
@@ -485,18 +507,12 @@ class TestComponentsShareOneCollection:
         assert controller.pp_group is pg_collection.pp
         assert controller.dp_group is pg_collection.dp
 
-    def test_dynamic_context_rejects_collection_without_mp(self):
+    def test_dynamic_context_rejects_collection_without_mp(self, build_tp2_collection):
         # The engine built on this context would broadcast on mp and call barrier(mp); without mp
         # both would run on the world group.
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
-        groups = dict(
-            vars(
-                build_inference_pg_collection(
-                    Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-                )
-            )
-        )
+        groups = dict(vars(build_tp2_collection()))
         del groups["mp"]
         model_config = TransformerConfig(
             params_dtype=torch.float32,
@@ -521,13 +537,11 @@ class TestComponentsShareOneCollection:
             ):
                 DynamicInferenceContext(model_config, inference_config)
 
-    def test_static_context_takes_collection_of_model(self):
+    def test_static_context_takes_collection_of_model(self, build_tp2_collection):
         _require_world_size_multiple_of(2)
         # The global grid has TP=1; the model runs on its own TP=2 groups.
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-        pg_collection = build_inference_pg_collection(
-            Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-        )
+        pg_collection = build_tp2_collection()
         model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
         model = SimpleNamespace(config=model_config, vocab_size=16, pg_collection=pg_collection)
 
@@ -545,12 +559,10 @@ class TestComponentsShareOneCollection:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_static_engine_shares_collection_of_model(self):
+    def test_static_engine_shares_collection_of_model(self, build_tp2_collection):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-        pg_collection = build_inference_pg_collection(
-            Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
-        )
+        pg_collection = build_tp2_collection()
         model_parallel_cuda_manual_seed(123)
         vocab_size = 100
         model = GPTModel(
