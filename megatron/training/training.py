@@ -3904,9 +3904,7 @@ def train_step(
     )
 
     if tensor_metric_observer is not None:
-        metric_pg_collection = _get_model_pg_collection(
-            model[0], pg_collection, owner="train_step"
-        )
+        metric_pg_collection = model_pg_collection
         tensor_metric_observer(
             model=model,
             optimizer=optimizer,
