@@ -43,8 +43,10 @@ expert load, so tokens cover 1, 7/8/9, 63/64/65, 127/128/129 and 512 with E_loca
 top-k 1, 2, 6, 8; H and I cover 128 (I only), 256, padding (160, 96) and production (2688,
 1856); EP offsets 0, interior and last; routing with an empty expert, all -1 rows and dropped
 routes. FlashInfer 0.7.2.post1 has no TRT-LLM kernel config for a (padded) hidden size of 128
-("No valid config found", GB200), which Megatron's config accepts: finding O4b-N3, tested on its
-own (``test_hidden_128_is_served_or_rejected_by_megatron``) so the numeric cases use H >= 160.
+at a few rows per expert ("No valid config found", GB200), which main launches anyway: finding
+O4b-N3. #8959 (``fix/mxfp8-moe-hidden-size``) pads those launches and tests them
+(``test_flashinfer_mxfp8.py::test_flashinfer_routed_mxfp8_runs_small_launches_at_hidden_128``);
+the numeric cases here use H >= 160.
 Hardware: Blackwell (FlashInfer's TRT-LLM routed MoE is SM100-only).
 """
 
@@ -297,35 +299,6 @@ def test_production_shape(tokens):
     )
     fc1, fc2 = problem.weights()
     _check(problem, problem.run(fc1, fc2), what=f"production T={tokens}")
-
-
-@pytest.mark.launch_on_gb200
-@ou.requires_sm(ou.BLACKWELL)
-@pytest.mark.parametrize("inter", [128, 256])
-def test_hidden_128_is_served_or_rejected_by_megatron(inter):
-    """Finding O4b-N3 (GB200): an expert hidden size of 128 (Megatron pads H to 128) passes
-    Megatron's config validation for routed MXFP8, but FlashInfer 0.7.2.post1's TRT-LLM batched
-    GEMM has no config for it and the first forward dies with a tvm InternalError ("No valid
-    config found for the given problem shape"). The contract: the MoE is computed correctly, or
-    Megatron rejects the size with a ValueError that names it - never an opaque kernel error."""
-    spec.require_flashinfer()
-    problem = Problem(
-        tokens=64, hidden=128, inter=inter, experts=8, local=8, offset=0, top_k=1, pattern="random"
-    )
-    try:
-        fc1, fc2 = problem.weights()
-        out = problem.run(fc1, fc2)
-    except ValueError as error:
-        assert "hidden" in str(error).lower(), f"rejected without naming the hidden size: {error}"
-        return
-    except Exception as error:  # noqa: BLE001 - the finding is which error escapes
-        pytest.fail(
-            f"hidden size 128 reached FlashInfer and failed there ({type(error).__name__}: "
-            f"{str(error).strip().splitlines()[0][:200]}); Megatron should reject it when the "
-            "model is configured",
-            pytrace=False,
-        )
-    _check(problem, out, what="hidden 128")
 
 
 @pytest.mark.launch_on_gb200

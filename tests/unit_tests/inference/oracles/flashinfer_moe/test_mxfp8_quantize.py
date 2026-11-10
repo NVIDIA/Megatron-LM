@@ -46,10 +46,12 @@ production sizes (H = 2688, 4096, 7168; weights 4096 x 2688 and 7168 x 2048 thro
 ``from_bf16``), BF16 and FP16, strided inputs, and (opt-in ``large``) element offsets past 2**31.
 Hardware: Blackwell (FlashInfer's quantizer is SM100-only).
 
-Finding O4b-M3 (suspected, Megatron; expected to fail on main): ``from_bf16`` hands a strided
-input straight to FlashInfer, whose binding requires a contiguous tensor (``CHECK_CONTIGUOUS``),
-so a transposed or sliced input raises where the Triton backend (#8357) quantizes it;
-``quantize_`` makes its value contiguous first and is not affected.
+Finding O4b-M3: on main ``from_bf16`` hands a strided input straight to FlashInfer, whose binding
+requires a contiguous tensor (``CHECK_CONTIGUOUS``), so a transposed or sliced input raises where
+the Triton backend (#8357) quantizes it; ``quantize_`` makes its value contiguous first and is
+not affected. #9312 (``fix/mxfp8-flashinfer-strided``) fixes that and tests the transposed and
+sliced inputs (``test_mxfp8_utils.py::TestMXFP8Tensor::test_flashinfer_reads_strided_input``);
+``from_bf16`` reads only a contiguous view at an offset here.
 """
 
 import pytest
@@ -502,32 +504,15 @@ def test_from_bf16_production_sizes(rows, cols):
     _check_swizzled(x, what=f"production {rows}x{cols}", backend=None)
 
 
-STRIDED = ["transpose", "row-slice", "column-slice", "offset"]
-
-
-def _strided(layout: str, generator: torch.Generator) -> torch.Tensor:
-    """A ``[129, 160]`` BF16 view with the given layout (as #8357's Triton test builds them)."""
-    if layout == "transpose":
-        return _hidden(160, 129, generator).cuda().t()
-    if layout == "row-slice":
-        return _hidden(258, 160, generator).cuda()[::2]
-    if layout == "column-slice":
-        return _hidden(129, 320, generator).cuda()[:, ::2]
-    return _hidden(130, 160, generator).cuda()[1:]
-
-
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
-@pytest.mark.parametrize("layout", STRIDED)
-def test_from_bf16_reads_strided_inputs(layout):
-    """``from_bf16`` quantizes the logical values of a strided input, as the Triton backend does
-    since #8357. Expected to fail on main for transpose, row-slice and column-slice (suspected
-    finding O4b-M3): FlashInfer's binding requires a contiguous input and ``from_bf16`` does not
-    make it one. ``offset`` (a contiguous view at an offset) passes."""
+def test_from_bf16_reads_an_offset_view():
+    """``from_bf16`` quantizes the logical values of a contiguous ``[129, 160]`` view at a
+    storage offset. Transposed and sliced views are #9312's (finding O4b-M3, see above)."""
     spec.require_flashinfer()
-    x = _strided(layout, ou.make_generator())
-    assert tuple(x.shape) == (129, 160) and x.is_contiguous() == (layout == "offset")
-    _check_swizzled(x, what=f"{layout} input")
+    x = _hidden(130, 160, ou.make_generator()).cuda()[1:]
+    assert tuple(x.shape) == (129, 160) and x.is_contiguous() and x.storage_offset() == 160
+    _check_swizzled(x, what="offset input")
 
 
 @pytest.mark.launch_on_gb200

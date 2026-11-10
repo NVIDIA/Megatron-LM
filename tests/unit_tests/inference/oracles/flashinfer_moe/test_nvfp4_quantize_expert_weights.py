@@ -26,7 +26,10 @@ before reading the kernel):
 * ``out=`` rewrites every byte of an existing set in place (same addresses); changed metadata
   raises ValueError. Inputs are read only.
 * Non-finite weights must stay visible: a NaN weight decodes to NaN (its scale, or the expert's
-  alpha, is NaN), as Megatron's other expert-weight formats propagate it.
+  alpha, is NaN), as Megatron's other expert-weight formats propagate it. On main a NaN weight
+  is quantized as a finite value (finding O4b-M2); #9311 (``fix/nvfp4-nan-expert-weight``) fixes
+  that and tests it in ``test_flashinfer_nvfp4.py``
+  (``test_prepare_routed_nvfp4_weights_keeps_nan_weights_visible``).
 
 Oracle: ``spec.nvfp4_quantize_spec`` in exact fp64 with the exact ``g = 2688 / amax``; tolerance
 class bit-exact against the spec, codes and scales reported apart; alpha an FP32 evaluation of
@@ -369,36 +372,3 @@ def test_refresh_rewrites_every_byte_in_place(monkeypatch):
         prepare_routed_nvfp4_weights(
             other.w1.to(torch.bfloat16), other.w2.to(torch.bfloat16), out=weights
         )
-
-
-@pytest.mark.launch_on_gb200
-@ou.requires_sm(ou.BLACKWELL)
-def test_nan_weight_stays_visible(monkeypatch):
-    """A NaN expert weight (a diverged checkpoint refit into inference) must decode to NaN, as
-    the BF16 and MXFP8 expert formats keep it. Megatron's ``_global_encode_scale`` maps a NaN
-    amax to ``g = 1`` (``torch.where(amax > 0, ...)``), and FlashInfer's block max ignores NaN, so
-    the expert is silently requantized with a wrong scale and the NaN decodes to a finite value
-    (suspected finding O4b-M2, predicted from the source; expected to fail on main until fixed).
-    The other expert must stay bit-exact."""
-    _setup(monkeypatch)
-    experts = Experts(hidden=256, inter=256, experts=2, gated=False, generator=ou.make_generator())
-    experts.w1[1, 10, 37] = float("nan")
-    weights = experts.prepare()
-    m = experts.matrices("fc1")[0]
-    codes, scales, defined, _, _ = spec.nvfp4_quantize_spec(m, _encode_of(m))
-    ou.assert_quantized_bit_exact(
-        torch.where(defined, spec.unpack_fp4(weights.fc1_data[0]), 0),
-        spec.unswizzle_128x4(weights.fc1_scale_swizzled[:256].reshape(-1), 256, 16),
-        torch.where(defined, codes, 0),
-        scales,
-        elems_per_scale=spec.NVFP4_BLOCK,
-        what="the expert without NaN",
-    )
-    got_scales = spec.unswizzle_128x4(weights.fc1_scale_swizzled[256:].reshape(-1), 256, 16)
-    decoded = spec.nvfp4_decode(spec.unpack_fp4(weights.fc1_data[1]).cpu(), got_scales.cpu())
-    value = decoded[10, 37] * weights.fc1_alpha[1].double().cpu()
-    assert torch.isnan(value), (
-        f"a NaN weight decodes to the finite value {float(value)!r} (alpha"
-        f" {float(weights.fc1_alpha[1])!r}): NVFP4 has NaN encodings (E4M3 scale 0x7F, FP32"
-        " alpha) and a NaN weight must not be quantized as a finite one"
-    )
