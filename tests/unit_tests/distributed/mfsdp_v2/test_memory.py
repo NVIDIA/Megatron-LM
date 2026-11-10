@@ -457,7 +457,7 @@ def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_syn
             context.finish_grad_sync()
         optimizer.step()
         assert all(
-            group._fused_grad_buffer is None for layer in model for group in layer.parameter_groups
+            group.partial_grad is None for layer in model for group in layer.parameter_groups
         )
         torch.cuda.synchronize(device)
         allocated.append(torch.cuda.memory_allocated(device))

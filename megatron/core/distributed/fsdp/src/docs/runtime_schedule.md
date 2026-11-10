@@ -65,29 +65,24 @@ with a record-and-replay mechanism.
 ![MFSDP backward runtime schedule with fused weight gradients][mfsdp-fused-wgrad-backward-schedule]
 
 Transformer Engine modules built with `fuse_wgrad_accumulation=True` accumulate weight
-gradients into `weight.main_grad` during Bwd\_i instead of returning them to autograd, so Bwd\_i
-is the first to write into the reduce-scatter input. Compared with the backward schedule above
+gradients into `weight.main_grad` during Bwd\_i instead of returning them to autograd, so the
+reduce-scatter input must exist before Bwd\_i starts. Compared with the backward schedule above
 (changes in purple):
 
 - AI\_{i-1}, which also zeroes the buffer, is issued when Bwd\_i starts, next to the AG\_{i-1}
   prefetch. It is queued ahead of RS\_i, so Bwd\_{i-1} can wait for it without waiting for
-  RS\_i. Only the next module's buffer is allocated, whatever the prefetch budget.
-- When Bwd\_i starts, compute waits for AI\_i and then sets `main_grad` to the buffer's views.
-- CI\_i only adds the gradients autograd still returns (biases, LayerNorm weights, unfused
-  weights) and removes `main_grad`. It is empty when a module's only gradients are fused.
+  RS\_i. The first module in backward order (layer 2 here) issues its own.
+- When Bwd\_i starts, compute waits for AI\_i and sets each parameter's `main_grad` to its view
+  of the buffer.
+- CI\_i only adds the gradients autograd still returns and removes `main_grad`. TE fuses only
+  GEMM weight gradients; bias and LayerNorm gradients still go through autograd, as with
+  Megatron's DDP.
 - DI\_i still follows RS\_i, so at most two buffers are alive: one being filled and one being
   reduced.
-- The first module in backward order (layer 2 here) has no predecessor and issues its own AI.
 
 The wait at the start of Bwd\_i is needed even when the order is right. Backward order lists a
-parent before its children, so a parent issues its last child's AI, and no CI lies between that
-AI and the child's backward. With delayed weight-gradient computation
-(`delay_wgrad_compute=True`), the caller picks the order of the `backward_dw()` calls, and a
-module's buffer lives until its `backward_dw()` has run.
-
-Groups that need no DP-inner reduction still use the buffer, since Transformer Engine needs
-`main_grad` to write into. A checkpointed region is recomputed before its modules' backward;
-recomputation sets no `main_grad`.
+parent before its children, so a parent issues its last child's AI with no CI in between. With
+`delay_wgrad_compute=True`, the caller picks the order of the `backward_dw()` calls.
 
 # Alternatives considered
 

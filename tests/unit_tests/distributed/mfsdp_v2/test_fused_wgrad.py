@@ -4,7 +4,7 @@
 
 TE modules built with ``fuse_wgrad_accumulation=True`` write their weight gradients into
 ``weight.main_grad``, which MFSDP points at its reduce-scatter input. Test buffer release in
-``test_memory.py`` and the buffer dtype in ``test_grad_comm_dtype.py``.
+``test_memory.py`` and the buffer dtype in ``test_gradient_accumulation.py``.
 """
 
 import gc
@@ -49,99 +49,24 @@ def _hsdp_placements() -> Placements:
     )
 
 
-def test_fused_wgrad_mask_marks_only_te_fused_gemm_weights(distributed_setup):
-    """Only 2-D weights of TE modules built with fuse_wgrad_accumulation=True are fused."""
+def test_fuse_wgrad_accumulation_follows_te_modules(distributed_setup):
+    """A group fuses wgrads when a trainable TE module in it has fuse_wgrad_accumulation=True."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Sequential(
-        te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True),
-        te.Linear(32, 16, bias=True, device=device, fuse_wgrad_accumulation=False),
+    mixed = nn.Sequential(
+        te.LayerNormLinear(16, 32, device=device, fuse_wgrad_accumulation=True),
+        te.Linear(32, 16, device=device, fuse_wgrad_accumulation=False),
     )
-    frozen = te.Linear(16, 16, bias=True, device=device, fuse_wgrad_accumulation=True)
+    unfused = te.Linear(16, 16, device=device, fuse_wgrad_accumulation=False)
+    frozen = te.Linear(16, 16, device=device, fuse_wgrad_accumulation=True)
     frozen.requires_grad_(False)
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-        fully_shard(frozen, mesh=mesh, placements=_default_placements())
+        for model in (mixed, unfused, frozen):
+            fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    fused_by_fqn = {
-        fqn: fused
-        for group in model.parameter_groups
-        for fsdp_parameter, fused in zip(group.fsdp_parameters, group.fused_wgrad_mask)
-        for fqn in fsdp_parameter.fqns
-    }
-    assert fused_by_fqn == {
-        "0.layer_norm_weight": False,
-        "0.layer_norm_bias": False,
-        "0.weight": True,
-        "0.bias": False,
-        "1.weight": False,
-        "1.bias": False,
-    }
-    assert [group.has_fused_wgrad for group in model.parameter_groups] == [True]
-    assert [group.has_fused_wgrad for group in frozen.parameter_groups] == [False]
-
-
-def _fused_layer_norm_linear_group(distributed_setup):
-    """Fully shard one fused te.LayerNormLinear; return it, its group, and unsharded params."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True)
-    with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-    [group] = model.parameter_groups
-    unsharded = {
-        fsdp_parameter.fqns[0]: fsdp_parameter.unsharded for fsdp_parameter in group.fsdp_parameters
-    }
-    # Return the model too: the group holds only a weak reference to it.
-    return model, group, unsharded
-
-
-def test_fused_grad_buffer_allocate_set_and_take(distributed_setup):
-    """allocate zeroes the buffer, set exposes fused views, take packs grads and drops main_grad."""
-    _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
-    unfused_names = ("layer_norm_weight", "layer_norm_bias", "bias")
-
-    with pytest.raises(RuntimeError, match="not allocated"):
-        group.set_fused_main_grads()
-    group.allocate_fused_grad_buffer()
-    buffer = group._fused_grad_buffer
-    # A second allocation before the buffer is taken, e.g. from another unshard(), keeps it.
-    group.allocate_fused_grad_buffer()
-    assert group._fused_grad_buffer is buffer
-    group.set_fused_main_grads()
-    main_grad = unsharded["weight"].main_grad
-    assert main_grad.shape == unsharded["weight"].shape
-    assert main_grad.dtype == group.grad_comm_dtype
-    assert torch.count_nonzero(main_grad) == 0
-    assert not any(hasattr(unsharded[name], "main_grad") for name in unfused_names)
-
-    main_grad.fill_(1.0)  # Stands in for TE's fused wgrad GEMM.
-    for name in unfused_names:
-        unsharded[name].grad = torch.full_like(unsharded[name], 2.0)
-    assert group.take_fused_grad_buffer() is buffer
-
-    assert not any(hasattr(parameter, "main_grad") for parameter in unsharded.values())
-    assert all(parameter.grad is None for parameter in unsharded.values())
-    views = {
-        fsdp_parameter.fqns[0]: buffer.get_tensor_view(index)
-        for index, fsdp_parameter in enumerate(group.fsdp_parameters)
-    }
-    torch.testing.assert_close(views["weight"], torch.ones_like(views["weight"]))
-    for name in unfused_names:
-        torch.testing.assert_close(views[name], torch.full_like(views[name], 2.0))
-    with pytest.raises(RuntimeError, match="not allocated"):
-        group.take_fused_grad_buffer()
-
-
-def test_fused_grad_buffer_requires_unfused_gradients(distributed_setup):
-    """An unfused parameter without a gradient is an error, as on the copy path."""
-    _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
-    group.allocate_fused_grad_buffer()
-    group.set_fused_main_grads()
-    unsharded["layer_norm_weight"].grad = torch.ones_like(unsharded["layer_norm_weight"])
-    unsharded["layer_norm_bias"].grad = torch.ones_like(unsharded["layer_norm_bias"])
-    with pytest.raises(RuntimeError, match="Missing gradient"):
-        group.take_fused_grad_buffer()
+    assert [group.fuse_wgrad_accumulation for group in mixed.parameter_groups] == [True]
+    assert [group.fuse_wgrad_accumulation for group in unfused.parameter_groups] == [False]
+    assert [group.fuse_wgrad_accumulation for group in frozen.parameter_groups] == [False]
 
 
 class _FusedWgradModel(nn.Module):
@@ -268,7 +193,7 @@ def test_fused_wgrad_losses_match_unfused(
 
 
 def test_fused_wgrad_main_grad_only_exists_during_backward(distributed_setup):
-    """main_grad is set on fused weights for their module's backward and removed afterwards."""
+    """main_grad is set for a fused module's backward and removed afterwards."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = _FusedWgradModel(device, torch.float32, fuse_first=True, fuse_second=True)
@@ -304,10 +229,15 @@ def test_fused_wgrad_main_grad_only_exists_during_backward(distributed_setup):
     assert with_main_grad("") == set()
     loss.backward()
 
-    # When the second layer's backward starts, only its own fused weight is exposed: prefetching
-    # allocates the first layer's buffer, but main_grad is set only when that backward starts.
-    assert seen["second"] == {"second.weight"}
-    assert seen["first"] == {"first.weight"}
+    # When the second layer's backward starts, only its own parameters have main_grad:
+    # prefetching allocates the first layer's buffer, but main_grad is set when its backward starts.
+    assert seen["second"] == {"second.weight", "second.bias"}
+    assert seen["first"] == {
+        "first.weight",
+        "first.bias",
+        "first.layer_norm_weight",
+        "first.layer_norm_bias",
+    }
     assert with_main_grad("") == set()
 
 
@@ -506,7 +436,7 @@ def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
         return [
             index
             for index, layer in enumerate(model)
-            if any(group._fused_grad_buffer is not None for group in layer.parameter_groups)
+            if any(group.partial_grad is not None for group in layer.parameter_groups)
         ]
 
     # Registered after fully_shard(), so these run after MFSDP's own backward pre-hooks.
@@ -523,30 +453,30 @@ def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
 
 
 def test_fused_wgrad_buffer_is_freed_after_its_reduce_scatter(distributed_setup, monkeypatch):
-    """Like partial_grad, a fused buffer is dropped once its reduce-scatter is launched."""
+    """A fused buffer is dropped once its reduce-scatter is launched, like the copy path's."""
     model, _context = _fused_linear_stack(distributed_setup)
-    taken = []
-    original = FsdpParameterGroup.take_fused_grad_buffer
+    allocated = []
+    original = FsdpParameterGroup.allocate_partial_grad_buffer
 
     def spy(self):
         buffer = original(self)
-        taken.append(weakref.ref(buffer))
+        allocated.append(weakref.ref(buffer))
         return buffer
 
-    monkeypatch.setattr(FsdpParameterGroup, "take_fused_grad_buffer", spy)
+    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", spy)
     alive_when_first_layer_starts = []
 
     def record_alive(_module, _grad_output):
         gc.collect()
-        alive_when_first_layer_starts.append(sum(ref() is not None for ref in taken))
+        alive_when_first_layer_starts.append(sum(ref() is not None for ref in allocated))
 
     model[0].register_full_backward_pre_hook(record_alive)
     x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
     model(x).square().mean().backward()
 
-    # The last two layers have reduced their buffers before the first layer's backward starts.
-    assert alive_when_first_layer_starts == [0]
-    assert len(taken) == 3
+    # When the first layer's backward starts, the last two layers have reduced theirs.
+    assert alive_when_first_layer_starts == [1]
+    assert len(allocated) == 3
 
 
 @pytest.mark.parametrize(
@@ -557,9 +487,9 @@ def test_fused_wgrad_waits_for_its_buffer_to_be_zeroed(
 ):
     """TE writes a fused wgrad only after its buffer is zeroed on the inner reduction stream.
 
-    The parameterless root allocates the last layer's buffer, and no post-backward runs between
-    that allocation and the last layer's backward, so only the wait at the start of that
-    backward orders the zeroing first. Stalling that stream exposes a missing wait.
+    The parameterless root allocates the last layer's buffer, and no reduction runs between that
+    allocation and the last layer's backward, so only the wait at the start of that backward
+    orders the zeroing first. Stalling that stream exposes a missing wait.
     """
     grads = {}
     for fuse in (False, True):
