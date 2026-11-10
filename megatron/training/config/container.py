@@ -33,6 +33,7 @@ from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
+    FaultToleranceConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
@@ -298,6 +299,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -478,6 +480,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
         self._validate_checkpoint()
+        if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
+            raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_ddp_config()
         self._validate_rl_config(global_batch_size)

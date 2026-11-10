@@ -36,6 +36,8 @@ from megatron.training.config import (
     DataConfig,
     DataloaderConfig,
     DistributedInitConfig,
+    FaultInjectorConfig,
+    FaultToleranceConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
@@ -1192,6 +1194,15 @@ def get_megatron_ddp_config(
         return DistributedDataParallelConfig(**kwargs)
 
 
+def fault_tolerance_config_from_args(args: Namespace) -> FaultToleranceConfig:
+    """Collect the flat legacy CLI settings into the FT section and optional injector."""
+    config = _default_config_from_args(FaultToleranceConfig, args)
+    injector = _default_config_from_args(FaultInjectorConfig, args)
+    if any(getattr(injector, f.name) is not None for f in fields(FaultInjectorConfig)):
+        config.fault_injector = injector
+    return config
+
+
 def pretrain_cfg_container_from_args(
     args: Namespace, model_cfg=None, *, data_cfg: DataConfig | None = None
 ) -> PretrainConfigContainer:
@@ -1239,6 +1250,7 @@ def pretrain_cfg_container_from_args(
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+        fault_tolerance=fault_tolerance_config_from_args(args),
     )
 
     return cfg
