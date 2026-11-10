@@ -3,6 +3,7 @@
 """Megatron-FSDP v1 rejects GTP weight rematerialization when it is constructed."""
 
 import contextlib
+import inspect
 import re
 import sys
 import types
@@ -14,7 +15,11 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp import mcore_adapter_v1
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    FullyShardedDataParallelV1,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -171,3 +176,21 @@ class TestMegatronFSDPV1GTPWeightRemat:
             range(dist.get_world_size())
         )
         assert fsdp.tp_group.size() == 1
+
+    def test_config_logger_dumps_only_the_constructor_arguments(self):
+        """The GTP check leaves no temporaries in the locals() that the config logger dumps."""
+        Utils.initialize_model_parallel()
+        config = TransformerConfig(num_attention_heads=1, num_layers=1, config_logger_dir="unused")
+        dumped = []
+
+        def record_keys(logged_config, dict_data, **kwargs):
+            dumped.append(set(dict_data))
+
+        with mock.patch.object(mcore_adapter_v1, "log_config_to_disk", side_effect=record_keys):
+            fsdp = _wrap(config, ProcessGroupCollection.use_mpu_process_groups())
+        fsdp.stop_communication()
+
+        (keys,) = dumped
+        arguments = set(inspect.signature(FullyShardedDataParallelV1.__init__).parameters)
+        # locals() of a method that calls super() also holds __class__.
+        assert keys - {"__class__"} == arguments
