@@ -263,8 +263,14 @@ class TestDefaultCollection:
         assert layer.self_attention.pg_collection is layer.pg_collection
 
     @pytest.mark.skipif(not HAVE_TE, reason="the MoE layer spec needs Transformer Engine")
-    @pytest.mark.parametrize("moe", [False, True])
-    def test_modules_read_only_the_fields_the_fallback_builds(self, monkeypatch, moe):
+    @pytest.mark.parametrize(
+        "moe, realtime_tests",
+        [(False, False), (True, False), (False, True)],
+        ids=["dense", "moe", "realtime_tests"],
+    )
+    def test_modules_read_only_the_fields_the_fallback_builds(
+        self, monkeypatch, moe, realtime_tests
+    ):
         Utils.initialize_model_parallel(expert_model_parallel_size=2 if moe else 1)
         model_parallel_cuda_manual_seed(123)
         moe_kwargs = (
@@ -279,7 +285,10 @@ class TestDefaultCollection:
             if moe
             else {}
         )
-        config = _config(num_layers=2, **moe_kwargs)
+        # In test_mode with qk_layernorm, every SelfAttention forward compares the Q/K layernorm
+        # parameters across the data-parallel group.
+        test_kwargs = dict(test_mode=True, qk_layernorm=True) if realtime_tests else {}
+        config = _config(num_layers=2, **moe_kwargs, **test_kwargs)
         field_names = {f.name for f in dataclasses.fields(ProcessGroupCollection)}
 
         # __getattr__ only runs for a field that is not in vars(): make reading one fail.
