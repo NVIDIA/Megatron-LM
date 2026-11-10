@@ -64,12 +64,17 @@ LAYOUTS = {
     )
 }
 KINDS = {
-    "nvfp4-relu2": dict(activation="squared_relu", recipe="nvfp4"),
-    "nvfp4-swiglu": dict(activation="swiglu", recipe="nvfp4"),
-    "mxfp8-routed": dict(activation="squared_relu", recipe="mxfp8"),
-    "mxfp8-cutlass": dict(activation="clamp", recipe="mxfp8"),
-    "bf16-cutlass": dict(activation="squared_relu", recipe="bf16"),
-    "bf16-cutlass-clamp": dict(activation="clamp", recipe="bf16"),
+    "nvfp4-relu2": dict(activation="squared_relu", recipe="nvfp4", backend="flashinfer"),
+    "nvfp4-swiglu": dict(activation="swiglu", recipe="nvfp4", backend="flashinfer"),
+    "mxfp8-routed": dict(activation="squared_relu", recipe="mxfp8", backend="flashinfer"),
+    "mxfp8-cutlass": dict(activation="clamp", recipe="mxfp8", backend="flashinfer"),
+    "bf16-cutlass": dict(activation="squared_relu", recipe="bf16", backend="flashinfer"),
+    "bf16-cutlass-clamp": dict(activation="clamp", recipe="bf16", backend="flashinfer"),
+    # MCore's MXFP8 grouped GEMM (scaled_grouped_mm, Blackwell only) under the torch and vLLM
+    # backends.
+    "torch-mxfp8-relu2": dict(activation="squared_relu", recipe="mxfp8", backend="torch"),
+    "torch-mxfp8-swiglu": dict(activation="swiglu", recipe="mxfp8", backend="torch"),
+    "vllm-mxfp8-clamp": dict(activation="clamp", recipe="mxfp8", backend="vllm"),
 }
 PADDING = 64.0  # finite padding-row hidden states: FlashInfer quantizes every row it is given
 
@@ -80,11 +85,16 @@ def env(request):
         yield env
 
 
-def _require(recipe: str, clamp: bool) -> None:
+def _require(kind: str, clamp: bool) -> None:
     """The kernels this hardware targets must be present (a skip is not evidence here)."""
     from megatron.core.inference.moe import flashinfer_mxfp8, flashinfer_nvfp4
 
-    if recipe == "nvfp4":
+    recipe = KINDS[kind]["recipe"]
+    if KINDS[kind]["backend"] != "flashinfer":
+        from megatron.core.inference.moe.fused_moe import HAVE_SCALED_GMM
+
+        assert HAVE_SCALED_GMM, "MXFP8 grouped GEMMs need torch scaled_grouped_mm"
+    elif recipe == "nvfp4":
         assert flashinfer_nvfp4.HAVE_FLASHINFER_ROUTED_NVFP4, "per-token NVFP4 MoE unavailable"
     elif recipe == "mxfp8" and clamp:
         flashinfer_mxfp8.require_flashinfer_cutlass_mxfp8()
@@ -100,7 +110,7 @@ def _config(problem, layout, kind, **overrides):
     elif recipe == "nvfp4":
         extra = dict(inference_moe_nvfp4_recipe="per_token")
     extra.update(overrides)
-    return etp.make_config(problem, layout, "flashinfer", **extra)
+    return etp.make_config(problem, layout, KINDS[kind]["backend"], **extra)
 
 
 @contextlib.contextmanager
@@ -130,7 +140,7 @@ def _build(config, problem, env, kind):
     from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
 
     recipe = KINDS[kind]["recipe"]
-    _require(recipe, problem.clamp is not None)
+    _require(kind, problem.clamp is not None)
     with _without_jit_cache_guard():
         if recipe == "mxfp8":
             from megatron.core.fp8_utils import get_fp8_context
@@ -145,9 +155,14 @@ def _build(config, problem, env, kind):
     return layer
 
 
-def _trusted(layout):
+def _trusted(layout, kind="mxfp8-routed"):
+    """FlashInfer kinds: the least precise FlashInfer finalize; MCore MXFP8: the torch/vLLM
+    design's rounding points (bf16 route outputs, fp32 unpermute and reduce-scatter)."""
+
     def fn(problem, x, routing, probs):
-        return etp.trusted_flashinfer(problem, x, routing, probs, layout)
+        if KINDS[kind]["backend"] == "flashinfer":
+            return etp.trusted_flashinfer(problem, x, routing, probs, layout)
+        return etp.trusted(problem, x, routing, probs, layout.etp)
 
     return fn
 
@@ -179,14 +194,16 @@ def test_matches_fp64_reference(env, case):
     config = _config(problem, layout, kind)
     layer = _build(config, problem, env, kind)
     with _fp8_context(config):
-        out = etp.run_step(env, layer, problem, batch, flashinfer=True)
+        out = etp.run_step(
+            env, layer, problem, batch, flashinfer=KINDS[kind]["backend"] == "flashinfer"
+        )
     etp.check_output(
         out,
         batch,
         tokens,
         problem,
         layout.etp,
-        trusted_fn=_trusted(layout),
+        trusted_fn=_trusted(layout, kind),
         what=f"{layout.name} rank {env.rank} {kind}",
     )
 
@@ -344,6 +361,6 @@ def test_small_case_for_the_sanitizer(env, kind):
         tokens,
         problem,
         layout.etp,
-        trusted_fn=_trusted(layout),
+        trusted_fn=_trusted(layout, kind),
         what=f"{layout.name} rank {env.rank} {kind} small",
     )

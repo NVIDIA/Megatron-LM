@@ -516,6 +516,9 @@ def make_config(
         num_moe_experts=problem.experts,
         moe_ffn_hidden_size=problem.ffn,
         moe_router_topk=problem.topk,
+        # Top-1 routing needs the pre-softmax router (TransformerConfig check); the router is
+        # bypassed except in test_router_through_the_layer, which uses top-2.
+        moe_router_pre_softmax=problem.topk == 1,
         moe_router_dtype="fp32",
         moe_grouped_gemm=True,
         moe_token_dispatcher_type="alltoall",
