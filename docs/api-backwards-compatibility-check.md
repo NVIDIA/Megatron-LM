@@ -170,7 +170,10 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
 - **Unit tests** set up the global grid on purpose, so `pyproject.toml` ignores
   `ParallelStateDeprecationWarning` for them. A test that checks the warning uses
   `pytest.warns(ParallelStateDeprecationWarning)` on a call site that has not warned yet in the
-  same process.
+  same process. A call site that a test has reached under the ignore filter is recorded as well
+  and stays silent, so a test of a call site that other tests share, such as a line of a test
+  helper, first clears the record with
+  `monkeypatch.setattr(parallel_state, "_warned_accessor_call_sites", set())`.
 
 ### Handling CI Failures
 

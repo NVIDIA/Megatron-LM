@@ -170,8 +170,9 @@ def _warn_deprecated_call(name: str, message: str, caller) -> None:
         warnings.warn(message, ParallelStateDeprecationWarning, stacklevel=3)
     finally:
         in_progress.discard(call_site)
-    # Recorded once the warning is shown: a warning that a filter turns into an error leaves no
-    # record, so it raises at every call, in every thread.
+    # Recorded once warnings.warn() returns, whether a filter showed the warning or ignored it. A
+    # warning that a filter turns into an error leaves no record, so it raises at every call, in
+    # every thread.
     _warned_accessor_call_sites.add(call_site)
 
 
