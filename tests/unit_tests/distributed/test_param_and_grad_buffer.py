@@ -1166,7 +1166,16 @@ def test_nccl_ub_warmup_syncs_only_the_data_parallel_group(backend: str):
         bucket_size=None,
         average_in_collective=False,
     )
+
+    def destroy_dp_group():
+        # Every rank finishes its warmup collectives before any communicator goes away.
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group(dp_group)
+
     with contextlib.ExitStack() as stack:
+        # Registered first, so it runs last: after the patches are undone, and also when a
+        # buffer fails to build.
+        stack.callback(destroy_dp_group)
         for patch in patches:
             stack.enter_context(patch)
         for buffer_index in range(num_buffers):

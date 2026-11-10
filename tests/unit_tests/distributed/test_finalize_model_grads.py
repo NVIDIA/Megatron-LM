@@ -202,11 +202,27 @@ def _forbid_global_groups():
         yield
 
 
+# The process groups that the helpers below created on this rank, until
+# _destroy_created_groups() destroys them.
+_CREATED_GROUPS = []
+
+
+def _destroy_created_groups():
+    """Destroy the groups in _CREATED_GROUPS; call on every rank."""
+    if not _CREATED_GROUPS:
+        return
+    # Every rank finishes its collectives before any communicator goes away.
+    torch.cuda.synchronize()
+    dist.barrier()
+    while _CREATED_GROUPS:
+        dist.destroy_process_group(_CREATED_GROUPS.pop())
+
+
 def _pipeline_pg_collection():
     """Groups of a TP=1 x DP x PP=4 grid, built without parallel_state.
 
     The word embeddings live on the first and last stage and the position embeddings on the first
-    stage; ranks outside those groups hold None.
+    stage; ranks outside those groups hold None. _destroy_created_groups() destroys the groups.
     """
     grid = HyperCommGrid(
         [1, dist.get_world_size() // _PIPELINE_SIZE, _PIPELINE_SIZE], ["tp", "dp", "pp"]
@@ -227,7 +243,24 @@ def _pipeline_pg_collection():
             pg_collection.embd = embd
         if dist.get_rank() == stage_ranks[0]:
             pg_collection.pos_embd = pos_embd
+    # Tests remove and replace fields of the collection, so the groups are recorded here.
+    _CREATED_GROUPS.extend(group for group in vars(pg_collection).values() if group is not None)
     return pg_collection
+
+
+def _rank_pairs_group():
+    """This rank's group when all ranks are split into the pairs (1, 2), (3, 4), ..., (last, 0).
+
+    The pairs differ from the DP groups of _pipeline_pg_collection() at every world size: those
+    hold one rank each on 4 ranks and the pairs (0, 1), (2, 3), ... on 8 ranks. Creating groups is
+    collective: call on every rank. _destroy_created_groups() destroys the group.
+    """
+    world_size = dist.get_world_size()
+    group, _ = dist.new_subgroups_by_enumeration(
+        [[rank, (rank + 1) % world_size] for rank in range(1, world_size, 2)]
+    )
+    _CREATED_GROUPS.append(group)
+    return group
 
 
 def _stage_config(sync_replicated_params=False, **kwargs):
@@ -323,6 +356,7 @@ class TestFinalizeModelGradsProcessGroups:
         parallel_state.destroy_model_parallel()
 
     def teardown_method(self, method):
+        _destroy_created_groups()
         Utils.destroy_model_parallel()
 
     def test_reads_no_global_groups(self):
@@ -417,7 +451,10 @@ class TestFinalizeModelGradsProcessGroups:
     def test_global_batch_quantile_balancing_reads_only_collection(self):
         """Global-batch quantile balancing pools router histograms over pg_collection.tp_dp_cp."""
         pg_collection = _pipeline_pg_collection()
-        pg_collection.tp_dp_cp = pg_collection.dp_cp
+        # Two ranks at every world size, and not the ranks of the TP, DP or PP group: pooling the
+        # histograms of no other rank, or of the ranks of one of those groups, gives another bias.
+        pg_collection.tp_dp_cp = _rank_pairs_group()
+        assert pg_collection.tp_dp_cp.size() == 2
         config = _stage_config(**_GLOBAL_BATCH_QB)
         chunk = _StageChunk(config, pg_collection.pp)
         router = torch.nn.Module()

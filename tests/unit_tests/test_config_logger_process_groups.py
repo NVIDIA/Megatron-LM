@@ -41,6 +41,10 @@ def _dump(directory, **kwargs):
     return name[len("dump.rank_") : -len(".iter0.json")]
 
 
+class _StopAfterDump(Exception):
+    """Ends the construction of a model once it has logged its config."""
+
+
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs at least 2 ranks")
 class TestConfigLoggerRankString:
     def setup_method(self, method):
@@ -93,6 +97,45 @@ class TestConfigLoggerRankString:
         with forbid_global_process_groups(), warnings.catch_warnings():
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             assert _dump(tmp_path, rank_str="custom") == "custom"
+
+    @pytest.mark.parametrize(
+        "module_name, class_name, arguments",
+        [
+            ("megatron.core.models.bert.bert_model", "BertModel", (0, None, 8, 4)),
+            ("megatron.core.models.hybrid.hybrid_model", "HybridModel", (None, 8, 4)),
+            ("megatron.core.models.T5.t5_model", "T5LMHead", (False, 8)),
+            ("megatron.core.models.vision.clip_vit_model", "CLIPViTModel", (None,)),
+            ("megatron.core.models.vision.radio", "RADIOViTModel", (None,)),
+            (
+                "megatron.core.models.multimodal.llava_model",
+                "LLaVAModel",
+                (None, 8, 4, None, None, False, None, None),
+            ),
+        ],
+        ids=["bert", "hybrid", "t5-lm-head", "clip-vit", "radio-vit", "llava"],
+    )
+    def test_models_pass_their_collection(self, module_name, class_name, arguments):
+        """Each of these models names its dump by the collection it was given.
+
+        They log before they build a layer or read another argument, so the logger ends the
+        construction and the arguments after the config are placeholders.
+        """
+        import importlib
+
+        from megatron.core.transformer import TransformerConfig
+
+        module = importlib.import_module(module_name)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(num_attention_heads=1, num_layers=1, config_logger_dir="unused")
+
+        with mock.patch.object(
+            module, "log_config_to_disk", side_effect=_StopAfterDump
+        ) as log_config:
+            with pytest.raises(_StopAfterDump):
+                getattr(module, class_name)(config, *arguments, pg_collection=pg_collection)
+
+        log_config.assert_called_once()
+        assert log_config.call_args.kwargs["pg_collection"] is pg_collection
 
     def test_ddp_passes_its_collection(self):
         """DistributedDataParallel names its dump by the collection it was given."""

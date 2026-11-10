@@ -328,19 +328,36 @@ def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection
 
     An optimizer whose groups are not set this way filters duplicates by the global grid.
 
+    A collection that does not set ``tp`` is deprecated and emits a
+    ``ProcessGroupFallbackWarning``. The filters then read the global grid for every group that
+    is unset or ``None``, as they did before the groups came from the collection.
+
     Args:
         optimizer: The optimizer, or a child optimizer that runs the filters itself.
         pg_collection: The collection of the model whose parameters ``optimizer`` updates.
 
     Raises:
-        ValueError: If ``pg_collection`` does not set ``tp``.
+        ValueError: If ``pg_collection`` does not set ``tp`` and the global parallel state, which
+            the filters would fall back to, is not initialized.
     """
     groups = vars(pg_collection)
     if 'tp' not in groups:
-        raise ValueError(
-            "pg_collection must set tp, the tensor-parallel group of the optimizer's "
-            "parameters; set it to None only if tensor parallelism is off"
+        if not parallel_state.model_parallel_is_initialized():
+            raise ValueError(
+                "pg_collection must set tp, the tensor-parallel group of the optimizer's "
+                "parameters; set it to None only if tensor parallelism is off"
+            )
+        warn_global_process_group_fallback(
+            "get_megatron_optimizer", "pg_collection.tp", deprecated_in="0.21", removed_in="0.23"
         )
+        # The groups as they were read before: the filters fall back to the global grid, and
+        # warn, for each one that is None.
+        optimizer.tp_group = None
+        optimizer.expert_tp_group = groups.get('expt_tp')
+        optimizer.gtp_group = groups.get('gtp_remat')
+        optimizer.expert_gtp_group = groups.get('expt_gtp_remat')
+        optimizer.duplicate_filter_groups_from_collection = False
+        return
     optimizer.tp_group = groups['tp']
     optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
     optimizer.gtp_group = resolve_gtp_remat_group(
