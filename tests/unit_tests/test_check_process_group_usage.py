@@ -673,6 +673,13 @@ class TestDetection(unittest.TestCase):
                 f"    grid = parallel_state\ndef use():\n    return {call}\n",
                 [],
             ),
+            # The local alias is resolved while the global name is: it must not come out empty.
+            "a global alias assigned back from a local alias of it": (
+                IMPORT + "grid = parallel_state\ndef outer():\n    local = grid\n"
+                "    def init():\n        global grid\n        grid = local\n"
+                "    def use():\n        return local.get_tensor_model_parallel_group()\n",
+                ["outer.use"],
+            ),
         }
         for case, (source, scopes) in cases.items():
             with self.subTest(case=case):
