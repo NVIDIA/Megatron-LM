@@ -24,7 +24,6 @@ import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
     is_device_nvls_capable,
-    multimem_all_gather_v,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
@@ -235,9 +234,9 @@ class TestAllGatherVZeroTokenStep:
     the peers, a rank could run its next step and overwrite a peer's counts before the peer had
     read them, so the ranks would disagree on the token offsets and on which blocks barrier.
 
-    Rank 0 launches the all-gather of a zero-token step while every peer holds its launch back
-    until rank 0 has watched its own for ``WINDOW_S`` seconds; the all-gather must not finish on
-    rank 0 within that window."""
+    Rank 0 launches the dispatch all-gather of a zero-token step while every peer holds its launch
+    back until rank 0 has watched its own for ``WINDOW_S`` seconds; the all-gather must not finish
+    on rank 0 within that window."""
 
     WINDOW_S = 2.0
 
@@ -249,8 +248,7 @@ class TestAllGatherVZeroTokenStep:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("kernel", ["3tensor", "single"])
-    def test_zero_token_step_waits_for_every_rank(self, kernel):
+    def test_zero_token_step_waits_for_every_rank(self):
         world = dist.get_world_size() if dist.is_initialized() else 1
         if world < 2:
             pytest.skip("needs at least two ranks")
@@ -277,7 +275,7 @@ class TestAllGatherVZeroTokenStep:
             buf.symm_buffer[: rows * width * dtype.itemsize].view(dtype).view(rows, width)
             for (dtype, width), buf in zip(specs, buffers)
         ]
-        # No tokens on any rank: empty views of real allocations.
+        # No tokens on any rank.
         inputs = [torch.zeros(1, width, dtype=dtype, device="cuda")[:0] for dtype, width in specs]
         step = dict(
             rank_token_offset=torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -286,12 +284,9 @@ class TestAllGatherVZeroTokenStep:
         )
 
         def dispatch():
-            if kernel == "3tensor":
-                multimem_all_gatherv_3tensor(
-                    *outputs, *inputs, *(buf.symm_mem_hdl for buf in buffers), **step
-                )
-            else:
-                multimem_all_gather_v(outputs[0], inputs[0], buffers[0].symm_mem_hdl, **step)
+            multimem_all_gatherv_3tensor(
+                *outputs, *inputs, *(buf.symm_mem_hdl for buf in buffers), **step
+            )
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -312,6 +307,6 @@ class TestAllGatherVZeroTokenStep:
         dist.all_reduce(early)
         dist.destroy_process_group(host_group)
         assert int(early) == 0, (
-            f"the {kernel} all-gather-v of a step with no tokens finished on rank 0 before any "
-            "peer launched it, so it did not synchronize the group"
+            "the all-gather-v of a step with no tokens finished on rank 0 before any peer "
+            "launched it, so it did not synchronize the group"
         )
