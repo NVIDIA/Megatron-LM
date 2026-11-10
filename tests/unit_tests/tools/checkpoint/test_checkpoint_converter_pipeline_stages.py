@@ -79,9 +79,13 @@ def _loader_stage_layer_numbers(split):
         pipeline_model_parallel_size=2,
         virtual_pipeline_model_parallel_size=None,
     )
+    # initialize_megatron_env registers the run config; loading sets its checkpoint section to
+    # fail on a missing checkpoint.
+    run_config = SimpleNamespace(checkpoint=SimpleNamespace())
     with (
         mock.patch.object(checkpointing, "load_checkpoint"),
         mock.patch("megatron.training.get_train_state", return_value=TrainState()),
+        mock.patch("megatron.training.global_vars.get_run_config", return_value=run_config),
     ):
         all_models, _, _ = loader.load_model_shards(_decoder_provider(split), torch.float32)
     # all_models[pp_rank][vp_rank] lists the models of the stage's TP ranks.
