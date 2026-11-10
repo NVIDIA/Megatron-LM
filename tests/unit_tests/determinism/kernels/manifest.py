@@ -407,6 +407,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "available in the H100 determinism bucket. Routing conversion is replayed separately.",
     ),
     KernelEntry(
+        name="te_megakernel",
+        sources=("megatron/core/transformer/moe/megakernel/te.py",),
+        tests=(K + "test_te_megakernel.py",),
+        kind="dispatch",
+        notes="Authoritative route conversion and probability-gradient replay. Distributed "
+        "NCCL EP plus grouped-MLP numerical coverage is in transformer/moe/test_te_megakernel.py.",
+    ),
+    KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
         tests=(

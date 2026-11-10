@@ -938,7 +938,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
+    Supported values: None, "mok", and "te". The "te" backend composes NCCL EP dispatch,
+    grouped MLP, and combine in one Transformer Engine Sequential. When set, the backend owns
+    dispatch/combine;
     moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
     """
 
@@ -946,6 +948,7 @@ class TransformerConfig(ModelParallelConfig):
     """Backend options for moe_megakernel_backend.
 
     For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    The TE backend accepts ``max_tokens_per_rank`` to bound inputs before its first forward.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -1853,6 +1856,74 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_te_megakernel(self) -> None:
+        """Validate the NCCL EP plus TE grouped-MLP execution contract."""
+        if not self.num_moe_experts or not self.moe_grouped_gemm:
+            raise ValueError("The TE MoE backend requires grouped MoE experts")
+        if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+            raise ValueError("The TE MoE backend requires TP=1 and expert TP=1")
+        if self.expert_model_parallel_size < 2:
+            raise ValueError("The TE MoE backend requires EP>=2")
+        if not self.bf16 or self.fp16 or self.fp4 or self.fp4_param:
+            raise ValueError("The TE MoE backend supports BF16 and MXFP8 only")
+        if self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8:
+            raise ValueError("The TE MoE backend supports only the MXFP8 recipe")
+        if self.fp8_param and not self.fp8:
+            raise ValueError("The TE MoE backend requires MXFP8 compute with FP8 parameters")
+        if self.params_dtype != torch.bfloat16:
+            raise ValueError("The TE MoE backend requires params_dtype=torch.bfloat16")
+        if not self.gated_linear_unit or self.activation_func != F.silu:
+            raise ValueError("The TE MoE backend currently requires SwiGLU")
+        if self.glu_linear_offset != 0 or self.activation_func_tanh_clamp_scale is not None:
+            raise ValueError("The TE MoE backend does not support modified SwiGLU")
+        unsupported = (
+            "add_bias_linear",
+            "moe_apply_probs_on_input",
+            "delay_wgrad_compute",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "overlap_moe_expert_parallel_comm",
+            "moe_shared_expert_overlap",
+            "moe_ncclep_zero_copy",
+            "moe_pad_expert_input_to_capacity",
+            "moe_router_padding_for_quantization",
+            "moe_paged_stash",
+            "moe_virtual_expert_load_balance",
+            "moe_shortcut_connection",
+            "cpu_offloading",
+            "fine_grained_activation_offloading",
+        )
+        for name in unsupported:
+            if getattr(self, name):
+                raise ValueError(f"The TE MoE backend does not support {name}")
+        if self.moe_latent_size is not None:
+            raise ValueError("The TE MoE backend does not support latent MoE")
+        if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
+            raise ValueError("The TE MoE backend does not support GTP weight rematerialization")
+        if self.transformer_impl != "transformer_engine":
+            raise ValueError("The TE MoE backend requires transformer_impl='transformer_engine'")
+        if self.moe_router_dtype == "fp64":
+            raise ValueError("The TE MoE backend requires FP32 router probabilities")
+        if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            raise ValueError("The TE MoE backend currently supports eager execution only")
+        if self.moe_expert_rank_capacity_factor is not None and (
+            not math.isfinite(self.moe_expert_rank_capacity_factor)
+            or self.moe_expert_rank_capacity_factor <= 0
+        ):
+            raise ValueError("The TE MoE backend requires a positive finite rank capacity factor")
+        if self.moe_dispatch_fwd_dtype == "mxfp8" or self.moe_combine_bwd_dtype == "mxfp8":
+            if not self.fp8 or self.hidden_size % 512:
+                raise ValueError(
+                    "TE MXFP8 communication requires MXFP8 compute and hidden_size%512=0"
+                )
+        options = self.moe_megakernel_backend_config
+        if options is not None:
+            if not isinstance(options, dict) or options.keys() - {"max_tokens_per_rank"}:
+                raise ValueError("TE backend options support only max_tokens_per_rank")
+            if "max_tokens_per_rank" in options:
+                bound = options["max_tokens_per_rank"]
+                if not isinstance(bound, int) or isinstance(bound, bool) or bound <= 0:
+                    raise ValueError("TE max_tokens_per_rank must be a positive integer")
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1937,7 +2008,9 @@ class TransformerConfig(ModelParallelConfig):
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
 
-        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+        if (
+            self.use_transformer_engine_op_fuser or self.moe_megakernel_backend == "te"
+        ) and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
@@ -2653,7 +2726,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
-            if (
+            if self.moe_megakernel_backend != "te" and (
                 self.moe_token_dispatcher_type != "flex"
                 or self.moe_flex_dispatcher_backend != "ncclep"
             ):
@@ -2661,7 +2734,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype require the 'ncclep' flex "
                     "dispatcher backend."
                 )
-            if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
+            if not (
+                (self.use_transformer_engine_op_fuser or self.moe_megakernel_backend == "te")
+                and self.moe_grouped_gemm
+            ):
                 raise ValueError(
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
@@ -2836,15 +2912,18 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "te"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok', or 'te', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
+
+        if self.moe_megakernel_backend == "te":
+            self._validate_te_megakernel()
 
         if self.moe_megakernel_backend == "mok":
             if self.moe_router_dtype == "fp64":
@@ -3045,13 +3124,17 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
+            if self.moe_megakernel_backend != "te" and self.moe_flex_dispatcher_backend not in (
+                "hybridep",
+                "ncclep",
+            ):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
                     "'hybridep' or 'ncclep'."
                 )
             if (
-                self.moe_flex_dispatcher_backend == "hybridep"
+                self.moe_megakernel_backend != "te"
+                and self.moe_flex_dispatcher_backend == "hybridep"
                 and not self.use_transformer_engine_op_fuser
                 and not self.moe_use_grouped_tensor
             ):
