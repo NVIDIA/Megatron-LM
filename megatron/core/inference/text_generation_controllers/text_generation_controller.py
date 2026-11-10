@@ -308,9 +308,11 @@ class TextGenerationController(MTPControllerMixin):
 
         # The wrapper resolves the pipeline-parallel group and rejects an unset one.
         self.pp_group = self.inference_wrapped_model.pp_group
-        # The collection that the wrapper resolved from the same config.
+        # The collection that the wrapper resolved from the same config, which rejects an unset
+        # or None dp group: torch.distributed would take it as the world group, and the seed
+        # offset below would be the global rank.
         pg_collection = inference_config.resolve_pg_collection(self.inference_wrapped_model.model)
-        self.dp_group = vars(pg_collection).get("dp")
+        self.dp_group = pg_collection.dp
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -348,13 +350,6 @@ class TextGenerationController(MTPControllerMixin):
             and not self.model_config.deterministic_mode
         )
         if offset_by_dp:
-            # torch.distributed takes a None group as the world group, which would offset the
-            # seed by the global rank.
-            if self.dp_group is None:
-                raise ValueError(
-                    "offset_sampling_seed_by_dp_rank needs a data-parallel group; set "
-                    "InferenceConfig.pg_collection.dp or disable the seed offset"
-                )
             seed += self.dp_group.rank()
         self.sampling_rng.manual_seed(seed)
 

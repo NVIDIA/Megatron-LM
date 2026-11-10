@@ -926,7 +926,9 @@ class TEGroupedMLP(MegatronModule):
         quant_context = (
             nullcontext()
             if fc1_recipe is None
-            else _get_fp8_autocast_for_quant_recipe(fc1_recipe, owner=type(self).__name__)
+            else _get_fp8_autocast_for_quant_recipe(
+                fc1_recipe, owner=type(self).__name__, pg_collection=self.pg_collection
+            )
         )
 
         # Construct fused impl if needed

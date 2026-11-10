@@ -13,6 +13,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
+    destroy_copied_amax_groups,
     forbid_global_amax_group,
     global_amax_group,
     record_amax_groups,
@@ -62,9 +63,11 @@ class TestAmaxReductionGroupHelper:
         assert amax_reduction_group(pg_collection, tp_only_amax_red=False) is tp_dp_cp
 
     @pytest.mark.parametrize("tp_only_amax_red", [False, True])
-    def test_rejects_an_unset_or_none_field(self, tp_only_amax_red):
+    def test_rejects_an_unset_or_none_field(self, tp_only_amax_red, monkeypatch):
         from megatron.core.process_groups_config import amax_reduction_group
 
+        # This class does not initialize torch.distributed, which the check depends on.
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         field_name = "tp_cp" if tp_only_amax_red else "tp_dp_cp"
         other_name = "tp_dp_cp" if tp_only_amax_red else "tp_cp"
         for pg_collection in (
@@ -74,10 +77,30 @@ class TestAmaxReductionGroupHelper:
             with pytest.raises(ValueError, match=field_name):
                 amax_reduction_group(pg_collection, tp_only_amax_red)
 
+    @pytest.mark.parametrize("tp_only_amax_red", [False, True])
+    def test_passes_no_group_without_torch_distributed(self, tp_only_amax_red, monkeypatch):
+        """A single-process model built on None groups opens its context without a group."""
+        from megatron.core.process_groups_config import amax_reduction_group
+
+        pg_collection = ProcessGroupCollection(tp=None, cp=None, pp=None, embd=None)
+        config = _config(
+            fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, tp_only_amax_red=tp_only_amax_red
+        )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        assert amax_reduction_group(pg_collection, tp_only_amax_red) is None
+        with record_amax_groups() as groups:
+            fp8_utils.get_fp8_context(config, 0, pg_collection=pg_collection)
+        assert groups == [None]
+
 
 class TestAmaxReductionGroupOnGrids:
 
     def teardown_method(self, method):
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if getattr(self, "grid", None) is not None:
+            self.grid.destroy()
+        destroy_copied_amax_groups()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
@@ -159,7 +182,7 @@ class TestAmaxReductionGroupOnGrids:
         # Global grid: TP=1 and PP=2, so the global amax group is the DP group of a stage.
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
         # Custom grid: PP is the fastest dimension, so its TP groups cross the global stages.
-        grid = HyperCommGrid([2, world_size // 2, 1, 1], ["pp", "tp", "cp", "dp"])
+        grid = self.grid = HyperCommGrid([2, world_size // 2, 1, 1], ["pp", "tp", "cp", "dp"])
         pg_collection = ProcessGroupCollection(
             tp_cp=grid.create_pg(["tp", "cp"]), tp_dp_cp=grid.create_pg(["tp", "cp", "dp"])
         )

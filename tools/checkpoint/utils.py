@@ -163,14 +163,14 @@ def register_checkpoint_converter_process_groups(parallel_state, pg_collection):
 
     The converter passes ``pg_collection`` to the models it builds and to
     ``load_checkpoint`` and ``save_checkpoint``. Registering it keeps code that still
-    reads the global groups during conversion, such as a model provider that takes no
-    collection, on the same group objects and ranks.
+    reads the global groups during conversion, such as a model provider that accepts
+    ``pg_collection`` but does not pass it to its model, or library code that reads
+    ``parallel_state``, on the same group objects and ranks.
 
     The fake groups are not torch.distributed groups, so the global rank lists of the
-    grid cannot be derived from them and stay unset. For the same reason, the global
-    pipeline rank is not available: ``get_pipeline_model_parallel_rank`` asks
-    torch.distributed for the rank of its group. Code on the conversion path takes the
-    stage from ``pg_collection.pp`` instead.
+    grid cannot be derived from them and stay unset. The global rank and size accessors,
+    such as ``get_pipeline_model_parallel_rank``, ask their group for its own rank or
+    size, so they return what ``set_checkpoint_converter_model_ranks`` selects.
 
     Args:
         parallel_state: The ``megatron.core.parallel_state`` module.
