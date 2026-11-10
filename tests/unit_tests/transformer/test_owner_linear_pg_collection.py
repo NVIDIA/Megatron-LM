@@ -463,6 +463,20 @@ def _build_mtp_block():
     return MultiTokenPredictionBlock(config=config, spec=spec)
 
 
+def _build_moe_mtp_block():
+    config = _transformer_config(
+        num_layers=2,
+        mtp_num_layers=1,
+        num_moe_experts=4,
+        moe_ffn_hidden_size=64,
+        moe_router_topk=2,
+        add_bias_linear=False,
+    )
+    layer_spec = get_gpt_layer_local_spec(num_experts=4, moe_grouped_gemm=False)
+    spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=False, pp_rank=0)
+    return MultiTokenPredictionBlock(config=config, spec=spec)
+
+
 def _build_moe_layer(**overrides):
     config = _transformer_config(
         num_moe_experts=4,
@@ -489,6 +503,8 @@ def _owners_without_collection():
             "SimplifiedDSGQAIndexer",
         ),
         "mtp_block": (_build_mtp_block, "MultiTokenPredictionBlock"),
+        # Its routed experts read expt_gtp_remat from the block's fallback collection.
+        "moe_mtp_block": (_build_moe_mtp_block, "MultiTokenPredictionBlock"),
         "moe_layer": (_build_moe_layer, "MoELayer"),
         "moe_layer_with_shared_experts": (
             partial(_build_moe_layer, moe_shared_expert_intermediate_size=64),
@@ -556,9 +572,10 @@ def test_owner_without_collection_warns_once(global_grid, owner):
     [
         ("self_attention", attrgetter("pg_collection"), ("gtp_remat",)),
         ("mtp_block", attrgetter("layers.0.pg_collection"), ("gtp_remat",)),
+        ("moe_mtp_block", attrgetter("layers.0.pg_collection"), ("gtp_remat", "expt_gtp_remat")),
         ("moe_layer", attrgetter("experts.pg_collection"), ("gtp_remat", "expt_gtp_remat")),
     ],
-    ids=["self_attention", "mtp_block", "moe_layer"],
+    ids=["self_attention", "mtp_block", "moe_mtp_block", "moe_layer"],
 )
 def test_owner_fallback_collection_holds_the_global_gtp_groups(
     global_grid, owner, fallback_collection, fields

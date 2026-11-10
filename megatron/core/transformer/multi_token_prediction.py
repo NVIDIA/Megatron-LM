@@ -2566,8 +2566,16 @@ class MultiTokenPredictionBlock(MegatronModule):
                 ['dp'] if self.config.mtp_hsm else []
             )
             # An MoE MTP layer requires the expert groups, and its experts read the expert
-            # data-parallel groups: the fields that get_default_pg_collection sets.
-            required_pgs += ['ep', 'expt_tp', 'tp_ep', 'expt_dp', 'expt_dp_gtp_remat']
+            # data-parallel groups and expt_gtp_remat, the GTP weight-remat group of their linear
+            # layers: the fields that get_default_pg_collection sets.
+            required_pgs += [
+                'ep',
+                'expt_tp',
+                'tp_ep',
+                'expt_dp',
+                'expt_dp_gtp_remat',
+                'expt_gtp_remat',
+            ]
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
