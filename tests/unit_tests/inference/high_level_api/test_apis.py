@@ -138,9 +138,7 @@ class TestLifecycleGuards:
         llm._engine._exit_custom_gc_mode.assert_called_once_with()
         llm.wait_for_shutdown()  # also a no-op
 
-    def test_context_exit_restores_gc_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
+    def test_context_exit_restores_gc_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         with MegatronLLM(model=model, tokenizer=tok, use_coordinator=False) as llm:
             llm._engine._exit_custom_gc_mode.assert_not_called()
