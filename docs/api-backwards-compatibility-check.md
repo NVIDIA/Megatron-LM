@@ -214,10 +214,11 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   unwarned call in Megatron Core, one that lost its warning included. Whether a new warned
   fallback should block a pull request is still to be decided, see
   [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run these
-  three test files in the `tests/unit_tests/**/*.py` bucket, where a failure of any of them
-  fails the job. Testmon selects tests by the code they execute, and these read the files they
-  check as text, so `tests/unit_tests/testmon_mandatory_tests.yaml` adds them to a selective
-  run of a pull request that changes a file in a folder they scan or a top-level script.
+  three test files and `tests/unit_tests/test_global_memory_buffer_imports.py` in the
+  `tests/unit_tests/**/*.py` bucket, where a failure of any of them fails the job. Testmon
+  selects tests by the code they execute, and the four read the files they check as text, so
+  `tests/unit_tests/testmon_mandatory_tests.yaml` adds them to a selective run of a pull
+  request that changes a file in a folder they scan or a top-level script.
 - **Removal** is due when the version in `megatron/core/package_info.py` reaches the
   `removed_in` version of a fallback, the default of that argument, or a `*_REMOVED_IN`
   constant such as `_ACCESSOR_REMOVED_IN` in `parallel_state.py`.
