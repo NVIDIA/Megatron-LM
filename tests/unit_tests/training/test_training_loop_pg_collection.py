@@ -571,3 +571,81 @@ def test_setup_rejects_a_batch_too_small_for_its_ranks(monkeypatch, run_config, 
         training.setup_model_and_optimizer(
             None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
         )
+
+
+@pytest.mark.parametrize("multi_module", [False, True])
+def test_train_passes_the_collection_to_its_helpers(monkeypatch, run_config, multi_module):
+    """One skipped and one rollout-only iteration of train(), with its helpers recorded."""
+    grid_pg_collection = sample_pg_collection = pg_collection = ProcessGroupCollection()
+    if multi_module:
+        # The grid readers fall back to the global grid; samples count on the language model.
+        grid_pg_collection = None
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"language": sample_pg_collection}, language_model_module_name="language"
+        )
+    run_config.train.gpu_sniff_test_interval = None if multi_module else 1
+    run_config.train.micro_batch_size, run_config.train.train_iters = 1, 2
+    run_config.train.iterations_to_skip = [1]
+    args = SimpleNamespace(seq_length=8, decoder_seq_length=None, logits_save_dir=None)
+    train_state, calls = TrainState(), []
+
+    def record(name, result=None):
+        def recorder(*args, **kwargs):
+            calls.append((name, kwargs["pg_collection"] if "pg_collection" in kwargs else args[0]))
+            return result
+
+        monkeypatch.setattr(training, name, recorder)
+
+    record("_run_gpu_sniff_test")
+    record("dummy_train_step")
+    record("_get_data_parallel_world_size", 1)
+    record("consume_seqlen_stats_in_iteration", (None, None))
+    record("post_training_step_callbacks", 0.0)
+    # Everything else that train() calls on this path: no-ops, unless it needs their result.
+    no_ops = """get_timers get_energy_monitor get_rerun_state_machine one_logger_utils
+        ft_integration write_args_to_tensorboard print_datetime report_memory
+        _get_forward_backward_func maybe_finalize_async_save update_num_microbatches
+        maybe_verify_choices training_log _end_otel_startup_span _start_otel_train_span
+        _maybe_reroot_otel_interval _end_otel_train_span"""
+    falsy = """get_one_logger get_tensorboard_writer should_disable_forward_pre_hook
+        is_batch_size_transition _should_compute_params_norm _otel_sg_enabled
+        checkpoint_and_decide_exit"""
+    sizes = (
+        "get_num_microbatches get_current_global_batch_size get_current_running_global_batch_size"
+    )
+    for names, stub in (
+        (no_ops, MagicMock()),
+        (falsy, Mock(return_value=None)),
+        (sizes, lambda: 1),
+    ):
+        for name in names.split():
+            monkeypatch.setattr(training, name, stub)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
+    monkeypatch.setattr(training, "_otel_managed_span", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(training, "num_floating_point_operations", lambda *args, **kwargs: 0.0)
+    _forbid_global_reads(monkeypatch, training)
+
+    training.train(
+        None,
+        [MagicMock()],
+        None,
+        None,
+        None,
+        SimpleNamespace(finalize_model_grads_func=None),
+        None,
+        next_train_iterator=lambda iteration, iterator: iterator,
+        run_eval=lambda **kwargs: None,
+        pg_collection=pg_collection,
+        run_train_loop_without_updates=True,
+    )
+
+    assert calls == [
+        *([] if multi_module else [("_run_gpu_sniff_test", grid_pg_collection)]),
+        ("dummy_train_step", grid_pg_collection),
+        ("_get_data_parallel_world_size", sample_pg_collection),
+        ("_get_data_parallel_world_size", sample_pg_collection),
+        ("consume_seqlen_stats_in_iteration", grid_pg_collection),
+        ("post_training_step_callbacks", grid_pg_collection),
+    ]
+    assert train_state.iteration == 2
