@@ -21,7 +21,8 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   ``k = V - 1`` drops exactly the least likely one.
 * Greedy: a ``top_k == 1`` row samples the lowest-index argmax of its logits, whatever its top-p
   (open PR #8875). On main such a row with tied maxima draws at random among them (R08-F2):
-  ``test_greedy_rows_in_a_mixed_batch`` fails on main and passes with #8875.
+  #8875 tests those rows (``test_sampling_contract.py::test_greedy_rows_take_lowest_tied_index``).
+  The ``k = 1`` rows here have a unique maximum and pass on both.
 * Outputs, RNG: int64 ids in ``[0, V)``; the same generator state replays bit-exactly, every
   call advances it.
 * Tolerance class: sampler. Chi-square per row group against the fp64 reference, false-failure
@@ -114,37 +115,6 @@ def test_k_around_the_vocabulary(monkeypatch):
     counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
     spy.assert_only(KERNEL, launches)
     so.assert_batch_distribution(counts, specs, what=f"{KERNEL} V={vocab}")
-
-
-def test_greedy_rows_in_a_mixed_batch():
-    """``top_k == 1`` rows, with or without top-p, return the lowest tied maximum (id 7).
-
-    Contract of PR #8875. Fails on main (R08-F2): the joint kernel's top-k mask keeps both
-    tied maxima (ids 7 and 11) at k = 1, and about half the greedy rows return 11.
-    """
-    vocab = 1024
-    logits_row = torch.linspace(-4.0, 4.0, vocab).to(torch.bfloat16)
-    logits_row[7] = logits_row[11] = 8.0
-    greedy = [so.RowSpec(logits_row, t, top_k=1, top_p=p) for t in (0.0, 0.8) for p in (0.0, 0.9)]
-    others = [
-        so.RowSpec(logits_row, 1.0, top_k=5, name="k=5"),
-        so.RowSpec(logits_row, 1.0, top_p=0.9, name="p=0.9"),
-    ]
-    batch = so.build_batch(greedy + others, replicas=512)
-    tokens = so.sample(so.make_sampler(vocab), batch.logits, batch.rows, so.batch_context(batch))
-    n_greedy = 512 * len(greedy)
-    ou.assert_exact(
-        tokens[:n_greedy],
-        torch.full((n_greedy,), 7, dtype=torch.int64),
-        what="greedy rows (top_k == 1) with ids 7 and 11 tied at the maximum",
-    )
-    counts = torch.stack(
-        [
-            torch.bincount(tokens[rows].cpu(), minlength=vocab)
-            for rows in batch.groups[len(greedy) :]
-        ]
-    )
-    so.assert_batch_distribution(counts, others, what="filtered rows next to greedy rows")
 
 
 def _chunk_edges(vocab):

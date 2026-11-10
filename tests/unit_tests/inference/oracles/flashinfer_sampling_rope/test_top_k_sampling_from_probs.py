@@ -17,9 +17,9 @@ written before reading the kernel):
   temperature. (``sampling_oracle.reference_distribution`` steps 1-3, 5.)
 * Greedy: a ``top_k == 1`` row samples the lowest-index argmax of its logits, the token the torch
   backend returns. This is the contract of open PR #8875 (``fix/sampling-contract``). On main a
-  ``k = 1`` row with tied maxima draws at random among them, by batch row (finding R08-F2), so
-  ``test_greedy_rows_take_the_lowest_index_maximum`` fails on main and passes with #8875; the
-  ``k = 1`` rows elsewhere have a unique maximum and pass on both.
+  ``k = 1`` row with tied maxima draws at random among them, by batch row (finding R08-F2):
+  #8875 tests those rows (``test_sampling_contract.py::test_greedy_rows_take_lowest_tied_index``).
+  The ``k = 1`` rows here have a unique maximum and pass on both.
 * Outputs, RNG: int64 ids in ``[0, V)``; the same generator state replays bit-exactly, every
   call advances it.
 * Tolerance class: sampler. Chi-square per row group against the fp64 reference, false-failure
@@ -103,38 +103,6 @@ def test_k_around_the_vocabulary(monkeypatch):
     counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
     spy.assert_only(KERNEL, launches)
     so.assert_batch_distribution(counts, specs, what=f"{KERNEL} V={vocab}")
-
-
-def _tied_maximum_logits(vocab):
-    """Ids 7 and 11 tie at the maximum (8.0, exact in bf16); every other id is lower."""
-    logits = torch.linspace(-4.0, 4.0, vocab).to(torch.bfloat16)
-    logits[7] = logits[11] = 8.0
-    return logits
-
-
-@pytest.mark.parametrize("mixed", [False, True], ids=["all-greedy", "greedy-among-top-k"])
-def test_greedy_rows_take_the_lowest_index_maximum(mixed):
-    """``top_k == 1`` rows return the lowest-index argmax: id 7 of the tied ids 7 and 11.
-
-    Contract of PR #8875. Fails on main (R08-F2): FlashInfer's top-k kernel keeps both tied
-    maxima at k = 1 and about half the rows return 11.
-    """
-    vocab, greedy_rows = 1024, 2048
-    logits_row = _tied_maximum_logits(vocab)
-    temperature = [0.0 if i % 2 else 0.7 for i in range(greedy_rows)]
-    specs = [so.RowSpec(logits_row, t, top_k=1) for t in temperature]
-    if mixed:
-        specs += [so.RowSpec(logits_row, 1.0, top_k=5, name="k=5")] * 2048
-    batch = so.build_batch(specs, replicas=1)
-    tokens = so.sample(so.make_sampler(vocab), batch.logits, batch.rows, so.batch_context(batch))
-    ou.assert_exact(
-        tokens[:greedy_rows],
-        torch.full((greedy_rows,), 7, dtype=torch.int64),
-        what="greedy rows (top_k == 1) with ids 7 and 11 tied at the maximum",
-    )
-    if mixed:
-        counts = torch.bincount(tokens[greedy_rows:].cpu(), minlength=vocab).reshape(1, -1)
-        so.assert_batch_distribution(counts, specs[-1:], what="k=5 rows next to greedy rows")
 
 
 @pytest.mark.parametrize("vocab", so.SAMPLING_VOCAB_SIZES)

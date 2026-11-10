@@ -24,9 +24,10 @@ Contract (from the call site and FlashInfer's documented API, written before rea
 * Determinism: ``log_probs_kernel`` replays bit-exactly (RL compares these log-probs with the
   trainer's). On main, ``top_p_renorm_probs`` builds its radix histograms with float atomics and
   ``top_k_renorm_probs`` sums rows split over several CTAs with float atomics, so a row whose
-  cut sits within rounding of a cumulative boundary can keep a different set from run to run:
-  ``test_log_probs_kernel_replays_bit_exactly`` can fail on main; open PR #8572 (s12,
-  ``fix/s12-processed-logprob-determinism``) makes it pass.
+  cut sits within rounding of a cumulative boundary can keep a different set from run to run.
+  Open PR #8572 (s12, ``fix/s12-processed-logprob-determinism``) makes the processed log-probs
+  replay bit-exactly and tests that
+  (``test_flashinfer_sampling.py::test_log_probs_replay_bit_exact``); this module does not.
 * Tolerance class: floating point, bounded (``sampling_oracle.assert_renormalized`` and
   ``assert_log_probs``). The kept set is exact. A row's scale (its mass) within the fp32
   summation error of FlashInfer's reduction tree plus its reciprocal; the values after that
@@ -216,28 +217,3 @@ def test_log_probs_kernel_maps_rows_to_requests():
     probs = torch.softmax(batch.logits / temperature.to(so.DEVICE)[:, None], dim=-1)
     trusted = torch.log(so.trusted_renorm(probs, refs))
     so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel, token_to_request_index")
-
-
-def test_log_probs_kernel_replays_bit_exactly():
-    """Two calls on the same rows return the same bits, also for cuts on a cumulative boundary.
-
-    Can fail on main (float-atomic histograms and multi-CTA sums, see the module docstring);
-    passes with PR #8572 (s12).
-    """
-    vocab, rows = 152064, 64
-    g = ou.make_generator(device=so.DEVICE)
-    g_cpu = ou.make_generator()
-    logits = torch.randn((rows, vocab), generator=g, device=so.DEVICE) * 3.0
-    probs = torch.softmax(logits, dim=-1)
-    # Half the rows cut exactly on a cumulative mass of their own sorted probabilities.
-    sorted_probs = probs.double().sort(dim=-1, descending=True).values
-    cumulative = sorted_probs.cumsum(-1) / sorted_probs.sum(-1, keepdim=True)
-    index = torch.randint(8, 2048, (rows,), generator=g, device=so.DEVICE)
-    top_p = cumulative.gather(1, index[:, None])[:, 0].float().cpu()
-    top_p[rows // 2 :] = 0.5 + 0.4 * torch.rand(rows - rows // 2, generator=g_cpu)
-    top_k = torch.where(torch.arange(rows) % 4 == 0, 1000, 0).tolist()
-    context = so.stub_context([1.0] * rows, top_k, top_p.tolist())
-    sampler = so.make_sampler(vocab)
-    first = sampler.log_probs_kernel(logits, context)
-    for _ in range(4):
-        ou.assert_exact(sampler.log_probs_kernel(logits, context), first, what="log_probs replay")

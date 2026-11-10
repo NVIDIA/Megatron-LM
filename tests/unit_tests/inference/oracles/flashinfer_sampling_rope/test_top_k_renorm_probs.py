@@ -21,13 +21,15 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   ``log_softmax(l / max(T, 1e-6))`` in fp32, bit for bit. ``T = 0`` is that clamp, not a
   division by zero, also for filtered rows that are not greedy. Greedy rows (``top_k == 1``) are
   one-hot on the lowest-index argmax (``0`` there, ``-inf`` elsewhere): the contract of open PR
-  #8875. On main a greedy row with tied maxima puts ``log(1/2)`` on both (R08-F2), so
-  ``test_greedy_rows_score_one_hot`` fails on main and passes with #8875.
+  #8875. On main a greedy row with tied maxima puts ``log(1/2)`` on both (R08-F2): #8875 tests
+  those rows (``test_sampling_contract.py::test_greedy_rows_take_lowest_tied_index``).
 * Every token the sampler draws has a finite processed log-prob, and the draws follow
   ``exp(log_probs)``: sampling and scoring describe one distribution.
 * Every vocabulary launches: a row is split over as many CTAs as its shared memory needs.
   Finding O4a-N1: sizes whose per-CTA chunk ends within a few dozen tokens of the 57592-token
-  limit fail with ``invalid argument`` (``test_vocabularies_at_the_shared_memory_limit``).
+  limit fail with ``invalid argument`` (``test_vocabularies_at_the_shared_memory_limit``); at
+  Megatron's call site, #8572 tests the processed log-probs at such sizes
+  (``test_dynamic_context.py::test_flashinfer_top_k_log_probs_at_large_padded_vocabularies``).
 * Tolerance class: floating point, bounded (``sampling_oracle.assert_renormalized`` and
   ``assert_log_probs``). The kept set is exact: zero (``-inf``) exactly off it, positive (finite)
   on it. A row's scale (its mass) within the fp32 summation error of FlashInfer's reduction tree
@@ -130,8 +132,7 @@ def test_vocabularies_at_the_shared_memory_limit(vocab):
     do the edge probes 57509-57511 and 115018 (pdx 7852166); the probe 115016, with 336 bytes,
     runs (pdx 7876398; ``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``). No Megatron change can fix
     it: every failing case is a strict xfail up to the FlashInfer the CI image pins
-    (``sampling_oracle.XFAIL_O4A_N1``); the Megatron call site is
-    ``test_log_probs_kernel_at_the_shared_memory_limit`` (#8572).
+    (``sampling_oracle.XFAIL_O4A_N1``). #8572 tests Megatron's call site at such sizes.
     """
     g = ou.make_generator()
     specs = _specs(vocab, so.spread_positions(vocab, 48, g))
@@ -182,17 +183,6 @@ def test_log_probs_kernel_scores_the_top_k_distribution(vocab):
     _check_top_k_log_probs(vocab)
 
 
-@pytest.mark.parametrize("vocab", so.RENORM_UNLAUNCHABLE_PADDED_VOCABS[:2])
-def test_log_probs_kernel_at_the_shared_memory_limit(vocab):
-    """Processed log-probs at 128-padded vocabularies where ``top_k_renorm_probs`` cannot launch.
-
-    Finding O4a-N1 at Megatron's call site: fails on main (``TopKRenormProb failed with error
-    code invalid argument``, dfw 21223592 for the kernel at these sizes); passes with PR #8572,
-    whose ``top_k_mask_logits`` + softmax launches at them (measured through the joint sampler).
-    """
-    _check_top_k_log_probs(vocab)
-
-
 def _check_top_k_log_probs(vocab):
     g = ou.make_generator()
     positions = so.spread_positions(vocab, 48, g)
@@ -235,7 +225,8 @@ def test_log_probs_kernel_at_zero_temperature():
     of the filtered batch (``log_softmax`` of the clamped scale, bit for bit). Over the ramp
     (logits 0.25 apart) a top-k row is one-hot on its unique maximum. Holds on main, on #8875
     (which maps a request's T = 0 to greedy before the kernel; the kernel still clamps) and on
-    #8572; the greedy T = 0 rows are ``test_greedy_rows_score_one_hot``.
+    #8572. Greedy T = 0 rows with tied maxima are #8875's
+    ``test_sampling_contract.py::test_greedy_rows_take_lowest_tied_index``.
     """
     vocab = 32000
     g = ou.make_generator()
@@ -259,22 +250,6 @@ def test_log_probs_kernel_at_zero_temperature():
     trusted = _trusted_log_probs(batch.logits[:3], filtered, refs)
     so.assert_log_probs(log_probs[:3], refs, trusted, what="log_probs_kernel at T = 0")
     _assert_unfiltered_rows_are_log_softmax(batch, log_probs, specs)
-
-
-def test_greedy_rows_score_one_hot():
-    """``top_k == 1`` rows score the lowest-index argmax only (0 there, -inf elsewhere).
-
-    Contract of PR #8875. Fails on main (R08-F2): ``top_k_renorm_probs`` keeps both maxima tied
-    at ids 7 and 11 and the processed log-prob of each is log(1/2).
-    """
-    vocab = 1024
-    logits_row = torch.linspace(-4.0, 4.0, vocab).to(torch.bfloat16)
-    logits_row[7] = logits_row[11] = 8.0
-    specs = [so.RowSpec(logits_row, t, top_k=1) for t in (0.0, 0.7, 1.0)]
-    specs.append(so.RowSpec(logits_row, 1.0, top_k=5, name="k=5"))
-    _, log_probs, refs = _log_probs(specs)
-    expected = torch.log(refs[:3]).to(torch.float32).to(log_probs.device)
-    ou.assert_exact(log_probs[:3], expected, what="greedy rows with ids 7 and 11 tied")
 
 
 def test_sampled_tokens_have_finite_log_probs():

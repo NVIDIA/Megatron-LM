@@ -152,9 +152,6 @@ XFAIL_O4A_N2 = ou.xfail_upstream(
     raises=AssertionError,
 )
 
-# 128-multiple vocabularies whose processed log-probs (top_k_renorm_probs) cannot launch on H100
-# by the boundary above (O4a-N1); the call-site case takes the first two.
-RENORM_UNLAUNCHABLE_PADDED_VOCABS = (115072, 172544, 172672, 230144, 230272, 287616, 287744, 287872)
 
 # Elementwise roundings of a processed log-prob before the shape comparison: FlashInfer's main
 # path multiplies by two rcp.approx reciprocals (up to 1.5 ulp each), takes the log and the shape
