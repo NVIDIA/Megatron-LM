@@ -83,7 +83,9 @@ functions that read those groups are deprecated; Megatron-Core is moving to expl
   such as `resolve_process_groups()`, it sits in a `with global_process_group_fallback(...)`
   block (not in a function or lambda defined there), or a statement that is only a call of
   `warn_global_process_group_fallback()` comes before it, in its block or in a block that
-  contains that block, of the same function (of the module for module-level code). In that code, a
+  contains that block, of the same function (of the module for module-level code). A
+  `resolve_gtp_remat_group(..., owner=None)` call does not warn, so it needs such a block or
+  warning like any other read. In that code, a
   use of a private `parallel_state` attribute, other than the memory-buffer alias
   `_set_global_memory_buffer()`, fails it even inside a fallback block or after a fallback warning.
   Take the memory buffer from `megatron.core.utils`: the unit tests reject its aliases from
