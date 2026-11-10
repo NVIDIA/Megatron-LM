@@ -1209,6 +1209,10 @@ class TopKRouter(Router):
                 topk_indices=topk_indices,
                 dense_output=dense_output and not fused,
                 qb_valid_mask=qb_valid_mask,
+                # Global-batch QB supplies its histogram only on grad-enabled training
+                # passes, so every pass must use the reference router to stay bitwise
+                # identical across activation-checkpoint recompute, evaluation and inference.
+                allow_batch_invariant_sigmoid_topk=not self.use_quantile_balancing,
             )
             if self.config.moe_virtual_expert_load_balance and fused:
                 # TE returns compact IDs but full-width probabilities; normalize the pair.

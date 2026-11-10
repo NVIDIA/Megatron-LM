@@ -4194,10 +4194,7 @@ class DynamicInferenceEngine(AbstractEngine):
         allocator = self.context.mamba_slot_allocator
         if allocator is None or not req.precomputed_block_hashes:
             return 0
-        for index in range(len(req.precomputed_block_hashes) - 1, -1, -1):
-            if req.precomputed_block_hashes[index] in allocator.hash_to_block_id:
-                return index + 1
-        return 0
+        return allocator.registry.match_mamba_farthest(req.precomputed_block_hashes)
 
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""

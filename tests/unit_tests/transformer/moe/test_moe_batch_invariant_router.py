@@ -251,3 +251,66 @@ class TestTrainingAndInferenceRouters:
         probs.sum().backward()
         assert train_router.weight.grad is not None
         assert torch.isfinite(train_router.weight.grad).all()
+
+    def test_global_batch_quantile_balancing_keeps_reference_routing(self, monkeypatch):
+        """Global-batch QB routes every pass with the reference router under BI.
+
+        Its histogram is supplied only on grad-enabled training forwards, so the no-grad
+        first pass of activation checkpointing and evaluation must not switch to the
+        kernel, and the inference router must agree with training bit for bit.
+        """
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("global-batch quantile balancing must keep the reference routing")
+
+        monkeypatch.setattr(moe_utils, "sigmoid_topk_routing", unexpected)
+        num_experts, topk = 128, 6
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="sigmoid",
+            moe_router_topk_scaling_factor=2.5,
+            moe_router_dtype="fp32",
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        pgs = ProcessGroupCollection.use_mpu_process_groups()
+        train_router = TopKRouter(config, pg_collection=pgs).cuda()
+        infer_router = InferenceTopKRouter(config, pg_collection=pgs).cuda()
+        for router in (train_router, infer_router):
+            router.set_layer_number(1)
+        with torch.no_grad():
+            train_router.expert_bias.uniform_(-0.05, 0.05)
+        infer_router.load_state_dict(train_router.state_dict())
+
+        hidden = torch.randn(96, 2, 256, device="cuda", dtype=torch.bfloat16)
+        with set_batch_invariant_mode(True):
+            train_router.train()
+            # The no-grad first pass of activation checkpointing, then its recompute.
+            with torch.no_grad():
+                nograd_probs, nograd_map = train_router(hidden)
+            probs, routing_map = train_router(hidden)
+            train_router.eval()
+            with torch.no_grad():
+                eval_probs, eval_map = train_router(hidden)
+            with InferenceMode.active(), torch.inference_mode():
+                inf_probs, inf_indices = infer_router(hidden[:, :1])
+                inf_probs_b, inf_indices_b = infer_router(hidden[:, 1:])
+
+        probs = probs.detach()
+        for other_probs, other_map in ((nograd_probs, nograd_map), (eval_probs, eval_map)):
+            assert torch.equal(other_map, routing_map)
+            assert _bits_equal(other_probs, probs)
+        dense = torch.zeros(96, 2, num_experts, device="cuda")
+        dense[:, 0].scatter_(1, inf_indices, inf_probs)
+        dense[:, 1].scatter_(1, inf_indices_b, inf_probs_b)
+        dense = dense.view(-1, num_experts)
+        assert torch.equal(routing_map, dense != 0)
+        assert _bits_equal(probs, dense)

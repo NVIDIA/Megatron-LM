@@ -3884,10 +3884,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                         source,
                         source_layout,
                         target_layout,
-                        self.cp_group,
+                        runtime_cp_group,
                         self.sequence_parallel,
                         self.tp_group,
-                        self.tp_cp_group,
+                        runtime_tp_cp_group,
                         cp_batch.thd_plan,
                     )
                     for source in attn_res_sources

@@ -740,7 +740,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 return hidden_states, local_tokens, probs, shared_expert_output
 
         forward_kwargs = dict(
-            hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
             rotary_pos_cos=node.chunk_state.rotary_pos_cos,
@@ -766,7 +765,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # while on SBHD TE reads only the keys it captured and ignores the
             # rest, so leaving it in kwargs is safe on both layouts.
             forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
-        forward_outputs = forward_func(**forward_kwargs)
+        forward_outputs = forward_func(hidden_states, **forward_kwargs)
         if is_mhc_layer:
             hidden_states, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post = (
                 forward_outputs

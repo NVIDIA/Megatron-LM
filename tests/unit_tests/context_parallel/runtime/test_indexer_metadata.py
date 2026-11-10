@@ -50,6 +50,7 @@ def test_dsa_runtime_cp_groups_are_forward_local():
         pg_collection=SimpleNamespace(cp=static_group, tp=_FakeCPGroup(1)),
         config=SimpleNamespace(
             rope_type="rope",
+            dsa_indexer_rope_interleaved=False,
             sequence_parallel=False,
             dsa_indexer_k_norm_fp32=False,
             dsa_indexer_rotate_activation=False,
@@ -71,7 +72,16 @@ def test_dsa_runtime_cp_groups_are_forward_local():
     indexer.rotary_pos_emb.get_rotary_seq_len = lambda *args: 3
     seen_groups = []
 
-    def capture_rope(value, rotary_pos_emb, mscale, cu_seqlens=None, cp_group=None):
+    def capture_rope(
+        value,
+        rotary_pos_emb,
+        mscale,
+        cu_seqlens=None,
+        max_seqlen=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        cp_group=None,
+    ):
         seen_groups.append(cp_group)
         return value
 

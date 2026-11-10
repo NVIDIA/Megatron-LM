@@ -2903,6 +2903,7 @@ def _add_network_size_args(parser):
         "grad_sync_func",
         "param_sync_func",
         "_cpu_offloading_context",
+        "_linear_cp_layout_explicit",
         "init_method",
         "output_layer_init_method",
         "embedding_init_method",

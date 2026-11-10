@@ -1958,10 +1958,7 @@ class TestDSv4HybridAttentionTHDCP:
             if reset_parameter_grads:
                 _zero_existing_grads(layer, hidden)
             output, context = layer(
-                hidden_states=hidden,
-                attention_mask=None,
-                packed_seq_params=packed,
-                padding_mask=padding_mask,
+                hidden, attention_mask=None, packed_seq_params=packed, padding_mask=padding_mask
             )
             assert context is None
             output.backward(output_grad)

@@ -256,12 +256,13 @@ def test_process_mtp_per_token_loss_uses_explicit_metric_group(monkeypatch):
     def capture_metrics(*args, **kwargs):
         captured["avg_group"] = kwargs["avg_group"]
         captured["loss"] = args[0]
-        captured["num_tokens"] = kwargs["num_tokens"]
+        captured["num_tokens"] = args[1]
+        captured["calculate_per_token_loss"] = kwargs["calculate_per_token_loss"]
 
     monkeypatch.setattr(
         mtp_module.parallel_state, "get_data_parallel_group", unexpected_global_read
     )
-    monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+    monkeypatch.setattr(MTPLossLoggingHelper, "save_loss_to_tracker", capture_metrics)
 
     config = TransformerConfig(
         mtp_num_layers=1,
@@ -290,8 +291,8 @@ def test_process_mtp_per_token_loss_uses_explicit_metric_group(monkeypatch):
     )
 
     assert captured["avg_group"] is metric_avg_group
-    assert captured["loss"].item() == (seq_len - 1 if per_token else 1)
-    if per_token:
-        assert captured["num_tokens"].item() == seq_len - 1
-    else:
-        assert captured["num_tokens"] is None
+    assert captured["calculate_per_token_loss"] is per_token
+    # The dev logging helper receives the raw local loss sum and token count in both
+    # modes and applies microbatch normalization itself when per-token loss is off.
+    assert captured["loss"].item() == seq_len - 1
+    assert captured["num_tokens"].item() == seq_len - 1

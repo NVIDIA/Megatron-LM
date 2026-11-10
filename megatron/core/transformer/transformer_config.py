@@ -1530,6 +1530,10 @@ class TransformerConfig(ModelParallelConfig):
     GDN/KDA perform their own module-local chunkwise conversion. Set contiguous
     explicitly with chunkwise GDP to use stack-level CP layout conversion."""
 
+    _linear_cp_layout_explicit: Optional[bool] = field(default=None, repr=False, compare=False)
+    """Internal: whether linear_cp_layout was set explicitly. Derived in __post_init__ and
+    carried by dataclasses.replace(), so the filled-in zigzag default stays implicit."""
+
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
 
@@ -2259,7 +2263,12 @@ class TransformerConfig(ModelParallelConfig):
                     else "headwise"
                 )
             )
-        self._linear_cp_layout_explicit = self.linear_cp_layout is not None
+        if self.linear_cp_layout is None:
+            self._linear_cp_layout_explicit = False
+        elif self._linear_cp_layout_explicit is None or self.linear_cp_layout != "zigzag":
+            # dataclasses.replace() passes the filled-in zigzag default back through
+            # __init__; keep the carried flag so that default does not become explicit.
+            self._linear_cp_layout_explicit = True
         if self.experimental_attention_variant == "dsv4_hybrid":
             # Preserve dev's uniform runtime-CP ownership for DSv4. Migrating dynamic
             # and balanced indexer routes to the newer per-layer layout manager is a

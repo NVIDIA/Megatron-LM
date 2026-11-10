@@ -484,7 +484,7 @@ def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
     batch = {
         "attention_mask": None,
         "cu_seqlens": cu_seqlens,
-        "hybrid_cp_group": object(),
+        "hybrid_cp_group": SimpleNamespace(size=lambda: 4),
         "labels": torch.zeros_like(tokens),
         "local_cp_size": torch.tensor(4),
         "loss_mask": loss_mask,

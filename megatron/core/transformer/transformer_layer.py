@@ -1238,7 +1238,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     "Layer deltas are only supported for the hybrid AttnRes wrapper."
                 )
             return self._forward_hybrid_attn_res_delta(
-                *args, input_is_normalized=input_is_normalized, **kwargs
+                hidden_states, *args, input_is_normalized=input_is_normalized, **kwargs
             )
         if input_is_normalized:
             raise RuntimeError(

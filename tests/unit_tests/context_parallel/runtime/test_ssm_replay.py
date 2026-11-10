@@ -75,6 +75,9 @@ def test_runtime_cp_gdn_module_replays(variant):
             linear_attention_freq=[1],
             deterministic_mode=True,
             gdn_kernel_backend="torch",
+            # Main's default; dev resolves an unset GDN linear_cp_mode to the
+            # FLA-only chunkwise path, which the native recurrence rejects.
+            linear_cp_mode="headwise",
             use_cpu_initialization=True,
             bf16=True,
             params_dtype=torch.bfloat16,

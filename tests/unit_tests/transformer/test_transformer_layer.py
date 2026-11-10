@@ -1050,11 +1050,11 @@ class TestMHCRecomputeMemorySavingDevFeatures:
         h = hidden_states
         for i, layer in enumerate(layers):
             is_last_in_block = (i == num_layers - 1) or ((i + 1) % recompute_block_size == 0)
-            kwargs = dict(hidden_states=h, attention_mask=attention_mask)
+            kwargs = dict(attention_mask=attention_mask)
             if manager is not None:
                 manager.is_last_layer_in_recompute_block = is_last_in_block
                 kwargs['mhc_recompute_manager'] = manager
-            h, _ = layer(**kwargs)
+            h, _ = layer(h, **kwargs)
             if manager is not None and is_last_in_block:
                 manager.discard_all_outputs_and_register_unified_recompute(h)
                 if i < num_layers - 1:
@@ -1512,7 +1512,7 @@ class TestMHCWithCudaGraphDevFeatures:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                out, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
+                out, _ = layer(static_input, attention_mask=attention_mask)
                 out.sum().backward()
         torch.cuda.current_stream().wait_stream(s)
 
@@ -1523,7 +1523,7 @@ class TestMHCWithCudaGraphDevFeatures:
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            output, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
+            output, _ = layer(static_input, attention_mask=attention_mask)
             output.sum().backward()
 
         # Replay with new input data.
@@ -1556,7 +1556,7 @@ class TestMHCWithCudaGraphDevFeatures:
         graph_grad = static_input.grad.detach().clone()
 
         eager_input = test_data.clone().requires_grad_(True)
-        eager_output, _ = layer(hidden_states=eager_input, attention_mask=attention_mask)
+        eager_output, _ = layer(eager_input, attention_mask=attention_mask)
         eager_output.sum().backward()
 
         assert torch.allclose(graph_out, eager_output.detach(), atol=1e-5), (
@@ -1717,7 +1717,7 @@ class TestMHCWithCudaGraphDevFeatures:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output, context = layer(hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (seq_len, batch_size, n_channels)
 
@@ -1782,7 +1782,7 @@ class TestMHCWithOffloadingDevFeatures:
             pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
         )
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output, context = layer(hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (
             seq_len,
@@ -1830,7 +1830,7 @@ class TestMHCWithOffloadingDevFeatures:
         layer_no_offload.train()
 
         h1 = input_data.clone().detach().requires_grad_(True)
-        out1, _ = layer_no_offload(hidden_states=h1, attention_mask=attention_mask)
+        out1, _ = layer_no_offload(h1, attention_mask=attention_mask)
         out1.sum().backward()
         grad_no_offload = h1.grad.clone()
         out1_detached = out1.detach().clone()
@@ -1854,7 +1854,7 @@ class TestMHCWithOffloadingDevFeatures:
         )
 
         h2 = input_data.clone().detach().requires_grad_(True)
-        out2, _ = layer_offload(hidden_states=h2, attention_mask=attention_mask)
+        out2, _ = layer_offload(h2, attention_mask=attention_mask)
         out2.sum().backward()
         grad_offload = h2.grad.clone()
 

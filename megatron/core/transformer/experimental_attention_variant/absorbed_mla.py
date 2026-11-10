@@ -13,6 +13,7 @@ can be more efficient for certain attention variants.
 """
 
 import copy
+import inspect
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ from megatron.core.transformer.attention_output_gate import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
@@ -131,6 +132,25 @@ class AbsorbedMLASelfAttentionSubmodules:
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     kv_layernorm: Union[ModuleSpec, type] = None
+
+
+def _core_attention_accepts_kwarg(spec_or_module: Union[ModuleSpec, type], name: str) -> bool:
+    """Return whether the core-attention module built from a spec accepts keyword ``name``.
+
+    Absorbed MLA forwards ``is_mtp_layer`` to sparse core attention modules such as
+    DSAttention, while standard backends such as TEDotProductAttention do not accept it.
+    """
+    target = spec_or_module
+    if isinstance(target, ModuleSpec):
+        target = get_module(target)
+    try:
+        parameters = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        # Preserve the previous behaviour when the signature cannot be inspected.
+        return True
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 class AbsorbedMLASelfAttention(Attention):
@@ -237,6 +257,12 @@ class AbsorbedMLASelfAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        # Sparse core attention (e.g. DSAttention) needs is_mtp_layer to offset its layer
+        # number; standard backends such as TEDotProductAttention do not accept it.
+        core_attn_extra_kwargs: dict[str, bool] = {}
+        if _core_attention_accepts_kwarg(submodules.core_attention, "is_mtp_layer"):
+            core_attn_extra_kwargs["is_mtp_layer"] = is_mtp_layer
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -248,7 +274,7 @@ class AbsorbedMLASelfAttention(Attention):
             v_channels=self.config.kv_lora_rank,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
-            is_mtp_layer=is_mtp_layer,
+            **core_attn_extra_kwargs,
         )
 
         if self.config.attention_output_gate:

@@ -29,6 +29,9 @@ def _config(num_layers=1, per_token=True):
         mtp_detach_heads=False,
         context_parallel_size=1,
         attention_cp_layout="zigzag",
+        mtp_loss_type="cross_entropy",
+        cross_entropy_loss_fusion=False,
+        cross_entropy_fusion_impl="native",
     )
 
 
@@ -47,14 +50,12 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         else None
     )
     reductions = []
-    logged = []
 
-    def roll(tensor, return_sum=True, cp_group=None, **kwargs):
+    def roll(tensors, cp_group=None, **kwargs):
+        # The dev MTP loss rolls labels and the loss mask as one grouped field list.
         assert cp_group is runtime_group
-        if not return_sum:
-            return tensor, None
-        mask = tensor.new_tensor([[1, 1, 1, 0]])
-        return mask, mask.sum()
+        labels, loss_mask = tensors
+        return [labels, loss_mask.new_tensor([[1, 1, 1, 0]])]
 
     def reduce(counts, op=None, group=None):
         assert cp_size == 2 and group is runtime_group
@@ -65,11 +66,9 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
 
     monkeypatch.setattr(mtp, "roll_tensor", roll)
     monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
-    monkeypatch.setattr(
-        mtp.MTPLossLoggingHelper,
-        "save_metrics_to_tracker",
-        lambda *args, **kwargs: logged.append((args[0].detach(), kwargs["num_tokens"])),
-    )
+    # Log into a fresh CPU tracker to observe the dev logging helper's local state.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(mtp.MTPLossLoggingHelper, "tracker", {})
     hidden = torch.ones(8, 1, 1, requires_grad=True)
     output = mtp.process_mtp_loss(
         hidden_states=hidden,
@@ -91,12 +90,14 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         torch.testing.assert_close(
             hidden.grad[4:, 0, 0] / main_tokens, torch.tensor([0.3 / mtp_tokens] * 3 + [0.0])
         )
-        assert logged[0][0].item() == 3
-        assert logged[0][1].item() == 3
+        tracker = mtp.MTPLossLoggingHelper.tracker
+        assert tracker["loss_sums"].item() == 3
+        assert tracker["num_tokens"].item() == 3
     else:
         torch.testing.assert_close(hidden.grad[4:, 0, 0], torch.tensor([0.1] * 3 + [0.0]))
-        assert logged[0][0].item() == 1
-        assert logged[0][1] is None
+        tracker = mtp.MTPLossLoggingHelper.tracker
+        assert tracker["loss_sums"].item() == 1
+        assert "num_tokens" not in tracker
 
 
 @pytest.fixture(scope="module")

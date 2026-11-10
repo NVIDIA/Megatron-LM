@@ -56,6 +56,14 @@ def _check_fixed_raw_storage(tracker, size: int) -> None:
         raise RuntimeError("DSA metric tracker raw-loss storage does not match fixed capacity.")
 
 
+def _logging_group_size(group) -> int:
+    """Return a logging group's width; opaque sentinel groups count as one rank."""
+    if group is None:
+        return 1
+    size = getattr(group, "size", None)
+    return int(size()) if callable(size) else 1
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
@@ -145,19 +153,34 @@ class DSAIndexerLossLoggingHelper:
                 tracker["raw_loss_recorded"] = True
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["requires_dp_cp"] = tracker.get("requires_dp_cp", False) or any(
+            _logging_group_size(group) > 1 for group in (reduce_group, avg_group)
+        )
+        DSAIndexerLossLoggingHelper._accumulate_cp_weighted_loss(
+            tracker, layer_number, loss, raw_loss, _logging_group_size(reduce_group)
+        )
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
-        """Clear indexer losses, optionally retaining reduction-group metadata."""
+        """Clear indexer losses, optionally retaining reduction-group metadata.
+
+        ``preserve_groups`` (CUDA Graph replay) keeps writer groups that are already recorded
+        but never adds placeholder entries: CP-weighted contributions need no saved groups.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        reduce_group = tracker.get("reduce_group") if preserve_groups else None
-        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
         if "raw_values" in tracker:
             tracker["raw_values"].zero_()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
+        if not preserve_groups:
+            tracker["reduce_group"] = None
+            tracker["avg_group"] = None
+        for key in ("cp_weighted_values", "cp_weighted_raw_values"):
+            if key in tracker:
+                tracker[key].zero_()
+        if not preserve_groups:
+            tracker["requires_dp_cp"] = False
+            tracker.pop("cp_weighted_incomplete", None)
 
     @staticmethod
     def reduce_loss_in_tracker(
@@ -189,7 +212,15 @@ class DSAIndexerLossLoggingHelper:
             dp_group: Data-parallel group that owns the language model. Used by static CP
                 logging and to validate the Dynamic-CP parent domain; defaults to the legacy
                 global process-group registry when omitted.
+            pg_collection: Language-model process groups. Without a Dynamic-CP parent, selects
+                the fixed DP x CP reduction of CP-weighted contributions, which does not depend
+                on the order of runtime CP microbatches.
         """
+        if pg_collection is not None and dynamic_cp_parent_group is None:
+            DSAIndexerLossLoggingHelper._reduce_loss_with_fixed_dp_cp(
+                pg_collection, num_layers, pp_group=pp_group
+            )
+            return
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
@@ -323,6 +354,121 @@ class DSAIndexerLossLoggingHelper:
         return True
 
     @staticmethod
+    def _cp_weighted_buffer(tracker, key: str, size: Optional[int] = None):
+        """Return a CP-weighted shadow buffer sized like ``values``, growing it when allowed."""
+        values = tracker["values"]
+        size = values.shape[0] if size is None else size
+        buffer = tracker.get(key)
+        if buffer is not None and buffer.shape[0] >= size:
+            return buffer
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            # Never allocate inside a CUDA Graph capture; the fixed DP x CP reduction rejects
+            # the incomplete buffer instead of logging partial values.
+            tracker["cp_weighted_incomplete"] = True
+            return None
+        grown = torch.zeros(size, device=values.device, dtype=values.dtype)
+        if buffer is not None:
+            grown[: buffer.shape[0]] = buffer
+        tracker[key] = grown
+        return grown
+
+    @staticmethod
+    def _accumulate_cp_weighted_loss(
+        tracker, layer_number: int, loss: torch.Tensor, raw_loss, scale: int
+    ) -> None:
+        """Accumulate contributions weighted by their own CP reduction width.
+
+        ``values`` keeps the writer-group semantics used with explicit language-model groups
+        and Dynamic CP. These shadow buffers let the fixed DP x CP reduction produce the same
+        logical-sample mean regardless of the order of runtime CP microbatches.
+        """
+        for key, value in (("cp_weighted_values", loss), ("cp_weighted_raw_values", raw_loss)):
+            if value is None:
+                continue
+            buffer = DSAIndexerLossLoggingHelper._cp_weighted_buffer(tracker, key)
+            if buffer is not None:
+                buffer[layer_number - 1].add_(value.detach(), alpha=scale)
+
+    @staticmethod
+    def _reduce_loss_with_fixed_dp_cp(
+        pg_collection: ProcessGroupCollection,
+        num_layers: Optional[int] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
+        """Reduce CP-weighted indexer metrics over the fixed DP x CP domain.
+
+        Each contribution was weighted by its CP reduction width when recorded, so summing over
+        the fixed DP x CP group (and GTP-remat replicas) and dividing by the contributing ranks
+        gives the same logical-sample mean for static CP, runtime CP and any microbatch order.
+        """
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        if pp_group is None:
+            pp_group = pg_collection.pp
+        # Legacy migration fallback for callers whose pg_collection carries no PP group.
+        if pp_group is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        dp_cp_group = getattr(pg_collection, "dp_cp", None)
+        if dp_cp_group is None:
+            cp_group = getattr(pg_collection, "cp", None)
+            dynamic_cp_groups = getattr(pg_collection, "dynamic_cp", None) or {}
+            if (
+                tracker.get("requires_dp_cp", False)
+                or _logging_group_size(cp_group) > 1
+                or any(_logging_group_size(group) > 1 for group in dynamic_cp_groups.values())
+            ):
+                raise ValueError("DSA indexer logging with CP requires a fixed dp_cp process group")
+            dp_cp_group = pg_collection.dp
+            if dp_cp_group is None:
+                raise ValueError("DSA indexer logging requires a dp or dp_cp process group")
+        if tracker.get("cp_weighted_incomplete", False):
+            raise RuntimeError(
+                "Fixed DP x CP DSA logging requires CP-weighted tracker storage allocated before "
+                "CUDA Graph capture."
+            )
+        agreed_size = tracker.get("agreed_size")
+        if agreed_size is not None:
+            if not _tracker_pp_group_matches(tracker, "agreed_size", pp_group):
+                raise RuntimeError(
+                    "DSA metric tracker cached size belongs to a different PP group."
+                )
+            size = agreed_size
+            if size > 0 and (tracker.get("values") is None or tracker["values"].shape[0] != size):
+                raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            size = int(size_t.item())
+            if size > 0:
+                DSAIndexerLossLoggingHelper.ensure_tracker_size(size)
+                tracker["agreed_size"] = size
+                _record_tracker_pp_group(tracker, "agreed_size", pp_group)
+        if size == 0:
+            return
+        metric_keys = [("values", "cp_weighted_values")]
+        if DSAIndexerLossLoggingHelper._agree_raw_loss_logging(
+            tracker, size, pp_group, lazy=agreed_size is None
+        ):
+            metric_keys.append(("raw_values", "cp_weighted_raw_values"))
+        contributing_ranks = get_pg_size(dp_cp_group)
+        gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+        if gtp_remat_group is not None:
+            contributing_ranks *= get_pg_size(gtp_remat_group)
+        for target_key, weighted_key in metric_keys:
+            weighted = DSAIndexerLossLoggingHelper._cp_weighted_buffer(tracker, weighted_key, size)
+            torch.distributed.all_reduce(weighted, group=pp_group)
+            torch.distributed.all_reduce(
+                weighted, group=dp_cp_group, op=torch.distributed.ReduceOp.SUM
+            )
+            if gtp_remat_group is not None and get_pg_size(gtp_remat_group) > 1:
+                torch.distributed.all_reduce(
+                    weighted, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
+                )
+            tracker[target_key].copy_(weighted / contributing_ranks)
+
+    @staticmethod
     def track_indexer_metrics(
         loss_scale: float,
         iteration: int,
@@ -360,16 +506,25 @@ class DSAIndexerLossLoggingHelper:
             pp_group: Pipeline-parallel group that owns the language model.
             dp_group: Data-parallel group that owns the language model.
         """
+        # A bare process-group collection selects the fixed DP x CP reduction. Explicit
+        # language-model groups keep the writer-group and Dynamic-CP parent reductions.
+        use_fixed_dp_cp = (
+            pg_collection is not None
+            and dynamic_cp_parent_group is None
+            and pp_group is None
+            and dp_group is None
+        )
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
-
+        reduce_kwargs = {"pg_collection": pg_collection} if use_fixed_dp_cp else {}
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
             dynamic_cp_parent_group=dynamic_cp_parent_group,
             configured_cp_size=configured_cp_size,
             pp_group=pp_group,
             dp_group=dp_group,
+            **reduce_kwargs,
         )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:

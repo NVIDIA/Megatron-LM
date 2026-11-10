@@ -796,21 +796,24 @@ class ContextParallelLayoutState:
         return self.manager.finalize_layer_output(layer_index, hidden_states, self.thd_plan)
 
     def convert_sequence_metadata(
-        self, tensor: torch.Tensor, target_layout: CPLayout
+        self, tensor: torch.Tensor, target_layout: CPLayout, *, sequence_parallel_local=False
     ) -> torch.Tensor:
         """Convert batch-first token metadata using the activation route's TP ownership.
 
         Token IDs and padding masks are replicated across TP, while a packed activation
         route may describe SP shards. Enter that same shard frame before the conversion,
         then gather back so downstream routers can select their own local token slice.
+        Metadata that the caller already scattered into the SP frame
+        (``sequence_parallel_local=True``) is converted as-is and stays SP-local.
         """
         source_layout = self.manager.boundary_layout
         if source_layout == target_layout:
             return tensor
+        reshard = self.manager.sequence_parallel and not sequence_parallel_local
         value = tensor.transpose(0, 1).contiguous()
-        if self.manager.sequence_parallel:
+        if reshard:
             value = scatter_to_sequence_parallel_region(value, group=self.manager.tp_group)
         value = self.manager._convert_cp_layout(value, source_layout, target_layout, self.thd_plan)
-        if self.manager.sequence_parallel:
+        if reshard:
             value = gather_from_sequence_parallel_region(value, group=self.manager.tp_group)
         return value.transpose(0, 1).contiguous()

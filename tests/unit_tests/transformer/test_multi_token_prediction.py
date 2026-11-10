@@ -5758,7 +5758,7 @@ class TestMultiTokenPredictionHybrid:
         assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
         assert captured["mtp_loss"]["packed_seq_params"] is zigzag_packed_seq_params
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
-        assert captured["mtp_loss"]["cp_group"] is cp_group
+        assert captured["mtp_loss"]["cp_group"] is runtime_cp_group
         assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
 

@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.context_parallel_layout import (
+    CpPartitionModeConverter,
+    convert_module_input_tensors_cp_partition_mode,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
@@ -616,6 +619,36 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 target_partition_mode="contiguous",
                 sequence_parallel=self.config.sequence_parallel,
                 config=self.config,
+            )
+        elif (
+            cp_size_headwise > 1
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and packed_seq_params.cp_partition_mode not in (None, "zigzag")
+        ):
+            # Runtime CP layout plans may hand GDN a non-zigzag THD layout (for example
+            # ``linear_cp_layout="contiguous"``). The headwise CP all-to-all assumes the
+            # zigzag order, so convert on entry and restore the caller's layout on exit.
+            input_partition_mode = packed_seq_params.cp_partition_mode
+            converter_kwargs = dict(
+                cp_group=cp_group_headwise,
+                packed_seq_params=packed_seq_params,
+                config=self.config,
+                tp_group=self.tp_group,
+                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+            )
+            to_zigzag_converter = CpPartitionModeConverter(
+                source_partition_mode=input_partition_mode,
+                target_partition_mode="zigzag",
+                **converter_kwargs,
+            )
+            hidden_states = to_zigzag_converter.convert(
+                hidden_states, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+            back_to_input_converter = CpPartitionModeConverter(
+                source_partition_mode="zigzag",
+                target_partition_mode=input_partition_mode,
+                **converter_kwargs,
             )
 
         seq_len_local, batch, _ = hidden_states.shape

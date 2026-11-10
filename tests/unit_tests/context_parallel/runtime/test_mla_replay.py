@@ -73,6 +73,7 @@ def test_mla_runtime_cp_projection_rope_replays(absorbed, fused_rope):
                 **{
                     name: getattr(submodules, name)
                     for name in AbsorbedMLASelfAttentionSubmodules.__dataclass_fields__
+                    if hasattr(submodules, name)
                 }
             )
         attention = cls(

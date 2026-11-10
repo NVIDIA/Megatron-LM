@@ -285,9 +285,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
-        # Chunkwise KDA partitions tokens and keeps all TP-local heads, so only
-        # headwise variants require divisibility by the selected CP group size.
-        if not (isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise"):
+        # Chunkwise KDA and dev's chunkwise GDN partition tokens and keep all TP-local
+        # heads, so only headwise variants require divisibility by the selected CP group
+        # size. GDN2 has no chunkwise path and always shards its heads across CP ranks.
+        if config.linear_cp_mode != "chunkwise" or config.experimental_attention_variant == "gdn2":
             _validate_dynamic_cp_head_geometry(
                 config,
                 self.pg_collection,

@@ -221,6 +221,8 @@ def test_embedding_min_norm_disabled_is_noop(monkeypatch):
 def test_post_optimizer_transform_runs_before_model_copy():
     events = []
     optimizer = SimpleNamespace(
+        _optimizer_state_offloader=None,
+        _layer_wise_non_distopt_child=False,
         config=SimpleNamespace(timers=None, reuse_grad_buf_for_mxfp8_param_ag=False),
         is_stub_optimizer=False,
         optimizer=SimpleNamespace(step=lambda: events.append("inner-step")),
@@ -243,6 +245,8 @@ def test_post_optimizer_transform_precedes_mxfp8_staging(overlap_param_gather, e
     """Overlap defers staging, while the synchronous MXFP8 path stages the floored master."""
     events = []
     optimizer = SimpleNamespace(
+        _optimizer_state_offloader=None,
+        _layer_wise_non_distopt_child=False,
         config=SimpleNamespace(
             timers=None,
             reuse_grad_buf_for_mxfp8_param_ag=True,
@@ -261,6 +265,8 @@ def test_post_optimizer_transform_precedes_mxfp8_staging(overlap_param_gather, e
 def test_stub_optimizer_does_not_run_post_optimizer_transform():
     events = []
     optimizer = SimpleNamespace(
+        _optimizer_state_offloader=None,
+        _layer_wise_non_distopt_child=False,
         config=SimpleNamespace(timers=None, reuse_grad_buf_for_mxfp8_param_ag=False),
         is_stub_optimizer=True,
         optimizer=SimpleNamespace(step=lambda: events.append("inner-step")),
@@ -275,6 +281,7 @@ def test_stub_optimizer_does_not_run_post_optimizer_transform():
 def test_overflow_skips_optimizer_step_and_post_transform():
     events = []
     optimizer = SimpleNamespace(
+        _optimizer_state_offloader=None,
         config=SimpleNamespace(timers=None),
         prepare_grads=lambda: True,
         step_with_ready_grads=lambda: events.append("step-with-ready-grads"),

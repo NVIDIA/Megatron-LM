@@ -26,7 +26,9 @@ def test_shortcut_router_receives_runtime_cp_metadata():
         assert padding_mask is mask and packed_seq_params is packed
         return value, padding_mask, None, None
 
-    def route(value, padding_mask, packed_seq_params=None):
+    def route(value, padding_mask, input_ids=None, packed_seq_params=None):
+        # Dev's shortcut block also forwards the unflattened token ids to routing.
+        assert input_ids is None
         assert padding_mask is mask and packed_seq_params is packed
         calls.append(packed_seq_params)
         return value, value
@@ -68,8 +70,11 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         assert padding_mask is input_mask and padding_mask_by_layout is masks_by_layout
         return moe_mask
 
-    def route(shortcut_hidden, padding_mask, packed_seq_params, recompute_context=None):
+    def route(
+        shortcut_hidden, padding_mask, packed_seq_params, recompute_context=None, input_ids=None
+    ):
         assert recompute_context is None
+        assert input_ids is None
         assert padding_mask is (moe_mask if with_layout else input_mask)
         assert packed_seq_params is (moe_packed if with_layout else input_packed)
         return shortcut_hidden, shortcut_hidden

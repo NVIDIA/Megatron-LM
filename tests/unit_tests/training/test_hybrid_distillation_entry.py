@@ -14,7 +14,8 @@ from megatron import training
 from megatron.training import argument_utils, arguments, global_vars, utils
 
 
-def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch):
+def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch, run_config):
+    # Since main #8798, loss checks read the rerun config; args keep only application inputs.
     args = SimpleNamespace(
         logits_load_dir="teacher-cache",
         logits_load_decode_threads=2,
@@ -22,9 +23,9 @@ def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch):
         logits_load_kd_loss_alpha=0.5,
         logits_load_ignore_errors=False,
         logits_load_ignore_hash=True,
-        check_for_nan_in_loss_and_grad=False,
-        check_for_spiky_loss=False,
     )
+    run_config.rerun_state_machine.check_for_nan_in_loss = False
+    run_config.rerun_state_machine.check_for_spiky_loss = False
     expected = (torch.tensor(12.0), torch.tensor(3), {"kd loss": torch.tensor([12.0, 3.0])})
     reader = Mock(return_value=expected)
     factory = Mock(return_value=reader)

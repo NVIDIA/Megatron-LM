@@ -1010,7 +1010,7 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     rotary_pos_emb_base = rope(packed_base.max_seqlen_q, packed_seq=True)
     input_base = local_thd_base.detach().clone().requires_grad_(True)
     out_base, _ = layer(
-        hidden_states=input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
+        input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
     )
     gathered_base = gather_thd(out_base, base_seqlens, cp_size, tp_size, sp, H, dynamic_cp=True)
     grad_base = torch.cat(base_grad_data, dim=0).unsqueeze(1)
@@ -1052,9 +1052,7 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     rotary_pos_emb_dcp = rope(packed_dcp.max_seqlen_q, packed_seq=True)
 
     input_dcp = local_thd_dcp.detach().clone().requires_grad_(True)
-    out_dcp, _ = layer(
-        hidden_states=input_dcp, packed_seq_params=packed_dcp, rotary_pos_emb=rotary_pos_emb_dcp
-    )
+    out_dcp, _ = layer(input_dcp, packed_seq_params=packed_dcp, rotary_pos_emb=rotary_pos_emb_dcp)
     gathered_dcp = gather_thd_dynamic(
         out_dcp, dcp_seqlens, local_cp_size, tp_size, sp, H, dcp_cp_group, dcp_cp_rank
     )
