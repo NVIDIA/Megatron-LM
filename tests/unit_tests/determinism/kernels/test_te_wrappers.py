@@ -1175,3 +1175,18 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
+
+
+def test_disabled_saved_lse_adapter_preserves_child_without_loading_te_backend():
+    """The disabled adapter must not inspect or replace an existing attention child."""
+    from types import SimpleNamespace
+
+    from megatron.core.ops.attention.te_saved_lse import install_saved_lse_attention
+
+    sentinel = object()
+    child = SimpleNamespace(forward=sentinel)
+    owner = SimpleNamespace(
+        config=SimpleNamespace(attention_saved_lse_cudnn_backward=False), flash_attention=child
+    )
+    assert install_saved_lse_attention(owner) is False
+    assert child.forward is sentinel
