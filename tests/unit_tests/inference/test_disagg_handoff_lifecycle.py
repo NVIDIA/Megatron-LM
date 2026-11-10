@@ -466,7 +466,10 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
         assert engine.context.use_cuda_graphs_for_non_decode_steps
         # Only a decode engine holds KV blocks for imports outside its request rows.
         held_for_imports = getattr(engine.context, "kv_blocks_held_for_imports", None)
-        assert (held_for_imports == engine._pending_import_block_count) == (role == "decode")
+        if role == "decode":
+            assert held_for_imports == engine._pending_import_block_count
+        else:
+            assert held_for_imports is None
         assert len(engine.context.cuda_graph_batch_dimensions_list) == 1
         engine.setup_kv_transfer(role)
 

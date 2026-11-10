@@ -1597,7 +1597,6 @@ class TestDynamicContext:
             assert ctx.total_request_count == 1 and ctx.paused_request_count == 1
             assert ctx.active_token_count == 0
         else:
-            assert ctx.kv_blocks_held_for_imports() == 0
             with pytest.raises(AssertionError, match="== 0 with 1 paused requests"):
                 ctx.update_requests(
                     active_requests_mask=torch.tensor([1]), new_tokens=torch.tensor([90])
