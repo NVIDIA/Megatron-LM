@@ -42,18 +42,23 @@ def test_fake_groups_support_default_process_group_collection(fake_groups):
     assert groups.expt_dp_gtp_remat.size() == 1
 
 
-def test_fake_groups_satisfy_language_module(mocker, fake_groups):
-    """A model built without a collection in a converter process, for example by a model
-    provider that takes none, resolves the registered fake groups with a deprecation warning,
-    and LanguageModule accepts them."""
+@pytest.mark.parametrize('explicit_collection', [False, True])
+def test_fake_groups_satisfy_language_module(mocker, fake_groups, explicit_collection):
+    """A collection resolved from the registered fake groups passes LanguageModule's checks when
+    passed explicitly. A model built without a collection in a converter process, for example
+    by a model provider that takes none, resolves the same groups with a deprecation warning."""
     clear_nvte_env_vars()
     mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
     mocker.patch('torch.distributed.is_initialized', return_value=True)
+    config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
 
-    with pytest.warns(FutureWarning, match='LanguageModule was called without `pg_collection`'):
+    if explicit_collection:
         model = LanguageModule(
-            TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         )
+    else:
+        with pytest.warns(FutureWarning, match='LanguageModule was called without `pg_collection`'):
+            model = LanguageModule(config)
 
     assert model.tp_group.size() == 4
     assert model.cp_group.size() == 1

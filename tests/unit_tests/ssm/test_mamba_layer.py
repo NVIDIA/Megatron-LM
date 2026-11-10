@@ -8,12 +8,12 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
 

@@ -60,7 +60,6 @@ GROUPS = {
     "get_dynamic_data_context_parallel_group_map": "pg_collection.dynamic_cp",
     "get_dynamic_tensor_data_context_parallel_group_map": "pg_collection.dynamic_tp_cp",
     "get_dynamic_data_context_parallel_groups": "pg_collection.dynamic_cp[group_size]",
-    "get_hybrid_data_context_parallel_groups": "pg_collection.dynamic_cp[group_size]",
     "get_dynamic_tensor_data_context_parallel_group": "pg_collection.dynamic_tp_cp[group_size]",
     "get_embedding_group": "pg_collection.embd",
     "get_position_embedding_group": "pg_collection.pos_embd",

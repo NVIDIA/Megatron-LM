@@ -2212,7 +2212,6 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
     gtp_remat_size: int = 1,
     expert_gtp_remat_size: int = 1,
@@ -2254,9 +2253,6 @@ def initialize_model_parallel(
             GPU 2: [5, 6] [13, 14]
             GPU 3: [7, 8] [15, 16]
 
-        hybrid_context_parallel (bool, default = False):
-            Deprecated alias for ``dynamic_context_parallel``.
-
         The other arguments are documented in build_process_group_collection().
 
     Returns:
@@ -2269,16 +2265,6 @@ def initialize_model_parallel(
             raise RuntimeError(
                 "pipeline-model-parallel size should be greater than 1 with interleaved schedule"
             )
-
-    if hybrid_context_parallel:
-        warnings.warn(
-            "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if dynamic_context_parallel:
-            raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
-        dynamic_context_parallel = True
 
     # Fail before creating any group: registering would only fail after the whole grid is built.
     _assert_process_groups_not_initialized()
@@ -2721,14 +2707,6 @@ def get_dynamic_data_context_parallel_groups(
     if check_initialized:
         assert _DYNAMIC_DP_CP_GROUPS is not None
     return _DYNAMIC_DP_CP_GROUPS[group_size]
-
-
-@_deprecated_accessor("pg_collection.dynamic_cp[group_size]")
-def get_hybrid_data_context_parallel_groups(
-    check_initialized: bool = True, group_size: Optional[int] = None
-) -> torch.distributed.ProcessGroup:
-    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
-    return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
 
 
 @_deprecated_accessor("pg_collection.dynamic_tp_cp[group_size]")
