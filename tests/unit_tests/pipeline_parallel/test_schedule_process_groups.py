@@ -18,7 +18,7 @@ from megatron.core.pipeline_parallel import combined_1f1b
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 _NO_PIPELINING = "forward_backward_no_pipelining"
 _WITHOUT_INTERLEAVING = "forward_backward_pipelining_without_interleaving"
@@ -149,6 +149,7 @@ def test_schedule_without_groups_warns_once_and_matches_explicit_groups(owner):
         pipeline_model_parallel_size=pipeline,
         virtual_pipeline_model_parallel_size=virtual,
     )
+    pg_collection = None
     try:
         config = _config(owner)
         # The layout of the global grid (order tp-cp-ep-dp-pp) on distinct communicators.
@@ -156,11 +157,10 @@ def test_schedule_without_groups_warns_once_and_matches_explicit_groups(owner):
             [tensor, 1, Utils.world_size // (tensor * pipeline), pipeline], ["tp", "cp", "dp", "pp"]
         )
         pp_group = grid.create_pg("pp")
-        explicit_groups = {
-            "pg_collection": ProcessGroupCollection(
-                tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=pp_group
-            )
-        }
+        pg_collection = ProcessGroupCollection(
+            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=pp_group
+        )
+        explicit_groups = {"pg_collection": pg_collection}
         if owner != _NO_PIPELINING:
             explicit_groups["p2p_communicator"] = P2PCommunicator(pp_group=pp_group, config=config)
 
@@ -180,6 +180,9 @@ def test_schedule_without_groups_warns_once_and_matches_explicit_groups(owner):
         assert default_results == [expected, expected]
         assert explicit_results == expected
     finally:
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if pg_collection is not None:
+            destroy_test_pg_collection(pg_collection)
         Utils.destroy_model_parallel()
 
 

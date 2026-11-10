@@ -21,9 +21,12 @@ from tests.unit_tests.amax_reduction_group_utils import (
     forbid_global_amax_group,
     global_amax_group,
     record_amax_groups,
-    with_copied_amax_groups,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    destroy_test_pg_collection,
+    new_group_with_same_ranks,
+)
 
 
 def _schedule_plan(layer):
@@ -249,7 +252,13 @@ def test_combined_1f1b_opens_no_outer_fp8_context_for_per_layer_recipes():
 class TestCombined1F1BDelayedScalingAmaxGroup:
     """The outer delayed-scaling context of combined 1F1B reduces amaxes over the model's group."""
 
+    # The collection of groups that a test created itself.
+    pg_collection = None
+
     def teardown_method(self, method):
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if self.pg_collection is not None:
+            destroy_test_pg_collection(self.pg_collection)
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("backward_only", [False, True], ids=["fwd-bwd", "bwd-only"])
@@ -258,7 +267,10 @@ class TestCombined1F1BDelayedScalingAmaxGroup:
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
         # Same ranks as the global groups but distinct communicators, so reading the global
         # group fails the identity check below even where the ranks agree.
-        pg_collection = with_copied_amax_groups()
+        self.pg_collection = pg_collection = ProcessGroupCollection(
+            tp_cp=new_group_with_same_ranks(global_amax_group(True)),
+            tp_dp_cp=new_group_with_same_ranks(global_amax_group(False)),
+        )
         expected = pg_collection.tp_cp if tp_only_amax_red else pg_collection.tp_dp_cp
         assert expected is not global_amax_group(tp_only_amax_red)
         model = _Wrapper(_ModelChunk(pg_collection))
@@ -285,7 +297,7 @@ class TestCombined1F1BDelayedScalingAmaxGroup:
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
         # Custom grid: PP is the fastest dimension, so its TP groups cross the global stages.
         grid = HyperCommGrid([2, world_size // 2, 1, 1], ["pp", "tp", "cp", "dp"])
-        pg_collection = ProcessGroupCollection(
+        self.pg_collection = pg_collection = ProcessGroupCollection(
             tp_cp=grid.create_pg(["tp", "cp"]), tp_dp_cp=grid.create_pg(["tp", "cp", "dp"])
         )
         custom_ranks = list(range(torch.distributed.get_rank() % 2, world_size, 2))

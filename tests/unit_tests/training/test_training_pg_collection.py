@@ -33,7 +33,7 @@ from megatron.training import global_vars, training
 from megatron.training.arguments import parse_args
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.dist_checkpointing.utils import init_basic_mock_args
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
 
 pytestmark = pytest.mark.skipif(
     Utils.world_size < 4 or Utils.world_size % 2 != 0, reason="Requires an even world of 4+ ranks"
@@ -162,7 +162,7 @@ class TestTrainingPgCollection:
 
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
     def test_setup_builds_the_optimizer_on_the_collection(
-        self, monkeypatch, run_config, use_gloo_process_groups
+        self, request, monkeypatch, run_config, use_gloo_process_groups
     ):
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
         run_config.dist.use_gloo_process_groups = use_gloo_process_groups
@@ -173,12 +173,18 @@ class TestTrainingPgCollection:
         if use_gloo_process_groups:
             # Distinct Gloo communicators over the data-parallel ranks (every rank on this grid),
             # so the optimizer holds them only if it takes its Gloo groups from the collection.
-            pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(
-                ranks=_ranks(pg_collection.dp_cp), backend="gloo"
+            gloo_groups = ProcessGroupCollection(
+                intra_dp_cp_gloo=torch.distributed.new_group(
+                    ranks=_ranks(pg_collection.dp_cp), backend="gloo"
+                ),
+                intra_expt_dp_gloo=torch.distributed.new_group(
+                    ranks=_ranks(pg_collection.expt_dp), backend="gloo"
+                ),
             )
-            pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(
-                ranks=_ranks(pg_collection.expt_dp), backend="gloo"
-            )
+            # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+            request.addfinalizer(lambda: destroy_test_pg_collection(gloo_groups))
+            pg_collection.intra_dp_cp_gloo = gloo_groups.intra_dp_cp_gloo
+            pg_collection.intra_expt_dp_gloo = gloo_groups.intra_expt_dp_gloo
         config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
         model = DistributedDataParallel(
             config,
