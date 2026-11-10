@@ -47,6 +47,11 @@ A read that is warned only through data flow, for example under a later ``if gro
 is *unwarned*. A read that gains its warning is a conversion; an allowlisted warned read that
 loses it fails like a new read.
 
+``resolve_gtp_remat_group(..., owner=None)`` leaves the warning to its caller, so the check holds
+it to the same rule: the call is ``guarded`` only when a fallback warning dominates it. Without
+one it is the unwarned ``shim`` read ``resolve_gtp_remat_group(owner=None)``, which fails like a
+new read. Only the constant ``None`` is recognized.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
@@ -150,6 +155,22 @@ GUARDED_HELPERS = {
 WARNED = ":warned"
 FALLBACK_WARNING = "megatron.core.process_groups_config.warn_global_process_group_fallback"
 FALLBACK_BLOCK = "megatron.core.process_groups_config.global_process_group_fallback"
+
+# resolve_gtp_remat_group(..., owner=None) reads the grid without warning, for a caller that has
+# warned already. Such a call is guarded when a fallback warning dominates it; without one it is
+# this unwarned shim read.
+GTP_RESOLVER = "megatron.core.process_groups_config.resolve_gtp_remat_group"
+SILENT_GTP_READ = "shim:resolve_gtp_remat_group(owner=None)"
+
+
+def _passes_owner_none(call: ast.Call) -> bool:
+    """True if ``call`` passes the constant ``owner=None``."""
+    return any(
+        keyword.arg == "owner"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is None
+        for keyword in call.keywords
+    )
 
 
 def _is_deprecated_accessor(name: str) -> bool:
@@ -384,6 +405,8 @@ def _violations_in(path: pathlib.Path):
                 identity = "shim:use_mpu_process_groups"
             elif name in GUARDED_HELPERS:
                 identity = f"{GUARDED}:{GUARDED_HELPERS[name]}"
+                if name == GTP_RESOLVER and not self.warned and _passes_owner_none(node):
+                    identity = SILENT_GTP_READ
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 if self.warned and not identity.startswith(GUARDED + ":"):
