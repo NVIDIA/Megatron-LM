@@ -84,10 +84,12 @@ def initialize_checkpoint_converter_fake_process_groups(
     groups therefore alias the corresponding non-GTP groups, matching
     ``initialize_model_parallel`` when the GTP axes have size one.
 
-    Context parallelism is not used during conversion either, but the model
-    still needs a size-one context-parallel group: ``LanguageModule`` requires
-    tensor-, context- and pipeline-parallel groups once ``torch.distributed`` is
-    initialized, as it is in the saver.
+    Context parallelism is not used during conversion either, but a size-one
+    context-parallel group is installed so that the collection resolved from
+    these globals matches ``initialize_model_parallel``. ``LanguageModule``
+    rejects a caller's collection whose tensor-, context- or pipeline-parallel
+    group is None once ``torch.distributed`` is initialized, as it is in the
+    saver.
     """
     fake_tp_group = _ConverterFakeProcessGroup(size=tensor_parallel_size)
     fake_cp_group = _ConverterFakeProcessGroup(size=1)
