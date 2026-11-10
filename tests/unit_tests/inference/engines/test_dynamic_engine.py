@@ -5076,7 +5076,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         engine.suspend()
         engine.resume()
+        # The checkpoint prefills again. Suspend once more while that prefill is partial:
+        # a partially prefilled request is reset, even while its stop is pending.
         for _ in range(8):
+            if engine.context.chunked_prefill_request_id == 0 or future.done():
+                break
+            engine.step_modern()
+        if not future.done():
+            assert engine.context.chunked_prefill_request_id == 0
+            engine.suspend()
+            engine.resume()
+        for _ in range(12):
             if future.done():
                 break
             engine.step_modern()

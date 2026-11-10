@@ -926,14 +926,19 @@ class DynamicInferenceEngine(
             ]
 
             # Reset any partially prefilled requests so they recompute from the start.
-            # A request waiting to finish on a stop word has finished its prefill even when
-            # the stop removed every generated token, so it keeps its prompt scores.
+            # A request waiting to finish on a stop word whose prefill is complete keeps its
+            # prompt scores, even when the stop removed every generated token; one that is
+            # prefilling again after an earlier checkpoint is reset like any other.
             for req_id in [*waiting_request_ids, *recompute_resident_ids]:
                 req = self.get_request(req_id)
+                stopped_after_prefill = req_id in self.stop_word_finished_request_ids and (
+                    req.remaining_prompt_tokens is not None
+                    and len(req.remaining_prompt_tokens) == 0
+                )
                 if (
                     req.finished_chunk_token_count > 0
                     and not req.generated_tokens
-                    and req_id not in self.stop_word_finished_request_ids
+                    and not stopped_after_prefill
                 ):
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
