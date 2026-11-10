@@ -193,6 +193,34 @@ def test_tensor_ops_replay():
     )
 
 
+@pytest.mark.parametrize(
+    "trailing_shape",
+    [(1,), (4096, 1), (8, 1, 128)],
+    ids=("one_element_rows", "unit_last_dim", "unit_middle_dim"),
+)
+def test_tensor_masked_update_unit_dimensions_replay(trailing_shape):
+    """Unit dimensions reach the masked-update kernels as constexpr arguments, a separate
+    compilation from the shapes above."""
+    from megatron.core.inference.contexts.attention_context.triton import tensor_ops
+
+    seeded()
+    states = torch.randn(512, *trailing_shape, device="cuda")
+    idx = torch.randperm(512, device="cuda").to(torch.int32)
+    idx[torch.rand(512, device="cuda") < 0.25] = -1
+    new_states = torch.randn(512, *trailing_shape, device="cuda")
+
+    def masked_update(states, new_states):
+        tensor_ops.tensor_masked_update(states, idx, new_states)
+        return states
+
+    assert_replays_bit_exact(
+        masked_update,
+        (states, new_states),
+        backward=False,
+        what=f"tensor_masked_update {trailing_shape}",
+    )
+
+
 def test_fused_kv_append_replays():
     from megatron.core.inference.contexts.fused_kv_append_kernel import (
         triton_append_key_value_cache,

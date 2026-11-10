@@ -300,3 +300,29 @@ def test_tensor_masked_update(device, ndim):
     expected_states = states.clone()
     tensor_masked_update(states, idx, new_states)
     assert torch.equal(states, expected_states), f"Failed {ndim}D: all mask values"
+
+
+@pytest.mark.parametrize(
+    "trailing_shape",
+    [(1,), (64, 1), (1, 1), (16, 64, 1), (16, 1, 128), (1, 1, 1)],
+    ids=lambda shape: "x".join(map(str, shape)),
+)
+def test_tensor_masked_update_unit_dimensions(device, trailing_shape):
+    """One-element rows and unit trailing dimensions update like any other shape.
+
+    Triton passes an int kernel argument equal to 1 (here a batch stride, ``SIZE_D1`` or
+    ``SIZE_D2``) as a constexpr, so the kernels must compile with such arguments.
+    """
+
+    states = torch.randn(6, *trailing_shape, device=device)
+    new_states = torch.randn(3, *trailing_shape, device=device)
+    new_states_before = new_states.clone()
+    idx = torch.tensor([4, -1, 0], dtype=torch.int32, device=device)
+    expected_states = states.clone()
+    expected_states[4] = new_states[0]
+    expected_states[0] = new_states[2]
+
+    tensor_masked_update(states, idx, new_states)
+
+    assert torch.equal(states, expected_states)
+    assert torch.equal(new_states, new_states_before)
