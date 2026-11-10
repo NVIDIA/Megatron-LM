@@ -206,6 +206,14 @@ class TestTEDotProductAttentionContextParallelGroup:
         with pytest.raises(ValueError, match="must have a cp process group"):
             self._build(pg_collection)
 
+    def test_fallback_on_uninitialized_grid_leaves_the_cp_group_unset(self):
+        """Without a collection or a global grid, the CP group is set later, as before."""
+        Utils.destroy_model_parallel()
+
+        attention = self._build(None)
+
+        assert attention.cp_group is None
+
     def test_uses_the_cp_group_of_the_collection(self):
         if Utils.world_size % 2:
             pytest.skip("needs an even number of ranks")
