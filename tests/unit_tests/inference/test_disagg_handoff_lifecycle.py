@@ -739,20 +739,6 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 0
 
 
-def test_pending_import_blocks_count_until_the_import_ends(handoff_loop):
-    engine = _HandoffHarness(handoff_loop)
-    assert engine._pending_import_block_count() == 0
-    engine.add_request_with_kv_handoff(
-        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), {"resume_tokens": [99]}, [100]
-    )
-    pending = engine._pending_kv_imports[0]
-    # One prompt block and the first decode step's block.
-    assert pending.local_blocks == [10] and pending.continuation_blocks == [11]
-    assert engine._pending_import_block_count() == 2
-    engine._release_pending_kv_import(pending)
-    assert engine._pending_import_block_count() == 0
-
-
 @pytest.mark.parametrize("queued", [False, True])
 @pytest.mark.parametrize("log_probs", [["invalid"], []])
 def test_invalid_handoff_metadata_does_not_reserve_or_queue(handoff_loop, queued, log_probs):
@@ -922,6 +908,20 @@ def test_releasing_pending_hybrid_import_returns_live_slot(handoff_loop):
     assert pending.ssm is None
     assert engine.context.mamba_metadata.freed == [20]
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 1
+
+
+def test_pending_import_blocks_count_until_the_import_ends(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    assert engine._pending_import_block_count() == 0
+    engine.add_request_with_kv_handoff(
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), {"resume_tokens": [99]}, [100]
+    )
+    pending = engine._pending_kv_imports[0]
+    # One prompt block and the first decode step's block.
+    assert pending.local_blocks == [10] and pending.continuation_blocks == [11]
+    assert engine._pending_import_block_count() == 2
+    engine._release_pending_kv_import(pending)
+    assert engine._pending_import_block_count() == 0
 
 
 def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
