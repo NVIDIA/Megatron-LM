@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp import mcore_adapter_v1
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
@@ -351,5 +352,22 @@ def test_standard_grid_fallback_warns_and_selects_the_collection_groups(grid, ne
                 "dp": parallel_state.get_data_parallel_group(with_context_parallel=True),
             }
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_config_logger_gets_the_collection():
+    """With config_logger_dir set, the adapter names its dump by the collection it was given."""
+    Utils.initialize_model_parallel()
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        inputs = _fsdp_inputs(moe=False, hsdp=False)
+        inputs["config"].config_logger_dir = "unused"
+        with mock.patch.object(mcore_adapter_v1, "log_config_to_disk") as log_config:
+            fsdp = FullyShardedDataParallelV1(**inputs, pg_collection=pg_collection)
+        fsdp.stop_communication()
+
+        log_config.assert_called_once()
+        assert log_config.call_args.kwargs["pg_collection"] is pg_collection
     finally:
         Utils.destroy_model_parallel()
