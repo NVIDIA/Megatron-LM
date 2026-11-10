@@ -62,6 +62,8 @@ def _validate_shortcut_fusion_config(config):
     if not config.moe_shortcut_wide_residual_norm_fusion:
         return
     wr, interval = config.wide_residual, config.residual_stream_recompute_num_layers
+    # Under MXFP8 each fused read hands reader zero to its consumer Linear directly as MXFP8.
+    mxfp8 = bool(config.fp8) and config.fp8_recipe == "mxfp8"
     recompute = set(config.recompute_modules or ()) & {
         "layernorm",
         "shortcut_pre_mlp_layernorm",
@@ -106,6 +108,11 @@ def _validate_shortcut_fusion_config(config):
             and set(config.offload_modules or ()) != {"fused_group_mlp"}
         ),
         "context_parallel_size > 1": config.context_parallel_size != 1,
+        "MXFP8 at a hidden_size other than a multiple of 1024 from 2048": mxfp8
+        and (config.hidden_size < 2048 or config.hidden_size % 1024),
+        "MXFP8 with tensor_model_parallel_size > 1": mxfp8
+        and config.tensor_model_parallel_size != 1,
+        "MXFP8 with tp_comm_overlap": mxfp8 and config.tp_comm_overlap,
         # A fused block hands its unwritten MoE output to the next layer on the same stage.
         "pipeline_model_parallel_size > 1": config.pipeline_model_parallel_size != 1,
     }
