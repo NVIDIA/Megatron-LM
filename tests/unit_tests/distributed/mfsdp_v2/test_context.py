@@ -119,7 +119,9 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
-    model(inputs).sum().backward()
+    # Recording ends after this microbatch even while outer reduction is skipped.
+    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
+        model(inputs).sum().backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
@@ -135,6 +137,35 @@ def test_recorded_execution_order(distributed_setup):
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
     model.zero_grad(set_to_none=True)
     model(inputs).sum().backward()
+
+
+def test_recorded_evaluation_order(distributed_setup):
+    """An evaluation-only execution can be recorded and replayed."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = (
+        nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device).eval()
+    )
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    with torch.no_grad():
+        expected = model(inputs)
+        assert list(context.execution_order) == [
+            ExecutionEvent(module, Phase.FORWARD) for module in [model, *model.children()]
+        ]
+        # Evaluation has no autograd callback; explicitly complete the recorded execution.
+        context.post_backward()
+        for _ in range(2):
+            torch.testing.assert_close(model(inputs), expected)
+            assert context.execution_order.position == 0
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):
