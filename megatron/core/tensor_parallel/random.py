@@ -596,7 +596,9 @@ def model_parallel_cuda_manual_seed(
     global parallel state. This fallback is deprecated and emits a
     ``ProcessGroupFallbackWarning``. It resolves the GTP_remat groups as the layers do without
     a collection (``resolve_gtp_remat_group``), so those axes are off when the global parallel
-    state has no GTP_remat groups.
+    state has no GTP_remat groups. A ``tp_rank``, ``ep_rank`` or ``etp_rank`` that is not passed
+    needs its global group: when the global parallel state is not initialized, this raises
+    ``RuntimeError`` instead of seeding every rank as rank 0.
     """
     if pg_collection is not None:
         seed_groups = ("tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat")
@@ -626,6 +628,24 @@ def model_parallel_cuda_manual_seed(
                 global_groups.ep,
                 global_groups.expt_tp,
             )
+            # get_pg_rank(None) is 0, so without a global grid every rank would seed as rank 0
+            # and the ranks of a group would share one RNG stream.
+            missing = [
+                f"{rank_name} (no global {group_name} group)"
+                for rank_name, rank, group_name, group in (
+                    ("tp_rank", tp_rank, "tp", tp_group),
+                    ("ep_rank", ep_rank, "ep", ep_group),
+                    ("etp_rank", etp_rank, "expt_tp", etp_group),
+                )
+                if rank is None and group is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "model_parallel_cuda_manual_seed was called without pg_collection and "
+                    f"without {', '.join(missing)}: the global parallel state is not "
+                    "initialized, so there is no group to read the rank from. Pass "
+                    "pg_collection, the process groups of the model being seeded, or the ranks."
+                )
         if None in (gtp_remat_rank, egtp_remat_rank, gtp_remat_world_size, egtp_remat_world_size):
             warn_global_process_group_fallback(
                 "model_parallel_cuda_manual_seed", deprecated_in="0.21", removed_in="0.23"

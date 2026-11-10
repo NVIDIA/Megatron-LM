@@ -336,6 +336,22 @@ def test_model_parallel_cuda_manual_seed_requires_pg_collection_groups(monkeypat
             model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
 
 
+def test_model_parallel_cuda_manual_seed_needs_a_global_grid_for_omitted_ranks():
+    """Without a collection or a global grid, an omitted rank is an error, not rank 0."""
+    Utils.initialize_model_parallel()
+    Utils.destroy_model_parallel()
+    assert not parallel_state.model_parallel_is_initialized()
+
+    with pytest.raises(RuntimeError, match="without tp_rank .*, ep_rank .*, etp_rank .*:"):
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+    with pytest.raises(RuntimeError, match=r"without ep_rank \(no global ep group\):"):
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True, tp_rank=0, etp_rank=0)
+
+    # A caller that passes its ranks still seeds without a grid, with the GTP_remat axes off.
+    model_parallel_cuda_manual_seed(1234, force_reset_rng=True, tp_rank=0, ep_rank=0, etp_rank=0)
+    assert get_gtp_remat_rng_tracker_name() not in _tracker_states()
+
+
 def test_checkpoint():
     def test_forward(*input):
         return input[0] + input[1]
