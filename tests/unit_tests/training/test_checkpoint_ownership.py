@@ -540,7 +540,10 @@ def test_fault_tolerance_sees_the_finalized_checkpoint_policy(monkeypatch, run_c
     class StopAtFaultTolerance(Exception):
         pass
 
-    def setup():
+    def setup(config, *, checkpoint_dir, async_save):
+        assert config is run_config.fault_tolerance
+        assert checkpoint_dir == run_config.checkpoint.save
+        assert async_save == run_config.checkpoint.async_save
         seen.append(global_vars.get_run_config().checkpoint.exit_on_missing_checkpoint)
         raise StopAtFaultTolerance  # Before initialize_megatron.
 
@@ -615,9 +618,9 @@ def test_the_cli_applies_the_msc_policy_it_parses(msc_installed, argv, enabled):
     assert not hasattr(checkpoint_config_from_args(args), "enable_msc")
 
 
-def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_installed):
+def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_installed, run_config):
     """A script that enables MSC itself (through the helper, before any path is read) keeps it on
-    through pretrain()'s fault-tolerance setup, which reads the registered arguments instead of
+    through pretrain()'s fault-tolerance setup, which uses explicit config inputs instead of
     re-parsing the command line (that used to re-apply the parser's default and switch MSC off);
     the helper turns it off again for a run without MSC, silently."""
     from megatron.training import ft_integration
@@ -631,7 +634,11 @@ def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_insta
         setup_multi_storage_client(True)
     warn.assert_called_once()
     assert msc_installed.is_enabled() is True
-    ft_integration.setup()
+    ft_integration.setup(
+        run_config.fault_tolerance,
+        checkpoint_dir=run_config.checkpoint.save,
+        async_save=run_config.checkpoint.async_save,
+    )
     assert msc_installed.is_enabled() is True
     with patch("megatron.training.utils.common_utils.warn_rank_0") as warn:
         setup_multi_storage_client(False)
