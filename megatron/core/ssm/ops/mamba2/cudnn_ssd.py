@@ -5,14 +5,17 @@
 ``cudnn_mamba_split_conv1d_scan_combined`` stands in for mamba_ssm's
 ``mamba_split_conv1d_scan_combined`` (without its fused RMSNorm and output projection). The
 depthwise causal conv1d + SiLU runs on causal-conv1d's channel-last kernels, as in the Triton
-path, and ``torch.ops.cudnn.mamba2_fwd`` / ``mamba2_bwd`` compute the chunked scan with the D
-skip and the ``silu(z)`` gate. Only ``zxBCdt`` and the pre-gate output are saved; the conv is
-recomputed in backward.
+path, and cuDNN's MAMBA2 / MAMBA2_BWD kernels compute the chunked scan with the D skip and the
+``silu(z)`` gate. Only ``zxBCdt`` and the pre-gate output are saved; the conv is recomputed in
+backward. The forward calls ``torch.ops.cudnn.mamba2_fwd``; the backward builds the MAMBA2_BWD
+node through the cuDNN graph API, so its gradients land in caller-provided views of
+``dzxBCdt`` and of the conv's input gradient instead of freshly allocated tensors.
 
 The kernels run on SM100 / SM103 / SM107 with head dim 64 and state dim 128 only.
 """
 
 import functools
+import threading
 from typing import Optional
 
 import torch
@@ -22,6 +25,11 @@ try:
 except ImportError:
     causal_conv1d_fwd_function = None
     causal_conv1d_bwd_function = None
+
+try:
+    from causal_conv1d.cpp_functions import _causal_conv1d_fwd_cpp
+except ImportError:
+    _causal_conv1d_fwd_cpp = None
 
 CUDNN_MAMBA2_HEAD_DIM = 64
 CUDNN_MAMBA2_STATE_DIM = 128
@@ -68,12 +76,18 @@ def _ensure_stride(t: torch.Tensor) -> torch.Tensor:
     return t if t.stride(1) % 8 == 0 else t.contiguous()
 
 
-def _conv1d_silu(xBC, weight, bias, seq_idx):
-    """Channel-last causal conv1d + SiLU, [b, l, d] -> [b, l, d]."""
-    out = causal_conv1d_fwd_function(
-        _ensure_stride(xBC).transpose(1, 2), weight, bias, seq_idx, None, None, True
+def _conv1d_silu(xBC, weight, bias, seq_idx, out=None):
+    """Channel-last causal conv1d + SiLU, [b, l, d] -> [b, l, d], into ``out`` if its layout allows."""
+    xBC = _ensure_stride(xBC)
+    if out is None or _causal_conv1d_fwd_cpp is None or out.stride(1) % 8 != 0:
+        out = causal_conv1d_fwd_function(
+            xBC.transpose(1, 2), weight, bias, seq_idx, None, None, True
+        )
+        return out.transpose(1, 2)
+    _causal_conv1d_fwd_cpp(
+        xBC.transpose(1, 2), weight, bias, seq_idx, None, out.transpose(1, 2), None, True
     )
-    return out.transpose(1, 2)
+    return out
 
 
 def _heads(t: torch.Tensor, headdim: int) -> torch.Tensor:
@@ -90,6 +104,103 @@ def _split_xBC(xBC: torch.Tensor, d_inner: int, ngroups: int, headdim: int):
         B.unflatten(-1, (ngroups, -1)),
         C.unflatten(-1, (ngroups, -1)),
     )
+
+
+# The MAMBA2_BWD gradients this module binds, each with the dtype of the input it differentiates.
+_MAMBA2_BWD_GRAD_OF = {
+    "dQ": "q",
+    "dK": "k",
+    "dV": "v",
+    "dG": "g",
+    "dA": "a",
+    "d_dt_bias": "dt_bias",
+    "dD": "d",
+    "dZ": "z",
+}
+
+# cuDNN handles are not thread-safe: one per thread and device, rebound to the launch stream.
+_cudnn_handles = threading.local()
+
+
+def _cudnn_handle(device: torch.device):
+    """This thread's cuDNN handle for ``device``, bound to the current stream."""
+    import cudnn
+
+    handles = _cudnn_handles.__dict__.setdefault("by_device", {})
+    if device.index not in handles:
+        with torch.cuda.device(device):
+            handles[device.index] = cudnn.create_handle()
+    stream = torch.cuda.current_stream(device).cuda_stream
+    cudnn.set_stream(handle=handles[device.index], stream=stream)
+    return handles[device.index]
+
+
+@functools.lru_cache(maxsize=None)
+def _mamba2_bwd_graph(signature, batch_invariant: bool, device: torch.device):
+    """Build a one-node MAMBA2_BWD graph for inputs of the given (name, shape, dtype) signature.
+
+    Tensors are declared by shape only: the kernels take the strides of the buffers bound at
+    execute time.
+    """
+    import cudnn
+
+    data_type = {
+        torch.float16: cudnn.data_type.HALF,
+        torch.bfloat16: cudnn.data_type.BFLOAT16,
+        torch.float32: cudnn.data_type.FLOAT,
+        torch.int32: cudnn.data_type.INT32,
+    }
+    input_dtypes = {name: data_type[dtype] for name, _, dtype in signature}
+    with torch.cuda.device(device):
+        graph = cudnn.pygraph()
+        tensors = {
+            name: graph.tensor(list(shape), data_type=input_dtypes[name], name=name)
+            for name, shape, _ in signature
+        }
+        grads = graph.mamba2_bwd(**tensors, batch_invariant=batch_invariant, name="mamba2_bwd")
+        grad_names = ("dQ", "dK", "dV", "dG", "dA", "d_initial_state", "d_dt_bias", "dD", "dZ")
+        for name, grad in zip(grad_names, grads):
+            if name in _MAMBA2_BWD_GRAD_OF:
+                grad.set_output(True).set_data_type(input_dtypes[_MAMBA2_BWD_GRAD_OF[name]])
+                tensors[name] = grad
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        graph.check_support()
+        graph.build_plans()
+    return graph, tensors
+
+
+def _mamba2_bwd(
+    dy, x, dt, A, B, C, cu_seqlens, D, dt_bias, z, y_pre, batch_invariant, *, dx, ddt, dB, dC, dz
+):
+    """``torch.ops.cudnn.mamba2_bwd`` writing dx, ddt, dB, dC and dz into the given buffers.
+
+    The output buffers may be strided views with a unit innermost stride, like the inputs.
+    Returns ``(dA, dD, ddt_bias)``.
+    """
+    inputs = dict(
+        q=C,
+        k=B,
+        v=x,
+        g=dt,
+        a=A,
+        cu_seqlens=cu_seqlens,
+        dO=dy,
+        dt_bias=dt_bias,
+        d=D,
+        z=z,
+        O_pre=y_pre,
+    )
+    signature = tuple((name, tuple(t.shape), t.dtype) for name, t in inputs.items())
+    graph, tensors = _mamba2_bwd_graph(signature, bool(batch_invariant), x.device)
+    dA, dD, ddt_bias = torch.empty_like(A), torch.empty_like(D), torch.empty_like(dt_bias)
+    buffers = dict(inputs, dQ=dC, dK=dB, dV=dx, dG=ddt, dA=dA, d_dt_bias=ddt_bias, dD=dD, dZ=dz)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=x.device)
+    graph.execute(
+        {tensors[name]: t for name, t in buffers.items()}, workspace, handle=_cudnn_handle(x.device)
+    )
+    return dA, dD, ddt_bias
 
 
 class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
@@ -160,10 +271,21 @@ class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         d_inner = nheads * headdim
         conv_dim = conv1d_weight.shape[0]
         z, xBC, dt = torch.split(zxBCdt, [d_inner, conv_dim, nheads], dim=-1)
+        dzxBCdt = torch.empty_like(zxBCdt)
+        dz, dxBC_out, ddt = torch.split(dzxBCdt, [d_inner, conv_dim, nheads], dim=-1)
+        # The conv output is recomputed into dxBC_out, unused until the conv backward writes it,
+        # so no separate buffer is live next to the scan backward's workspace.
         x, B, C = _split_xBC(
-            _conv1d_silu(xBC, conv1d_weight, conv1d_bias, seq_idx), d_inner, ngroups, headdim
+            _conv1d_silu(xBC, conv1d_weight, conv1d_bias, seq_idx, out=dxBC_out),
+            d_inner,
+            ngroups,
+            headdim,
         )
-        dx, ddt, dA, dB, dC, dD, ddt_bias, dz, _ = torch.ops.cudnn.mamba2_bwd(
+        # dz and ddt go straight into their dzxBCdt slices, and dx, dB and dC into one dxBC
+        # buffer for the conv backward.
+        dxBC = zxBCdt.new_empty(batch, seqlen, conv_dim)
+        dx, dB, dC = _split_xBC(dxBC, d_inner, ngroups, headdim)
+        dA, dD, ddt_bias = _mamba2_bwd(
             _heads(dy.contiguous(), headdim),
             x,
             dt.flatten(0, 1),
@@ -171,27 +293,18 @@ class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             B,
             C,
             cu_seqlens,
-            D=D,
-            dt_bias=dt_bias,
-            z=_heads(z, headdim),
-            y_pre=y_pre,
-            batch_invariant=ctx.batch_invariant,
+            D,
+            dt_bias,
+            _heads(z, headdim),
+            y_pre,
+            ctx.batch_invariant,
+            dx=dx,
+            ddt=ddt.flatten(0, 1),
+            dB=dB,
+            dC=dC,
+            dz=_heads(dz, headdim),
         )
-        del x, B, C
-
-        dzxBCdt = torch.empty_like(zxBCdt)
-        dz_out, dxBC_out, ddt_out = torch.split(dzxBCdt, [d_inner, conv_dim, nheads], dim=-1)
-        # TODO: mamba2_bwd returns freshly allocated gradients, so dz and ddt are copied into
-        # the strided dzxBCdt slices here, where mamba_split_conv1d_scan_combined writes them
-        # in place. Pass dz_out / ddt_out to mamba2_bwd once it accepts output buffers.
-        dz_out.copy_(dz.view_as(dz_out))
-        ddt_out.copy_(ddt.view_as(ddt_out))
-        # TODO: the conv backward takes a single [b, l, conv_dim] gradient, so dx, dB and dC
-        # are concatenated here. Have mamba2_bwd write them into views of one dxBC buffer
-        # once it accepts output buffers.
-        dxBC = torch.cat([dx.flatten(1), dB.flatten(1), dC.flatten(1)], dim=-1)
-        dxBC = dxBC.view(batch, seqlen, conv_dim)
-        del dx, dB, dC, dz, ddt
+        del x, B, C, dx, dB, dC
 
         dxBC_in, dweight, dbias, *_ = causal_conv1d_bwd_function(
             _ensure_stride(xBC).transpose(1, 2),
