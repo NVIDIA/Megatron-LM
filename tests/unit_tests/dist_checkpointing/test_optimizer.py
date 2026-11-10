@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import re
@@ -54,7 +54,7 @@ from tests.unit_tests.dist_checkpointing import (
     setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_model
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 def _quantized_param_storage_support(precision, recipe):
@@ -969,6 +969,7 @@ class TestDistributedOptimizer:
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=fully_parallel)
                 from megatron.training.training import preprocess_common_state_dict
 
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     10,
                     model,
@@ -991,6 +992,7 @@ class TestDistributedOptimizer:
                         seed=3, tp=tp, pp=pp, initialize_fn=initialize_fn
                     )
                 # Load optimizer B from checkpoint
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
                 if test_step:
                     # Complete "step" for comparison
@@ -1013,7 +1015,7 @@ class TestDistributedOptimizer:
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
     def test_finetune_doesnt_load_optimizer(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu, run_config
     ):
         """Test finetuning doesn't try to load the optimizer."""
         Utils.initialize_model_parallel(*src_tp_pp)
@@ -1033,6 +1035,8 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
+                run_config.model.transformer = model[0].config
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
@@ -1045,11 +1049,13 @@ class TestDistributedOptimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
+                run_config.model.transformer = model[0].config
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
 
                 # Load with different TPxPP should raise DistributeOptimizer error
                 with pytest.raises(RuntimeError) as exc_info:
+                    sync_checkpoint_config(mock_args)
                     load_checkpoint_no_arg_checks(model, optimizer, None)
                 # "(TP, PP) mismatch" check is for backwards compatibility tests
                 assert "(TP, PP) mismatch" in str(
@@ -1062,6 +1068,7 @@ class TestDistributedOptimizer:
 
                 # Now test the same with a `finetune` flag
                 mock_args.finetune = True
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
                 # Model weights should be different, but optimizer state is unchanged
@@ -1081,6 +1088,7 @@ class TestDistributedOptimizer:
                 mock_args.finetune = False
                 mock_args.no_load_optim = True
                 mock_args.no_load_rng = True
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
                 # Model weights should be different, but optimizer state is unchanged
