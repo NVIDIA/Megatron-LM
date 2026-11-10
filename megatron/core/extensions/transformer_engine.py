@@ -1743,7 +1743,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -2494,10 +2493,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
 
-    Note that if Megatron's parallel_state has not been initialized yet, the
-    tp_group passed to TE will be None and must be set later via
-    set_tensor_parallel_group(). With context_parallel_size > 1, the
-    context-parallel group is required at construction.
+    Note that if no pg_collection is passed and Megatron's parallel_state has
+    not been initialized yet, the tp_group and cp_group passed to TE will be
+    None and must be set later via set_tensor_parallel_group() and
+    set_context_parallel_group(). A pg_collection that is passed must hold the
+    context-parallel group when context_parallel_size > 1.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2551,6 +2551,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
+        used_global_fallback = pg_collection is None
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
@@ -2585,8 +2586,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
             # torch.distributed resolves a None group to the default group, so the ranks of the
-            # whole job would become the context-parallel ranks.
-            if pg_collection.cp is None:
+            # whole job would become the context-parallel ranks. The deprecated fallback keeps
+            # the None group of an uninitialized parallel_state, which the caller sets later
+            # through set_context_parallel_group().
+            if pg_collection.cp is None and not used_global_fallback:
                 raise ValueError(
                     "TEDotProductAttention with context_parallel_size > 1 requires a "
                     "context-parallel group in pg_collection.cp"

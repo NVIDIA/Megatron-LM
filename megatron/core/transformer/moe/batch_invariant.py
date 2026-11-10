@@ -338,7 +338,8 @@ def unpermute(
     ``ep_size`` is the expert-parallel size of the caller's token dispatcher, which
     splits the experts into ``ep_size`` contiguous per-rank shards. Omitting it is
     deprecated: the size of the global expert-parallel group is used, with a
-    ``ProcessGroupFallbackWarning``.
+    ``ProcessGroupFallbackWarning``. A size set with
+    ``parallel_state.set_expert_model_parallel_world_size()`` is not used.
     """
     if ep_size is None:
         # Deprecated fallback for callers that do not pass their dispatcher's EP size.

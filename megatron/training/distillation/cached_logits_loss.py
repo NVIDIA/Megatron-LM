@@ -1464,12 +1464,17 @@ class LossFuncCallable:
         """
         if self.kd_func is None:
             # Constructed on the first call, on the process groups of the model being trained.
+            try:
+                pg_collection = get_attr_wrapped_model(model, "pg_collection")
+            except RuntimeError:
+                # No wrapper level defines a collection: use the global parallel state.
+                pg_collection = None
             self.kd_func = CachedLogitsKDLoss(
                 logprobs_dir=self.logprobs_dir,
                 decode_threads=self.decode_threads,
                 msc_prefetch_depth=self.msc_prefetch_depth,
                 ignore_hash=self.ignore_hash,
-                pg_collection=get_attr_wrapped_model(model, "pg_collection"),
+                pg_collection=pg_collection,
             )
 
         # LM loss
