@@ -550,6 +550,10 @@ class TestMXFP8Tensor:
         assert tensor.backend == "flashinfer"
 
     @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="FlashInfer's MXFP8 quantizer requires Blackwell (SM 100+)",
+    )
     @pytest.mark.parametrize("layout", ["transpose", "row_slice", "column_slice"])
     def test_flashinfer_reads_strided_input(self, layout):
         """FlashInfer quantizes the strided views the Triton backend reads by their values."""
