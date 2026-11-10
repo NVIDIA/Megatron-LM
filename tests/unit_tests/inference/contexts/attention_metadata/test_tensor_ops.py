@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
+
 import pytest
 import torch
 
@@ -65,10 +67,12 @@ def slice_params():
     return {"input_batch": 16, "output_batch": 20, "feature_dim": 256}
 
 
-def test_get_slice_after_basic(device, slice_params):
+@pytest.mark.parametrize("pos_dtype", [torch.int64, torch.int32])
+def test_get_slice_after_basic(device, slice_params, pos_dtype):
     params = slice_params
     input_tensor = torch.randn(params["input_batch"], params["feature_dim"], device=device)
-    pos_on_device = torch.tensor([5], device=device)
+    # The SSM layer passes an int32 position (MambaMetadata.device_decode_prefill).
+    pos_on_device = torch.tensor([5], dtype=pos_dtype, device=device)
 
     output_ref = torch.zeros(params["output_batch"], params["feature_dim"], device=device)
     output_triton = torch.zeros_like(output_ref)
@@ -165,11 +169,12 @@ def merge_params():
     return {"tensor_a_batch": 8, "tensor_b_batch": 12, "output_batch": 32, "feature_dim": 256}
 
 
+@pytest.mark.parametrize("pos_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("in_place", [False, True])
-def test_tensor_merge_basic(device, merge_params, in_place):
+def test_tensor_merge_basic(device, merge_params, in_place, pos_dtype):
     params = merge_params
     pos_val = 5
-    pos_on_device = torch.tensor([pos_val], device=device)
+    pos_on_device = torch.tensor([pos_val], dtype=pos_dtype, device=device)
 
     tensor_b = torch.randn(params["tensor_b_batch"], params["feature_dim"], device=device)
 
@@ -244,6 +249,79 @@ def test_tensor_merge_small(device):
 
     assert torch.equal(output_tensor[:2], tensor_a[:2])
     assert torch.equal(output_tensor[2:7], tensor_b)
+
+
+IN_PROJ_ROW = 2 * 8192 + 2 * 8 * 128 + 128
+"""Elements per token of Nemotron-H 8B's Mamba in_proj output at TP 1 (z, x, B, C, dt): the rows
+that the SSM layer's mixed-batch slice copies."""
+D_INNER_ROW = 8192
+"""Elements per token of Nemotron-H 8B's SSM output at TP 1: the rows that the merge copies."""
+INT32_GUARD = 2**31
+"""Elements in front of a large case's tensors. An element offset in [2**31, 2**32) computed in
+int32 wraps to offset - 2**32, which lands here instead of faulting."""
+
+
+def _behind_front_guard(shape, fill, device):
+    """``(tensor, guard)``: a bf16 ``shape`` after ``INT32_GUARD`` elements, all set to ``fill``."""
+    buffer = torch.full(
+        (INT32_GUARD + math.prod(shape),), fill, dtype=torch.bfloat16, device=device
+    )
+    return buffer[INT32_GUARD:].view(shape), buffer[:INT32_GUARD]
+
+
+def _require_free_memory(nbytes):
+    """Skip, with the numbers, when the device has less than ``nbytes`` free."""
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < nbytes:
+        pytest.skip(f"needs {nbytes / 2**30:.1f} GiB of device memory, {free / 2**30:.1f} free")
+
+
+@pytest.mark.large
+class TestInt32RowOffsets:
+    """Rows that start at or past 2**31 elements, where int32 row offsets would wrap.
+
+    The sources sit behind zeros and the output behind NaN, so a wrapped read leaves an output
+    row unequal to its source and a wrapped write shows in the output's guard. Opt in with
+    ``-m large`` (about 20 GiB of device memory each); run one case per process, since a wrapped
+    offset can leave a sticky illegal-address error.
+    """
+
+    def test_get_slice_after(self, device):
+        """The last of 115,706 in_proj rows starts past 2**31 elements. With position 0 it is read
+        and written at that offset."""
+        rows = INT32_GUARD // IN_PROJ_ROW + 2
+        _require_free_memory(22 << 30)
+        x, _ = _behind_front_guard((rows, 1, IN_PROJ_ROW), 0.0, device)
+        x.normal_()
+        out, out_guard = _behind_front_guard((rows, 1, IN_PROJ_ROW), float("nan"), device)
+        pos = torch.tensor([0, rows], dtype=torch.int32, device=device)
+
+        tensor_get_slice_after(x, out, pos)
+
+        assert out_guard.isnan().all(), "wrote before the output"
+        assert torch.equal(out, x)
+
+    @pytest.mark.parametrize("source", ["tensor_a", "tensor_b"])
+    def test_tensor_merge(self, device, source):
+        """The last of 262,145 SSM output rows starts at 2**31 elements. It comes from tensor_a
+        (position = rows) or tensor_b (position 0), so both of the kernel's source offsets reach
+        it."""
+        rows = INT32_GUARD // D_INNER_ROW + 1
+        _require_free_memory(22 << 30)
+        src, _ = _behind_front_guard((rows, 1, D_INNER_ROW), 0.0, device)
+        src.normal_()
+        other = torch.randn(3, 1, D_INNER_ROW, dtype=torch.bfloat16, device=device)
+        out, out_guard = _behind_front_guard((rows, 1, D_INNER_ROW), float("nan"), device)
+        tensor_a, tensor_b, pos_val = (
+            (src, other, rows) if source == "tensor_a" else (other, src, 0)
+        )
+        pos = torch.tensor([pos_val, rows - pos_val], dtype=torch.int32, device=device)
+
+        tensor_merge(tensor_a, tensor_b, pos, output_tensor=out)
+
+        assert out_guard.isnan().all(), "wrote before the output"
+        assert torch.equal(out, src)
 
 
 @pytest.mark.parametrize("ndim", [2, 3, 4])

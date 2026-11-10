@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
+
 import pytest
 import torch
 
@@ -109,6 +111,74 @@ class TestKVAppendLargeBlockIdx:
         assert torch.equal(
             actual_value, expected_value
         ), f"Value not at expected cache position (block {target_block})."
+
+
+def _append_fused_qkv_views(tokens, heads, group, head_dim, block_size, guard=0):
+    """Append key and value views of a fused QKV projection and check every token's slot.
+
+    The projection is ``[tokens, 1, heads, (group + 2) * head_dim]`` (``group`` query heads per
+    KV head), as attention splits it, so the key's and value's token stride is the whole QKV row.
+    It follows ``guard`` zeros in the same allocation, so a token offset that wraps below the
+    projection reads zeros instead of faulting.
+    """
+    device = "cuda"
+    row = heads * (group + 2) * head_dim
+    buffer = torch.zeros(guard + tokens * row, dtype=torch.bfloat16, device=device)
+    qkv = buffer[guard:].view(tokens, 1, heads, (group + 2) * head_dim)
+    qkv.normal_()
+    key = qkv[..., group * head_dim : (group + 1) * head_dim]
+    value = qkv[..., (group + 1) * head_dim :]
+    blocks = math.ceil(tokens / block_size) + 1
+    memory_buffer = torch.full(
+        (2, 1, blocks, block_size, heads, head_dim),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    slots = torch.arange(tokens, device=device)
+
+    triton_append_key_value_cache(
+        layer_number=0,
+        key=key,
+        value=value,
+        memory_buffer=memory_buffer,
+        padded_active_token_count=tokens,
+        token_to_block_idx=slots // block_size,
+        token_to_local_position_within_kv_block=(slots % block_size).to(torch.int32),
+        dummy_block_idx=blocks - 1,
+    )
+
+    cache = memory_buffer.view(2, blocks * block_size, heads, head_dim)
+    assert torch.equal(cache[0, :tokens], key.squeeze(1)), "keys differ"
+    assert torch.equal(cache[1, :tokens], value.squeeze(1)), "values differ"
+    assert cache[:, tokens:].isnan().all(), "wrote past the last token's slot"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton required")
+class TestKVAppendFusedQKVViews:
+    """Key and value as attention passes them: views of the fused QKV projection."""
+
+    @pytest.mark.internal
+    def test_fused_qkv_views(self):
+        _append_fused_qkv_views(tokens=37, heads=2, group=4, head_dim=16, block_size=8)
+
+    @pytest.mark.large
+    @pytest.mark.internal
+    def test_token_offsets_past_int32(self):
+        """The last token's key and value start past 2**31 elements.
+
+        A Llama-3-8B-shaped layer (32 query heads, 8 KV heads of 128) at TP 1 has a fused QKV
+        row of 6144 elements, so token 349,526 starts at 2,147,487,744. The projection follows
+        2**31 zeros, which a wrapped int32 offset would read. Opt in with ``-m large`` (about
+        12 GiB of device memory); run it in its own process.
+        """
+        heads, group, head_dim = 8, 4, 128
+        tokens = 2**31 // (heads * (group + 2) * head_dim) + 2
+        torch.cuda.empty_cache()
+        if _gpu_memory_gb() < 12.0:
+            pytest.skip("Needs >= 12 GiB free GPU memory")
+        _append_fused_qkv_views(tokens, heads, group, head_dim, block_size=64, guard=2**31)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
