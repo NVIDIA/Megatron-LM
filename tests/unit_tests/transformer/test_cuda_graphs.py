@@ -2755,10 +2755,12 @@ class TestCudaGraphManagerProcessGroups:
         _CudagraphGlobalRecord._disable_saved_tensors_observer()
         CudaGraphManager.global_mempool = None
         torch.cuda.set_stream(torch.cuda.default_stream())
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if getattr(self, "model_pp_group", None) is not None:
+            torch.distributed.destroy_process_group(self.model_pp_group)
         Utils.destroy_model_parallel()
 
-    @staticmethod
-    def _model_pipeline_group(global_pp):
+    def _model_pipeline_group(self, global_pp):
         """Initialize a global grid with `global_pp` stages and return the model's PP group.
 
         The model's pipeline size differs from the global one: under a global PP of 1 the model
@@ -2772,8 +2774,8 @@ class TestCudaGraphManagerProcessGroups:
         if global_pp == 2:
             return None
         pairs = [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
-        group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
-        return group
+        self.model_pp_group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
+        return self.model_pp_group
 
     @pytest.mark.parametrize("global_pp", [1, 2])
     def test_function_manager_follows_module_pipeline_group(self, monkeypatch, global_pp):
@@ -2811,6 +2813,36 @@ class TestCudaGraphManagerProcessGroups:
         )
         module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
         assert manager.reuse_cudagraphs is False
+
+    @pytest.mark.parametrize("manager_sets_pp", [False, True])
+    def test_function_manager_uses_first_collection_with_pipeline_group(
+        self, monkeypatch, manager_sets_pp
+    ):
+        """A manager collection without `pp` defers to the module's; one that sets `pp` wins."""
+        # The global PP size is 1, and the module's pipeline group holds 2 ranks.
+        model_pp_group = self._model_pipeline_group(global_pp=1)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        module = _SimpleModule(config).cuda()
+        module.pg_collection = ProcessGroupCollection(pp=model_pp_group)
+        # pp=None turns pipeline parallelism off for the manager.
+        manager_groups = {"pp": None} if manager_sets_pp else {"tp": None}
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            manager = CudaGraphManager(
+                config,
+                base_module=module,
+                function_name="my_op",
+                need_backward=False,
+                pg_collection=ProcessGroupCollection(**manager_groups),
+            )
+            module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        assert manager.reuse_cudagraphs is manager_sets_pp
 
     @pytest.mark.parametrize("global_pp", [1, 2])
     def test_transformer_layer_follows_its_pipeline_group(self, monkeypatch, global_pp):

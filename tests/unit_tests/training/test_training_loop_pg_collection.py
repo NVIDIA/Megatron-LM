@@ -52,9 +52,14 @@ def _forbid_global_reads(monkeypatch, *modules):
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", classmethod(_raise))
 
 
+# The groups of the running test, which the default_grid fixture destroys.
+_created_groups = []
+
+
 def _subgroup(rank_lists):
     """This rank's group from a partition of the world; every rank creates every group."""
     group, _ = torch.distributed.new_subgroups_by_enumeration(rank_lists)
+    _created_groups.append(group)
     return group
 
 
@@ -94,6 +99,11 @@ class TestTrainingLoopPgCollection:
         # Set up before, and torn down after, the monkeypatched accessors.
         Utils.initialize_model_parallel()
         yield
+        # Every rank finishes its collectives before any communicator goes away.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        while _created_groups:
+            torch.distributed.destroy_process_group(_created_groups.pop())
         Utils.destroy_model_parallel()
 
     @_needs_4_ranks
@@ -211,24 +221,31 @@ class TestTrainingLoopPgCollection:
         assert (next(data_iterator, None) is None) == (tp_group.rank() == 0)
 
     @_needs_4_ranks
-    def test_full_dataset_length_reduces_over_the_collection(self, monkeypatch, run_config):
+    @pytest.mark.parametrize("deduplicate_across_cp", [False, True])
+    def test_full_dataset_length_reduces_over_the_collection(
+        self, monkeypatch, run_config, deduplicate_across_cp
+    ):
+        sample_group, cp_sample_group = _subgroup(_pairs()), _subgroup(_strided_pairs())
         pg_collection = ProcessGroupCollection(
-            dp_gtp_remat=_subgroup(_pairs()), mp=_subgroup(_singletons())
+            dp_gtp_remat=sample_group, dp_cp_gtp_remat=cp_sample_group, mp=_subgroup(_singletons())
         )
         rank = torch.distributed.get_rank()
         provider = Mock(
             return_value=(SimpleNamespace(_dataloader=range(rank + 1)), None, None),
             supports_train_full_dataset=True,
         )
-        args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=False)
+        args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=deduplicate_across_cp)
         _forbid_global_reads(monkeypatch, training)
 
         sample_count = training._get_train_full_dataset_sample_count(
             args, provider, pg_collection=pg_collection
         )
 
-        first_rank_of_pair = rank - rank % 2
-        assert sample_count == (first_rank_of_pair + 1) + (first_rank_of_pair + 2)
+        # A dataloader deduplicated across context parallelism is summed over those ranks too.
+        summed_group = cp_sample_group if deduplicate_across_cp else sample_group
+        assert sample_count == sum(
+            peer + 1 for peer in torch.distributed.get_process_group_ranks(summed_group)
+        )
 
     @_needs_4_ranks
     @pytest.mark.parametrize("model_carries_collection", [True, False])
@@ -314,10 +331,18 @@ class TestTrainingLoopPgCollection:
             evaluated.append(eval_iters)
             return {}, None, False
 
+        sent = []
+        broadcast = torch.distributed.broadcast
+
+        def record_and_broadcast(tensor, *args, **kwargs):
+            sent.append(tensor.tolist())
+            return broadcast(tensor, *args, **kwargs)
+
         monkeypatch.setattr(training, "evaluate", evaluate)
         monkeypatch.setattr(training, "get_args", SimpleNamespace)
         monkeypatch.setattr(training, "get_train_state", TrainState)
         monkeypatch.setattr(training, "get_wandb_writer", lambda: None)
+        monkeypatch.setattr(torch.distributed, "broadcast", record_and_broadcast)
         _forbid_global_reads(monkeypatch, training)
 
         training.evaluate_and_print_results(
@@ -331,6 +356,9 @@ class TestTrainingLoopPgCollection:
             write_to_tensorboard=False,
         )
 
+        # World rank 0 broadcasts its lengths, so the result alone does not show which ranks
+        # filled them in: only tensor-parallel rank 0 of the collection does.
+        assert sent == [[3, 4] if pg_collection.tp.rank() == 0 else [0, 0]]
         assert evaluated == [3, 4]
         assert run_config.validation.eval_iters == [3, 4]
 
@@ -515,3 +543,112 @@ class TestTrainingLoopPgCollection:
         # Only the last pipeline stage of the collection, half of the ranks, contributes.
         assert stats["packed_sequence/original_samples"] == 2.0 * Utils.world_size / 2
         assert stats["packed_sequence/total_tokens"] == 250.0 * Utils.world_size / 2
+
+
+def test_sample_sum_requires_the_collection_sample_group(monkeypatch):
+    _forbid_global_reads(monkeypatch, training)
+
+    with pytest.raises(ValueError, match="dp_gtp_remat"):
+        training._reduce_sum_across_data_parallel_group(1.0, pg_collection=ProcessGroupCollection())
+
+
+@pytest.mark.parametrize("num_microbatches", [None, 0])
+def test_setup_rejects_a_batch_too_small_for_its_ranks(monkeypatch, run_config, num_microbatches):
+    args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_train_state", TrainState)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "get_model", Mock(return_value=[SimpleNamespace()]))
+    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: num_microbatches)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+    # The check sizes its message from the run config, not from the global grid.
+    _forbid_global_reads(monkeypatch, training)
+
+    with pytest.raises(ValueError, match="too small for"):
+        training.setup_model_and_optimizer(
+            None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
+        )
+
+
+@pytest.mark.parametrize("multi_module", [False, True])
+def test_train_passes_the_collection_to_its_helpers(monkeypatch, run_config, multi_module):
+    """One skipped and one rollout-only iteration of train(), with its helpers recorded."""
+    grid_pg_collection = sample_pg_collection = pg_collection = ProcessGroupCollection()
+    if multi_module:
+        # The grid readers fall back to the global grid; samples count on the language model.
+        grid_pg_collection = None
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"language": sample_pg_collection}, language_model_module_name="language"
+        )
+    run_config.train.gpu_sniff_test_interval = None if multi_module else 1
+    run_config.train.micro_batch_size, run_config.train.train_iters = 1, 2
+    run_config.train.iterations_to_skip = [1]
+    args = SimpleNamespace(seq_length=8, decoder_seq_length=None, logits_save_dir=None)
+    train_state, calls = TrainState(), []
+
+    def record(name, result=None):
+        def recorder(*args, **kwargs):
+            calls.append((name, kwargs["pg_collection"] if "pg_collection" in kwargs else args[0]))
+            return result
+
+        monkeypatch.setattr(training, name, recorder)
+
+    record("_run_gpu_sniff_test")
+    record("dummy_train_step")
+    record("_get_data_parallel_world_size", 1)
+    record("consume_seqlen_stats_in_iteration", (None, None))
+    record("post_training_step_callbacks", 0.0)
+    # Everything else that train() calls on this path: no-ops, unless it needs their result.
+    no_ops = """get_timers get_energy_monitor get_rerun_state_machine one_logger_utils
+        ft_integration write_args_to_tensorboard print_datetime report_memory
+        _get_forward_backward_func maybe_finalize_async_save update_num_microbatches
+        maybe_verify_choices training_log _end_otel_startup_span _start_otel_train_span
+        _maybe_reroot_otel_interval _end_otel_train_span"""
+    falsy = """get_one_logger get_tensorboard_writer should_disable_forward_pre_hook
+        is_batch_size_transition _should_compute_params_norm _otel_sg_enabled
+        checkpoint_and_decide_exit"""
+    sizes = (
+        "get_num_microbatches get_current_global_batch_size get_current_running_global_batch_size"
+    )
+    for names, stub in (
+        (no_ops, MagicMock()),
+        (falsy, Mock(return_value=None)),
+        (sizes, lambda: 1),
+    ):
+        for name in names.split():
+            monkeypatch.setattr(training, name, stub)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
+    monkeypatch.setattr(training, "_otel_managed_span", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(training, "num_floating_point_operations", lambda *args, **kwargs: 0.0)
+    _forbid_global_reads(monkeypatch, training)
+
+    training.train(
+        None,
+        [MagicMock()],
+        None,
+        None,
+        None,
+        SimpleNamespace(finalize_model_grads_func=None),
+        None,
+        next_train_iterator=lambda iteration, iterator: iterator,
+        run_eval=lambda **kwargs: None,
+        pg_collection=pg_collection,
+        run_train_loop_without_updates=True,
+    )
+
+    assert calls == [
+        *([] if multi_module else [("_run_gpu_sniff_test", grid_pg_collection)]),
+        ("dummy_train_step", grid_pg_collection),
+        ("_get_data_parallel_world_size", sample_pg_collection),
+        ("_get_data_parallel_world_size", sample_pg_collection),
+        ("consume_seqlen_stats_in_iteration", grid_pg_collection),
+        ("post_training_step_callbacks", grid_pg_collection),
+    ]
+    assert train_state.iteration == 2
