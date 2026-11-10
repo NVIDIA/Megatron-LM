@@ -2746,11 +2746,13 @@ def _build_pg_collection_from_parallel_state(args, config=None):
         dp_cp_ag, expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=(config.expert_model_parallel_size > 1), timeout=timeout
         )
-        # create_all_gather_groups lays the expert ranks out in the default order, so check that
-        # each all-gather group spans the ranks of the group whose parameters it gathers.
+        # create_all_gather_groups mirrors the full data-parallel groups and lays the expert
+        # ranks out in the default order, so check that each all-gather group spans the ranks
+        # of the group Megatron-FSDP shards its parameters over: the intra-instance group,
+        # which is the full group with one distributed optimizer instance.
         for ag_group, group in (
-            (dp_cp_ag, pg_collection.dp_cp),
-            (expt_dp_ag, pg_collection.expt_dp),
+            (dp_cp_ag, pg_collection.intra_dp_cp),
+            (expt_dp_ag, pg_collection.intra_expt_dp),
         ):
             if ag_group is not None and (
                 torch.distributed.get_process_group_ranks(ag_group)
@@ -2758,8 +2760,9 @@ def _build_pg_collection_from_parallel_state(args, config=None):
             ):
                 raise ValueError(
                     "--create-all-gather-group built all-gather groups whose ranks differ from "
-                    "the data-parallel groups; with expert parallelism it supports only the "
-                    "default tp-cp-ep-dp-pp rank order."
+                    "the data-parallel groups Megatron-FSDP shards over. It does not support "
+                    "--num-distributed-optimizer-instances > 1, and with expert parallelism it "
+                    "supports only the default tp-cp-ep-dp-pp rank order."
                 )
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
@@ -3011,8 +3014,11 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
 
     - A collection that sets ``gtp_remat`` to None, or to a group of one rank, has no GTP
       weight-remat axis, so the replicate group is the same group.
-    - A collection that does not set ``gtp_remat`` does not say whether it has that axis. It
-      gets the replicate group with a ProcessGroupFallbackWarning; this is deprecated.
+    - A collection that does not set ``gtp_remat`` does not say whether it has that axis, so
+      the global parallel state decides, as it does for the model's layers
+      (``resolve_gtp_remat_group``), with a ProcessGroupFallbackWarning; this is deprecated.
+      The replicate group serves when the global GTP weight-remat group is unset or has one
+      rank.
 
     Args:
         pg_collection: Process groups to take the group from. Omitting it is deprecated: the
@@ -3021,9 +3027,10 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
         owner: Name of the function that needs the group, used in the warnings and errors.
 
     Raises:
-        ValueError: ``pg_collection`` does not set the GTP-inclusive group and either sets
-            ``gtp_remat`` to a group of more than one rank, so that the replicate group misses
-            ranks that read distinct data, or does not set the replicate group either.
+        ValueError: ``pg_collection`` does not set the GTP-inclusive group and either has a GTP
+            weight-remat axis of more than one rank (its own ``gtp_remat``, or the global one
+            when it does not set ``gtp_remat``), so that the replicate group misses ranks that
+            read distinct data, or does not set the replicate group either.
     """
     if pg_collection is None:
         with global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23"):
@@ -3051,6 +3058,16 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
         warn_global_process_group_fallback(
             owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
         )
+        # The model's layers take the GTP weight-remat axis of such a collection from the
+        # global parallel state, so the replicate group serves only when that axis is off.
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+
+        if get_pg_size(resolve_gtp_remat_group(pg_collection, is_expert=False, owner=None)) > 1:
+            raise ValueError(
+                f"{owner} requires pg_collection to set {name}: pg_collection does not set "
+                "gtp_remat and the global parallel state has GTP weight remat, so "
+                f"{replicate_name} does not hold every rank that reads distinct data"
+            )
     return groups[replicate_name]
 
 
@@ -3918,9 +3935,7 @@ def train_step(
     )
 
     if tensor_metric_observer is not None:
-        metric_pg_collection = _get_model_pg_collection(
-            model[0], pg_collection, owner="train_step"
-        )
+        metric_pg_collection = model_pg_collection
         tensor_metric_observer(
             model=model,
             optimizer=optimizer,
@@ -4147,6 +4162,9 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+    # The MoE metrics tracker gets the caller's argument: without a collection it keeps its own
+    # fallback, which averages over the global data-parallel group without CP.
+    moe_metrics_pg_collection = pg_collection
     # The memory report prints on rank 0 of this data-parallel group; None selects
     # pg_collection.dp.
     memory_report_group = None
@@ -4382,7 +4400,7 @@ def training_log(
             num_moe_layers=num_moe_layers,
             moe_layer_freq=cfg.model.transformer.moe_layer_freq,
             num_hash_layers=num_hash_layers,
-            pg_collection=pg_collection,
+            pg_collection=moe_metrics_pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
@@ -4933,16 +4951,20 @@ def _param_hashes_match_across_dp_replicas(model, pg_collection):
     """Return whether every data-parallel replica of the model holds the same parameters.
 
     The replicas are those of the model's process-group collection, or of ``pg_collection``,
-    the run's collection, for a model without one (see ``_get_model_pg_collection``).
+    the run's collection, for a model without one (see ``_get_model_pg_collection``). For a
+    collection without an expert data-parallel group, the expert replicas are those of the
+    group that DistributedDataParallel built in its place.
     """
     model_pg_collection = _get_model_pg_collection(
         model[0], pg_collection, owner="_param_hashes_match_across_dp_replicas"
     )
+    expt_dp_group = model_pg_collection.expt_dp
+    if expt_dp_group is None:
+        # DistributedDataParallel accepts a collection without expt_dp and reduces the expert
+        # gradients over single-rank groups of its own; compare the expert hashes over the same.
+        expt_dp_group = getattr(model[0], "expt_dp_group", None)
     return check_param_hashes_across_dp_replicas(
-        model,
-        cross_check=True,
-        dp_group=model_pg_collection.dp,
-        expt_dp_group=model_pg_collection.expt_dp,
+        model, cross_check=True, dp_group=model_pg_collection.dp, expt_dp_group=expt_dp_group
     )
 
 

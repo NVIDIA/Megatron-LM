@@ -337,6 +337,38 @@ def test_rejects_collection_without_dp_cp(process_group_collection, distributed_
     assert not isinstance(layer, FsdpModule)
 
 
+def test_config_logger_gets_the_collection(process_group_collection, monkeypatch):
+    """With config_logger_dir set, the wrapper names its dump by the collection it was given."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        config_logger_dir="unused",
+    )
+    logged = []
+    monkeypatch.setattr(
+        mcore_adapter_v2, "log_config_to_disk", lambda *args, **kwargs: logged.append(kwargs)
+    )
+    FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        ),
+        pg_collection=process_group_collection,
+    )
+
+    (kwargs,) = logged
+    assert kwargs["pg_collection"] is process_group_collection
+
+
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
     """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
     config = TransformerConfig(

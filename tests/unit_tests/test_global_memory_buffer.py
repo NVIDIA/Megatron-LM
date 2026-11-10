@@ -27,7 +27,14 @@ def _own_tensor_parallel_group(tp_size):
 
 @pytest.fixture
 def parallel_state_buffer_forbidden(monkeypatch):
-    """Make parallel_state's buffer aliases raise, so callers must use megatron.core.utils."""
+    """Make parallel_state's buffer aliases raise when they are looked up on the module.
+
+    This catches a call through the module (``parallel_state.get_global_memory_buffer()``, as
+    the local attention had) and an import inside a function (as the dynamic inference engine
+    had). It cannot catch a module-level ``from megatron.core.parallel_state import ...``, as
+    the tensor-parallel layers and mappings had, because that binds the function when the
+    module is imported. test_global_memory_buffer_imports.py checks every in-tree import.
+    """
 
     def forbidden(*args, **kwargs):
         raise RuntimeError("the global memory buffer was taken from parallel_state")

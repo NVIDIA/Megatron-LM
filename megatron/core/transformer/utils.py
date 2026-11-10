@@ -324,7 +324,10 @@ def _get_extra_state_offsets(
 
 
 def ensure_metadata_has_dp_cp_group(
-    metadata: Optional[dict], dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+    metadata: Optional[dict],
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    owner: Optional[str] = None,
 ) -> dict:
     """Ensure `metadata` is a dict containing `dp_cp_group` entry.
 
@@ -338,19 +341,23 @@ def ensure_metadata_has_dp_cp_group(
             context-parallel group including GTP-remat peers (``dp_cp_gtp_remat``), whose ranks
             the replica ids are computed over. A `dp_cp_group` already in `metadata` takes
             precedence. When neither is given, the global GTP-inclusive DP x CP group is used,
-            with a ``ProcessGroupFallbackWarning`` that names the calling function. That
-            fallback is deprecated.
+            with a ``ProcessGroupFallbackWarning`` that names ``owner``. That fallback is
+            deprecated.
+        owner: Name, for the fallback warning, of the module or function that did not supply
+            the group. Defaults to the name of the calling function, which for an inherited
+            method is that of the class that defines it.
     """
     if metadata is not None:
         assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
         if 'dp_cp_group' in metadata:
             return metadata
     if dp_cp_group is None:
-        # The caller is the module that did not supply its own group.
-        caller = sys._getframe(1).f_code.co_qualname
+        if owner is None:
+            # The calling function is the one that did not supply a group.
+            owner = sys._getframe(1).f_code.co_qualname
         dp_cp_group = resolve_process_groups(
             None,
-            owner=f"ensure_metadata_has_dp_cp_group (from {caller})",
+            owner=f"ensure_metadata_has_dp_cp_group (from {owner})",
             required=("dp_cp_gtp_remat",),
             argument="dp_cp_group",
             deprecated_in="0.21",
@@ -392,7 +399,9 @@ def sharded_state_dict_default(
     """
 
     # Guard for cases metadata is not provided
-    metadata = ensure_metadata_has_dp_cp_group(metadata)
+    metadata = ensure_metadata_has_dp_cp_group(
+        metadata, owner=f"sharded_state_dict_default({type(module).__name__})"
+    )
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(

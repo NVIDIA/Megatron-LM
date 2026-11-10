@@ -196,6 +196,26 @@ class TestGtpShardCheckpointEntries:
         assert tp_group is parallel_state.get_tensor_model_parallel_group()
         assert dp_cp_group is parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    def test_without_a_collection_uses_the_global_group_with_the_gtp_remat_peers(
+        self, model_parallel, recorded_rebuilds
+    ):
+        if Utils.world_size % 2 != 0:
+            pytest.skip(f"world size {Utils.world_size} must be even for a GTP-remat axis of 2")
+        # With GTP remat on, the global DP x CP group no longer holds a rank's GTP-remat peer.
+        Utils.initialize_model_parallel(gtp_remat_size=2)
+
+        with pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="Float16OptimizerWithFloat16Params was called without `pg_collection`",
+        ):
+            _backfill_gtp_sharded_param_map({}, [[_gtp_shard()]])
+
+        ((_, dp_cp_group),) = recorded_rebuilds
+        assert dp_cp_group is parallel_state.get_data_parallel_group(with_context_parallel=True)
+        assert dp_cp_group is not parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        )
+
     def test_a_shard_with_a_model_entry_needs_no_groups(self, recorded_rebuilds):
         shard = _gtp_shard()
         # A native-FP8 shard's model entry holds a dequantized copy that links back to it.

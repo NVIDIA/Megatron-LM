@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
@@ -51,7 +52,6 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import (
     Utils,

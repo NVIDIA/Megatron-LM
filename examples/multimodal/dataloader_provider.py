@@ -168,7 +168,8 @@ def train_valid_test_dataloaders_provider(
         pg_collection: Process groups of the run. Its tensor-, context- and pipeline-parallel
             ranks select the dataloader ranks, and the loaders shard samples over its
             data-parallel group including the GTP weight-remat axis (dp_gtp_remat), or over its
-            data-parallel group (dp) when the collection has no dp_gtp_remat. Its
+            data-parallel group (dp) when the collection has no dp_gtp_remat. A collection
+            with GTP weight remat (gtp_remat of more than one rank) must set dp_gtp_remat. Its
             pipeline-parallel size picks the checkpoint directory the dataloader state is
             restored from. None falls back to the global parallel state with a
             ProcessGroupFallbackWarning; that fallback is deprecated.
@@ -198,7 +199,13 @@ def train_valid_test_dataloaders_provider(
         require_process_groups(pg_collection, ("tp", "cp", "pp"), owner=owner)
     # The GTP weight-remat ranks of a data-parallel replica consume distinct samples, as in
     # build_pretraining_data_loader. Collections that predate the GTP weight-remat fields carry
-    # only the replicate group.
+    # only the replicate group, which holds every reader as long as that axis is off.
+    gtp_remat = pg_collection.gtp_remat
+    if pg_collection.dp_gtp_remat is None and gtp_remat is not None and gtp_remat.size() > 1:
+        raise ValueError(
+            f"{owner} requires pg_collection.dp_gtp_remat: with GTP weight remat, dp does not "
+            "hold every rank that reads distinct data"
+        )
     data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
     if data_parallel_group is None:
         raise ValueError(f"{owner} requires pg_collection.dp_gtp_remat or pg_collection.dp")

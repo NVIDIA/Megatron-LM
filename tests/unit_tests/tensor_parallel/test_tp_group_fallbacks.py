@@ -2,6 +2,7 @@
 
 """Tensor-parallel helpers warn when they fall back to the global tensor-parallel group."""
 
+import contextlib
 import warnings
 
 import pytest
@@ -25,7 +26,7 @@ from megatron.core.tensor_parallel.random import checkpoint, model_parallel_cuda
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, new_group_with_same_ranks
 
 HELPER = "get_tensor_model_parallel_group_if_none"
 VERSIONS = "deprecated since Megatron Core 0.21 and will be removed in 0.23"
@@ -61,17 +62,29 @@ def _forbid_global_tp_group(monkeypatch):
     monkeypatch.setattr(cross_entropy, "get_tensor_model_parallel_group", forbid)
 
 
+def _destroy_group(group):
+    """Destroy a group that a test created, once every rank has finished its collectives."""
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group(group)
+
+
+@contextlib.contextmanager
 def _distinct_tp_group():
-    """A communicator with this rank's global TP ranks that is not the global TP group."""
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    world_size = torch.distributed.get_world_size()
-    ranks = [list(range(start, start + tp_size)) for start in range(0, world_size, tp_size)]
-    group, _ = torch.distributed.new_subgroups_by_enumeration(ranks)
-    assert group is not parallel_state.get_tensor_model_parallel_group()
-    assert torch.distributed.get_process_group_ranks(
-        group
-    ) == torch.distributed.get_process_group_ranks(parallel_state.get_tensor_model_parallel_group())
-    return group
+    """A communicator with this rank's global TP ranks that is not the global TP group.
+
+    It is destroyed when the block ends.
+    """
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    group = new_group_with_same_ranks(tp_group)
+    try:
+        assert group is not tp_group
+        assert torch.distributed.get_process_group_ranks(
+            group
+        ) == torch.distributed.get_process_group_ranks(tp_group)
+        yield group
+    finally:
+        _destroy_group(group)
 
 
 def _config(**kwargs):
@@ -130,9 +143,8 @@ class TestTensorModelParallelGroupIfNone:
         assert all(w.filename == __file__ for w in _fallback_warnings(record))
 
     def test_explicit_group_never_warns_or_reads_the_global_group(self, monkeypatch):
-        group = _distinct_tp_group()
-        _forbid_global_tp_group(monkeypatch)
-        with warnings.catch_warnings():
+        with _distinct_tp_group() as group, warnings.catch_warnings():
+            _forbid_global_tp_group(monkeypatch)
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             assert get_tensor_model_parallel_group_if_none(group) is group
             assert get_tensor_model_parallel_group_if_none(group, is_expert=True) is group
@@ -191,9 +203,8 @@ class TestVocabParallelCrossEntropyFallback:
         expected = vocab_parallel_cross_entropy(
             logits.clone(), target, tp_group=parallel_state.get_tensor_model_parallel_group()
         )
-        group = _distinct_tp_group()
-        _forbid_global_tp_group(monkeypatch)
-        with warnings.catch_warnings():
+        with _distinct_tp_group() as group, warnings.catch_warnings():
+            _forbid_global_tp_group(monkeypatch)
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             loss = vocab_parallel_cross_entropy(logits.clone(), target, tp_group=group)
         assert torch.equal(loss, expected)
@@ -242,24 +253,24 @@ class TestTensorParallelCallersPassTheirGroup:
 
     def test_row_parallel_linear_forward_uses_its_group(self, monkeypatch):
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
-        group = _distinct_tp_group()
-        layer = RowParallelLinear(
-            8,
-            4,
-            config=_config(),
-            init_method=torch.nn.init.normal_,
-            bias=True,
-            input_is_parallel=True,
-            skip_bias_add=False,
-            tp_group=group,
-        ).cuda()
-        inputs = torch.randn(3, 2, 4, device="cuda", requires_grad=True)
+        with _distinct_tp_group() as group:
+            layer = RowParallelLinear(
+                8,
+                4,
+                config=_config(),
+                init_method=torch.nn.init.normal_,
+                bias=True,
+                input_is_parallel=True,
+                skip_bias_add=False,
+                tp_group=group,
+            ).cuda()
+            inputs = torch.randn(3, 2, 4, device="cuda", requires_grad=True)
 
-        _forbid_global_tp_group(monkeypatch)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", ProcessGroupFallbackWarning)
-            output, _ = layer(inputs)
-            output.sum().backward()
+            _forbid_global_tp_group(monkeypatch)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                output, _ = layer(inputs)
+                output.sum().backward()
         assert inputs.grad is not None
 
     def test_checkpoint_splits_the_saved_input_over_the_given_group(self, monkeypatch):
@@ -275,11 +286,14 @@ class TestTensorParallelCallersPassTheirGroup:
         second = torch.full((4, 4), 2.0, device="cuda")
 
         _forbid_global_tp_group(monkeypatch)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", ProcessGroupFallbackWarning)
-            output = checkpoint(forward, True, first, second, tp_group=group)
-            assert first.data.shape == (16 // Utils.world_size,)
-            output.sum().backward()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                output = checkpoint(forward, True, first, second, tp_group=group)
+                assert first.data.shape == (16 // Utils.world_size,)
+                output.sum().backward()
+        finally:
+            _destroy_group(group)
         assert torch.equal(output, torch.full((4, 4), 3.0, device="cuda"))
         assert torch.equal(first.grad, torch.ones((4, 4), device="cuda"))
 

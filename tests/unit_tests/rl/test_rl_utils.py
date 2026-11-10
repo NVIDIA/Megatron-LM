@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -37,7 +37,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -178,6 +178,55 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer, data_p
     assert (callback.model, callback.optimizer) == (["chunk"], optimizer)
     assert callback.inference_model == "inference_model"
     assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
+
+
+def test_build_rl_inference_model_forwards_the_training_collection(monkeypatch):
+    """The inference grid takes the sizes that the RL config leaves unset from the trained
+    model's collection, and the inference model is built on the collection of that grid."""
+    seen = {}
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=SimpleNamespace(context_parallel_size=1)),
+        dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+    )
+    inference_model = [MagicMock()]
+
+    def build_grid(world_size, **kwargs):
+        seen["grid"] = (world_size, kwargs)
+        return "inference_pg_collection"
+
+    def get_model(model_provider, model_type, **kwargs):
+        seen["model"] = (model_provider, model_type, kwargs)
+        return inference_model
+
+    monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "safe_get_world_size", lambda: 8)
+    monkeypatch.setattr(training_setup, "build_inference_pg_collection", build_grid)
+    monkeypatch.setattr(training_setup, "inference_model_alloc_context", nullcontext)
+    monkeypatch.setattr(training_setup, "get_model", get_model)
+    training_pg_collection = object()
+
+    built = training_setup.build_rl_inference_model(
+        RLConfig(rl_inference_tensor_model_parallel_size=2),
+        SimpleNamespace(inference_shards=None),
+        SimpleNamespace(tensor_model_parallel_size=1),
+        "provider",
+        "type",
+        training_pg_collection=training_pg_collection,
+    )
+
+    assert built is inference_model
+    world_size, grid_kwargs = seen["grid"]
+    assert world_size == 8
+    assert grid_kwargs["training_pg_collection"] is training_pg_collection
+    # Only the TP size is set; the grid takes the others from the training collection.
+    assert grid_kwargs["tp_size"] == 2
+    assert [grid_kwargs[name] for name in ("pp_size", "cp_size", "ep_size", "expt_tp_size")] == [
+        None
+    ] * 4
+    model_provider, model_type, model_kwargs = seen["model"]
+    assert (model_provider, model_type) == ("provider", "type")
+    assert model_kwargs["pg_collection"] == "inference_pg_collection"
+    assert model_kwargs["config"].tensor_model_parallel_size == 2
 
 
 @pytest.mark.parametrize(
@@ -464,6 +513,22 @@ def initialize_model_parallel(request, monkeypatch):
     Utils.destroy_model_parallel()
     destroy_global_vars()
     destroy_num_microbatches_calculator()
+
+
+@pytest.fixture
+def own_process_groups():
+    """A list for the process groups a test creates itself; they are destroyed after the test.
+
+    Request it after initialize_model_parallel, so that these groups go before the grid's.
+    """
+    groups = []
+    yield groups
+    # Every rank finishes its collectives before any communicator goes away.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dist.barrier()
+    for group in groups:
+        dist.destroy_process_group(group)
 
 
 @pytest.fixture(autouse=True)
@@ -892,7 +957,9 @@ class TestRLUtils:
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
-        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        # Records the models the interface is requested for.
+        interface.get_interface = MagicMock(return_value=interface)
+        monkeypatch.setattr(rl_utils, "get_inference_interface", interface.get_interface)
         monkeypatch.setattr(
             rl_utils,
             "unwrap_model",
@@ -968,7 +1035,7 @@ class TestRLUtils:
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
-        interface, _ = self._patch_rl_inference_mode_deps(
+        interface, loop = self._patch_rl_inference_mode_deps(
             monkeypatch, args, RLConfig(rl_training_cuda_graphs=False), iteration=11
         )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
@@ -993,6 +1060,10 @@ class TestRLUtils:
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
+        # The interface serves the inference model; its warmup gets the model being trained.
+        interface.get_interface.assert_called_once_with(
+            args, loop, model, training_model if separate_training_model else model
+        )
         interface.set_generation_epoch.assert_called_once_with(11)
         expected_modules = (
             [
@@ -1685,18 +1756,55 @@ class TestRLUtils:
         )
         assert get_num_microbatches() == expected_microbatches
 
+    def test_get_training_data_parallel_group(self, monkeypatch):
+        """The rollouts are spread over dp_gtp_remat. A collection that predates the GTP
+        weight-remat fields carries only dp, which serves when there is no GTP weight-remat
+        axis: in the collection's gtp_remat or, for a collection that does not set it, in the
+        global parallel state, where the model's layers then look. A collection without a
+        data-parallel group is rejected."""
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        dp, dp_gtp_remat = SimpleNamespace(size=lambda: 2), SimpleNamespace(size=lambda: 4)
+        gtp_remat = SimpleNamespace(size=lambda: 2)
+        select = rl_utils.get_training_data_parallel_group
+
+        def rejected():
+            return pytest.raises(ValueError, match="pg_collection to set dp_gtp_remat")
+
+        # A collection that sets gtp_remat does not look at the global parallel state.
+        monkeypatch.setattr(
+            parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: gtp_remat
+        )
+        full = ProcessGroupCollection(dp=dp, dp_gtp_remat=dp_gtp_remat, gtp_remat=gtp_remat)
+        assert select(full) is dp_gtp_remat
+        assert select(ProcessGroupCollection(dp=dp, gtp_remat=None)) is dp
+        for groups in ({"dp": dp, "gtp_remat": gtp_remat}, {"dp": None, "gtp_remat": None}):
+            with rejected():
+                select(ProcessGroupCollection(**groups))
+
+        # A collection that does not set gtp_remat has the axis of the global parallel state.
+        with pytest.warns(ProcessGroupFallbackWarning, match="pg_collection.gtp_remat"):
+            with rejected():
+                select(ProcessGroupCollection(dp=dp))
+        monkeypatch.setattr(parallel_state, "get_gtp_weight_remat_group", lambda **kwargs: None)
+        assert select(ProcessGroupCollection(dp=dp)) is dp
+
     @pytest.mark.skipif(
         Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
     )
+    @pytest.mark.parametrize("dp_field", ["dp_gtp_remat", "dp"])
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
-    def test_prepare_data_for_update_uses_training_model_groups(self, initialize_model_parallel):
+    def test_prepare_data_for_update_uses_training_model_groups(
+        self, initialize_model_parallel, own_process_groups, dp_field
+    ):
         """The rollouts are split over the data-parallel group of the model being trained, which
         need not be the global one, and the logprobs pass selects and runs its schedule on the
-        model's process groups: no global grid accessor is read."""
+        model's process groups: no global grid accessor is read. The group is dp_gtp_remat, or
+        dp in a collection that does not set dp_gtp_remat."""
         world_size, _, _, _ = initialize_model_parallel
         tokenizer = MockTokenizer()
         self.create_test_args(
@@ -1712,7 +1820,9 @@ class TestRLUtils:
         model_dp_group, _ = dist.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, world_size, 2)]
         )
-        model.pg_collection.dp_gtp_remat = model_dp_group
+        own_process_groups.append(model_dp_group)
+        model.pg_collection.dp_gtp_remat = None
+        setattr(model.pg_collection, dp_field, model_dp_group)
 
         def rollout(row):
             # The second token identifies the row.
@@ -1750,7 +1860,7 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_eager_train_comm_warmup_uses_given_groups(
-        self, initialize_model_parallel, monkeypatch
+        self, initialize_model_parallel, own_process_groups, monkeypatch
     ):
         """The communicator warmup all-reduces once over each group of the collection it is
         given, in order, skips the groups the collection does not hold, and reads no global
@@ -1759,6 +1869,7 @@ class TestRLUtils:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # A distinct communicator over the ranks of the global data-parallel group.
         pg_collection.dp_gtp_remat = dist.new_group(ranks=list(range(world_size)))
+        own_process_groups.append(pg_collection.dp_gtp_remat)
         pg_collection.expt_tp = None
         reduced_groups = []
         all_reduce = dist.all_reduce

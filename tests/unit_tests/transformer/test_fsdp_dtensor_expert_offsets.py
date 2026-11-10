@@ -194,3 +194,17 @@ class TestExpertOffsetsFromTheGlobalGrid:
             pytest.raises(RuntimeError, match="has not created the expert-parallel group"),
         ):
             get_ep_layer_offset(NUM_EXPERTS)
+
+    def test_fallback_ignores_the_rank_and_size_overrides(self, monkeypatch):
+        """A layout set with set_expert_model_parallel_rank/_world_size() is not used."""
+        monkeypatch.setattr(parallel_state, "_EXPERT_MODEL_PARALLEL_GROUP", None)
+        # What set_expert_model_parallel_world_size(4) and set_expert_model_parallel_rank(3)
+        # store; monkeypatch restores both.
+        monkeypatch.setattr(parallel_state, "_MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE", 4)
+        monkeypatch.setattr(parallel_state, "_MPU_EXPERT_MODEL_PARALLEL_RANK", 3)
+
+        with (
+            pytest.warns(ProcessGroupFallbackWarning),
+            pytest.raises(RuntimeError, match="has not created the expert-parallel group"),
+        ):
+            get_ep_layer_offset(NUM_EXPERTS)

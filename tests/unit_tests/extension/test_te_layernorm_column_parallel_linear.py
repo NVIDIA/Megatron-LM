@@ -125,8 +125,12 @@ class TestShardedStateDictDpCpGroup:
         if Utils.world_size % 4 != 0:
             pytest.skip("needs TP=2 with at least two data-parallel replicas")
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        self.own_groups = []
 
     def teardown_method(self, method):
+        # Utils.destroy_model_parallel only destroys the groups of the global grid.
+        for group in self.own_groups:
+            torch.distributed.destroy_process_group(group)
         Utils.destroy_model_parallel()
 
     @staticmethod
@@ -169,6 +173,7 @@ class TestShardedStateDictDpCpGroup:
             [[rank] for rank in range(world_size)]
         )
         dp_cp_group = torch.distributed.new_group(list(range(world_size)))
+        self.own_groups += [tp_group, dp_cp_group]
         pg_collection = ProcessGroupCollection(
             tp=tp_group, dp_cp=dp_cp_group, dp_cp_gtp_remat=dp_cp_group
         )

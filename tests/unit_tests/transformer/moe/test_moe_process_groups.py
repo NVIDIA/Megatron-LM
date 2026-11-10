@@ -14,8 +14,10 @@ import torch
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -25,6 +27,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     get_updated_expert_bias,
 )
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -146,7 +149,7 @@ def _assert_same_groups(actual, expected):
         assert actual_group is expected_group
 
 
-def _moe_config(tp, ep, grouped_gemm):
+def _moe_config(tp, ep, grouped_gemm, **overrides):
     return TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -164,6 +167,7 @@ def _moe_config(tp, ep, grouped_gemm):
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
+        **overrides,
     )
 
 
@@ -258,6 +262,35 @@ def test_moe_layer_without_collection_warns_once_per_owner(tp, ep, grouped_gemm)
         for name, groups in held.items():
             for group in groups:
                 assert group is expected[name], name
+
+
+def test_mtp_block_without_collection_builds_its_moe_layer_on_the_global_groups():
+    """The block's own fallback collection sets the groups that its MoE layers require."""
+    _initialize_or_skip(ep=2)
+    model_parallel_cuda_manual_seed(123)
+    config = _moe_config(1, 2, grouped_gemm=False, mtp_num_layers=1)
+    spec = get_gpt_mtp_block_spec(
+        config=config,
+        spec=get_gpt_layer_local_spec(num_experts=4, moe_grouped_gemm=False),
+        use_transformer_engine=False,
+        pp_rank=0,
+    )
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        block = MultiTokenPredictionBlock(config=config, spec=spec)
+    fallbacks = _fallback_warnings(record)
+    assert ("MultiTokenPredictionBlock", "pg_collection") in fallbacks
+    # The MoE layer gets the block's collection, so it does not fall back itself.
+    assert ("MoELayer", "pg_collection") not in fallbacks
+
+    moe_layer = block.layers[0].mtp_model_layer.mlp
+    assert isinstance(moe_layer, MoELayer)
+    expected = _global_moe_groups()
+    assert moe_layer.ep_group is expected["ep"]
+    assert moe_layer.ep_group.size() == 2
+    assert moe_layer.token_dispatcher.tp_group is expected["expt_tp"]
+    assert moe_layer.token_dispatcher.tp_ep_group is expected["tp_ep"]
+    assert moe_layer.experts.dp_group is expected["expt_dp"]
 
 
 def test_default_collection_without_global_grid_raises():
