@@ -218,6 +218,102 @@ def gpu_model_parallel():
     Utils.destroy_model_parallel()
 
 
+@pytest.fixture
+def gpu_context_parallel():
+    if not torch.cuda.is_available() or Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip("Requires CUDA and an even distributed world size for CP=2")
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    torch.manual_seed(1234)
+    model_parallel_cuda_manual_seed(1234)
+    yield ProcessGroupCollection.use_mpu_process_groups()
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("boundary_layout", ["contiguous", "zigzag"])
+@pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+@pytest.mark.parametrize("with_mhc", [False, True])
+def test_external_layer_cp_token_ids_match_unsharded_reference(
+    gpu_context_parallel, boundary_layout, recompute_method, with_mhc
+):
+    class TokenGainLayer(ExternalGainLayer):
+        def forward(self, hidden_states, *, input_ids=None, **kwargs):
+            assert input_ids is not None
+            output = super().forward(hidden_states, input_ids=input_ids, **kwargs)
+            token_scale = 1 + input_ids.transpose(0, 1).unsqueeze(-1).to(output.dtype) / 16
+            return output * token_scale
+
+    class TokenGainConfig(ExternalGainConfig):
+        layer_type = TokenGainLayer
+
+    other_layout = "zigzag" if boundary_layout == "contiguous" else "contiguous"
+    # Consecutive layers reuse converted IDs, then the last layer needs the original IDs.
+    layouts = [other_layout, other_layout, boundary_layout]
+
+    def make_stack(groups, method):
+        options = {}
+        if method is not None:
+            options = dict(
+                recompute_granularity="full", recompute_method=method, recompute_num_layers=2
+            )
+        root = _root_config(
+            context_parallel_size=groups.cp.size(),
+            linear_cp_layout=boundary_layout,
+            enable_mhc_connections=with_mhc,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=3,
+            **options,
+        )
+        configs = [TokenGainConfig.from_config(root) for _ in layouts]
+        for config, layout in zip(configs, layouts, strict=True):
+            config.linear_cp_layout = layout
+        return HybridStack(
+            config=root,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=configs,
+            pg_collection=groups,
+            post_layer_norm=False,
+        ).cuda()
+
+    groups = gpu_context_parallel
+    # TP=1 provides real singleton groups for an independent, unsharded reference.
+    reference_groups = ProcessGroupCollection(
+        tp=groups.tp, pp=groups.pp, cp=groups.tp, tp_cp=groups.tp
+    )
+    actual = make_stack(groups, recompute_method)
+    reference = make_stack(reference_groups, None)
+    reference.load_state_dict(actual.state_dict())
+
+    def positions_for(layout):
+        positions = torch.arange(8, device="cuda")
+        if layout == "contiguous":
+            return positions.chunk(2)[groups.cp.rank()]
+        chunks = positions.chunk(4)
+        return torch.cat((chunks[groups.cp.rank()], chunks[3 - groups.cp.rank()]))
+
+    positions = positions_for(boundary_layout)
+    token_ids = torch.arange(16, device="cuda").reshape(2, 8)
+    hidden = torch.linspace(0.1, 1.0, 8 * 2 * actual.config.hidden_size, device="cuda")
+    reference_input = hidden.reshape(8, 2, -1).requires_grad_()
+    actual_input = reference_input.detach().index_select(0, positions).requires_grad_()
+    expected = reference(reference_input, attention_mask=None, input_ids=token_ids)
+    output = actual(
+        actual_input, attention_mask=None, input_ids=token_ids.index_select(1, positions)
+    )
+    torch.testing.assert_close(output, expected.index_select(0, positions))
+    expected.square().sum().backward()
+    output.square().sum().backward()
+    torch.testing.assert_close(actual_input.grad, reference_input.grad.index_select(0, positions))
+    for layer, layout in zip(actual.layers, layouts, strict=True):
+        inner = layer.inner_layer if with_mhc else layer
+        torch.testing.assert_close(
+            inner.last_forward_inputs[-1], token_ids.index_select(1, positions_for(layout))
+        )
+    for name, parameter in actual.named_parameters():
+        assert parameter.grad is not None, name
+        torch.distributed.all_reduce(parameter.grad, group=groups.cp)
+        torch.testing.assert_close(parameter.grad, reference.get_parameter(name).grad, msg=name)
+
+
 @pytest.mark.parametrize("recompute_mode", [None, "uniform", "block", "mhc"])
 def test_external_layer_mhc_matches_eager(gpu_model_parallel, recompute_mode):
     def make_stack(mode):

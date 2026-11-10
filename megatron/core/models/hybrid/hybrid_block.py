@@ -832,6 +832,11 @@ class HybridStack(MegatronModule):
                         is_custom_layer = (
                             layer_utils.get_custom_layer_type(layer_config) is not None
                         )
+                        layer_input_ids = input_ids
+                        if is_custom_layer and cp_layout_state is not None:
+                            layer_input_ids = cp_layout_state.get_layer_input_ids(
+                                physical_layer_idx, input_ids
+                            )
                         with inner_quant_context:
                             if is_custom_layer and not isinstance(
                                 layer, HyperConnectionHybridLayer
@@ -843,7 +848,7 @@ class HybridStack(MegatronModule):
                                     rotary_pos_emb=rotary_pos_emb,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
-                                    input_ids=input_ids,
+                                    input_ids=layer_input_ids,
                                 )
                             elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -877,7 +882,7 @@ class HybridStack(MegatronModule):
                                 if input_ids is not None and (
                                     is_custom_layer or self._uses_hash_routing(layer)
                                 ):
-                                    layer_kwargs["input_ids"] = input_ids
+                                    layer_kwargs["input_ids"] = layer_input_ids
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
