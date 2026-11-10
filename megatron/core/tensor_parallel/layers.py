@@ -107,7 +107,8 @@ def param_is_not_tensor_parallel_duplicate(
         use_global_fallback: What a ``None`` group means. With ``True``, an expert parameter
             without ``expert_tp_group`` uses ``tp_group``, and a parameter left without a group
             reads the global tensor-parallel rank. That fallback is deprecated and emits a
-            ``ProcessGroupFallbackWarning``. Callers that took both groups from the owner's
+            ``ProcessGroupFallbackWarning``; it raises ``RuntimeError`` when the global
+            tensor-parallel group is not initialized. Callers that took both groups from the owner's
             ``ProcessGroupCollection`` pass ``False``: ``None`` then marks an axis that is off,
             so the parameter has no replica along it and is kept.
     """
@@ -132,6 +133,13 @@ def param_is_not_tensor_parallel_duplicate(
         deprecated_in="0.21",
         removed_in="0.23",
     )
+    if global_groups.tp is None:
+        # get_pg_rank(None) is 0, so without a global grid every rank would keep its replica.
+        raise RuntimeError(
+            "param_is_not_tensor_parallel_duplicate was called without a tensor-parallel group "
+            "and the global tensor model parallel group is not initialized. Pass tp_group, and "
+            "expert_tp_group for expert parameters."
+        )
     return get_pg_rank(global_groups.tp) == 0
 
 

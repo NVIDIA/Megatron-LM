@@ -924,7 +924,9 @@ class TEGroupedMLP(MegatronModule):
                 "and linear_fc2. Apply the override to both linears."
             )
         quant_context = (
-            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+            nullcontext()
+            if fc1_recipe is None
+            else _get_fp8_autocast_for_quant_recipe(fc1_recipe, pg_collection=self.pg_collection)
         )
 
         # Construct fused impl if needed
