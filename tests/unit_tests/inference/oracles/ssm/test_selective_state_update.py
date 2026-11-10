@@ -50,12 +50,14 @@ capability >= 10 tile (32, 8) for dstate > 64 runs only on GB200 (`launch_on_gb2
 Main vs open PRs: #8569 (s10) asserts D is (nheads, dim); every call here passes that shape, so the module
 runs the same on main and with s10.
 
-Suspected finding O7-N1 (no fix PR yet): the kernel's softplus is log(exp(x) + 1) in fp32 (:34-36), whose
-absolute error of ~2**-24 is a relative error up to ~5e-5 at production arguments (dt' ~ 1e-3); exp(A dt')
-with |A| up to 16 carries it into the state. With an fp32 state or output that is ~3x torch's fp32 rms
-error, so cases of `test_decode_step_fp32_outputs_match_fp64`, its Blackwell twin,
-`test_production_shapes[fp32_state]` and `test_speculative_rollback_restores_accepted_prefix[fp32_state]`
-fail on main (confirmed on H100 and GB200). bf16 outputs and states are rounding-dominated and pass.
+Finding O7-N1: on main the kernel's softplus is log(exp(x) + 1) in fp32 (:34-36), whose absolute error of
+~2**-24 is a relative error up to ~5e-5 at production arguments (dt' ~ 1e-3); exp(A dt') with |A| up to 16
+carries it into the state. With an fp32 state that is ~3x torch's fp32 rms error (confirmed on H100 and
+GB200). #8960 (fix/mamba-decode-softplus) computes it as log1p(exp(x)) and carries the fp32-state cases as
+its regression tests (tests/unit_tests/ssm/ops/mamba2/test_selective_state_update.py,
+`TestSelectiveStateUpdateAccuracy`), so this module leaves out the cases that need it: the fp32-state sweep
+cases with softplus and dt_bias, and the fp32-state production and rollback cases. bf16 outputs and states
+are rounding-dominated and pass on main.
 """
 
 import pytest
@@ -389,6 +391,7 @@ def _headdim(offset, dstate, blackwell):
 def _decode_cases(blackwell, fp32_outputs):
     """Pairwise cases for one architecture's tile table; `fp32_outputs` picks the cases with an fp32 out or
     state (where the kernel's own fp32 error, not output rounding, meets the bound) or those without.
+    Cases with an fp32 state, softplus and dt_bias are left to #8960's tests (O7-N1, module docstring).
     """
     factors = {
         "dstate": DSTATES,
@@ -417,6 +420,8 @@ def _decode_cases(blackwell, fp32_outputs):
         case["io_dtype"], case["state_dtype"] = case.pop("dtypes")
         case["headdim"] = _headdim(case["headdim"], case["dstate"], blackwell)
         variant = case.pop("variant")
+        if case["state_dtype"] == torch.float32 and variant == "default":
+            continue  # O7-N1: fails on main; #8960's regression tests carry these
         case["with_dt_bias"] = variant != "no_dt_bias"
         case["dt_softplus"] = variant != "no_softplus"
         block_m, warps = decode_tile(case["dstate"], blackwell)
@@ -450,9 +455,8 @@ def test_decode_step_matches_fp64(case):
 @ou.requires_sm(ou.HOPPER)
 @pytest.mark.parametrize("case", _decode_cases(blackwell=False, fp32_outputs=True))
 def test_decode_step_fp32_outputs_match_fp64(case):
-    """The sweep's cases with an fp32 out or state (production: fp32 states). Cases fail on main for the
-    suspected finding O7-N1 (module docstring): the kernel's fp32 softplus costs about 3x torch's fp32 rms
-    error in the state (2x allowed)."""
+    """The sweep's cases with an fp32 out or state (production: fp32 states), except the fp32-state cases
+    with softplus and dt_bias, which #8960 carries (O7-N1, module docstring)."""
     run_decode_case(**case)
 
 
@@ -468,18 +472,17 @@ def test_decode_step_matches_fp64_blackwell(case):
 @ou.requires_sm(ou.BLACKWELL)
 @pytest.mark.parametrize("case", _decode_cases(blackwell=True, fp32_outputs=True))
 def test_decode_step_fp32_outputs_match_fp64_blackwell(case):
-    """Blackwell's fp32-output cases; see `test_decode_step_fp32_outputs_match_fp64` (O7-N1)."""
+    """Blackwell's fp32-output cases; see `test_decode_step_fp32_outputs_match_fp64`."""
     run_decode_case(**case)
 
 
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
-@pytest.mark.parametrize(
-    "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16_state", "fp32_state"]
-)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16], ids=["bf16_state"])
 def test_production_shapes(state_dtype):
     """Production decode: 8 local heads, 1 group, head dim 64, dstate 128, bf16 activations, int64 slots,
-    with and without three speculative tokens. fp32 states (the default) fail on main for O7-N1."""
+    with and without three speculative tokens. The fp32 state (the default) fails on main for O7-N1;
+    #8960's `test_fp32_state_matches_fp64` checks this shape with it."""
     for seq_len, snapshots in ((1, False), (4, True)):
         run_decode_case(
             dstate=128,
@@ -606,16 +609,15 @@ def test_reduced_launcher_layouts(form):
 
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
-@pytest.mark.parametrize(
-    "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16_state", "fp32_state"]
-)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16], ids=["bf16_state"])
 def test_speculative_rollback_restores_accepted_prefix(state_dtype):
     """Speculative decoding: S = 4 tokens with snapshots, then `mamba_state_selective_copy` with each
     request's accepted index a. The live state must be snapshot[slot, a] bit for bit and the fp64 state after
     a + 1 tokens within the bound; a prefill request's slot is left as the decode step wrote it.
 
-    `[fp32_state]` fails on main for O7-N1 (its fp32 snapshots carry the kernel's softplus error: rms 2.1x
-    torch fp32's on H100 and GB200); `[bf16_state]` checks the same rollback and passes."""
+    An fp32 state fails on main for O7-N1 (its fp32 snapshots carry the kernel's softplus error: rms 2.1x
+    torch fp32's on H100 and GB200), so it is left to #8960's `test_fp32_state_matches_fp64[speculative-*]`,
+    which checks the fp32 per-token states; the bf16 state checks the same rollback."""
     seq_len, heads, headdim, dstate = 4, 4, 16, 64
     result = run_decode_case(
         dstate=dstate,

@@ -5,9 +5,7 @@ call site, the static-batching Mamba prefill (`MambaMixer._static_prefill`, mega
 which returns each request's final SSM state and copies it into the static cache.
 
 Before this module the call was the trusted implementation of the varlen scan oracle
-(test_chunk_scan_varlen.py) but was never tested itself; its final-state handoff was reached only by the
-static-decode prefill cases (test_mamba_static_decode.py), which check the conv cache and fail on main for
-an unrelated decode bug (#8568) at b > 1.
+(test_chunk_scan_varlen.py) but was never tested itself.
 
 Contract (written from the Mamba-2 recurrence, mamba_ssm's documented API and the call site, before running
 the kernel):

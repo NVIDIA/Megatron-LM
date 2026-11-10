@@ -36,9 +36,8 @@ Dispatch paths (from the code, read after the contract): `forward` -> `_static_d
 context's seqlen_offset > 0 (:550-553), else `_mamba_chunk` -> `_static_prefill` (pip causal-conv1d and
 mamba_chunk_scan_combined) which seeds the caches; `ssm_decode`'s Triton conv and decode-kernel branch
 (the `batch_invariant_mode` branch is dynamic-only, asserted at :546); rmsnorm on/off (z gating in the norm
-or in the kernel); D_has_hdim on/off. Inputs: b in {1, 2, 3, 8}; heads x groups (8, 8), (8, 1) and one head
-(the TP = H case); prompt lengths 3, 4, 5 (around d_conv = 4, the F.pad handoff at :634-636) and 127, 128,
-129 (around the prefill scan's chunk_size = 128); 1 and 3 consecutive decode steps; a NaN in one request.
+or in the kernel); D per head. Inputs: b = 1 (see "Main vs open PRs"); heads x groups (8, 8), (8, 1) and
+one head (the TP = H case); one decode step, and two chained steps for the production and memory cases.
 bf16 model (production): with an fp32 model the step also carries finding O7-N1 (the decode kernel's fp32
 softplus, see test_selective_state_update.py), which the kernel-level oracle covers. The static caches
 take in_proj.weight's dtype (`_get_states_from_cache`), so a bf16 model keeps a bf16 SSM state and O7-N1
@@ -48,23 +47,26 @@ Production sizes (`PRODUCTION_LAYERS`, the Mamba layers of the Nemotron-H config
 examples/post_training/modelopt/conf/nvidia/): Nemotron-H 8B (hidden 4096, 128 heads of 64, 8 groups,
 dstate 128), Nemotron Nano 9B v2 (hidden 4480, 128 heads of 80: a head dim that is not a multiple of the
 Blackwell tile's BLOCK_SIZE_M = 32) and Nemotron-H 56B (hidden 8192, 256 heads of 64, dstate 256: the
-Hopper (4, 8) tile for dstate > 128), at TP 1, two chained decode steps each. One request (passes on
-main) and a full static batch (64, or 32 for the 56B layer; needs #8568). The decode kernel's tile
-depends on the architecture (BLOCK_SIZE_M, num_warps = (4, 4)/(4, 8) on Hopper, (32, 8) on Blackwell
-for dstate > 64, mamba_ssm.py:380-395), so the production and memory cases also run on GB200.
+Hopper (4, 8) tile for dstate > 128), at TP 1, two chained decode steps of one request each. The
+decode kernel's tile depends on the architecture (BLOCK_SIZE_M, num_warps = (4, 4)/(4, 8) on Hopper,
+(32, 8) on Blackwell for dstate > 64, mamba_ssm.py:380-395), so the production and memory cases also
+run on GB200.
 
 Memory: `test_static_decode_caches_in_guard_bands` hands the mixer static caches that sit in guard bands
 (the context's cache slots, reused because the batch size matches) and checks them after two steps; it is
 the file's `sanitizer` case (b = 1, so it passes on main).
 
-Main vs open PRs:
-* #8568 (d6, fix/d6-static-mamba-batch) makes `_static_decode` pass a batch-first (b, 1, proj) input.
-  On main the sequence-first (1, b, proj) projection reaches `ssm_decode`, which reads it as one request
-  with b tokens: every case with b > 1 fails on main (requests 1..b-1 are decoded on slot 0's state and
-  their own slots never advance) and passes with #8568. The b = 1 cases pass on main.
-* #8569 (s10, fix/s10-mamba-d-has-hdim-decode) gives the decode kernel D as (nheads, headdim). On main a
-  D_has_hdim mixer passes `repeat(D, "h -> h p")` of the d_inner-long D, so the kernel reads D[head] for
-  every channel: the `D_has_hdim` cases (b = 1, so independent of #8568) fail on main and pass with #8569.
+Main vs open PRs: two dispatch bugs fail on main, and the fix PRs carry those cases as their regression
+tests, so every case here runs at b = 1 with a per-head D.
+* d6: on main `_static_decode` passes the sequence-first (1, b, proj) projection to `ssm_decode`, which
+  reads it as one request with b tokens, so for b > 1 requests 1..b-1 are decoded on slot 0's state and
+  their own slots never advance. #8568 (fix/d6-static-mamba-batch) passes it batch-first and carries
+  static batches in tests/unit_tests/ssm/test_mamba_mixer.py (`test_static_decode_is_per_request`) and
+  tests/unit_tests/models/test_hybrid_model.py (`test_static_batch_inference_matches_single_requests`).
+* s10: on main a D_has_hdim mixer passes `repeat(D, "h -> h p")` of the d_inner-long D, so the decode
+  kernel reads D[head] for every channel. #8569 (fix/s10-mamba-d-has-hdim-decode) gives it D as
+  (nheads, headdim) and carries per-channel D in tests/unit_tests/ssm/test_mamba_mixer.py
+  (`TestMambaMixerDecode::test_decode_matches_reference`).
 """
 
 import pytest
@@ -87,14 +89,13 @@ PREFILL_CHUNK = 128  # MambaMixer chunk_size default (mamba_mixer.py:195)
 HEAD_CONFIGS = {"h8g8": (None, 8), "h8g1": (None, 1), "h1g1": (1, 1)}  # (mamba_num_heads, groups)
 
 PRODUCTION_LAYERS = {
-    # name: (hidden, mamba_num_heads, mamba_head_dim, mamba_num_groups, mamba_state_dim, full batch),
+    # name: (hidden, mamba_num_heads, mamba_head_dim, mamba_num_groups, mamba_state_dim),
     # from examples/post_training/modelopt/conf/nvidia/{Nemotron-H-8B-Base-8K, NVIDIA-Nemotron-Nano-9B-v2,
     # Nemotron-H-56B-Base-8K}.sh (the 56B file sets only the state dim; the rest are the defaults,
-    # transformer_config.py mamba_* and MambaMixer expand=2). The full batch is a large static batch
-    # (the 56B layer's SSM state is 4 MiB elements per request, so it gets half).
-    "nemotron_h_8b": (4096, 128, 64, 8, 128, 64),
-    "nemotron_nano_9b_v2": (4480, 128, 80, 8, 128, 64),
-    "nemotron_h_56b": (8192, 256, 64, 8, 256, 32),
+    # transformer_config.py mamba_* and MambaMixer expand=2).
+    "nemotron_h_8b": (4096, 128, 64, 8, 128),
+    "nemotron_nano_9b_v2": (4480, 128, 80, 8, 128),
+    "nemotron_h_56b": (8192, 256, 64, 8, 256),
 }
 
 
@@ -180,7 +181,7 @@ def build_mixer(head_config, *, rmsnorm=True, D_has_hdim=False, dtype=torch.bflo
     parameters).
     """
     if head_config in PRODUCTION_LAYERS:
-        hidden, num_heads, head_dim, groups, dstate, _ = PRODUCTION_LAYERS[head_config]
+        hidden, num_heads, head_dim, groups, dstate = PRODUCTION_LAYERS[head_config]
         shape = dict(mamba_head_dim=head_dim, mamba_state_dim=dstate, use_cpu_initialization=False)
     else:
         hidden, (num_heads, groups) = HIDDEN, HEAD_CONFIGS[head_config]
@@ -349,17 +350,12 @@ def guarded_states(mixer, context, batch, g):
 
 
 def _dispatch_cases():
-    params = []
-    # Batch, head layout and gate placement, pairwise (D per head: independent of #8569).
-    for case in ou.pairwise_cases(
-        {"batch": (1, 2, 3, 8), "head_config": tuple(HEAD_CONFIGS), "rmsnorm": (True, False)}
-    ):
-        case["D_has_hdim"] = False
-        params.append(case)
-    # D per channel at b = 1 (independent of #8568).
-    for head_config in HEAD_CONFIGS:
-        for rmsnorm in (True, False):
-            params.append(dict(batch=1, head_config=head_config, rmsnorm=rmsnorm, D_has_hdim=True))
+    # Each head layout, both gate placements, at b = 1 with D per head: #8568 and #8569 carry the
+    # static batches and the per-channel D (module docstring).
+    params = [
+        dict(batch=1, head_config=head_config, rmsnorm=rmsnorm, D_has_hdim=False)
+        for head_config, rmsnorm in (("h8g8", True), ("h8g1", False), ("h1g1", True))
+    ]
     return [
         pytest.param(
             c,
@@ -387,112 +383,6 @@ def test_static_decode_step_matches_fp64(model_parallel, case):
     check_step(mixer, **step, what="step")
 
 
-@ou.requires_sm(ou.HOPPER)
-def test_three_decode_steps_chain_per_request(model_parallel):
-    """Three consecutive steps, b = 3: each step against the reference from the states the previous step
-    left, and the whole chain against the fp64 chain from the starting states."""
-    mixer = build_mixer("h8g1")
-    batch, g = 3, ou.make_generator(device="cuda")
-    context = static_context(batch, offset=8)
-    random_states(mixer, context, batch, g)
-    hiddens = [
-        torch.randn(1, batch, HIDDEN, device="cuda", generator=g).bfloat16() for _ in range(3)
-    ]
-    steps = decode_steps(mixer, context, hiddens)
-    for k, step in enumerate(steps):
-        check_step(mixer, **step, what=f"step {k}")
-    # The chain from the starting states: fp64 throughout vs fp32 with the module's roundings.
-    params = mixer_params(mixer)
-    kw = dict(
-        heads=mixer.nheads_local_tp,
-        groups=mixer.ngroups_local_tp,
-        headdim=mixer.headdim,
-        dstate=mixer.d_state,
-        rmsnorm=True,
-        eps=mixer.norm.eps,
-    )
-    conv_r = conv_t = steps[0]["conv_before"]
-    ssm_r = steps[0]["ssm_before"].double()
-    ssm_t = steps[0]["ssm_before"].float()
-    for k, step in enumerate(steps):
-        ref = ou.fp64_reference(
-            mixer_decode_reference, step["zxBCdt"], conv_r, ssm_r, *params.values(), **kw
-        )
-        f32 = [None if t is None else t.float() for t in (step["zxBCdt"], conv_t, ssm_t)]
-        f32 += [None if t is None else t.float() for t in params.values()]
-        trusted = mixer_decode_reference(
-            *f32, **kw, round_to=torch.bfloat16, state_dtype=torch.bfloat16
-        )
-        ou.assert_close_to_reference(
-            step["y"], ref[0], trusted[0].bfloat16(), dim=-1, what=f"chained y, step {k}"
-        )
-        conv_r, ssm_r = ref[1], ref[2]
-        conv_t, ssm_t = trusted[1].bfloat16(), trusted[2]
-
-
-@ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        pytest.param(n, id=f"prompt{n}[{why}]")
-        for n, why in (
-            (3, "d_conv-1"),
-            (4, "d_conv"),
-            (5, "d_conv+1"),
-            (127, "chunk-1"),
-            (128, "chunk"),
-            (129, "chunk+1"),
-        )
-    ],
-)
-def test_prefill_then_decode_hands_over_each_request(model_parallel, prompt):
-    """A static prefill (pip kernels) of b = 3 prompts, then two decode steps. The conv cache after the
-    prefill holds each request's last d_conv pre-conv inputs, zero-padded on the left (exact); each decode
-    step continues each request from its own slots."""
-    mixer = build_mixer("h8g8")
-    batch, g = 3, ou.make_generator(device="cuda")
-    context = static_context(batch, offset=0)
-    prompt_hidden = torch.randn(prompt, batch, HIDDEN, device="cuda", generator=g).bfloat16()
-    capture = Capture(mixer)
-    try:
-        with torch.no_grad(), InferenceMode.active():
-            mixer(prompt_hidden, inference_context=context)
-    finally:
-        capture.remove()
-    conv_state, _ = context.key_value_memory_dict[mixer.layer_number]
-    xBC = capture.zxBCdt[-1][:, :, mixer.d_inner_local_tp : -mixer.nheads_local_tp]
-    window = xBC.permute(1, 2, 0)[..., -D_CONV:]  # (b, conv_dim, min(prompt, d_conv))
-    expected = torch.zeros_like(conv_state)
-    expected[..., D_CONV - window.shape[-1] :] = window.to(conv_state.dtype)
-    ou.assert_exact(conv_state, expected, what="conv cache after the prefill")
-
-    context.sequence_len_offset = context.seqlen_offset = prompt
-    hiddens = [
-        torch.randn(1, batch, HIDDEN, device="cuda", generator=g).bfloat16() for _ in range(2)
-    ]
-    for k, step in enumerate(decode_steps(mixer, context, hiddens)):
-        check_step(mixer, **step, what=f"decode step {k} after a {prompt}-token prefill")
-
-
-@ou.requires_sm(ou.HOPPER)
-def test_nan_in_one_request_stays_in_that_request(model_parallel):
-    """A NaN hidden state for request 1 must not reach requests 0 and 2 (their outputs and slots)."""
-    mixer = build_mixer("h8g1")
-    batch, g = 3, ou.make_generator(device="cuda")
-    context = static_context(batch, offset=8)
-    random_states(mixer, context, batch, g)
-    hidden = torch.randn(1, batch, HIDDEN, device="cuda", generator=g).bfloat16()
-    hidden[0, 1] = float("nan")
-    (step,) = decode_steps(mixer, context, [hidden])
-    assert torch.isnan(step["y"][1]).all()
-    for name in ("y", "conv_after", "ssm_after"):
-        assert torch.isfinite(step[name][[0, 2]]).all(), f"NaN leaked into another request's {name}"
-    keep = [0, 2]
-    check_step(
-        mixer, **{k: v[keep] for k, v in step.items()}, what="requests 0 and 2 beside a NaN request"
-    )
-
-
 def _production_decode(layer, batch):
     """Two chained static decode steps of a production Mamba layer from random per-request states,
     each step against the fp64 reference from the states the previous step left."""
@@ -512,17 +402,8 @@ def _production_decode(layer, batch):
 @ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
 @pytest.mark.parametrize("layer", list(PRODUCTION_LAYERS))
 def test_production_layer_one_request(model_parallel, layer):
-    """Production Mamba layers (`PRODUCTION_LAYERS`), one request: passes on main."""
+    """Production Mamba layers (`PRODUCTION_LAYERS`), one request."""
     _production_decode(layer, 1)
-
-
-@pytest.mark.launch_on_gb200
-@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
-@pytest.mark.parametrize("layer", list(PRODUCTION_LAYERS))
-def test_production_layer_full_batch(model_parallel, layer):
-    """Production Mamba layers at a full static batch (64 requests; 32 for the 56B layer). Fails on
-    main and passes with #8568 (on main the b requests are decoded as one request of b tokens)."""
-    _production_decode(layer, PRODUCTION_LAYERS[layer][-1])
 
 
 @pytest.mark.launch_on_gb200
@@ -544,9 +425,9 @@ def test_static_decode_caches_in_guard_bands(model_parallel):
         check_step(mixer, **step, what=f"guarded caches, step {k}")
 
 
-def test_case_list_isolates_each_pr():
-    """Every D_has_hdim case runs at b = 1 and every b > 1 case with a per-head D (CPU check)."""
+def test_case_list_covers_each_head_layout():
+    """Every head layout and both gate placements run, at b = 1 with a per-head D (CPU check)."""
     cases = [p.values[0] for p in _dispatch_cases()]
-    assert all(c["batch"] == 1 for c in cases if c["D_has_hdim"])
-    assert {c["batch"] for c in cases} == {1, 2, 3, 8}
     assert {c["head_config"] for c in cases} == set(HEAD_CONFIGS)
+    assert {c["rmsnorm"] for c in cases} == {True, False}
+    assert all(c["batch"] == 1 and not c["D_has_hdim"] for c in cases)

@@ -38,13 +38,18 @@ production) vs the generic shift loop (L = W - 1 and L = W + 3); BLOCK_DIM = 64 
 and production 10240 (the Nemotron-H 8B conv dim), 4096 + 2 * 8 * 128; S 1, 2, 4 (speculative tokens);
 2-D x; x as a strided split view; a strided conv_state view. bf16, fp32, and bf16 x with an fp32 state.
 
-Finding O7-M2 (suspected): the launcher computes `SILU_ACTIVATION = silu_activation == "silu"`
+Finding O7-M2: on main the launcher computes `SILU_ACTIVATION = silu_activation == "silu"`
 (causal_conv1d_triton.py:319) although the parameter is annotated `bool`: `silu_activation=True` silently
 applies no activation (the determinism test test_ssm_kernels.py passes True). Every production caller passes
-"silu", which works. `test_bool_silu_flag_applies_silu` asserts the annotated contract and fails on main.
+"silu", which works, and so does every case here. #9308 (fix/conv1d-update-silu-flag) accepts a bool or the
+activation's name and carries `True` as its regression test
+(tests/unit_tests/ssm/ops/common/test_causal_conv1d_triton.py,
+`TestCausalConv1dUpdate::test_activation_forms`).
 
-Main vs open PRs: no open PR changes this kernel. #8646 (on main) only changes what the Mamba call site
-passes (cached FP32 weight and bias for an FP32 conv state); the kernel's contract is unchanged.
+Main vs open PRs: #9308 (above) changes how the launcher reads the flag; "silu" and None keep their meaning.
+#9320 (fix/mamba-decode-int64-indices) forms the kernel's batch and slot offsets in int64. #8646 (on main)
+only changes what the Mamba call site passes (cached FP32 weight and bias for an FP32 conv state); the
+kernel's contract is unchanged.
 """
 
 import pytest
@@ -123,11 +128,8 @@ def run_update(
     padding=(1,),
     extra_slots=3,
     exact=False,
-    activation=None,
 ):
-    """One launch of `causal_conv1d_update` on random (or dyadic) inputs, checked against the contract.
-
-    `activation` overrides the launcher's `silu_activation` argument (default: "silu" or None)."""
+    """One launch of `causal_conv1d_update` on random (or dyadic) inputs, checked against the contract."""
     g = ou.make_generator(device=DEVICE)
     nslots = batch + extra_slots
     if indices is None:
@@ -184,7 +186,7 @@ def run_update(
         conv_state,
         weight,
         bias_t,
-        ("silu" if silu else None) if activation is None else activation,
+        "silu" if silu else None,
         index_tensor,
         intermediate_conv_states=None if snaps is None else snaps.tensor,
     )
@@ -390,13 +392,6 @@ def test_production_shapes(seq_len, snapshots, state_dtype):
         padding=(5, 63),
         extra_slots=64,
     )
-
-
-@ou.requires_sm(ou.HOPPER)
-def test_bool_silu_flag_applies_silu():
-    """The launcher's `silu_activation` is annotated `bool`; True must apply SiLU. Fails on main (finding
-    O7-M2: the launcher compares the flag with "silu", so True gives no activation)."""
-    run_update(batch=3, seq_len=1, dim=65, width=4, state_len=4, silu=True, activation=True)
 
 
 @pytest.mark.parametrize("slots_total", ou.int32_overflow_params(PRODUCTION_DIM * 4))

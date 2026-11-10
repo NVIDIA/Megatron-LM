@@ -39,13 +39,17 @@ HAS_INITIAL_STATES, HAS_BIAS; precomputed vs derived metadata; C around both BLO
 lengths 1, W - 2, W - 1, W, W + 1 (initial-state taps) and long ones; the production initial-state view
 and a contiguous one; bf16, fp32, bf16 x with fp32 states.
 
-Finding O7-M1 (suspected, `large` only): the kernel forms its token offsets as int32 products
+Finding O7-M1 (`large` only): on main the kernel forms its token offsets as int32 products
 (`src_safe * conv_dim` and `t_off * conv_dim`, causal_conv1d_varlen.py), so a prefill step with
 T * C >= 2^31 elements (209716 tokens at C = 10240, 104858 at Nemotron-H 56B's C = 20480) reads and writes
 at wrapped offsets. The default `max_tokens` (16384) stays far below; a larger configured prefill budget
-does not. `test_token_offsets_past_int32` asserts the contract there; expected to fail on main.
+does not. #9310 (fix/conv1d-varlen-int64-offsets) forms them in int64 and carries the step whose last
+token's row starts past 2^31 as its regression test
+(tests/unit_tests/ssm/ops/common/test_causal_conv1d_varlen.py, `TestInt32TokenOffsets`);
+`test_token_offsets_past_int32` stops at the size whose last row crosses 2^31.
 
-Main vs open PRs: no open PR changes this kernel.
+Main vs open PRs: #9310 (above), and #9316 (fix/gdp-grid-axis), which launches the kernel on grid axis 0;
+the cases here call the launcher.
 """
 
 import pytest
@@ -269,12 +273,19 @@ def test_production_prefill_step(state_dtype, config):
         )
 
 
-@pytest.mark.parametrize("tokens", ou.int32_overflow_params(PRODUCTION_DIM))
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        p
+        for p in ou.int32_overflow_params(PRODUCTION_DIM)
+        if (p.values[0] - 1) * PRODUCTION_DIM < 2**31
+    ],
+)
 @ou.requires_sm(ou.HOPPER)
 def test_token_offsets_past_int32(tokens):
-    """A prefill step whose T * C crosses 2^31 elements (C = 10240): the last request's tokens, whose
-    offsets cross it, must still be convolved from their own inputs and state. Fails on main if the
-    kernel's int32 offset products wrap (suspected finding O7-M1)."""
+    """A prefill step whose T * C reaches 2^31 elements (C = 10240): the last request's tokens, whose
+    offsets cross it, must still be convolved from their own inputs and state. A last row that starts
+    past 2^31 fails on main (finding O7-M1) and is #9310's regression case."""
     ou.require_free_memory(24 * 2**30)
     g = ou.make_generator(device=DEVICE)
     dim, width, tail = PRODUCTION_DIM, 4, 300

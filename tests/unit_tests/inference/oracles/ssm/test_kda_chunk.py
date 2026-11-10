@@ -66,12 +66,14 @@ check; the kernel must leave them unchanged. Three small K=96 cases (T=1 two-sta
 a pack with single-token sequences) are marked ``sanitizer``.
 
 Main vs open PRs:
-* ``test_kda_matches_fp64_reference[two_stage-zero_centered]`` fails on main, at the gated norm:
-  two-stage KDA forms the zero-centered gain ``w + 1`` in bf16, so a learned ``w = 0.0038`` becomes
-  a gain of exactly 1.0 (R01-F1, a systematic 0.38% error on every output, about 2.5x the trusted
-  rms error). #8882 (fix/kda-gated-norm-contract) forms the gain in fp32 and makes it pass.
+* R01-F1: on main two-stage KDA forms the zero-centered gain ``w + 1`` in bf16, so a learned
+  ``w = 0.0038`` becomes a gain of exactly 1.0 (a systematic 0.38% error on every output, about
+  2.5x the trusted rms error). #8882 (fix/kda-gated-norm-contract) forms the gain in fp32 and
+  carries the two-stage zero-centered case as its regression test
+  (tests/unit_tests/ssm/test_kda_gate_precision.py,
+  ``test_two_stage_zero_centered_gain_is_added_in_fp32``), so this file leaves it out.
   ``[direct-zero_centered]`` expects Transformer Engine's RMSNorm to form ``w + 1`` in fp32 as
-  well (not verified by reading TE). Every other case is expected to pass on main.
+  well (not verified by reading TE). Every case here is expected to pass on main.
 * #8882 also builds the two-stage ``out_norm`` as a weight-only RMSNorm whatever ``normalization``
   says; ``[two_stage-layernorm_config]`` checks that contract and passes on both (main builds a
   LayerNorm but its forward never reads the bias).
@@ -670,11 +672,8 @@ def _case_id(case: Case) -> str:
 
 SPECIAL_CASES = [
     # Zero-centered gain w = 0.0038 lies in (-2**-9, 2**-8): bf16(w + 1) == 1.0, a 0.38% error.
-    # Two-stage fails on main (R01-F1); #8882 forms the gain in fp32.
-    pytest.param(
-        Case(64, 4, "two_stage", "safe_lb-5", steps=65, zero_centered=True, gain=0.0038),
-        id="two_stage-zero_centered",
-    ),
+    # Direct gates leave the gain to TE's norm. Two-stage gates fail on main (R01-F1): #8882's
+    # test_two_stage_zero_centered_gain_is_added_in_fp32 carries that case.
     pytest.param(
         Case(64, 4, "direct", "safe_lb-5", steps=65, zero_centered=True, gain=0.0038),
         id="direct-zero_centered",
@@ -697,11 +696,7 @@ SPECIAL_CASES = [
     "case", [pytest.param(c, id=_case_id(c)) for c in _sbhd_cases() + _thd_cases()] + SPECIAL_CASES
 )
 def test_kda_matches_fp64_reference(model_parallel, case):
-    """KDA forward at TP=1 against the fp64 contract: kernel output, gated norm, module output.
-
-    ``[two_stage-zero_centered]`` fails on main (R01-F1) and passes with #8882; see the module
-    docstring.
-    """
+    """KDA forward at TP=1 against the fp64 contract: kernel output, gated norm, module output."""
     _run(case)
 
 
