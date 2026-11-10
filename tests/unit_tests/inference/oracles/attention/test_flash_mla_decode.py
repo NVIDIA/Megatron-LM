@@ -39,7 +39,7 @@ lengths (the scheduler metadata is recomputed inside the captured call).
 Hardware and open PRs (written against main):
 * H100 needs a FlashMLA build with its SM90 kernels: the CI image builds it with
   ``FLASH_MLA_DISABLE_SM90=1`` (fixed by #8701, ci), and a build without them exits the process at
-  the first launch, so a subprocess probes it first and the tests fail with that reason.
+  the first launch, so a subprocess probes it first and the tests xfail with that reason.
 * GB200: FlashMLA has no dense decode kernel on SM100 ("Dense decode MLA is only supported on
   SM90a", R11-F1). #8873 (t3-r11f1) runs FlashInfer's TRTLLM-GEN MLA decode there, with
   ``test_multi_latent_attention.py::TestMLAAbsorbedDecode`` as its regression test, so the cases
@@ -104,10 +104,9 @@ def _require_flash_mla_on_hopper() -> None:
     if not attention_module.HAVE_FMLA:
         pytest.fail("flash_mla is not installed", pytrace=False)
     if not _flash_mla_decode_runs():
-        pytest.fail(
-            "this flash_mla build has no SM90 decode kernels (the CI image builds it with "
-            "FLASH_MLA_DISABLE_SM90=1; #8701)",
-            pytrace=False,
+        pytest.xfail(
+            "FlashMLA's SM90 decode kernels are missing: the CI image builds FlashMLA without SM90 "
+            "kernels; fixed by #8701"
         )
 
 

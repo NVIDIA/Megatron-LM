@@ -250,15 +250,17 @@ def _flash_mla_decode_runs() -> bool:
 
 
 def _require_kernels() -> None:
-    """Fail (not skip) where the scenario's kernels are missing on its hardware."""
+    """Fail (not skip) where the scenario's kernels are missing on its hardware; xfail while the
+    CI image's FlashMLA lacks its SM90 kernels (#8701)."""
     if not (attention_module.HAVE_FA4 or attention_module.HAVE_FA3):
         pytest.fail("the latent-cache prefill needs FlashAttention 3 or 4", pytrace=False)
     if ou.device_sm_major() == ou.HOPPER:
-        if not attention_module.HAVE_FMLA or not _flash_mla_decode_runs():
-            pytest.fail(
-                "flash_mla with its SM90 decode kernels is required (the CI image builds it "
-                "with FLASH_MLA_DISABLE_SM90=1; #8701)",
-                pytrace=False,
+        if not attention_module.HAVE_FMLA:
+            pytest.fail("flash_mla is not installed", pytrace=False)
+        if not _flash_mla_decode_runs():
+            pytest.xfail(
+                "FlashMLA's SM90 decode kernels are missing: the CI image builds FlashMLA without "
+                "SM90 kernels; fixed by #8701"
             )
 
 
