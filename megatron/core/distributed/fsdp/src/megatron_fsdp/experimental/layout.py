@@ -17,7 +17,6 @@
 import bisect
 import dataclasses
 import itertools
-import math
 from collections.abc import Iterable
 from typing import TypeAlias
 
@@ -46,7 +45,9 @@ class GlobalLayout:
             next entry, or ``size`` for the last segment; see ``rank_size``. On a 1-D
             mesh ``k`` is the rank; on a multi-axis mesh ``get_rank_range`` maps the ranks
             of the Shard axes to ``k``. Segment sizes are equal (``size // dp_size``) for
-            ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
+            the padded ``RowAtomic`` / ``BlockAtomic`` layout of
+            ``layout_builder.build_for_row_atomic``; generally uneven for
+            ``build_for_row_atomic_unpadding`` and ``build_for_tensor_atomic``.
     """
 
     tensor_shapes: tuple[torch.Size, ...]
@@ -114,14 +115,9 @@ class GlobalLayout:
                 )
 
     def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
-        """Check equal-size shards and row/block alignment from the actual offsets."""
+        """Check that no rank boundary splits a row (or ``block_size``-row block)."""
         if block_size <= 0:
             raise ValueError(f"Block size must be positive, got {block_size}.")
-        if not self.has_equal_shard_sizes:
-            raise ValueError(
-                "Unequal rank segment sizes are incompatible with RowAtomic/BlockAtomic."
-            )
-        chunk_size = 1
         for tensor_id, (shape, start) in enumerate(
             zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
         ):
@@ -132,15 +128,16 @@ class GlobalLayout:
                     f"{block_size}."
                 )
             alignment = block_size * row_size
-            if start % alignment != 0:
-                raise ValueError(
-                    f"Tensor {tensor_id} offset {start} is incompatible with alignment {alignment}."
-                )
-            chunk_size = math.lcm(chunk_size, alignment)
-        if any(offset % chunk_size for offset in self.rank_to_offset):
-            raise ValueError(
-                f"Rank offsets {self.rank_to_offset} are incompatible with alignment {chunk_size}."
-            )
+            end = start + shape.numel()
+            # Only boundaries strictly inside (start, end) can split this tensor.
+            first = bisect.bisect_right(self.rank_to_offset, start)
+            last = bisect.bisect_left(self.rank_to_offset, end)
+            for offset in self.rank_to_offset[first:last]:
+                if (offset - start) % alignment != 0:
+                    raise ValueError(
+                        f"Rank offsets {self.rank_to_offset} are incompatible with alignment "
+                        f"{alignment} of tensor {tensor_id} {tuple(shape)} at offset {start}."
+                    )
 
     def validate_for_tensor_atomic(self) -> None:
         """Check every nonempty tensor is contained in a single rank segment."""
