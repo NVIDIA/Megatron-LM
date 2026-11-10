@@ -447,6 +447,22 @@ def initialize_model_parallel(request, monkeypatch):
     destroy_num_microbatches_calculator()
 
 
+@pytest.fixture
+def own_process_groups():
+    """A list for the process groups a test creates itself; they are destroyed after the test.
+
+    Request it after initialize_model_parallel, so that these groups go before the grid's.
+    """
+    groups = []
+    yield groups
+    # Every rank finishes its collectives before any communicator goes away.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dist.barrier()
+    for group in groups:
+        dist.destroy_process_group(group)
+
+
 @pytest.fixture(autouse=True)
 def cleanup_global_state():
     """Ensure global state is correctly cleaned up after every test."""
@@ -1699,7 +1715,7 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_prepare_data_for_update_uses_training_model_groups(
-        self, initialize_model_parallel, dp_field
+        self, initialize_model_parallel, own_process_groups, dp_field
     ):
         """The rollouts are split over the data-parallel group of the model being trained, which
         need not be the global one, and the logprobs pass selects and runs its schedule on the
@@ -1720,6 +1736,7 @@ class TestRLUtils:
         model_dp_group, _ = dist.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, world_size, 2)]
         )
+        own_process_groups.append(model_dp_group)
         model.pg_collection.dp_gtp_remat = None
         setattr(model.pg_collection, dp_field, model_dp_group)
 
@@ -1759,7 +1776,7 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_eager_train_comm_warmup_uses_given_groups(
-        self, initialize_model_parallel, monkeypatch
+        self, initialize_model_parallel, own_process_groups, monkeypatch
     ):
         """The communicator warmup all-reduces once over each group of the collection it is
         given, in order, skips the groups the collection does not hold, and reads no global
@@ -1768,6 +1785,7 @@ class TestRLUtils:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # A distinct communicator over the ranks of the global data-parallel group.
         pg_collection.dp_gtp_remat = dist.new_group(ranks=list(range(world_size)))
+        own_process_groups.append(pg_collection.dp_gtp_remat)
         pg_collection.expt_tp = None
         reduced_groups = []
         all_reduce = dist.all_reduce
