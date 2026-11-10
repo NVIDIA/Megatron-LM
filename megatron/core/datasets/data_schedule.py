@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
 from functools import partial
@@ -904,11 +904,21 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
         batch['cu_seqlens_padded'] = batch['cu_seqlens_padded'].unsqueeze(0)
         additional_layouts = set()
-        if config.linear_cp_layout != config.attention_cp_layout:
-            additional_layouts.add(config.attention_cp_layout)
+        if getattr(config, "_linear_cp_layout_explicit", True):
+            boundary_layout = config.linear_cp_layout
+            if config.linear_cp_layout != config.attention_cp_layout:
+                additional_layouts.add(config.attention_cp_layout)
+        else:
+            # Legacy single-knob CP layout: without an explicit linear_cp_layout the hybrid
+            # stack follows cp_partition_mode (HybridStack keys on the same flag) and its
+            # attention modules convert their own inputs, so the batch is sharded in that
+            # layout and carries no second view. Sharding zigzag here while the modules
+            # assume contiguous rows silently feeds the chunkwise linear layers a permuted
+            # token order.
+            boundary_layout = cp_partition_mode
         cp_batch = get_batches_on_this_cp_rank(
             batch,
-            boundary_layout=config.linear_cp_layout,
+            boundary_layout=boundary_layout,
             dynamic_cp=dynamic_cp,
             cp_group=runtime_cp_group,
             additional_layouts=additional_layouts,
@@ -925,6 +935,16 @@ def get_batch_on_this_rank_for_sequence_packing(
             ),
             tokens_per_sample=None,
         )
+        if not getattr(config, "_linear_cp_layout_explicit", True):
+            # Match the tuple path's metadata for the legacy layout: static THD batches
+            # always take the padded attention path (see the PackedSeqParams below).
+            boundary_params = cp_batch.get_packed_seq_params()
+            if boundary_params is not None:
+                boundary_params.pad_between_seqs = getattr(
+                    config, 'thd_max_packed_sequences', None
+                ) is not None or not torch.equal(
+                    boundary_params.cu_seqlens_q, boundary_params.cu_seqlens_q_padded
+                )
 
         if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:
             # The general batch builder retains TE's physical-offset workaround
