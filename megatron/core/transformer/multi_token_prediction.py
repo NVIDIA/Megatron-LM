@@ -6,6 +6,7 @@ import warnings
 from contextlib import AbstractContextManager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
 import torch
@@ -39,6 +40,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.soft_mtp import SoftMTPGradientRouter, validate_soft_mtp_config
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1117,6 +1119,7 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    soft_mtp_compatible_loss: bool = False,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1147,11 +1150,50 @@ def process_mtp_loss(
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
         main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
             Defaults to the first chunk of ``hidden_states``.
+        soft_mtp_compatible_loss (bool): Caller-supplied compatibility tag confirming that
+            this Soft-MTP router can reuse the main supervised next-token cross-entropy
+            gradient as its teacher signal. Both paths must share the output projection,
+            logit scaling, labels, loss mask and CP layout. Main-loss reduction must follow
+            ``config.calculate_per_token_loss``; backward scaling must match
+            ``MTPLossAutoScaler``. Must be True when Soft-MTP is active.
+
+            TODO(kwangjuna): In a follow-up, check the loss selected by
+            ``pretrain_hybrid.forward_step`` and pass this tag through ``HybridModel.forward``.
+            Only its ordinary cross-entropy path should set True; custom/distillation paths
+            keep False. No production caller opts in yet, so active Soft-MTP raises.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
     """
     cp_group = resolve_cp_group(cp_group, packed_seq_params)
+    soft_weight = config.soft_mtp_weight
+    soft_mtp = soft_weight > 0 and is_training and torch.is_grad_enabled()
+    if soft_mtp:
+        validate_soft_mtp_config(config)
+        if not soft_mtp_compatible_loss:
+            raise ValueError(
+                "soft_mtp_weight > 0 requires the caller to confirm a compatible main loss "
+                "with soft_mtp_compatible_loss=True."
+            )
+        if labels is None:
+            raise ValueError(
+                "soft_mtp_weight > 0 requires labels; labels derived from input_ids are not "
+                "supported."
+            )
+        if loss_mask is None:
+            raise ValueError("soft_mtp_weight > 0 requires a loss mask.")
+        if config.sequence_parallel and tp_group is None:
+            raise ValueError(
+                "soft_mtp_weight > 0 with sequence parallelism requires an explicit tp_group."
+            )
+        if not config.calculate_per_token_loss and cp_group is not None and cp_group.size() > 1:
+            raise ValueError(
+                "soft_mtp_weight > 0 with context parallelism requires "
+                "calculate_per_token_loss=True."
+            )
+    # SoftMTPGradientRouter expects [heads, batch, sequence] weights, stacked in head order.
+    # Use α * head loss weight on valid positions, zero elsewhere, for backward subtraction.
+    corrections = []
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
@@ -1181,6 +1223,16 @@ def process_mtp_loss(
     mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
+    # Soft-MTP's mean reduction requires CP size 1 (checked above) and a binary loss mask,
+    # so its denominator matches the caller's integer token count. Summed losses skip this sync.
+    if (
+        soft_mtp
+        and not config.calculate_per_token_loss
+        and not bool(((loss_mask == 0) | (loss_mask == 1)).all())
+    ):
+        raise ValueError(
+            "soft_mtp_weight > 0 with mean loss reduction requires a binary loss mask."
+        )
     if derived_labels_from_input_ids:
         # input_ids has no real token beyond the sequence window, so the last rolled-in
         # label is fabricated (zeroed). Roll loss_mask in lockstep with the
@@ -1199,6 +1251,15 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    if soft_mtp:
+        # Undo only the token-count division; preserve loss scaling and microbatch averaging.
+        if config.calculate_per_token_loss:
+            # Per-token/summed main losses are sums, so there is no denominator to undo.
+            soft_source_count = original_num_tokens.new_ones(())
+        else:
+            # Mean loss: undo division by max(N0, 1), matching the caller's empty-loss clamp.
+            # Count in FP32 because BF16 can round 857 to 856.
+            soft_source_count = loss_mask.sum(dtype=torch.float32).clamp(min=1)
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1346,14 +1407,32 @@ def process_mtp_loss(
                 num_tokens=num_tokens if config.calculate_per_token_loss else None,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        # Normalize each masked MTP head loss: mtp_loss_normalized = c_k * mtp_loss.
+        # N0 is the main mask sum; Nk is this head's shifted/conditioned mask sum.
+        # With base = mtp_loss_scale = lambda / K (overall MTP weight / number of heads):
+        #   summed:    c_k = base
+        #   per-token: c_k = base * N0 / max(Nk, 1)  (counts summed over CP)
+        #   mean:      c_k = base / max(Nk, 1)
+
+        # For Soft-MTP, compute head_loss_coefficient = c_k once for both the head loss
+        # and teacher correction. See "Multi-Token Prediction Done Right", Appendix B.5:
+        # https://arxiv.org/abs/2610.38331
+        # The router undoes any main-loss mean via soft_source_count, then subtracts
+        # α * c_k times the aligned NTP gradient, preserving shared backward scaling.
+        # Keep the inactive path's operation order unchanged for bitwise compatibility.
         if config.calculate_per_token_loss and getattr(
             config, "mtp_normalize_loss_by_main_tokens", False
         ):
+            # Case 1: summed loss, normalized later by the global main-token count.
             # Preserve the loss as a sum. Gradient finalization divides the accumulated main
             # and MTP gradients once by the global main-loss token count, making the result
             # invariant to rank and microbatch partitioning.
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss
+            if soft_mtp:
+                head_loss_coefficient = mtp_loss.new_full((), mtp_loss_scale)
+            else:
+                mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
+            # Case 2: per-token loss, adjusted by the CP-summed main/head token ratio.
             # finalize_model_grads divides by the global main-loss token count.
             # Use one main/MTP token ratio for this logical microbatch, independent
             # of its CP partition. Rolling and masking can leave different ratios
@@ -1368,12 +1447,30 @@ def process_mtp_loss(
             # Clamp only after the collective; empty ranks must participate too.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
-            )
+            if soft_mtp:
+                # Form the ratio in the count dtype before casting, preserving its rounding.
+                head_loss_coefficient = mtp_loss_scale * (
+                    main_num_tokens / mtp_num_tokens.clamp(min=1)
+                ).to(mtp_loss.dtype)
+            else:
+                mtp_loss_normalized = (
+                    mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
+                )
         else:
+            # Case 3: mean loss, divided by this head's valid-token count.
             safe_num_tokens = num_tokens.clamp(min=1)
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+            if soft_mtp:
+                head_loss_coefficient = mtp_loss_scale / safe_num_tokens.to(mtp_loss.dtype)
+            else:
+                mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+
+        if soft_mtp:
+            # Use the same coefficient for the hard-label loss and its teacher correction.
+            mtp_loss_normalized = head_loss_coefficient * mtp_loss
+            # Save α * head loss weight at valid positions for the router's correction.
+            # Use a boolean mask: the NTP gradient already contains the target's loss-mask weight.
+            # Multiplying by 0.5 again, for example, would turn that target's weight into 0.25.
+            corrections.append(soft_weight * head_loss_coefficient * (layer_loss_mask != 0))
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
@@ -1390,7 +1487,52 @@ def process_mtp_loss(
         else:
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
 
+    if soft_mtp:
+        # Attach last, so this node sees only the main cross-entropy gradient. Route it to the
+        # live head states; early backward, which detaches them, is rejected above.
+        # For 1-based head k, logical positions i (MTP) and i+k (NTP) share target i+k+1.
+        # The router repeats this label roll k times to align their stored positions.
+        roll = partial(
+            _roll_soft_mtp_gradient,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout=config.attention_cp_layout,
+        )
+        hidden_states = SoftMTPGradientRouter.apply(
+            hidden_states,
+            torch.stack(corrections),
+            soft_source_count,
+            roll,
+            tp_group if config.sequence_parallel else None,
+            *hidden_states_list[1:],
+        )
     return hidden_states
+
+
+def _roll_soft_mtp_gradient(
+    gradient: Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams],
+    cp_layout: CPLayout,
+) -> Tensor:
+    """Shift the teacher-gradient copy left once, using the MTP label alignment.
+
+    For 1-based head depth k and logical sequence position i, the MTP target is
+    token i+k+1. NTP predicts that token at position i+k. After k rolls, its
+    teacher gradient reaches the head's stored position i.
+    Only the teacher copy is shifted; the original NTP gradient stays unchanged.
+    Document boundaries and CP layout follow the same roll as the labels.
+    """
+    rolled, _ = roll_tensor(
+        gradient,
+        shifts=-1,
+        dims=-1,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        return_sum=False,
+        cp_layout=cp_layout,
+    )
+    return rolled
 
 
 class MultiTokenPredictionLayer(MegatronModule):

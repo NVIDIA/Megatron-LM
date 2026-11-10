@@ -97,6 +97,21 @@ class TransformerConfig(ModelParallelConfig):
     ``calculate_per_token_loss=True``.
     """
 
+    soft_mtp_weight: float = 0.0
+    """Teacher share α for MTP representation gradients, in [0, 1].
+
+    α = 0 keeps standard hard-label MTP; α = 1 trains representations toward the NTP
+    prediction for the same target, held fixed for this MTP gradient. Intermediate
+    values linearly mix these two gradients.
+
+    α = 1 corresponds to Soft-MTP from "Multi-Token Prediction Done Right", Sec. 5.1:
+    https://arxiv.org/abs/2610.38331
+
+    Forward values and reported losses are unchanged; the output projection keeps
+    hard-label supervision. ``mtp_loss_scaling_factor`` remains the overall MTP loss weight.
+    Requires MTP layers and a model that supports Soft-MTP; takes effect in training.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1957,6 +1972,9 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
             )
+
+        if not 0.0 <= self.soft_mtp_weight <= 1.0:
+            raise ValueError(f"soft_mtp_weight must be in [0, 1], got {self.soft_mtp_weight}.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

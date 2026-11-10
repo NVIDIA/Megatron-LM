@@ -29,6 +29,7 @@ def _config(num_layers=1, per_token=True):
         mtp_detach_heads=False,
         context_parallel_size=1,
         attention_cp_layout="zigzag",
+        soft_mtp_weight=0.0,
     )
 
 
