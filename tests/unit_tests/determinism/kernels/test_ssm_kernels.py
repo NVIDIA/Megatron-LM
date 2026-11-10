@@ -301,7 +301,8 @@ def test_selective_state_update_replays():
 # --- causal conv (Megatron Triton variants) ---------------------------------------------------
 
 
-def test_causal_conv1d_update_replays():
+@pytest.mark.parametrize("silu_activation", [True, None], ids=["silu", "linear"])
+def test_causal_conv1d_update_replays(silu_activation):
     from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 
     seeded()
@@ -312,7 +313,7 @@ def test_causal_conv1d_update_replays():
     bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
 
     def fn(x, conv_state, weight, bias):
-        out = causal_conv1d_update(x, conv_state, weight, bias, True, None)
+        out = causal_conv1d_update(x, conv_state, weight, bias, silu_activation, None)
         return out, conv_state
 
     assert_replays_bit_exact(
