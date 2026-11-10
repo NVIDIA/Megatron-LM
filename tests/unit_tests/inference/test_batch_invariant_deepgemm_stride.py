@@ -187,3 +187,60 @@ def test_expanded_operand_is_copied(monkeypatch):
         bik.disable_batch_invariant_mode()
     assert strides == [(1, 128)]
     torch.testing.assert_close(output.double(), reference, atol=1e-2, rtol=1e-2)
+
+
+def _at_storage_offset(t, offset, transposed=False):
+    """t's values in a fresh buffer starting `offset` elements in: row-major, or with
+    `transposed` the transpose of a row-major [cols, rows] buffer, as a linear passes w.t()."""
+    rows, cols = t.shape
+    storage = torch.zeros(t.numel() + offset, device=t.device, dtype=t.dtype)
+    if transposed:
+        view = storage[offset:].view(cols, rows)
+        view.copy_(t.t())
+        return view.t()
+    view = storage[offset:].view(rows, cols)
+    view.copy_(t)
+    return view
+
+
+@pytest.mark.parametrize(
+    "operand, transposed, offset, m, k, n",
+    [
+        ("a", False, 1, 64, 64, 64),
+        ("a", False, 4, 17, 4096, 64),
+        ("b", False, 1, 64, 64, 64),
+        ("b", True, 1, 1, 4096, 4096),
+        ("b", True, 3, 129, 4096, 136),
+        ("both", False, 7, 33, 128, 256),
+    ],
+    ids=["a-1", "a-4", "b-1", "weight_t-1", "weight_t-3", "both-7"],
+)
+def test_misaligned_data_pointer_is_copied(monkeypatch, operand, transposed, offset, m, k, n):
+    """An operand whose data pointer is not 16-byte aligned (a view at an odd storage offset)
+    reaches DeepGEMM as an aligned copy. The product is exact and has the bits of the same
+    values at an aligned address; DeepGEMM refuses the misaligned pointer itself."""
+    a = torch.randint(-1, 2, (m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-1, 2, (k, n), device="cuda").to(torch.bfloat16)
+    aligned_b = b.t().contiguous().t() if transposed else b
+    a_view = _at_storage_offset(a, offset) if operand in ("a", "both") else a
+    b_view = _at_storage_offset(b, offset, transposed) if operand in ("b", "both") else aligned_b
+    assert a_view.data_ptr() % 16 or b_view.data_ptr() % 16
+    pointers = []
+    native = bik.deep_gemm.bf16_gemm_nn
+
+    def witness(a, b, d, **kwargs):
+        pointers.append((a.data_ptr() % 16, b.data_ptr() % 16))
+        return native(a, b, d, **kwargs)
+
+    monkeypatch.setattr(bik.deep_gemm, "bf16_gemm_nn", witness)
+    bik.enable_batch_invariant_mode(backend="deepgemm", collective="ordered")
+    try:
+        output = torch.mm(a_view, b_view)
+        aligned = torch.mm(a, aligned_b)
+    finally:
+        bik.disable_batch_invariant_mode()
+    assert pointers == [(0, 0), (0, 0)]
+    # Products of {-1, 0, 1} and their sums are exact in fp32, so the result is the float64
+    # product rounded once to bf16.
+    assert torch.equal(output, (a.double() @ b.double()).to(torch.bfloat16))
+    assert torch.equal(output, aligned)
