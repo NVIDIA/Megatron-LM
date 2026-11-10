@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
@@ -112,6 +113,21 @@ class FsdpModule:
             if schedule_policy.grad_accumulation_count is not None
             else sum(1 for _ in self._trainable_fsdp_parameters())
         )
+        # Explicit callback windows may span GraphTasks. Keep their local
+        # accumulation in the original dtype until the complete window.
+        self._early_grad_staging = (
+            schedule_policy.register_hooks and schedule_policy.grad_accumulation_count is None
+        )
+        self._staged_partial_grads: dict[FsdpParameterGroup, DBuffer] = {}
+        self._staged_buffer_ready: dict[FsdpParameterGroup, torch.cuda.Event] = {}
+        self._staged_copy_events: dict[FsdpParameterGroup, dict[int, torch.cuda.Event]] = {}
+        self._staged_parameters: set[nn.Parameter] = set()
+        self._gradient_buffer_indices = {
+            parameter.unsharded: index
+            for group in self._parameter_groups
+            if group.requires_grad
+            for index, parameter in enumerate(group.fsdp_parameters)
+        }
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
@@ -193,10 +209,12 @@ class FsdpModule:
         module = cast(nn.Module, self)
         module_ref = ref(self)
 
-        def post_accumulate_grad_hook_per_parameter(_: nn.Parameter) -> None:
+        def post_accumulate_grad_hook_per_parameter(parameter: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
+            if module._early_grad_staging:
+                module._stage_gradient(parameter)
             if module._trainable_parameter_countdown.decrement():
                 post_accumulate_grad_hook(module)
 
@@ -446,6 +464,41 @@ class FsdpModule:
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
 
+    def _stage_gradient(self, parameter: nn.Parameter) -> None:
+        """Pack one completed gradient without waiting for its module's peers."""
+        group = get_containing_parameter_group(parameter)
+        assert group is not None
+        if not group.requires_inner_reduction:
+            # Preserve the direct local-accumulation path without a packing buffer.
+            return
+        if parameter in self._staged_parameters:
+            raise RuntimeError(
+                "A parameter produced multiple gradient callbacks in one reduction window. "
+                "Declare grad_accumulation_count to preserve local accumulation."
+            )
+        partial_grad = self._staged_partial_grads.get(group)
+        if partial_grad is None:
+            inner_reduction_stream = self.context.inner_reduction_stream
+            with torch.cuda.stream(inner_reduction_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+                ready = torch.cuda.Event()
+                ready.record(inner_reduction_stream)
+            self._staged_partial_grads[group] = partial_grad
+            self._staged_buffer_ready[group] = ready
+            self._staged_copy_events[group] = {}
+
+        current_stream = self.context.current_stream()
+        # Each producer must wait for the previous reduction's use of reused storage.
+        current_stream.wait_event(self._staged_buffer_ready[group])
+        group.copy_gradient_to_partial_buffer(
+            self._gradient_buffer_indices[parameter], partial_grad
+        )
+        events = self._staged_copy_events[group]
+        if current_stream.cuda_stream not in events:
+            events[current_stream.cuda_stream] = torch.cuda.Event()
+        events[current_stream.cuda_stream].record(current_stream)
+        self._staged_parameters.add(parameter)
+
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and launch their reductions.
 
@@ -477,6 +530,7 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+            self._staged_parameters.clear()
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
@@ -497,10 +551,21 @@ class FsdpModule:
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
-        with torch.cuda.stream(inner_reduction_stream):
-            partial_grad = group.allocate_partial_grad_buffer()
-        current_stream.wait_stream(inner_reduction_stream)
-        group.copy_gradients_to_partial_buffer(partial_grad)
+        partial_grad = self._staged_partial_grads.pop(group, None)
+        if partial_grad is None:
+            with torch.cuda.stream(inner_reduction_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+            current_stream.wait_stream(inner_reduction_stream)
+            group.copy_gradients_to_partial_buffer(partial_grad)
+        elif any(
+            parameter.unsharded not in self._staged_parameters
+            for parameter in group.fsdp_parameters
+        ):
+            raise RuntimeError("Cannot reduce a partially staged parameter group.")
+        else:
+            for event in self._staged_copy_events.pop(group).values():
+                inner_reduction_stream.wait_event(event)
+            del self._staged_buffer_ready[group]
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
