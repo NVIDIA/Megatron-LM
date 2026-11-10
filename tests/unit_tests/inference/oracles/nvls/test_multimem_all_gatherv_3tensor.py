@@ -9,16 +9,18 @@ each rank's hidden states, routing map and probabilities in one launch.
 Contract (from the launcher's docstring and the dispatcher): rank q of a group of ws ranks owns
 c_q tokens (counts differ and may be 0); its rows start at off_q = c_0 + ... + c_{q-1} of the
 global layout, whose buffers hold global_max = per_rank_max * ws rows. For each of the three
-tensors k, rank r passes in_k [c_r, w_k] (any dtype; row bytes a multiple of 8) and every rank's
-out_k (a symmetric buffer view [global_max, w_k] at output_byte_offset_k, each tensor in its own
-buffer or packed in one). rank_token_offset holds off_r, ep_max_tokens max_q c_q (device int32
-scalars, the latter the same on every rank). After the call, on every rank,
+tensors k, rank r passes in_k [c_r, w_k] (any dtype; row bytes a multiple of 8, or of 4 with #8562)
+and every rank's out_k (a symmetric buffer view [global_max, w_k] at output_byte_offset_k, each
+tensor in its own buffer or packed in one). rank_token_offset holds off_r, ep_max_tokens max_q c_q
+(device int32 scalars, the latter the same on every rank). After the call, on every rank,
 out_k[off_q : off_q + c_q] == in_k of rank q, bit for bit, for every q, and nothing else is
 written: rows [total, global_max) keep what they held, as do the bytes around each region and
 the inputs. The kernel has an exit barrier and no entry barrier: peers must have finished
 reading the previous contents (in the dispatcher, the preceding combine's entry barrier or the
-metadata kernel orders this). Rows of 8 but not 16 bytes take the 64-bit path; rows that are not
-a multiple of 8 bytes are refused (odd top-k fp32 probabilities).
+metadata kernel orders this). Rows of 8 but not 16 bytes take the 64-bit path. On main rows that
+are not a multiple of 8 bytes are refused, odd top-k fp32 probabilities among them; #8562
+(``fix/d4-d9-inference-router-shape``) gathers rows of a multiple of 4 bytes with 32-bit stores
+and refuses the rest.
 
 Tolerance class: exact (bitwise; random bit patterns, so NaN payloads, -0.0 and -1 routing
 entries must survive), against the rows gathered with NCCL.
@@ -344,11 +346,13 @@ def test_sanitizer_small_case(nvls_groups):
     run_all_gatherv_3tensor(g, specs, 129, counts, "packed", seed)
 
 
-@pytest.mark.parametrize("topk", [2, 3])
-def test_launcher_refuses_rows_not_a_multiple_of_8_bytes(monkeypatch, topk):
-    """fp32 probabilities with an odd top-k (rows of 4 * topk bytes) cannot be gathered with
-    64- or 128-bit stores: the launcher refuses them before launching; even top-k launches.
-    Passes on main (CPU: the kernel is replaced by a recorder)."""
+@pytest.mark.parametrize("case", ["even-top-k", "hidden-rows-of-6-bytes"])
+def test_launcher_refuses_rows_it_cannot_store(monkeypatch, case):
+    """bf16 hidden states 3 wide (rows of 6 bytes) cannot be gathered with 32-, 64- or 128-bit
+    stores: the launcher refuses them before launching. Hidden states 128 wide with top-2
+    routing (fp32 probability rows of 8 bytes) launch. Passes on main, which refuses rows that
+    are not a multiple of 8 bytes, and with #8562, which refuses rows that are not a multiple
+    of 4 (CPU: the kernel is replaced by a recorder)."""
     pytest.importorskip("triton")
     launches = []
 
@@ -360,9 +364,9 @@ def test_launcher_refuses_rows_not_a_multiple_of_8_bytes(monkeypatch, topk):
     monkeypatch.setattr(variable_collectives, "is_device_nvls_capable", lambda device: True)
     handle = SimpleNamespace(world_size=4, rank=1, multicast_ptr=0, signal_pad_ptrs_dev=0)
     meta = SimpleNamespace(numel=lambda: 1, dtype=torch.int32, is_cuda=True)
-    hidden = torch.zeros(3, 128, dtype=torch.bfloat16)
-    routing = torch.zeros(3, topk, dtype=torch.int64)
-    probs = torch.zeros(3, topk, dtype=torch.float32)
+    hidden = torch.zeros(3, 3 if case == "hidden-rows-of-6-bytes" else 128, dtype=torch.bfloat16)
+    routing = torch.zeros(3, 2, dtype=torch.int64)
+    probs = torch.zeros(3, 2, dtype=torch.float32)
     outputs = [torch.zeros(12, t.shape[1], dtype=t.dtype) for t in (hidden, routing, probs)]
 
     def launch():
@@ -379,10 +383,10 @@ def test_launcher_refuses_rows_not_a_multiple_of_8_bytes(monkeypatch, topk):
             per_rank_max_tokens=3,
         )
 
-    if topk % 2 == 0:
+    if case == "even-top-k":
         launch()
         assert len(launches) == 1
         return
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="byte aligned"):
         launch()
     assert not launches
