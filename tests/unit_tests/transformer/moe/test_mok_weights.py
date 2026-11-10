@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.transformer import transformer_config as transformer_config_module
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -149,16 +150,107 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
 @pytest.mark.parametrize(
     "cuda_graph_modules",
     [
-        [CudaGraphModule.moe],
-        [CudaGraphModule.moe_router],
         [CudaGraphModule.moe_preprocess],
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
-def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
-    with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
+def test_mok_rejects_per_layer_cuda_graph_covering_moe_preprocess(
+    cuda_graph_impl, cuda_graph_modules
+):
+    with pytest.raises(ValueError, match="moe_preprocess"):
         _mok_transformer_config(
             cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
+        )
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("2.19.0"),
+    reason="The megakernel moe CUDA graph scope requires TE 2.19 and later.",
+)
+@pytest.mark.parametrize(
+    "cuda_graph_modules", [[CudaGraphModule.moe], [CudaGraphModule.attn, CudaGraphModule.moe]]
+)
+def test_mok_accepts_transformer_engine_moe_cuda_graph(cuda_graph_modules):
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+    )
+
+    assert config.cuda_graph_modules == cuda_graph_modules
+
+
+def test_mok_rejects_local_moe_cuda_graph():
+    with pytest.raises(ValueError, match="only with cuda_graph_impl='transformer_engine'"):
+        _mok_transformer_config(cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.moe])
+
+
+def test_mok_rejects_moe_cuda_graph_with_moe_recompute():
+    with pytest.raises(ValueError, match="'moe' in recompute_modules"):
+        _mok_transformer_config(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+            recompute_granularity="selective",
+            recompute_modules=["moe"],
+        )
+
+
+def test_mok_rejects_moe_cuda_graph_with_pipeline_parallelism():
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size=1"):
+        _mok_transformer_config(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+        )
+
+
+def test_mok_accepts_moe_router_cuda_graph_with_pipeline_parallelism():
+    # MOK runs eagerly after the router graph, so each call keeps its own saved state.
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.bfloat16,
+    )
+
+    assert config.pipeline_model_parallel_size == 2
+
+
+def test_mok_moe_cuda_graph_requires_te_that_does_not_clone_param_grads(monkeypatch):
+    original = transformer_config_module.is_te_min_version
+
+    def is_te_min_version(version, *args, **kwargs):
+        return version != "2.19.0" and original(version, *args, **kwargs)
+
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", is_te_min_version)
+    with pytest.raises(ValueError, match="requires Transformer Engine >= 2.19"):
+        _mok_transformer_config(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+        )
+
+
+def test_native_moe_cuda_graph_still_requires_drop_padding():
+    with pytest.raises(AssertionError, match="drop-padding MoE"):
+        _mok_transformer_config(
+            moe_megakernel_backend=None,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+        )
+
+
+def test_mok_accepts_transformer_engine_moe_router_cuda_graph():
+    cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+    )
+
+    assert config.cuda_graph_modules == cuda_graph_modules
+
+
+def test_mok_rejects_local_moe_router_cuda_graph():
+    with pytest.raises(ValueError, match="only with cuda_graph_impl='transformer_engine'"):
+        _mok_transformer_config(
+            cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.moe_router]
         )
 
 
