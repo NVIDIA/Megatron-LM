@@ -176,3 +176,5 @@ class TestSequentialMLPProcessGroups:
         finally:
             _GTP_PARAMS.clear()
             reset_gtp_state()
+            torch.distributed.destroy_process_group(expt_dp)
+            torch.distributed.destroy_process_group(expt_gtp_remat)

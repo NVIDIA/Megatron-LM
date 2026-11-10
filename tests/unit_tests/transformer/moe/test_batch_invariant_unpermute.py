@@ -121,35 +121,38 @@ class TestAlltoAllDispatcherBatchInvariantCombine:
         ep_group, _ = torch.distributed.new_subgroups_by_enumeration(
             [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
         )
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=_HIDDEN,
-            num_attention_heads=1,
-            num_moe_experts=_NUM_EXPERTS,
-            moe_token_dispatcher_type="alltoall",
-        )
-        num_local_experts = _NUM_EXPERTS // ep_group.size()
-        first_local_expert = ep_group.rank() * num_local_experts
-        dispatcher = MoEAlltoAllTokenDispatcher(
-            num_local_experts=num_local_experts,
-            local_expert_indices=list(
-                range(first_local_expert, first_local_expert + num_local_experts)
-            ),
-            config=config,
-            pg_collection=ProcessGroupCollection(ep=ep_group, expt_tp=None, tp_ep=ep_group),
-        )
-        # The state dispatch leaves behind for one token routed to all four experts.
-        dispatcher.hidden_shape = torch.Size((1, 1, _HIDDEN))
-        dispatcher.hidden_shape_before_permute = torch.Size((1, _HIDDEN))
-        dispatcher.routing_map = torch.ones(1, _NUM_EXPERTS, device="cuda", dtype=torch.bool)
-        dispatcher.reversed_local_input_permutation_mapping = torch.zeros(
-            _NUM_EXPERTS, device="cuda", dtype=torch.int64
-        )
-        dispatcher.batch_invariant_inverse_permutation_mapping = _inverse_map()
+        try:
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=_HIDDEN,
+                num_attention_heads=1,
+                num_moe_experts=_NUM_EXPERTS,
+                moe_token_dispatcher_type="alltoall",
+            )
+            num_local_experts = _NUM_EXPERTS // ep_group.size()
+            first_local_expert = ep_group.rank() * num_local_experts
+            dispatcher = MoEAlltoAllTokenDispatcher(
+                num_local_experts=num_local_experts,
+                local_expert_indices=list(
+                    range(first_local_expert, first_local_expert + num_local_experts)
+                ),
+                config=config,
+                pg_collection=ProcessGroupCollection(ep=ep_group, expt_tp=None, tp_ep=ep_group),
+            )
+            # The state dispatch leaves behind for one token routed to all four experts.
+            dispatcher.hidden_shape = torch.Size((1, 1, _HIDDEN))
+            dispatcher.hidden_shape_before_permute = torch.Size((1, _HIDDEN))
+            dispatcher.routing_map = torch.ones(1, _NUM_EXPERTS, device="cuda", dtype=torch.bool)
+            dispatcher.reversed_local_input_permutation_mapping = torch.zeros(
+                _NUM_EXPERTS, device="cuda", dtype=torch.int64
+            )
+            dispatcher.batch_invariant_inverse_permutation_mapping = _inverse_map()
 
-        with set_batch_invariant_mode(True), monkeypatch.context() as patch:
-            _forbid_global_process_groups(patch)
-            output = dispatcher.combine_postprocess(_expert_outputs())
+            with set_batch_invariant_mode(True), monkeypatch.context() as patch:
+                _forbid_global_process_groups(patch)
+                output = dispatcher.combine_postprocess(_expert_outputs())
 
-        expected = torch.full((1, 1, _HIDDEN), _SUM_BY_EP_SIZE[2], device="cuda")
-        torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
+            expected = torch.full((1, 1, _HIDDEN), _SUM_BY_EP_SIZE[2], device="cuda")
+            torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
+        finally:
+            torch.distributed.destroy_process_group(ep_group)
