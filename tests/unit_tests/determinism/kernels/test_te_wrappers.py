@@ -837,6 +837,7 @@ class TestTEWrappers:
         )
 
     @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
     @pytest.mark.parametrize("grad_fp8_format", ["e4m3", "e5m2"])
     def test_te_fused_cross_entropy_mxfp8_grad_replays(self, grad_fp8_format):
