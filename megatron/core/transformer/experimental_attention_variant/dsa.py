@@ -2334,6 +2334,12 @@ class DSAIndexer(MegatronModule):
             cp_group=cp_group,
             # This flag is for the MLA-style interleaving in RoPE.
             mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
+            # Native FP8 reductions are sensitive to operand order near top-k ties.
+            # Restore adjacent RoPE pairs instead of exposing the internal even/odd grouping.
+            mla_output_remove_interleaving=(
+                self.config.dsa_indexer_scoring_precision == "fp8"
+                and self.config.dsa_indexer_rope_interleaved
+            ),
         )
         if squeezed_batch_dim:
             x_pe = x_pe.unsqueeze(1)
@@ -2390,6 +2396,10 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
+        if self.config.dsa_indexer_rope_fp32:
+            # Keep query RoPE preprocessing in FP32 end-to-end, with no intermediate BF16
+            # round-trip before the scoring matmul.
+            q = q.float()
         q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q, cp_group=cp_group)
         if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
             q = rotate_activation(q)
@@ -2400,7 +2410,7 @@ class DSAIndexer(MegatronModule):
         with self._projection_quantization_context():
             # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
             k, _ = self.linear_wk(x)
-            if self.config.dsa_indexer_k_norm_fp32:
+            if self.config.dsa_indexer_rope_fp32 or self.config.dsa_indexer_k_norm_fp32:
                 k_dtype = k.dtype
                 # TE LayerNorm casts its input to the parameter dtype, so passing
                 # k.float() to the BF16 module does not guarantee FP32 math.
@@ -2415,7 +2425,10 @@ class DSAIndexer(MegatronModule):
                         k_norm_weight,
                         self.k_norm.bias.float(),
                         self.k_norm.eps,
-                    ).to(dtype=k_dtype)
+                    )
+                # rope_fp32 keeps LayerNorm -> RoPE in FP32 with no intermediate BF16 round-trip.
+                if not self.config.dsa_indexer_rope_fp32:
+                    k = k.to(dtype=k_dtype)
             else:
                 k = self.k_norm(k)
             # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
@@ -2437,6 +2450,10 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights = self._project_indexer_weights(x)
+        if self.config.dsa_indexer_scoring_precision == "fp8":
+            # Preserve the projected values before score normalization; BF16 rounding here
+            # changes the discrete top-k selection even when Q/K quantization matches.
+            weights = weights.float()
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         # Save token-aligned compression scores for the subsequent pool selection.
