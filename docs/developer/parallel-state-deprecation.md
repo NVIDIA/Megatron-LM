@@ -144,6 +144,13 @@ back to the global grid. Each such fallback emits a `ProcessGroupFallbackWarning
 - If the global grid is not initialized, a separate warning names the groups that came back
   `None`; `torch.distributed` treats them as the default (world) group.
 
+A fallback that takes a rank or size from the global group does not see a `set_*_rank()` or
+`set_*_world_size()` override: an override changes only what the deprecated rank and size
+accessors return. For example, batch-invariant `unpermute` without `ep_size`,
+`get_ep_layer_offset()` without `ep_rank` and `ep_size`, and `build_inference_pg_collection()`
+with a size left out use the global group. A caller that only set an override passes these
+arguments instead.
+
 Inside Megatron Core, a component's fallback goes through `resolve_process_groups()`, or calls
 `warn_global_process_group_fallback()` itself before it reads the grid. `resolve_process_groups()`
 warns before it reads an initialized grid, and checks that the fields the component reads are set:
