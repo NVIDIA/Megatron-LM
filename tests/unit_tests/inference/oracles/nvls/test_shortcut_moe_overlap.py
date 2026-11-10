@@ -53,10 +53,12 @@ three wide residual streams, which add the shortcut residual read on the side st
 `graphs-nano3` case has Nemotron 3 Nano's production widths (hidden 2688, 128 experts of 1856,
 a 3712-wide shared expert).
 
-Not covered here (see packet o5): an fp64 per-token reference of the MoE half of the pair (the
-kernels it runs have their own oracles: the NVLS collectives in this package, the fused MoE in
-packet O3); EP sizes other than the whole node; FP8/FP4 and batch-invariant mode, which the option
-rejects at configuration.
+`test_pair_output_matches_fp64_reference` adds an fp64 per-token reference of both pairs with the
+option on, so a schedule that is wrong in both runs alike cannot pass.
+
+Not covered here (see packet o5): tokens at a near tie in the routing (left out of the fp64 case);
+EP sizes other than the whole node; the legacy scheduler; FP8/FP4, speculative decoding and
+batch-invariant mode, which the option rejects at configuration.
 """
 
 import gc
