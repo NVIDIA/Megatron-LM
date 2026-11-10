@@ -81,13 +81,16 @@ in a mixed step and both reread by a decode-only step; bf16 and FP8 tensorwise f
 unused-memory contracts; poison values 1e4 and NaN. DeepSeek-V3's head widths (``qk_head_dim``
 128, ``qk_pos_emb_head_dim`` 64, ``v_head_dim`` 128), so the query's content and RoPE parts have
 different widths; random RMSNorm gains (the q and kv norms), so a norm applied twice or skipped
-changes the result (with unit gains RMSNorm is idempotent).
+changes the result (with unit gains RMSNorm is idempotent). Production width: DeepSeek-V3's
+attention layer (hidden 7168, 128 heads, ``q_lora_rank`` 1536, the head widths above, its YaRN)
+through the four-step scenario at TP 1 (128 heads on one GPU) and TP 8 (16 heads per rank, the
+serving split).
 
 Hardware: H100 with a FlashMLA build that has its SM90 kernels (#8701; the manifest runs the SM90
-build) and FA3 or FA4 for the paged prefill (FA2 cannot read 64-token pages); the TP cases on 2
-H100s. The scenario also runs on GB200, where it fails on main (FlashMLA has no SM100 dense
-decode, R11-F1; FA4's SM100 forward does not compile in the CI image, G1) and passes with #8873
-and #8860.
+build) and FA3 or FA4 for the paged prefill (FA2 cannot read 64-token pages); the TP 2 cases on 2
+H100s, the TP 8 production case on 8. The scenario also runs on GB200, where it fails on main
+(FlashMLA has no SM100 dense decode, R11-F1; FA4's SM100 forward does not compile in the CI image,
+G1) and passes with #8873 and #8860.
 
 Open PRs (written against main):
 * #8571 (s8): main does not pass the sink to the dynamic MLA kernels, so ``[learnable]`` fails on
@@ -126,6 +129,18 @@ from tests.unit_tests.test_utilities import Utils
 HEADS, HIDDEN, LATENT, ROPE, QK, V = 16, 512, 512, 64, 128, 128
 TP_HEADS = 32  # 16 per rank at TP 2, as DeepSeek-V3's 128 heads at TP 8
 ROPE_BASE = 10000.0
+# Layer widths (MLATransformerConfig fields). LATENT, ROPE, QK and V above are DeepSeek-V3's
+# kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim and v_head_dim already; "deepseek_v3" adds its
+# hidden size and q_lora_rank (its config.json), with its 128 heads (PRODUCTION_HEADS). The init
+# std keeps the attention logits' spread where the small cases have it: with these weights and
+# gains the logits have std 0.67 under DeepSeek-V3's YaRN scale, as the small widths have with
+# plain RoPE (0.67; 1.23 with YaRN), while DeepSeek-V3's own init std 0.006 would give 0.14 (an
+# almost uniform softmax) and the small cases' 0.05 about 10 (an almost one-hot one).
+WIDTHS = {
+    "small": dict(hidden_size=HIDDEN, q_lora_rank=128, init_method_std=0.05),
+    "deepseek_v3": dict(hidden_size=7168, q_lora_rank=1536, init_method_std=0.013),
+}
+PRODUCTION_HEADS = 128
 MAX_LEN = 256
 PROMPTS = {0: 63, 1: 64, 2: 65, 3: 129}
 LATE_PROMPT = 70  # joins in the mixed step
@@ -272,6 +287,20 @@ def tensor_parallel():
     Utils.destroy_model_parallel()
 
 
+@pytest.fixture
+def production_tensor_parallel(request):
+    """Tensor parallelism of size ``request.param`` (indirect parametrization); returns the size."""
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    tp = request.param
+    if Utils.world_size < tp:
+        pytest.fail(f"TP {tp} needs {tp} GPUs, the world size is {Utils.world_size}", pytrace=False)
+    Utils.initialize_model_parallel(tp, 1)
+    model_parallel_cuda_manual_seed(123)
+    yield tp
+    Utils.destroy_model_parallel()
+
+
 def _config(
     *,
     cache: bool,
@@ -284,15 +313,14 @@ def _config(
     sp: bool = False,
     spec: str = "te",
     mtp: bool = False,
+    width: str = "small",
     **extra,
 ):
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
     kwargs = dict(
         num_layers=1,
-        hidden_size=HIDDEN,
         num_attention_heads=heads,
-        q_lora_rank=128,
         kv_lora_rank=LATENT,
         qk_head_dim=QK,
         qk_pos_emb_head_dim=ROPE,
@@ -308,9 +336,9 @@ def _config(
         attention_dropout=0.0,
         softmax_type="learnable" if sink else "vanilla",
         flash_attention_version=flash_version,
-        init_method_std=0.05,
         tensor_model_parallel_size=tp,
         sequence_parallel=sp,
+        **WIDTHS[width],
         **ROPE_VARIANTS[variant],
     )
     if spec == "inference_optimized":
@@ -376,6 +404,7 @@ def _weights(
     spec: str = "te",
     mtp: bool = False,
     seed: int = 0,
+    width: str = "small",
 ):
     """A factory of latent-caching layers that all hold one set of random weights, and the training
     twin holding them too. The weights are copied before any inference forward, which deletes the
@@ -393,6 +422,7 @@ def _weights(
             sp=sp,
             spec=spec,
             mtp=mtp,
+            width=width,
         )
 
     first = _layer(layer_config(), spec)
@@ -428,7 +458,7 @@ def _weights(
 
     # The trusted training forward: TE spec, no sequence parallelism, scale from the definition.
     twin_config = _config(
-        cache=False, sink=sink, fp8=fp8, variant=variant, heads=heads, tp=tp, mtp=mtp
+        cache=False, sink=sink, fp8=fp8, variant=variant, heads=heads, tp=tp, mtp=mtp, width=width
     )
     twin = _layer(twin_config, "te", core_scale=_softmax_scale(variant))
     # The inference-optimized linears subclass TE's, so their state carries every twin key.
@@ -485,11 +515,11 @@ def _admit_chunk(context, request, length: int):
         request.remaining_prompt_tokens = request.remaining_prompt_tokens.new_empty(0)
 
 
-def _hidden_states(seed: int) -> Dict[int, torch.Tensor]:
-    """Fixed per-request hidden states [MAX_LEN, HIDDEN], the same on every rank."""
+def _hidden_states(seed: int, hidden: int = HIDDEN) -> Dict[int, torch.Tensor]:
+    """Fixed per-request hidden states [MAX_LEN, hidden], the same on every rank."""
     g = ou.make_generator(seed=seed, device="cuda")
     return {
-        rid: torch.randn(MAX_LEN, HIDDEN, device="cuda", generator=g).to(torch.bfloat16)
+        rid: torch.randn(MAX_LEN, hidden, device="cuda", generator=g).to(torch.bfloat16)
         for rid in list(PROMPTS) + [len(PROMPTS)]
     }
 
@@ -515,7 +545,7 @@ class _Scenario:
         self.layer, self.config, self.fp8 = layer, config, fp8
         self.context = _context(config, **inference)
         self.context.memory_buffer.zero_()
-        self.hidden = _hidden_states(ou.DEFAULT_SEED + 7)
+        self.hidden = _hidden_states(ou.DEFAULT_SEED + 7, config.hidden_size)
         group = layer.pg_collection.tp
         self.tp_size, self.tp_rank = group.size(), group.rank()
         self.sequence_parallel = config.sequence_parallel and self.tp_size > 1
@@ -543,7 +573,11 @@ class _Scenario:
         context = self.context
         context.initialize_attention_state()
         hidden = torch.zeros(
-            context.padded_active_token_count, 1, HIDDEN, device="cuda", dtype=torch.bfloat16
+            context.padded_active_token_count,
+            1,
+            self.config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
         spans, start = {}, 0
         for rid, offset, length in self._active():
@@ -863,6 +897,31 @@ def test_tensor_parallel_small_scenario_for_sanitizer():
         _check_rows(checks, twin, scenario.hidden, rows, f"TP 2 sanitizer {name}")
         scenario.advance()
     checks.run()
+
+
+PRODUCTION_CASES = [
+    pytest.param(1, id="deepseek_v3-tp1", marks=DEVICES),
+    # Eight GPUs: H100 nodes only (a GB200 node has four).
+    pytest.param(8, id="deepseek_v3-tp8", marks=ou.requires_sm(ou.HOPPER)),
+]
+
+
+@pytest.mark.parametrize("production_tensor_parallel", PRODUCTION_CASES, indirect=True)
+def test_production_width_steps_match_training(production_tensor_parallel):
+    """DeepSeek-V3's attention layer (hidden 7168, 128 heads, q_lora_rank 1536, kv_lora_rank 512,
+    qk_nope/rope/v head dims 128/64/128, YaRN factor 40 with mscale = mscale_all_dim = 1) through
+    the prefill, absorbed decode-only (FlashMLA), mixed (whole-pool up-projection) and decode-only
+    steps: every live token's attention output matches the fp64 reference within the training
+    twin's error. ``[deepseek_v3-tp1]`` holds all 128 heads on one GPU (FlashMLA and the paged
+    prefill at 128 query heads, a 32768-wide whole-pool up-projection); ``[deepseek_v3-tp8]`` is
+    the serving split, 16 heads per rank, against a TP 8 training twin."""
+    _require_kernels()
+    tp = production_tensor_parallel
+    variant = "yarn_deepseek_v3"
+    make_layer, twin = _weights(width="deepseek_v3", heads=PRODUCTION_HEADS, tp=tp, variant=variant)
+    layer = make_layer()
+    assert layer.num_attention_heads_per_partition == PRODUCTION_HEADS // tp
+    _run_scenario(layer, twin, variant, f"DeepSeek-V3 width, TP {tp}")
 
 
 MTP_CASES = [
