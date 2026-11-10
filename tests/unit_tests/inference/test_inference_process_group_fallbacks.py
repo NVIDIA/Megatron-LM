@@ -48,6 +48,9 @@ INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
 COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
 # The groups whose None means that the axis is off.
 AXIS_GROUPS = ("ep", "cp", "expt_tp", "expt_dp")
+# The axis groups that only the disaggregated coordinator setup and the Dynamo engine service read,
+# for their sizes. A configured collection may omit them until Megatron Core 0.23, with a warning.
+SIZE_ONLY_GROUPS = ("cp", "expt_tp", "expt_dp")
 # The dynamic context and engine also read tp_ep. A configured collection may leave it unset; the
 # model's collection and the global fallback set it.
 RESOLVED_GROUPS = (*INFERENCE_GROUPS, "tp_ep")
@@ -367,15 +370,43 @@ class TestInferenceConfigBoundary:
             ):
                 config.resolve_pg_collection()
 
-    @pytest.mark.parametrize("name", AXIS_GROUPS)
-    def test_configured_collection_requires_every_group_inference_reads(self, name):
-        config = InferenceConfig(pg_collection=_stand_in_collection(**{name: _ABSENT}))
+    def test_configured_collection_requires_ep(self):
+        # The dynamic context and engine read ep; unset, it would read as expert parallelism off.
+        config = InferenceConfig(pg_collection=_stand_in_collection(ep=_ABSENT))
 
         with forbid_global_process_groups(), no_fallback_warnings():
             with pytest.raises(
-                ValueError, match=rf"InferenceConfig requires pg_collection to set {name}\."
+                ValueError, match=r"InferenceConfig requires pg_collection to set ep\."
             ):
                 config.resolve_pg_collection()
+
+    @pytest.mark.parametrize(
+        "omitted", [("cp",), ("expt_tp",), ("expt_dp",), SIZE_ONLY_GROUPS], ids="-".join
+    )
+    def test_configured_collection_without_size_only_groups_warns(self, omitted):
+        # An unset cp, expt_tp or expt_dp reads as None where it is read, which means that the
+        # axis is off, so the collection still resolves. The last case leaves the groups that a
+        # dynamic engine without disaggregation reads: tp, pp, dp, mp, ep and tp_ep.
+        configured = _stand_in_collection(**dict.fromkeys(omitted, _ABSENT))
+        config = InferenceConfig(pg_collection=configured)
+
+        with forbid_global_process_groups(), pytest.warns(FutureWarning) as record:
+            assert config.resolve_pg_collection() is configured
+
+        assert config.pg_collection is configured
+        assert not set(omitted) & set(vars(configured))
+        future_warnings = [w for w in record if issubclass(w.category, FutureWarning)]
+        assert len(future_warnings) == 1, [str(w.message) for w in record]
+        # Not a fallback to the global grid, so strict fallback mode does not turn it into an error.
+        assert future_warnings[0].category is FutureWarning
+        message = str(future_warnings[0].message)
+        assert (
+            f"InferenceConfig was given a pg_collection that does not set {', '.join(omitted)}. "
+            in message
+        )
+        assert "becomes an error in Megatron Core 0.23" in message
+        # The warning points at the code that configured the collection, not at Megatron Core.
+        assert future_warnings[0].filename == __file__
 
     def test_configured_collection_rejects_non_member_groups(self):
         non_member = torch.distributed.GroupMember.NON_GROUP_MEMBER
