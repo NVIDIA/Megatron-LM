@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 try:
     import emerging_optimizers  # pylint: disable=unused-import
@@ -122,6 +122,8 @@ class FsdpMuon(Muon):
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             if fsdp_group.mesh.ndim != 1:
                 raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
+            if not isinstance(fsdp_group.main_weight.placements[0], Shard):
+                raise NotImplementedError("FsdpMuon requires sharded main weights, not no_shard.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
                 if not isinstance(buffer, DBuffer):
                     raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")
