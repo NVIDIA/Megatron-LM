@@ -162,6 +162,17 @@ def _free_storage(tensor: torch.Tensor):
                 tensor._typed_storage()._resize_(0)
 
 
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device) -> None:
+    """Replace ``module``'s own meta parameters and buffers with uninitialized tensors on
+    ``device``, leaving its tensors that are already on a device unchanged.
+    """
+
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(tensor, device=device) if tensor.is_meta else tensor
+
+    module._apply(materialize, recurse=False)
+
+
 TensorItemIndex = namedtuple(
     "TensorItemIndex", ["global_data_index", "size", "item_id", "bucket_id", "shape"]
 )
@@ -3027,7 +3038,7 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            _materialize_meta_tensors(m, self.device)
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")

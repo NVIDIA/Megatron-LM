@@ -510,7 +510,7 @@ def _allreduce_non_tensor_model_parallel_grads(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
-    All-reduce layernorm grads (for sequence parallelism), gradients of parameters with
+    All-reduce layernorm grads (for sequence parallelism), gradients from modules with
     average_gradients_across_tp_domain=True, and gradients of parameters with
     sum_gradients_across_tp_domain=True (e.g. GatedDeltaNet's out_norm) across
     tensor-model-parallel ranks.
@@ -540,9 +540,8 @@ def _allreduce_non_tensor_model_parallel_grads(
                     else:
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
-                # Check if this param needs sum reduction (sequence parallel, qk_layernorm, or
-                # sum_gradients_across_tp_domain). One branch, so a parameter matching more than
-                # one condition is still summed exactly once.
+                # Check if this param needs sum reduction (sequence parallel, qk_layernorm,
+                # or sum_gradients_across_tp_domain)
                 elif (
                     (config.sequence_parallel and getattr(param, "sequence_parallel", False))
                     or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))

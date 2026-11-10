@@ -345,9 +345,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
-        # out_norm's parameters are shared by every value head, but TP splits the heads, so
-        # each TP rank's gradient is only a partial sum. Tag them so finalize_model_grads sums
-        # them across TP ranks whether or not sequence parallelism is enabled.
+
+        # out_norm's parameters are shared by all heads, but TP splits the heads, so each
+        # rank's gradient is a partial sum. Tag them so finalize_model_grads sums them.
         for param in self.out_norm.parameters():
             setattr(param, "sum_gradients_across_tp_domain", True)
 
