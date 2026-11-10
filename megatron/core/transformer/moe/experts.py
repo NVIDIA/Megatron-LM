@@ -988,16 +988,22 @@ class TEGroupedMLP(MegatronModule):
             post_probs = None
             if self.config.deterministic_mode:
                 if self.linear_fc2.use_bias:
+                    # The rewrite itself would hold with a bias: FC2 scales its bias by the
+                    # probabilities, so the output is p * (FC2(act) + bias) either way. The
+                    # bias gradient is the problem. TE sums it over tokens with atomic adds.
                     raise RuntimeError(
                         "deterministic_mode with the Transformer Engine operation-fuser grouped "
-                        "MLP requires FC2 without bias: "
-                        "routing probabilities are applied after FC2."
+                        "MLP requires FC2 without bias: Transformer Engine accumulates the "
+                        "grouped FC2 bias gradient with non-deterministic atomic adds."
                     )
                 if output_buffer is not None:
                     raise RuntimeError(
                         "deterministic operation-fuser grouped MLP does not support NCCL-EP "
                         "zero-copy output buffers: probability scaling changes the output storage."
                     )
+                # moe_combine_bwd_dtype is the wire dtype of the gradient that the NCCL-EP combine
+                # all-to-all sends back in backward. With 'mxfp8' that gradient reaches FC2
+                # already quantized, so no autograd op may sit between FC2 and the combine.
                 if self.config.moe_combine_bwd_dtype != "bf16":
                     raise RuntimeError(
                         "deterministic operation-fuser grouped MLP requires "
