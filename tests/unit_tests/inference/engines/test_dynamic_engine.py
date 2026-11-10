@@ -4193,6 +4193,7 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
         generated_log_probs=[-0.1, -0.2],
         generated_top_n_logprobs=[{"10": -0.1}, {"8": -0.2}],
         tpot=[0.01, 0.02],
+        acceptance_step_lengths=[1, 1],
     )
     request.add_event_generated_token(10)
     request.add_event_generated_token(8)
@@ -4239,6 +4240,9 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     current.generated_log_probs = step_log_probs[remaining_prompt_scores:]
     current.prompt_top_n_logprobs.extend(step_top_n[:remaining_prompt_scores])
     current.generated_top_n_logprobs = step_top_n[remaining_prompt_scores:]
+    # The step records the count of its own tokens that the stop kept.
+    if pending_trim < 2:
+        current.acceptance_step_lengths.append(2 - pending_trim)
     merged = record.merge()
     serialized = merged.serialize()
 
@@ -4261,6 +4265,7 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert len(merged.generated_log_probs) == len(merged.generated_tokens)
     assert len(merged.generated_top_n_logprobs) == len(merged.generated_tokens)
     assert len(merged.tpot) == len(merged.generated_tokens)
+    assert sum(merged.acceptance_step_lengths) == len(merged.generated_tokens)
     assert _generated_event_tokens(merged) == merged.generated_tokens
     serialized_event_tokens = [
         event["payload"]["token_id"]
@@ -7412,11 +7417,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    @pytest.mark.parametrize("keep_stop", [True, False], ids=["keep", "strip"])
     def test_speculative_long_stop_word_hit(
-        self, materialize_only_last_token_logits, sampling_backend
+        self, keep_stop, materialize_only_last_token_logits, sampling_backend
     ):
         """Test that if an accepted speculative token completes a long stop word
-        (length > num_speculative_tokens), it is correctly detected."""
+        (length > num_speculative_tokens), it is correctly detected, and stripped
+        when the client does not keep it."""
         if sampling_backend == "flashinfer":
             pytest.importorskip("flashinfer")
 
@@ -7473,7 +7480,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
             sampling_params=SamplingParams(
-                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=keep_stop
             ),
         )
 
@@ -7490,15 +7497,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert finished_req.status == Status.COMPLETED
         assert len(finished_req.generated_tokens) < 10
-        token_triplets = [
-            finished_req.generated_tokens[i : i + 3]
-            for i in range(len(finished_req.generated_tokens) - 2)
-        ]
-        assert [7, 8, 9] in token_triplets
-        # A stop sequence longer than the draft depth can reach back past the step that
-        # triggered it, removing tokens earlier `acceptance_step_lengths` entries counted. The
-        # list must still sum to the output length, or a client reconstructing acceptance from
-        # it reads more tokens than were emitted.
+        if keep_stop:
+            token_triplets = [
+                finished_req.generated_tokens[i : i + 3]
+                for i in range(len(finished_req.generated_tokens) - 2)
+            ]
+            assert [7, 8, 9] in token_triplets
+        else:
+            assert finished_req.generated_tokens == [5, 6]
+        # A stripped stop sequence longer than the draft depth can reach back past the step
+        # that triggered it, removing tokens earlier `acceptance_step_lengths` entries counted.
+        # The list must still sum to the output length, or a client reconstructing acceptance
+        # from it reads more tokens than were emitted.
         assert sum(finished_req.acceptance_step_lengths) == len(finished_req.generated_tokens), (
             f"acceptance_step_lengths {finished_req.acceptance_step_lengths} sums to "
             f"{sum(finished_req.acceptance_step_lengths)} but the request emitted "
