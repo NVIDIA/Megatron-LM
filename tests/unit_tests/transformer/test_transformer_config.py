@@ -107,6 +107,36 @@ def test_pinned_offload_buffer_config(size_gib, offload, error):
         assert config.fine_grained_offloading_buffer_size_gib == size_gib
 
 
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        (dict(batch_invariant_moe_combine_ep_size=3), "must divide num_moe_experts \\(8\\)"),
+        (dict(batch_invariant_moe_combine_ep_size=0), "must divide num_moe_experts"),
+        (dict(batch_invariant_moe_combine_ep_size=2, batch_invariant_mode=False), "MoE models"),
+        (dict(batch_invariant_moe_combine_ep_size=2, num_moe_experts=None), "MoE models"),
+    ],
+)
+def test_batch_invariant_moe_combine_ep_size_is_validated_at_construction(overrides, match):
+    from megatron.core.transformer.enums import AttnBackend
+
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        moe_token_dispatcher_type="alltoall",
+        batch_invariant_mode=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        attention_dropout=0.0,
+    )
+    TransformerConfig(**{**kwargs, "batch_invariant_moe_combine_ep_size": 4})
+    with pytest.raises(ValueError, match=match):
+        TransformerConfig(**{**kwargs, **overrides})
+
+
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
