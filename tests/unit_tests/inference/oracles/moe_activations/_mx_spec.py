@@ -291,10 +291,6 @@ VALUE_KINDS = ("randn", "wide", "boundary", "zeros")
 
 STRIDED_LAYOUTS = ("transpose", "column-slice", "row-step", "column-step", "broadcast")
 """Non-contiguous [rows, width] views a caller may pass to a quantizer (``input_view``)."""
-IN_STORAGE_LAYOUTS = ("transpose", "column-slice", "row-step")
-"""The strided layouts whose row-major misreading (row r at ``r * width``) stays inside the
-view's storage, so a kernel that ignores strides reads other finite elements instead of
-faulting (CI.md §2 item 10: never launch a kernel on inputs it is known to fault on)."""
 
 
 def input_view(

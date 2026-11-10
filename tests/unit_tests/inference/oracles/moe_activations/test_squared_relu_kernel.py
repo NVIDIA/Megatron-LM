@@ -38,7 +38,9 @@ compile-time variants (production passes ``ZERO_PADDING=False``); int64 row offs
 both variants of each; N around the 1024 tile cap and inside one tile, production widths; M and
 ``n_used`` around the 512-program grid; padding at program starts and wraps; int32 and int64
 maps holding token indices in expert-grouped order; special values; CUDA-graph replay with a
-changed ``n_used``; offsets past 2**31 (``large``).
+changed ``n_used``; offsets past 2**31 (``large``). NaN propagation (finding O2-N3, which fails
+on main) is #8955's regression test ``test_squared_relu_propagates_nan``
+(``tests/unit_tests/inference/test_moe_permute.py``).
 
 Runs on H100 (the torch-backend BF16 squared-ReLU experts).
 """
@@ -196,28 +198,6 @@ def test_special_values(clamp, zero_padding):
     if clamp is None:
         ok = (out.double() == expected) | (flush & (out == 0))
         assert bool(ok[finite].all()), "unclamped squares are not exact"
-
-
-@pytest.mark.parametrize("clamp", [None, 8.0])
-def test_nan_propagates(clamp):
-    """A NaN FC1 output stays NaN, as training's ``relu(NaN) = NaN``; its neighbours are
-    unaffected.
-
-    Fails on main (finding O2-N3): ``_clamped_relu`` computes the ReLU as ``tl.maximum(x, 0.0)``
-    with Triton's default ``propagate_nan=NONE`` (``maxnumf``), so NaN becomes 0. Fixed by the
-    open PR #8955 (s4f-nan-relu), which changes ``_clamped_relu``.
-    """
-    g = ou.make_generator(device=DEVICE)
-    x = squared_relu_inputs((3, 160), clamp, g).cpu()
-    x[0, 3] = float("nan")
-    x[2, 100:110] = float("nan")
-    x = x.to(DEVICE)
-    perm = torch.arange(3, dtype=torch.int32, device=DEVICE)
-    out = run_padded_squared_relu(x, perm, _common.device_scalar(3), clamp)
-    nan = torch.isnan(x)
-    ou.assert_exact(torch.isnan(out), nan, what="NaN positions")
-    exact = ou.fp64_reference(sr.squared_relu_exact, x, clamp)
-    _common.assert_rounded_once(out[~nan], exact[~nan], what="finite neighbours")
 
 
 def test_n_used_zero_writes_nothing():

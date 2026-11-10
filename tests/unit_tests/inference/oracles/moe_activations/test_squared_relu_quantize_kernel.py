@@ -31,8 +31,13 @@ Structure: persistent grid ``NUM_BLOCKS = min(M, 512)`` over rows; the whole row
 ``BLOCK_K = next_pow2(K)`` with ``K / 32`` real groups; ``CLAMP`` compile-time variant. Covered:
 both ``CLAMP`` variants, K around powers of two and with padded scale columns, production
 widths and a production buffer, M and ``n_used`` around the grid and the 128-row tile, padding
-layouts, tiny blocks, strided inputs, CUDA-graph replay with changing ``n_used``, row offsets
-past 2**31 (``large``).
+layouts, CUDA-graph replay with changing ``n_used``, row offsets past 2**31 (``large``). Cases
+that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_mxfp8_utils.py``: NaN propagation (finding O2-N3) in #8955's
+``test_squared_relu_and_quantize_mxfp8_propagates_nan``; blocks with activation amax at most
+``448 * 2**-127`` (O2-N1) and a strided ``x`` (O2-N2) in #8956's
+``TestSquaredReluAndQuantizeMxfp8::test_tiny_groups_take_the_smallest_scale`` and
+``test_rejects_strided_input``.
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -165,18 +170,15 @@ def test_mxfp8_boundaries(clamp):
 
 @pytest.mark.parametrize("clamp", [None, 8.0])
 def test_special_values(clamp):
-    """NaN propagates through the squared ReLU and decodes to NaN; +inf decodes to NaN or
-    saturates; -inf gives 0; blocks without them are unaffected.
+    """+inf decodes to NaN or saturates; -inf gives 0; blocks without them are unaffected.
 
-    Fails on main (suspected finding O2-N3): the ReLU is ``tl.maximum(x, 0.0)`` with Triton's
-    default ``propagate_nan=NONE``, which lowers to ``maxnumf`` and returns 0 for a NaN input
-    (the interpreter's ``np.fmax`` does the same), so an upstream NaN is quantized to 0 instead
-    of surfacing as training's ``relu(NaN) = NaN`` would.
+    A NaN input (finding O2-N3: it decodes to 0 on main) is #8955's regression test
+    ``test_squared_relu_and_quantize_mxfp8_propagates_nan``.
     """
     rows, width = 4, 160
     g = ou.make_generator()
     x = torch.randn(rows, width, generator=g).to(torch.bfloat16)
-    special = [(0, 3, float("nan")), (1, 40, float("inf")), (2, 70, float("-inf"))]
+    special = [(1, 40, float("inf")), (2, 70, float("-inf"))]
     for r, c, v in special:
         x[r, c] = v
     x = x.to(DEVICE)
@@ -184,8 +186,8 @@ def test_special_values(clamp):
     t = run_fused(x, perm, _common.device_scalar(rows), clamp)
     scales, _ = mx.unswizzle(t.scale.cpu(), rows, width // mx.BLOCK)
     codes = t.data.cpu().view(torch.uint8)
-    # NaN blocks, and +inf blocks unless the clamp maps +inf to s (tanh saturates).
-    bad = {(r, c // mx.BLOCK) for r, c, v in special if v != v or (v > 0 and clamp is None)}
+    # +inf blocks, unless the clamp maps +inf to s (tanh saturates).
+    bad = {(r, c // mx.BLOCK) for r, c, v in special if v > 0 and clamp is None}
     for r in range(rows):
         for b in range(width // mx.BLOCK):
             if (r, b) in bad:
@@ -199,8 +201,6 @@ def test_special_values(clamp):
                 what=f"block {r},{b}",
             )
     decoded = mx.dequantize(codes, scales)
-    nan_value = decoded[0, 3].item()
-    assert nan_value != nan_value, f"relu(NaN)**2 decodes to {nan_value}, not NaN"
     inf_value = decoded[1, 40].item()
     sat = 448.0 * mx.e8m0_decode(scales[1, 40 // mx.BLOCK]).item()
     if clamp is None:
@@ -215,65 +215,6 @@ def test_sanitizer_small():
     perm = _glu.permutation_map(130, "runs", torch.int32, g, DEVICE)
     t = run_fused(x, perm, _common.device_scalar(100), 8.0)
     check(t, x, perm, 100, 8.0, "sanitizer case")
-
-
-@pytest.mark.parametrize("clamp", [None, 8.0])
-def test_tiny_blocks_take_the_smallest_scale(clamp):
-    """Blocks whose activation amax is at most ``448 * 2**-127`` (normal bf16 values) take
-    E8M0's smallest scale, 0x00; a block just above that bound takes 0x01 (control).
-
-    Fails on main (finding O2-N1, the same quantization code as ``_mxfp8_quant_swizzle_row``):
-    ``amax / 448`` is an fp32 subnormal there, and adding 0x7FFFFF to its bits gives 2**-126
-    (byte 0x01). Fixed by the open PR #8956 (s4f-mxfp8-quant), whose shared scale helper serves
-    this kernel too.
-    """
-    # Activations bf16(x**2): 2**-120, 1.5625 * 2**-120, 3.0625 * 2**-120 and 2**-126 (tiny);
-    # 3.515625 * 2**-120 = 1.7578125 * 2**-119 (just above 448 * 2**-127).
-    tiny = (2.0**-60, 1.25 * 2.0**-60, 1.75 * 2.0**-60, 2.0**-63, 1.875 * 2.0**-60)
-    rows, width = len(tiny), 64
-    x = torch.zeros(rows, width, dtype=torch.float64)
-    for r, v in enumerate(tiny):
-        x[r, 0] = v
-        x[r, 1:32:3] = -v  # ReLU to zero
-        x[r, 2:32:3] = v
-        x[r, 32:] = 1.5  # an ordinary block next to it
-    x = x.to(torch.bfloat16).to(DEVICE)
-    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-    t = run_fused(x, perm, _common.device_scalar(rows), clamp)
-    check(t, x, perm, rows, clamp, f"tiny blocks, clamp {clamp}")
-
-
-def test_strided_input_is_quantized_or_rejected():
-    """A strided [M, K] ``x`` (transpose, column slice, row step) is quantized by its values or
-    rejected, never misread. The views stay inside their storage, so a misreading kernel reads
-    other finite elements instead of faulting.
-
-    Fails on main (finding O2-N2's precondition, here in the fused kernel): the launcher does
-    not check contiguity and the kernel addresses row r at ``r * K``. Fixed by the open PR #8956
-    (s4f-mxfp8-quant), which asserts a contiguous input here.
-    """
-    g = ou.make_generator(device=DEVICE)
-    rows, width = 128, 160
-    base = (torch.randn(2 * rows, 2 * width, generator=g, device=DEVICE) * 4).to(torch.bfloat16)
-    views = {
-        "transpose": base[:width, :rows].t(),
-        "column-slice": base[:rows, :width],
-        "row-step": base[::2, :width],
-    }
-    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-    for name, x in views.items():
-        assert x.shape == (rows, width) and not x.is_contiguous()
-        before = x.clone()
-        try:
-            with _common.captured_allocations(activations) as allocs:
-                t = activations.squared_relu_and_quantize_mxfp8(
-                    x, perm, _common.device_scalar(rows)
-                )
-        except (AssertionError, ValueError, RuntimeError):
-            continue  # rejected before any launch
-        allocs.check(f"outputs for a strided input ({name})")
-        ou.assert_exact(x, before, what="x is read-only")
-        check(t, before, perm, rows, None, f"strided input ({name})")
 
 
 @pytest.mark.parametrize("clamp", [None, 10.0])

@@ -44,6 +44,11 @@ production widths; M and ``n_used`` around the 512-program grid and the 128-row 
 (``n_used = 0`` and ``> M``); padding layouts with int32 and int64 maps holding token indices in
 expert-grouped order; round-up scale ties, E4M3 midpoints and wide-range blocks; special values;
 CUDA-graph replay with changing ``n_used``; a production buffer; offsets past 2**31 (``large``).
+Cases that fail on main are regression tests of their fix PRs, in
+``tests/unit_tests/inference/test_mxfp8_utils.py``: NaN propagation (finding O2-M2) in #8955's
+``test_batch_invariant_squared_relu_quantize_mxfp8_propagates_nan``, and blocks with amax at
+most ``448 * 2**-127`` (O2-M1) in #8956's
+``test_batch_invariant_squared_relu_quantize_tiny_groups_take_the_smallest_scale``.
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where the MXFP8 expert path runs it.
 """
@@ -262,64 +267,6 @@ def test_special_values(clamp):
         got = decoded[r, c].item()
         sat = 448.0 * mx.e8m0_decode(scales[r, c // mx.BLOCK]).item()
         assert got != got or got == sat, f"infinite activation at ({r}, {c}) decodes to {got}"
-
-
-@pytest.mark.parametrize("clamp", [None, 8.0])
-def test_nan_propagates(clamp):
-    """A NaN FC1 output decodes to NaN, as training's ``relu(NaN) = NaN``; other blocks are
-    unaffected.
-
-    Fails on main (suspected finding O2-M2): the ReLU is ``tl.maximum(value, 0.0)`` with Triton's
-    default ``propagate_nan=NONE`` (``maxnumf``), so NaN becomes 0, as in O2-N3 and O3-N1. The
-    open fix PR #8955 (s4f-nan-relu) predates this kernel and does not change it.
-    """
-    rows, width = 3, 160
-    g = ou.make_generator()
-    x = torch.randn(rows, width, generator=g).to(torch.bfloat16)
-    x[0, 3] = float("nan")
-    x[2, 32:64] = float("nan")
-    probs = torch.rand(rows, generator=g, dtype=torch.float32) * 0.9 + 0.05
-    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-    t = run_fused(x.to(DEVICE), perm, _common.device_scalar(rows), probs.to(DEVICE), clamp)
-    scales, _ = mx.unswizzle(t.scale.cpu(), rows, width // mx.BLOCK)
-    codes = t.data.cpu().view(torch.uint8)
-    for r, b in ((0, 1), (0, 4), (1, 0), (1, 3), (2, 0), (2, 2)):
-        cols = slice(b * mx.BLOCK, (b + 1) * mx.BLOCK)
-        lo, hi = sr.activation_bounds(x[r : r + 1, cols], clamp, probs[r : r + 1])
-        sr.assert_quantized_activation(
-            codes[r : r + 1, cols], scales[r : r + 1, b : b + 1], lo, hi, what=f"block {r},{b}"
-        )
-    decoded = mx.dequantize(codes, scales)
-    for r, c in ((0, 3), (2, 32), (2, 63)):
-        got = decoded[r, c].item()
-        assert got != got, f"relu(NaN)**2 * p at ({r}, {c}) decodes to {got}, not NaN"
-
-
-@pytest.mark.parametrize("clamp", [None, 8.0])
-def test_tiny_blocks_take_the_smallest_scale(clamp):
-    """Blocks whose activation amax is at most ``448 * 2**-127`` (normal fp32 and bf16 values)
-    take E8M0's smallest scale, 0x00: the smallest power of two with ``amax / X <= 448``.
-
-    Fails on main (suspected finding O2-M1): the kernel's quantization rounds ``amax / 448`` up
-    by adding 0x7FFFFF to its fp32 bits, which for a subnormal quotient gives 2**-126 (byte
-    0x01), as in O2-N1. The open fix PR #8956 (s4f-mxfp8-quant) predates this kernel and does not
-    change its copy of the quantization.
-    """
-    # (x, p): activations 448 * 2**-127 exactly, 2**-120, 2**-123 and 2**-126.
-    tiny = [(2.0**-60, 3.5), (2.0**-60, 1.0), (2.0**-62, 2.0), (2.0**-63, 1.0)]
-    rows, width = len(tiny), 64
-    x = torch.zeros(rows, width, dtype=torch.float64)
-    probs = torch.zeros(rows, dtype=torch.float32)
-    for r, (v, p) in enumerate(tiny):
-        x[r, 0] = v
-        x[r, 1:32:3] = -v  # ReLU to zero
-        x[r, 2:32:3] = v
-        x[r, 32:] = 1.5  # an ordinary block next to it
-        probs[r] = p
-    x = x.to(torch.bfloat16)
-    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-    t = run_fused(x.to(DEVICE), perm, _common.device_scalar(rows), probs.to(DEVICE), clamp)
-    check(t, x, perm, probs, rows, clamp, f"tiny blocks, clamp {clamp}")
 
 
 def test_strided_input_is_quantized_or_rejected():

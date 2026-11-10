@@ -35,7 +35,10 @@ in registers, ``BLOCK_K = next_pow2(K)`` with ``BLOCK_GROUPS = BLOCK_K / 32`` bl
 with 1-3 padded scale columns, production widths; M around the 128-row tile; the three input
 dtypes; random, wide-range, round-up-tie and E4M3-midpoint, and zero/sign-of-zero inputs; reused
 storage; non-contiguous and unaligned inputs through each entry point (#8357); the ``scaled_mm``
-consumer (Blackwell); row offsets past 2**31 (``large``).
+consumer (Blackwell); row offsets past 2**31 (``large``). Blocks with ``amax / 448`` at most
+2**-127 (finding O2-N1, which fails on main) are #8956's regression test
+``TestMxfp8Quantize::test_tiny_groups_take_the_smallest_scale``
+(``tests/unit_tests/inference/test_mxfp8_utils.py``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -178,31 +181,6 @@ def test_non_contiguous_inputs(layout, entry):
         data, scale = t.data, t.scale
     ou.assert_exact(x, before, what=f"{what}: x is read-only")
     mx.assert_matches_spec(data, scale, before.contiguous(), what=what)
-
-
-TINY_AMAX = (448.0 * 2.0**-127, 2.0**-126, 2.0**-127, 2.0**-130, 2.0**-133)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_tiny_blocks_take_the_smallest_scale(dtype):
-    """Blocks whose ``amax / 448`` is at most 2**-127 take E8M0's smallest scale, 0x00
-    (2**-127): it is the smallest power of two with ``amax / X <= 448``.
-
-    Fails on main (suspected finding O2-N1): the kernel rounds ``amax / 448`` up by adding
-    0x7FFFFF to its fp32 bits, which for an fp32 subnormal quotient yields 2**-126 (byte 0x01).
-    The codes then differ too (half the spec's), although both encodings decode to nearly the
-    same values. A round-up E8M0 conversion such as ``cvt.rp.satfinite.ue8m0x2.f32`` gives 0x00
-    (recalled from the PTX semantics, not run here).
-    """
-    rows = len(TINY_AMAX)
-    x = torch.zeros(rows, 64, dtype=torch.float64)
-    for r, amax in enumerate(TINY_AMAX):
-        x[r, 0] = amax
-        x[r, 1:32] = torch.linspace(-amax, amax, 31, dtype=torch.float64)
-        x[r, 32:] = 1.5  # an ordinary block next to it
-    x = x.to(dtype).to(DEVICE)
-    data, scale = quantize_guarded(x)
-    mx.assert_matches_spec(data, scale, x, what=f"tiny blocks, {dtype}")
 
 
 def test_special_values():

@@ -17,16 +17,16 @@ the launcher's documented API and the OCP MX spec; written before reading the ke
 * **Tolerance class:** bit-exact against the spec (codes and scales apart); untouched rows still
   poisoned; zero scale bytes exact.
 
-Open PR #8564 (d8) clamps the count to M and rejects a non-contiguous ``x``. On main,
-``test_count_past_the_buffer`` writes past the data and scale buffers and
-``test_strided_input_is_quantized_or_rejected`` quantizes the wrong elements: both fail on main
-because of the bug #8564 fixes and pass with it.
+A count past the buffer and a strided ``x`` fail on main (the kernel runs to ``n_rows`` and reads
+row r at ``r * K``). They are regression tests of #8564 (d8), in
+``tests/unit_tests/inference/test_batch_invariant_live_rows.py``:
+``TestMxfp8QuantizeRows::test_count_clamped_to_height`` and ``test_rejects_non_contiguous_input``.
 
 Structure: persistent grid of ``NUM_PROGRAMS = max(1, min(M, 4096))`` programs striding over
 rows; each row is the shared ``_mxfp8_quant_swizzle_row`` (``BLOCK_K = next_pow2(K)``). Covered:
 M and ``n_rows`` around the 128-row scale tile and around the 4096-program grid, both count
-dtypes, input dtypes and value kinds, strided and unaligned inputs, a production buffer, CUDA-graph
-replay with changing counts, row offsets past 2**31 (``large``).
+dtypes, input dtypes and value kinds, unaligned inputs, a production buffer, CUDA-graph replay
+with changing counts, row offsets past 2**31 (``large``).
 
 Runs on H100 and on GB200 (``launch_on_gb200``), where production uses it.
 """
@@ -45,11 +45,11 @@ pytestmark = [pytest.mark.launch_on_gb200, _common.hardware(ou.HOPPER, ou.BLACKW
 PROGRAMS_CAP = 4096  # mxfp8_quantize.py: num_programs = max(1, min(M, max_programs=4096))
 
 
-def run_rows(x, n_rows, *, guard_bytes=None):
+def run_rows(x, n_rows):
     """``mxfp8_quantize_rows`` with guarded outputs (data NaN-poisoned, scales zeroed as the
     launcher asks); checks the guards and that ``x`` is read-only."""
     before = x.clone()
-    with _common.launcher_on_cpu(), _common.captured_allocations(mq, guard_bytes) as allocs:
+    with _common.launcher_on_cpu(), _common.captured_allocations(mq) as allocs:
         data, scale = mq.mxfp8_quantize_rows(x, n_rows)
     assert len(allocs.buffers) == 2
     allocs.check("mxfp8_quantize_rows outputs")
@@ -107,44 +107,6 @@ def test_grid_wraps(rows, n):
     x = mx.mx_inputs(rows, 32, torch.bfloat16, "wide", g).to(DEVICE)
     data, scale = run_rows(x, _common.device_scalar(n))
     check(data, scale, x, n, f"M{rows}-n{n}")
-
-
-@pytest.mark.parametrize("rows,extra", [(128, 1), (129, 1), (129, 3)])
-def test_count_past_the_buffer(rows, extra):
-    """``n_rows > M`` quantizes the M rows and writes nothing past the outputs.
-
-    ``x`` is the leading rows of a larger tensor of ordinary values, so a kernel that runs past M
-    reads finite rows and writes codes and scales that differ from the guard bytes and from the
-    zero tile padding. Fails on main (bug fixed by #8564, d8): the loop runs to ``n_rows``.
-    """
-    g = ou.make_generator()
-    width = 128
-    backing = mx.mx_inputs(rows + 8, width, torch.bfloat16, "randn", g).to(DEVICE)
-    x = backing[:rows]
-    guard = 8 * width + 4096
-    data, scale = run_rows(x, _common.device_scalar(rows + extra), guard_bytes=guard)
-    check(data, scale, x, rows + extra, f"n_rows = M + {extra}")
-
-
-@pytest.mark.parametrize("layout", mx.IN_STORAGE_LAYOUTS)
-def test_strided_input_is_quantized_or_rejected(layout):
-    """A strided [M, K] view is quantized by its values, or rejected; never misread.
-
-    Fails on main (bug fixed by #8564, d8, which asserts contiguity; #8357's copy of a
-    non-contiguous input is in ``mxfp8_quantize_into`` only). The views stay inside their
-    storage, so the misreading kernel reads other finite elements instead of faulting.
-    """
-    rows, width = 128, 160
-    x = mx.input_view(layout, rows, width, torch.bfloat16, ou.make_generator(), DEVICE)
-    before = x.clone()
-    try:
-        with _common.launcher_on_cpu(), _common.captured_allocations(mq) as allocs:
-            data, scale = mq.mxfp8_quantize_rows(x, _common.device_scalar(100))
-    except (AssertionError, ValueError, RuntimeError):
-        return  # rejected before any launch
-    allocs.check(f"outputs for a strided input ({layout})")
-    ou.assert_exact(x, before, what="x is read-only")
-    check(data, scale, before.contiguous(), 100, f"strided input ({layout})")
 
 
 def test_unaligned_contiguous_view():
