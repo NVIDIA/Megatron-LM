@@ -163,8 +163,9 @@ def register_checkpoint_converter_process_groups(parallel_state, pg_collection):
 
     The converter passes ``pg_collection`` to the models it builds and to
     ``load_checkpoint`` and ``save_checkpoint``. Registering it keeps code that still
-    reads the global groups during conversion, such as a model provider that takes no
-    collection, on the same group objects and ranks.
+    reads the global groups during conversion, such as a model provider that accepts
+    ``pg_collection`` but does not pass it to its model, or library code that reads
+    ``parallel_state``, on the same group objects and ranks.
 
     The fake groups are not torch.distributed groups, so the global rank lists of the
     grid cannot be derived from them and stay unset. The global rank and size accessors,

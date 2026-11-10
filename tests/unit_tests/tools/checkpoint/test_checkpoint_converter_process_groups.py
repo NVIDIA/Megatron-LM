@@ -48,7 +48,8 @@ def test_fake_groups_support_default_process_group_collection(fake_groups):
 def test_fake_groups_satisfy_language_module(mocker, fake_groups, explicit_collection):
     """A collection resolved from the registered fake groups passes LanguageModule's checks when
     passed explicitly. A model built without a collection in a converter process, for example
-    by a model provider that takes none, resolves the same groups with a deprecation warning."""
+    by a model provider that accepts ``pg_collection`` but does not pass it to its model,
+    resolves the same groups with a deprecation warning."""
     clear_nvte_env_vars()
     mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
     mocker.patch('torch.distributed.is_initialized', return_value=True)
