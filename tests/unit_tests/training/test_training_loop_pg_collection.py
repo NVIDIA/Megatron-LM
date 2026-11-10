@@ -314,10 +314,18 @@ class TestTrainingLoopPgCollection:
             evaluated.append(eval_iters)
             return {}, None, False
 
+        sent = []
+        broadcast = torch.distributed.broadcast
+
+        def record_and_broadcast(tensor, *args, **kwargs):
+            sent.append(tensor.tolist())
+            return broadcast(tensor, *args, **kwargs)
+
         monkeypatch.setattr(training, "evaluate", evaluate)
         monkeypatch.setattr(training, "get_args", SimpleNamespace)
         monkeypatch.setattr(training, "get_train_state", TrainState)
         monkeypatch.setattr(training, "get_wandb_writer", lambda: None)
+        monkeypatch.setattr(torch.distributed, "broadcast", record_and_broadcast)
         _forbid_global_reads(monkeypatch, training)
 
         training.evaluate_and_print_results(
@@ -331,6 +339,9 @@ class TestTrainingLoopPgCollection:
             write_to_tensorboard=False,
         )
 
+        # World rank 0 broadcasts its lengths, so the result alone does not show which ranks
+        # filled them in: only tensor-parallel rank 0 of the collection does.
+        assert sent == [[3, 4] if pg_collection.tp.rank() == 0 else [0, 0]]
         assert evaluated == [3, 4]
         assert run_config.validation.eval_iters == [3, 4]
 
