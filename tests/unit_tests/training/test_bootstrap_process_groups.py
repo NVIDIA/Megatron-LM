@@ -41,6 +41,7 @@ from megatron.core.process_groups_config import (
 )
 from megatron.training import arguments, global_vars, initialize, training
 from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -494,6 +495,73 @@ class TestLazyMpuInit:
         assert deprecation.filename == __file__
         assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE == 2
         assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK == 3
+
+
+class TestTrainLoop:
+    """train() updates the timeout of the run's groups once, after its first iteration."""
+
+    def test_timeout_update_gets_the_collection_of_the_run(self, monkeypatch, run_config):
+        parser = ArgumentParser()
+        arguments.add_megatron_arguments(parser)
+        args = parser.parse_args([])
+        run_config.train.train_iters, run_config.train.micro_batch_size = 3, 1
+        run_config.dist.distributed_timeout_seconds_after_init = 7
+        pg_collection = ProcessGroupCollection(dp=_Group())
+        train_state = TrainState()
+        updates = []
+        # Stand-ins for what train() calls around an iteration, with the value each returns.
+        services = dict(
+            get_args=args,
+            get_train_state=train_state,
+            get_timers=Mock(),
+            get_rerun_state_machine=Mock(),
+            get_energy_monitor=None,
+            get_one_logger=None,
+            get_num_microbatches=1,
+            get_current_global_batch_size=1,
+            get_current_running_global_batch_size=1,
+            _get_data_parallel_world_size=1,
+            _get_forward_backward_func=None,
+            consume_seqlen_stats_in_iteration=(None, None),
+            num_floating_point_operations=0.0,
+            training_log=False,
+            post_training_step_callbacks=0.0,
+            checkpoint_and_decide_exit=False,
+            write_args_to_tensorboard=None,
+            print_datetime=None,
+            report_memory=None,
+            update_num_microbatches=None,
+            maybe_verify_choices=None,
+            _maybe_reroot_otel_interval=None,
+        )
+        for name, value in services.items():
+            monkeypatch.setattr(training, name, Mock(return_value=value))
+        monkeypatch.setattr(training, "one_logger_utils", Mock())
+        monkeypatch.setattr(
+            training,
+            "update_pg_timeout",
+            lambda timeout, **kwargs: updates.append((train_state.iteration, timeout, kwargs)),
+        )
+
+        # Three iterations of the real loop, without optimizer steps.
+        training.train(
+            None,
+            [Mock()],
+            None,
+            None,
+            None,
+            SimpleNamespace(finalize_model_grads_func=None),
+            {},
+            next_train_iterator=lambda iteration, iterator: iterator,
+            run_eval=Mock(),
+            pg_collection=pg_collection,
+            run_train_loop_without_updates=True,
+        )
+
+        # Once, before the second iteration, with the collection that train() was given.
+        ((iteration, timeout, kwargs),) = updates
+        assert (iteration, timeout) == (1, timedelta(seconds=7))
+        assert list(kwargs) == ["pg_collection"] and kwargs["pg_collection"] is pg_collection
 
 
 # Rank 5 of 8 builds the all-gather groups of a TP2 x EP2 x DP2 grid on the fake backend. It
