@@ -122,7 +122,6 @@ def _on_the_collection_only(phase):
     """
     with pytest.MonkeyPatch.context() as patch, warnings.catch_warnings():
         patch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
-        patch.setattr(optimizer_module, "_warned_world_grad_stats_owners", set())
         patch.setattr(parallel_state, "_warned_accessor_call_sites", set())
         warnings.simplefilter("error", ProcessGroupFallbackWarning)
         warnings.simplefilter("error", ParallelStateDeprecationWarning)
@@ -577,7 +576,6 @@ def test_the_collection_differs_from_the_global_grid(grids):
 
 def test_the_block_rejects_global_reads_and_fallbacks(monkeypatch):
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
-    monkeypatch.setattr(optimizer_module, "_warned_world_grad_stats_owners", set())
     with pytest.raises(AssertionError, match=r"probe failed .*get_tensor_model_parallel_group"):
         with _on_the_collection_only("probe"):
             parallel_state.get_tensor_model_parallel_group()
@@ -588,7 +586,8 @@ def test_the_block_rejects_global_reads_and_fallbacks(monkeypatch):
     with pytest.raises(AssertionError, match=r"probe failed .*ProcessGroupFallbackWarning"):
         with _on_the_collection_only("probe"):
             warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
-    # So does the fallback of an optimizer without a grad-stats group, which has its own registry.
+    # So does the fallback of an optimizer without a grad-stats group, which the same registry
+    # records.
     with pytest.warns(ProcessGroupFallbackWarning):
         optimizer_module._warn_grad_stats_reduced_over_world(owner)
     with pytest.raises(AssertionError, match=r"probe failed .*ProcessGroupFallbackWarning"):
