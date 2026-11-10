@@ -101,33 +101,30 @@ class CorpusStream(torch.utils.data.IterableDataset):
             reader.close()
 
 
-def _attention_mask(
-    samples: list[dict], length: int, modes: list[str], eod_ids: list[int | None]
-) -> torch.Tensor:
-    """Preserve real-token attention independently of the scoring mask."""
-    if all(mode == "causal" for mode in modes):
+def _segments(sample: dict) -> torch.Tensor:
+    """A sample's attention segments; a sample without any is one causal segment."""
+    n = sample["tokens"].numel()
+    segments = sample.get("segments")
+    if segments is None:
+        return torch.tensor([n] if n else [], dtype=torch.long)
+    segments = segments.long()
+    if (segments <= 0).any() or int(segments.sum()) != n:
+        raise ValueError("HF offline KD segments must cover the stored tokens exactly")
+    return segments
+
+
+def _attention_mask(samples: list[dict], length: int) -> torch.Tensor:
+    """Causal attention within each stored segment, independent of the scoring mask."""
+    segments = [_segments(sample) for sample in samples]
+    if all(parts.numel() <= 1 for parts in segments):
         mask = torch.zeros(len(samples), length, dtype=torch.long)
         for row, sample in enumerate(samples):
             mask[row, : sample["tokens"].numel()] = 1
         return mask
     mask = torch.full((len(samples), 1, length, length), torch.finfo(torch.float32).min)
-    for row, (sample, mode, eod_id) in enumerate(zip(samples, modes, eod_ids)):
-        n = sample["tokens"].numel()
-        if mode == "isolated_segments":
-            if "segments" not in sample:
-                raise ValueError("HF offline KD isolated_segments requires segment lengths")
-            segments = sample["segments"].long()
-            if (segments <= 0).any() or int(segments.sum()) != n:
-                raise ValueError("HF offline KD segments must cover the stored tokens exactly")
-            segment_ids = torch.repeat_interleave(torch.arange(segments.numel()), segments)
-        elif mode == "causal_eod_reset":
-            if type(eod_id) is not int:
-                raise ValueError("HF offline KD causal_eod_reset requires an eod_id")
-            # EOD belongs to the preceding context; the following token starts a new one.
-            segment_ids = torch.zeros(n, dtype=torch.long)
-            segment_ids[1:] = (sample["tokens"][:-1] == eod_id).long().cumsum(0)
-        else:
-            segment_ids = torch.zeros(n, dtype=torch.long)
+    for row, parts in enumerate(segments):
+        n = int(parts.sum())
+        segment_ids = torch.repeat_interleave(torch.arange(parts.numel()), parts)
         positions = torch.arange(n)
         allowed = (positions[:, None] >= positions[None, :]) & (
             segment_ids[:, None] == segment_ids[None, :]
@@ -136,55 +133,25 @@ def _attention_mask(
     return mask
 
 
-def collate(
-    samples: list[dict],
-    *,
-    pad_token_id: int = 0,
-    attention_mode: str | None = None,
-    eod_id: int | None = None,
-) -> dict[str, torch.Tensor]:
+def collate(samples: list[dict], *, pad_token_id: int = 0) -> dict[str, torch.Tensor]:
     """Right-pad samples and preserve their contexts; pad top-K widths with sentinels.
 
-    Readers attach attention metadata to each sample. Hand-built samples can supply
-    it through the keyword arguments. Non-causal modes return a 4D additive mask for
-    eager/SDPA attention; plain causal samples use the usual 2D padding mask.
+    Attention follows each sample's ``segments`` (packed sequences or EOD-reset
+    documents). Samples with several segments get a 4D additive block-causal mask for
+    eager/SDPA attention; otherwise the usual 2D padding mask is returned.
     """
     if not samples:
         raise ValueError("Cannot collate an empty offline KD microbatch")
     length = max(sample["tokens"].numel() for sample in samples)
     if length == 0:
         raise ValueError("Cannot collate an offline KD microbatch with no input tokens")
-    modes, eod_ids = [], []
-    for sample in samples:
-        mode = sample.get("attention_mode", attention_mode or "causal")
-        if mode not in ("causal", "causal_eod_reset", "isolated_segments"):
-            raise ValueError(f"Unsupported HF offline KD attention mode {mode!r}")
-        if attention_mode is not None and mode != attention_mode:
-            raise ValueError("HF collator attention_mode differs from the stored sample")
-        if (
-            "attention_mode" not in sample
-            and attention_mode is None
-            and "segments" in sample
-            and sample["segments"].numel() > 1
-        ):
-            raise ValueError("HF collator needs an explicit attention_mode for multiple segments")
-        stored_eod = sample.get("eod_id")
-        if (
-            mode == "causal_eod_reset"
-            and eod_id is not None
-            and stored_eod is not None
-            and stored_eod != eod_id
-        ):
-            raise ValueError("HF collator eod_id differs from the stored sample")
-        modes.append(mode)
-        eod_ids.append(stored_eod if stored_eod is not None else eod_id)
     with_targets = "teacher_values" in samples[0]
     if any(("teacher_values" in sample) != with_targets for sample in samples):
         raise ValueError("Cannot mix offline KD samples with and without targets")
     k = max(sample["teacher_values"].shape[-1] for sample in samples) if with_targets else 0
     batch = {
         "input_ids": torch.full((len(samples), length), pad_token_id, dtype=torch.long),
-        "attention_mask": _attention_mask(samples, length, modes, eod_ids),
+        "attention_mask": _attention_mask(samples, length),
         "position_ids": torch.zeros(len(samples), length, dtype=torch.long),
         "labels": torch.full((len(samples), length), -100, dtype=torch.long),
         "loss_weights": torch.zeros(len(samples), length),

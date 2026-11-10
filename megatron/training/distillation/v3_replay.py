@@ -310,8 +310,6 @@ class _BlockReader:
         a, b = inputs["sample_offsets"][row : row + 2].tolist()
         sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
         sample["sample_id"] = sample_id
-        sample["attention_mode"] = self.contract["attention_mode"]
-        sample["eod_id"] = self.contract["tokenizer"].get("eod_id")
         s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
         sample["segments"] = inputs["segment_lengths"][s0:s1]
         if targets is not None:
@@ -659,6 +657,22 @@ def _layout_sample(
     return torch.cat(pieces), torch.cat(positions), boundaries
 
 
+def _segment_ids(
+    sample: dict, source: torch.Tensor, boundaries: torch.Tensor | None
+) -> torch.Tensor:
+    """Attention segment of each student position; padding forms its own segment."""
+    if boundaries is not None:
+        return torch.repeat_interleave(
+            torch.arange(boundaries.numel() - 1), (boundaries[1:] - boundaries[:-1]).long()
+        )
+    count = sample["segments"].numel()
+    stored = torch.repeat_interleave(torch.arange(count), sample["segments"].long())
+    ids = torch.full(source.shape, count, dtype=torch.int64)
+    real = source >= 0
+    ids[real] = stored[source[real]]
+    return ids
+
+
 def collate_samples(
     samples: list[dict],
     seq_length: int,
@@ -679,7 +693,7 @@ def collate_samples(
     if not samples:
         raise ValueError("Cannot collate an empty offline KD microbatch")
     fields = {field: [] for field in TOKEN_FIELDS}
-    boundary_rows, values, indices, tails = [], [], [], []
+    boundary_rows, segment_rows, values, indices, tails = [], [], [], [], []
     with_targets = "teacher_values" in samples[0]
     if any(("teacher_values" in sample) != with_targets for sample in samples):
         raise ValueError("Cannot mix offline KD samples with and without targets")
@@ -721,7 +735,9 @@ def collate_samples(
             indices.append(row_indices)
             tails.append(row_tail)
         boundary_rows.append(boundaries)
+        segment_rows.append(_segment_ids(sample, source, boundaries))
     result = {field: torch.stack(rows) for field, rows in fields.items()}
+    result["_kd_segment_ids"] = torch.stack(segment_rows)
     result["cu_seqlens_padded"] = None
     if packed:
         width = max(row.numel() for row in boundary_rows)

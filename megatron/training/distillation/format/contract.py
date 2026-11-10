@@ -84,11 +84,6 @@ def validate_metadata(
         index_encoding_for_vocab(contract["logprob_vocab_size"])
     if contract["attention_mode"] not in ATTENTION_MODES:
         raise ValueError(f"Unsupported offline KD attention_mode {contract['attention_mode']!r}")
-    if (
-        contract["attention_mode"] == "causal_eod_reset"
-        and type(tokenizer.get("eod_id")) is not int
-    ):
-        raise ValueError("Offline KD causal_eod_reset requires an integer tokenizer eod_id")
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
     if replay:
@@ -121,18 +116,8 @@ def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> tuple
 
 
 def blend_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    """Return the shared semantics of corpus sources, excluding per-file decoding.
-
-    EOD identity matters only when it defines attention boundaries. It is deliberately
-    outside the tokenizer fingerprint, and other producers may leave it unspecified.
-    """
-    shared = {key: contract[key] for key in BLEND_KEYS}
-    shared["tokenizer"] = {
-        key: value
-        for key, value in contract["tokenizer"].items()
-        if key != "eod_id" or contract["attention_mode"] == "causal_eod_reset"
-    }
-    return shared
+    """Return the shared semantics of corpus sources, excluding per-file decoding."""
+    return {key: contract[key] for key in BLEND_KEYS}
 
 
 def mismatched_corpus_order(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
@@ -171,15 +156,12 @@ def tokenizer_fingerprint(
     )
 
 
-def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[str, Any]:
+def hf_tokenizer_identity(tokenizer: Any) -> dict[str, Any]:
     """Describe a Hugging Face tokenizer for the ``tokenizer`` setting."""
     special_ids = {
         role: getattr(tokenizer, f"{role}_token_id", None) for role in ("bos", "eos", "pad", "unk")
     }
-    return {
-        "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, len(tokenizer)),
-        "eod_id": eod_id,
-    }
+    return {"sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, len(tokenizer))}
 
 
 def tail_logprob(values: torch.Tensor) -> torch.Tensor:

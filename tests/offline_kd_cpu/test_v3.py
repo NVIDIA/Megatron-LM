@@ -59,7 +59,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "writer_mbs": mbs,
         "attention_mode": "causal",
         "prefix_stable": True,
-        "tokenizer": {"sha256": "test", "eod_id": 2},
+        "tokenizer": {"sha256": "test"},
         "logprob_vocab_size": 1 << 17,
     }
     noted = {
@@ -511,7 +511,7 @@ def test_target_encoder_rejects_invalid_ids(index, value):
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
         {"logprob_vocab_size": 0},
-        {"tokenizer": {"eod_id": 2}},
+        {"tokenizer": {}},
         {"writers": 0},
         {"first_sample": -1},
     ],
@@ -592,9 +592,7 @@ def test_tokenizer_fingerprint_is_canonical():
         def __len__(self):
             return 3
 
-    identity = codec.hf_tokenizer_identity(HF(), eod_id=2)
-    assert identity == {"sha256": first, "eod_id": 2}
-    assert codec.hf_tokenizer_identity(HF(), eod_id=0)["sha256"] == first  # EOD is not hashed.
+    assert codec.hf_tokenizer_identity(HF()) == {"sha256": first}
 
 
 def packed_capture(weights, *, bounds=(0, 4, 8)):
@@ -1591,7 +1589,7 @@ class StudentTokenizer:
 
 def hf_sources(root):
     """Two corpus sources fingerprinted with :class:`StudentTokenizer`."""
-    two_sources(root, tokenizer=codec.hf_tokenizer_identity(StudentTokenizer(), eod_id=2))
+    two_sources(root, tokenizer=codec.hf_tokenizer_identity(StudentTokenizer()))
     return blend.plan(blend_config(root), budget=40)
 
 
@@ -2147,6 +2145,67 @@ def test_targets_beyond_the_student_vocabulary_are_masked(tmp_path, capsys):
     assert "beyond the student vocabulary" in capsys.readouterr().out
 
 
+def eod_sample():
+    """One stored EOD-reset sample of three documents: [5], [6, 7], [8]."""
+    return {
+        "tokens": torch.tensor([5, 6, 7, 8]),
+        "labels": torch.tensor([2, 7, 2, 9]),
+        "position_ids": torch.tensor([0, 2, 3, 5]),
+        "loss_mask": torch.ones(4, dtype=torch.bool),
+        "segments": torch.tensor([1, 2, 1]),
+        "sample_id": 0,
+    }
+
+
+def test_eod_reset_documents_are_stored_as_segments():
+    """Documents end right after each EOD; each loses its trailing zero-weight run."""
+    tokens = torch.tensor([5, 2, 6, 7, 2, 8])
+    captured = {
+        "sample_offsets": torch.tensor([0, 6]),
+        "tokens": tokens,
+        "labels": torch.tensor([2, 6, 7, 2, 8, 9]),
+        "position_ids": torch.arange(6),
+        "loss_mask": torch.ones(6, dtype=torch.bool),
+        "cu_seqlens": None,
+    }
+    values = torch.zeros(6, 1)
+    targets = (values, tokens.reshape(-1, 1), codec.tail_logprob(values))
+    record, rows, _, _ = codec.finalize_record(captured, *targets, isolated=False, eod_id=2)
+    assert record["segment_lengths"].tolist() == [2, 3, 1] and rows.shape[0] == 6
+    # With EOD tokens unscored (``--eod-mask-loss``), each document drops its EOD.
+    captured["loss_mask"] = torch.tensor([True, False, True, True, False, True])
+    record, rows, _, _ = codec.finalize_record(captured, *targets, isolated=False, eod_id=2)
+    assert record["tokens"].tolist() == [5, 6, 7, 8]
+    assert record["position_ids"].tolist() == [0, 2, 3, 5]  # Teacher positions are kept.
+    assert record["segment_lengths"].tolist() == [1, 2, 1] and rows.shape[0] == 4
+    # Without EOD resets, the whole sample is one segment.
+    record, _, _, _ = codec.finalize_record(captured, *targets, isolated=False)
+    assert record["segment_lengths"].tolist() == [6]
+
+
+def test_student_dense_mask_follows_stored_segments(runtime_environment):
+    args, runtime, _ = runtime_environment
+    args.create_attention_mask_in_dataloader = True
+    batch = replay.collate_samples([eod_sample()], 6)
+    assert batch["_kd_segment_ids"].tolist() == [[0, 1, 1, 2, 3, 3]]  # Padding: its own.
+    result, _ = runtime.prepare_replay_batch(batch)
+    assert "_kd_segment_ids" not in result
+    allowed = ~result["attention_mask"]
+    assert allowed.shape == (1, 1, 6, 6)
+    assert allowed[0, 0, 2].tolist() == [False, True, True, False, False, False]
+    assert allowed[0, 0, 3].tolist() == [False, False, False, True, False, False]
+    # A shorter student keeps a prefix of the documents.
+    assert replay.collate_samples([eod_sample()], 2)["_kd_segment_ids"].tolist() == [[0, 1]]
+
+
+def test_hf_collate_masks_stored_segments():
+    batch = hf.collate([eod_sample()])
+    assert batch["attention_mask"].shape == (1, 1, 4, 4)
+    allowed = batch["attention_mask"][0, 0] == 0
+    assert allowed[2].tolist() == [False, True, True, False]
+    assert allowed[3].tolist() == [False, False, False, True]
+
+
 def test_megatron_hf_tokenizer_fingerprint_matches_other_producers(
     runtime_environment, monkeypatch
 ):
@@ -2163,7 +2222,7 @@ def test_megatron_hf_tokenizer_fingerprint_matches_other_producers(
 
     wrapper = types.SimpleNamespace(eod=2, _tokenizer=types.SimpleNamespace(tokenizer=HF()))
     monkeypatch.setattr(sys.modules["megatron.training"], "get_tokenizer", lambda: wrapper)
-    assert runtime.tokenizer_identity() == codec.hf_tokenizer_identity(HF(), eod_id=2)
+    assert runtime.tokenizer_identity() == codec.hf_tokenizer_identity(HF())
 
 
 @pytest.mark.parametrize(

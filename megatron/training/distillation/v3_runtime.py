@@ -166,7 +166,6 @@ def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
     from megatron.training import get_tokenizer
 
     tokenizer = get_tokenizer()
-    eod = _tokenizer_attr(tokenizer, "eod")
     inner = getattr(tokenizer, "_tokenizer", None)
     for candidate in (getattr(inner, "tokenizer", None), inner):
         if (
@@ -174,7 +173,7 @@ def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
             and hasattr(candidate, "get_vocab")
             and hasattr(candidate, "__len__")
         ):
-            return hf_tokenizer_identity(candidate, eod_id=eod), len(candidate)
+            return hf_tokenizer_identity(candidate), len(candidate)
     try:
         vocab = tokenizer.vocab
     except NotImplementedError:
@@ -184,8 +183,7 @@ def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
     if not isinstance(vocab, dict):
         raise ValueError("Offline KD v3 requires a tokenizer exposing its vocabulary mapping")
     special_ids = {role: _tokenizer_attr(tokenizer, role) for role in ("bos", "eos", "pad", "unk")}
-    identity = {"sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab)), "eod_id": eod}
-    return identity, len(vocab)
+    return {"sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab))}, len(vocab)
 
 
 def student_padding_divisor(args: Any) -> int:
@@ -455,10 +453,6 @@ def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = Tr
     student_tokenizer, student_tokenizer_size = _tokenizer_identity_and_size()
     if contract["tokenizer"]["sha256"] != student_tokenizer["sha256"]:
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
-    if contract["attention_mode"] == "causal_eod_reset" and contract["tokenizer"][
-        "eod_id"
-    ] != student_tokenizer.get("eod_id"):
-        raise ValueError("Offline KD v3 EOD attention-boundary token mismatch")
     # Matching fingerprints imply the same tokenizer, hence the same true size.
     if args.padded_vocab_size < student_tokenizer_size:
         raise ValueError(
@@ -891,22 +885,16 @@ def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
             "tail": batch["_kd_tail"],
             "sample_ids": batch["_kd_sample_ids"],
         }
+    segment_ids = result.pop("_kd_segment_ids", None)
     for key in ("_kd_values", "_kd_indices", "_kd_tail", "_kd_sample_ids"):
         result.pop(key, None)
     if args.create_attention_mask_in_dataloader:
-        from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
-
-        # A causal corpus need not assign an EOD boundary token. It is unused when
-        # attention resets are disabled; stored positions and loss weights are retained.
-        eod = _PLAN["metadata"]["contract"]["tokenizer"].get("eod_id", -1)
-        result["attention_mask"] = torch.stack(
-            [
-                _get_ltor_masks_and_position_ids(
-                    tokens, eod, False, args.reset_attention_mask, False, True
-                )[0]
-                for tokens in result["tokens"]
-            ]
-        )
+        # Causal attention within the stored segments (EOD-reset documents, or one
+        # segment per causal sample); True marks a masked pair, as in Megatron.
+        length = segment_ids.shape[-1]
+        causal = torch.ones(length, length, dtype=torch.bool).tril()
+        allowed = causal & (segment_ids[:, :, None] == segment_ids[:, None, :])
+        result["attention_mask"] = (~allowed).unsqueeze(1)
     return result, sidecar
 
 

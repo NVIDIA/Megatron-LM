@@ -173,8 +173,7 @@ in its copy of the blend configuration.
 The sources must share tokenizer identity, attention mode and prefix stability. Their
 normalization vocabulary sizes, index encodings and top-K widths may differ: decoding
 uses each file's vocabulary size, and collation pads K to the batch maximum with masked
-entries. EOD IDs must agree only for EOD-reset attention. Teacher identity is recorded
-per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
+entries. Teacher identity is recorded per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
 file table or sample schedule. Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
 LM loss only; to hold data out of a blend, dump it as its own source and leave it out.
@@ -191,13 +190,13 @@ same position.
 `CorpusStream` already assigns samples to DP ranks; do not wrap it in another distributed
 dataset sharder (including automatic Trainer/Accelerate sharding). Use a DataLoader with
 `num_workers=0` or `1`; more workers are rejected rather than duplicating the stream.
-The reader attaches attention mode and EOD identity to each sample. For isolated segments
-and EOD-reset attention, the collator constructs a 4D additive block-causal mask, independent
+Attention follows each sample's stored `segments`. For samples with several segments
+(packed sequences or EOD-reset documents), the collator constructs a 4D additive
+block-causal mask, independent
 of loss weights. Use a standard-attention HF model/backend that honors custom masks
 (`eager` or `sdpa`); FlashAttention and recurrent/linear attention require a dedicated
 boundary adapter. The reference mask uses quadratic memory. Plain causal samples retain
-the usual 2D padding mask. Hand-built samples must supply equivalent attention metadata
-or pass `attention_mode` and, when needed, `eod_id` to `collate`.
+the usual 2D padding mask. A hand-built sample without `segments` is one causal segment.
 
 The HF loss uses the actual student logit width to move unsupported teacher target IDs
 into the residual bucket, even if `student_vocab_size` was not supplied to the reader.
@@ -389,10 +388,7 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
 {
   "format_version": 3,
   "contract": {
-    "tokenizer": {
-      "sha256": "<canonical tokenizer SHA-256>",
-      "eod_id": 128001
-    },
+    "tokenizer": {"sha256": "<canonical tokenizer SHA-256>"},
     "logprob_vocab_size": 128512,
     "attention_mode": "causal",
     "prefix_stable": true,
@@ -440,9 +436,8 @@ and pins each file's normalization size:
 
 | Key | Meaning and reason for storing it |
 | --- | --- |
-| `tokenizer` | Object describing the token-ID space through the two fields below. Stored token IDs and targets must have the same meaning for the student. |
+| `tokenizer` | Object describing the token-ID space through the field below. Stored token IDs and targets must have the same meaning for the student. |
 | `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
-| `tokenizer.eod_id` | Document-boundary ID for `causal_eod_reset`; required to reconstruct that attention mode and must match the student's EOD ID. Unused for the other modes and excluded from cross-source comparisons for them. |
 | `logprob_vocab_size` | Size of the teacher's normalization domain, including any padding entries. Bounds valid target IDs and determines/checks `u16` versus `u16+u8` index encoding. Sources in a blend may differ. It is not used to recompute or adjust the stored probabilities. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
 | `prefix_stable` | Whether a retained prefix preserves the teacher's distributions. False for length-dependent position scaling such as dynamic NTK RoPE or LongRoPE's short/long switch. Megatron currently writes true. Shortening a longer sample requires true. |
@@ -549,13 +544,12 @@ present:
 | `labels` | int32, next-token label at each position | Preserves CE supervision, including a final label that may not occur in the stored input sequence. Already shifted relative to inputs. |
 | `position_ids` | int32 | Preserves teacher positioning and resets when reconstructing the student batch. |
 | `loss_mask` | bool, or float32 for fractional weights; one type per file | Defines scored positions, target-row alignment and loss weighting. Zero-weight prompts remain valid context. It is authoritative even when labels alone do not reveal the scoring mask. |
-| `segments` | int32 positive lengths summing to the sample's token count; one segment for a non-packed sample | Preserves isolated attention boundaries and allows each segment to be re-padded for the student. |
+| `segments` | int32 positive lengths summing to the sample's token count | Attention boundaries: causal attention never crosses a segment. Packed sequences store one segment per packed sequence (re-padded for the student); EOD-reset samples one per document, ending right after each EOD token; other samples a single segment. |
 
 Arrow's outer list offsets preserve sample boundaries; no separate stored
 `sample_offsets` tensor is needed. There is no `cu_seqlens` column: cumulative segment
 lengths reconstruct it after applying the student's padding. Dense attention masks are
-not stored; the reader reconstructs the declared `attention_mode` from segment lengths
-or EOD tokens. The loss mask describes scoring independently of those boundaries.
+not stored; readers build them from the segments, so no EOD token ID is needed. The loss mask describes scoring independently of those boundaries.
 
 A target row with no valid entry (all sentinel)
 contributes zero KD loss; its stored loss weight still controls CE supervision.
@@ -612,9 +606,13 @@ their 17-bit encoding.
 
 | `attention_mode` | Context construction |
 | --- | --- |
-| `causal` | Causal attention over each sample |
-| `causal_eod_reset` | Causal attention reset after `eod_id` tokens |
-| `isolated_segments` | Causal attention within each stored segment |
+| `causal` | Causal attention over each sample (one segment) |
+| `causal_eod_reset` | Causal attention within each document (one segment per document) |
+| `isolated_segments` | Causal attention within each packed sequence (one segment per sequence) |
+
+All three are causal attention within the stored segments. The mode tells the student
+which runtime path to reproduce: a sample-wide or EOD-reset dense mask, or packed
+sequences that are re-padded per segment.
 
 Megatron derives the mode from its dataset path: `reset_attention_mask` without a
 dataloader attention mask still yields `causal`. Students must reproduce the mode.
@@ -636,8 +634,7 @@ For Hugging Face tokenizers, `vocab` is `get_vocab()` (including added tokens) s
 ID, `special_ids` are the `*_token_id` attributes (null when absent), and `size` is
 `len(tokenizer)` (`v3_format.hf_tokenizer_identity`). Megatron fingerprints its wrapped
 Hugging Face tokenizer the same way. Normalizers, pre-tokenizers and chat templates are
-excluded because inputs are stored as IDs. Megatron's EOD is recorded as `eod_id` for
-`causal_eod_reset` and is not hashed.
+excluded because inputs are stored as IDs.
 The canonical `special_ids` object participates in the fingerprint but is not separately
 stored in the tokenizer metadata.
 
@@ -740,7 +737,7 @@ field.
 | `budget` | Requested student sample count before rounding up to whole lanes. Descriptive once the schedule has been built. |
 | `lanes` | Number of streams, `L`. Global sample position `p` maps to lane `p % L` and offset `p // L`, independently of student DP. |
 | `lane_samples` | Equal number of samples assigned to each lane. Total planned capacity is `lanes * lane_samples`, at least the requested budget. |
-| `contract` | Shared tokenizer, attention mode and prefix stability. Per-file normalization size and writer layout are excluded. EOD ID is retained only for EOD-reset attention. |
+| `contract` | Shared tokenizer, attention mode and prefix stability. Per-file normalization size and writer layout are excluded. |
 | `files` | Array resolving scheduled file IDs to source folders, writer/range names and planned file properties. |
 | `sources` | Per-source reporting and provenance summaries. Not needed to execute an already built schedule. |
 | `segments` | Integer array of schedule pieces `(lane, file_id, block, first_row, end_row)`. These pieces select sample rows; they are unrelated to the attention `segments` column stored inside Arrow. |

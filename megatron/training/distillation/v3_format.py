@@ -139,13 +139,16 @@ def finalize_record(
     tail: torch.Tensor,
     *,
     isolated: bool,
+    eod_id: int | None = None,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert joined teacher captures to the stored, padding-free record.
 
-    Within each segment (each saved ``cu_seqlens`` segment when ``isolated``, else
-    each whole sample), drop the trailing run of zero-weight positions. Under causal
-    attention no kept position attends to them and they are never scored, so this is
-    lossless; it removes dataset padding and trailing masked turns alike. Targets are
+    Segments are the attention boundaries: each saved ``cu_seqlens`` segment when
+    ``isolated``; with ``eod_id`` (EOD-reset attention), the documents ending right
+    after each EOD token; else the whole sample. Within each segment, drop the trailing
+    run of zero-weight positions. No kept position attends to them and they are never
+    scored, so this is lossless; it removes dataset padding and trailing masked turns
+    alike. Targets are
     kept only for the remaining positions with nonzero loss weight: context-only
     positions such as prompts need tokens but no target rows.
     """
@@ -155,7 +158,13 @@ def finalize_record(
     segment_lengths, segment_counts = [], []
     for sample in range(len(offsets) - 1):
         start, end = offsets[sample], offsets[sample + 1]
-        bounds = inputs["cu_seqlens"][sample].tolist() if isolated else [0, end - start]
+        if isolated:
+            bounds = inputs["cu_seqlens"][sample].tolist()
+        elif eod_id is not None:
+            ends = (torch.nonzero(inputs["tokens"][start:end] == eod_id).reshape(-1) + 1).tolist()
+            bounds = [0, *(e for e in ends if e < end - start), end - start]
+        else:
+            bounds = [0, end - start]
         count = 0
         for a, b in zip(bounds[:-1], bounds[1:]):
             scored = torch.nonzero(weights[start + a : start + b]).reshape(-1)

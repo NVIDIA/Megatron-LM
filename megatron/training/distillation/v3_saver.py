@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args, get_tensorboard_writer
+from megatron.training import get_args, get_tensorboard_writer, get_tokenizer
 
 from .format.arrow import samples_batch, write_file
 from .logits_saver import LogitsSaverHooks
@@ -152,6 +152,11 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 torch.cat(all_indices),
                 torch.cat(all_tails),
                 isolated=contract["attention_mode"] == "isolated_segments",
+                eod_id=(
+                    get_tokenizer().eod
+                    if contract["attention_mode"] == "causal_eod_reset"
+                    else None
+                ),
             )
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
