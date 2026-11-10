@@ -30,7 +30,12 @@ from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig, _get_megatron_optimizer_based_on_param_groups
 from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
-from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.optimizer import (
+    ChainedOptimizer,
+    MegatronOptimizer,
+    set_duplicate_filter_groups,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
@@ -574,6 +579,43 @@ class TestGradNormWithCollectionGroups:
         # The grad-stats group is one TP pair, which counts its bias on TP rank 0 only.
         assert counted_elements == COLUMNS_PER_WEIGHT
         assert grad_norm == pytest.approx(bias_grad.double().norm().item(), rel=1e-5)
+
+    @pytest.mark.parametrize("tp_field", ["off", "unset"])
+    def test_layer_wise_zero_count_follows_the_collection(self, tp_field, monkeypatch):
+        """LayerWise counts zeros with the fallback choice that its collection gave it."""
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+        # One zero gradient, replicated across each TP pair of the global grid.
+        _, bias_grad = _logical_layer_grads(0)
+        parameters = [_parameter_with_grad(torch.zeros_like(bias_grad))]
+        groups = {"gtp_remat": None, "expt_gtp_remat": None}
+        if tp_field == "off":
+            groups["tp"] = None
+        grad_stats_group = parallel_state.get_model_parallel_group()
+        # count_zeros reads only the attributes set here, so the optimizer needs no model.
+        optimizer = object.__new__(LayerWiseDistributedOptimizer)
+        optimizer.config = OptimizerConfig()
+        optimizer.grad_stats_parallel_group = grad_stats_group
+        optimizer.chained_optimizers = [
+            _ParametersOnlyOptimizer(parameters, grad_stats_group, None)
+        ]
+        expectation = (
+            pytest.warns(ProcessGroupFallbackWarning)
+            if tp_field == "unset"
+            else contextlib.nullcontext()
+        )
+        with expectation:
+            set_duplicate_filter_groups(optimizer, ProcessGroupCollection(**groups))
+            counted_elements = optimizer.count_zeros()
+
+        # With tensor parallelism off in the collection both ranks of the global TP pair count
+        # their gradient; an unset tp falls back to the global TP rank, which counts it once.
+        copies = 2 if tp_field == "off" else 1
+        assert counted_elements == copies * COLUMNS_PER_WEIGHT
 
     def test_collection_without_tp_is_rejected_without_a_global_grid(self):
         """Without a global grid to fall back to, an unset ``tp`` is an error."""
