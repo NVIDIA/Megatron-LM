@@ -225,10 +225,10 @@ def _enable_checkpoint_expert_bias(args):
     Global-batch quantile balancing registers and applies expert_bias without this flag, and
     config validation rejects enabling both, so such checkpoints are left unchanged.
     """
-    balancing = args.moe_router_load_balancing_type
+    balancing = getattr(args, "moe_router_load_balancing_type", None)
     if (
         balancing in ("quantile_balancing", ["quantile_balancing"])
-        and getattr(args, 'moe_router_quantile_balancing_estimation_scope', None) == "global_batch"
+        and getattr(args, "moe_router_quantile_balancing_estimation_scope", None) == "global_batch"
     ):
         return
     if any(key.endswith('router.expert_bias') for key in _checkpoint_tensor_keys(args)):

@@ -12,7 +12,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
-    apply_legacy_residual_keys,
+    apply_combined_residual_keys,
     load_residual_state,
 )
 
@@ -122,9 +122,9 @@ class WideResidualTransformerLayer(TransformerLayer):
                 )
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
-        """Build the sharded state dict, using legacy residual keys when loading them."""
+        """Build the sharded state dict, using combined residual keys when loading them."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        apply_legacy_residual_keys(sharded_state_dict, prefix, metadata)
+        apply_combined_residual_keys(sharded_state_dict, prefix, metadata)
         return sharded_state_dict
