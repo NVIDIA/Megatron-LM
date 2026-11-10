@@ -1,13 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Oracle for the Shortcut MoE inference overlap (#8257): `ShortcutMoEBlock._forward_inference_overlap`
+"""Oracle for the Shortcut MoE inference overlap (#8257):
+`ShortcutMoEBlock._forward_inference_overlap`
 (megatron/core/models/hybrid/shortcut_block.py:459, taken at :592), which runs the routed half of a
 shortcut MoE layer (router -> NVLS all-gather-v dispatch -> routed experts -> NVLS reduce-scatter-v
 combine) on the process-wide MoE side stream while the paired Mamba or attention layer runs on the
 main stream, inside the engine's CUDA graphs.
 
 Contract (from the docstrings of `_forward_inference_overlap` and `forward`, the config option
-`InferenceConfig.inference_shortcut_moe_overlap` and its validation, `InferenceConfig.validate_shortcut_moe_model`,
+`InferenceConfig.inference_shortcut_moe_overlap` and its validation,
+`InferenceConfig.validate_shortcut_moe_model`,
 config.py:853-888, written before reading the method body): the option changes only *where* the
 routed work runs, never *what* it computes. The pair's output is defined by the eager, single-stream
 schedule (`forward` with the option off): the router reads the pair input (the shortcut), the
@@ -46,7 +48,9 @@ predecessor types run and two pairs share the dispatcher's symmetric buffers, th
 buffers and the side stream within a step and across steps (the buffer-reuse hazard).
 Nemotron-3-Nano-like routing (sigmoid, expert bias, top-6 of 16, shared expert, post norm), BF16,
 TP 1, EP = the whole node (8 on H100, 4 on GB200), the default async scheduler. The `wide` cases use
-three wide residual streams, which add the shortcut residual read on the side stream.
+three wide residual streams, which add the shortcut residual read on the side stream. The
+`graphs-nano3` case has Nemotron 3 Nano's production widths (hidden 2688, 128 experts of 1856,
+a 3712-wide shared expert).
 
 Not covered here (see packet o5): an fp64 per-token reference of the MoE half of the pair (the
 kernels it runs have their own oracles: the NVLS collectives in this package, the fused MoE in
@@ -162,22 +166,40 @@ def expert_parallel():
         Utils.destroy_model_parallel()
 
 
-def _build_model(wide):
+TEST_DIMS = dict(
+    hidden_size=128,
+    ffn_hidden_size=128,
+    num_attention_heads=4,
+    num_query_groups=2,
+    num_moe_experts=NUM_EXPERTS,
+    moe_ffn_hidden_size=128,
+    moe_shared_expert_intermediate_size=256,
+)
+NANO3_DIMS = dict(
+    hidden_size=2688,
+    ffn_hidden_size=1856,
+    num_attention_heads=32,
+    num_query_groups=2,
+    kv_channels=128,
+    num_moe_experts=128,
+    moe_ffn_hidden_size=1856,
+    moe_shared_expert_intermediate_size=3712,
+)
+"""Nemotron 3 Nano 30B-A3B's layer widths and experts
+(examples/post_training/modelopt/conf/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.sh); its Mamba
+dimensions and routing are the test model's."""
+
+
+def _build_model(wide, dims=None):
     model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
     torch.manual_seed(123)
     config = TransformerConfig(
         num_layers=len(PATTERN),
-        hidden_size=128,
-        ffn_hidden_size=128,
-        num_attention_heads=4,
-        num_query_groups=2,
-        num_moe_experts=NUM_EXPERTS,
-        moe_ffn_hidden_size=128,
+        **(TEST_DIMS if dims is None else dims),
         moe_router_topk=6,
         moe_router_score_function="sigmoid",
         moe_router_enable_expert_bias=True,
         moe_router_topk_scaling_factor=2.5,
-        moe_shared_expert_intermediate_size=256,
         moe_router_dtype="fp32",
         moe_shared_expert_overlap=False,
         moe_grouped_gemm=True,
@@ -485,11 +507,11 @@ def _assert_coverage(records, *, graphs):
         assert any(s["graph"] and s["prefill"] == 0 for s in real), "no decode step from a graph"
 
 
-def _overlap_case(monkeypatch, rank, *, wide, graphs, delayed):
+def _overlap_case(monkeypatch, rank, *, wide, graphs, delayed, dims=None):
     spy = _Spy(monkeypatch)
     if delayed:
         _inject_delays(monkeypatch)
-    model = _build_model(wide)
+    model = _build_model(wide, dims)
     runs = {}
     # The first run also absorbs one-time effects (Triton autotuning, JIT, allocator warmup), so
     # the two runs compared are both on warm caches.
@@ -520,18 +542,19 @@ def _overlap_case(monkeypatch, rank, *, wide, graphs, delayed):
 
 @gpu_test
 @pytest.mark.parametrize(
-    "graphs,wide",
+    "graphs,wide,dims",
     [
-        pytest.param(False, False, id="eager"),
-        pytest.param(True, False, id="graphs"),
-        pytest.param(True, True, id="graphs-wide"),
+        pytest.param(False, False, None, id="eager"),
+        pytest.param(True, False, None, id="graphs"),
+        pytest.param(True, True, None, id="graphs-wide"),
+        pytest.param(True, False, NANO3_DIMS, id="graphs-nano3"),
     ],
 )
-def test_overlap_is_bitwise_invariant(expert_parallel, monkeypatch, graphs, wide):
+def test_overlap_is_bitwise_invariant(expert_parallel, monkeypatch, graphs, wide, dims):
     """Option on vs off over decode, prefill, mixed and chunked-prefill steps with uneven per-rank
     loads and dummy ranks, eager and from CUDA graphs: bitwise equal logits and tokens, with an
-    option-off control run."""
-    _overlap_case(monkeypatch, expert_parallel, wide=wide, graphs=graphs, delayed=False)
+    option-off control run. `graphs-nano3` has Nemotron 3 Nano's widths and 128 experts."""
+    _overlap_case(monkeypatch, expert_parallel, wide=wide, graphs=graphs, delayed=False, dims=dims)
 
 
 @gpu_test
