@@ -217,6 +217,31 @@ def test_mean_batch_invariant_offsets_past_int32(form):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "n",
+    (
+        3 * 1024 + 1,
+        pytest.param(2**31 - 1024, marks=pytest.mark.large),
+        pytest.param(2**31 - 1023, marks=pytest.mark.large),
+        pytest.param(2**31 - 1, marks=pytest.mark.large),
+    ),
+    ids=("small", "counter-fits", "counter-wraps-first", "counter-wraps-last"),
+)
+def test_mean_batch_invariant_loop_counter_past_int32(n):
+    """The mean of n bf16 ones is 1. Its loop steps the counter a block past the last element,
+    which passes 2**31 for n from 2**31 - 1023 to 2**31 - 1 although every offset fits in int32.
+
+    The three cases near 2**31 need 4 GiB each: opt in with ``-m large`` and run one case per
+    process, since a wrapped counter reads before the input.
+    """
+    _require_free_memory(n * 2 + 2**30)
+    x = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+    with set_batch_invariant_mode(True):
+        out = torch.mean(x, dim=0)
+    assert torch.equal(out, torch.ones_like(out))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_full_mean_under_batch_invariant_mode():
     """`x.mean()` / `torch.mean(x)` dispatch to aten::mean.dim with dim=[]."""
     x = torch.randn(4, 8, device="cuda", requires_grad=True)

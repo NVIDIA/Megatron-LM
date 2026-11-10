@@ -419,17 +419,18 @@ def mean_kernel(
     if m_idx >= M or k_idx >= K:
         return
 
-    # Input element offsets reach 2**31 or more
+    # Input element offsets, or the loop counter, reach 2**31 or more
+    n_begin = 0
     if INT64_OFFSETS:
         m_idx = m_idx.to(tl.int64)
         k_idx = k_idx.to(tl.int64)
+        # An int64 start makes the loop counter, and so n_offsets, int64
+        n_begin = tl.zeros((), dtype=tl.int64)
 
     # Accumulate sum across reduction dimension
     acc = tl.zeros((), dtype=ACC_DTYPE)
-    for n_start in range(0, N, BLOCK_SIZE):
+    for n_start in range(n_begin, N, BLOCK_SIZE):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
-        if INT64_OFFSETS:
-            n_offsets = n_offsets.to(tl.int64)
         mask = n_offsets < N
 
         # Calculate input indices
@@ -547,7 +548,8 @@ def mean_dim(
         K,
         BLOCK_SIZE,
         ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
-        INT64_OFFSETS=max_offset >= 2**31,
+        # The loop over N also steps its counter up to a block past the last element.
+        INT64_OFFSETS=max(max_offset, N + BLOCK_SIZE - 1) >= 2**31,
     )
 
     return output
