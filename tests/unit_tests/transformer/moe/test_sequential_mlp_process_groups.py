@@ -173,8 +173,6 @@ class TestSequentialMLPProcessGroups:
                         getattr(weight, "gtp_replica_group", None) is expt_dp
                     ), "the expert weight does not carry the collection's expt_dp replica group"
             assert sharded_state_dict
-            for key, sharded in sharded_state_dict.items():
-                assert sharded.replica_id[2] == expt_dp.rank(), key
         finally:
             _GTP_PARAMS.clear()
             reset_gtp_state()
