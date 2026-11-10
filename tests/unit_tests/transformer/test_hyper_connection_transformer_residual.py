@@ -31,6 +31,7 @@ def _base_init(self, config, submodules, layer_number=1, **kwargs):
     nn.Module.__init__(self)
     self.config, self.layer_number = config, layer_number
     self.hidden_dropout, self.is_moe_layer = config.hidden_dropout, False
+    self.tp_group = None  # The dedicated constructor hands it to the mHC modules.
     self.input_layernorm = nn.LayerNorm(config.hidden_size)
     self.pre_mlp_layernorm = nn.LayerNorm(config.hidden_size)
     self.recompute_input_layernorm = self.recompute_pre_mlp_layernorm = False
