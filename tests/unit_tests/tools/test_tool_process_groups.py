@@ -227,15 +227,11 @@ def test_disk_embedder_splits_blocks_over_the_model_data_parallel_group(
 
 
 @pytest.mark.usefixtures("run_config")
-def test_bert_embedder_builds_its_model_on_the_collection_of_the_registered_grid(monkeypatch):
+def test_bert_embedder_builds_its_model_on_the_collection_of_the_registered_grid(
+    embed, monkeypatch
+):
     """The embedder builds its model on the collection that pretrain() builds from the registered
     grid, so setup_model_and_optimizer() does not fall back to the global grid."""
-    pytest.importorskip("h5py")
-    pytest.importorskip("transformers")
-    # The embedding tool imports the BERT example's model provider as a top-level module.
-    monkeypatch.syspath_prepend(str(_REPO_ROOT / "examples" / "bert"))
-    embed = importlib.import_module("tools.bert_embedding.embed")
-
     registered = ProcessGroupCollection(
         dp=object(),
         dp_gtp_remat=object(),
@@ -260,17 +256,13 @@ def test_bert_embedder_builds_its_model_on_the_collection_of_the_registered_grid
 
 
 @pytest.mark.usefixtures("run_config")
-def test_bert_embedder_on_an_unregistered_grid_warns_as_setup_model_and_optimizer_did(monkeypatch):
+def test_bert_embedder_on_an_unregistered_grid_warns_as_setup_model_and_optimizer_did(
+    embed, monkeypatch
+):
     """On a grid set up without registering a collection, the embedder builds its model on the
     global grid with the single warning that setup_model_and_optimizer() gave before: the
     embedder takes no pg_collection, so a warning that named it would point at an argument it
     lacks."""
-    pytest.importorskip("h5py")
-    pytest.importorskip("transformers")
-    # The embedding tool imports the BERT example's model provider as a top-level module.
-    monkeypatch.syspath_prepend(str(_REPO_ROOT / "examples" / "bert"))
-    embed = importlib.import_module("tools.bert_embedding.embed")
-
     monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", None)
     global_groups = ProcessGroupCollection(dp=object())
     monkeypatch.setattr(
