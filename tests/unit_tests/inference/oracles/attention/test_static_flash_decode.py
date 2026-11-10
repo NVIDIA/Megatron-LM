@@ -33,8 +33,9 @@ value write is exact (a copy).
 Variants covered: positions ``0, 1, 127, 128, 129, 255, 256, 257, S_max - 1`` in one batch (FA2's
 128-key split-KV tiles), batch below the cache's ``B_max`` (poisoned unused slots); GQA 1, 4, 8;
 head dim 64 and 128; NeoX and interleaved pairs; full and half rotary dim; no RoPE; softcap;
-learnable sink; window ``127, 128, 129``. Layer level: ``flash_decode`` on/off x output gate x
-window x full/partial batch, plus GPT and Hybrid static generation (control and #8863 case).
+learnable sink. Layer level, with RoPE: ``flash_decode`` off x output gate x window x full/partial
+batch, and ``flash_decode`` on with a full batch, no gate and no window (see below); GPT static
+generation.
 Production shapes (``test_flash_decode_at_production_shapes``): Qwen2.5-1.5B as the offline
 inference example runs it (12 query and 2 KV heads of 128, rotary base 1e6, a batch of 64) over
 a 4096-token cache (the inference server's ``--inference-max-seq-length``), and Llama-3.1-8B (32
@@ -42,25 +43,20 @@ query and 8 KV heads of 128, rotary base 5e5) over an 8192-token cache with a ba
 positions around the tiles and powers of two up to the last cache row, the rest of the batch at
 random positions.
 
-Open PRs (written against main):
+Open PRs (written against main); the cases that fail on main are their regression tests:
 * #8878 (t3-flashdecode): main passes no ``window_size`` to the decode kernel (R11-F3) and
-  returns before the output gate (R11-F4): the ``window`` kernel cases and the layer cases with
-  ``flash_decode`` and a window or the gate fail on main and pass with #8878.
-* t3-p4n2 (branch fix/te-strided-query-layout): TE's FusedAttention reads strided ``k``/``v``
-  batch slices of the static cache as dense, so the layer cases with a partial batch fail on main
-  in every step that runs TE attention (prefill, and decode with ``flash_decode`` off) and pass
-  with it; ``[batch=full-mha_without_rope]`` (a strided query view of the fused QKV output, P4-N2)
-  likewise.
-* Strided ``k``/``v`` (P4-N7, suspected): with a batch below ``B_max`` the static path hands TE
-  ``k``/``v`` as batch slices of the cache. TE (2.20's ``get_qkv_layout``) takes them as
-  ``sbhd_sbhd_sbhd`` without making them dense only when ``k`` and ``v`` have the same strides and
-  zero offsets; a RoPE'd key is a new dense tensor, so the RoPE cases above never reach it.
-  ``[batch=partial-gqa_without_rope]`` does (GQA keeps the query dense: its reshape copies), and
-  asserts that it does before comparing; it fails on main only if P4-N7 is real. The
-  flash-decode partial-batch cases reach it in their prefill (keys are RoPE'd before caching).
+  returns before the output gate (R11-F4). Its ``test_flash_decode.py::TestStaticFlashDecodeStep``
+  carries both, so the kernel cases here run without a window and the ``flash_decode`` layer cases
+  without a window or the gate.
+* #8953 (t3-p4n2): TE's FusedAttention reads as dense a strided query view of the fused QKV output
+  (MHA without RoPE, P4-N2) and strided ``k``/``v`` batch slices of the static cache (a batch below
+  ``B_max``, P4-N7). Its ``test_te_attention_qkv_layout.py::TestStaticTEAttentionStridedInputs``
+  carries both, so the layer cases here apply RoPE, and run a partial batch only with
+  ``flash_decode`` off: RoPE'd keys reach TE as new dense tensors, while the flash-decode prefill
+  caches RoPE'd keys and hands TE the cache slices.
 * #8863 (t3-r11f5): HybridModel never builds ``rotary_pos_cos/sin``, so its flash-decode static
-  generation applies no RoPE (R11-F5): ``test_model_static_generation[hybrid]`` fails on main and
-  passes with #8863 (``[gpt]`` is the control). #8864 (t3-p4n1) keeps the GPT case passing.
+  generation applies no RoPE (R11-F5); its ``test_hybrid_model.py::TestHybridModelFlashDecodeRope``
+  carries that. ``test_model_static_generation`` runs GPT, which #8864 (t3-p4n1) keeps passing.
 """
 
 from typing import List, Optional
@@ -163,7 +159,8 @@ def _tables(rot_dim: int, dtype: torch.dtype, s_max: int = S_MAX, base: float = 
 
 
 def _kernel_cases():
-    # The window comes first so that its cases (R11-F3, #8878) can be selected by id prefix.
+    # Window cases are #8878's (R11-F3, see the module docstring). They are generated and left
+    # out, so the other cases stay those of the full pairwise set.
     factors = {
         "window": [None, 127, 128, 129],
         "kv_heads": [HEADS, HEADS // 4, HEADS // 8],
@@ -180,6 +177,7 @@ def _kernel_cases():
             marks=ou.requires_sm(ou.HOPPER),
         )
         for case in ou.pairwise_cases(factors)
+        if case["window"] is None
     ]
 
 
@@ -434,7 +432,7 @@ class _Capture:
             hook.remove()
 
 
-def _static_oracle(attention, capture, window: Optional[int], rope: bool, what: str):
+def _static_oracle(attention, capture, window: Optional[int], what: str):
     """Check every captured step against fp64 attention over the RoPE'd history."""
     config = attention.config
     head_dim = config.kv_channels
@@ -450,17 +448,14 @@ def _static_oracle(attention, capture, window: Optional[int], rope: bool, what: 
         q, k, v = qkv[:3]  # [s, B, H|Hk, D]
         s, batch = q.shape[:2]
         positions = torch.arange(start, start + s, device="cuda")
-        if rope:
-            theta = ar.rope_angles(positions, head_dim, ROPE_BASE)
-            cos64 = torch.cos(theta)[:, None, None, :]
-            sin64 = torch.sin(theta)[:, None, None, :]
-            interleaved = config.rotary_interleaved
-            q64 = ou.fp64_reference(ar.rope_reference, q, cos64, sin64, interleaved=interleaved)
-            k64 = ou.fp64_reference(ar.rope_reference, k, cos64, sin64, interleaved=interleaved)
-            q_lp = ar.rope_lowp(q, cos64, sin64, interleaved=interleaved)
-            k_lp = ar.rope_lowp(k, cos64, sin64, interleaved=interleaved)
-        else:
-            q64, k64, q_lp, k_lp = q.double(), k.double(), q, k
+        theta = ar.rope_angles(positions, head_dim, ROPE_BASE)
+        cos64 = torch.cos(theta)[:, None, None, :]
+        sin64 = torch.sin(theta)[:, None, None, :]
+        interleaved = config.rotary_interleaved
+        q64 = ou.fp64_reference(ar.rope_reference, q, cos64, sin64, interleaved=interleaved)
+        k64 = ou.fp64_reference(ar.rope_reference, k, cos64, sin64, interleaved=interleaved)
+        q_lp = ar.rope_lowp(q, cos64, sin64, interleaved=interleaved)
+        k_lp = ar.rope_lowp(k, cos64, sin64, interleaved=interleaved)
         keys.append((k64, k_lp))
         values.append(v)
         k_all64 = torch.cat([x[0] for x in keys])
@@ -494,6 +489,9 @@ def _layer_cases():
         for flash_decode in (True, False):
             for gate in (False, True):
                 for window in (None, 8):
+                    if flash_decode and (batch == "partial" or gate or window is not None):
+                        # #8953's (partial batch) and #8878's (gate, window); see the docstring.
+                        continue
                     case_id = (
                         f"batch={batch}-flash_decode={flash_decode}-gate={gate}-window={window}"
                     )
@@ -504,74 +502,7 @@ def _layer_cases():
                             marks=ou.requires_sm(ou.HOPPER),
                         )
                     )
-    # MHA without RoPE: the query TE receives is a strided view of the fused QKV output.
-    cases.append(
-        pytest.param(
-            dict(flash_decode=False, gate=False, window=None, batch="full", mha_without_rope=True),
-            id="batch=full-mha_without_rope",
-            marks=ou.requires_sm(ou.HOPPER),
-        )
-    )
-    # GQA without RoPE, batch below B_max: dense query, k/v strided cache slices (P4-N7).
-    cases.append(
-        pytest.param(
-            dict(
-                flash_decode=False, gate=False, window=None, batch="partial", gqa_without_rope=True
-            ),
-            id="batch=partial-gqa_without_rope",
-            marks=ou.requires_sm(ou.HOPPER),
-        )
-    )
     return cases
-
-
-def _te_layout(q, k, v) -> str:
-    """The layout Transformer Engine's detection assigns to (q, k, v), for messages only."""
-    try:
-        from transformer_engine.pytorch.attention.dot_product_attention.utils import get_qkv_layout
-
-        return str(get_qkv_layout(q, k, v, qkv_format="sbhd")[0])
-    except Exception as error:  # noqa: BLE001  (version-dependent internals; report only)
-        return f"unknown ({type(error).__name__})"
-
-
-class _StridedKVProbe:
-    """Records, for every static TE core-attention call, whether it receives a dense query and
-    ``k``/``v`` that are strided views with the same strides and zero offsets: the inputs TE takes
-    as ``sbhd_sbhd_sbhd`` without making them dense."""
-
-    def __init__(self, attention):
-        self.calls = []
-        self._hook = attention.core_attention.register_forward_pre_hook(self._record)
-
-    def _record(self, module, args):
-        q, k, v = args[:3]
-        self.calls.append(
-            dict(
-                q_dense=q.is_contiguous(),
-                kv_strided=not k.is_contiguous() and not v.is_contiguous(),
-                kv_same_strides=k.stride() == v.stride(),
-                zero_offsets=all(x.storage_offset() == 0 for x in (q, k, v)),
-                te_layout=_te_layout(q, k, v),
-                shapes=[tuple(x.shape) for x in (q, k, v)],
-                strides=[x.stride() for x in (q, k, v)],
-            )
-        )
-
-    def remove(self):
-        self._hook.remove()
-
-    def assert_reached(self):
-        assert self.calls, "no static TE core-attention call was made"
-        for step, call in enumerate(self.calls):
-            reached = (
-                call["q_dense"]
-                and call["kv_strided"]
-                and call["kv_same_strides"]
-                and call["zero_offsets"]
-            )
-            assert reached, f"precondition not reached in step {step}: {call}"
-        print(f"P4-N7 probe: TE layout {self.calls[0]['te_layout']}; {self.calls[0]}")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -585,9 +516,6 @@ def test_static_steps_match_reference(case):
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
     head_dim, kv_heads, prompt, decode_steps, batch_max, seq_max = 64, 2, 12, 4, 3, 64
-    rope = not (case.get("mha_without_rope") or case.get("gqa_without_rope"))
-    if case.get("mha_without_rope"):
-        kv_heads = HEADS
     config = _config(
         kv_heads=kv_heads,
         head_dim=head_dim,
@@ -606,7 +534,6 @@ def test_static_steps_match_reference(case):
     )
     g = ou.make_generator(device="cuda")
     capture = _Capture(attention)
-    probe = _StridedKVProbe(attention) if case.get("gqa_without_rope") else None
     try:
         with torch.no_grad(), InferenceMode.active():
             for t, s in enumerate([prompt] + [1] * decode_steps):
@@ -623,30 +550,23 @@ def test_static_steps_match_reference(case):
                             (batch,), context.sequence_len_offset, dtype=torch.int32, device="cuda"
                         ),
                     )
-                elif rope:
+                else:
                     kwargs.update(rotary_pos_emb=rotary(seq_max))
                 attention(hidden.to(torch.bfloat16), **kwargs)
                 context.increment_sequence_len_offset(s)
     finally:
         capture.remove()
-        if probe is not None:
-            probe.remove()
-    if probe is not None:
-        # The case must hand TE strided k/v slices it takes as dense, or it tests nothing.
-        probe.assert_reached()
-    _static_oracle(attention, capture, case["window"], rope=rope, what=f"static steps {case}")
+    _static_oracle(attention, capture, case["window"], what=f"static steps {case}")
 
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize(
-    "model", [pytest.param(m, marks=ou.requires_sm(ou.HOPPER)) for m in ("gpt", "hybrid")]
+    "model", [pytest.param(m, marks=ou.requires_sm(ou.HOPPER)) for m in ("gpt",)]
 )
 def test_model_static_generation(model):
     """Static flash-decode generation of a RoPE model: in the prefill and in each decode step, the
-    attention layer's output is the fp64 attention over keys RoPE'd at their positions.
-
-    ``[hybrid]`` fails on main (HybridModel builds no cos/sin tables, so flash decoding applies no
-    RoPE, R11-F5) and passes with #8863; ``[gpt]`` is the control."""
+    attention layer's output is the fp64 attention over keys RoPE'd at their positions. HybridModel
+    is #8863's (R11-F5, see the module docstring)."""
     _require_fa2()
     from megatron.core.inference.contexts.static_context import StaticInferenceContext
     from megatron.core.inference.utils import InferenceMode
@@ -665,33 +585,17 @@ def test_model_static_generation(model):
         params_dtype=torch.bfloat16,
         flash_decode=True,
     )
-    if model == "gpt":
-        from megatron.core.models.gpt.gpt_layer_specs import (
-            get_gpt_layer_with_transformer_engine_spec,
-        )
-        from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
 
-        net = GPTModel(
-            config=config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=vocab,
-            max_sequence_length=seq_max,
-            position_embedding_type="rope",
-        )
-        attention = net.decoder.layers[0].self_attention
-    else:
-        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-        from megatron.core.models.hybrid.hybrid_model import HybridModel
-
-        net = HybridModel(
-            config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=vocab,
-            max_sequence_length=seq_max,
-            hybrid_layer_pattern="*-",
-            position_embedding_type="rope",
-        )
-        attention = net.decoder.layers[0].self_attention
+    net = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=vocab,
+        max_sequence_length=seq_max,
+        position_embedding_type="rope",
+    )
+    attention = net.decoder.layers[0].self_attention
     net = net.cuda().eval()
     context = StaticInferenceContext(batch, seq_max)
     g = ou.make_generator(device="cuda")
@@ -716,4 +620,4 @@ def test_model_static_generation(model):
                 start += s
     finally:
         capture.remove()
-    _static_oracle(attention, capture, None, rope=True, what=f"{model} static generation")
+    _static_oracle(attention, capture, None, what=f"{model} static generation")

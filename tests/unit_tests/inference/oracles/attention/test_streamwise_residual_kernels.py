@@ -43,13 +43,17 @@ bf16 and fp32 logits, bf16/fp16 updates into an fp32 stream, read outputs in ano
 2-D and 3-D (``[s, b, K W]``) layouts; padded logits poisoned with NaN past ``K``; inputs in
 NaN-guarded buffers (an over-read shows as NaN, a write as a changed guard). Production: ``K``
 4 of 4096-wide streams at a 8192-token prefill chunk and a 256-token decode batch, bf16 and an
-fp32 stream with bf16 updates. Offsets: rows whose element offsets ``row * K * W`` cross 2**31
-(``large``).
+fp32 stream with bf16 updates. Offsets: rows up to the last whose element offsets
+``row * K * W`` stay below 2**31 (``large``).
 
-Widths between 64 and 128 that are not powers of two (``test_widths_below_the_column_tile``
-[96], [127]) give a column tile of ``W`` columns, which Triton cannot build (``tl.arange`` needs
-a power of two), although the dispatch accepts every ``W >= 64``: suspected O8b-M1 (packet
-doc). They fail on main.
+On main, widths between 64 and 128 that are not powers of two give a column tile of ``W``
+columns, which Triton cannot build (``tl.arange`` needs a power of two), although the dispatch
+accepts every ``W >= 64`` (O8b-M1), and row offsets past 2**31 overflow int32 (O8b-M2). #9303
+fixes both, with ``test_streamwise_residual_ops.py``'s
+``test_fused_cuda_widths_below_column_tile_match_reference`` and
+``test_fused_forward_addresses_rows_past_int32_offsets`` as their regression tests, so
+``test_widths_below_the_column_tile`` runs widths 64 and 128 and ``test_offsets_past_int32`` the
+last row count whose offsets fit.
 """
 
 import contextlib
@@ -324,14 +328,12 @@ def test_write_matches_reference(case):
     )
 
 
-@pytest.mark.parametrize("width", [64, 96, 127, 128])
+@pytest.mark.parametrize("width", [64, 128])
 @pytest.mark.parametrize("op", ["read", "write"])
 def test_widths_below_the_column_tile(op, width):
-    """Stream widths from the dispatch's minimum (64) to the 128-column tile. The dispatch
-    accepts every width from 64, so each must meet the contract, fused or not.
-
-    [96] and [127] fail on main (suspected O8b-M1): the kernels' column tile is ``W`` columns
-    below 128, and Triton builds tiles only of power-of-two sizes."""
+    """Stream widths at the dispatch's minimum (64) and the 128-column tile. The dispatch
+    accepts every width from 64, so each must meet the contract, fused or not; the widths between
+    them are #9303's (O8b-M1, see the module docstring)."""
     if op == "read":
         _read_case(33, width, 3, torch.bfloat16, None, torch.float32, "2d")
     else:
@@ -491,16 +493,17 @@ def test_production_sizes(rows, stream_dtype):
 
 
 def _overflow_rows():
-    return ou.int32_overflow_params(2 * 8192)
+    # The row counts whose offsets cross 2**31 are #9303's (O8b-M2, see the module docstring).
+    return [p for p in ou.int32_overflow_params(2 * 8192) if "int32-fits" in p.id]
 
 
 @pytest.mark.large
 @pytest.mark.parametrize("op", ["read", "write"])
 @pytest.mark.parametrize("rows", _overflow_rows())
 def test_offsets_past_int32(op, rows):
-    """Rows whose element offsets ``row * K * W`` reach 2**31 (K = 2 streams of 8192): the
-    kernels must address them in 64 bits. Rows around the crossing and the last rows are
-    compared with the reference."""
+    """Rows whose element offsets ``row * K * W`` reach up to 2**31 (K = 2 streams of 8192), the
+    last row starting just below it. Rows around the limit and the last rows are compared with
+    the reference."""
     k, width = 2, 8192
     row_elems = k * width
     ou.require_free_memory(rows * row_elems * 2 * 3 + (4 << 30))

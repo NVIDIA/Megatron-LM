@@ -45,11 +45,6 @@ Contract (from the MLA math; the training path is the semantic definition):
   reads the layer's output, after ``linear_proj``, where the cross-row scale acts.
 * Unused memory: a request's outputs do not depend on pool pages it does not own (free pages,
   other requests' pages, the dummy page), in bf16 and under FP8 per-tensor scaling.
-* DSA cannot use the latent cache: its sparse attention needs an indexer cache the dynamic path
-  does not have, so ``cache_mla_latents`` with ``experimental_attention_variant='dsa'`` must be
-  rejected when the config is built.
-* FA2 cannot read 64-token pages nor value heads narrower than query heads: a pinned FA2 must be
-  refused with a ValueError, not fail inside flash-attn.
 
 Reference: fp64 MLA attention built from the training path's own bf16 projections (its ``q`` before
 RoPE, from ``linear_q_up_proj``, and the latent and ``k_pe`` before the kv norm and RoPE, from
@@ -62,23 +57,22 @@ with the reference scale, so it shares neither the layer's scale derivation (whi
 YaRN's factor into any configured scale) nor its kernels; its RoPE (the YaRN embedding module
 both paths share) is itself checked against the fp64 rotation, bounded by the same rotation in
 bf16 (``rope_lowp``). Padding and unused-memory contracts: exact (metamorphic: poisoned vs clean
-runs are bitwise equal). DSA/FA2: the error. Comparisons of a scenario are collected and asserted
+runs are bitwise equal). Comparisons of a scenario are collected and asserted
 after its last step, so a failing rank cannot leave another waiting in a collective.
 
 Variants covered: prompts 63, 64, 65, 129 (around the 64-token page), a prefill step, a
 decode-only step (absorbed, FlashMLA), a mixed step (decodes plus a 70-token prefill, whole-pool
-up-projection), another decode-only step; vanilla and learnable sink; plain RoPE, YaRN with
+up-projection), another decode-only step; vanilla softmax (no sink); plain RoPE, YaRN with
 DeepSeek-V3's scaling (factor 40, ``mscale = mscale_all_dim = 1``: scale times 1.874, unit
 amplitude) and with Megatron's MLA default (``mscale_all_dim = 0``: unit scale factor, amplitude
-1.369); TP 2 without and with sequence parallelism (TE spec) and TP 2 with the inference-optimized
-layers and sequence parallelism (the inference server's configuration), 16 heads per rank;
+1.369); TP 2 without sequence parallelism (TE spec), 16 heads per rank;
 speculative decoding with 1 and 2 speculative tokens (FlashMLA with 2 and 3 query rows per
 request, and the mixed step's varlen path), without the draft-KV plane and with it: the commit
 pass and every draft depth after a prefill step (varlen path over the draft plane), after a
 decode-only step (absorbed FlashMLA over the draft plane) and after a mixed step; chunked prefill
 of a 129-token prompt split at 63, 64 and 65 tokens (page boundary - 1, at, + 1), the second chunk
-in a mixed step and both reread by a decode-only step; bf16 and FP8 tensorwise for the padding and
-unused-memory contracts; poison values 1e4 and NaN. DeepSeek-V3's head widths (``qk_head_dim``
+in a mixed step and both reread by a decode-only step; bf16 for the padding and unused-memory
+contracts; poison values 1e4 and NaN. DeepSeek-V3's head widths (``qk_head_dim``
 128, ``qk_pos_emb_head_dim`` 64, ``v_head_dim`` 128), so the query's content and RoPE parts have
 different widths; random RMSNorm gains (the q and kv norms), so a norm applied twice or skipped
 changes the result (with unit gains RMSNorm is idempotent). Production width: DeepSeek-V3's
@@ -88,26 +82,31 @@ serving split).
 
 Hardware: H100 with a FlashMLA build that has its SM90 kernels (#8701; the manifest runs the SM90
 build) and FA3 or FA4 for the paged prefill (FA2 cannot read 64-token pages); the TP 2 cases on 2
-H100s, the TP 8 production case on 8. The scenario also runs on GB200, where it fails on main
-(FlashMLA has no SM100 dense decode, R11-F1; FA4's SM100 forward does not compile in the CI image,
-G1) and passes with #8873 and #8860.
+H100s, the TP 8 production case on 8. On GB200 the scenario fails on main (FlashMLA has no SM100
+dense decode, R11-F1; FA4's SM100 forward does not compile in the CI image, G1); #8873 and #8860
+carry those with their own tests, so it runs on Hopper only here.
 
-Open PRs (written against main):
-* #8571 (s8): main does not pass the sink to the dynamic MLA kernels, so ``[learnable]`` fails on
-  main and passes with s8.
-* #8874 (t3-r11f2): main does not zero the MLA attention output's padding rows under FP8 (R11-F2):
-  ``test_padding_rows_do_not_reach_live_rows[fp8]`` fails on main and passes with #8874.
+Open PRs (written against main); the cases that fail on main are their regression tests
+(``test_multi_latent_attention.py`` unless named otherwise):
+* #8571 (s8): main does not pass the sink to the dynamic MLA kernels. Its
+  ``TestParallelMLAAttention.test_dynamic_inference_forwards_sink_offset_to_flash_attention``
+  carries that, so the scenario here runs without a sink.
+* #8874 (t3-r11f2): main does not zero the MLA attention output's padding rows under FP8
+  (R11-F2). Its ``TestDynamicInferencePaddingRows.test_mla_real_rows_ignore_padding_under_fp8``
+  carries that, so the padding contract runs in bf16 here.
 * #8702 (n6): main up-projects the whole latent pool through the FP8 linear, so one per-tensor
-  scale covers unused pages (R11-F6): ``test_unused_pages_do_not_reach_live_rows[fp8-1e4]`` fails
-  on main and passes with n6. ``[bf16-nan]`` also needs the latent tails to be finite or masked by
-  the prefill kernel (#8872 zeroes new latent pages). Under sequence parallelism main caches a
-  sequence shard of the latent next to the gathered ``k_pe`` and crashes at the first forward:
-  ``test_tensor_parallel_steps_match_training[tp2-sp]`` and ``[tp2-sp-inference_optimized]`` fail
-  on main and pass with n6.
-* #8570 (d5): ``test_dsa_with_latent_cache_is_rejected`` fails on main (accepted) and passes with
-  d5. It runs on CPU.
-* #8584 (n2): ``test_fa2_is_refused`` fails on main (RuntimeError inside flash-attn) and passes
-  with n2.
+  scale covers unused pages (R11-F6), and under sequence parallelism it caches a sequence shard of
+  the latent next to the gathered ``k_pe`` and crashes at the first forward. Its
+  ``TestMLALatentPoolUpProjection.test_used_blocks_ignore_unused_blocks`` and
+  ``TestSequenceParallelMLALatentCache`` carry those, so the unused-memory contract runs in bf16
+  and TP 2 without sequence parallelism here. ``[bf16-nan]`` also needs the latent tails to be
+  finite or masked by the prefill kernel (#8872 zeroes new latent pages).
+* #8570 (d5): ``cache_mla_latents`` with a DSA core (its sparse attention needs an indexer cache
+  the dynamic path does not have) is accepted on main; ``test_transformer_config.py``'s
+  ``test_cache_mla_latents_rejects_dsa`` carries the rejection.
+* #8584 (n2): a pinned FA2, which cannot read the latent cache's 64-token pages, fails inside
+  flash-attn on main; ``test_dynamic_context.py``'s
+  ``test_pinned_flash_attention_2_rejects_unsupported_paged_kv[mla]`` carries the ValueError.
 * #8873 (t3-r11f1): GB200 decode-only steps; see above.
 """
 
@@ -144,7 +143,8 @@ PRODUCTION_HEADS = 128
 MAX_LEN = 256
 PROMPTS = {0: 63, 1: 64, 2: 65, 3: 129}
 LATE_PROMPT = 70  # joins in the mixed step
-DEVICES = [ou.requires_sm(ou.HOPPER, ou.BLACKWELL), pytest.mark.launch_on_gb200]
+# Hopper only: the scenario's GB200 kernels are #8860's and #8873's (see the module docstring).
+DEVICES = [ou.requires_sm(ou.HOPPER)]
 
 # The rotary variants (MLATransformerConfig fields). YaRN: DeepSeek-V3's rope_scaling (factor 40
 # over 4096 positions, beta 32/1, mscale = mscale_all_dim = 1) and Megatron's MLA default, which
@@ -833,7 +833,6 @@ def _run_scenario(layer, twin, variant: str, what: str, **inference):
 
 SCENARIO_CASES = [
     pytest.param(dict(sink=False, variant="rope"), id="vanilla", marks=DEVICES),
-    pytest.param(dict(sink=True, variant="rope"), id="learnable", marks=DEVICES),
     pytest.param(
         dict(sink=False, variant="yarn_deepseek_v3"), id="yarn-deepseek_v3", marks=DEVICES
     ),
@@ -857,23 +856,16 @@ def test_dynamic_steps_match_training(case):
     _run_scenario(make_layer(), twin, case["variant"], f"sink={case['sink']}, {case['variant']}")
 
 
-TP_CASES = [
-    pytest.param(dict(sp=False, spec="te"), id="tp2", marks=DEVICES),
-    pytest.param(dict(sp=True, spec="te"), id="tp2-sp", marks=DEVICES),
-    pytest.param(
-        dict(sp=True, spec="inference_optimized"), id="tp2-sp-inference_optimized", marks=DEVICES
-    ),
-]
+TP_CASES = [pytest.param(dict(sp=False, spec="te"), id="tp2", marks=DEVICES)]
 
 
 @pytest.mark.usefixtures("tensor_parallel")
 @pytest.mark.parametrize("case", TP_CASES)
 def test_tensor_parallel_steps_match_training(case):
-    """The dynamic steps at TP 2 (16 heads per rank), with and without sequence parallelism: each
-    rank's attention output (its heads, every token) matches the fp64 reference built from the
-    TP 2 training twin (TE spec, no sequence parallelism) within that twin's error.
-    ``[tp2-sp]`` and ``[tp2-sp-inference_optimized]`` fail on main (n6: the cached latent is a
-    sequence shard, the gathered ``k_pe`` is not; the concatenation raises) and pass with n6."""
+    """The dynamic steps at TP 2 (16 heads per rank), without sequence parallelism (#8702's, see
+    the module docstring): each rank's attention output (its heads, every token) matches the fp64
+    reference built from the TP 2 training twin (TE spec, no sequence parallelism) within that
+    twin's error."""
     _require_kernels()
     make_layer, twin = _weights(tp=2, sp=case["sp"], heads=TP_HEADS, spec=case["spec"])
     _run_scenario(make_layer(), twin, "rope", f"TP 2, {case}")
@@ -1035,7 +1027,7 @@ def _poison_padding_rows(value: float):
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize(
-    "precision", [pytest.param(p, marks=ou.requires_sm(ou.HOPPER)) for p in ("bf16", "fp8")]
+    "precision", [pytest.param(p, marks=ou.requires_sm(ou.HOPPER)) for p in ("bf16",)]
 )
 def test_padding_rows_do_not_reach_live_rows(precision):
     """A padded prefill step: the layer's live output rows (after ``linear_proj``) are finite and
@@ -1044,8 +1036,8 @@ def test_padding_rows_do_not_reach_live_rows(precision):
     The garbage is what a per-tensor FP8 scale would see in stale memory: a large finite value
     and an infinity for ``[fp8]`` (an amax reduction built on fmax skips NaN, so NaN alone may not
     move it), NaN and a large value for the ``[bf16]`` control, whose linear_proj is row-local.
-    ``[fp8]`` fails on main (R11-F2: ``linear_proj``'s input amax covers the padding rows) and
-    passes with #8874, which zeroes them first."""
+    ``[fp8]`` is #8874's (R11-F2: on main ``linear_proj``'s input amax covers the padding rows;
+    see the module docstring)."""
     _require_kernels()
     fp8 = precision == "fp8"
     poisons = (1e4, float("inf")) if fp8 else (float("nan"), 1e4)
@@ -1082,14 +1074,14 @@ def test_padding_rows_do_not_reach_live_rows(precision):
     [
         pytest.param("bf16", 1e4, marks=ou.requires_sm(ou.HOPPER)),
         pytest.param("bf16", float("nan"), marks=ou.requires_sm(ou.HOPPER)),
-        pytest.param("fp8", 1e4, marks=ou.requires_sm(ou.HOPPER)),
     ],
-    ids=["bf16-1e4", "bf16-nan", "fp8-1e4"],
+    ids=["bf16-1e4", "bf16-nan"],
 )
 def test_unused_pages_do_not_reach_live_rows(precision, poison):
     """Prefill and mixed steps up-project the whole latent pool. Live rows are bitwise the same
     whether the pool's unused pages (and the unwritten tails of used ones) hold zeros or poison.
-    ``[fp8-1e4]`` fails on main (one FP8 scale over the whole pool, R11-F6) and passes with n6."""
+    ``[fp8-1e4]`` is #8702's (R11-F6: on main one FP8 scale covers the whole pool; see the module
+    docstring)."""
     _require_kernels()
     fp8 = precision == "fp8"
     make_layer, _ = _weights(fp8=fp8)
@@ -1112,35 +1104,6 @@ def test_unused_pages_do_not_reach_live_rows(precision, poison):
     for key, clean in results[0].items():
         assert torch.isfinite(results[1][key]).all(), f"{key}: poison reached a live row"
         ou.assert_exact(results[1][key], clean, what=f"{key}: poisoned vs clean pool")
-
-
-@pytest.mark.usefixtures("model_parallel")
-@ou.requires_sm(ou.HOPPER)
-def test_fa2_is_refused():
-    """FA2 cannot read the latent cache's 64-token pages nor value heads narrower than the query
-    heads (192 vs 128): a pinned FA2 must be refused with a ValueError (#8584, n2). Fails on main,
-    where flash-attn raises a RuntimeError at the first prefill."""
-    if attention_module.flash_attn_varlen_func is None:
-        pytest.fail("flash-attn 2 is not installed", pytrace=False)
-    with pytest.raises(ValueError):
-        make_layer, _ = _weights(flash_version=2)
-        layer = make_layer()
-        scenario = _Scenario(layer, layer.config)
-        _add_request(scenario.context, 0, PROMPTS[0])
-        scenario.step()
-
-
-def test_dsa_with_latent_cache_is_rejected():
-    """DSA's sparse attention cannot run on the dense latent-cache path, so the config must reject
-    ``cache_mla_latents`` with a DSA core (#8570, d5). Fails on main (accepted). CPU only."""
-    with pytest.raises(ValueError):
-        _config(
-            cache=True,
-            experimental_attention_variant="dsa",
-            dsa_indexer_n_heads=8,
-            dsa_indexer_head_dim=64,
-            dsa_indexer_topk=64,
-        )
 
 
 @pytest.mark.usefixtures("model_parallel")

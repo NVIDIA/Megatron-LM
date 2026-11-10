@@ -31,9 +31,9 @@ Variants covered: both paths; ``d_rot`` = D, D/2, 16; both pairings; S = 1, 2, 1
 positions); bf16, fp16, fp32; contiguous and strided ``t``; D = 64, 128; GQA-sized head counts.
 
 Main: the fallback rotates by ``cos(cos theta)`` and ``sin(sin theta)`` with a misplaced
-interleave (d7, the audit's R11 record; fixed by upstream PR #7465, not one of ours), so every
-``test_fallback_*`` case fails on main and passes once #7465 lands. The flash path is the control.
-The fallback runs on CPU, so these cases need no GPU.
+interleave (d7, the audit's R11 record; fixed by PR #7465, another author's), so every
+``test_fallback_*`` case is a strict xfail until #7465 lands; that PR removes the marks. The flash
+path is the control. The fallback runs on CPU, so these cases need no GPU.
 """
 
 import pytest
@@ -44,6 +44,11 @@ from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.attention import attention_reference as ar
 
 BASE = 10000.0
+D7 = pytest.mark.xfail(
+    strict=True,
+    reason="d7 (R11): the torch fallback of apply_rotary_pos_emb_with_cos_sin rotates by "
+    "cos(cos θ) and sin(sin θ); fixed by #7465",
+)
 
 
 def _inputs(seq, batch, heads, dim, rot_dim, dtype, strided, device):
@@ -94,6 +99,7 @@ def _rot_dim(spec: str, dim: int) -> int:
     return {"D": dim, "D/2": dim // 2, "16": 16}[spec]
 
 
+@D7
 @pytest.mark.parametrize("case", _cases())
 def test_fallback_matches_reference(case, monkeypatch):
     """The torch fallback (flash-attn's rotary module missing) rotates pairs by theta."""
@@ -106,6 +112,7 @@ def test_fallback_matches_reference(case, monkeypatch):
     _check(t, cos, sin, case["interleaved"], f"fallback {case}")
 
 
+@D7
 def test_fallback_is_identity_at_position_zero(monkeypatch):
     """theta = 0 (cos 1, sin 0) leaves every channel unchanged, bit for bit."""
     monkeypatch.setattr(rope_utils, "apply_rotary_emb_flash", None)

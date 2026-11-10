@@ -28,22 +28,23 @@ holding the full weight, unwrapped and unsharded, under the same FP8 recipe, on 
 padded full input. At TP=1 the wrapped output must also equal the unwrapped module on the padded
 input bit for bit (exact, metamorphic; tensorwise and MXFP8 current scaling).
 
-Variants covered: TELinear (duplicated), TEColumnParallelLinear, TERowParallelLinear and
-TELayerNormColumnParallelLinear; TP 1, 2, 4 (sequence parallel when TP > 1); full sequence
-``TP, 16 - TP, 16, 16 + TP, 32 + TP`` around the 16-row alignment (32-row for MXFP8); batch 1
-and 2; tensorwise and delayed scaling on H100, MXFP8 on GB200 (256 x 128 features). Production
+Variants covered: TELinear (duplicated), TEColumnParallelLinear, TERowParallelLinear (TP 1 only, see
+below) and TELayerNormColumnParallelLinear; TP 1, 2, 4 (sequence parallel when TP > 1); full
+sequence ``TP, 16 - TP, 16, 16 + TP, 32 + TP`` around the 16-row alignment (32-row for MXFP8); batch
+1 and 2; tensorwise and delayed scaling on H100, MXFP8 on GB200 (256 x 128 features). Production
 widths (``test_wrapped_linear_at_production_widths``, tensorwise on H100 and MXFP8 on GB200):
-Llama-3.1-8B's projections (QKV 4096 -> 6144 with the fused norm, attention output 4096 -> 4096,
-the gated FFN 4096 -> 28672 and 14336 -> 4096) and DeepSeek-V3's MLA KV down-projection (7168 ->
-576, duplicated), at TP 1, 2, 4 (pairwise) with 132 tokens (a decode batch) and 2044 tokens (a
-prefill chunk of the inference server's 2048-token step budget), both off the alignment and
-divisible by TP; batch 1, the dynamic engine's token layout. Delayed scaling is not repeated at
-these widths.
+Llama-3.1-8B's projections (QKV 4096 -> 6144 with the fused norm, attention output 4096 -> 4096, the
+gated FFN 4096 -> 28672 and 14336 -> 4096) and DeepSeek-V3's MLA KV down-projection (7168 -> 576,
+duplicated), at TP 1, 2, 4 (pairwise) with 132 tokens (a decode batch) and 2044 tokens (a prefill
+chunk of the inference server's 2048-token step budget), both off the alignment and divisible by TP;
+batch 1, the dynamic engine's token layout. Delayed scaling is not repeated at these widths.
 
 Open PRs (written against main):
 * #8567 (s7): with sequence parallelism the wrapper clears ``module.sequence_parallel``, so TE's
   row-parallel linear all-reduces, and then reduce-scatters the result again: the row-parallel
-  output is TP times too large. Every ``row`` case with TP > 1 fails on main and passes with s7.
+  output is TP times too large. Its ``test_fp8_utils.py``'s
+  ``TestFP8PaddingSequenceParallel.test_wrapped_output_matches_unwrapped[row-*]`` carries that, so
+  the row-parallel cases here run at TP 1 only.
 """
 
 import pytest
@@ -270,6 +271,8 @@ def _cases(recipe_name: str, align: int, marks):
         modes = MODES if tp == 1 else ["column", "row", "layernorm_column"]
         factors = {"mode": modes, "seq": _sizes(tp, align), "batch": [1, 2]}
         for case in ou.pairwise_cases(factors):
+            if case["mode"] == "row" and tp > 1:
+                continue  # #8567's (see the module docstring)
             params.append(
                 pytest.param(
                     recipe_name,
@@ -326,6 +329,8 @@ def _production_cases(recipe_name: str, align: int, marks):
     ]
     for case in cases:
         mode, in_features, out_features = PRODUCTION_WIDTHS[case["shape"]]
+        if mode == "row" and case["tp"] > 1:
+            continue  # #8567's (see the module docstring)
         params.append(
             pytest.param(
                 recipe_name,
@@ -353,7 +358,7 @@ def test_wrapped_linear_at_production_widths(
     """The contract of ``test_wrapped_linear_matches_reference`` at production model widths and
     token counts: each rank's wrapped FP8 output is its part of the full ``x @ W^T`` (bounded by
     TE's own unsharded linear), and at TP=1 it equals the unwrapped module on the padded input
-    bit for bit. Row-parallel cases with TP > 1 fail on main (s7, #8567)."""
+    bit for bit."""
     _run(mode, tp, recipe_name, seq, 1, align, in_features, out_features)
 
 

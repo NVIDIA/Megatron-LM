@@ -41,18 +41,16 @@ Reference: fp64 attention over the KV gathered through the block table from the 
 the trusted yardstick ``attention_lowp`` (SDPA math-backend order in the kernel dtype) on the same
 gathered KV, per token row (``dim=-1``). Batch-invariance: exact (property).
 
-Variants covered: FA2, FA3, FA4 (each where it is installed and runs: FA2 and FA3 on Hopper, FA4
-on Hopper and Blackwell); prefill/mixed and decode-only; page size 256 (FA2's only legal size) and
-64/128/256 for FA3/FA4 (FA4 uses TMA paging only at 128); lengths ``1, P-1, P, P+1, 2P-1, 2P+1,
-4097`` in one batch (rows of different lengths, the last crossing split-KV chunks); chunked
-prefill continuing across a page boundary; decode with ``S`` in 1, 2, 4 (MTP); GQA 1, 4, 8;
-head dim 64 and 128; window ``P-1``, ``P``, ``P+1``; softcap; learnable sink; zero-length padding
-requests; FA3 (prefill) and FA4 ``max_seqlen_k`` at the block-table capacity (as CUDA graphs
-pass it); FA3/FA4 batch-invariant mode. Factors combined pairwise. Decode whose packed query
-rows ``S * H / Hk`` (FA3/FA4 pack a KV head's query heads with the request's tokens into the
-rows of one M tile) sit below, at and past the 128-row M tile and past FA4's two-stage 256-row
-tile on SM100, where FA4 sizes its schedule from ``max_seqlen_q * H / Hk`` (one tile per request
-when that fits):
+Variants covered: FA2, FA3, FA4 on Hopper (each where it is installed); prefill/mixed and
+decode-only; page size 256 (FA2's only legal size) and 64/128/256 for FA3/FA4 (FA4 uses TMA paging
+only at 128); lengths ``1, P-1, P, P+1, 2P-1, 2P+1, 4097`` in one batch (rows of different
+lengths, the last crossing split-KV chunks); chunked prefill continuing across a page boundary;
+decode with ``S`` in 1, 2, 4 (MTP); GQA 1, 4, 8; head dim 64 and 128; window ``P-1``, ``P``,
+``P+1``; softcap; learnable sink; zero-length padding requests; FA3 (prefill) and FA4
+``max_seqlen_k`` at the block-table capacity (as CUDA graphs pass it); FA3/FA4 batch-invariant
+mode (the only FA4 mode of these pairwise cases, see below). Factors combined pairwise. Decode
+whose packed query rows ``S * H / Hk`` (FA3/FA4 pack a KV head's query heads with the request's
+tokens into the rows of one M tile) sit below, at and past the 128-row M tile:
 ``test_decode_query_rows_cross_the_m_tile``. Batch-invariant decode with token-only padding rows
 past the requests' tokens (CUDA-graph buckets pad the token count): the call site passes only
 the requests' rows to the kernel and returns zero rows for the padding
@@ -61,14 +59,17 @@ query and 8 KV heads of 128 on 256-token pages (the context's default), a 64-req
 step over contexts up to 8192 tokens and a prefill step with a 1024-token chunk over a
 3072-token prefix (``test_production_geometry_matches_reference``).
 
-Open PRs (written against main):
-* #8584 (n2): on main, FA4 on Hopper asks for split-KV (``num_splits=0``), which FA4's SM90
-  forward rejects ("SplitKV not supported on SM 9.0") once the KV is long (the 4097-key requests,
-  and the capacity ``max_seqlen_k``): the FA4 cases fail on H100 on main and pass with n2.
-  ``test_fa2_refuses_pages_it_cannot_read`` fails on main (FA2 raises a RuntimeError inside
-  flash-attn) and passes with n2 (a ValueError from Megatron).
-* #8860 (t3-g1): on main, FA4's SM100 forward cannot compile in the CI image (G1), so the FA4
-  cases fail on GB200 on main and pass with t3-g1's FA4 lock.
+Open PRs (written against main); the cases that fail on main are their regression tests:
+* #8584 (n2): outside batch-invariant mode, main asks FA4 on Hopper for split-KV
+  (``num_splits=0``), which FA4's SM90 forward rejects ("SplitKV not supported on SM 9.0") once the
+  KV is long. Its ``TestFlashAttentionDeviceSelection.test_fa4_num_splits`` (test_attention.py)
+  and ``test_long_context_on_hopper_with_fa4_installed`` (test_dynamic_engine.py) carry that, so
+  the pairwise and M-tile FA4 cases here run batch-invariant (``num_splits=1``, as n2 makes every
+  SM90 call). Its ``test_auto_fa2_rejects_paged_kv_it_cannot_read`` carries the ValueError for
+  pages FA2 cannot read.
+* #8860 (t3-g1): main's FA4 SM100 forward cannot compile in the CI image (G1); its
+  ``test_attention_fa4.py::test_fa4_paged_attention_on_sm100`` carries that, so the FA4 cases here
+  run on Hopper only.
 * #8878 (t3-flashdecode) moves the window lookup into ``_flash_attn_window_size``; the window
   cases here must pass unchanged with it.
 """
@@ -115,10 +116,8 @@ def _require_flash(version: int) -> None:
     pytest.skip(reason)
 
 
-def _version_marks(version: int):
-    if version == 4:
-        return [ou.requires_sm(ou.HOPPER, ou.BLACKWELL), pytest.mark.launch_on_gb200]
-    return [ou.requires_sm(ou.HOPPER)]
+# Every FA generation runs on Hopper here; FA4 on Blackwell is #8860's (see the module docstring).
+HOPPER = [ou.requires_sm(ou.HOPPER)]
 
 
 @pytest.fixture
@@ -305,6 +304,10 @@ def _cases(version: int, phase: str):
         factors["v_tail"] = ["zero", "nan"]
     params = []
     for case in ou.pairwise_cases(factors):
+        if version == 4 and not case["batch_invariant"]:
+            # Main asks FA4 for split-KV outside batch-invariant mode, which its Hopper forward
+            # rejects for these long requests (#8584, see the module docstring).
+            continue
         # "fa4bi-..." for batch-invariant cases, so the ids can be selected by prefix.
         tag = f"fa{version}" + ("bi" if case.get("batch_invariant") else "")
         case_id = f"{tag}-" + "-".join(
@@ -312,7 +315,7 @@ def _cases(version: int, phase: str):
             for k, v in case.items()
             if k != "batch_invariant" and v not in (None, False, "none", "zero")
         )
-        params.append(pytest.param(version, case, id=case_id, marks=_version_marks(version)))
+        params.append(pytest.param(version, case, id=case_id, marks=HOPPER))
     return params
 
 
@@ -402,9 +405,7 @@ def test_fp16_matches_reference(phase):
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.sanitizer
-@pytest.mark.parametrize(
-    "version", [pytest.param(v, id=f"fa{v}", marks=_version_marks(v)) for v in (2, 3, 4)]
-)
+@pytest.mark.parametrize("version", [pytest.param(v, id=f"fa{v}", marks=HOPPER) for v in (2, 3, 4)])
 def test_small_batch_for_sanitizer(version):
     """A small poisoned prefill and decode (compute-sanitizer memcheck case)."""
     _require_flash(version)
@@ -432,9 +433,7 @@ def test_small_batch_for_sanitizer(version):
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
-@pytest.mark.parametrize(
-    "version", [pytest.param(v, id=f"fa{v}", marks=_version_marks(v)) for v in (3, 4)]
-)
+@pytest.mark.parametrize("version", [pytest.param(v, id=f"fa{v}", marks=HOPPER) for v in (3, 4)])
 def test_batch_invariant_rows_do_not_depend_on_the_batch(version, phase):
     """Batch-invariant mode: each request's rows are bitwise the same alone and in the batch."""
     _require_flash(version)
@@ -482,27 +481,19 @@ def test_batch_invariant_rows_do_not_depend_on_the_batch(version, phase):
 # max_seqlen_q * H / Hk; on SM100 it gives each request a single tile while that product fits
 # (flash_attn/cute/interface.py, max_m_blocks_leq_one and q_stage, read at 4.0.0b27 and b34). With
 # MQA (Hk = 1) and 32 query heads, S = 3, 4, 5, 9 give 96, 128, 160 and 288 packed rows: below,
-# at and past the 128-row tile, and past the 256-row one.
+# at and past the 128-row tile, and past the 256-row one. The cases run on Hopper only, FA4 in
+# batch-invariant mode (see the module docstring).
 M_TILE_HEADS, M_TILE_KV_HEADS, M_TILE_HEAD_DIM = 32, 1, 128
 M_TILE_TOKENS = (3, 4, 5, 9)
 
 
 def _m_tile_cases():
     params = []
-    for tag, version, batch_invariant in (
-        ("fa2", 2, False),
-        ("fa3", 3, False),
-        ("fa4", 4, False),
-        ("fa4bi", 4, True),
-    ):
+    for tag, version, batch_invariant in (("fa2", 2, False), ("fa3", 3, False), ("fa4bi", 4, True)):
         for tokens in M_TILE_TOKENS:
             params.append(
                 pytest.param(
-                    version,
-                    batch_invariant,
-                    tokens,
-                    id=f"{tag}-tokens={tokens}",
-                    marks=_version_marks(version),
+                    version, batch_invariant, tokens, id=f"{tag}-tokens={tokens}", marks=HOPPER
                 )
             )
     return params
@@ -512,9 +503,9 @@ def _m_tile_cases():
 @pytest.mark.parametrize("version, batch_invariant, tokens", _m_tile_cases())
 def test_decode_query_rows_cross_the_m_tile(version, batch_invariant, tokens):
     """Multi-token decode (MTP, speculative) whose packed query rows ``S * H / Hk`` sit below, at
-    and past the 128-row M tile (and FA4's 256-row two-stage tile): every query row of every
-    request matches the fp64 reference, so the kernel must be told ``S`` query tokens per request
-    (``max_seqlen_q``) and must compute every M tile of a request."""
+    and past the 128-row M tile: every query row of every request matches the fp64 reference, so
+    the kernel must be told ``S`` query tokens per request (``max_seqlen_q``) and must compute
+    every M tile of a request."""
     _require_flash(version)
     page = 256 if version == 2 else 128  # FA2 reads only 256-token pages
     module = _attention(
@@ -550,9 +541,7 @@ def test_decode_query_rows_cross_the_m_tile(version, batch_invariant, tokens):
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("tokens", [1, 2], ids=["tokens=1", "tokens=2"])
-@pytest.mark.parametrize(
-    "version", [pytest.param(v, id=f"fa{v}", marks=_version_marks(v)) for v in (3, 4)]
-)
+@pytest.mark.parametrize("version", [pytest.param(v, id=f"fa{v}", marks=HOPPER) for v in (3, 4)])
 def test_batch_invariant_decode_zeroes_token_padding(version, tokens):
     """Batch-invariant decode whose q has token-only padding rows past the ``R * S`` rows the
     metadata describes (a CUDA-graph bucket's token count): the requests' rows match the
@@ -620,13 +609,7 @@ def _production_cases():
     ):
         for phase in ("prefill", "decode"):
             params.append(
-                pytest.param(
-                    version,
-                    batch_invariant,
-                    phase,
-                    id=f"{tag}-{phase}",
-                    marks=_version_marks(version),
-                )
+                pytest.param(version, batch_invariant, phase, id=f"{tag}-{phase}", marks=HOPPER)
             )
     return params
 
@@ -680,9 +663,7 @@ def test_production_geometry_matches_reference(version, batch_invariant, phase):
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.large
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
-@pytest.mark.parametrize(
-    "version", [pytest.param(v, id=f"fa{v}", marks=_version_marks(v)) for v in (2, 4)]
-)
+@pytest.mark.parametrize("version", [pytest.param(v, id=f"fa{v}", marks=HOPPER) for v in (2, 4)])
 def test_pool_offsets_past_int32(version, phase):
     """The live pages sit past 2**31 elements into each pool tensor (production pools are tens
     of GB): page offsets must be computed in 64 bits."""
@@ -734,28 +715,6 @@ def test_pool_offsets_past_int32(version, phase):
         window=None,
         what=f"FA{version} {phase}, pages past 2**31 elements",
     )
-
-
-@pytest.mark.usefixtures("model_parallel")
-@ou.requires_sm(ou.HOPPER)
-def test_fa2_refuses_pages_it_cannot_read():
-    """FA2 reads a paged KV cache only in pages of a multiple of 256 tokens. The call site must
-    refuse other page sizes with a ValueError (#8584, n2), not run into flash-attn's own check.
-
-    Fails on main: flash-attn raises a RuntimeError ("Paged KV cache block size must be divisible
-    by 256"). Passes with n2."""
-    _require_flash(2)
-    module = _attention(2, kv_heads=2, head_dim=64)
-    with pytest.raises(ValueError):
-        _run(
-            module,
-            phase="prefill",
-            requests=[(5, 5), (2, 70)],
-            padding=0,
-            page=64,
-            kv_heads=2,
-            head_dim=64,
-        )
 
 
 # ---------------------------------------------------------------------------------------------

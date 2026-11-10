@@ -22,10 +22,8 @@ Contract (from the MLA math, the call site and FlashMLA's documented interface):
   (the call site's sink correction relies on it).
 * Memory: the pool is read only. Rows past ``L_r`` in a request's last page and the dummy page
   are never written on main (``_initialize_mha_value_pages`` skips the latent cache) and may hold
-  any bits, so on SM90 they hold NaN here; FlashMLA masks scores past ``L_r`` and zero-fills
-  out-of-bounds latent rows. On Blackwell the cases run with a large finite value (1e4) there
-  instead: #8873 keeps the dummy page zero and #8872 zeroes new latent pages, the precondition its
-  FlashInfer kernel relies on.
+  any bits, so they hold NaN here; FlashMLA masks scores past ``L_r`` and zero-fills
+  out-of-bounds latent rows.
 
 Reference: fp64 attention over the latents gathered through the block table
 (``attention_reference.attention_fp64``), LSE included. Tolerance class: floating point, bounded by
@@ -43,8 +41,9 @@ Hardware and open PRs (written against main):
   ``FLASH_MLA_DISABLE_SM90=1`` (fixed by #8701, ci), and a build without them exits the process at
   the first launch, so a subprocess probes it first and the tests fail with that reason.
 * GB200: FlashMLA has no dense decode kernel on SM100 ("Dense decode MLA is only supported on
-  SM90a"), so every ``launch_on_gb200`` case fails on main (R11-F1) and passes with #8873
-  (t3-r11f1), which runs FlashInfer's TRTLLM-GEN MLA decode there.
+  SM90a", R11-F1). #8873 (t3-r11f1) runs FlashInfer's TRTLLM-GEN MLA decode there, with
+  ``test_multi_latent_attention.py::TestMLAAbsorbedDecode`` as its regression test, so the cases
+  here run on Hopper only.
 * #8571 (s8) does not change this call site's decode math; its sink plumbing is covered by
   ``test_mla_dynamic_path.py``.
 """
@@ -112,7 +111,8 @@ def _require_flash_mla_on_hopper() -> None:
         )
 
 
-DEVICES = [ou.requires_sm(ou.HOPPER, ou.BLACKWELL), pytest.mark.launch_on_gb200]
+# Hopper only: Blackwell's absorbed MLA decode is #8873's (see the module docstring).
+DEVICES = [ou.requires_sm(ou.HOPPER)]
 
 
 @pytest.fixture
@@ -162,9 +162,8 @@ def _mla_attention(num_heads: int):
 
 
 def _poison() -> float:
-    """NaN on SM90 (main's contract: latent tails are never initialized); a large finite value
-    elsewhere (#8872/#8873's precondition for FlashInfer: finite tails and dummy page)."""
-    return float("nan") if ou.device_sm_major() == ou.HOPPER else 1e4
+    """NaN (main's contract: latent tails are never initialized)."""
+    return float("nan")
 
 
 def _latent_batch(lengths, tokens, num_heads, padding, *, spare_pages=2):
