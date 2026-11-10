@@ -91,6 +91,8 @@ def test_post_training_step_callbacks_check_the_model_dp_groups():
         profiling=SimpleNamespace(use_nsys_profiler=False, use_pytorch_profiler=False),
         # The straggler detector is a section of the run config; None leaves it off.
         straggler=None,
+        # Main's #8851 reads autoresume from the run config's fault-tolerance section.
+        fault_tolerance=SimpleNamespace(adlr_autoresume=False, adlr_autoresume_interval=1000),
     )
     check = mock.Mock(return_value=True)
 
