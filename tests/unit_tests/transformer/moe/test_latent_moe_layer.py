@@ -1,14 +1,22 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+from megatron.core import process_groups_config
 from megatron.core.extensions import transformer_engine as transformer_engine_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    enable_strict_process_group_fallbacks,
+)
 from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -155,6 +163,66 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
         "gtp_remat_group" not in kwargs and "gtp_replica_group" not in kwargs
         for _, kwargs in _RecordingInferenceLinear.calls
     )
+
+
+def test_latent_projections_without_a_gtp_remat_group_warn_as_the_layer(monkeypatch):
+    """A collection without gtp_remat falls back to the global group; the warning names MoELayer."""
+    # The collection of the test above, without the gtp_remat field.
+    pg_collection = ProcessGroupCollection(
+        tp=_FakeProcessGroup(),
+        ep=_FakeProcessGroup(),
+        dp_cp=_FakeProcessGroup(),
+        cp=None,
+        expt_tp=None,
+        tp_ep=None,
+        tp_cp=None,
+        tp_dp_cp=None,
+    )
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=1,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="allgather",
+        moe_ffn_hidden_size=16,
+        moe_latent_size=4,
+        use_cpu_initialization=True,
+        add_bias_linear=False,
+        gtp_remat_opt_in_modules=["moe_latent_proj"],
+    )
+    submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
+    # The global grid has GTP weight remat off.
+    global_groups = Mock(return_value=ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None))
+
+    _RecordingLinear.calls.clear()
+    monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
+    monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
+    monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", global_groups)
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        MoELayer(config, submodules, pg_collection=pg_collection)
+
+    fallbacks = [
+        str(w.message) for w in record if issubclass(w.category, ProcessGroupFallbackWarning)
+    ]
+    assert len(fallbacks) == 1
+    assert fallbacks[0].startswith("MoELayer was called without `pg_collection.gtp_remat`")
+    global_groups.assert_called_once_with(required_pgs=["gtp_remat", "expt_gtp_remat"])
+    assert len(_RecordingLinear.calls) == 2
+    assert all(kwargs["gtp_remat_group"] is None for _, kwargs in _RecordingLinear.calls)
+
+    # Strict mode raises before the layer reads the global grid.
+    global_groups.reset_mock()
+    with warnings.catch_warnings():
+        enable_strict_process_group_fallbacks()
+        with pytest.raises(ProcessGroupFallbackWarning, match="^MoELayer was called without"):
+            MoELayer(config, submodules, pg_collection=pg_collection)
+    global_groups.assert_not_called()
 
 
 class TestLatentMoELayer:

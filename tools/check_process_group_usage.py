@@ -63,6 +63,11 @@ A read that is warned only through data flow, for example under a later ``if gro
 is *unwarned*. A read that gains its warning is a conversion; an allowlisted warned read that
 loses it fails like a new read.
 
+``resolve_gtp_remat_group(..., owner=None)`` leaves the warning to its caller, so the check holds
+it to the same rule: the call is ``guarded`` only when a fallback warning dominates it. Without
+one it is the unwarned ``shim`` read ``resolve_gtp_remat_group(owner=None)``, which fails like a
+new read. Only the constant ``None`` is recognized.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
@@ -155,7 +160,8 @@ PARALLEL_STATE_MODULES = ("megatron.core.parallel_state", "megatron.core.mpu")
 SHIM = "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
 # The binding that ``from module import *`` makes, under a name no identifier can have.
 STAR = "*"
-# The most times a file is visited to follow attribute aliases of attribute aliases.
+# The most times a file is visited to follow attribute aliases of attribute aliases, and aliases
+# assigned to names declared global or nonlocal.
 MAX_ALIAS_PASSES = 10
 
 # The helpers of process_groups_config.py that read the global grid when the caller omits its
@@ -194,6 +200,22 @@ ALIAS_TARGETS = {
 WARNED = ":warned"
 FALLBACK_WARNING = "megatron.core.process_groups_config.warn_global_process_group_fallback"
 FALLBACK_BLOCK = "megatron.core.process_groups_config.global_process_group_fallback"
+
+# resolve_gtp_remat_group(..., owner=None) reads the grid without warning, for a caller that has
+# warned already. Such a call is guarded when a fallback warning dominates it; without one it is
+# this unwarned shim read.
+GTP_RESOLVER = "megatron.core.process_groups_config.resolve_gtp_remat_group"
+SILENT_GTP_READ = "shim:resolve_gtp_remat_group(owner=None)"
+
+
+def _passes_owner_none(call: ast.Call) -> bool:
+    """True if ``call`` passes the constant ``owner=None``."""
+    return any(
+        keyword.arg == "owner"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is None
+        for keyword in call.keywords
+    )
 
 
 def _is_deprecated_accessor(name: str) -> bool:
@@ -369,8 +391,9 @@ def _moved_bindings(tree, source):
 
     Returns ``{id(scope node): {name: [(position, target), ...]}}``. A function or class body
     that declares a name ``global`` binds it in the module, and one that declares it ``nonlocal``
-    binds it in the nearest enclosing function that binds it. The events keep their positions and
-    are resolved in the scope they move to.
+    binds it in the nearest enclosing function that binds it. The events keep their positions. An
+    expression assigned to such a name is still resolved in the body that assigns it, where its
+    names are bound (_Scope.written).
     """
     moved = {}
     # Only a source with one of the words can declare a name; skip the walk of the others.
@@ -429,10 +452,14 @@ class _Scope:
     def __init__(self, kind, node, parent, moved):
         self.kind = kind
         self.events, declared = _scope_bindings(node)
+        # The expressions that the body assigns to the names it binds in another scope.
+        self.written = []
         if kind != "module":
             # The body binds and reads these names in the module or an enclosing function.
             for name in declared:
-                self.events.pop(name, None)
+                self.written += [
+                    target for _, target in self.events.pop(name, []) if not isinstance(target, str)
+                ]
         for name, events in moved.get(id(node), {}).items():
             self.events.setdefault(name, []).extend(events)
         self.parent = parent
@@ -452,22 +479,37 @@ def _violations_in(path: pathlib.Path):
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     moved = _moved_bindings(tree, source)
+    # The expressions among the moved events, by id.
+    written = {
+        id(target)
+        for names in moved.values()
+        for events in names.values()
+        for _, target in events
+        if not isinstance(target, str)
+    }
 
     class Visitor(ast.NodeVisitor):
         """Attach a stable enclosing scope to each reference to the global grid."""
 
-        def __init__(self, attribute_aliases):
+        def __init__(self, attribute_aliases, written_paths):
             self.scope = []
             self.hits = []
             self.scopes = [_Scope("module", tree, None, moved)]
             # What each binding event refers to, once resolved (_target).
             self.targets = {}
+            # What each expression assigned to a name declared global or nonlocal refers to in
+            # the body that assigns it: as the previous pass found it, and as this pass does.
+            self.written_paths = written_paths
+            self.found_paths = {}
             # Whether a fallback warning dominates the statement being visited.
             self.warned = False
             # Attribute spellings, such as "self.grid", that alias a module or class of
             # megatron: those found by the previous pass, and those this pass finds.
             self.attribute_aliases = attribute_aliases
             self.found_aliases = {}
+            # The references to resolve_gtp_remat_group that are called with owner=None where no
+            # fallback warning dominates the call (SILENT_GTP_READ), by id.
+            self.silent_gtp_reads = set()
 
         def visit_FunctionDef(self, node):
             """Resolve function-local imports independently of sibling and class bindings."""
@@ -488,6 +530,12 @@ def _violations_in(path: pathlib.Path):
             current = self.scopes[-1]
             parent = current.parent if current.kind == "class" else current
             self.scopes.append(_Scope(kind, node, parent, moved))
+            # Resolve here what the body assigns to names bound in another scope; the next pass
+            # follows the aliases among it where those names are read (_target).
+            for value in self.scopes[-1].written:
+                path = self._path(value, self.scopes[-1])
+                if path in ALIAS_TARGETS:
+                    self.found_paths[id(value)] = path
             self.scope.append(node.name)
             # A function body runs when it is called, not where it is defined; a class body runs
             # in place.
@@ -549,9 +597,15 @@ def _violations_in(path: pathlib.Path):
             function is not followed: it is a reference, which counts where the assignment is.
             Each event is resolved once: the events of ``x = x.y`` repeated in one scope would
             otherwise resolve each earlier one again, in time exponential in their number.
+            An expression that a ``global`` or ``nonlocal`` declaration moved to ``scope`` is
+            resolved in the body that assigns it: a module imported there is an alias, and a
+            parameter of that body is not, whatever its name refers to in ``scope``. The previous
+            pass resolved it there (_visit_scope); until then it refers to nothing.
             """
             if isinstance(target, str):
                 return target
+            if id(target) in written:
+                return self.written_paths.get(id(target), "")
             key = (id(target), id(scope))
             if key not in self.targets:
                 # An event that its own resolution reaches again refers to nothing.
@@ -568,24 +622,28 @@ def _violations_in(path: pathlib.Path):
             global grid by then. Other bindings never hide an earlier import or alias (a
             conservative choice for branches and loops), but a name bound in the scope without a
             preceding one is a local value, not a module.
+
+            The events are resolved from the oldest on, so that an assignment that refers to the
+            name's previous value, such as ``x = x.y``, finds that value resolved. From the most
+            recent on, each one would resolve the one before it first, and a few hundred of them
+            in a row would exceed the recursion limit.
             """
-            for start, target in sorted(events, key=lambda event: event[0], reverse=True):
+            resolved = ""
+            for start, target in sorted(events, key=lambda event: event[0]):
                 if start < position:
-                    resolved = self._target(target, scope)
-                    if resolved:
-                        return resolved
-            return ""
+                    resolved = self._target(target, scope) or resolved
+            return resolved
 
         def _seen_by_nested_scopes(self, name, scope):
-            """Return what ``name`` of ``scope`` refers to when a nested scope runs later."""
+            """Return what ``name`` of ``scope`` refers to when a nested scope runs later: its
+            most recent import or alias, resolved from the oldest on as in _binding_at."""
             if name not in scope.seen:
+                # Until all are resolved, the name refers to nothing for one that reads it again.
                 scope.seen[name] = ""
-                events = sorted(scope.events[name], key=lambda event: event[0], reverse=True)
-                for _, target in events:
-                    resolved = self._target(target, scope)
-                    if resolved:
-                        scope.seen[name] = resolved
-                        break
+                resolved = ""
+                for _, target in sorted(scope.events[name], key=lambda event: event[0]):
+                    resolved = self._target(target, scope) or resolved
+                scope.seen[name] = resolved
             return scope.seen[name]
 
         def _enclosing(self, name, scope):
@@ -605,15 +663,22 @@ def _violations_in(path: pathlib.Path):
             if found is not None:
                 return found
             # A star import binds the public names of its module; follow only those the check
-            # counts or follows, so that builtins such as getattr keep their meaning.
-            star = self._binding_at(scope.events.get(STAR, []), position, scope)
-            star = star or self._enclosing(STAR, scope)
-            if star == "megatron.core" and name == "mpu":
-                # megatron.core.__all__ exports parallel_state but not mpu.
-                return name
-            path = f"{star}.{name}"
-            if star and not name.startswith("_") and (_classify(path) or path in ALIAS_TARGETS):
-                return path
+            # counts or follows, and the fallback warning and block that make a read warned, so
+            # that builtins such as getattr keep their meaning. A later star import adds its
+            # names and leaves those of an earlier one bound: try the modules of all that
+            # precede the reference, the most recent first, then those of the enclosing scopes.
+            while scope is not None and not name.startswith("_"):
+                for start, module in sorted(scope.events.get(STAR, []), reverse=True):
+                    path = f"{module}.{name}"
+                    followed = path in ALIAS_TARGETS or path in (FALLBACK_WARNING, FALLBACK_BLOCK)
+                    # megatron.core.__all__ exports parallel_state but not mpu.
+                    if (
+                        (position is None or start < position)
+                        and (module, name) != ("megatron.core", "mpu")
+                        and (_classify(path) or followed)
+                    ):
+                        return path
+                scope, position = scope.parent, None
             return name
 
         def _path(self, node, scope=None):
@@ -685,6 +750,8 @@ def _violations_in(path: pathlib.Path):
             if not path and isinstance(node, ast.Call):
                 path = self._named_attribute(node, ("setattr", "delattr"))
             identity = _classify(path)
+            if id(node) in self.silent_gtp_reads:
+                identity = SILENT_GTP_READ
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 if self.warned and identity.split(":", 1)[0] not in (GUARDED, PRIVATE):
@@ -703,8 +770,18 @@ def _violations_in(path: pathlib.Path):
 
         def visit_Call(self, node):
             """Record ``getattr()``, ``setattr()`` or ``delattr()`` of a counted function or
-            attribute with a constant name."""
+            attribute with a constant name, and mark the resolver that an unwarned
+            ``resolve_gtp_remat_group(..., owner=None)`` calls."""
             self._reference(node)
+            # resolve_gtp_remat_group(..., owner=None) does not warn: unless a fallback warning
+            # dominates the call, the reference to the resolver that it calls, however it was
+            # imported, is the unwarned read rather than a guarded one.
+            if (
+                not self.warned
+                and _passes_owner_none(node)
+                and self._path(node.func) == GTP_RESOLVER
+            ):
+                self.silent_gtp_reads.add(id(node.func))
             self.generic_visit(node)
 
         def visit_Assign(self, node):
@@ -735,15 +812,16 @@ def _violations_in(path: pathlib.Path):
             for spelling in spellings:
                 self.found_aliases.setdefault(spelling, path)
 
-    # An attribute alias can be assigned after the code that uses it, or alias another one: visit
-    # again with the aliases found until no new one appears.
-    aliases = {}
+    # An attribute alias can be assigned after the code that uses it, or alias another one, and
+    # an alias assigned to a name declared global or nonlocal is known to the pass after the one
+    # that resolves it: visit again with the aliases found until no new one appears.
+    aliases, paths = {}, {}
     for _ in range(MAX_ALIAS_PASSES):
-        visitor = Visitor(aliases)
+        visitor = Visitor(aliases, paths)
         visitor.visit(tree)
-        if visitor.found_aliases == aliases:
+        if (visitor.found_aliases, visitor.found_paths) == (aliases, paths):
             break
-        aliases = visitor.found_aliases
+        aliases, paths = visitor.found_aliases, visitor.found_paths
     return visitor.hits
 
 

@@ -34,6 +34,7 @@ GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
 GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
 GTP_IMPORT = "from megatron.core.process_groups_config import resolve_gtp_remat_group\n"
 GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False)"
+SILENT_GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False, owner=None)"
 WARN_IMPORT = "from megatron.core.process_groups_config import warn_global_process_group_fallback\n"
 WARN = "warn_global_process_group_fallback('f')"
 WARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group:warned"
@@ -135,7 +136,7 @@ class TestDetection(unittest.TestCase):
             ),
             (
                 "from megatron.core import process_groups_config as pgc\n",
-                "pgc.resolve_gtp_remat_group(None, False, owner=None)",
+                "pgc.resolve_gtp_remat_group(None, False, owner='Model')",
                 "resolve_gtp_remat_group",
             ),
             (
@@ -464,6 +465,14 @@ class TestDetection(unittest.TestCase):
         for case, body in cases.items():
             with self.subTest(case=case):
                 self.assertEqual(self.hits(IMPORT + WARN_IMPORT + body), [WARNED_HIT])
+        # A star import binds the warning and the block too.
+        star = "from megatron.core.process_groups_config import *\n"
+        for body in (
+            f"def f():\n    {WARN}\n    {CALL}\n",
+            f"def f():\n    with global_process_group_fallback('f'):\n        {CALL}\n",
+        ):
+            with self.subTest(case="through a star import", body=body):
+                self.assertEqual(self.hits(IMPORT + star + body), [WARNED_HIT])
 
     def test_reads_that_no_fallback_warning_dominates_are_unwarned(self):
         cases = {
@@ -512,6 +521,53 @@ class TestDetection(unittest.TestCase):
             self.hits(WARN_IMPORT + GUARDED_IMPORT + f"def f():\n    {WARN}\n    {GUARDED_CALL}"),
             ["f:guarded:resolve_process_groups"],
         )
+
+    def test_gtp_resolver_with_owner_none_is_guarded_only_after_a_fallback_warning(self):
+        # resolve_gtp_remat_group(..., owner=None) does not warn, so the warning of its caller
+        # has to dominate it like any other read.
+        prefix = GTP_IMPORT + WARN_IMPORT
+        guarded = ["f:guarded:resolve_gtp_remat_group"]
+        self.assertEqual(
+            self.hits(prefix + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n"), guarded
+        )
+        unwarned = {
+            "no warning": f"def f():\n    {SILENT_GTP_CALL}\n",
+            "after a branch that warns": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {SILENT_GTP_CALL}\n"
+            ),
+            "through a module alias": (
+                "from megatron.core import process_groups_config as pgc\n"
+                "def f():\n    pgc.resolve_gtp_remat_group(None, False, owner=None)\n"
+            ),
+        }
+        for case, body in unwarned.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(prefix + body), ["f:" + checker.SILENT_GTP_READ])
+        # The rule holds however the resolver and the warning are reached.
+        star = "from megatron.core.process_groups_config import *\n"
+        module = "from megatron.core import process_groups_config as pgc\n"
+        by_name = "getattr(pgc, 'resolve_gtp_remat_group')(None, False, owner=None)"
+        self.assertEqual(
+            self.hits(star + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n"), guarded
+        )
+        self.assertEqual(
+            self.hits(module + WARN_IMPORT + f"def f():\n    {WARN}\n    {by_name}\n"), guarded
+        )
+        followed = {
+            "through a star import": star + f"def f():\n    {SILENT_GTP_CALL}\n",
+            "through getattr()": module + f"def f():\n    {by_name}\n",
+            "in a lambda after a warning": (
+                prefix + f"def f():\n    {WARN}\n    return lambda: {SILENT_GTP_CALL}\n"
+            ),
+        }
+        for case, source in followed.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), ["f:" + checker.SILENT_GTP_READ])
+        # A named owner warns for itself, and only the constant None is recognized.
+        for owner in ("'Model'", "name"):
+            with self.subTest(owner=owner):
+                call = f"resolve_gtp_remat_group(None, False, owner={owner})"
+                self.assertEqual(self.hits(prefix + f"def f(name):\n    {call}\n"), guarded)
 
     def test_counts_every_deprecated_parallel_state_function(self):
         # Megatron Core's own calls do not emit ParallelStateDeprecationWarning, so the ratchet is
@@ -646,6 +702,32 @@ class TestDetection(unittest.TestCase):
                 f"def use():\n    return {call}\n",
                 [],
             ),
+            # The assigned value is resolved where it is written, not where the name is bound.
+            "a global alias of a module imported in the function": (
+                "grid = None\ndef init():\n    global grid\n"
+                "    from megatron.core import parallel_state\n    grid = parallel_state\n"
+                f"def use():\n    return {call}\n",
+                ["use"],
+            ),
+            "a nonlocal alias of a module imported in the function": (
+                "def outer():\n    grid = None\n"
+                "    def init():\n        nonlocal grid\n"
+                "        from megatron.core import parallel_state\n        grid = parallel_state\n"
+                f"    def use():\n        return {call}\n",
+                ["outer.use"],
+            ),
+            "a global name assigned a parameter named like the imported module": (
+                IMPORT + "grid = None\ndef init(parallel_state):\n    global grid\n"
+                f"    grid = parallel_state\ndef use():\n    return {call}\n",
+                [],
+            ),
+            # The local alias is resolved while the global name is: it must not come out empty.
+            "a global alias assigned back from a local alias of it": (
+                IMPORT + "grid = parallel_state\ndef outer():\n    local = grid\n"
+                "    def init():\n        global grid\n        grid = local\n"
+                "    def use():\n        return local.get_tensor_model_parallel_group()\n",
+                ["outer.use"],
+            ),
         }
         for case, (source, scopes) in cases.items():
             with self.subTest(case=case):
@@ -671,6 +753,32 @@ class TestDetection(unittest.TestCase):
         worker.start()
         worker.join(timeout=10)
         self.assertEqual(hits, [[]], "resolving 60 reassignments took more than 10 s")
+
+    def test_many_reassignments_of_a_name_resolve_within_the_recursion_limit(self):
+        # A function defined above the assignments of a name, or one that declares the name
+        # global, sees them all at once. Resolved from the most recent on, each resolved the one
+        # before it first, and 200 of them raised RecursionError.
+        hit = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+        cases = {
+            "below a function that reads the name": (
+                "def f():\n    return x.y\nx = a\n" + "x = x.attr\n" * 300,
+                [],
+            ),
+            "below a function that reads an alias": (
+                IMPORT + "def f():\n    return x.get_tensor_model_parallel_group()\n"
+                "x = parallel_state\n" + "x = x.replace('a', 'b')\n" * 300,
+                [hit],
+            ),
+            "of a global name": (
+                "x = a\ndef init():\n    global x\n"
+                + "    x = x or y\n" * 300
+                + "def f():\n    return x.y\n",
+                [],
+            ),
+        }
+        for case, (source, hits) in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), hits)
 
     def test_attribute_aliases_through_self_cls_and_the_class(self):
         hit = "Model.rank:accessor:parallel_state.get_tensor_model_parallel_group"
@@ -853,6 +961,29 @@ class TestDetection(unittest.TestCase):
                 "def f():\n    return resolve_process_groups" + GUARDED_ARGS + "\n"
             ),
             ["f:guarded:resolve_process_groups"],
+        )
+        # A later star import leaves the names of an earlier one bound.
+        self.assertEqual(
+            self.hits(
+                "from megatron.core.parallel_state import *\nfrom torch import *\n"
+                "def f():\n    return get_tensor_model_parallel_group()\n"
+            ),
+            ["f:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+        self.assertEqual(
+            self.hits(
+                "from ..process_groups_config import *\nfrom .hybrid_block import *\n"
+                "resolve_process_groups" + GUARDED_ARGS + "\n"
+            ),
+            ["<module>:guarded:resolve_process_groups"],
+        )
+        # One that follows a module-level reference has not bound its names yet.
+        self.assertEqual(
+            self.hits(
+                "from torch import *\nget_tensor_model_parallel_group()\n"
+                "from megatron.core.parallel_state import *\n"
+            ),
+            [],
         )
         # megatron.core exports parallel_state, but not mpu.
         self.assertEqual(
@@ -1245,6 +1376,40 @@ class TestRatchet(unittest.TestCase):
             {"megatron/core/sample.py": ["build:guarded:resolve_gtp_remat_group"]},
         )
 
+    def test_gtp_resolver_with_owner_none_that_loses_its_warning_fails(self):
+        prefix = GTP_IMPORT + WARN_IMPORT
+        self.write_baseline(prefix + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.assertEqual(
+            json.loads(original)["allowed"],
+            {"megatron/core/sample.py": ["f:guarded:resolve_gtp_remat_group"]},
+        )
+        self.assertEqual(self.run_check(), 0)
+        self.source.write_text(prefix + f"def f():\n    {SILENT_GTP_CALL}\n", encoding="utf-8")
+        self.assertEqual(checker._counts(checker.scan())["unwarned"], 1)
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 1)
+        self.assertEqual(self.allowlist.read_bytes(), original)
+
+    def test_unwarned_gtp_resolver_with_owner_none_does_not_replace_a_read(self):
+        # After a fallback warning the call is guarded and replaces the warned read of its scope
+        # like any guarded call. Without one it is a new unwarned read.
+        self.write_baseline(IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.source.write_text(GTP_IMPORT + f"def f():\n    {SILENT_GTP_CALL}\n", encoding="utf-8")
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 1)
+        self.assertEqual(self.allowlist.read_bytes(), original)
+        self.source.write_text(
+            GTP_IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {SILENT_GTP_CALL}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": ["f:guarded:resolve_gtp_remat_group"]},
+        )
+
     def test_guarded_call_without_a_replaced_read_is_new(self):
         other = self.core / "other.py"
         read_in_build = IMPORT + "def build():\n    " + CALL
@@ -1369,6 +1534,82 @@ class TestTree(unittest.TestCase):
             stale,
             "UNWARNED_READS lists reads that are now warned or gone; remove them:\n"
             + "\n".join(stale),
+        )
+
+
+def _testmon_mappings(text):
+    """Return ``[(source_dirs, {platform: tests})]`` for testmon_mandatory_tests.yaml.
+
+    The file is read line by line: the job that runs this file by path has no YAML parser.
+    """
+    mappings, items = [], None
+    for line in text.splitlines():
+        entry = line.strip()
+        if entry.startswith("#"):
+            continue
+        if entry == "- source_dirs:":
+            items = []
+            mappings.append((items, {}))
+        elif entry.endswith(":") and mappings and entry != "test_buckets:":
+            items = mappings[-1][1].setdefault(entry[:-1], [])
+        elif entry.startswith("- ") and items is not None:
+            items.append(entry[2:])
+    return mappings
+
+
+class TestTestmonMapping(unittest.TestCase):
+    """A selective unit-test run adds the stdlib checks when a file that they scan changes.
+
+    The checks read the source as text, so Testmon never selects them for a source change:
+    tests/unit_tests/testmon_mandatory_tests.yaml maps the folders they scan and the top-level
+    scripts to them. tests/test_utils/test_unit_testmon_mandatory.py tests that mapping with the
+    code that applies it, but no CI job runs that folder. This test reads the mapping as text, so
+    the workflow step that runs this file fails when a scanned folder or a top-level script has
+    no entry.
+    """
+
+    CHECKS = (
+        "test_check_process_group_usage.py",
+        "test_global_memory_buffer_imports.py",
+        "test_parallel_state_accessor_uses.py",
+        "test_removal_versions.py",
+    )
+
+    def test_a_change_of_a_scanned_file_selects_the_checks(self):
+        unit_tests = REPO_ROOT / "tests" / "unit_tests"
+        folders = {
+            path.relative_to(checker.REPO_ROOT).parts[0]
+            for path in (checker.SCAN_ROOT, checker.ALLOWLIST)
+        }
+        # The checker's test scans what the checker does; each other check names its folders.
+        for name in self.CHECKS[1:]:
+            spec = importlib.util.spec_from_file_location(name[:-3], unit_tests / name)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            folders.update(module.SCANNED_FOLDERS)
+        changed = [f"{folder}/example.py" for folder in sorted(folders)]
+        changed += sorted(path.name for path in REPO_ROOT.glob("*.py"))
+
+        text = (unit_tests / "testmon_mandatory_tests.yaml").read_text(encoding="utf-8")
+        mappings = _testmon_mappings(text)
+        checks = {f"tests/unit_tests/{name}" for name in self.CHECKS}
+        unmapped = {}
+        for path in changed:
+            # A source entry that is not a glob matches itself and the files under it.
+            selected = {
+                test
+                for sources, buckets in mappings
+                if any(path == source or path.startswith(source + "/") for source in sources)
+                for test in buckets.get("dgx_h100", ())
+            }
+            if checks - selected:
+                unmapped[path] = sorted(checks - selected)
+        self.assertEqual(
+            unmapped,
+            {},
+            "tests/unit_tests/testmon_mandatory_tests.yaml does not add these checks to a "
+            "selective H100 run that changes the file: list its folder, or the top-level "
+            "script, under the source_dirs of the mapping that holds the checks.",
         )
 
 

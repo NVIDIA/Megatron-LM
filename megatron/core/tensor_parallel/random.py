@@ -686,13 +686,16 @@ def model_parallel_cuda_manual_seed(
                 "state is not initialized, so there is no group to read the rank from. Set "
                 "them in pg_collection, to None when an axis is off, or pass the ranks."
             )
-    if None in (gtp_remat_rank, egtp_remat_rank, gtp_remat_world_size, egtp_remat_world_size):
-        if pg_collection is None:
-            warn_global_process_group_fallback(
-                "model_parallel_cuda_manual_seed", deprecated_in="0.21", removed_in="0.23"
-            )
-        gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False, owner=None)
-        egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True, owner=None)
+    # resolve_gtp_remat_group warns before it reads the global group. For a collection it names
+    # the unset group that collection_sets() has warned about, which does not warn a second time.
+    if gtp_remat_rank is None or gtp_remat_world_size is None:
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert=False, owner="model_parallel_cuda_manual_seed"
+        )
+    if egtp_remat_rank is None or egtp_remat_world_size is None:
+        egtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert=True, owner="model_parallel_cuda_manual_seed"
+        )
     if tp_rank is None:
         tp_rank = get_pg_rank(tp_group)
     if ep_rank is None:

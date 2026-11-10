@@ -576,9 +576,16 @@ def test_the_collection_differs_from_the_global_grid(grids):
 
 def test_the_block_rejects_global_reads_and_fallbacks(monkeypatch):
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
-    with pytest.raises(AssertionError, match=r"probe failed .*get_tensor_model_parallel_group"):
+    # Match the text of forbid_global_process_groups(): a call from this file also warns, and the
+    # warning, an error in the block, names the accessor too.
+    forbidden = r"probe failed .*parallel_state\.{}\(\) reads the global parallel grid"
+    with pytest.raises(AssertionError, match=forbidden.format("get_tensor_model_parallel_group")):
         with _on_the_collection_only("probe"):
             parallel_state.get_tensor_model_parallel_group()
+    # So does the registry getter, which returns the same groups and emits no warning.
+    with pytest.raises(AssertionError, match=forbidden.format("get_registered_process_groups")):
+        with _on_the_collection_only("probe"):
+            parallel_state.get_registered_process_groups()
     # A fallback that already warned in this process raises in the block all the same.
     owner = "test_process_group_collection_end_to_end probe"
     with pytest.warns(ProcessGroupFallbackWarning):

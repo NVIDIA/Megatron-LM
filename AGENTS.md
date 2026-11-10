@@ -83,7 +83,9 @@ lists their replacements and describes the warnings and checks summarized here.
   emits a `ProcessGroupFallbackWarning` dated by `deprecated_in` and
   `removed_in`: 0.21 and 0.23, the defaults, for a fallback that first warns
   in 0.21. `resolve_gtp_remat_group(owner=None)` does not warn; it is only for
-  a caller that has already warned. A comment does not make a read a fallback.
+  a caller that has already warned, and the checker below counts it as an
+  unwarned read where no fallback warning precedes it. A comment does not make
+  a read a fallback.
 - In `megatron/core`, `tools/check_process_group_usage.py` counts every use,
   called or not and through the aliases, `getattr()` and module lookups it can
   follow, of the deprecated functions, of `use_mpu_process_groups()` and

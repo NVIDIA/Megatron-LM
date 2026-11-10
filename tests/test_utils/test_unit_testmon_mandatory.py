@@ -113,16 +113,18 @@ def test_repository_maps_the_parallel_state_checks_to_what_they_scan(monkeypatch
     # holds them must run them.
     checks = [
         "tests/unit_tests/test_check_process_group_usage.py",
+        "tests/unit_tests/test_global_memory_buffer_imports.py",
         "tests/unit_tests/test_parallel_state_accessor_uses.py",
         "tests/unit_tests/test_removal_versions.py",
     ]
     checker = _module_at(ROOT / "tools/check_process_group_usage.py")
     folders = {
-        *_module_at(ROOT / checks[1]).SCANNED_FOLDERS,
-        *_module_at(ROOT / checks[2]).SCANNED_FOLDERS,
         checker.SCAN_ROOT.relative_to(ROOT).parts[0],
         checker.ALLOWLIST.relative_to(ROOT).parts[0],
     }
+    # The checker's test scans what the checker does; each other check names its folders.
+    for check in checks[1:]:
+        folders.update(_module_at(ROOT / check).SCANNED_FOLDERS)
     changed = [f"{folder}/example.py" for folder in sorted(folders)]
     changed += sorted(path.name for path in ROOT.glob("*.py"))
     mappings = mandatory.load_mappings(CONFIG_PATH)

@@ -179,7 +179,9 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   with an error. Its allowlist of the existing calls records which ones are warned: preceded, in
   the same function, by a `warn_global_process_group_fallback()` call in their block or in a
   block that contains it, or inside a `with global_process_group_fallback(...)` block. A warned
-  call that loses its warning is an error too.
+  call that loses its warning is an error too. `resolve_gtp_remat_group(..., owner=None)` does
+  not warn, so the check counts it as guarded only where such a warning precedes it, and as an
+  unwarned call elsewhere.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
@@ -205,8 +207,9 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   the allowlist, and each read that the checker counts in Megatron Core's code, is warned or
   guarded, apart from those the test lists (none now), and that the checker counts every helper of
   `process_groups_config.py` that reads the grid. A new unwarned read in Megatron Core therefore
-  fails the job. It also fails when `tests/unit_tests/test_removal_versions.py` fails (see
-  *Removal*). The job then runs
+  fails the job. So does a folder that the checks scan, or a top-level script, that the Testmon
+  mapping described below leaves out. The job also fails when
+  `tests/unit_tests/test_removal_versions.py` fails (see *Removal*). It then runs
   `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
   as report-only steps (`continue-on-error`): they list every new call in Megatron Core, warned
   and guarded ones included, every call that lost its warning, and every deprecated call outside
@@ -214,10 +217,11 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   unwarned call in Megatron Core, one that lost its warning included. Whether a new warned
   fallback should block a pull request is still to be decided, see
   [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run these
-  three test files in the `tests/unit_tests/**/*.py` bucket, where a failure of any of them
-  fails the job. Testmon selects tests by the code they execute, and these read the files they
-  check as text, so `tests/unit_tests/testmon_mandatory_tests.yaml` adds them to a selective
-  run of a pull request that changes a file in a folder they scan or a top-level script.
+  three test files and `tests/unit_tests/test_global_memory_buffer_imports.py` in the
+  `tests/unit_tests/**/*.py` bucket, where a failure of any of them fails the job. Testmon
+  selects tests by the code they execute, and the four read the files they check as text, so
+  `tests/unit_tests/testmon_mandatory_tests.yaml` adds them to a selective run of a pull
+  request that changes a file in a folder they scan or a top-level script.
 - **Removal** is due when the version in `megatron/core/package_info.py` reaches the
   `removed_in` version of a fallback, the default of that argument, or a `*_REMOVED_IN`
   constant such as `_ACCESSOR_REMOVED_IN` in `parallel_state.py`.

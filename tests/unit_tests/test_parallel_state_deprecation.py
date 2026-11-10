@@ -458,6 +458,54 @@ def test_the_test_suite_ignores_the_warning(pytestconfig):
     )
 
 
+@pytest.mark.parametrize(
+    "module",
+    [
+        "megatron.training.training",
+        "examples.multimodal.train",
+        "tools.checkpoint.convert",
+        "tasks.finetune_utils",
+        "scripts.check_api_backwards_compatibility",
+        "pretrain_gpt",
+        "pretrain_vlm",
+        "train_rl",
+        "hybrid_builders",
+        "model_provider",
+        "__main__",
+    ],
+)
+def test_the_test_suite_raises_for_a_caller_in_this_repository(module):
+    """pyproject.toml turns the warning of this repository's code outside the tests into an error.
+
+    The filters are the ones pytest installed for this test; they match the caller's module name.
+    """
+    with pytest.raises(ParallelStateDeprecationWarning):
+        warnings.warn_explicit(
+            "deprecated", ParallelStateDeprecationWarning, "caller.py", 1, module, registry={}
+        )
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "tests.unit_tests.test_utilities",
+        "megatron.energon.loader",
+        "megatron.bridge",
+        "megatronx.training",
+        "toolsx",
+        "pretrain_gpt_copy",
+        "my_model_provider",
+    ],
+)
+def test_the_test_suite_ignores_the_tests_and_other_packages(module):
+    """The later ignore entry wins for megatron.energon and megatron.bridge; the rest match none."""
+    with warnings.catch_warnings(record=True) as record:
+        warnings.warn_explicit(
+            "deprecated", ParallelStateDeprecationWarning, "caller.py", 1, module, registry={}
+        )
+    assert record == []
+
+
 def test_calls_from_megatron_core_do_not_warn():
     """A caller whose source file is in megatron/core is exempt; core warns for its fallbacks.
 
