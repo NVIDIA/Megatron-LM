@@ -27,6 +27,22 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+def get_checkpoint_parameter_id(tensor: torch.Tensor) -> int:
+    """Return a registered local parameter identity, or the tensor's own ID."""
+    return getattr(tensor, "_checkpoint_parameter_id", id(tensor))
+
+
+def register_checkpoint_parameter(tensor: torch.Tensor, parameter: torch.Tensor) -> None:
+    """Match a checkpoint payload to its original local parameter.
+
+    Preserve shape, element order, and sharding; dtype may differ. Keep the source
+    parameter alive until matching finishes. Tensor views do not inherit this ID.
+    """
+    if tensor.shape != parameter.shape:
+        raise ValueError("Checkpoint payload and source parameter must have the same shape.")
+    tensor._checkpoint_parameter_id = get_checkpoint_parameter_id(parameter)
+
+
 class ShardedBase(ABC):
     """Base class for ShardedTensor and ShardedStateDict."""
 
