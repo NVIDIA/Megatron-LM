@@ -1881,7 +1881,12 @@ class TestMoEModules:
                 2,
                 {"moe_flex_dispatcher_backend": "deepepv2"},
                 id="flex-deepepv2-ep2",
-                marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
+                # Replays whichever DeepEP v2 buffer is installed: EPBuffer (DeepEP 2.5) or
+                # ElasticBuffer (DeepEP 2.1).
+                marks=pytest.mark.skipif(
+                    not HAVE_DEEP_EP_V2,
+                    reason="DeepEP v2 (EPBuffer or ElasticBuffer) not installed",
+                ),
             ),
         ],
     )

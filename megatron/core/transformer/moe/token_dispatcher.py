@@ -1488,8 +1488,9 @@ class _DeepepManager(_DispatchManager):
 
         if fused_dispatch is None:
             raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from "
-                "https://github.com/deepseek-ai/deepep."
+                "DeepEP (deep_ep.Buffer) is unavailable. Please install DeepEP package from "
+                "https://github.com/deepseek-ai/deepep. DeepEP 2.5 no longer provides the v1 "
+                "Buffer API; with DeepEP 2.5, use --moe-flex-dispatcher-backend deepepv2."
             )
         # None -> 20 (DeepEP's historical mcore default when moe_flex_dispatcher_num_sms is unset).
         set_deepep_num_sms(
@@ -1694,7 +1695,7 @@ class _DeepepManager(_DispatchManager):
 
 class _DeepepV2Manager(_DeepepManager):
     """
-    A manager class for the DeepEP v2 ElasticBuffer backend.
+    A manager class for the DeepEP v2 backend (EPBuffer, or ElasticBuffer before DeepEP 2.5).
 
     This keeps the original DeepEP backend isolated under "deepep", while "deepepv2"
     uses the v2 dispatch/combine APIs.
@@ -1731,8 +1732,9 @@ class _DeepepV2Manager(_DeepepManager):
 
         if deepepv2_dispatch is None:
             raise ImportError(
-                "DeepEP v2 (deep_ep.ElasticBuffer) is unavailable. Install or upgrade DeepEP "
-                "in your container following https://github.com/deepseek-ai/DeepEP#installation "
+                "DeepEP v2 is unavailable: neither deep_ep.EPBuffer (DeepEP 2.5) nor "
+                "deep_ep.ElasticBuffer (DeepEP 2.1) could be imported. Install DeepEP in your "
+                "container following https://github.com/deepseek-ai/DeepEP#installation "
                 "and ensure its CUDA, PyTorch, and NCCL requirements are met. "
                 "HybridEP also uses the deep_ep Python module and may need to be uninstalled "
                 "first; replacing it with DeepEP v2 can make the hybridep backend unavailable."
