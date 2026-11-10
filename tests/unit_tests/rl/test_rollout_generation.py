@@ -305,9 +305,7 @@ class TestConsumptionRelease:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("consumption_granularity", ["G", "B"])
-    async def test_group_submission_below_one_batch_still_delivers(
-        self, consumption_granularity
-    ):
+    async def test_group_submission_below_one_batch_still_delivers(self, consumption_granularity):
         """Group slots return only when a banked batch is consumed, so a negative lag
         (fewer slots than groups per batch, e.g. from --rl-max-inflight-requests) must
         still keep a whole batch in flight."""
