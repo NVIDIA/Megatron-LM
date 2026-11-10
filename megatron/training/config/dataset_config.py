@@ -9,10 +9,9 @@ tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the 
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Seven Core fields are owned by other container sections (the parallel
-layout with its deprecated ``hybrid_context_parallel`` alias, the validation flags): the container
-writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the
-section.
+saved with the section. Six Core fields are owned by other container sections (the parallel
+layout and the validation flags): the container writes them at ``finalize()``
+(``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
@@ -27,6 +26,7 @@ from typing import Any
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.config.utils import serialize_value
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
@@ -44,15 +44,12 @@ DATASET_FAMILIES = tuple(DATASET_CLASSES)
 # Fields of the dataset config that other container sections own: the parallel layout (the model
 # config) and the validation flags (the validation config). PretrainConfigContainer writes them at
 # finalize(), the container-oriented factory leaves them unset and the section serializes without
-# them: they are recorded once, in their owning sections. hybrid_context_parallel is the deprecated
-# alias of dynamic_context_parallel (#7047): the container folds it into the canonical field and
-# clears it, so it is neither serialized nor left set.
+# them: they are recorded once, in their owning sections.
 CONTAINER_WRITTEN_FIELDS = (
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
     "dynamic_context_parallel",
-    "hybrid_context_parallel",
     "multiple_validation_sets",
     "full_validation",
 )
@@ -283,9 +280,6 @@ class DataConfig:
         sections); Megatron Core's derived values (``mock``, ``split_matrix``, ``token_dtype_code``)
         are read-only properties, not fields, and are never written.
         """
-        from megatron.training.config.container import ConfigContainerBase
-
-        convert = ConfigContainerBase._convert_value_to_dict
         dataset = None
         if self.dataset is not None:
             cls = type(self.dataset)
@@ -293,10 +287,10 @@ class DataConfig:
             for f in fields(self.dataset):
                 if not f.init or f.name == "tokenizer" or f.name in CONTAINER_WRITTEN_FIELDS:
                     continue
-                dataset[f.name] = convert(getattr(self.dataset, f.name))
+                dataset[f.name] = serialize_value(getattr(self.dataset, f.name))
         return {
             "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
             "dataset": dataset,
-            "dataloader": convert(self.dataloader),
-            "dataset_type": convert(self.dataset_type),
+            "dataloader": serialize_value(self.dataloader),
+            "dataset_type": serialize_value(self.dataset_type),
         }
