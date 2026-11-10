@@ -27,7 +27,6 @@ from transformer_engine.pytorch import RMSNorm as TERMSNorm
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.fusions import fused_layer_norm
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
 from megatron.core.inference.inference_request import DynamicInferenceEventType
@@ -37,6 +36,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_layer_specs,
     get_gpt_mtp_block_spec,
 )
+from megatron.core.ops.norm import fused_layer_norm
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.tensor_parallel import InferenceColumnParallelLinear
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
@@ -46,7 +47,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
     TestPrefixCacheRealEngineMatrix as _PrefixEngineHarness,
