@@ -70,7 +70,7 @@ class FsdpContext:
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
-    _post_backward_hook_registered: bool
+    _post_autograd_hook_registered: bool
 
     def __init__(
         self,
@@ -99,10 +99,12 @@ class FsdpContext:
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
         self._gradient_finalization_mode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+        self.autograd_completes_execution = runtime_policy.autograd_completes_execution
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
+        self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
-        self._post_backward_hook_registered = False
+        self._post_autograd_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -242,7 +244,7 @@ class FsdpContext:
         """Require a caller-owned wait or a pending autograd completion callback."""
         if (
             self._gradient_finalization_mode is not GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-            or self._post_backward_hook_registered
+            or self._post_autograd_hook_registered
         ):
             return
         raise RuntimeError(
@@ -272,24 +274,31 @@ class FsdpContext:
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
-    def post_backward(self) -> None:
-        """Finish backward cleanup and synchronize gradients when finalization is enabled."""
-        self._run_delayed_post_backward_callbacks()
+    def _finish_execution_order(self) -> None:
+        """Finish recording or validate replay at the execution-window boundary."""
+        if not self._recording_execution_order and self.execution_order.position != 0:
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
         self._recording_execution_order = False
-        # Standalone training can call optimizer.step() immediately after backward.
-        # Wait for reductions on the last microbatch; earlier microbatches keep
-        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
-        # after its schedule completes, including delayed weight gradients.
-        if self._gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT:
-            self.finish_grad_sync()
-        self._post_backward_hook_registered = False
 
-    def _run_delayed_post_backward_callbacks(self) -> None:
-        """Run deferred module completion callbacks once."""
+    def post_backward(self) -> None:
+        """Complete the execution order after all backwards in this schedule."""
+        self._finish_execution_order()
+
+    def run_delayed_post_backward_callbacks(self) -> None:
+        """Release deferred module weights after each microbatch backward."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
+
+    def _post_autograd(self) -> None:
+        """Run deferred cleanup and the configured automatic completion and gradient wait."""
+        self.run_delayed_post_backward_callbacks()
+        self._post_autograd_hook_registered = False
+        if self.autograd_completes_execution:
+            self.post_backward()
+        if self._gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT:
+            self.finish_grad_sync()
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
@@ -300,15 +309,15 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self._post_backward_hook_registered:
+        if self._post_autograd_hook_registered:
             # Another root sharing this context already queued the completion wait.
             return
-        self._post_backward_hook_registered = True
+        self._post_autograd_hook_registered = True
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
-        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+        torch.autograd.Variable._execution_engine.queue_callback(self._post_autograd)
 
 
 def _collect_backward_order(

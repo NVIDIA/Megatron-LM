@@ -44,6 +44,7 @@ try:
         FsdpContext,
         GradientFinalizationMode,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -253,17 +254,36 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
+        prefetch_order = self.prefetch_order_for(config)
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=prefetch_order,
+                        autograd_completes_execution=not (
+                            config.pipeline_model_parallel_size > 1
+                            or config.virtual_pipeline_model_parallel_size is not None
+                        ),
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.prefetch_order is not PrefetchOrder.RECORDED
+            ):
+                raise ValueError(
+                    "Ordinary PP/VPP MFSDP v2 schedules require "
+                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
+                )
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.autograd_completes_execution
+            ):
+                raise ValueError("Ordinary PP/VPP requires autograd_completes_execution=False.")
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -283,6 +303,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    @staticmethod
+    def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
+        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
+        if not config.overlap_moe_expert_parallel_comm and (
+            config.pipeline_model_parallel_size > 1
+            or config.virtual_pipeline_model_parallel_size is not None
+        ):
+            return PrefetchOrder.RECORDED
+        return PrefetchOrder.REGISTRATION
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
