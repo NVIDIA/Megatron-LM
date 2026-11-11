@@ -13,6 +13,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
+import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import _initialize_symmetric_memory_meshes
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -212,6 +213,41 @@ def test_wraps_fsdp_unit_modules_before_root(process_group_collection):
     }
     assert child_parameter_names
     assert root_parameter_names == {"1.weight", "1.bias"}
+
+
+def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    fully_shard_context_calls = []
+    original_fully_shard_context = mcore_adapter_v2.fully_shard_context
+
+    def record_fully_shard_context(context):
+        fully_shard_context_calls.append(context.use_symmetric_memory)
+        return original_fully_shard_context(context)
+
+    monkeypatch.setattr(mcore_adapter_v2, "fully_shard_context", record_fully_shard_context)
+    FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=True,
+        ),
+        module=model,
+        pg_collection=process_group_collection,
+    )
+
+    assert fully_shard_context_calls == [True]
 
 
 def test_symmetric_memory_rendezvous_requires_initialized_mesh(distributed_setup):
