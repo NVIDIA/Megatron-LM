@@ -401,7 +401,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
-        attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
+        attn_norm_manager = self.off_interface(
+            self.offload_attn_norm, hidden_states, "attn_norm", owner=self
+        )
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
@@ -509,7 +511,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
-        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        self.mlp_norm_manager = self.off_interface(
+            self.offload_mlp_norm, hidden_states, "mlp_norm", owner=self
+        )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
@@ -1076,7 +1080,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
         self.attn_norm_manager = self.off_interface(
-            self.offload_attn_norm, hidden_states, "attn_norm"
+            self.offload_attn_norm, hidden_states, "attn_norm", owner=self
         )
         self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
             self._mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
@@ -1177,7 +1181,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
-        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        self.mlp_norm_manager = self.off_interface(
+            self.offload_mlp_norm, hidden_states, "mlp_norm", owner=self
+        )
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
             self._mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )

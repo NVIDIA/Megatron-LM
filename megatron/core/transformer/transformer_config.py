@@ -1633,16 +1633,18 @@ class TransformerConfig(ModelParallelConfig):
     thd_max_packed_sequences: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
     )
-    """Optional maximum number of THD packed sequences per microbatch, including any
-    dummy sequence appended for a padding tail. The dp_balanced packing scheduler reserves
-    that dummy slot when THD padding appends one. When set, cu_seqlens tensors are padded
-    to this size + 1 in both eager and CUDA Graph modes. THD CUDA Graph requires this value.
+    """Optional maximum number of THD packed sequences per output microbatch, including any
+    dummy sequence appended for a padding tail. Both dp_balanced and default_dynamic_cp cap
+    real sequences at this value (minus one with a dummy tail); dynamic CP applies the cap per
+    CP subgroup. When set, cu_seqlens tensors are padded to this size + 1 in both eager and
+    CUDA Graph modes. THD CUDA Graph requires this value.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
     Setting it too small results in more microbatches with smaller packs (wasted
-    token budget); setting it too large just allocates a slightly larger cu_seqlens
-    buffer."""
+    token budget); setting it too large increases cu_seqlens storage. Dynamic-CP graph
+    capture bounds the number of source-item subsamples independently of this output-pack
+    capacity, while the runtime packed microbatch count must still fit the captured range."""
 
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.

@@ -170,7 +170,8 @@ def test_graph_scheduler_accounts_for_main_padding(monkeypatch, alignment, fp8, 
     )
     observed = []
 
-    def run(scheduler, *args):
+    def run(scheduler, *args, validate_cuda_graph_limits=True):
+        assert validate_cuda_graph_limits
         groups = scheduler.get_groups_and_subsamples([(i, 3) for i in range(5)])
         observed.extend(len(group[0]) for group in groups)
         return None, len(groups), 15, 45
@@ -871,18 +872,26 @@ def test_align_sample_id_groups_repeatedly_splits_packed_full_cp_group():
     assert sorted(sample_id for group in aligned for sample_id in group[0]) == list(range(16))
 
 
-def test_align_sample_id_groups_prefers_existing_cp_block_split():
-    untouched_full_group = [[10, 11] for _ in range(8)]
+def test_align_sample_id_groups_preserves_samples_when_splitting_packed_tail():
+    packed_tail = [[10, 11] for _ in range(8)]
     sample_id_groups = [
         [[20] for _ in range(8)],
         [[0], [0], [0], [0], [1], [1], [2], [2]],
-        untouched_full_group,
+        packed_tail,
     ]
 
     aligned = align_sample_id_groups(sample_id_groups, 4)
 
     assert len(aligned) == 4
-    assert aligned[2] == untouched_full_group
+    assert all(len(group) == 8 and all(group) for group in aligned)
+    assert sorted(sample_id for group in aligned for sample_id in set(sum(group, []))) == [
+        0,
+        1,
+        2,
+        10,
+        11,
+        20,
+    ]
 
 
 def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():

@@ -15,9 +15,9 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_data_parallel_gather_group,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
-    get_data_parallel_gather_group,
     next_hdp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
@@ -41,12 +41,12 @@ except ImportError:
 
 def _validate_cuda_graph_microbatch_count(config, num_microbatches: int) -> None:
     """Require runtime packing to stay within the captured schedule proof."""
-    limit = getattr(config, '_cuda_graph_num_microbatches', None)
+    limit = getattr(config, "_cuda_graph_num_microbatches", None)
     if limit is not None and not 1 <= num_microbatches <= limit:
         raise ValueError(
             f"{num_microbatches=} is outside the captured CUDA graph range 1..{limit}."
         )
-    allowed = getattr(config, '_cuda_graph_allowed_microbatches', None)
+    allowed = getattr(config, "_cuda_graph_allowed_microbatches", None)
     if allowed is not None and num_microbatches not in allowed:
         raise ValueError(
             f"{num_microbatches=} is not covered by the CUDA graph liveness proof; "

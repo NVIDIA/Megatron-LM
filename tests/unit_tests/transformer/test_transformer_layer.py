@@ -334,7 +334,9 @@ class TestParallelTransformerLayer:
         assert layer.mhc_checkpoint_pre_mlp_layernorm
         assert not layer.recompute_input_layernorm
         assert not layer.recompute_pre_mlp_layernorm
-        layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
+        layer.off_interface = lambda _enabled, hidden_states, _name, *, owner=None: nullcontext(
+            hidden_states
+        )
 
         class IdentityBranch(torch.nn.Module):
             def forward(self, hidden_states, **_kwargs):

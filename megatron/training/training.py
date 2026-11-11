@@ -8092,15 +8092,37 @@ def _get_dynamic_cp_cuda_graph_helper_kwargs(args):
     """
     if not args.dynamic_context_parallel:
         return dict(dynamic_cp_group_getter=None, thd_max_subsamples_per_item=1)
-    # The dynamic-CP scheduler unpacks dataset items. A varlen item is one sequence; other THD
-    # datasets yield pre-packed items of up to thd_max_packed_sequences sequences.
+    # Varlen and mock SFT items carry one sequence. Real SFT items can contain
+    # many conversations even when the destination pack is capped at one.
     max_subsamples_per_item = 1
-    if not args.use_varlen_dataset and args.thd_max_packed_sequences is not None:
-        max_subsamples_per_item = args.thd_max_packed_sequences
+    if (
+        getattr(args, "sft", False)
+        and not args.use_varlen_dataset
+        and not getattr(args, "mock_data", False)
+    ):
+        # SFTDataset truncates after appending a conversation. If the pack has
+        # exactly seq_length tokens, one final (possibly empty) tail is included.
+        max_subsamples_per_item = args.seq_length // _get_thd_source_padding_granularity(args) + 1
     return dict(
         dynamic_cp_group_getter=get_dynamic_data_context_parallel_groups,
         thd_max_subsamples_per_item=max_subsamples_per_item,
     )
+
+
+def _get_thd_source_padding_granularity(args):
+    """Match the CP/SP padding divisor used by SFTDataset source items."""
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    return cp_pad * sp_pad
 
 
 def _get_thd_sequence_length_upper_bound(args):
@@ -8125,16 +8147,5 @@ def _get_thd_sequence_length_upper_bound(args):
     if getattr(args, "seq_length", None) is not None:
         max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
 
-    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
-    if getattr(args, "dynamic_context_parallel", False):
-        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
-    else:
-        cp_pad = cp_size * 2 if cp_size > 1 else 1
-
-    sp_pad = (
-        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
-        if getattr(args, "sequence_parallel", False)
-        else 1
-    )
-    pad_granularity = cp_pad * sp_pad
+    pad_granularity = _get_thd_source_padding_granularity(args)
     return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)

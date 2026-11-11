@@ -4,7 +4,7 @@ import logging
 import math
 from collections import defaultdict, deque
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -25,6 +25,13 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
+
+
+def _is_te_slot_graph_capturing() -> bool:
+    """Whether TE currently owns graph-scoped offload saves and transfers."""
+    from transformer_engine.pytorch import graph as te_graph
+
+    return getattr(te_graph, "_is_graph_slot_memory_capturing", lambda: False)()
 
 
 def debug_rank(message):
@@ -967,6 +974,27 @@ class PipelineOffloadManager:
             # gives Megatron-owned tensors the same opt-out path.
             tensor._do_not_offload = True
 
+    def graph_offload_checker(
+        self, owner_id: Optional[int], name: str
+    ) -> Callable[[torch.Tensor], bool]:
+        """Freeze a scope's conservative offload policy across runtime microbatch counts.
+
+        A physical graph slot can represent different logical microbatches. Keep a scope on GPU
+        if any of its warmed instances was retained by the fraction, PP-balance or tail policy.
+        CPU buffers for the remaining scopes are managed by TE's union-liveness slot plan.
+        """
+        groups = [
+            (chunk, group)
+            for chunk in self._cached_chunks_forward
+            for group in chunk.offload_groups
+            if getattr(group, "graph_owner", None) == (owner_id, name)
+        ]
+        if not groups or self._is_warmup:
+            raise RuntimeError("Graph offloading requires a completed eager offload warmup.")
+        enabled = all(group.offload for _, group in groups)
+        checker = groups[0][0].tensor_need_offloading_checker
+        return lambda tensor: enabled and checker(tensor)
+
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
@@ -1697,11 +1725,11 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
             current_stream = torch.cuda.current_stream()
             # TE uses this external event to synchronize the main stream after
             # replay. Record it only after the entire GraphTask, including all
-            # requested parameter and input gradients, has completed. The following
-            # H2D join remains after the event so next-group reload can overlap
-            # main-stream work while still belonging to the captured graph.
+            # requested parameter and input gradients, has completed.
             current_stream.record_event(mgr.cuda_graph_event)
-            current_stream.wait_stream(mgr.h2d_stream)
+            # Slot hooks join their own transfers, not the legacy group's stream work.
+            if not _is_te_slot_graph_capturing():
+                current_stream.wait_stream(mgr.h2d_stream)
 
         # TE warms up and captures every callable with a separate autograd.backward(),
         # so this callback runs before that callable's backward capture context closes.
@@ -1716,21 +1744,46 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
-    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+    def __init__(self, offload: bool, tensor: torch.Tensor, name: str, *, owner=None) -> None:
         self.offload = offload
         self.tensor = tensor
         self.name = name
+        self.owner_id = id(owner) if owner is not None else None
+        self._graph_context = None
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
+        self._graph_context = None
         if self.offload:
+            from transformer_engine.pytorch import graph as te_graph
+
+            manager = PipelineOffloadManager.get_instance()
+            if _is_te_slot_graph_capturing():
+                if not hasattr(te_graph, "_graph_memory_offload_context"):
+                    raise RuntimeError(
+                        "DCP graph offloading requires Transformer Engine slot-offload support."
+                    )
+                checker = manager.graph_offload_checker(self.owner_id, self.name)
+                self._graph_context = te_graph._graph_memory_offload_context(
+                    checker, d2h_stream=manager.d2h_stream, h2d_stream=manager.h2d_stream
+                )
+                self._graph_context.__enter__()
+                return self.tensor
             self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
-            PipelineOffloadManager.get_instance().__enter__()
+            chunk = manager.cur_forward_chunk()
+            if chunk is not None and chunk.do_offload and chunk.is_warmup:
+                chunk.offload_groups[chunk._offloaded_group_index - 1].graph_owner = (
+                    self.owner_id,
+                    self.name,
+                )
+            manager.__enter__()
         return self.tensor
 
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
-        if self.offload:
+        if self._graph_context is not None:
+            self._graph_context.__exit__(*args)
+        elif self.offload:
             PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod
@@ -1773,6 +1826,8 @@ class FineGrainedActivationOffloadingInterface:
 
     def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
         """Group offload the tensors."""
+        if self._graph_context is not None:
+            return tensor
         if self.offload:
             return fine_grained_offloading_group_offload(
                 tensor, self.name, forced_released_tensors, delay_offload
@@ -1789,7 +1844,8 @@ class FineGrainedActivationOffloadingInterface:
         """Record the forward event for cuda graph capture."""
         mgr = PipelineOffloadManager.get_instance()
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
+        if not _is_te_slot_graph_capturing():
+            torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
     @staticmethod
     def backward_record(tensor) -> torch.Tensor:

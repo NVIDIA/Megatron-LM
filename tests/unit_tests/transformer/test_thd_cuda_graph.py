@@ -2390,6 +2390,7 @@ class TestDynamicMicrobatchSlots:
             hidden_size=128,
             num_attention_heads=4,
             dynamic_context_parallel=True,
+            calculate_per_token_loss=True,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[CudaGraphModule.attn],
             cuda_graph_dynamic_microbatches=True,
@@ -2418,6 +2419,7 @@ class TestDynamicMicrobatchSlots:
             hidden_size=128,
             num_attention_heads=4,
             dynamic_context_parallel=True,
+            calculate_per_token_loss=True,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[CudaGraphModule.attn],
             cuda_graph_dynamic_microbatches=True,
@@ -2616,6 +2618,12 @@ class TestDynamicMicrobatchSlots:
         layer.cuda_graphs_by_dynamic_cp_size = {}
         layer.cuda_graph_manual_hooks = []
         helper.callables_per_chunk = [[layer]]
+        root = torch.nn.Module()
+        rotary = torch.nn.Identity()
+        rotary._cuda_graph_rotary_embeddings = {(4096, 0, True, None): object()}
+        root.add_module("rotary", rotary)
+        layer._cuda_graph_rotary_embeddings = {(4096, 0, True, None): object()}
+        helper.model = [root]
         helper.tp_group = object()
         helper.dp_cp_group = object()
         monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
@@ -2633,6 +2641,8 @@ class TestDynamicMicrobatchSlots:
         assert helper._graphs_created is False
         assert layer.cuda_graphs == []
         assert layer.cuda_graphs_by_dynamic_cp_size == {}
+        assert not hasattr(layer, "_cuda_graph_rotary_embeddings")
+        assert not hasattr(rotary, "_cuda_graph_rotary_embeddings")
         assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
         assert not hasattr(helper.config, '_cuda_graph_allowed_microbatches')
         assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
@@ -3109,6 +3119,32 @@ class TestDynamicMicrobatchSlots:
                 '_warmup_plan_alias_groups',
             )
         )
+
+    @pytest.mark.internal
+    def test_dynamic_cp_capture_reuses_leading_samples_across_banks(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        canonical = [(torch.empty(4, 8), torch.tensor([1])), (torch.empty(4, 8),)]
+        branch = [(torch.empty(4, 8), torch.tensor([2])), (torch.empty(4, 8),)]
+        old_leading_refs = [weakref.ref(args[0]) for args in branch]
+        branch_metadata = branch[0][1]
+
+        TECudaGraphHelper._reuse_dynamic_cp_leading_samples(canonical, branch)
+
+        assert all(args[0] is canonical[index][0] for index, args in enumerate(branch))
+        assert branch[0][1] is branch_metadata
+        assert all(ref() is None for ref in old_leading_refs)
+
+        with pytest.raises(RuntimeError, match="leading tensor layout"):
+            TECudaGraphHelper._reuse_dynamic_cp_leading_samples(
+                canonical, [(torch.empty(5, 8), torch.tensor([2])), (torch.empty(4, 8),)]
+            )
+
+        reused = torch.empty(4, 8)
+        with pytest.raises(RuntimeError, match="leading-input aliases"):
+            TECudaGraphHelper._reuse_dynamic_cp_leading_samples(
+                canonical, [(reused, torch.tensor([2])), (reused,)]
+            )
 
     @pytest.mark.internal
     def test_dynamic_cp_slot_plan_covers_unaligned_capture_order(self):

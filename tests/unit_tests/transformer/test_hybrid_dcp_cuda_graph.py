@@ -92,7 +92,12 @@ def test_wrapper_reconstructs_capture_variant(cp_size):
 
 
 def test_wrapper_replay_selects_own_bank_before_decomposing_metadata():
-    layer = _wrapper(SimpleNamespace(fine_grained_activation_offloading=False))
+    layer = _wrapper(
+        SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            sequence_packing_scheduler="default_dynamic_cp",
+        )
+    )
     groups = {size: object() for size in (1, 2)}
     replayed = []
 
@@ -200,6 +205,7 @@ def test_hybrid_multi_cp_capture_replay_matches_eager(grouped, hash_routing, mon
             num_residual_streams=4,
             is_hybrid_model=True,
             dynamic_context_parallel=True,
+            calculate_per_token_loss=True,
             sequence_packing_scheduler="default_dynamic_cp",
             max_seqlen_per_dp_cp_rank=64,
             pad_packed_seq_alignment=64,

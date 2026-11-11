@@ -593,7 +593,9 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        qkv_linear_manager = off_interface(
+            self.offload_qkv_linear, hidden_states, "qkv_linear", owner=self
+        )
         with qkv_linear_manager as hidden_states:
             query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
                 hidden_states,
@@ -640,7 +642,7 @@ class MultiLatentAttention(Attention):
         # Need corresponding TE change
         needs_output_trim = False
         core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
+            self.offload_core_attention and self.training, query, "core_attn", owner=self
         )
         orig_v_dim = None
         padded_v_dim = None
@@ -736,7 +738,9 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        attn_proj_manager = off_interface(
+            self.offload_attn_proj, core_attn_out, "attn_proj", owner=self
+        )
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])

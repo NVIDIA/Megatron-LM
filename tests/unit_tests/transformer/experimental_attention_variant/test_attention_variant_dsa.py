@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import gc
 import logging
 import math
 import warnings
@@ -3097,6 +3098,54 @@ class TestDSAIndexer:
         for b in range(batch_size):
             for i in range(seqlen):
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
+
+    def test_graph_replay_keeps_rope_table_beyond_lru_capacity(self, seqlen):
+        """A captured indexer must replay with its own RoPE table after more than 32 other
+        tables have evicted it from the shared cache, matching eager."""
+        from megatron.core.transformer import cuda_graphs
+
+        indexer = self.indexer.cuda()
+        rope = indexer.rotary_pos_emb
+        x = torch.randn(seqlen, 1, self.config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        qr = torch.randn(seqlen, 1, self.config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+        helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
+        helper.model = [indexer]
+        helper._capture_finished = False
+        graph = torch.cuda.CUDAGraph()
+        with patch.object(self.config, "dsa_indexer_rotate_activation", False), torch.no_grad():
+            expected = indexer.forward_before_topk(x, qr)
+            RotaryEmbedding.clear_cache()
+            try:
+                # The helper turns on the per-module RoPE cache of every nested RotaryEmbedding.
+                helper._start_capturing()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    indexer.forward_before_topk(x, qr)  # Warmup, as TE runs before capture.
+                torch.cuda.current_stream().wait_stream(stream)
+                with cuda_graphs.capture_constants(graph), torch.cuda.graph(graph):
+                    outputs = indexer.forward_before_topk(x, qr)
+            finally:
+                cuda_graphs._set_capture_end()
+                vars(rope).pop("_cuda_graph_rotary_cache_active", None)
+                if cuda_graphs.FREEZE_GC:
+                    gc.unfreeze()
+            scribble = None
+            try:
+                # Other layers and CP banks add more than 32 tables to the shared LRU cache.
+                for length in range(seqlen + 1, seqlen + 41):
+                    rope(length)
+                RotaryEmbedding.clear_cache()
+                torch.cuda.empty_cache()
+                scribble = torch.full((64 << 20,), float("nan"), device="cuda")
+                graph.replay()
+                for actual, reference in zip(outputs, expected):
+                    torch.testing.assert_close(actual, reference)
+            finally:
+                del scribble
+                graph.reset()
+                cuda_graphs.release_capture_constants(graph)
+                helper._clear_cuda_graph_rotary_caches()
 
 
 class TestDSAttention:

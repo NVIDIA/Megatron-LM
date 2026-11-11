@@ -1664,7 +1664,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if head_wise_gate_enabled:
             assert split_qkv, "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
 
-        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        qkv_linear_manager = off_interface(
+            self.offload_qkv_linear, hidden_states, "qkv_linear", owner=self
+        )
         with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
@@ -1872,7 +1874,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             packed_seq_params=packed_seq_params,
         )
         core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
+            self.offload_core_attention and self.training, query, "core_attn", owner=self
         )
         if self.checkpoint_core_attention and self.training:
             # Upstream _checkpointed_attention_forward now threads tensor-valued
@@ -1979,7 +1981,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the attention output projection to a core-attention result."""
         nvtx_range_push(suffix="linear_proj")
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        attn_proj_manager = off_interface(
+            self.offload_attn_proj, core_attn_out, "attn_proj", owner=self
+        )
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])

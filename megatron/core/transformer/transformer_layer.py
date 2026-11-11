@@ -1010,7 +1010,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
 
         self.attn_norm_manager = self.off_interface(
-            self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
+            self.offload_attn_norm and recompute_context is None,
+            hidden_states,
+            "attn_norm",
+            owner=self,
         )
         if input_is_normalized:
             # AttnRes norm fusion: the depth aggregation already applied input_layernorm
@@ -1286,6 +1289,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self.offload_mlp_norm and residual_stream_recompute_context is None,
             hidden_states,
             "mlp_norm",
+            owner=self,
         )
         if input_is_normalized:
             # AttnRes norm fusion: the depth aggregation already applied pre_mlp_layernorm
@@ -3020,6 +3024,7 @@ class AttnResTransformerLayer(TransformerLayer):
         # checkpoint's hook (on the MLP output), so the aggregation is rebuilt first.
         self.mlp_attn_res.discard_output_and_register_recompute(output)
         return output
+
 
 class MoETransformerLayer(TransformerLayer):
     """

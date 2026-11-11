@@ -2448,13 +2448,13 @@ def _is_mtp_te_callable(layer, chunk_with_decoder):
 class _DynamicCPCaptureCallable(torch.nn.Module):
     """Set one dynamic-CP context immediately before capturing a wrapped layer."""
 
-    def __init__(self, module, context_setter, context):
+    def __init__(self, module, context_setter, context) -> None:
         super().__init__()
         self.module = module
         # A grouped hybrid graph can cover a sibling's prefix without registering it
         # under the original layer. Expose that state and its TE hooks on this temporary
         # callable too: nn.Module traversal does not invoke a child's parameters override.
-        graph_modules = getattr(module, '_get_submodules_under_cudagraphs', None)
+        graph_modules = getattr(module, "_get_submodules_under_cudagraphs", None)
         if graph_modules is not None:
             registered = set(module.modules())
             self._capture_only_modules = torch.nn.ModuleList(
@@ -3079,6 +3079,18 @@ class TECudaGraphHelper:
         for config in configs.values():
             vars(config).pop('_cuda_graph_thd_rotary_seq_lens', None)
 
+    def _clear_cuda_graph_rotary_caches(self):
+        """Release RoPE tables only after their graph executables are discarded."""
+        roots = [*getattr(self, "model", ()), *getattr(self, "chunks_with_decoder", ())]
+        roots.extend(
+            layer for layers in getattr(self, "callables_per_chunk", ()) for layer in layers
+        )
+        for root in roots:
+            if isinstance(root, torch.nn.Module):
+                for module in root.modules():
+                    vars(module).pop("_cuda_graph_rotary_embeddings", None)
+                    vars(module).pop("_cuda_graph_rotary_cache_active", None)
+
     def _get_thd_capture_rotary_layout(self, capture_cp_size):
         """Return the RoPE length and packed boundaries used for THD capture."""
         token_capacity = int(self.config.max_seqlen_per_dp_cp_rank) * int(capture_cp_size)
@@ -3235,10 +3247,7 @@ class TECudaGraphHelper:
                         uses_mla = False
                     elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
                         uses_mla = True
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not uses_mla
-                ):
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     packed_seq = packs_thd
                     capture_cp_group = None
                     if packed_seq:
@@ -3554,16 +3563,16 @@ class TECudaGraphHelper:
             self.config._cuda_graph_num_microbatches = (
                 self._dynamic_slot_liveness_limit or self.num_microbatches
             )
-            counts = getattr(self, '_dynamic_slot_liveness_counts', None)
+            counts = getattr(self, "_dynamic_slot_liveness_counts", None)
             if counts is not None:
                 self.config._cuda_graph_allowed_microbatches = frozenset(counts)
             else:
-                vars(self.config).pop('_cuda_graph_allowed_microbatches', None)
+                vars(self.config).pop("_cuda_graph_allowed_microbatches", None)
 
     def _clear_dynamic_cp_graph_microbatch_limit(self) -> None:
         """Remove the runtime schedule contract when its graphs are discarded."""
-        vars(self.config).pop('_cuda_graph_num_microbatches', None)
-        vars(self.config).pop('_cuda_graph_allowed_microbatches', None)
+        vars(self.config).pop("_cuda_graph_num_microbatches", None)
+        vars(self.config).pop("_cuda_graph_allowed_microbatches", None)
 
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
         """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
@@ -4402,6 +4411,44 @@ class TECudaGraphHelper:
 
         return TECudaGraphHelper._color_liveness_conflicts(conflicts)
 
+    @staticmethod
+    def _reuse_dynamic_cp_leading_samples(canonical_args, branch_args):
+        """Keep one leading input per physical frame across CP capture banks."""
+        if len(canonical_args) != len(branch_args):
+            raise RuntimeError("Dynamic-CP variants have different capture input counts.")
+
+        def layout(tensor):
+            return (
+                tensor.shape,
+                tensor.stride(),
+                tensor.dtype,
+                tensor.device,
+                tensor.layout,
+                tensor.requires_grad,
+            )
+
+        def alias_pattern(samples):
+            groups = {}
+            return tuple(groups.setdefault(args[0].data_ptr(), len(groups)) for args in samples)
+
+        for index, (canonical, branch) in enumerate(zip(canonical_args, branch_args)):
+            if not canonical or len(canonical) != len(branch):
+                raise RuntimeError(f"Dynamic-CP capture input {index} has incompatible arity.")
+            first, alternative = canonical[0], branch[0]
+            if not isinstance(first, torch.Tensor) or not isinstance(alternative, torch.Tensor):
+                raise RuntimeError(f"Dynamic-CP capture input {index} is not a tensor.")
+            if layout(first) != layout(alternative):
+                raise RuntimeError(
+                    f"Dynamic-CP capture input {index} changes its leading tensor layout."
+                )
+
+        if alias_pattern(canonical_args) != alias_pattern(branch_args):
+            raise RuntimeError("Dynamic-CP variants have different leading-input aliases.")
+
+        for index, (canonical, branch) in enumerate(zip(canonical_args, branch_args)):
+            first = canonical[0]
+            branch_args[index] = (first, *branch[1:])
+
     def _get_dynamic_cp_variant_capture_data(self, capture_banks):
         """Combine CP alternatives into one slot-aliased TE capture call and pool."""
         callables = []
@@ -4559,6 +4606,16 @@ class TECudaGraphHelper:
         if FREEZE_GC:
             gc.freeze()
 
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        # TE's bank warmups must retain every table before stream capture starts.
+        # Local graphs retain their own constants and may still capture cache misses.
+        for model_chunk in self.model:
+            if isinstance(model_chunk, torch.nn.Module):
+                for module in model_chunk.modules():
+                    if isinstance(module, RotaryEmbedding):
+                        vars(module).setdefault("_cuda_graph_rotary_embeddings", {})
+                        module._cuda_graph_rotary_cache_active = True
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
@@ -4598,6 +4655,10 @@ class TECudaGraphHelper:
 
         if self.config.fine_grained_activation_offloading:
             off_interface.reset()
+        for model_chunk in self.model:
+            if isinstance(model_chunk, torch.nn.Module):
+                for module in model_chunk.modules():
+                    vars(module).pop("_cuda_graph_rotary_cache_active", None)
         torch.cuda.synchronize()
         self._reset_after_capture()
 
@@ -4636,6 +4697,7 @@ class TECudaGraphHelper:
             with suppress(BaseException):
                 cleanup()
         for cleanup in (
+            self._clear_cuda_graph_rotary_caches,
             self._clear_thd_rotary_seq_lens,
             self._clear_dynamic_cp_graph_microbatch_limit,
             self._clear_graph_dynamic_route_arenas,
@@ -4769,7 +4831,11 @@ class TECudaGraphHelper:
                                 "Dynamic-CP capture changed slot count across variants: "
                                 f"{expected_num_microbatches} -> {self.num_microbatches}."
                             )
+                        if capture_banks:
+                            self._reuse_dynamic_cp_leading_samples(capture_banks[0][2], sample_args)
                         capture_banks.append((cp_size, cp_group, sample_args, kwargs))
+                    if len(capture_banks) > 1:
+                        torch.cuda.empty_cache()
 
                     if has_graphable_layers:
                         self._capture_dynamic_cp_variants(capture_banks, captured_graphs)
@@ -4870,6 +4936,7 @@ class TECudaGraphHelper:
         finally:
             self._graphs_created = False
             cleanup_callbacks = (
+                self._clear_cuda_graph_rotary_caches,
                 self._clear_dynamic_cp_graph_microbatch_limit,
                 self._clear_thd_rotary_seq_lens,
                 self._clear_graph_dynamic_route_arenas,

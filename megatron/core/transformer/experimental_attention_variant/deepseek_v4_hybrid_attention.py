@@ -547,7 +547,7 @@ class DSv4HybridAttention(Attention):
         # ==================================
         # Need corresponding TE change
         core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
+            self.offload_core_attention and self.training, query, "core_attn", owner=self
         )
         with core_attn_manager as query:
             core_attn_out = self.core_attention(
@@ -597,7 +597,9 @@ class DSv4HybridAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        attn_proj_manager = off_interface(
+            self.offload_attn_proj, core_attn_out, "attn_proj", owner=self
+        )
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
