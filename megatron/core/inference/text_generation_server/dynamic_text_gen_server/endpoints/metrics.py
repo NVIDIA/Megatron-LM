@@ -6,6 +6,11 @@ GET /metrics asks every data parallel engine for its counters through the Infere
 coordinator -> engines path (GET_METRICS); each engine answers at its next step. Counters are
 lifetime totals, so throughput over a window is the difference of two scrapes divided by the
 window length. Each metric is reported per engine (label ``engine``) and summed over engines.
+
+In disaggregated serving the engine identities are ``prefill_s<i>_dp<j>`` and
+``decode_s<i>_dp<j>``. Prompt tokens are counted by prefill engines, generated tokens by the engine
+that sampled them (the first by prefill, the rest by decode), and finished requests by decode;
+prefill engines report their completed hand-offs as ``prefill_handoffs_total``.
 """
 
 import logging
@@ -20,6 +25,10 @@ _METRICS = {
     "prompt_tokens_total": ("counter", "Prompt tokens prefilled (computed)."),
     "prompt_tokens_cached_total": ("counter", "Prompt tokens skipped by prefix-cache hits."),
     "requests_finished_total": ("counter", "Requests finished."),
+    "prefill_handoffs_total": (
+        "counter",
+        "Disaggregated prefill requests finished and handed off to decode.",
+    ),
     "engine_steps_total": ("counter", "Engine steps."),
     "requests_running": ("gauge", "Requests in the active batch."),
     "requests_paused": ("gauge", "Requests paused (out of KV blocks)."),

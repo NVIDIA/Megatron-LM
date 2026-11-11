@@ -564,8 +564,15 @@ class CoordinatorMixin:
         """
         context = self.context
         lengths = context.get_active_sequence_lengths()
+        counters = dict(self._metrics_counters)
+        if self._is_disaggregated_role("prefill"):
+            # A prefill engine's requests finish by handing off to decode, which finishes them
+            # for the user: report them apart so the summed requests_finished_total counts each
+            # request once. Prompt tokens are counted here and generated tokens by whichever
+            # engine sampled them (the first by prefill, the rest by decode), so those sums hold.
+            counters["prefill_handoffs_total"] = counters.pop("requests_finished_total")
         return {
-            **self._metrics_counters,
+            **counters,
             "prompt_tokens_total": context.metrics_prompt_tokens_total,
             "prompt_tokens_cached_total": context.metrics_prompt_tokens_cached_total,
             "requests_running": context.total_request_count - context.paused_request_count,

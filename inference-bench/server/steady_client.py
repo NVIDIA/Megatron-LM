@@ -131,6 +131,15 @@ def parse_step_mix(text):
     return out
 
 
+def _pool(engine):
+    """"prefill" / "decode" for an engine of a disaggregated server (main's native PD names
+    engines prefill_s<i>_dp<j> / decode_s<i>_dp<j>), else None."""
+    for role in ("prefill", "decode"):
+        if engine.startswith((f"{role}_", f"{role}/")):
+            return role
+    return None
+
+
 def diff_step_mix(m0, m1):
     """Step-mix counters over a window: m1 - m0 per scope and class, with the mean step time
     and each class's share of the scope's steps and wall time. "all" sums engines, so its
@@ -143,8 +152,8 @@ def diff_step_mix(m0, m1):
             delta = {f: counters[f] - before.get(f, 0.0) for f in STEP_MIX_FIELDS}
             if delta["steps"] > 0:
                 out.setdefault(scope, {})[step_class] = delta
-    for scope in [s for s in out if "/" in s]:
-        pool = out.setdefault(scope.split("/", 1)[0], {})
+    for scope in [s for s in out if _pool(s)]:
+        pool = out.setdefault(_pool(scope), {})
         for step_class, delta in out[scope].items():
             acc = pool.setdefault(step_class, dict.fromkeys(STEP_MIX_FIELDS, 0.0))
             for f in STEP_MIX_FIELDS:
