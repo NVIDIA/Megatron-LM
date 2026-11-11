@@ -33,7 +33,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 from tests.unit_tests.transformer.packed_seq_test_utils import make_test_packed_seq_params
 
 
@@ -153,6 +153,7 @@ def check_mla_parallel_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
+        sync_checkpoint_config(mock_args)
         save_checkpoint(10, gpt_model, None, None, 0)
 
         # Calculate baseline output
@@ -215,6 +216,7 @@ def check_mla_parallel_correctness(
             get_model(initialize_gpt_model, config=transformer_config, wrap_with_ddp=False)
         )
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            sync_checkpoint_config(mock_args)
             load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank

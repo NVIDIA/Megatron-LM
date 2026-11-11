@@ -7,8 +7,8 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module import language_module as language_module_module
-from megatron.core.tensor_parallel import cross_entropy as cross_entropy_module
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss import cross_entropy as cross_entropy_module
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from tests.unit_tests.test_utilities import Utils
 
