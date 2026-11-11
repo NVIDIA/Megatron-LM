@@ -428,7 +428,7 @@ backend's existing behaviour.
 
 | Argument | Default | Effect |
 |----------|---------|--------|
-| `--moe-deepepv2-num-max-tokens-per-rank N` | unset | One token bound for every rank, passed to the buffer and to every dispatch. A rank with more than `N` tokens raises an error. |
+| `--moe-deepepv2-num-max-tokens-per-rank N` | unset | One token bound for every rank, passed to the buffer and to every dispatch. A rank with more than `N` tokens raises an error before it enters the dispatch; if only some ranks exceed `N`, the other ranks wait in the collective until a timeout or the launcher stops the job. |
 | `--moe-deepepv2-pad-uneven-dispatch-inputs` | off | Uses the largest token count in the dispatcher group as the bound: one MAX all-reduce and a host sync per dispatch. Not together with a fixed bound. |
 | `--moe-deepepv2-num-allocated-qps N` | `0` | RDMA queue pairs for the buffer. `0` lets DeepEP choose. |
 | `--no-moe-deepepv2-allow-hybrid-mode` | hybrid mode allowed | Requests DeepEP's direct mode. |

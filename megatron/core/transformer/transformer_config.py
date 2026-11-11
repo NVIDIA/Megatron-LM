@@ -1159,11 +1159,13 @@ class TransformerConfig(ModelParallelConfig):
     """Token bound passed to the deepepv2 buffer and to every deepepv2 dispatch. DeepEP v2
     requires the same num_max_tokens_per_rank on every rank of the dispatcher group. None (the
     default) passes each rank's local token count; the first buffer build raises a ValueError if
-    the ranks' counts differ, but counts that diverge after it are not detected. Whenever local
-    counts can differ, for example with packed THD inputs, set a bound that covers every rank's
-    token count, or set moe_deepepv2_pad_uneven_dispatch_inputs; sequence packing requires one
-    of them. A dispatch with more tokens than the bound raises a ValueError. Only valid with the
-    deepepv2 backend.
+    the ranks' counts differ, but counts that diverge after it are not detected and can hang.
+    Whenever local counts can differ, for example with packed THD inputs, set a bound that covers
+    every rank's token count, or set moe_deepepv2_pad_uneven_dispatch_inputs; sequence packing
+    requires one of them. A dispatch with more tokens than the bound raises a ValueError on
+    that rank before the collective; if only some ranks exceed the bound, the others wait in the
+    collective until a timeout or the launcher stops the job. Only valid with the deepepv2
+    backend.
     """
 
     moe_deepepv2_pad_uneven_dispatch_inputs: bool = False
