@@ -70,7 +70,7 @@ def prepare_mimo_step(
     not be integers; scheduler-local indices are private to this preparation.
 
     ``cp_groups`` maps each allowed CP size to this rank's pre-created group,
-    including a singleton for CP1. For TP1, TP x CP defaults to that same group.
+    including a singleton when CP1 is allowed. For TP1, TP x CP defaults to that same group.
     Returned inputs are full packs: splice features before calling the model's
     unified CP partition. No encoder, processor, dataset, process-group creation,
     or training configuration mutation occurs here.
@@ -175,9 +175,5 @@ def prepare_mimo_step(
         }
         rounds.append(MimoRoundPlan(sample_ids, plans, group, inputs))
     return MimoStepPlan(
-        tuple(rounds),
-        len(samples),
-        supervised,
-        source_tokens,
-        source_tokens_squared,
+        tuple(rounds), len(samples), supervised, source_tokens, source_tokens_squared
     )

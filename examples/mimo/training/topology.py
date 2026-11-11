@@ -174,10 +174,12 @@ def create_topology(
             ranks = list(
                 range(language_spec.rank_offset, language_spec.rank_offset + language_spec.size)
             )
-            # All world ranks create groups in the same order. CP1 remains available for eval,
-            # even when the training scheduler has a larger minimum CP size.
+            # All world ranks create groups in the same order. Train and eval share the minimum.
             topology.cp_groups = create_dynamic_dp_cp_groups(
-                dist.get_rank(), ranks, _get_pg_options("cp", high_priority_stream_groups)
+                dist.get_rank(),
+                ranks,
+                _get_pg_options("cp", high_priority_stream_groups),
+                min_cp_size=min_cp_size,
             )
             # Only newly created groups belong here; grid-owned aliases are destroyed
             # by their HyperCommGrid, not by the dynamic-group cleanup above.
@@ -185,7 +187,8 @@ def create_topology(
             if dist.get_rank() in ranks:
                 language_pg = module_pgs[language_name]
                 topology.cp_groups[language_spec.size] = language_pg.dp_cp
-                topology.cp_groups.setdefault(language_spec.cp, language_pg.cp)
+                if language_spec.cp >= min_cp_size:
+                    topology.cp_groups.setdefault(language_spec.cp, language_pg.cp)
                 language_pg.dynamic_cp = topology.cp_groups
                 language_pg.dynamic_tp_cp = topology.cp_groups
                 # Match native DCP initialization: avoid lazy communicator creation while

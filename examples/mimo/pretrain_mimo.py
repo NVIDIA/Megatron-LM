@@ -110,7 +110,9 @@ def main() -> None:
         specs,
         cfg.dist.high_priority_stream_groups,
         packed=args.mimo_packed,
-        min_cp_size=args.min_dynamic_context_parallel_size,
+        min_cp_size=(
+            args.min_dynamic_context_parallel_size if args.dynamic_context_parallel else 1
+        ),
     )
 
     communicator = None if args.mimo_packed else provider.build_communicator(args, topology)

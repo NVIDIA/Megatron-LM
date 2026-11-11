@@ -139,7 +139,8 @@ def test_high_priority_options_are_wired_to_each_module_grid(monkeypatch, mock_n
         assert all(options.is_high_priority_stream for _, _, options in grid.calls if options)
 
 
-def test_packed_decoder_groups_exclude_encoders_and_include_singleton():
+@pytest.mark.parametrize(("static_cp_size", "min_cp_size"), [(2, 1), (1, 2), (2, 2), (2, 4)])
+def test_packed_decoder_groups_exclude_encoders_and_honor_minimum(static_cp_size, min_cp_size):
     Utils.initialize_distributed()
     topology = None
     try:
@@ -163,10 +164,12 @@ def test_packed_decoder_groups_exclude_encoders_and_include_singleton():
         topology = create_topology(
             [
                 ModuleGridSpec(name=ENCODER, num_ranks=4),
-                ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, cp=2, rank_offset=4),
+                ModuleGridSpec(
+                    name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, cp=static_cp_size, rank_offset=4
+                ),
             ],
             packed=True,
-            min_cp_size=2,
+            min_cp_size=min_cp_size,
         )
         rank = dist.get_rank()
         active_name = ENCODER if rank < 4 else MIMO_LANGUAGE_MODULE_KEY
@@ -179,10 +182,11 @@ def test_packed_decoder_groups_exclude_encoders_and_include_singleton():
             assert dist.get_process_group_ranks(pg.dynamic_cp[1]) == [rank]
             assert not topology._dynamic_groups
         else:
-            assert set(topology.cp_groups) == {1, 2, 4}
+            expected_sizes = {size for size in (1, 2, 4) if size >= min_cp_size}
+            assert set(topology.cp_groups) == expected_sizes
             assert pg.dynamic_cp is topology.cp_groups
             assert topology.cp_groups[4] is pg.dp_cp
-            assert {group.size() for group in topology._dynamic_groups} == {1, 2}
+            assert {group.size() for group in topology._dynamic_groups} == expected_sizes - {4}
             assert all(
                 group is not pg.dp_cp and group is not pg.cp for group in topology._dynamic_groups
             )
