@@ -851,6 +851,10 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
+            if config.gtp_weight_remat_size > 1:
+                from megatron.core.tensor_parallel.gtp_api import finalize_gtp_forward_counts
+
+                finalize_gtp_forward_counts(model)
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
 

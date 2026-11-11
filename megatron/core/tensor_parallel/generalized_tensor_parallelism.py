@@ -472,7 +472,7 @@ def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
     return buf
 
 
-# Weights owing a flush. Entries outlive an early flush: the fence is where the count is learned.
+# Weights with active forward/backward counts. The fence resets even early-flushed windows.
 _GTP_PENDING_WGRAD_ACCUM: set = set()
 
 
@@ -487,19 +487,28 @@ def _collect_inflight_wgrad_reduce_scatters() -> None:
             param._already_finalized = False  # the cascade must not skip the next one
 
 
-def _close_wgrad_accumulation_windows() -> None:
-    """Reduce-scatter what is still accumulating, then learn each weight's consume count.
-
-    Most iterations flushed earlier; this catches iteration 1 and mispredicted counts.
-    """
-    if not _GTP_PENDING_WGRAD_ACCUM:
-        return
+def _finalize_wgrad_accumulation() -> None:
+    """Flush outstanding contributions and forget this accumulation window's counts."""
     for param in list(_GTP_PENDING_WGRAD_ACCUM):
-        param.flush_accumulated_wgrad()  # no-op if the last-consume trigger already flushed
-        # Learn AFTER any re-opened window, so an undercount self-corrects.
-        param._wgrad_accum_expected = param._wgrad_accum_consumes
+        param.flush_accumulated_wgrad()  # no-op if the final consume already flushed
+        param._wgrad_accum_expected = None
+        param._wgrad_accum_forwards = 0
         param._wgrad_accum_consumes = 0
     _GTP_PENDING_WGRAD_ACCUM.clear()
+
+
+def finalize_gtp_forward_counts(model) -> None:
+    """Seal forward counts so the final output-head backward can launch reduce-scatter.
+
+    Call once after the last forward and before its backward; at most one backward per forward.
+    The final GTP fence remains required; omitting this call defers reduction to that fence.
+    """
+    models = model if isinstance(model, list) else [model]
+    for model_module in models:
+        for param in model_module.parameters():
+            if is_gtp_param(param) and param._can_accumulate_wgrad():
+                param._wgrad_accum_expected = param._wgrad_accum_forwards
+                _GTP_PENDING_WGRAD_ACCUM.add(param)
 
 
 def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
@@ -591,7 +600,7 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     # AFTER the joins: this fires grad-ready, which can dispatch a DP collective that would
     # race peers' main_grad.add_ still queued on rs_stream.
     if not torch.cuda.is_current_stream_capturing():
-        _close_wgrad_accumulation_windows()
+        _finalize_wgrad_accumulation()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():
@@ -645,25 +654,16 @@ def update_gtp_config(**kwargs):
         setattr(GTP_CONFIG, key, value)
 
 
-def _num_microbatches_can_change() -> bool:
-    """True when num_microbatches can change mid-run (--step-batch-size-schedule)."""
-    # Lazy: a module-scope import here can silently flip HAVE_GTP to False.
-    from megatron.core import num_microbatches_calculator as nmb
-
-    calc = nmb._GLOBAL_NUM_MICROBATCHES_CALCULATOR
-    # Never initialized (unit tests): nothing can vary it.
-    return calc is not None and not isinstance(calc, nmb.ConstantNumMicroBatchesCalculator)
-
-
 def tag_gtp_params_with_names(model):
     """Populate _debug_name on every GTPShardedParam with its full dotted parameter name.
 
     Call once after model construction so the linking log prints human-readable names
     instead of raw tensor ids.
     """
-    # Off under a stepped batch schedule: a rising consume count double-fires grad-ready and
-    # drops a contribution (see _is_last_expected_consume).
-    accum_ok = not _num_microbatches_can_change()
+    # Pipeline schedules can synchronize a chunk before the global GTP fence.
+    # Until accumulation windows are chunk-aware, keep their per-consume reduction.
+    pipeline_size = getattr(getattr(model, "config", None), "pipeline_model_parallel_size", 1)
+    accum_ok = pipeline_size == 1
     for name, param in model.named_parameters():
         if is_gtp_param(param):
             param._debug_name = name
@@ -1229,7 +1229,8 @@ def _init_gtp_runtime_attrs(obj):
     # Pre-RS wgrad accumulation (output_layer under MTP).
     obj._wgrad_accum_enabled = False  # static per-weight opt-in
     obj._wgrad_accum_buf = None  # the buffer being summed into; non-None == a flush is owed
-    obj._wgrad_accum_expected = 0  # consume count learned last iteration
+    obj._wgrad_accum_expected = None  # unknown until the caller closes the forward window
+    obj._wgrad_accum_forwards = 0  # None disables early reduction for this window
     obj._wgrad_accum_consumes = 0  # consumes so far this iteration
     # Chain identity (GRAPHED/UNGRAPHED). Defaults to UNGRAPHED; classify_gtp_chains(model)
     # walks the model at init (after set_cuda_graph_modules) and reclassifies on param name +
@@ -2711,6 +2712,27 @@ class GTPShardedParam(torch.nn.Parameter):
             return False
         return getattr(self, "_gtp_graph_wgrad_ring_slot", None) is None
 
+    def record_wgrad_forward(self) -> None:
+        """Track a linear use; grad-disabled/recomputed uses disable the early flush."""
+        if not self._can_accumulate_wgrad():
+            return
+        if self._wgrad_accum_expected is not None:
+            if self._wgrad_accum_consumes and (
+                self._wgrad_accum_consumes == self._wgrad_accum_expected
+            ):
+                raise RuntimeError("GTP forward after the accumulated gradient was reduced")
+            # A recomputed/discovered forward invalidates the sealed count. Fall back
+            # to the final fence instead of guessing how many backwards remain.
+            self._wgrad_accum_expected = None
+            self._wgrad_accum_forwards = None
+        if not torch.is_grad_enabled():
+            # A reentrant checkpoint first runs without grad, then recreates its
+            # head in backward. That use is not in the observed autograd count yet.
+            self._wgrad_accum_forwards = None
+        elif self._wgrad_accum_forwards is not None:
+            self._wgrad_accum_forwards += 1
+        _GTP_PENDING_WGRAD_ACCUM.add(self)
+
     def record_wgrad_consume(self, buf) -> bool:
         """Record this backward; True if it should ADD into ``buf`` rather than overwrite.
 
@@ -2719,6 +2741,11 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         if not self._can_accumulate_wgrad():
             return False
+        if (
+            self._wgrad_accum_expected is not None
+            and self._wgrad_accum_consumes >= self._wgrad_accum_expected
+        ):
+            raise RuntimeError("GTP backward exceeded the declared forward count")
         first = self._wgrad_accum_buf is None
         self._wgrad_accum_buf = buf
         self._wgrad_accum_consumes += 1
@@ -2726,15 +2753,11 @@ class GTPShardedParam(torch.nn.Parameter):
         return not first
 
     def _is_last_expected_consume(self) -> bool:
-        """A PREDICTION: this is consume number N, and last iteration had N of them.
-
-        '==', not '>=': _consumes resets only at the fence, so >= would re-fire on every later
-        consume -- one RS each, and DDP's golden grad-ready count breaks.
-
-        A rising count would fire grad-ready twice and drop that iteration's last consume, so
-        tag_gtp_params_with_names leaves the feature off under --step-batch-size-schedule.
-        """
-        return self._wgrad_accum_consumes == self._wgrad_accum_expected
+        """True only for the final consume of an explicitly closed forward window."""
+        return (
+            self._wgrad_accum_expected is not None
+            and self._wgrad_accum_consumes == self._wgrad_accum_expected
+        )
 
     def flush_accumulated_wgrad(self, async_op=False):
         """Reduce-scatter the accumulated wgrad once and fold it into main_grad.
@@ -3152,7 +3175,8 @@ def reset_gtp_state():
     for param in _GTP_PENDING_WGRAD_ACCUM:
         param._wgrad_accum_buf = None
         param._wgrad_accum_consumes = 0
-        param._wgrad_accum_expected = 0
+        param._wgrad_accum_expected = None
+        param._wgrad_accum_forwards = 0
     _GTP_PENDING_WGRAD_ACCUM.clear()
     clear_graph_wgrad_rings()
     clear_eager_wgrad_rings()
