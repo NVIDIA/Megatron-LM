@@ -1245,6 +1245,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        replay_context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """Decode step of ``seq_len`` tokens per request. ``zVKQba`` is ``[n,
         seq_len, proj_dim]``; returns ``[n, seq_len, d_inner]``. ``seq_len`` is
@@ -1258,7 +1259,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         the conv and SSM state after each draft token, so that verification can
         roll each request's recurrence back to its accepted prefix. Both come
         from the inference context and are slot-indexed like the caches they
-        shadow; they are passed as a pair or not at all.
+        shadow; they are passed as a pair or not at all. ``replay_context`` must
+        be None: ReplaySSM supports only Mamba-2 mixers.
 
         Every op here is CUDA-graph safe: no host synchronization, no
         data-dependent shapes, and the state caches are addressed by device-side
@@ -1267,6 +1269,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
             "a rollback needs both halves of the recurrent state"
         )
+        assert replay_context is None, "ReplaySSM supports only Mamba-2 mixers."
         assert self.cp is not None, "Headwise geometry is required for GDP inference"
 
         # Keep the sequence dimension so the shared helpers apply: their (b, l, ...)
