@@ -111,14 +111,6 @@ def symm_mem_sync(
     local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
-    # Only the first world_size lanes exchange signals. Order memory accesses
-    # for the whole CTA around their release/acquire operations.
-    if hasPreviousMemAccess:
-        tl.debug_barrier()
-
     if flat_tid < world_size:
         _send_signal(send_addrs, "release" if hasPreviousMemAccess else "relaxed")
         _wait_signal(wait_addrs, "acquire" if hasSubsequentMemAccess else "relaxed")
-
-    if hasSubsequentMemAccess:
-        tl.debug_barrier()

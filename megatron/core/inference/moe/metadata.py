@@ -89,6 +89,9 @@ def _fused_metadata_kernel(
         hasPreviousMemAccess=True,
         hasSubsequentMemAccess=True,
     )
+    # Only threads 0..WORLD_SIZE-1 acquire in symm_mem_sync; the whole block reads peers' values
+    # below, so it must wait for them.
+    sync_threads()
 
     # 3. Load all ranks' values, reduce, and write metadata.
     offsets = tl.arange(0, WORLD_SIZE)
