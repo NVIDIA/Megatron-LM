@@ -327,7 +327,8 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             remove_special_tokens = not self.include_special_tokens
         tokens = self.ids_to_tokens(ids)
         if remove_special_tokens:
-            # all_special_tokens is a property that rebuilds its list on every access.
+            # We cache transformers.PreTrainedTokenizerBase.all_special_tokens because it's a
+            # property that rebuilds its list on every access.
             special_tokens = set(self.tokenizer.all_special_tokens)
             tokens_clean = [t for t in tokens if t is not None and t not in special_tokens]
         else:

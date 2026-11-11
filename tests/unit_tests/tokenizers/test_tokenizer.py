@@ -19,6 +19,9 @@ from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
     from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
         HAVE_TRANSFORMERS,
         HuggingFaceTokenizer,
@@ -528,9 +531,6 @@ def test_hf_ids_to_text_eos_with_include_and_remove_special_tokens(
 @pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
 def test_hf_ids_to_text_removes_only_special_tokens(tmp_path):
     """Removal drops the special-tokens map, not every added token flagged special."""
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
     vocab = {"[UNK]": 0, "hello": 1, "world": 2, "<eos>": 3}
     backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
