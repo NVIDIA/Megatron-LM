@@ -15,6 +15,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.launch_on_gb200
+
 pytest.importorskip("deep_select")
 
 from megatron.core.transformer.experimental_attention_variant.dsa_batch_invariant import (  # noqa: E402

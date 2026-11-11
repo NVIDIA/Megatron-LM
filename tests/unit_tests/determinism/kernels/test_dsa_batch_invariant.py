@@ -11,6 +11,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference 
 )
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def test_tied_routing_forward_replays(monkeypatch, record_property):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):

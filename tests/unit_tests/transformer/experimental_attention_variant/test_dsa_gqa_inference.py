@@ -178,6 +178,7 @@ def _reference_attention(query, keys, values, table, row_requests, row_lengths, 
     return out
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("batch_invariant", [False, True], ids=["native", "bi"])
 @pytest.mark.parametrize(
     "query_lengths,kv_lengths,num_decode_requests",
