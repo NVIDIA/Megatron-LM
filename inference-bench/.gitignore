@@ -1,0 +1,7 @@
+# Run outputs
+experiments/
+*.out
+*.log
+__pycache__/
+# Cluster-specific settings (see cluster.env.example)
+cluster.env
