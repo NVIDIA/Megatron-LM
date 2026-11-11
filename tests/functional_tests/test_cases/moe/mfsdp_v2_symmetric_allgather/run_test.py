@@ -41,10 +41,11 @@ def main() -> None:
     assert len(set(hosts)) >= 2, "This functional test requires multiple nodes."
     mesh = DeviceMesh.from_group(dist.group.WORLD, device_type=device.type)
 
+    allocator = symm_mem.get_mempool_allocator(device)
     # Follow PyTorch's no-split policy to avoid concurrent operations sharing
     # a segment's signal pad.
     # https://github.com/pytorch/pytorch/blob/v2.15.0/torch/distributed/_symmetric_memory/__init__.py#L2415-L2420
-    pool = symm_mem.get_mem_pool(device)
+    pool = torch.cuda.MemPool(allocator, no_split=True)
     with torch.cuda.use_mem_pool(pool):
         source = DBuffer.empty(
             mesh, [RowAtomic()], [(world_size * 1024, 1024)], torch.bfloat16, device
