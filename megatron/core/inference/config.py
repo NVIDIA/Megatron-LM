@@ -614,9 +614,9 @@ class InferenceConfig:
     Reserve one recurrent-state buffer for expert-parallel dummy forwards.
 
     Disaggregated handoff can retain every request-owned recurrent-state slot after its request
-    leaves the active batch. An idle EP rank still needs a state buffer for the dummy forward that
-    joins its peers' expert collectives. The reserved entry is outside normal request capacity and
-    is only allocated for hybrid models with expert parallelism.
+    leaves the active batch. An idle tp_ep rank still needs a state buffer for the dummy forward
+    that joins its peers' collectives. The reserved entry is outside normal request capacity and
+    is only allocated for hybrid models whose tp_ep group (expert TP x EP) has more than one rank.
     """
 
     max_tokens: Optional[int] = None
