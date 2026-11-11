@@ -2280,8 +2280,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
-        self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
-        eager_packed_seq_params = kwargs.get('packed_seq_params')
+        self._activate_dynamic_cp_cuda_graph(kwargs.get("packed_seq_params"))
+        eager_packed_seq_params = kwargs.get("packed_seq_params")
         context = None
         padding_mask = kwargs.get("padding_mask", None)
         if (

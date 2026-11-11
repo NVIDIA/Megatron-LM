@@ -3301,7 +3301,7 @@ class TestFusedIndexerSparseAttnFromTopk:
                 total_q,
                 (
                     torch.tensor([0, total_q], dtype=torch.int32),
-                    torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                    torch.tensor([0, inputs["k_indexer"].shape[0]], dtype=torch.int32),
                     torch.tensor([0], dtype=torch.int32),
                 ),
                 q_padding_mask,
@@ -5872,7 +5872,7 @@ class TestThdPaddingRowMasking:
         padded, cu_q_unpadded = self._build_per_seg_padded(
             real, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=False
         )
-        padded['q_indexer'] = padded['q_indexer'].detach().requires_grad_(True)
+        padded["q_indexer"] = padded["q_indexer"].detach().requires_grad_(True)
         packed = []
 
         def pack(tensor):
@@ -5885,7 +5885,7 @@ class TestThdPaddingRowMasking:
             )
 
         assert any(
-            tensor.dtype == torch.bool and tensor.shape == (padded['total_q'],) for tensor in packed
+            tensor.dtype == torch.bool and tensor.shape == (padded["total_q"],) for tensor in packed
         )
 
         assert torch.allclose(loss_with_pad, loss_no_pad, atol=5e-2, rtol=1e-1), (

@@ -1515,17 +1515,17 @@ def validate_args(args, defaults={}):
                 f"{args.min_dynamic_context_parallel_size} is invalid for DPxCP size "
                 f"{dp_cp_size}; expected one of {valid_group_sizes}"
             )
-        if args.cuda_graph_impl == 'transformer_engine':
+        if args.cuda_graph_impl == "transformer_engine":
             if args.step_batch_size_schedule is not None:
-                raise ValueError('Dynamic CP CUDA graphs do not support step_batch_size_schedule.')
+                raise ValueError("Dynamic CP CUDA graphs do not support step_batch_size_schedule.")
             # One graph bank is captured per power-of-two CP size between these bounds.
             for name, size in (
-                ('dp_size * cp_size', dp_cp_size),
-                ('min_dynamic_context_parallel_size', args.min_dynamic_context_parallel_size),
+                ("dp_size * cp_size", dp_cp_size),
+                ("min_dynamic_context_parallel_size", args.min_dynamic_context_parallel_size),
             ):
                 if size < 1 or size & (size - 1):
                     raise ValueError(
-                        f'Dynamic CP CUDA graphs require {name} ({size}) to be a power of two.'
+                        f"Dynamic CP CUDA graphs require {name} ({size}) to be a power of two."
                     )
 
         import warnings

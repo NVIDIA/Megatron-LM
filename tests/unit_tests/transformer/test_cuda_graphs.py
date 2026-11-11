@@ -3019,11 +3019,11 @@ class TestSlotAliasedVariantOrder:
                     cp_size,
                     None,
                     ((),),
-                    {'_order': (1, -1), '_reuse_graph_input_output_buffers': True},
+                    {"_order": (1, -1), "_reuse_graph_input_output_buffers": True},
                 )
             )
         _, _, kwargs = helper._get_dynamic_cp_variant_capture_data(capture_banks)
-        return kwargs['_order']
+        return kwargs["_order"]
 
     def test_capture_uses_minimum_cp_as_canonical(self):
         assert self._dynamic_cp_capture_order() == [3, -3, 1, -1, 2, -2]

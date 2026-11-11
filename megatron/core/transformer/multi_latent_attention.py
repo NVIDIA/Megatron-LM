@@ -270,14 +270,14 @@ class MultiLatentAttention(Attention):
 
     def _retain_cuda_graph_rope_tensors(self, *rope_tensors: Optional[torch.Tensor]) -> None:
         """Retain MLA-internal RoPE allocations used by TE CUDA graphs."""
-        if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
+        if getattr(self.config, "cuda_graph_impl", "none") != "transformer_engine":
             return
 
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
         if not is_graph_capturing():
             return
-        refs = self.__dict__.setdefault('_cuda_graph_static_tensor_refs', {})
+        refs = self.__dict__.setdefault("_cuda_graph_static_tensor_refs", {})
         refs.update((id(tensor), tensor) for tensor in rope_tensors if tensor is not None)
 
     def __init__(

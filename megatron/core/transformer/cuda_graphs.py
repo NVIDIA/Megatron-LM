@@ -2334,7 +2334,7 @@ def _layer_is_graphable(layer, config):
 
     # Wrappers own the graph bank; their inner layer determines DCP support.
     inner = layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
-    if getattr(config, 'dynamic_context_parallel', False) and not isinstance(
+    if getattr(config, "dynamic_context_parallel", False) and not isinstance(
         inner, TransformerLayer
     ):
         return False
@@ -2468,7 +2468,7 @@ class _DynamicCPCaptureCallable(torch.nn.Module):
         """Select the dynamic-CP capture context and invoke the wrapped layer."""
         self._context_setter(self._capture_context)
         outputs = self.module(*args, **kwargs)
-        mlp_norm_manager = getattr(self.module, 'mlp_norm_manager', None)
+        mlp_norm_manager = getattr(self.module, "mlp_norm_manager", None)
         if mlp_norm_manager is not None and not mlp_norm_manager.offload:
             self.module.mlp_norm_manager = None
         return outputs
@@ -3077,7 +3077,7 @@ class TECudaGraphHelper:
             if model_chunk is not None:
                 configs[id(model_chunk.config)] = model_chunk.config
         for config in configs.values():
-            vars(config).pop('_cuda_graph_thd_rotary_seq_lens', None)
+            vars(config).pop("_cuda_graph_thd_rotary_seq_lens", None)
 
     def _clear_cuda_graph_rotary_caches(self):
         """Release RoPE tables only after their graph executables are discarded."""
@@ -3323,7 +3323,7 @@ class TECudaGraphHelper:
                 # Packed THD capture above builds the full table; anything else samples the
                 # CP-sliced one.
                 if (
-                    position_embedding_type == 'rope'
+                    position_embedding_type == "rope"
                     and is_thd
                     and context_parallel_size > 1
                     and not packs_thd
@@ -3744,7 +3744,7 @@ class TECudaGraphHelper:
         self, global_batch_size_upper_bound, microbatch_group_size_per_vp_stage
     ):
         """Return the run-level THD packing upper bound used for graph capture."""
-        if self.config.sequence_packing_scheduler == 'default_dynamic_cp':
+        if self.config.sequence_packing_scheduler == "default_dynamic_cp":
             max_sequence_length = (
                 self.thd_sequence_length_upper_bound
                 if self.thd_sequence_length_upper_bound is not None
@@ -3853,11 +3853,11 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
-        schedule_kwargs = {'forward_only': False}
+        schedule_kwargs = {"forward_only": False}
         if overlap_moe_expert_parallel_comm is not None:
-            schedule_kwargs['overlap_moe_expert_parallel_comm'] = overlap_moe_expert_parallel_comm
+            schedule_kwargs["overlap_moe_expert_parallel_comm"] = overlap_moe_expert_parallel_comm
         if p2p_communicator is not None:
-            schedule_kwargs['p2p_communicator'] = p2p_communicator
+            schedule_kwargs["p2p_communicator"] = p2p_communicator
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
             num_microbatches,
             self.num_model_chunks,
@@ -4156,7 +4156,7 @@ class TECudaGraphHelper:
                     for hook in post_warmup_hooks:
                         hook()
 
-                kwargs['post_warmup_hook'] = post_warmup_hook
+                kwargs["post_warmup_hook"] = post_warmup_hook
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
@@ -4167,7 +4167,7 @@ class TECudaGraphHelper:
         seen_dispatchers = set()
         for layer in self.flattened_callables:
             for module in layer.modules():
-                dispatcher = getattr(module, 'token_dispatcher', None)
+                dispatcher = getattr(module, "token_dispatcher", None)
                 if dispatcher is None or id(dispatcher) in seen_dispatchers:
                     continue
                 seen_dispatchers.add(id(dispatcher))
@@ -4202,17 +4202,17 @@ class TECudaGraphHelper:
 
     def _set_dynamic_cp_capture_context(self, context):
         """Propagate the temporary capture context to every layer config copy."""
-        self._set_cuda_graph_config_attr('_cuda_graph_capture_dynamic_cp', context)
+        self._set_cuda_graph_config_attr("_cuda_graph_capture_dynamic_cp", context)
 
     def _get_cuda_graph_configs(self):
         """Return unique root and graph-layer configs owned by this helper."""
         configs = {}
-        root_config = getattr(self, 'config', None)
+        root_config = getattr(self, "config", None)
         if root_config is not None:
             configs[id(root_config)] = root_config
-        for layers in getattr(self, 'callables_per_chunk', ()):
+        for layers in getattr(self, "callables_per_chunk", ()):
             for layer in layers:
-                layer_config = getattr(layer, 'config', None)
+                layer_config = getattr(layer, "config", None)
                 if layer_config is not None:
                     configs[id(layer_config)] = layer_config
         return tuple(configs.values())
@@ -4465,15 +4465,15 @@ class TECudaGraphHelper:
                 for layer in self.flattened_callables
             )
             sample_args.extend(bank_sample_args)
-            if 'sample_kwargs' in bank_kwargs:
+            if "sample_kwargs" in bank_kwargs:
                 has_sample_kwargs = True
-                sample_kwargs.extend(bank_kwargs['sample_kwargs'])
+                sample_kwargs.extend(bank_kwargs["sample_kwargs"])
             if base_order is None:
-                base_order = bank_kwargs['_order']
-            elif bank_kwargs['_order'] != base_order:
+                base_order = bank_kwargs["_order"]
+            elif bank_kwargs["_order"] != base_order:
                 raise RuntimeError("Dynamic-CP variants produced different PP/VPP graph orders.")
 
-            enabled = bank_kwargs.get('fp8_enabled', False)
+            enabled = bank_kwargs.get("fp8_enabled", False)
             if isinstance(enabled, tuple):
                 fp8_enabled.extend(enabled)
             elif enabled:
@@ -4483,7 +4483,7 @@ class TECudaGraphHelper:
         # never simultaneously live, while CP alternatives for one frame are mutually exclusive.
         graph_memory_slots = []
         base_order = tuple(base_order)
-        liveness_orders = tuple(getattr(self, '_dynamic_slot_liveness_orders', (base_order,)))
+        liveness_orders = tuple(getattr(self, "_dynamic_slot_liveness_orders", (base_order,)))
         if base_order not in liveness_orders:
             # The physical slot count need not be scheduler-aligned (for example, a VPP
             # group size of 4 can produce 7 slots). Capture itself runs that synthetic
@@ -4521,31 +4521,31 @@ class TECudaGraphHelper:
             range(len(capture_banks)), key=lambda index: capture_banks[index][0]
         )
         combined_kwargs = capture_banks[0][3].copy()
-        if not combined_kwargs.get('_reuse_graph_input_output_buffers', False):
+        if not combined_kwargs.get("_reuse_graph_input_output_buffers", False):
             raise RuntimeError(
                 "Slot-aliased dynamic-CP capture requires TE graph input/output buffer reuse."
             )
         # Each variant runs a complete schedule during capture. Explicit slot arenas use the
         # union-liveness plan above, so their addresses also remain valid in replay schedules.
-        combined_kwargs['_graph_memory_slots'] = tuple(graph_memory_slots)
-        combined_kwargs['_order'] = self._build_slot_aliased_variant_order(
+        combined_kwargs["_graph_memory_slots"] = tuple(graph_memory_slots)
+        combined_kwargs["_order"] = self._build_slot_aliased_variant_order(
             base_order,
             len(capture_banks),
             self.num_model_chunks,
             canonical_variant=canonical_variant,
         )
-        combined_kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk * len(capture_banks)
+        combined_kwargs["_num_layers_per_chunk"] = self.num_layers_per_chunk * len(capture_banks)
         if has_sample_kwargs:
             if len(sample_kwargs) != len(sample_args):
                 raise RuntimeError(
                     f"Dynamic-CP capture has {len(sample_kwargs)} kwargs for "
                     f"{len(sample_args)} argument tuples."
                 )
-            combined_kwargs['sample_kwargs'] = tuple(sample_kwargs)
+            combined_kwargs["sample_kwargs"] = tuple(sample_kwargs)
         else:
-            combined_kwargs.pop('sample_kwargs', None)
+            combined_kwargs.pop("sample_kwargs", None)
         if fp8_enabled:
-            combined_kwargs['fp8_enabled'] = tuple(fp8_enabled)
+            combined_kwargs["fp8_enabled"] = tuple(fp8_enabled)
 
         if len(sample_args) != len(graph_memory_slots):
             raise RuntimeError(
@@ -4561,9 +4561,9 @@ class TECudaGraphHelper:
             tp_group=None,
             dp_cp_group=None,
             level=logging.INFO,
-            msg=f'Rank {torch.distributed.get_rank()}: capturing {len(capture_banks)} '
-            f'dynamic-CP variants over {self.num_microbatches} slot-aliased physical TE pool '
-            'slots; each CP variant follows one complete PP/VPP schedule.',
+            msg=f"Rank {torch.distributed.get_rank()}: capturing {len(capture_banks)} "
+            f"dynamic-CP variants over {self.num_microbatches} slot-aliased physical TE pool "
+            "slots; each CP variant follows one complete PP/VPP schedule.",
         )
         callables, sample_args, kwargs = self._get_dynamic_cp_variant_capture_data(capture_banks)
         sample_args = list(sample_args)
@@ -4587,11 +4587,11 @@ class TECudaGraphHelper:
         layer.cuda_graphs_by_dynamic_cp_size = {}
         layer.cuda_graph_cp_groups_by_dynamic_cp_size = {}
         layer.cuda_graph_manual_hooks = []
-        clear_static_inputs = getattr(layer, 'clear_te_cuda_graph_static_hidden_inputs', None)
+        clear_static_inputs = getattr(layer, "clear_te_cuda_graph_static_hidden_inputs", None)
         if clear_static_inputs is not None:
             clear_static_inputs()
         for module in layer.modules():
-            vars(module).pop('_cuda_graph_static_tensor_refs', None)
+            vars(module).pop("_cuda_graph_static_tensor_refs", None)
 
     def _start_capturing(self):
         """

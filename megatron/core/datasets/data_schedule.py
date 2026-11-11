@@ -618,7 +618,7 @@ def wrap_data_iterator(
     # Keep the cap derived above from cuda_graph_thd_max_packed_sequences; the config
     # rejects combining it with thd_max_packed_sequences.
     if scheduler_kwargs.get('max_num_seqs') is None:
-        scheduler_kwargs['max_num_seqs'] = _get_scheduler_max_real_num_seqs(config)
+        scheduler_kwargs["max_num_seqs"] = _get_scheduler_max_real_num_seqs(config)
 
     scheduler = scheduler_map[scheduler_type](
         capacity,

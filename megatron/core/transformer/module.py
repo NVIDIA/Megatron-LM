@@ -588,12 +588,12 @@ class GraphableMegatronModule(MegatronModule):
         captured auxiliary-loss reduction.
         """
         if (
-            getattr(self.config, 'dynamic_context_parallel', False)
-            and kwargs.get('packed_seq_params') is None
+            getattr(self.config, "dynamic_context_parallel", False)
+            and kwargs.get("packed_seq_params") is None
         ):
             capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
-            kwargs['packed_seq_params'] = PackedSeqParams(
-                qkv_format='thd', local_cp_size=capture_cp_size, cp_group=capture_cp_group
+            kwargs["packed_seq_params"] = PackedSeqParams(
+                qkv_format="thd", local_cp_size=capture_cp_size, cp_group=capture_cp_group
             )
 
     def _activate_dynamic_cp_cuda_graph(self, packed_seq_params):
@@ -626,7 +626,7 @@ class GraphableMegatronModule(MegatronModule):
             # The data path marks a CP-off microbatch with cp_group=None and keeps the
             # singleton group in cp_singleton_group, as resolve_cp_group() accepts. Resolve it
             # here without asserts so the guard also holds under optimized Python.
-            runtime_group = getattr(packed_seq_params, 'cp_singleton_group', None)
+            runtime_group = getattr(packed_seq_params, "cp_singleton_group", None)
         if runtime_group is not expected_group:
             raise RuntimeError(
                 "Dynamic-CP CUDA graph replay received a process group that does not match "

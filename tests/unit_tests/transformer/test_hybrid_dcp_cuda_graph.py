@@ -139,7 +139,7 @@ def test_dynamic_capture_exposes_grouped_prefix_state_without_changing_model():
     layer = _wrapper(SimpleNamespace())
     prefix = torch.nn.Linear(2, 2)
     prefix.register_buffer("routing_table", torch.arange(4))
-    object.__setattr__(layer, '_get_submodules_under_cudagraphs', lambda: [layer, prefix])
+    object.__setattr__(layer, "_get_submodules_under_cudagraphs", lambda: [layer, prefix])
     before = tuple(layer.state_dict())
     capture = _DynamicCPCaptureCallable(layer, lambda context: None, (1, object()))
     assert tuple(layer.state_dict()) == before
@@ -237,7 +237,7 @@ def test_hybrid_multi_cp_capture_replay_matches_eager(grouped, hash_routing, mon
         if not grouped:
             monkeypatch.setattr(
                 HyperConnectionHybridLayer,
-                '_can_group_te_cuda_graph_with',
+                "_can_group_te_cuda_graph_with",
                 lambda self, next_layer: False,
             )
         chunk = _GraphTestChunk()

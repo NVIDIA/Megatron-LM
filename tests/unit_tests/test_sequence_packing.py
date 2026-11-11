@@ -449,7 +449,7 @@ def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
         output.copy_(torch.cat([input_, remote]))
 
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
-    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
     monkeypatch.setattr(
         torch.distributed,
@@ -487,10 +487,10 @@ def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
             dp_cp_group=dp_cp_group,
         )
 
-    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
         torch.distributed,
-        'get_process_group_ranks',
+        "get_process_group_ranks",
         lambda group: [0, 1] if group is dp_group else [0, 2],
     )
     with pytest.raises(RuntimeError, match="must use the same rank order"):

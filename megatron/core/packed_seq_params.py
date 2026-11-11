@@ -590,7 +590,7 @@ def pad_sequence_for_thd(
 
     # Keep the real length before adding a synthetic padding sequence. This host-only
     # validation value is deliberately not a dataclass field or a graph/TE input.
-    max_seqlen_unpadded = getattr(packed_seq_params, '_max_seqlen_unpadded', None)
+    max_seqlen_unpadded = getattr(packed_seq_params, "_max_seqlen_unpadded", None)
     if max_seqlen_unpadded is None:
         boundaries = {
             id(cu): cu
