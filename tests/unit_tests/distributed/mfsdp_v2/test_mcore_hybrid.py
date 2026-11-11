@@ -6,10 +6,15 @@ import os
 
 import pytest
 import torch
-from torch.distributed.tensor import Replicate, Shard
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import _initialize_symmetric_memory_meshes
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -33,6 +38,56 @@ def model_parallel_cleanup(distributed_setup):
     """Initialize distributed state and clean up the topology created by each test."""
     yield
     destroy_model_parallel()
+
+
+def test_symmetric_memory_initializes_dense_and_expert_mesh_axes(
+    distributed_setup, model_parallel_cleanup
+):
+    """Fresh hybrid dense/expert groups can register buffers and average over both axes."""
+    world_size, rank = distributed_setup.world_size, distributed_setup.rank
+    if world_size < 4 or world_size % 2:
+        pytest.skip("Requires an even world size of at least four ranks.")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    device = distributed_setup.device
+    inner_size = world_size // 2
+    outer_group = None
+    for column in range(inner_size):
+        ranks = [column, column + inner_size]
+        group = dist.new_group(ranks, backend="nccl")
+        if rank in ranks:
+            outer_group = group
+    meshes = []
+    for _ in range(2):
+        inner_group = None
+        for start in (0, inner_size):
+            ranks = list(range(start, start + inner_size))
+            group = dist.new_group(ranks, backend="nccl")
+            if rank in ranks:
+                inner_group = group
+        meshes.append(
+            DeviceMesh.from_group(
+                [outer_group, inner_group],
+                device_type=device.type,
+                mesh=torch.arange(world_size).reshape(2, inner_size),
+                mesh_dim_names=("dp_outer", "dp_inner"),
+            )
+        )
+
+    _initialize_symmetric_memory_meshes(tuple(meshes), device)
+    with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device)):
+        for mesh in meshes:
+            buffer = DBuffer.distribute_tensors(
+                [torch.full((world_size * 4, 2), float(rank + 1), device=device)],
+                mesh,
+                [Partial("avg"), Partial("avg")],
+            )
+            sharded = buffer.reduce_scatter(1, RowAtomic()).reduce_scatter(0, RowAtomic())
+            gathered = sharded.allgather(0).allgather(1)
+            actual = gathered.get_tensor_view(0)
+            torch.testing.assert_close(
+                actual, torch.full_like(actual, (world_size + 1) / 2), rtol=0, atol=0
+            )
 
 
 def _config() -> TransformerConfig:

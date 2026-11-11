@@ -2,19 +2,21 @@
 
 """Dense MCore adapter and optimizer integration tests for MFSDP v2."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
-import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    RuntimePolicy,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -211,7 +213,11 @@ def test_wraps_fsdp_unit_modules_before_root(process_group_collection):
     assert root_parameter_names == {"1.weight", "1.bias"}
 
 
-def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch):
+@pytest.mark.parametrize("ambient_symmetric_memory", [None, True, False])
+def test_symmetric_memory_initializes_supplied_mesh(
+    process_group_collection, distributed_setup, ambient_symmetric_memory
+):
+    """A fresh supplied group supports registration and follows the active context's policy."""
     config = TransformerConfig(
         num_layers=1,
         hidden_size=16,
@@ -220,30 +226,51 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
         bf16=True,
         params_dtype=torch.bfloat16,
     )
-    model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+    model = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False).to(
         device="cuda", dtype=config.params_dtype
     )
-    fully_shard_context_calls = []
-    original_fully_shard_context = mcore_adapter_v2.fully_shard_context
-
-    def record_fully_shard_context(context):
-        fully_shard_context_calls.append(context.use_symmetric_memory)
-        return original_fully_shard_context(context)
-
-    monkeypatch.setattr(mcore_adapter_v2, "fully_shard_context", record_fully_shard_context)
-    FullyShardedDataParallel(
-        config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            data_parallel_sharding_strategy="optim_grads_params",
-            nccl_ub=True,
-        ),
-        module=model,
-        pg_collection=process_group_collection,
+    # Keep this group cold until the adapter constructs its mesh.
+    process_group_collection.dp_cp = dist.new_group(backend="nccl")
+    construction_context = (
+        nullcontext()
+        if ambient_symmetric_memory is None
+        else fully_shard_context(
+            FsdpContext(
+                device=distributed_setup.device,
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ambient_symmetric_memory, caller_managed_grad_sync=True
+                ),
+            )
+        )
     )
+    with construction_context:
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+                nccl_ub=ambient_symmetric_memory is not True,
+            ),
+            module=model,
+            device=distributed_setup.device,
+            pg_collection=process_group_collection,
+        )
 
-    assert fully_shard_context_calls == [True]
+    assert wrapped.module.context.use_symmetric_memory == (ambient_symmetric_memory is not False)
+    inputs = torch.full(
+        (2, config.hidden_size),
+        float(distributed_setup.rank + 1),
+        device=distributed_setup.device,
+        dtype=config.params_dtype,
+    )
+    run_forward_backward_on_microbatches(wrapped, lambda: wrapped(inputs).float().sum())
+    [parameter] = wrapped.parameters()
+    assert parameter.grad is not None
+    gradient = parameter.grad.full_tensor()
+    torch.testing.assert_close(
+        gradient, torch.full_like(gradient, distributed_setup.world_size + 1), rtol=0, atol=0
+    )
 
 
 def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_collection):

@@ -204,12 +204,6 @@ class DBuffer:
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)
-        # NCCL window registration requires an initialized communicator.
-        # For cold groups, follow PyTorch's eager initialization with device_id:
-        # https://github.com/pytorch/pytorch/blob/v2.13.0/torch/distributed/distributed_c10d.py#L2333-L2335
-        backend = group._get_backend(self.device)
-        if not backend._is_initialized():
-            backend.eager_connect_single_device(self.device)
         symm_mem.rendezvous(self.local_buffer, group=group.group_name)
 
     def _resize_storage(self, numel: int) -> None:

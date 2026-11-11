@@ -120,6 +120,17 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
+def _initialize_symmetric_memory_meshes(
+    meshes: tuple[DeviceMesh | None, ...], device: torch.device
+) -> None:
+    """Initialize each mesh-axis communicator before registering symmetric buffers."""
+    groups = dict.fromkeys(
+        group for mesh in meshes if mesh is not None for group in mesh.get_all_groups()
+    )
+    for group in groups:
+        dist.barrier(group=group, device_ids=[device.index])
+
+
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
@@ -280,7 +291,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "RuntimePolicy(caller_managed_grad_sync=True)."
                 )
             construction_context = nullcontext(active_context)
-        with construction_context:
+        with construction_context as context:
+            if context.use_symmetric_memory:
+                _initialize_symmetric_memory_meshes(
+                    (dp_mesh, expert_dp_mesh), context.allgather_stream.device
+                )
             collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
             for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
