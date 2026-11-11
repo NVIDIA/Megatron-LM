@@ -300,3 +300,122 @@ class TestCausalConv1dUpdate:
                 atol=1e-5,
                 rtol=1e-5,
             )
+
+
+@pytest.mark.internal
+class TestInt32Offsets:
+    """Slot and batch offsets at the int32 limit, at Nemotron-H 8B's conv (TP 1: 10,240 channels,
+    d_conv 4, so 40,960 state elements per slot).
+
+    The inference context gives the kernel one layer's view of ``[layers, slots, ...]`` states,
+    so a wrapped offset lands silently in another layer. The ``large`` cases (opt in with
+    ``-m large``; about 10 GiB of device memory) put an offset at 2**31 elements, or just below
+    it; the small cases run the same checks far below the limit.
+    """
+
+    dim, width = 10240, 4
+
+    def setup_method(self, method):
+        _requires_cuda()
+
+    @pytest.mark.parametrize(
+        "slots, steps",
+        [
+            pytest.param(4, 1, id="small"),
+            pytest.param(4, 8, id="small-snapshots"),
+            pytest.param(52429, 1, marks=pytest.mark.large, id="state-below"),
+            pytest.param(52430, 1, marks=pytest.mark.large, id="state-past"),
+            pytest.param(6554, 8, marks=pytest.mark.large, id="snapshots-below"),
+            pytest.param(6555, 8, marks=pytest.mark.large, id="snapshots-past"),
+        ],
+    )
+    def test_last_slot_of_a_layer_matches_its_own_run(self, slots, steps):
+        """A request decodes into the last slot of layer 1, with int32 slot indices. Its state
+        starts past 2**31 elements at 52,430 slots (52,429 is the control); with 7 draft tokens,
+        its snapshots (327,680 elements per slot) start past it at 6,555 slots (6,554 is the
+        control)."""
+        torch.manual_seed(0)
+        dim, width = self.dim, self.width
+        x = torch.randn(1, steps, dim, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        initial_state = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+        # Two layers of states and snapshots, filled with a sentinel.
+        states = torch.full((2, slots, dim, width), 7.0, device="cuda", dtype=torch.bfloat16)
+        states[1, -1] = initial_state
+        snapshots = None
+        if steps > 1:
+            snapshots = torch.full(
+                (2, slots, steps, dim, width), 7.0, device="cuda", dtype=torch.bfloat16
+            )
+
+        out = causal_conv1d_update(
+            x,
+            states[1],
+            weight,
+            bias,
+            "silu",
+            torch.tensor([slots - 1], dtype=torch.int32, device="cuda"),
+            intermediate_conv_states=None if snapshots is None else snapshots[1],
+        )
+
+        alone_state = initial_state[None].clone()
+        alone_snapshots = None if snapshots is None else torch.zeros_like(snapshots[1, :1])
+        alone = causal_conv1d_update(
+            x,
+            alone_state,
+            weight,
+            bias,
+            "silu",
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            intermediate_conv_states=alone_snapshots,
+        )
+        torch.testing.assert_close(out, alone, rtol=0, atol=0)
+        torch.testing.assert_close(states[1, -1], alone_state[0], rtol=0, atol=0)
+        assert bool((states[0] == 7.0).all()), "the update wrote into layer 0's states"
+        if snapshots is not None:
+            torch.testing.assert_close(snapshots[1, -1], alone_snapshots[0], rtol=0, atol=0)
+            assert bool((snapshots[0] == 7.0).all()), "the update wrote into layer 0's snapshots"
+
+    @pytest.mark.parametrize(
+        "requests",
+        [
+            pytest.param(64, id="small"),
+            pytest.param(115705, marks=pytest.mark.large, id="below"),
+            pytest.param(115706, marks=pytest.mark.large, id="past"),
+        ],
+    )
+    def test_batch_offset_of_a_projection_view(self, requests):
+        """MambaMixer passes x as a column slice of the in_proj output, so its request stride is
+        the whole in_proj row (18,560 elements): the last request's x starts past 2**31 elements
+        at 115,706 one-token requests (115,705 is the control). Every request but the last is
+        padding, so only the last one holds a slot."""
+        torch.manual_seed(0)
+        dim, width = self.dim, self.width
+        d_inner, nheads = 8192, 128
+        projection = torch.full(
+            (requests, 1, d_inner + dim + nheads), 7.0, device="cuda", dtype=torch.bfloat16
+        )
+        projection[-1].normal_()
+        weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        initial_state = torch.randn(1, dim, width, device="cuda", dtype=torch.bfloat16)
+        indices = torch.full((requests,), -1, dtype=torch.int64, device="cuda")
+        indices[-1] = 0
+
+        state = initial_state.clone()
+        out = causal_conv1d_update(
+            projection[..., d_inner : d_inner + dim], state, weight, bias, "silu", indices
+        )
+
+        alone_state = initial_state.clone()
+        alone = causal_conv1d_update(
+            projection[-1:, :, d_inner : d_inner + dim].clone(),
+            alone_state,
+            weight,
+            bias,
+            "silu",
+            torch.zeros(1, dtype=torch.int64, device="cuda"),
+        )
+        torch.testing.assert_close(out[-1:], alone, rtol=0, atol=0)
+        torch.testing.assert_close(state, alone_state, rtol=0, atol=0)

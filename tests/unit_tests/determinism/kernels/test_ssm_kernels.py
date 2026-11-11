@@ -553,6 +553,66 @@ def test_causal_conv1d_update_spec_decode_replays():
     )
 
 
+def test_selective_state_update_spec_decode_replays():
+    """The SSM update of the speculative decode step above, with the rollback snapshots.
+
+    Dynamic batching passes each request's slot in ``state_batch_indices``, and
+    ``intermediate_ssm_states`` receives the state after each draft token.
+    ``test_selective_state_update_replays`` covers the single-token path without slots.
+    """
+    from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+
+    seeded()
+    batch, seq_len, nheads, headdim, dstate, ngroups = 256, 4, 8, 64, 128, 2
+    slots = batch + 8
+    state = torch.randn(slots, nheads, headdim, dstate, device="cuda")
+    intermediate = torch.zeros(slots, seq_len, nheads, headdim, dstate, device="cuda")
+    x = torch.randn(batch, seq_len, nheads, headdim, device="cuda", dtype=torch.bfloat16)
+    dt = (
+        torch.rand(batch, seq_len, nheads, device="cuda")
+        .unsqueeze(-1)
+        .expand(batch, seq_len, nheads, headdim)
+    )
+    A = (
+        (-torch.rand(nheads, device="cuda") - 1.0)
+        .view(nheads, 1, 1)
+        .expand(nheads, headdim, dstate)
+    )
+    Bm = torch.randn(batch, seq_len, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
+    Cm = torch.randn(batch, seq_len, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
+    D = torch.randn(nheads, device="cuda").unsqueeze(-1).expand(nheads, headdim)
+    dt_bias = (torch.rand(nheads, device="cuda") - 4.0).unsqueeze(-1).expand(nheads, headdim)
+    # -1 marks a padding request, whose output is zeroed and whose state and snapshots are
+    # left untouched.
+    state_indices = torch.randperm(slots, device="cuda")[:batch].to(torch.int32)
+    state_indices[::16] = -1
+
+    def fn(state, intermediate, x, dt, A, Bm, Cm, D, dt_bias, state_indices):
+        out = selective_state_update(
+            state,
+            x,
+            dt,
+            A,
+            Bm,
+            Cm,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_indices,
+            intermediate_ssm_states=intermediate,
+        )
+        return out, state, intermediate
+
+    assert_replays_bit_exact(
+        fn,
+        (state, intermediate, x, dt, A, Bm, Cm, D, dt_bias, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="selective_state_update (speculative decode)",
+    )
+
+
 @pytest.mark.parametrize("cache_autotuning", [False, True], ids=["no_cache", "autotune_cache"])
 def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
     from megatron.core.ssm.ops.common import causal_conv1d_varlen
