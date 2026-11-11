@@ -5,6 +5,12 @@ import argparse
 import math
 import json
 import os
+
+# Workers provide process-level parallelism. Disable per-worker tokenizer thread
+# pools by default to avoid exhausting task limits with forkserver or spawn.
+# Set this before tokenizer imports and worker startup; explicit user values win.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
