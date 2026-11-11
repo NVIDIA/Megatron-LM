@@ -2447,7 +2447,7 @@ class TestDynamicMicrobatchSlots:
             (size, groups[size]) for size in (8, 4, 2, 1)
         ]
 
-        bank = {size: [f'cp{size}'] for size in groups}
+        bank = {size: [f"cp{size}"] for size in groups}
         activated_static_input_banks = []
         layer = SimpleNamespace(
             cuda_graphs=[],
@@ -2499,7 +2499,7 @@ class TestDynamicMicrobatchSlots:
         with pytest.raises(RuntimeError, match="capture failed"):
             helper.create_cudagraphs()
         assert helper._capture_finished is False
-        assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
+        assert not hasattr(helper.config, "_cuda_graph_thd_rotary_seq_lens")
 
         helper.create_cudagraphs()
 
@@ -2584,7 +2584,7 @@ class TestDynamicMicrobatchSlots:
 
         helper._clear_thd_rotary_seq_lens()
         for config in (helper.config, *chunk_configs):
-            assert not hasattr(config, '_cuda_graph_thd_rotary_seq_lens')
+            assert not hasattr(config, "_cuda_graph_thd_rotary_seq_lens")
 
     @pytest.mark.internal
     @pytest.mark.parametrize("reset_fails", (False, True))
@@ -2626,9 +2626,9 @@ class TestDynamicMicrobatchSlots:
         helper.model = [root]
         helper.tp_group = object()
         helper.dp_cp_group = object()
-        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
-        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
-        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(cuda_graphs, "is_te_min_version", lambda version: True)
+        monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
         if reset_fails:
             with pytest.raises(RuntimeError, match="reset failed"):
@@ -2643,10 +2643,10 @@ class TestDynamicMicrobatchSlots:
         assert layer.cuda_graphs_by_dynamic_cp_size == {}
         assert not hasattr(layer, "_cuda_graph_rotary_embeddings")
         assert not hasattr(rotary, "_cuda_graph_rotary_embeddings")
-        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
-        assert not hasattr(helper.config, '_cuda_graph_allowed_microbatches')
-        assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
-        assert not hasattr(chunk_config, '_cuda_graph_thd_rotary_seq_lens')
+        assert not hasattr(helper.config, "_cuda_graph_num_microbatches")
+        assert not hasattr(helper.config, "_cuda_graph_allowed_microbatches")
+        assert not hasattr(helper.config, "_cuda_graph_thd_rotary_seq_lens")
+        assert not hasattr(chunk_config, "_cuda_graph_thd_rotary_seq_lens")
 
     @pytest.mark.internal
     def test_delete_graphs_without_graphable_layers_releases_state(self, monkeypatch):
@@ -2662,14 +2662,14 @@ class TestDynamicMicrobatchSlots:
         helper.callables_per_chunk = []
         helper.tp_group = object()
         helper.dp_cp_group = object()
-        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
-        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
-        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(cuda_graphs, "is_te_min_version", lambda version: True)
+        monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
         helper.delete_cuda_graphs()
 
-        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
-        assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
+        assert not hasattr(helper.config, "_cuda_graph_num_microbatches")
+        assert not hasattr(helper.config, "_cuda_graph_thd_rotary_seq_lens")
 
     @pytest.mark.internal
     def test_delete_graphs_preserves_first_error_and_runs_remaining_cleanup(self, monkeypatch):
@@ -2698,15 +2698,15 @@ class TestDynamicMicrobatchSlots:
             raise RuntimeError("rope cleanup failed")
 
         helper._clear_thd_rotary_seq_lens = fail_rope_cleanup
-        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
-        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
-        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(cuda_graphs, "is_te_min_version", lambda version: True)
+        monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
         with pytest.raises(RuntimeError, match="reset failed"):
             helper.delete_cuda_graphs()
 
         assert cleanup_calls == ["rope"]
-        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
+        assert not hasattr(helper.config, "_cuda_graph_num_microbatches")
         assert layer.cuda_graphs == []
 
     @pytest.mark.internal
@@ -2716,7 +2716,7 @@ class TestDynamicMicrobatchSlots:
         model = GPTModel.__new__(GPTModel)
         object.__setattr__(
             model,
-            'config',
+            "config",
             SimpleNamespace(
                 context_parallel_size=4, _cuda_graph_thd_rotary_seq_lens={4: 16384, 8: 16384}
             ),
@@ -2725,55 +2725,55 @@ class TestDynamicMicrobatchSlots:
         def metadata(cp_size):
             cu = torch.tensor([0, 16384, 16384])
             return SimpleNamespace(
-                qkv_format='thd', local_cp_size=cp_size, cu_seqlens_q=cu, cu_seqlens_kv=cu
+                qkv_format="thd", local_cp_size=cp_size, cu_seqlens_q=cu, cu_seqlens_kv=cu
             )
 
         assert model._bound_thd_rotary_seq_len(32768, metadata(8)) == 16384
         assert model._bound_thd_rotary_seq_len(32768, metadata(None)) == 16384
         assert (
             model._bound_thd_rotary_seq_len(
-                32768, SimpleNamespace(qkv_format='sbhd', local_cp_size=8)
+                32768, SimpleNamespace(qkv_format="sbhd", local_cp_size=8)
             )
             == 32768
         )
         assert model._bound_thd_rotary_seq_len(32768, None) == 32768
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("overlong_side", ('q', 'kv', 'missing'))
+    @pytest.mark.parametrize("overlong_side", ("q", "kv", "missing"))
     def test_thd_graph_runtime_rope_rejects_unproved_shortening(self, overlong_side):
         from megatron.core.models.gpt.gpt_model import GPTModel
 
         model = GPTModel.__new__(GPTModel)
         object.__setattr__(
             model,
-            'config',
+            "config",
             SimpleNamespace(context_parallel_size=1, _cuda_graph_thd_rotary_seq_lens={1: 4}),
         )
         cu = torch.tensor([0, 4])
-        params = PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu)
-        if overlong_side == 'missing':
+        params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+        if overlong_side == "missing":
             params.cu_seqlens_kv = None
         else:
-            setattr(params, f'cu_seqlens_{overlong_side}', torch.tensor([0, 8]))
+            setattr(params, f"cu_seqlens_{overlong_side}", torch.tensor([0, 8]))
         with pytest.raises(
             ValueError, match="real sequence-length metadata|exceeds the captured RoPE"
         ):
             model._bound_thd_rotary_seq_len(8, params)
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("tail_policy", ('append_dummy_seq', 'extend_last'))
+    @pytest.mark.parametrize("tail_policy", ("append_dummy_seq", "extend_last"))
     def test_thd_graph_runtime_rope_allows_padding_beyond_real_limit(self, tail_policy):
         from megatron.core.models.gpt.gpt_model import GPTModel
 
         model = GPTModel.__new__(GPTModel)
         object.__setattr__(
             model,
-            'config',
+            "config",
             SimpleNamespace(context_parallel_size=1, _cuda_graph_thd_rotary_seq_lens={1: 4}),
         )
         cu = torch.tensor([0, 4], dtype=torch.int32)
         params = PackedSeqParams(
-            qkv_format='thd',
+            qkv_format="thd",
             cu_seqlens_q=cu,
             cu_seqlens_kv=cu,
             cu_seqlens_q_padded=cu,
@@ -2841,8 +2841,8 @@ class TestDynamicMicrobatchSlots:
 
         mla = MLASelfAttention.__new__(MLASelfAttention)
         torch.nn.Module.__init__(mla)
-        mla.config = SimpleNamespace(cuda_graph_impl='transformer_engine')
-        monkeypatch.setattr(cuda_graphs, 'is_graph_capturing', lambda: True)
+        mla.config = SimpleNamespace(cuda_graph_impl="transformer_engine")
+        monkeypatch.setattr(cuda_graphs, "is_graph_capturing", lambda: True)
 
         tensor = torch.ones(1)
         tensor_ref = weakref.ref(tensor)
@@ -3080,9 +3080,9 @@ class TestDynamicMicrobatchSlots:
                 object(),
                 [(offset + index,) for index in range(2)],
                 {
-                    '_order': order,
-                    '_num_layers_per_chunk': [1],
-                    '_reuse_graph_input_output_buffers': True,
+                    "_order": order,
+                    "_num_layers_per_chunk": [1],
+                    "_reuse_graph_input_output_buffers": True,
                 },
             )
 
@@ -3108,15 +3108,15 @@ class TestDynamicMicrobatchSlots:
         assert sample_args == tuple((index,) for index in range(2)) + tuple(
             (10 + index,) for index in range(2)
         )
-        assert kwargs['_graph_memory_slots'] == expected_slots
-        assert kwargs['_num_layers_per_chunk'] == [1, 1]
+        assert kwargs["_graph_memory_slots"] == expected_slots
+        assert kwargs["_num_layers_per_chunk"] == [1, 1]
         assert not any(
             key in kwargs
             for key in (
-                '_saved_tensor_memory_alias_groups',
-                '_slot_io_memory_alias_groups',
-                '_slot_io_liveness_groups',
-                '_warmup_plan_alias_groups',
+                "_saved_tensor_memory_alias_groups",
+                "_slot_io_memory_alias_groups",
+                "_slot_io_liveness_groups",
+                "_warmup_plan_alias_groups",
             )
         )
 
@@ -3174,9 +3174,9 @@ class TestDynamicMicrobatchSlots:
             object(),
             [(index,) for index in range(14)],
             {
-                '_order': base_order,
-                '_num_layers_per_chunk': [1, 1],
-                '_reuse_graph_input_output_buffers': True,
+                "_order": base_order,
+                "_num_layers_per_chunk": [1, 1],
+                "_reuse_graph_input_output_buffers": True,
             },
         )
 
@@ -3184,7 +3184,7 @@ class TestDynamicMicrobatchSlots:
         saved_arenas = {
             (model_chunk, physical_slot): saved_arena
             for (saved_arena, physical_slot, _, model_chunk, _, _, _) in kwargs[
-                '_graph_memory_slots'
+                "_graph_memory_slots"
             ]
         }
 
@@ -3211,9 +3211,9 @@ class TestDynamicMicrobatchSlots:
                 object(),
                 [(cp_size, slot) for slot in range(2)],
                 {
-                    '_order': order,
-                    '_num_layers_per_chunk': [1],
-                    '_reuse_graph_input_output_buffers': True,
+                    "_order": order,
+                    "_num_layers_per_chunk": [1],
+                    "_reuse_graph_input_output_buffers": True,
                 },
             )
             for cp_size in (2, 1)
@@ -3227,8 +3227,8 @@ class TestDynamicMicrobatchSlots:
             return [object() for _ in sample_args]
 
         helper._capture_graph_bank = capture_graph_bank
-        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
-        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
         captured_graphs = {}
         helper._capture_dynamic_cp_variants(banks, captured_graphs)
@@ -3262,7 +3262,7 @@ class TestDynamicMicrobatchSlots:
         helper.num_microbatches = 32
         helper._publish_dynamic_cp_graph_microbatch_limit()
         assert helper.config._cuda_graph_num_microbatches == 32
-        assert not hasattr(helper.config, '_cuda_graph_allowed_microbatches')
+        assert not hasattr(helper.config, "_cuda_graph_allowed_microbatches")
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -3311,15 +3311,15 @@ class TestDynamicMicrobatchSlots:
             )
             assert num_slots == 16
 
-            events = [('forward', *op) for op in forward_ops[:num_warmup]]
+            events = [("forward", *op) for op in forward_ops[:num_warmup]]
             for index in range(num_warmup, len(forward_ops)):
-                events.append(('forward', *forward_ops[index]))
-                events.append(('backward', *backward_ops[index - num_warmup]))
-            events.extend(('backward', *op) for op in backward_ops[-num_warmup:])
+                events.append(("forward", *forward_ops[index]))
+                events.append(("backward", *backward_ops[index - num_warmup]))
+            events.extend(("backward", *op) for op in backward_ops[-num_warmup:])
             live_slots = [dict() for _ in range(num_model_chunks)]
             for phase, microbatch, chunk in events:
                 slot = microbatch % num_slots
-                if phase == 'forward':
+                if phase == "forward":
                     assert slot not in live_slots[chunk]
                     live_slots[chunk][slot] = microbatch
                 else:

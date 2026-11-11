@@ -490,7 +490,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         try:
             # Select the CP graph bank before packed metadata is decomposed;
             # both the split attention path and the wrapper graph replay it.
-            self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
+            self._activate_dynamic_cp_cuda_graph(kwargs.get("packed_seq_params"))
             self._decompose_packed_seq_params_to_kwargs(kwargs)
             return self._te_cuda_graph_replay_impl(args, kwargs)
         finally:

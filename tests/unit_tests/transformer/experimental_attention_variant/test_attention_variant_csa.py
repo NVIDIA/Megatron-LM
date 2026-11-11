@@ -1372,7 +1372,7 @@ class TestCompressedSparseAttentionCompressed:
             submodules=_make_csa_submodules(),
             layer_number=self._get_layer_number(compress_ratio),
             attn_mask_type=AttnMaskType.causal,
-            attention_type='self',
+            attention_type="self",
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
             compress_ratio=compress_ratio,
