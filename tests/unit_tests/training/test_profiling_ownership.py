@@ -477,7 +477,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     monkeypatch.setattr(training, "get_timers", lambda: timers)
     for getter in (
         "get_tensorboard_writer",
-        "get_wandb_writer",
+        "get_experiment_writer",
         "get_one_logger",
         "get_energy_monitor",
         "get_telemetry",

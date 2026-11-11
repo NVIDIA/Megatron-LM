@@ -395,7 +395,12 @@ def test_attention_metric_logging_reads_model_config(
     monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
     monkeypatch.setattr(training, 'one_logger_utils', Mock())
     monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
-    for getter in ('get_wandb_writer', 'get_one_logger', 'get_energy_monitor', 'get_telemetry'):
+    for getter in (
+        'get_experiment_writer',
+        'get_one_logger',
+        'get_energy_monitor',
+        'get_telemetry',
+    ):
         monkeypatch.setattr(training, getter, lambda: None)
     model = [SimpleNamespace(config=transformer)] if supplied_model else None
     training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, 7.0, model=model)

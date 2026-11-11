@@ -190,8 +190,10 @@ from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from .global_vars import (
     destroy_global_vars,
+    finish_experiment_logging,
     get_args,
     get_energy_monitor,
+    get_experiment_writer,
     get_one_logger,
     get_run_config,
     get_signal_handler,
@@ -2392,6 +2394,7 @@ def pretrain(
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    finish_experiment_logging()
 
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
@@ -3825,7 +3828,7 @@ def training_log(
     cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
-    wandb_writer = get_wandb_writer()
+    wandb_writer = get_experiment_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
@@ -3916,56 +3919,65 @@ def training_log(
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
-    # Tensorboard values.
-    if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
+    # Scalar backends do not require TensorBoard to be enabled.
+    if (writer or wandb_writer) and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': train_state.consumed_train_samples}, iteration)
         if learning_rate is not None:
-            writer.add_scalar('learning-rate', learning_rate, iteration)
-            writer.add_scalar('learning-rate vs samples', learning_rate, train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar('learning-rate', learning_rate, iteration)
+                writer.add_scalar('learning-rate vs samples', learning_rate, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
         if train_state.skipped_train_samples > 0:
-            writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
+            if writer:
+                writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': train_state.skipped_train_samples}, iteration)
-        writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
+        if writer:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
         for key in loss_dict:
-            writer.add_scalar(key, loss_dict[key], iteration)
-            writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar(key, loss_dict[key], iteration)
+                writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if cfg.logger.log_loss_scale_to_tensorboard:
-            writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale, train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar('loss-scale', loss_scale, iteration)
+                writer.add_scalar('loss-scale vs samples', loss_scale, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
         if cfg.logger.log_world_size_to_tensorboard:
-            writer.add_scalar('world-size', safe_get_world_size(), iteration)
-            writer.add_scalar('world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar('world-size', safe_get_world_size(), iteration)
+                writer.add_scalar('world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'world-size': safe_get_world_size()}, iteration)
         if grad_norm is not None:
-            writer.add_scalar('grad-norm', grad_norm, iteration)
-            writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar('grad-norm', grad_norm, iteration)
+                writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
-            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-            writer.add_scalar(
-                'num-zeros vs samples', num_zeros_in_grad, train_state.consumed_train_samples
-            )
+            if writer:
+                writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
+                writer.add_scalar(
+                    'num-zeros vs samples', num_zeros_in_grad, train_state.consumed_train_samples
+                )
             if wandb_writer:
                 wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
         if params_norm is not None:
-            writer.add_scalar('params-norm', params_norm, iteration)
-            writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
+            if writer:
+                writer.add_scalar('params-norm', params_norm, iteration)
+                writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if cfg.logger.log_memory_to_tensorboard:
+        if writer and cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
@@ -3979,11 +3991,13 @@ def training_log(
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
         model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         if model_config is not None and model_config.log_max_attention_logit:
-            writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
+            if writer:
+                writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-        callback_manager.callback_context.batch_size = batch_size
-        callback_manager.trigger("on_tensorboard_log")
+        if writer:
+            callback_manager.callback_context.batch_size = batch_size
+            callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
     if cfg.model.transformer.num_moe_experts is not None:
@@ -5547,7 +5561,7 @@ def train(
                 if writer:
                     for name, value in embedding_min_norm_metrics.items():
                         writer.add_scalar(name, value, iteration)
-                wandb_writer = get_wandb_writer()
+                wandb_writer = get_experiment_writer()
                 if wandb_writer:
                     wandb_writer.log(embedding_min_norm_metrics, iteration)
 
@@ -5732,6 +5746,7 @@ def train(
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
+        finish_experiment_logging("FAILED" if exit_code else "KILLED")
         ft_integration.shutdown()
         one_logger_utils.finish()
         # This sys.exit() bypasses the rest of pretrain() -- including its normal
@@ -6020,7 +6035,7 @@ def evaluate_and_print_results(
     start_event = "on_test_start" if is_test else "on_eval_start"
     end_event = "on_test_end" if is_test else "on_eval_end"
 
-    wandb_writer = get_wandb_writer()
+    wandb_writer = get_experiment_writer()
 
     data_iterators = data_iterator if cfg.validation.multiple_validation_sets else [data_iterator]
 
@@ -6096,10 +6111,10 @@ def evaluate_and_print_results(
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, train_state.consumed_train_samples
                     )
-                if wandb_writer and is_last_rank():
-                    wandb_writer.log(
-                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
-                    )
+            if wandb_writer and is_last_rank():
+                wandb_writer.log(
+                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                )
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)

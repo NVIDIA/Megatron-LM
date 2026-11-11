@@ -29,6 +29,7 @@ _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
+_GLOBAL_EXPERIMENT_WRITER = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
@@ -87,6 +88,23 @@ def get_one_logger():
     to check if it is initialized."""
     return _GLOBAL_ONE_LOGGER
 
+
+def get_experiment_writer():
+    """Return the scalar writer for enabled experiment backends, or None."""
+    return _GLOBAL_EXPERIMENT_WRITER or get_wandb_writer()
+
+
+def get_external_experiment_writer():
+    """Return the optional MLflow/Comet service for checkpoint reporting."""
+    return _GLOBAL_EXPERIMENT_WRITER
+
+
+def finish_experiment_logging(status="FINISHED"):
+    """Flush optional experiment backends after pending checkpoints complete."""
+    if _GLOBAL_EXPERIMENT_WRITER is not None:
+        _GLOBAL_EXPERIMENT_WRITER.finish(status)
+
+
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
     to check if it is initialized."""
@@ -133,6 +151,7 @@ def _graceful_shutdown(signum, frame):
     """
     from megatron.training.utils import print_rank_0
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
+    finish_experiment_logging("KILLED")
 
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -206,6 +225,7 @@ def initialize_runtime_services(
         resolve_tokenizer_vocab_size(cfg)
     _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
+    _set_experiment_writer(args)
     _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
@@ -258,6 +278,9 @@ def unset_global_variables():
     Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py` for an example.
     """
 
+    finish_experiment_logging()
+    global _GLOBAL_EXPERIMENT_WRITER
+    _GLOBAL_EXPERIMENT_WRITER = None
     global _GLOBAL_ARGS
     global _GLOBAL_RUN_CONFIG
     global _GLOBAL_TRAIN_STATE
@@ -389,6 +412,18 @@ def _wandb_run_id(exp_name: str) -> str:
     the unmodified name is still what gets displayed.
     """
     return re.sub(r"[/\\#?%:]", "-", exp_name)
+
+
+def _set_experiment_writer(args):
+    global _GLOBAL_EXPERIMENT_WRITER
+    _ensure_var_is_not_initialized(_GLOBAL_EXPERIMENT_WRITER, 'experiment writer')
+    cfg = get_run_config()
+    if (cfg.logger.mlflow_experiment or cfg.logger.comet_project) and args.rank == (
+        safe_get_world_size() - 1
+    ):
+        from megatron.training.logging.experiment_writer import ExperimentWriter
+
+        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg, get_wandb_writer())
 
 
 def _set_wandb_writer(args):
@@ -714,6 +749,10 @@ def _set_telemetry(args, *, include_training: bool = True):
 
 
 def destroy_global_vars():
+    finish_experiment_logging()
+    global _GLOBAL_EXPERIMENT_WRITER
+    _GLOBAL_EXPERIMENT_WRITER = None
+
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
 

@@ -15,7 +15,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import unwrap_model
-from megatron.training.global_vars import get_tensorboard_writer, get_wandb_writer
+from megatron.training.global_vars import get_experiment_writer, get_tensorboard_writer
 from megatron.training.utils import get_nvtx_range
 
 from .core import (
@@ -632,7 +632,7 @@ def _write_scalar_results(
     if tensorboard_writer is not None:
         for tag, value in scalars.items():
             tensorboard_writer.add_scalar(tag, value, iteration)
-    wandb_writer = get_wandb_writer()
+    wandb_writer = get_experiment_writer()
     if wandb_writer is not None and scalars:
         wandb_writer.log(scalars, iteration)
     if scalars and tensorboard_writer is None and wandb_writer is None and _is_last_rank():

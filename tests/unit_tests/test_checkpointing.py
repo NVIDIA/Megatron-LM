@@ -1069,6 +1069,49 @@ def test_save_checkpoint(
         assert args.memory_snapshot_path == "stale.pickle"
 
 
+@pytest.mark.parametrize("async_save", [False, True])
+def test_experiment_reporting_waits_for_checkpoint(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, run_config, monkeypatch, async_save
+):
+    """The reporting rank sees the completed weights and rank-0 metadata, once."""
+    from megatron.training.async_utils import maybe_finalize_async_save
+
+    args = create_args
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = True
+    args.ckpt_format = 'torch_dist'
+    args.async_save = async_save
+    args.no_save_optim = True
+    args.no_save_rng = True
+    args.save_tokenizer_assets = False
+    run_config.logger.comet_project = 'test'
+    run_config.logger.comet_experiment_name = 'test'
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    writer = mock.Mock()
+    reporting_rank = torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
+    monkeypatch.setattr(
+        checkpointing, 'get_external_experiment_writer', lambda: writer if reporting_rank else None
+    )
+
+    def check_completed(path, iteration):
+        assert iteration == 7
+        assert os.path.isfile(os.path.join(path, 'run_config.yaml'))
+        assert os.path.isfile(os.path.join(path, '.metadata'))
+        with open(os.path.join(os.path.dirname(path), 'latest_checkpointed_iteration.txt')) as f:
+            assert f.read() == '7'
+
+    writer.checkpoint_saved.side_effect = check_completed
+    with TempNamedDir(tmp_path_dist_ckpt / 'experiment_reporting', sync=True) as save_dir:
+        args.save = str(save_dir)
+        set_args(args)
+        sync_checkpoint_config(args)
+        save_checkpoint(7, [model], None, None, 0)
+        if async_save:
+            writer.checkpoint_saved.assert_not_called()
+            maybe_finalize_async_save(blocking=True, terminate=True)
+        assert writer.checkpoint_saved.call_count == int(reporting_rank)
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 @pytest.mark.parametrize(
     "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]

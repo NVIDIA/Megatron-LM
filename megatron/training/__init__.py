@@ -5,6 +5,7 @@ import torch
 from .global_vars import (
     get_adlr_autoresume,
     get_args,
+    get_experiment_writer,
     get_one_logger,
     get_run_config,
     get_signal_handler,

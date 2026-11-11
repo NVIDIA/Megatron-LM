@@ -1268,7 +1268,12 @@ def test_training_tokenizer_padding_uses_model_inputs(
     )
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
-    for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
+    for service in (
+        "_set_wandb_writer",
+        "_set_experiment_writer",
+        "_set_telemetry",
+        "initialize_training_runtime_services",
+    ):
         monkeypatch.setattr(global_vars, service, Mock())
 
     global_vars.initialize_runtime_services(args, training=True)

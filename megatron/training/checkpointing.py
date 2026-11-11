@@ -66,7 +66,12 @@ from megatron.training.argument_utils import (
     project_checkpoint_policy,
 )
 from megatron.training.config import CheckpointConfig, PretrainConfigContainer, TokenizerConfig
-from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
+from megatron.training.global_vars import (
+    get_external_experiment_writer,
+    get_run_config,
+    get_tokenizer,
+    get_train_state,
+)
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
     get_checkpoint_train_state_filename,
@@ -1390,6 +1395,27 @@ def save_checkpoint(
         else:
             onelogger_finalize_fn()
 
+    experiment_writer = get_external_experiment_writer()
+    experiment_finalize_fn = None
+    if (
+        (cfg.logger.mlflow_experiment or cfg.logger.comet_project)
+        and not skip_weight_ckpt
+        and not non_persistent_ckpt
+    ):
+        artifact_dir = get_checkpoint_name(save_dir, iteration, release=release, return_base_dir=True)
+
+        def experiment_finalize_fn():
+            # Rank 0 writes config/tracker files in its preceding finalize callback.
+            # The reporting rank must see those writes before uploading artifacts.
+            if checkpoint.async_save and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if experiment_writer is not None:
+                experiment_writer.checkpoint_saved(artifact_dir, iteration)
+
+        if checkpoint.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(experiment_finalize_fn)
+
     if checkpoint.async_save:
         # Schedule logits flush AFTER the checkpoint request so the persistent
         # worker processes checkpoint preload first (unblocking the main
@@ -1460,6 +1486,9 @@ def save_checkpoint(
 
         if on_saved is not None:
             on_saved()
+
+        if experiment_finalize_fn is not None:
+            experiment_finalize_fn()
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -3831,6 +3860,10 @@ def load_checkpoint(
 
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg='After loading checkpoint')
+
+    experiment_writer = get_external_experiment_writer()
+    if experiment_writer is not None:
+        experiment_writer.checkpoint_loaded(checkpoint_name, load_dir)
 
     return iteration, num_floating_point_operations_so_far
 

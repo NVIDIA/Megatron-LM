@@ -11,6 +11,9 @@
 
 Get started with Megatron Core training using these practical examples.
 
+For optional experiment tracking in the Megatron training loop, see
+[MLflow and Comet logging](features/experiment_logging.md).
+
 ## Basic Training Example
 
 Use the basic training loop with mock data to get started:
