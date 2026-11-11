@@ -1,16 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Loss, gradient, and update parity for explicitly scheduled MFSDP training.
+"""Loss, gradient, and update parity for module-scheduled MFSDP training.
 
-The caller materializes weights and submits completed gradients without execution
-or gradient-completion hooks, with both per-parameter and packed grouping.
+Each linear's custom autograd implementation materializes weights and submits
+completed gradients without execution or gradient-completion hooks.
 """
-
-import copy
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
@@ -26,6 +25,47 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
+
+
+class _ScheduledLinearFunction(torch.autograd.Function):
+    """Own weight materialization and gradient submission at the compute sites."""
+
+    @staticmethod
+    def forward(ctx, inputs, _weight, _bias, module):
+        """Gather for the forward GEMM and release weights immediately afterward."""
+        # Sharded parameters are inputs to apply() to retain autograd edges even
+        # when activations do not require gradients. Compute uses the full weights.
+        ctx.module = module
+        ctx.save_for_backward(inputs)
+        module.context.allgather_stream.wait_stream(module.context.current_stream())
+        module.unshard()
+        output = F.linear(inputs, module.weight, module.bias)
+        module.reshard()
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Gather for backward GEMMs, submit completed gradients, and reshard."""
+        module = ctx.module
+        (inputs,) = ctx.saved_tensors
+        module.context.allgather_stream.wait_stream(module.context.current_stream())
+        module.unshard()
+        grad_input = grad_output.matmul(module.weight) if ctx.needs_input_grad[0] else None
+        module.weight.grad = grad_output.t().matmul(inputs)
+        module.bias.grad = grad_output.sum(0)
+        module.post_accumulate_grad()
+        module.reshard()
+        # post_accumulate_grad() installs reduced gradients on optimizer parameters;
+        # autograd must not accumulate another copy through their graph edges.
+        return grad_input, None, None, None
+
+
+class _ScheduledLinear(nn.Linear):
+    """Linear whose autograd implementation explicitly drives its FSDP lifecycle."""
+
+    def forward(self, inputs):
+        """Dispatch compute and its backward without registering execution hooks."""
+        return _ScheduledLinearFunction.apply(inputs, self.weight, self.bias, self)
 
 
 @pytest.mark.parametrize(
@@ -51,7 +91,8 @@ def test_manual_schedule_matches_dense_training(
     mesh = init_device_mesh(device.type, mesh_shape)
     torch.manual_seed(42)
     baseline = nn.Sequential(nn.Linear(7, 5), nn.Tanh(), nn.Linear(5, 3)).to(device)
-    model = copy.deepcopy(baseline)
+    model = nn.Sequential(_ScheduledLinear(7, 5), nn.Tanh(), _ScheduledLinear(5, 3)).to(device)
+    model.load_state_dict(baseline.state_dict())
     placement = Shard(0)
     placements = Placements(list(range(mesh_ndim)), *[[placement] * mesh_ndim for _ in range(3)])
     if mesh_ndim == 2:
@@ -62,55 +103,50 @@ def test_manual_schedule_matches_dense_training(
         device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
     )
     with fully_shard_context(context):
-        fully_shard(
-            model,
-            mesh,
-            placements,
-            schedule_policy=SchedulePolicy(register_hooks=False),
-            shard_layout=shard_layout,
-            parameter_grouping=parameter_grouping,
-        )
+        for layer_index in (0, 2):
+            fully_shard(
+                model[layer_index],
+                mesh,
+                placements,
+                schedule_policy=SchedulePolicy(register_hooks=False),
+                shard_layout=shard_layout,
+                parameter_grouping=parameter_grouping,
+            )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05, momentum=0.9)
     torch.manual_seed(123 + dist.get_rank())
-    for _ in range(3):
+    for step in range(3):
         optimizer.zero_grad(set_to_none=True)
         reference_optimizer.zero_grad(set_to_none=True)
-        inputs = torch.randn(4, 7, device=device, requires_grad=True)
+        inputs = torch.randn(4, 7, device=device, requires_grad=step > 0)
         reference_loss = baseline(inputs).square().mean()
         reference_loss.backward()
 
-        # Materialize forward weights, then discard them between phases.
-        context.allgather_stream.wait_stream(context.current_stream())
-        model.unshard()
-        loss = model(inputs.detach().requires_grad_()).square().mean()
+        model_inputs = inputs.detach().requires_grad_(inputs.requires_grad)
+        loss = model(model_inputs).square().mean()
         torch.testing.assert_close(loss, reference_loss)
-        model.reshard()
-
-        # All saved weight views must be live again before autograd uses them.
-        model.unshard()
         loss.backward()
-        # With register_hooks=False, the scheduler declares gradients complete.
-        model.post_accumulate_grad()
-        context.post_backward()
         context.finish_grad_sync()
+        if inputs.requires_grad:
+            torch.testing.assert_close(model_inputs.grad, inputs.grad)
 
         for reference in baseline.parameters():
             dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
         # MFSDP shard geometry need not match DTensor's ordinary chunk geometry.
         references = dict(baseline.named_parameters())
-        for group in model.parameter_groups:
-            full_grad = group.pre_optimizer_main_grad.redistribute([Replicate()] * mesh_ndim)
-            for index, parameter in enumerate(group.fsdp_parameters):
-                torch.testing.assert_close(
-                    full_grad.get_tensor_view(index), references[parameter.fqns[0]].grad
-                )
+        for layer_index in (0, 2):
+            for group in model[layer_index].parameter_groups:
+                full_grad = group.pre_optimizer_main_grad.redistribute([Replicate()] * mesh_ndim)
+                for index, parameter in enumerate(group.fsdp_parameters):
+                    reference = references[f"{layer_index}.{parameter.fqns[0]}"]
+                    torch.testing.assert_close(full_grad.get_tensor_view(index), reference.grad)
         optimizer.step()
         reference_optimizer.step()
 
-        context.allgather_stream.wait_stream(context.current_stream())
-        model.unshard()
-        for reference, parameter in zip(baseline.parameters(), model.parameters()):
-            torch.testing.assert_close(parameter, reference)
-        model.reshard()
+        for layer_index in (0, 2):
+            for group in model[layer_index].parameter_groups:
+                full_weight = group.main_weight.redistribute([Replicate()] * mesh_ndim)
+                for index, parameter in enumerate(group.fsdp_parameters):
+                    reference = references[f"{layer_index}.{parameter.fqns[0]}"]
+                    torch.testing.assert_close(full_weight.get_tensor_view(index), reference)
