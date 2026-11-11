@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
@@ -1364,6 +1365,111 @@ class TestGroupedHybridStackCudagraphs:
         assert [layer.layer_number for layer in layers] == [1, 2, 3, 4, 5]
         assert [layer.is_first_layer for layer in layers] == [True, False, False, False, False]
         assert [layer.is_last_layer for layer in layers] == [False, False, False, False, True]
+
+    @pytest.mark.skipif(
+        not cuda_graphs_module.HAVE_TE_GRAPHS, reason="TE CUDA graphs are not available"
+    )
+    @pytest.mark.parametrize("layer_pattern", ["M-M*-", "[M-][M*-]", "M[-M*]-", "[M-M*-]"])
+    def test_te_helper_and_microbatch_reach_grouped_layers(self, layer_pattern):
+        """TE capture and microbatch selection cover every physical layer, grouped or not."""
+        block = self.get_hybrid_block(layer_pattern, cuda_graph_impl="transformer_engine")
+        model = torch.nn.Module()
+        model.decoder = block
+        layers = block.physical_layers()
+
+        helper = TECudaGraphHelper([model], block.config, 32, 2)
+
+        assert len(layers) == 5
+        assert helper.num_layers_per_chunk == [5]
+        assert all(
+            callable is layer
+            for callable, layer in zip(helper.flattened_callables, layers, strict=True)
+        )
+
+        set_current_microbatch(model, 3)
+        assert [layer.current_microbatch for layer in layers] == [3] * 5
+
+    @pytest.mark.skipif(
+        not cuda_graphs_module.HAVE_TE_GRAPHS, reason="TE CUDA graphs are not available"
+    )
+    @pytest.mark.parametrize("layer_pattern", ["*-*-", "[*-][*-]", "*[-*]-"])
+    def test_te_graphs_replay_grouped_layers_like_eager(self, layer_pattern):
+        """Layers inside a group are captured, and replaying them matches the eager pass."""
+        seq_length, micro_batch_size, hidden_size = 32, 1, 64
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=micro_batch_size,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        hybrid_model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=seq_length,
+            hybrid_layer_pattern=layer_pattern,
+            pg_collection=pg_collection,
+        ).cuda()
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(),
+            hybrid_model,
+            disable_bucketing=True,
+            pg_collection=pg_collection,
+        )
+        decoder = hybrid_model.decoder
+        layers = decoder.physical_layers()
+        hidden_states = torch.randn(
+            seq_length, micro_batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        # The causal mask the attention layers are captured with.
+        attention_mask = (
+            ~torch.tril(torch.ones((seq_length, seq_length), device="cuda")).bool()
+        ).reshape(1, 1, seq_length, seq_length)
+
+        def run_decoder():
+            inputs = hidden_states.clone().requires_grad_(True)
+            output = decoder(hidden_states=inputs, attention_mask=attention_mask)
+            output.float().sum().backward()
+            model.zero_grad_buffer()
+            return output.detach().clone(), inputs.grad.detach().clone()
+
+        set_current_microbatch(model, 0)
+        eager_output, eager_input_grad = run_decoder()
+
+        helper = TECudaGraphHelper([model], config, seq_length, micro_batch_size, optimizers=[])
+        assert all(
+            callable is layer
+            for callable, layer in zip(helper.flattened_callables, layers, strict=True)
+        )
+        try:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert [len(layer.cuda_graphs) for layer in layers] == [1] * 4
+
+            set_current_microbatch(model, 0)
+            graph_output, graph_input_grad = run_decoder()
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+
+        torch.testing.assert_close(graph_output, eager_output)
+        torch.testing.assert_close(graph_input_grad, eager_input_grad)
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,
