@@ -1,11 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import io
+import random
+from collections import Counter
 from unittest import mock
 
 import pytest
 import torch
 from packaging import version
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
-from torch.distributed.checkpoint import FileSystemReader, TensorStorageMetadata
+from torch.distributed.checkpoint import (
+    BytesStorageMetadata,
+    FileSystemReader,
+    Metadata,
+    TensorStorageMetadata,
+)
+from torch.distributed.checkpoint.default_planner import create_default_local_load_plan
+from torch.distributed.checkpoint.metadata import TensorProperties
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
@@ -14,6 +24,7 @@ from megatron.core.dist_checkpointing.strategies.checkpointable import (
     LocalShardsContainer,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
+    MCoreLoadPlanner,
     mcore_to_pyt_state_dict,
     sharded_tensor_to_torch_sharded_tensor,
 )
@@ -175,3 +186,113 @@ class TestPrependedAxisCheckpointable:
 
             loaded_sd = load({'prep_ten_sd': self.get_prepended_sh_ten(val=0)}, ckpt_dir)
             assert torch.equal(loaded_sd['prep_ten_sd'].data, self.get_prepended_sh_ten(val=3).data)
+
+
+def _read_item_fields(item):
+    # MetadataIndex equality ignores the index hint, so compare it explicitly.
+    return (
+        item.type,
+        item.dest_index.fqn,
+        item.dest_index.offset,
+        item.dest_index.index,
+        tuple(item.dest_offsets),
+        item.storage_index.fqn,
+        item.storage_index.offset,
+        item.storage_index.index,
+        tuple(item.storage_offsets),
+        tuple(item.lengths),
+    )
+
+
+@pytest.mark.skipif(
+    not is_torch_min_version("2.6a0"),
+    reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
+)
+class TestPrependedAxisLoadPlan:
+    """MCoreLoadPlanner must plan the same reads as the default DCP load plan."""
+
+    @staticmethod
+    def expert_shards(ep_size, ep_rank, tp_size, tp_rank, num_layers=3, num_experts=4):
+        """Gated expert weights: layer and expert axes prepended, both halves split TP ways."""
+        local_experts = num_experts // ep_size
+        return [
+            ShardedTensor.from_rank_offsets(
+                "experts.fc1",
+                torch.empty(8 // tp_size, 6),
+                (0, layer, num_layers),
+                (1, expert, num_experts),
+                (2, half * tp_size + tp_rank, 2 * tp_size),
+                prepend_axis_num=2,
+            )
+            for layer in range(num_layers)
+            for expert in range(ep_rank * local_experts, (ep_rank + 1) * local_experts)
+            for half in range(2)
+        ]
+
+    @staticmethod
+    def flat_shards(offsets):
+        """Irregular 1-D shards (no axis has extent one), e.g. optimizer buckets."""
+        bounds = list(offsets) + [20]
+        return [
+            ShardedTensor(
+                "bucket",
+                torch.empty(end - start),
+                torch.float32,
+                (end - start,),
+                (20,),
+                (start,),
+                None,
+            )
+            for start, end in zip(bounds[:-1], bounds[1:])
+        ]
+
+    @staticmethod
+    def local_shards(shards):
+        return LocalShardsContainer([CheckpointableShardedTensor.from_sh_ten(sh) for sh in shards])
+
+    @staticmethod
+    def tensor_metadata(shards):
+        chunks = [CheckpointableShardedTensor.from_sh_ten(sh)._local_chunk() for sh in shards]
+        random.Random(0).shuffle(chunks)
+        return TensorStorageMetadata(
+            TensorProperties(dtype=torch.float32), torch.Size(shards[0].global_shape), chunks
+        )
+
+    @pytest.mark.parametrize(
+        ('save_layout', 'load_layout'),
+        [((2, 1), (1, 2)), ((1, 2), (4, 1)), ((2, 2), (2, 2)), ((1, 8), (2, 2))],
+    )
+    def test_create_local_plan_matches_default_plan(self, save_layout, load_layout):
+        save_ep, save_tp = save_layout
+        saved_experts = [
+            sh
+            for ep_rank in range(save_ep)
+            for tp_rank in range(save_tp)
+            for sh in self.expert_shards(save_ep, ep_rank, save_tp, tp_rank)
+        ]
+        metadata = Metadata(
+            state_dict_metadata={
+                "experts.fc1": self.tensor_metadata(saved_experts),
+                "bucket": self.tensor_metadata(self.flat_shards([0, 5, 12])),
+                "obj": BytesStorageMetadata(),
+            }
+        )
+
+        load_ep, load_tp = load_layout
+        for ep_rank in range(load_ep):
+            for tp_rank in range(load_tp):
+                state_dict = {
+                    "experts.fc1": self.local_shards(
+                        self.expert_shards(load_ep, ep_rank, load_tp, tp_rank)
+                    ),
+                    "bucket": self.local_shards(self.flat_shards([0, 3, 9])[1:]),
+                    "obj": io.BytesIO(),
+                }
+                planner = MCoreLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False)
+                planner.set_up_planner(state_dict, metadata)
+
+                plan = planner.create_local_plan()
+                default_plan = create_default_local_load_plan(state_dict, metadata)
+                assert Counter(map(_read_item_fields, plan.items)) == Counter(
+                    map(_read_item_fields, default_plan.items)
+                )
