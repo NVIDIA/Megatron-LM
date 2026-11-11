@@ -2197,7 +2197,8 @@ class CudaGraphManager(torch.nn.Module):
         if cache_key is None and is_inference_mode:
             inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():
-                batch_size = kwargs['hidden_states'].shape[0]
+                hidden_states = args[0] if args else kwargs['hidden_states']
+                batch_size = hidden_states.shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
             else:
                 cache_key = inference_context.padded_batch_dimensions
@@ -2240,13 +2241,17 @@ class CudaGraphManager(torch.nn.Module):
                                     getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
-                                    and ArgMetadata(r[3]['hidden_states'])
-                                    == ArgMetadata(kwargs['hidden_states'])
+                                    and ArgMetadata(r[2][0] if r[2] else r[3]['hidden_states'])
+                                    == ArgMetadata(args[0] if args else kwargs['hidden_states'])
                                 )
                             )
                             # Replace the hidden states from previous layer's output buffer
-                            local_kwargs = dict(kwargs)
-                            local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                            previous_output = previous_runner[0].fwd_graph_outputs[0]
+                            if args:
+                                local_args = (previous_output, *args[1:])
+                            else:
+                                local_kwargs = dict(kwargs)
+                                local_kwargs['hidden_states'] = previous_output
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass
@@ -2403,6 +2408,9 @@ class TECudaGraphHelper:
                 chunk_with_decoder = get_attr_wrapped_model(
                     model_chunk, 'decoder', allow_none=False, return_model_obj=True
                 )
+                # unwrap the language model for vlm models, such as qwen3-vl.
+                if hasattr(chunk_with_decoder, 'language_model'):
+                    chunk_with_decoder = chunk_with_decoder.language_model
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
