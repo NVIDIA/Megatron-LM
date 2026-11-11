@@ -1,11 +1,16 @@
-# MoE runtime token-imbalance benchmark (standard all-to-all baseline)
+# MoE runtime token-imbalance benchmark
 
-A reproducible benchmark for the MoE token-imbalance problem: a routing workload is executed
-through the **existing standard all-to-all dispatcher**, checked against an exact oracle, and
-measured per rank, together with the **rank-level load** it puts on each EP rank.
+A reproducible benchmark for the MoE token-imbalance problem. One set of logical routing
+workloads is executed by several **arms** (ways of running the same MoE layer), checked
+against exact oracles, and measured per rank, together with the **rank-level load** each
+workload puts on each EP rank.
 
-This is the first slice of the "public runtime token-imbalance benchmark" work item. It
-deliberately does **not** implement ECHO / MoonEP / UltraEP or a runtime-aware scheduler.
+Two drivers share the workloads, metrics and output format:
+
+| Driver | What it runs |
+|---|---|
+| `benchmark.py` | the standard all-to-all dispatcher alone, in `dispatch_only`, `moe_fwd_bwd` or `training_step` mode, with exact dispatch/combine round-trip oracles |
+| `compare_arms.py` | one real `MoELayer` per arm (all-to-all, HybridEP, MoonEP virtual experts, and the MoEScheduler planners when present), same parameters, inputs and replayed routes, rotated arm order |
 
 ## What is measured: rank-level load
 
@@ -175,9 +180,61 @@ Run `--help` for the full flag list. `--capability-json` writes the backend capa
 result so a run records what the backend actually supported. `report.py RESULTS_ROOT` turns a
 results tree into the per-experiment step-time and rank-level tables.
 
+## Arms (`compare_arms.py`)
+
+`arms.py` is the arm registry. Every arm builds the same layer from one shared configuration
+(`arms.base_config`: BF16, TP=ETP=1, TE grouped experts, FP32 router, no aux loss, routing
+replay on) and adds only the overrides that select its method; an arm that tries to change a
+shared setting is rejected. New arms are added with `arms.register`.
+
+| Arm | Method | Requires |
+|---|---|---|
+| `alltoall` | `MoEAlltoAllTokenDispatcher` | nothing beyond TE |
+| `hybridep` | flex dispatcher, HybridEP backend | DeepEP `HybridEPBuffer` |
+| `moonep` | `moe_virtual_expert_load_balance` (MoonEP virtual experts over HybridEP, #7450) | HybridEP with dense top-k routing (DeepEP@10d4dd7, as in `docker/Dockerfile.ci.dev`) |
+| `scheduler_echo`, `scheduler_eplb`, `scheduler_moon_ep`, `scheduler_ultra_ep` | `moe_enable_scheduler` with that planner (#8500) | `TransformerConfig.moe_enable_scheduler` and the TE op fuser (not `--no-te-op-fuser`); UltraEP also needs the `ultra_ep` package |
+
+All arms run with `use_transformer_engine_op_fuser=True` by default, as MoEScheduler requires
+(`--no-te-op-fuser` turns it off for every arm alike).
+
+MoonEP and the scheduler arms hand the experts a capacity-padded buffer (more rows than
+`sum(tokens_per_expert)`). Only TE's native grouped-tensor GEMM consumes such a buffer, and TE
+selects it only with cuBLASLt >= 13.3; with an older cuBLASLt it falls back to split-quantize and
+the first expert GEMM fails with a `split_with_sizes` mismatch. `run.json` records the
+cuBLASLt, TE, DeepEP, Triton and NCCL versions of each run.
+
+Requirements are probed on the node (`arms.probe_requirements`). An unavailable arm is
+listed in `run.json` with every unmet requirement and is not run; it is never replaced by
+another arm. The scheduler arms use one replica slot per EP rank (`moon_ep`: one per logical
+expert, as its planner requires) and `--scheduler-transport replica_nccl` by default.
+
+Fairness rules the driver enforces:
+
+* every arm gets the same initial logical parameters (copied from the first arm built), the
+  same per-rank inputs and upstream gradients, and the same replayed routes, which are
+  checked against the routes the layer executed at every call;
+* `--warmup` unmeasured and `--iters` measured passes over all `--steps` steps, identical for
+  every arm;
+* arm order is rotated per workload (`--order rotate`), so no arm always runs first;
+* numerics of every arm are compared with `--reference-arm` (default `hybridep`) on the first
+  measured pass: relative L2 <= 0.01 and peak-normalized error <= 0.05 for the output, input,
+  gate and parameter gradients (and updated parameters with `--learning-rate`). These are BF16
+  tolerance gates, not bit-exactness claims.
+
+The headline number is the worst-rank time per step (max over ranks of the CUDA-event time
+for router, forward, backward and optional SGD), summarized in `summary.json` as median,
+p10/p90 and min/max over `iters * steps` samples. Per-rank JSONL rows keep every sample,
+logical expert and rank loads, hashes of inputs, routes and values, and the virtual-expert
+plan.
+
+```bash
+torchrun --standalone --nproc_per_node=4 compare_arms.py \
+    --arms alltoall,hybridep,moonep --steps 6 --warmup 2 --iters 5 --out results/arms-ep4
+```
+
 ## Capability probe
 
-`backend_adapter.py` reports what the backend supports **here**, from imports and measurement,
+`backend_adapter.py` reports what the all-to-all backend of `benchmark.py` supports **here**, from imports and measurement,
 never from documentation. Unknown items are reported as `UNVERIFIED`. The expert computation
 is a per-expert loop in every mode (`moe_grouped_gemm=False`), so absolute step times are
 **not** comparable with a grouped-GEMM run, though comparisons between workloads at one
@@ -200,9 +257,11 @@ straggler is the point of a token-imbalance benchmark; averaging would hide it.
 * **Every source rank sends the same routing block.** The workloads describe one source rank's
   rows and every rank replays them, so source-side (pre-dispatch) skew is not modeled; that is
   a sender-side dimension separate from the destination rank load measured here.
-* **Only the standard all-to-all backend exists.** There is no ECHO / MoonEP / UltraEP adapter;
-  adding one should reuse that method's own code and configuration.
-* **The grouped-GEMM expert path is not exercised.**
+* **`benchmark.py` runs only the standard all-to-all backend**, with a per-expert loop
+  (`moe_grouped_gemm=False`). Its times are not comparable with `compare_arms.py`, which uses
+  TE grouped experts for every arm; the two are reported in separate tables.
+* **`compare_arms.py` uses one NVLink host,** fixed per-rank source tokens and `topk`, and
+  BF16. Recompute, CUDA graphs, zero source rows and other precisions are not exercised.
 * **`strong` vs `weak` scaling is not a recorded field.** Increasing EP at fixed per-rank tokens
   increases the total token count, so results across EP widths are weak-scaling comparisons and
   must not be read as "EP=N is faster".

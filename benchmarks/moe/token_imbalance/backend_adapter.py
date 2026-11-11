@@ -13,10 +13,10 @@ It is deliberately NOT a scheduler framework. A capability check must report pre
 EP/ETP, zero-token support, recompute, graph and hardware dependencies; anything unknown is
 reported as such rather than assumed.
 
-The first (and currently only) adapter is ``standard_alltoall``: the repository's existing
-``MoEAlltoAllTokenDispatcher``. Future backends (ECHO / MoonEP / UltraEP) plug in here by
-reusing their authors' code and configuration, and are compared on the SAME logical workload
-and oracle.
+This adapter is ``standard_alltoall``, the repository's existing ``MoEAlltoAllTokenDispatcher``,
+as driven by ``benchmark.py``. The MoE-layer arms (HybridEP, MoonEP virtual experts and the
+MoEScheduler planners) live in ``arms.py`` and ``arm_adapter.py`` and are compared by
+``compare_arms.py`` on the same logical workloads.
 """
 
 from __future__ import annotations

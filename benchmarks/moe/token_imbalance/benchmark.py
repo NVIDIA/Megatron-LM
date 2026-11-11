@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MoE runtime token-imbalance benchmark (standard all-to-all baseline).
 
-Scope (first slice of the roadmap #6757 item):
+Scope:
     routing workload -> existing standard all-to-all dispatcher -> local expert computation
     -> correctness oracle -> per-rank raw metrics, plus the rank-level load it produces
 
