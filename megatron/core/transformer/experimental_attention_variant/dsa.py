@@ -51,6 +51,9 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
 _warned_mtp_index_sharing_fused_bypass = False
+# Kinds of prebuilt packed-CP layout mismatch already warned about (geometry fields
+# and/or device that differed), so each kind is reported once per process.
+_DSA_PREBUILT_LAYOUT_MISMATCH_WARNED = set()
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -284,6 +287,43 @@ def _validate_nonpacked_cp_uniform_length(
             "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
             f"got local query length {sq} and key length {skv} for cp_size={cp_size}."
         )
+
+
+class _PermuteRows(torch.autograd.Function):
+    """``x.index_select(0, perm)`` for a bijective ``perm``, with a gather as its backward.
+
+    Autograd's generic ``index_select`` backward is a zero fill plus an atomic
+    ``index_add_``. When ``perm`` is a permutation, every input row receives exactly
+    one gradient row, so the backward is just ``grad.index_select(0, inv_perm)``: one
+    coalesced gather, no fill and no atomics. The values are identical except that
+    a gathered ``-0.0`` stays ``-0.0``, where adding it onto the zero fill gives
+    ``+0.0``.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, perm: torch.Tensor, inv_perm: torch.Tensor) -> torch.Tensor:
+        """Gather the rows of ``x`` in ``perm`` order."""
+        ctx.save_for_backward(inv_perm)
+        return x.index_select(0, perm)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Scatter the gradient back to input order by gathering with ``inv_perm``."""
+        (inv_perm,) = ctx.saved_tensors
+        return grad_output.index_select(0, inv_perm), None, None
+
+
+def _permute_rows(
+    x: torch.Tensor, perm: torch.Tensor, inv_perm: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Return ``x.index_select(0, perm)``, with a gather backward when ``inv_perm`` is given.
+
+    Without ``inv_perm`` or without a backward to record (no grad mode, or an input
+    that does not require grad), this is the plain ``index_select``.
+    """
+    if inv_perm is None or not (torch.is_grad_enabled() and x.requires_grad):
+        return x.index_select(0, perm)
+    return _PermuteRows.apply(x, perm, inv_perm)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -2732,7 +2772,7 @@ class DSAttention(MegatronModule):
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
     logs_dsa_indexer_loss = True
-    _LAYOUT_HOLDER_ATTR = "_dsa_packed_cp_layout_holder"
+    _LAYOUT_HOLDER_ATTR = dsa_layout.PACKED_CP_LAYOUT_MEMO_ATTR
 
     def __init__(
         self,
@@ -2855,13 +2895,75 @@ class DSAttention(MegatronModule):
         return cache
 
     @staticmethod
-    def _memoized(cache: Optional[dict], key: tuple, build):
-        """Return ``cache[key]``, building it on first use. No-op when cache is None."""
+    def _memoized(cache: Optional[dict], key: tuple, build, prebuilt=None):
+        """Return ``cache[key]``, building it on first use. No-op when cache is None.
+
+        ``prebuilt`` (tables built at batch construction for exactly this request) is
+        returned as-is instead, without building or touching the cache.
+        """
+        if prebuilt is not None:
+            return prebuilt
         if cache is None:
             return build()
         if key not in cache:
             cache[key] = build()
         return cache[key]
+
+    @staticmethod
+    def _match_prebuilt_packed_cp_layout(
+        packed_seq_params: Optional[PackedSeqParams],
+        requested: dsa_layout.PackedCPLayoutGeometry,
+        device: torch.device,
+    ) -> Optional[dsa_layout.PrebuiltPackedCPLayout]:
+        """Return the batch-time prebuilt packed-CP layout if it answers ``requested``.
+
+        ``None`` selects the lazy memo path: when no current layout is attached (see
+        ``dsa_layout.get_prebuilt_packed_cp_layout``), or when the attached one describes
+        another geometry or device (warned once per kind of mismatch), since the lazy
+        path builds the requested layout from the same host boundaries. Inside a CUDA
+        graph capture both raise instead: a lazily built table, or a memo entry from an
+        eager warmup, would be baked into the graph and go stale when the packing
+        changes. A layout whose tables contradict its own geometry raises (see
+        ``PrebuiltPackedCPLayout.validate``).
+        """
+        layout = dsa_layout.get_prebuilt_packed_cp_layout(packed_seq_params)
+        if layout is not None and layout.geometry == requested and layout.device == device:
+            layout.validate()
+            return layout
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if layout is None:
+            if capturing:
+                raise RuntimeError(
+                    "DSA cannot build its packed-CP layout inside CUDA graph capture: no current "
+                    f"prebuilt layout for {requested} is attached to the PackedSeqParams it "
+                    "received. Prebuild it outside the capture with "
+                    "dsa_layout.prebuild_packed_cp_layout (prepare_packed_seq_params does this "
+                    "for DSA models) and keep it attached to the PackedSeqParams DSA consumes."
+                )
+            return None
+        mismatch = (
+            f"the prebuilt packed-CP layout was built for {layout.geometry} on {layout.device}, "
+            f"but this DSA layer requests {requested} on {device}"
+        )
+        if capturing:
+            raise RuntimeError(
+                f"DSA cannot use a lazily built packed-CP layout inside CUDA graph capture: "
+                f"{mismatch}. Refresh the static prebuilt layout for this geometry before "
+                "capture/replay."
+            )
+        kind = tuple(
+            name
+            for name in requested._fields
+            if getattr(layout.geometry, name) != getattr(requested, name)
+        ) + (("device",) if layout.device != device else ())
+        if kind not in _DSA_PREBUILT_LAYOUT_MISMATCH_WARNED:
+            _DSA_PREBUILT_LAYOUT_MISMATCH_WARNED.add(kind)
+            logger.warning(
+                "DSA ignores a prebuilt layout and builds it in the forward instead, so every "
+                "microbatch with this mismatch builds the tables twice: %s.",
+                mismatch,
+            )
+        return None
 
     def _prepare_mtp_sharing_payload(
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
@@ -3070,6 +3172,9 @@ class DSAttention(MegatronModule):
         packed_query_positions = None
         nonpacked_query_positions = None
         kv_reorder_idx = None
+        # Inverse of kv_reorder_idx, built (for packed THD, memoized) with it; it gives the
+        # reorder a gather backward.
+        kv_reorder_inv_idx = None
         single_packed_thd_sequence = False
         # Layout metadata is identical for every layer in a microbatch; memoize it on
         # the per-microbatch PackedSeqParams so only the first DSA layer pays for it.
@@ -3090,16 +3195,35 @@ class DSAttention(MegatronModule):
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
-            query_cu_seqlens_cover_output = (
-                single_packed_thd_sequence
-                and isinstance(packed_seq_params.max_seqlen_q, int)
-                and packed_seq_params.max_seqlen_q == packed_global_output_size
+            query_cu_seqlens_cover_output, key_cu_seqlens_cover_output = (
+                dsa_layout.resolve_packed_cp_cover_output_flags(
+                    packed_seq_params, packed_global_output_size
+                )
             )
-            key_cu_seqlens_cover_output = (
-                single_packed_thd_sequence
-                and isinstance(packed_seq_params.max_seqlen_kv, int)
-                and packed_seq_params.max_seqlen_kv == packed_global_output_size
-            )
+
+            def _prebuilt_layout_tables(local_rows, positions_only=False):
+                # Tables prebuilt at batch construction (dsa_layout.prebuild_packed_cp_layout)
+                # for exactly this request, shaped like the memo entry they replace; None
+                # selects the memo path below (and raises inside a CUDA graph capture).
+                layout = self._match_prebuilt_packed_cp_layout(
+                    packed_seq_params,
+                    dsa_layout.PackedCPLayoutGeometry(
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        local_rows=local_rows,
+                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    ),
+                    query.device,
+                )
+                if layout is None:
+                    return None
+                # The SP "local_positions" entry comes from the same host positions
+                # builder with the same output size as the reorder wrapper's positions.
+                if positions_only:
+                    return layout.query_positions
+                return layout.query_positions, layout.kv_reorder_idx, layout.kv_reorder_inv_idx
+
             if sequence_parallel_query_is_local and cp_size == 1:
                 row_start = sequence_parallel_tp_row_start
                 packed_query_positions = torch.arange(
@@ -3126,6 +3250,7 @@ class DSAttention(MegatronModule):
                             output_size=packed_query_output_size,
                         )
                     ),
+                    prebuilt=_prebuilt_layout_tables(packed_query_output_size, positions_only=True),
                 )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
@@ -3133,7 +3258,7 @@ class DSAttention(MegatronModule):
                 else:
                     packed_query_positions = packed_query_positions_full
             elif cp_size > 1:
-                packed_query_positions, kv_reorder_idx = self._memoized(
+                packed_query_positions, kv_reorder_idx, kv_reorder_inv_idx = self._memoized(
                     layout_cache,
                     (
                         "positions_and_reorder",
@@ -3157,6 +3282,7 @@ class DSAttention(MegatronModule):
                             global_output_size=packed_global_output_size,
                             query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
                             key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            return_inverse_key_reorder=True,
                         )
                         if host_cu_q is not None and host_cu_kv is not None
                         else dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
@@ -3170,8 +3296,10 @@ class DSAttention(MegatronModule):
                             global_output_size=packed_global_output_size,
                             query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
                             key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            return_inverse_key_reorder=True,
                         )
                     ),
+                    prebuilt=_prebuilt_layout_tables(packed_query_output_size),
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -3216,11 +3344,14 @@ class DSAttention(MegatronModule):
 
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
+            # Returns the reorder index and its inverse, which gives the reorder a gather
+            # backward. The non-packed zigzag reorder is not memoized; its inverse is the
+            # gathered key positions the builder already sorts, so it costs no extra kernel.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
                     # Same memo key shape as the branch above, so when the output sizes
                     # coincide this reuses that result instead of rerunning the cp_size loop.
-                    _, idx = self._memoized(
+                    _, idx, inv_idx = self._memoized(
                         layout_cache,
                         (
                             "positions_and_reorder",
@@ -3244,6 +3375,7 @@ class DSAttention(MegatronModule):
                                 global_output_size=local_len * cp_size,
                                 query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
                                 key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                                return_inverse_key_reorder=True,
                             )
                             if host_cu_q is not None and host_cu_kv is not None
                             else (
@@ -3259,12 +3391,17 @@ class DSAttention(MegatronModule):
                                 global_output_size=local_len * cp_size,
                                 query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
                                 key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                                return_inverse_key_reorder=True,
                             )
                         ),
+                        prebuilt=_prebuilt_layout_tables(local_len),
                     )
-                    return idx
+                    return idx, inv_idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                    sq=local_len, cp_size=cp_size, device=query.device
+                    sq=local_len,
+                    cp_size=cp_size,
+                    device=query.device,
+                    return_inverse_key_reorder=True,
                 )
 
             gathered_cp_key = False
@@ -3272,14 +3409,14 @@ class DSAttention(MegatronModule):
             if key.size(0) in local_cp_kv_lens:
                 local_cp_kv_len = key.size(0)
                 if kv_reorder_idx is None:
-                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                    kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
                 gathered_cp_key = True
             if value is not None and value.size(0) in local_cp_kv_lens:
                 if local_cp_kv_len is None:
                     local_cp_kv_len = value.size(0)
                     if kv_reorder_idx is None:
-                        kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                        kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 elif value.size(0) != local_cp_kv_len:
                     raise RuntimeError(
                         "DSA local key/value sequence length mismatch before CP gather: "
@@ -3294,14 +3431,14 @@ class DSAttention(MegatronModule):
                             "DSA gathered key length mismatch: "
                             f"key_seqlen={key.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
-                    key = key.index_select(0, kv_reorder_idx)
+                    key = _permute_rows(key, kv_reorder_idx, kv_reorder_inv_idx)
                 if gathered_cp_value:
                     if value.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
                             "DSA gathered value length mismatch: "
                             f"value_seqlen={value.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
-                    value = value.index_select(0, kv_reorder_idx)
+                    value = _permute_rows(value, kv_reorder_idx, kv_reorder_inv_idx)
 
         skv = key.size(0)
 
@@ -3434,14 +3571,14 @@ class DSAttention(MegatronModule):
                 q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
                 if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                     if kv_reorder_idx is None:
-                        kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
+                        kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(k.size(0))
                     k = gather_from_sequence_parallel_region(k, group=cp_group)
                     if k.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
                             "DSA gathered indexer-key length mismatch: "
                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
-                    k = k.index_select(0, kv_reorder_idx)
+                    k = _permute_rows(k, kv_reorder_idx, kv_reorder_inv_idx)
                     # Apply the same CP gather + reorder to the kpool gate score so it
                     # matches the now-global key length (otherwise the per-seg reshape
                     # in _kpool_compress_keys crashes with a size mismatch).
