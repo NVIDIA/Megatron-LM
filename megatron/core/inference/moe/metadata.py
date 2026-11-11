@@ -89,8 +89,11 @@ def _fused_metadata_kernel(
         hasPreviousMemAccess=True,
         hasSubsequentMemAccess=True,
     )
-    # Only threads 0..WORLD_SIZE-1 acquire in symm_mem_sync; the whole block reads peers' values
-    # below, so it must wait for them.
+    # Triton 3.9 changed the semantics of tl.max here: it now reduces over all 32 threads of the
+    # warp (redux.sync.max), including the threads that hold replicated copies of the loaded
+    # values, where 3.6 reduced over threads 0..WORLD_SIZE-1 only. Only those threads acquire in
+    # symm_mem_sync, so without this sync the other threads can load a stale token count and
+    # ep_max_tokens can differ across ranks, which hangs the next EP collective's barrier.
     sync_threads()
 
     # 3. Load all ranks' values, reduce, and write metadata.
