@@ -3,11 +3,13 @@
 """Training-loop plumbing regression tests."""
 
 import inspect
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
@@ -940,3 +942,113 @@ def test_train_step_scopes_forward_tensor_observation_around_schedule():
         )
 
     assert events == ["observe-enter", "forward-backward", "observe-exit", "commit", "optimizer"]
+
+
+@pytest.mark.parametrize(
+    ("extra_argv", "expected_subsamples"),
+    [
+        ([], 1),
+        (["--context-parallel-size", "2"], 1),
+        (["--dynamic-context-parallel", "--thd-max-packed-sequences", "4"], 1),
+        (
+            [
+                "--dynamic-context-parallel",
+                "--thd-max-packed-sequences",
+                "4",
+                "--use-varlen-dataset",
+            ],
+            1,
+        ),
+    ],
+)
+def test_train_builds_te_cuda_graph_helper_from_parsed_args(
+    monkeypatch, extra_argv, expected_subsamples
+):
+    """train() builds TECudaGraphHelper from the parsed args, including non-THD runs.
+
+    Without THD packing, --thd-max-packed-sequences keeps its default of None; the helper must
+    still be constructible with the arguments train() passes.
+    """
+    from megatron.core.pipeline_parallel import p2p_communication
+    from megatron.core.transformer import cuda_graphs
+    from megatron.training.arguments import parse_args
+
+    monkeypatch.setattr(
+        sys, "argv", ["pretrain_gpt.py", "--cuda-graph-impl", "transformer_engine", *extra_argv]
+    )
+    args = parse_args()
+    kwargs = training_mod._get_dynamic_cp_cuda_graph_helper_kwargs(args)
+    expected_getter = (
+        training_mod.get_dynamic_data_context_parallel_groups
+        if args.dynamic_context_parallel
+        else None
+    )
+    assert kwargs["dynamic_cp_group_getter"] is expected_getter
+
+    monkeypatch.setattr(cuda_graphs, "HAVE_TE_GRAPHS", True)
+    monkeypatch.setattr(
+        cuda_graphs.TECudaGraphHelper,
+        "_discover_layers",
+        lambda helper: setattr(helper, "flattened_callables", []),
+    )
+    monkeypatch.setattr(p2p_communication, "P2PCommunicator", lambda **_kwargs: object())
+    helper = cuda_graphs.TECudaGraphHelper(
+        model=[torch.nn.Module()],
+        config=SimpleNamespace(cuda_graph_impl=args.cuda_graph_impl, cuda_graph_modules=[]),
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        optimizers=[],
+        pg_collection=SimpleNamespace(tp=object(), dp=object(), dp_cp=object(), pp=object()),
+        thd_sequence_length_upper_bound=training_mod._get_thd_sequence_length_upper_bound(args),
+        **kwargs,
+    )
+    assert helper.thd_max_subsamples_per_item == expected_subsamples
+    assert helper.dynamic_cp_group_getter is expected_getter
+
+
+def test_sft_source_subsample_bound_covers_dynamic_cp_repacking():
+    """Destination pack capacity must not cap conversations in a source SFT item."""
+    from megatron.core.datasets.data_schedule import _validate_cuda_graph_microbatch_count
+    from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+    args = SimpleNamespace(
+        dynamic_context_parallel=True,
+        use_varlen_dataset=False,
+        sft=True,
+        mock_data=False,
+        seq_length=256,
+        data_parallel_size=2,
+        context_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+    )
+    kwargs = training_mod._get_dynamic_cp_cuda_graph_helper_kwargs(args)
+    assert kwargs["thd_max_subsamples_per_item"] == 65
+    args.mock_data = True
+    assert (
+        training_mod._get_dynamic_cp_cuda_graph_helper_kwargs(args)["thd_max_subsamples_per_item"]
+        == 1
+    )
+
+    remaining = list(enumerate([80, 80, 96, 80, 80, 96]))
+    num_microbatches = 0
+    while remaining:
+        _, remaining, _, _ = next_hdp_group_packing_aware(
+            remaining, total_gpus=2, max_seq_len_per_rank=64, max_num_seqs=1
+        )
+        num_microbatches += 1
+    assert num_microbatches == 6
+
+    captured_limit = TECudaGraphHelper._get_default_dynamic_cp_thd_max_num_microbatches(
+        global_batch_size=2,
+        total_dcp_gpus=2,
+        max_seqlen_per_dp_cp_rank=64,
+        max_sequence_length=256,
+        max_subsamples_per_item=kwargs["thd_max_subsamples_per_item"],
+    )
+    assert captured_limit >= num_microbatches
+    config = SimpleNamespace(_cuda_graph_num_microbatches=captured_limit)
+    _validate_cuda_graph_microbatch_count(config, num_microbatches)
+    with pytest.raises(ValueError, match="outside the captured CUDA graph range"):
+        _validate_cuda_graph_microbatch_count(config, captured_limit + 1)

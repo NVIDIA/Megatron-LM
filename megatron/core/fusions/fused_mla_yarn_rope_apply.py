@@ -575,11 +575,9 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             rope_first=rope_first,
             thd_global_start=thd_global_start,
         )
-        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
-        ctx.has_position_ids = position_ids is not None
+        ctx.save_for_backward(cos, sin, position_ids, cu_seqlens_q)
         ctx.nope_dim = nope_dim
         ctx.emb_dim = emb_dim
-        ctx.cu_seqlens_q = cu_seqlens_q
         ctx.rotary_interleaved = rotary_interleaved
         ctx.inverse = inverse
         ctx.remove_interleaving = remove_interleaving
@@ -598,12 +596,10 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
                 or [total_seq_len, head_num, nope_dim + emb_dim]
         """
-        if ctx.has_position_ids:
-            cos, sin, position_ids = ctx.saved_tensors
-        else:
-            cos, sin = ctx.saved_tensors
-            position_ids = None
-        if ctx.cu_seqlens_q is None or ctx.has_position_ids or ctx.thd_global_start is not None:
+        # Graph replay only refreshes tensors saved for backward, so read the THD
+        # metadata from saved_tensors rather than from ctx attributes.
+        cos, sin, position_ids, cu_seqlens_q = ctx.saved_tensors
+        if cu_seqlens_q is None or position_ids is not None or ctx.thd_global_start is not None:
             grad = grad.contiguous()
 
         mla_rope_unapply_raw(
@@ -612,7 +608,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             sin,
             ctx.nope_dim,
             ctx.emb_dim,
-            cu_seqlens_q=ctx.cu_seqlens_q,
+            cu_seqlens_q=cu_seqlens_q,
             cp_rank=ctx.cp_rank,
             cp_size=ctx.cp_size,
             inverse=ctx.inverse,
@@ -978,9 +974,10 @@ class _FusedMLARoPEConcat(torch.autograd.Function):
             ROT_BLOCK=rot_block,
         )
 
-        ctx.save_for_backward(cos, sin)
+        # cu_seqlens may be a CUDA-graph buffer that a later replay overwrites before this
+        # backward, so it travels with the saved tensors rather than on ctx.
+        ctx.save_for_backward(cos, sin, cu_seqlens)
         ctx.input_shape = nope.shape
-        ctx.cu_seqlens = cu_seqlens
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         ctx.nope_dim = nope_dim
@@ -993,12 +990,12 @@ class _FusedMLARoPEConcat(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Compute gradients for the packed non-positional and RoPE inputs."""
-        cos, sin = ctx.saved_tensors
+        cos, sin, cu_seqlens = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         if ctx.is_thd:
             total_seqlen, nheads, _ = grad_output.shape
             batch_size = 1
-            seq_num = len(ctx.cu_seqlens) - 1
+            seq_num = len(cu_seqlens) - 1
         else:
             max_seqlen, batch_size, nheads, _ = grad_output.shape
             total_seqlen = max_seqlen * batch_size
@@ -1021,7 +1018,7 @@ class _FusedMLARoPEConcat(torch.autograd.Function):
             nheads,
             batch_size,
             seq_num,
-            ctx.cu_seqlens,
+            cu_seqlens,
             grad_output.stride(0),
             grad_output.stride(1),
             dnope.stride(0),
@@ -1411,13 +1408,13 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             V_BLOCK=triton.next_power_of_2(v_dim),
             ROT_BLOCK=triton.next_power_of_2(emb_dim // 2),
         )
-        ctx.save_for_backward(cos, sin)
+        # Saved with the tensors, not on ctx: a later graph replay may overwrite cu_seqlens_kv.
+        ctx.save_for_backward(cos, sin, cu_seqlens_kv)
         ctx.remove_interleaving = remove_interleaving
         ctx.rotary_interleaved = rotary_interleaved
         ctx.emb_dim = emb_dim
         ctx.k_dim = k_dim
         ctx.v_dim = v_dim
-        ctx.cu_seqlens_kv = cu_seqlens_kv
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         if cu_seqlens_kv is None:
@@ -1435,11 +1432,11 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
                 or [total_seq_len, head_num, emb_dim + k_dim]
             dv: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
         """
-        cos, sin = ctx.saved_tensors
+        cos, sin, cu_seqlens_kv = ctx.saved_tensors
         max_seqlen = None
         batch_size = None
         seq_num = None
-        if ctx.cu_seqlens_kv is None:
+        if cu_seqlens_kv is None:
             # sbhd
             max_seqlen, batch_size, nheads, _ = dk.shape
             dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
@@ -1447,7 +1444,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             total_seqlen = dk.shape[0]
         else:
             # thd
-            seq_num = len(ctx.cu_seqlens_kv) - 1
+            seq_num = len(cu_seqlens_kv) - 1
             total_seqlen, nheads, _ = dk.shape
         assert dk.stride(-1) == 1
         assert dv.stride(-1) == 1
@@ -1469,7 +1466,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             nheads,
             batch_size,
             seq_num,
-            ctx.cu_seqlens_kv,
+            cu_seqlens_kv,
             dk.stride(0),
             dk.stride(1),
             dv.stride(0),
@@ -1484,7 +1481,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             V_BLOCK=triton.next_power_of_2(ctx.v_dim),
             ROT_BLOCK=triton.next_power_of_2(ctx.emb_dim // 2),
         )
-        if ctx.cu_seqlens_kv is None:
+        if cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
         return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None

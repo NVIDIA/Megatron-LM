@@ -8,7 +8,14 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
 )
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import (
+    _set_capture_end,
+    _set_capture_start,
+    capture_constants,
+    release_capture_constants,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
@@ -19,6 +26,72 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("rope_type", (RotaryEmbedding, YarnRotaryEmbedding))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_graph_rope_tables_survive_more_than_lru_capacity(rope_type, monkeypatch):
+    kwargs = {"original_max_position_embeddings": 32} if rope_type is YarnRotaryEmbedding else {}
+    rope = rope_type(8, rotary_percent=1.0, use_cpu_initialization=False, **kwargs)
+    vars(rope)["_cuda_graph_rotary_embeddings"] = {}
+    rope._cuda_graph_rotary_cache_active = True
+    graph = None
+    _set_capture_start()
+    try:
+        first = rope(64)
+        first_table = first[0] if isinstance(first, tuple) else first
+        first_ptr = first_table.data_ptr()
+        expected = first_table.detach().clone()
+        static_input = torch.ones_like(first_table)
+        graph = torch.cuda.CUDAGraph()
+        with capture_constants(graph), torch.cuda.graph(graph):
+            captured = rope(64)
+            table = captured[0] if isinstance(captured, tuple) else captured
+            output = static_input * table
+        del first, first_table, captured, table
+
+        for length in range(65, 105):
+            rope(length)
+        assert len(vars(rope)["_cuda_graph_rotary_embeddings"]) == 41
+        rope.clear_cache()
+        torch.cuda.empty_cache()
+        graph.replay()
+        torch.testing.assert_close(output, expected)
+
+        with capture_constants(graph), monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+            cached = rope(64)
+            assert (cached[0] if isinstance(cached, tuple) else cached).data_ptr() == first_ptr
+            with pytest.raises(RuntimeError, match="not prepared before CUDA graph"):
+                rope(105)
+    finally:
+        _set_capture_end()
+        if graph is not None:
+            graph.reset()
+            release_capture_constants(graph)
+        vars(rope).pop("_cuda_graph_rotary_embeddings", None)
+        vars(rope).pop("_cuda_graph_rotary_cache_active", None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_retained_te_rotary_cache_allows_local_capture_miss():
+    rope = RotaryEmbedding(8, rotary_percent=1.0)
+    retained = rope(64)
+    vars(rope)["_cuda_graph_rotary_embeddings"] = {"retained": retained}
+    expected = rope(65).clone()
+    rope.clear_cache()
+    graph = torch.cuda.CUDAGraph()
+    _set_capture_start()
+    try:
+        with capture_constants(graph), torch.cuda.graph(graph):
+            output = rope(65).clone()
+        graph.replay()
+        torch.testing.assert_close(output, expected)
+        assert vars(rope)["_cuda_graph_rotary_embeddings"]["retained"] is retained
+    finally:
+        _set_capture_end()
+        graph.reset()
+        release_capture_constants(graph)
 
 
 class TestMultimodalRotaryEmbedding:

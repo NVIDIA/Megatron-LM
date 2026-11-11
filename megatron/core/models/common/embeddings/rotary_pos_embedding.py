@@ -27,7 +27,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
-from megatron.core.transformer.cuda_graphs import register_capture_constant
+from megatron.core.transformer.cuda_graphs import is_graph_capturing, register_capture_constant
 from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,21 @@ class RotaryEmbedding(nn.Module):
             self.inv_freq.dtype,
         )
         capturing = torch.cuda.is_current_stream_capturing()
+        graph_cache = (
+            getattr(self, "_cuda_graph_rotary_embeddings", None)
+            if is_graph_capturing() and getattr(self, "_cuda_graph_rotary_cache_active", False)
+            else None
+        )
+        if graph_cache is not None:
+            if key in graph_cache:
+                emb, scale = graph_cache[key]
+                register_capture_constant(emb)
+                return emb, scale
+            if capturing:
+                raise RuntimeError(
+                    "RoPE table was not prepared before CUDA graph stream capture: "
+                    f"sequence length {max_seq_len}, offset {offset}."
+                )
         if key in self._embedding_cache:
             emb, scale = self._embedding_cache[key]
             self._embedding_cache.move_to_end(key)
@@ -169,6 +184,8 @@ class RotaryEmbedding(nn.Module):
                 if len(self._embedding_cache) > self.CACHE_CAPACITY_FOR_NON_CG_EMBS:
                     self._embedding_cache.popitem(last=False)
 
+        if graph_cache is not None:
+            graph_cache[key] = (emb, scale)
         register_capture_constant(emb)
         return emb, scale
 

@@ -1056,7 +1056,10 @@ class TEGroupedMLP(MegatronModule):
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
-            fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
+            fine_grained_activation_offloading,
+            permuted_local_hidden_states,
+            offload_name,
+            owner=self,
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
             # In case of MXFP8 Dispatch permuted_local_hidden_states is GroupedTensor which does
@@ -1301,11 +1304,11 @@ class TEGroupedMLP(MegatronModule):
         )
         moe_act_group_name = "fused_group_mlp" if offload_group_mlp else "moe_act"
         group_mlp_manager = off_interface(
-            group_includes_fc1, permuted_local_hidden_states, "fused_group_mlp"
+            group_includes_fc1, permuted_local_hidden_states, "fused_group_mlp", owner=self
         )
         with group_mlp_manager as permuted_local_hidden_states:
             expert_fc1_manager = off_interface(
-                offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+                offload_expert_fc1, permuted_local_hidden_states, "expert_fc1", owner=self
             )
             with expert_fc1_manager as permuted_local_hidden_states:
                 fc1_output, bias_parallel = apply_module(self.linear_fc1)(
@@ -1317,7 +1320,9 @@ class TEGroupedMLP(MegatronModule):
                 delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
-            moe_act_manager = off_interface(offload_moe_act, fc1_output, moe_act_group_name)
+            moe_act_manager = off_interface(
+                offload_moe_act, fc1_output, moe_act_group_name, owner=self
+            )
 
             if setup_activation_checkpoint:
                 self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()

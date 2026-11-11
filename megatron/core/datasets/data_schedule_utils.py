@@ -508,6 +508,22 @@ def create_data_iterator(
     return new_data_iterator
 
 
+def get_data_parallel_gather_group(dp_group, dp_cp_group):
+    """Reuse DPxCP only when it has exactly the same ordered ranks as DP."""
+    if dp_group.size() != dp_cp_group.size():
+        return dp_group
+
+    if dp_group is not dp_cp_group and torch.distributed.is_initialized():
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        groups_match = dp_ranks == dp_cp_ranks
+    else:
+        groups_match = dp_group.rank() == dp_cp_group.rank()
+    if not groups_match:
+        raise RuntimeError("Equivalent DP and DPxCP groups must use the same rank order.")
+    return dp_cp_group
+
+
 def reroute_samples_to_dcp_ranks(
     batch,
     global_ids_this_rank,
@@ -524,7 +540,8 @@ def reroute_samples_to_dcp_ranks(
     Each CP lane gathers the samples from its DP group, then keeps only the
     samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
     collecting the identical input held by every CP sibling and avoids the
-    fully connected P2P transport created by NCCL all-to-all.
+    fully connected P2P transport created by NCCL all-to-all. When DP and
+    DPxCP are equivalent, the already-warmed DPxCP communicator is reused.
 
     The gather is issued one data key at a time to bound temporary memory to
     one global field. Selected slices are cloned before the next key so the
@@ -537,6 +554,7 @@ def reroute_samples_to_dcp_ranks(
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
+    gather_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
 
     batch_keys = set(batch[0]) if batch else set(sample_keys or _REROUTE_KEY_ORDER)
     unsupported_keys = batch_keys - _REROUTE_KEY_SET
@@ -632,7 +650,9 @@ def reroute_samples_to_dcp_ranks(
             gathered_tensor = gather_input
         else:
             gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+            torch.distributed.all_gather_into_tensor(
+                gathered_tensor, gather_input, group=gather_group
+            )
 
         for gid in recv_ids:
             start, sample_numel = sample_slices[gid]
@@ -769,6 +789,7 @@ def next_hdp_group_packing_aware(
     min_cp_size: int = 1,
     cp_group_sizes: Optional[Sequence[int]] = None,
     pad_sequences: bool = False,
+    max_num_seqs: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -782,7 +803,7 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    every rank. ``max_num_seqs`` optionally caps the real sequences per subgroup.
     """
     valid_group_sizes: List[int] = get_valid_dynamic_context_parallel_group_sizes(total_gpus)
     if cp_group_sizes is None:
@@ -870,6 +891,11 @@ def next_hdp_group_packing_aware(
 
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
+                    continue
+                if (
+                    max_num_seqs is not None
+                    and len(micro_batches[group_members[group_id][0]]) >= max_num_seqs
+                ):
                     continue
                 if (
                     packing_sequence_len.get(group_id, 0) + per_rank_length(seq_len, cp_size)
@@ -1029,7 +1055,9 @@ def next_hdp_group_packing_aware(
 
         for sample_id, seq_len in sample_seqlens:
             per_rank_len = per_rank_length(seq_len, total_gpus)
-            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+            if (
+                max_num_seqs is None or len(selected) < max_num_seqs
+            ) and packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
             else:

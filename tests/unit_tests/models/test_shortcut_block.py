@@ -691,7 +691,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
             calls["recompute_hook"] = hook_tensor
 
     class RecordingOffload:
-        def __init__(self, enabled, tensor, name):
+        def __init__(self, enabled, tensor, name, *, owner=None):
             calls["offload_enabled"] = enabled
             calls["offload_input"] = tensor
             calls["offload_name"] = name

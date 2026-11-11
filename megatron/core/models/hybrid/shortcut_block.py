@@ -328,6 +328,7 @@ class ShortcutMoEBlock(MegatronModule):
             and not InferenceMode.is_active(),
             post_norm_input,
             "shortcut_post_norm",
+            owner=self,
         )
         with post_norm_manager as post_norm_input:
             if recompute_context is not None and not isinstance(

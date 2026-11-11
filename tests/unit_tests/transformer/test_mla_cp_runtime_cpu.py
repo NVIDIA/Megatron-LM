@@ -55,7 +55,7 @@ def test_forward_binds_dynamic_cp_singleton_before_projection(attention_cls, mon
 
     layer.get_query_key_value_tensors = project
     monkeypatch.setattr(
-        mla_module, "off_interface", lambda enabled, value, name: nullcontext(value)
+        mla_module, "off_interface", lambda enabled, value, name, *, owner=None: nullcontext(value)
     )
     with pytest.raises(ProjectionReached):
         attention_cls.forward(layer, torch.zeros(2, 1, 4), None, packed_seq_params=packed)

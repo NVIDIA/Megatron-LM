@@ -6761,6 +6761,7 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            **_get_dynamic_cp_cuda_graph_helper_kwargs(args),
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -7324,7 +7325,7 @@ def train(
         )
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
@@ -7509,9 +7510,14 @@ def evaluate(
 
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
+                    # Evaluation runs eagerly, outside the captured training graph schedule.
                     packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(
-                            data_iterator, config, eval_num_microbatches, pg_collection=eval_pgc
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=eval_pgc,
+                            validate_cuda_graph_limits=False,
                         )
                     )
                 except StopIteration:
@@ -8078,6 +8084,49 @@ def should_disable_forward_pre_hook(args, optimizer):
     )
 
 
+def _get_dynamic_cp_cuda_graph_helper_kwargs(args):
+    """Return the dynamic-CP arguments that train() passes to TECudaGraphHelper.
+
+    Without dynamic CP these are the helper defaults, so fixed-CP and non-THD runs do not depend
+    on THD-only arguments such as ``thd_max_packed_sequences`` (unset by default).
+    """
+    if not args.dynamic_context_parallel:
+        return dict(dynamic_cp_group_getter=None, thd_max_subsamples_per_item=1)
+    # Varlen and mock SFT items carry one sequence. Real SFT items can contain
+    # many conversations even when the destination pack is capped at one.
+    max_subsamples_per_item = 1
+    if (
+        getattr(args, "sft", False)
+        and not args.use_varlen_dataset
+        and not getattr(args, "mock_data", False)
+    ):
+        # SFTDataset pads the pack to a multiple of the divisor after each
+        # conversation, so at most seq_length // divisor conversations fit whole. When
+        # the divisor does not divide seq_length, a truncated final one adds one more;
+        # otherwise the truncated tail is empty and dropped, and the +1 is spare.
+        max_subsamples_per_item = args.seq_length // _get_thd_source_padding_granularity(args) + 1
+    return dict(
+        dynamic_cp_group_getter=get_dynamic_data_context_parallel_groups,
+        thd_max_subsamples_per_item=max_subsamples_per_item,
+    )
+
+
+def _get_thd_source_padding_granularity(args):
+    """Match the CP/SP padding divisor used by SFTDataset source items."""
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    return cp_pad * sp_pad
+
+
 def _get_thd_sequence_length_upper_bound(args):
     """Return the padded per-sample THD length upper bound used for graph sizing."""
     max_sequence_length = getattr(args, "seq_length", None)
@@ -8100,16 +8149,5 @@ def _get_thd_sequence_length_upper_bound(args):
     if getattr(args, "seq_length", None) is not None:
         max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
 
-    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
-    if getattr(args, "dynamic_context_parallel", False):
-        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
-    else:
-        cp_pad = cp_size * 2 if cp_size > 1 else 1
-
-    sp_pad = (
-        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
-        if getattr(args, "sequence_parallel", False)
-        else 1
-    )
-    pad_granularity = cp_pad * sp_pad
+    pad_granularity = _get_thd_source_padding_granularity(args)
     return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)

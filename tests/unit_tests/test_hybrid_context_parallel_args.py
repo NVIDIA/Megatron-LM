@@ -102,6 +102,26 @@ def test_hybrid_context_parallel_cuda_graph_rejects_nonstatic_padding(monkeypatc
         validate_args(args)
 
 
+@pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
+def test_dynamic_cp_pp_graphs_reject_inter_document_masking(monkeypatch, pipeline_parallel_size):
+    """The PP graph schedule needs a per-item sequence bound that GPT documents do not have."""
+    args = _hybrid_cp_args(
+        monkeypatch,
+        cuda_graph_impl="transformer_engine",
+        pad_packed_seq_alignment="max",
+        check_for_nan_in_loss_and_grad=False,
+        world_size=2,
+        global_batch_size=2,
+        pipeline_model_parallel_size=pipeline_parallel_size,
+        dataloader_inter_document_masking=True,
+    )
+    if pipeline_parallel_size == 1:
+        validate_args(args)
+        return
+    with pytest.raises(ValueError, match="--dataloader-inter-document-masking"):
+        validate_args(args)
+
+
 def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)

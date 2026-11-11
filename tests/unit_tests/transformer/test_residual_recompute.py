@@ -261,7 +261,7 @@ class _RecordingOffloadInterface:
     created: list[tuple[str, bool]] = []
     excluded: list[Tensor] = []
 
-    def __init__(self, offload: bool, tensor: Tensor, name: str):
+    def __init__(self, offload: bool, tensor: Tensor, name: str, *, owner=None):
         self.offload = offload
         self.tensor = tensor
         self.name = name

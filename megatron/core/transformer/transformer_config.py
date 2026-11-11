@@ -1633,16 +1633,18 @@ class TransformerConfig(ModelParallelConfig):
     thd_max_packed_sequences: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
     )
-    """Optional maximum number of THD packed sequences per microbatch, including any
-    dummy sequence appended for a padding tail. The dp_balanced packing scheduler reserves
-    that dummy slot when THD padding appends one. When set, cu_seqlens tensors are padded
-    to this size + 1 in both eager and CUDA Graph modes. THD CUDA Graph requires this value.
+    """Optional maximum number of THD packed sequences per output microbatch, including any
+    dummy sequence appended for a padding tail. Both dp_balanced and default_dynamic_cp cap
+    real sequences at this value (minus one with a dummy tail); dynamic CP applies the cap per
+    CP subgroup. When set, cu_seqlens tensors are padded to this size + 1 in both eager and
+    CUDA Graph modes. THD CUDA Graph requires this value.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
     Setting it too small results in more microbatches with smaller packs (wasted
-    token budget); setting it too large just allocates a slightly larger cu_seqlens
-    buffer."""
+    token budget); setting it too large increases cu_seqlens storage. Dynamic-CP graph
+    capture bounds the number of source-item subsamples independently of this output-pack
+    capacity, while the runtime packed microbatch count must still fit the captured range."""
 
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
@@ -5160,33 +5162,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.cuda_graph_impl = "transformer_engine"
 
         if self.dynamic_context_parallel:
-            # Captured graphs bake in static communicators, so they cannot follow the
-            # per-microbatch CP group that dynamic context parallelism selects at runtime.
-            # NOTE(nightly-sync 26_10_2026): dev has since implemented packed-DSA
-            # dynamic CP under CUDA graphs as an experimental-but-supported path --
-            # is_packed_dsa_cp_cuda_graph_experimental() takes dynamic_context_parallel
-            # as an explicit input and only warns (see the warnings.warn call later in
-            # this method, plus PACKED_DSA_CP_CUDA_GRAPH_WARNING's "set
-            # cuda_graph_impl='none' to use the supported eager path"). Main's blanket
-            # rejection would make that whole path unreachable, so scope it to the
-            # configurations main wrote it for. Main's guard tests set neither
-            # experimental_attention_variant="dsa" nor the dynamic-pack scheduler, so
-            # the predicate is False for them and they still raise --
-            # test_transformer_config.py::test_dynamic_context_parallel_validation and
-            # test_hybrid_context_parallel_args.py::
-            # test_hybrid_context_parallel_rejects_cuda_graph_impl hold, as does dev's
-            # test_attention_variant_dsa.py::
-            # test_packed_dsa_cp_cuda_graph_warning_boundary[dynamic_te_mlp].
-            packed_dsa_cp_cuda_graphs = is_packed_dsa_cp_cuda_graph_experimental(
-                experimental_attention_variant=self.experimental_attention_variant,
-                sequence_packing_scheduler=self.sequence_packing_scheduler,
-                dynamic_context_parallel=self.dynamic_context_parallel,
-                context_parallel_size=self.context_parallel_size,
-                cuda_graph_impl=self.cuda_graph_impl,
-            )
-            assert (
-                self.cuda_graph_impl == "none" or packed_dsa_cp_cuda_graphs
-            ), "Dynamic context parallelism not supported with CUDA Graph"
+            if self.cuda_graph_impl not in ("none", "transformer_engine"):
+                raise ValueError("Dynamic CP supports only layer-wise TE CUDA graphs.")
+            # Scope and slot restrictions are checked below after graph scopes are normalized.
             assert (
                 self.calculate_per_token_loss
             ), "Dynamic context parallelism must be used with calculate_per_token_loss"
@@ -5353,6 +5331,7 @@ class TransformerConfig(ModelParallelConfig):
             and self.offload_modules
             and self.cuda_graph_impl == "transformer_engine"
             and not self.cuda_graph_modules
+            and not self.dynamic_context_parallel  # Dynamic CP rejects this combination.
         ):
             warnings.warn(
                 "Fine-grained activation offloading with Transformer Engine whole-layer "
@@ -6541,6 +6520,27 @@ class TransformerConfig(ModelParallelConfig):
                 "supported together with a sequence_packing_scheduler. Either enable a "
                 "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
+
+        if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
+            if not self.cuda_graph_dynamic_microbatches:
+                raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
+            if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
+                raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
+            if self.moe_paged_stash:
+                raise ValueError(
+                    "Dynamic CP graphs do not support moe_paged_stash: its capture bookkeeping "
+                    "does not cover the per-CP-size graph banks."
+                )
+            if self.cuda_graph_modules and CudaGraphModule.mamba in self.cuda_graph_modules:
+                raise ValueError(
+                    "Dynamic CP graphs capture TransformerLayer scopes only; remove 'mamba' from "
+                    "cuda_graph_modules."
+                )
+            if self.fine_grained_activation_offloading and not self.cuda_graph_modules:
+                raise ValueError(
+                    "Dynamic CP graphs support fine-grained activation offloading only with "
+                    "partial cuda_graph_modules scopes, not whole-layer capture."
+                )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

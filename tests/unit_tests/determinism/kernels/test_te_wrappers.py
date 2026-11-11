@@ -930,6 +930,47 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("cp_size, cp_rank", [(1, 0), (2, 0), (2, 1)])
+def test_thd_short_rope_table_replays_fwd_bwd(monkeypatch, cp_size, cp_rank):
+    """A THD RoPE table shorter than max_seqlen bypasses TE fused RoPE and replays bit-exactly.
+
+    Dynamic-CP CUDA graphs bound the RoPE table to the captured length while the packed
+    max_seqlen can include a padding tail, so apply_rotary_pos_emb takes the unfused THD path.
+    The second sequence runs past the table, so every rank also replays clamped positions.
+    """
+    from megatron.core.models.common.embeddings import rope_utils
+
+    def reject_te(*args, **kwargs):
+        raise AssertionError("a THD RoPE table shorter than max_seqlen must bypass TE")
+
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", reject_te)
+    seeded()
+    config = _config(apply_rope_fusion=True)
+    table_len, max_seqlen, heads, head_dim, rot_dim = 1024, 4096, 16, 128, 64
+    # Both sequence lengths divide by 2 * CP; the second one (3072) exceeds the table.
+    cu_seqlens = torch.tensor([0, 1024, 4096], dtype=torch.int32, device="cuda")
+    freqs = torch.randn(table_len, 1, 1, rot_dim, device="cuda", dtype=torch.float32)
+    # rot_dim < head_dim also replays the pass-through channels.
+    t = torch.randn(
+        max_seqlen // cp_size,
+        heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    group = SimpleNamespace(size=lambda: cp_size, rank=lambda: cp_rank)
+
+    def fn(t):
+        return rope_utils.apply_rotary_pos_emb(
+            t, freqs, config, cu_seqlens=cu_seqlens, cp_group=group, max_seqlen=max_seqlen
+        )
+
+    assert_replays_bit_exact(
+        fn, (t,), replays=3, contention=True, what=f"short-table THD RoPE CP{cp_size}/rank{cp_rank}"
+    )
+
+
 def test_te_fused_mla_kv_rope_mxfp8_replays():
     """The fused MLA key/value split + key RoPE + MXFP8 quantization that MLA dispatches with
     use_fused_mla_kv_rope_quant (its backward is the replayed Triton key/value split RoPE)."""
