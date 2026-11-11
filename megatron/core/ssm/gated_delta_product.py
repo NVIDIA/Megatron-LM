@@ -1118,6 +1118,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
+    def _clamp_g(self, g: torch.Tensor) -> torch.Tensor:
+        """Optionally bound per-token log decay before any kernel prefix sums."""
+        if self.config.gdp_g_clamp_value is None:
+            return g
+        return g.clamp_min(-self.config.gdp_g_clamp_value)
+
     def _compute_gating(
         self, ba: torch.Tensor, *, runtime_cp: _GDPRuntimeCP
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1139,6 +1145,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             A_log = runtime_cp.helper.get_A_log()
             dt_bias = runtime_cp.helper.get_dt_bias()
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+
+        # Clamp out of place, so the caller's g and the zero-decay Householder copies
+        # stay unchanged.
+        g = self._clamp_g(g)
 
         if self.config.gdp_cutedsl_kernel:
             beta = rearrange(beta, "b l d -> (b l) d")
@@ -1235,6 +1245,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        replay_context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """Decode step of ``seq_len`` tokens per request. ``zVKQba`` is ``[n,
         seq_len, proj_dim]``; returns ``[n, seq_len, d_inner]``. ``seq_len`` is
@@ -1248,7 +1259,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         the conv and SSM state after each draft token, so that verification can
         roll each request's recurrence back to its accepted prefix. Both come
         from the inference context and are slot-indexed like the caches they
-        shadow; they are passed as a pair or not at all.
+        shadow; they are passed as a pair or not at all. ``replay_context`` must
+        be None: ReplaySSM supports only Mamba-2 mixers.
 
         Every op here is CUDA-graph safe: no host synchronization, no
         data-dependent shapes, and the state caches are addressed by device-side
@@ -1257,6 +1269,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
             "a rollback needs both halves of the recurrent state"
         )
+        assert replay_context is None, "ReplaySSM supports only Mamba-2 mixers."
         assert self.cp is not None, "Headwise geometry is required for GDP inference"
 
         # Keep the sequence dimension so the shared helpers apply: their (b, l, ...)
@@ -1292,6 +1305,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             head_dim=self.headdim,
             state_dim=self.d_state,
         )
+        # Match training/prefill. Zero-decay Householder copies remain zero.
+        g = self._clamp_g(g)
 
         # Forked recurrent kernel: reads and writes `ssm_state` in place at the
         # slots named by `batch_indices`, so there is no gather of the initial
@@ -1435,6 +1450,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             head_dim=self.headdim,
             state_dim=self.d_state,
         )
+        # Match training/decode. Zero-decay Householder copies remain zero.
+        g = self._clamp_g(g)
 
         # batch = 1 packed sequence of length T; householder folded into seq. The shapes
         # and the GQA expansion come from gdp_prefill_prepare above, which emits exactly
