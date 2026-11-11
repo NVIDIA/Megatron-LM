@@ -19,6 +19,7 @@ from torch import Tensor
 from megatron.core.quantization import indexer_quantization
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_deepselect_topk,
     dsa_indexer_loss,
     dsa_layout,
     dsa_masking,
@@ -288,6 +289,9 @@ class IndexerScorerOptions:
             (:func:`_selected_scores_for_indexer_loss`). Weights stay BF16, and the indexer
             loss and backward keep using the BF16 Q/K. ``"bf16"`` returns the scorer's own
             FP32 values. Every other scorer path rejects ``"mxfp8"``.
+        topk_backend: Kernel of the non-deterministic top-k over the scores, ``'cudnn'`` or
+            ``'deepselect'`` (``dsa_indexer_topk_backend``). DeepSelect runs only where
+            :func:`dsa_deepselect_topk.fallback_reason` allows it; other calls use cuDNN.
         topk_scratch_bytes: Per-launch int32 scratch budget of every cuDNN top-k the indexer
             runs, in bytes (``dsa_cudnn_topk_scratch_gib``); ``None`` uses
             ``_TOPK_WRAPPER_MAX_SCRATCH_BYTES``. See :func:`_topk_wrapper_chunk_rows`.
@@ -295,6 +299,7 @@ class IndexerScorerOptions:
 
     skip_masked_score_fill: bool = False
     precision: str = "bf16"
+    topk_backend: str = "cudnn"
     topk_scratch_bytes: Optional[int] = None
 
 
@@ -303,6 +308,7 @@ def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> Indexe
     return IndexerScorerOptions(
         skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False)),
         precision=str(getattr(config, "dsa_indexer_precision", "bf16")),
+        topk_backend=getattr(config, "dsa_indexer_topk_backend", "cudnn") or "cudnn",
         topk_scratch_bytes=_topk_scratch_bytes_from_config(config),
     )
 
@@ -1118,6 +1124,7 @@ def _indexer_top_k_wrapper_chunked(
     topk_k: int,
     return_topk_scores: bool,
     deterministic: bool = False,
+    topk_backend: str = "cudnn",
     topk_scratch_bytes: Optional[int] = None,
 ) -> dict:
     """Run cuDNN top-k in row chunks to bound wrapper scratch allocation.
@@ -1136,13 +1143,36 @@ def _indexer_top_k_wrapper_chunked(
     budget when only top-k is needed), so neither this scratch budget nor the ``tie_break``
     path applies to them.
 
+    With ``topk_backend='deepselect'`` an eligible non-deterministic call
+    (:func:`dsa_deepselect_topk.fallback_reason`) runs one DeepSelect launch over all rows
+    instead, with the same output contract and no scratch; any other call runs cuDNN. Which
+    one ran is logged once per reason and score dtype.
+
     Below :func:`_cudnn_topk_min_reliable_k` of the scores' dtype (``topk_k`` < 6 for FP32,
     < 14 for BF16), the radix kernel gets rows longer than ``topk_k`` but at most that many
     elements long wrong. Those rows reach it with length 0 and are selected by
     :func:`_exact_small_topk` (:func:`_select_short_rows_exactly`), which returns the
     deterministic canonical result for them in either mode; every other row is the kernel's.
+
+    Scores may be FP32 or BF16; the selected values come back in the scores' dtype from either
+    backend. The cuDNN radix top-k is compiled for a compact row-major ``[rows, cols]``
+    tensor, so callers hand it contiguous scores, and its scratch is sized by the FP32 budget
+    below, which over-estimates BF16 (one int32 buffer instead of two).
     """
     n_rows, sk = scores_flat.shape
+    deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
+    if topk_backend == "deepselect":
+        reason = dsa_deepselect_topk.fallback_reason(scores_flat, seq_lens, topk_k, deterministic)
+        dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason, scores_flat.dtype)
+        if reason is None:
+            return dsa_deepselect_topk.deepselect_topk(
+                scores_flat, seq_lens, topk_k, return_topk_scores
+            )
+    elif topk_backend != "cudnn":
+        raise ValueError(
+            f"DSA indexer top-k backend must be one of {dsa_deepselect_topk.TOPK_BACKENDS}, "
+            f"got {topk_backend!r}."
+        )
     all_seq_lens, short_rows = seq_lens, None
     reliable_k = _cudnn_topk_min_reliable_k(scores_flat.dtype)
     if topk_k < reliable_k:
@@ -1165,7 +1195,6 @@ def _indexer_top_k_wrapper_chunked(
     chunk_rows = _topk_wrapper_chunk_rows(
         n_rows, sk, scores_flat.element_size(), max_scratch_bytes=topk_scratch_bytes
     )
-    deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
     use_frontend_tie_break = deterministic and _supports_lowest_index_topk_tie_break()
     if deterministic and not use_frontend_tie_break:
         # Bound the masks, prefix ranks, and K-wide gather buffers used by the
@@ -1379,6 +1408,7 @@ def _indexer_topk_from_score_chunks(
     score_seq_lens: Optional[Tensor] = None,
     bottom_right_key_start: Optional[int] = None,
     deterministic: bool = False,
+    topk_backend: str = "cudnn",
     topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -1454,6 +1484,7 @@ def _indexer_topk_from_score_chunks(
             topk_k=chunk_topk_k,
             return_topk_scores=return_topk_scores,
             deterministic=deterministic,
+            topk_backend=topk_backend,
             topk_scratch_bytes=topk_scratch_bytes,
         )
         topk_indices = tk_result["indices"].view(b, row_end - row_start, chunk_topk_k)
@@ -1752,6 +1783,14 @@ def _indexer_topk_packed_thd_cudnn(
         ),
         **({"clean_logits": False} if skip_fill else {}),
         **precision_kwargs,
+        **_deepselect_score_out_kwargs(
+            n_rows=score_q.size(0),
+            width=max_score_k,
+            topk_k=min(topk_k, max_score_k),
+            device=device,
+            deterministic=deterministic,
+            topk_backend=scorer_options.topk_backend,
+        ),
     )["scores"]
 
     # Without the prefill only [0, column_limit) of each row is defined. Rows outside
@@ -1794,6 +1833,7 @@ def _indexer_topk_packed_thd_cudnn(
         topk_k=score_topk,
         return_topk_scores=return_topk_scores,
         deterministic=deterministic,
+        topk_backend=scorer_options.topk_backend,
         topk_scratch_bytes=scorer_options.topk_scratch_bytes,
     )
     topk_indices = tk_result["indices"].view(1, sq, score_topk)
@@ -1925,6 +1965,62 @@ def _recompute_selected_indexer_log_probs(
     )["predict"][..., :n_selected]
     log_probs = torch.log(predict.float().clamp_min(_CLIP_PROB_MIN))
     return torch.where(topk_indices >= 0, log_probs, torch.full_like(log_probs, float("-inf")))
+
+
+# cuDNN's SM100 scorer binds a caller ``out`` directly only when its row width is a multiple of
+# 4 FP32 elements (its TMA store alignment); otherwise it stages through a padded buffer and
+# copies back, and rejects that copy with ``clean_logits=False``. Only frontend 1.31 was
+# checked to bind a row-padded ``out`` without a copy.
+_CUDNN_SCORE_OUT_WIDTH_ALIGNMENT = 4
+_SCORE_OUT_FE_VERSION = (1, 31)
+
+
+def _deepselect_score_out_kwargs(
+    *,
+    n_rows: int,
+    width: int,
+    topk_k: int,
+    device: torch.device,
+    deterministic: bool,
+    topk_backend: str,
+) -> dict:
+    """``out=`` for the dense THD scorer when DeepSelect will read a padded-stride buffer.
+
+    DeepSelect needs a score row stride that is a multiple of 1024 bytes. The scorer
+    allocates ``[rows, width]`` (``width`` rounded to 4 elements), which already satisfies
+    that for every rank width of 1M-token CP64 and 128K-token CP32 calls: 1M CP64 widths are
+    multiples of 8192 elements, 128K ones multiples of 2048 at CP32 (and of 1024 at CP64).
+    For other widths that DeepSelect would take, the scorer writes into a view of a buffer
+    whose rows are padded to the stride instead: frontend >= 1.31 binds such an ``out``
+    directly (its own row padding uses the same strided view), so nothing is copied. Calls
+    that will not use DeepSelect, and older frontends, keep the default buffer (and the
+    top-k then falls back to cuDNN for an unaligned width).
+    """
+    if topk_backend != "deepselect" or topk_k >= width:
+        return {}
+    deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
+    if (
+        dsa_deepselect_topk.static_fallback_reason(
+            n_rows=n_rows,
+            width=width,
+            topk_k=topk_k,
+            dtype=torch.float32,
+            device=device,
+            deterministic=deterministic,
+        )
+        is not None
+    ):
+        return {}
+    row_stride = dsa_deepselect_topk.score_row_stride(width, torch.float32)
+    if (
+        row_stride == width
+        or width % _CUDNN_SCORE_OUT_WIDTH_ALIGNMENT
+        or not _cudnn_frontend_at_least(_SCORE_OUT_FE_VERSION)
+        or not _accepts_named_parameter(_cudnn_dsa.indexer_forward_wrapper, "out")
+    ):
+        return {}
+    buffer = torch.empty((n_rows, row_stride), dtype=torch.float32, device=device)
+    return {"out": buffer[:, :width]}
 
 
 def _mxfp8_scorer_device_problem(device: torch.device) -> Optional[str]:
@@ -2107,6 +2203,7 @@ def _indexer_topk_single_packed_cp_segments(
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
     deterministic: bool = False,
+    topk_backend: str = "cudnn",
     topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Fast cuDNN top-k for one packed THD sequence split into CP front/back slices."""
@@ -2177,6 +2274,7 @@ def _indexer_topk_single_packed_cp_segments(
             return_topk_scores,
             bottom_right_key_start=key_start + rel_start,
             deterministic=deterministic,
+            topk_backend=topk_backend,
             topk_scratch_bytes=topk_scratch_bytes,
         )
         topk_indices, topk_scores = _pad_topk_result(topk_indices, topk_scores, topk_k)
@@ -2718,10 +2816,12 @@ def _indexer_topk_bshd(
     sequence-local top-k indices to the global packed key coordinate space.
 
     ``scorer_options`` carries the config-level scorer opt-ins: the skipped prefill applies
-    to the general packed THD executor only, the scratch budget to every executor.
+    to the general packed THD executor only, the top-k backend and scratch budget to every
+    executor.
     """
     _ensure_dsa_namespace()
     topk_options = scorer_options or IndexerScorerOptions()
+    topk_backend = topk_options.topk_backend
     topk_scratch_bytes = topk_options.topk_scratch_bytes
 
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -2822,6 +2922,7 @@ def _indexer_topk_bshd(
                 topk_k,
                 return_topk_scores,
                 deterministic=deterministic,
+                topk_backend=topk_backend,
                 topk_scratch_bytes=topk_scratch_bytes,
             )
         else:
@@ -2841,6 +2942,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
                 deterministic=deterministic,
+                topk_backend=topk_backend,
                 topk_scratch_bytes=topk_scratch_bytes,
             )
         elif not return_scores and plan is IndexerScoringPlan.PACKED_THD_GENERAL:
@@ -2877,6 +2979,7 @@ def _indexer_topk_bshd(
                 indexer_ratio=_INDEXER_RATIO,
                 score_seq_lens=ends,
                 deterministic=deterministic,
+                topk_backend=topk_backend,
                 topk_scratch_bytes=topk_scratch_bytes,
             )
         else:
@@ -2912,6 +3015,7 @@ def _indexer_topk_bshd(
             topk_k=topk_k,
             return_topk_scores=return_topk_scores,
             deterministic=deterministic,
+            topk_backend=topk_backend,
             topk_scratch_bytes=topk_scratch_bytes,
         )
         del scores_for_topk, scores_flat
