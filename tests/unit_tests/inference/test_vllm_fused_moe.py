@@ -582,9 +582,9 @@ class TestParallelAlignBlockSize:
 class TestLaunchConfigs:
 
     def test_tuned_tables_are_consistent(self):
-        from megatron.core.inference.moe.vllm_fused_moe import _TUNED_CONFIGS
+        from megatron.core.inference.moe.vllm_fused_moe_configs import TUNED_CONFIGS
 
-        for key, entries in _TUNED_CONFIGS.items():
+        for key, entries in TUNED_CONFIGS.items():
             bounds = [max_tokens for max_tokens, _, _ in entries]
             assert bounds == sorted(set(bounds)), key
             for _, fc1, fc2 in entries:
@@ -595,15 +595,15 @@ class TestLaunchConfigs:
 
     def test_lookup_matches_device_shape_and_hint(self, monkeypatch):
         from megatron.core.inference.moe.vllm_fused_moe import (
-            _TUNED_CONFIGS,
             _get_default_config,
             _get_launch_configs,
         )
+        from megatron.core.inference.moe.vllm_fused_moe_configs import TUNED_CONFIGS
 
         # The package re-exports a function of the same name; use the module itself.
         vllm_module = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
         key = ((10, 3), 32, 1856, 2688, 6)
-        entries = _TUNED_CONFIGS[key]
+        entries = TUNED_CONFIGS[key]
         monkeypatch.setattr(vllm_module, "_get_device_capability", lambda device: (10, 3))
         assert _get_launch_configs(1, 32, 6, 1856, 2688, "cuda") == entries[0][1:]
         assert _get_launch_configs(9, 32, 6, 1856, 2688, "cuda") == entries[3][1:]
@@ -612,13 +612,13 @@ class TestLaunchConfigs:
         default = _get_default_config(M=last + 1, E=32, top_k=6)
         assert _get_launch_configs(last + 1, 32, 6, 1856, 2688, "cuda") == (default, default)
         # EP=8 (16 local experts) has its own table.
-        ep8 = _TUNED_CONFIGS[((10, 3), 16, 1856, 2688, 6)]
+        ep8 = TUNED_CONFIGS[((10, 3), 16, 1856, 2688, 6)]
         assert _get_launch_configs(8, 16, 6, 1856, 2688, "cuda") == ep8[0][1:]
         assert _get_launch_configs(100, 16, 6, 1856, 2688, "cuda") == ep8[2][1:]
         # Super and Ultra (top-22) have their own tables per EP size.
-        super_ep8 = _TUNED_CONFIGS[((10, 3), 64, 2688, 1024, 22)]
+        super_ep8 = TUNED_CONFIGS[((10, 3), 64, 2688, 1024, 22)]
         assert _get_launch_configs(1, 64, 22, 2688, 1024, "cuda") == super_ep8[0][1:]
-        ultra_ep4 = _TUNED_CONFIGS[((10, 3), 128, 5120, 2048, 22)]
+        ultra_ep4 = TUNED_CONFIGS[((10, 3), 128, 5120, 2048, 22)]
         assert _get_launch_configs(3, 128, 22, 5120, 2048, "cuda") == ultra_ep4[0][1:]
         # Other shapes and devices keep vLLM's heuristic.
         assert _get_launch_configs(8, 8, 6, 1856, 2688, "cuda")[0] == _get_default_config(
@@ -1042,6 +1042,8 @@ class TestVllmFusedMoe:
                 _vt(tokens),
                 routing_map,
                 num_tokens_hint=tokens,
+                parallel_align=True,
+                tiled_sum=True,
             )
 
         # 4096 tokens x top-5 exceeds the multi-CTA builder's pair limit; 1025-2048
@@ -1129,6 +1131,8 @@ class TestVllmFusedMoeModelShapes:
             out=out,
             num_tokens_hint=hint,
             activation_clamp_scale=clamp,
+            parallel_align=True,
+            tiled_sum=True,
         )
         if clamp is None:
             expected = _ref_sequential_moe(
@@ -1158,12 +1162,13 @@ class TestVllmFusedMoeModelShapes:
     ):
         """On the measured device, the tuned configs reproduce the default configs' bits."""
         from megatron.core.inference.moe import fused_moe
-        from megatron.core.inference.moe.vllm_fused_moe import _TUNED_CONFIGS, vllm_fused_moe
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+        from megatron.core.inference.moe.vllm_fused_moe_configs import TUNED_CONFIGS
 
         capability = torch.cuda.get_device_capability()
         s = dict(shape, num_local=num_local)
         key = (capability, s["num_local"], s["ffn_hidden"], s["hidden_size"], s["topk"])
-        if key not in _TUNED_CONFIGS:
+        if key not in TUNED_CONFIGS:
             pytest.skip(f"no measured launch configs for {key}")
         max_tokens = max(hint, 16)
         hidden, probs, routing_map, fc1, fc2 = _model_shape_inputs(
@@ -1172,8 +1177,8 @@ class TestVllmFusedMoeModelShapes:
         # The package re-exports the vllm_fused_moe function under the module's name.
         module = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
         outputs = []
-        for tables in (_TUNED_CONFIGS, {}):
-            monkeypatch.setattr(module, "_TUNED_CONFIGS", tables)
+        for tables in (TUNED_CONFIGS, {}):
+            monkeypatch.setattr(module, "TUNED_CONFIGS", tables)
             out = torch.full((max_tokens, s["hidden_size"]), float("nan"), device="cuda")
             vllm_fused_moe(
                 hidden,
@@ -1876,6 +1881,8 @@ def test_persistent_buffers_mode_switch_graph_replay(monkeypatch, initial_bi_mod
             routing,
             out=out,
             num_tokens_hint=tokens,
+            parallel_align=True,
+            tiled_sum=True,
         )
 
     for bi_mode in (initial_bi_mode, not initial_bi_mode):
@@ -1936,5 +1943,7 @@ def test_bi_keeps_original_expert_dispatch(monkeypatch, activation, hint):
             _vt(tokens),
             routing,
             num_tokens_hint=hint,
+            parallel_align=True,
+            tiled_sum=True,
         )
     assert torch.isfinite(out).all()

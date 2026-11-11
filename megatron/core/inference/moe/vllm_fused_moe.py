@@ -39,6 +39,7 @@ from megatron.core.inference.moe.permute import (
     compute_expert_offsets,
     compute_local_tokens_per_expert,
 )
+from megatron.core.inference.moe.vllm_fused_moe_configs import TUNED_CONFIGS
 from megatron.core.transformer.moe.ep_invariant_combine import (
     EPInvariantCombineArgs,
     expert_tp_fold,
@@ -107,93 +108,6 @@ def _get_default_config(M: int, E: int, top_k: int) -> dict:
     }
 
 
-def _config(block_m, block_n, block_k, num_warps, num_stages, group_m=1) -> dict:
-    """Build a GEMM launch config from tile sizes and scheduling parameters."""
-    return {
-        'BLOCK_SIZE_M': block_m,
-        'BLOCK_SIZE_N': block_n,
-        'BLOCK_SIZE_K': block_k,
-        'GROUP_SIZE_M': group_m,
-        'num_warps': num_warps,
-        'num_stages': num_stages,
-    }
-
-
-# Offline-tuned BF16 configs keyed by (SM, local experts, FC1 width, hidden size, top-k).
-# Rows: (max token hint, FC1 config, FC2 config); config args: tile M/N/K, warps, stages.
-# FC1 and FC2 share BLOCK_SIZE_M because they reuse the same indirection table.
-# Unmatched keys or hints above the last entry use _get_default_config.
-_TUNED_CONFIGS = {
-    ((10, 3), 32, 1856, 2688, 6): (
-        (1, _config(16, 32, 128, 4, 5), _config(16, 32, 128, 4, 5)),
-        (2, _config(16, 64, 128, 4, 5), _config(16, 32, 128, 4, 5)),
-        (8, _config(16, 64, 128, 4, 4), _config(16, 64, 64, 4, 5)),
-        (16, _config(16, 64, 128, 4, 3), _config(16, 64, 64, 4, 3)),
-        (32, _config(16, 128, 128, 4, 3), _config(16, 64, 64, 4, 3)),
-        (64, _config(16, 64, 64, 4, 3), _config(16, 64, 64, 4, 5)),
-        (128, _config(16, 64, 128, 4, 2), _config(16, 64, 128, 4, 3)),
-        (256, _config(16, 128, 128, 4, 2), _config(16, 128, 64, 4, 5)),
-        (512, _config(32, 128, 128, 4, 2), _config(32, 128, 64, 4, 4)),
-        (1024, _config(64, 128, 64, 8, 4), _config(64, 128, 64, 8, 3)),
-        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
-    ),
-    ((10, 3), 16, 1856, 2688, 6): (
-        (16, _config(16, 64, 128, 4, 5), _config(16, 64, 64, 4, 5)),
-        (32, _config(16, 64, 128, 4, 4), _config(16, 64, 64, 4, 5)),
-        (128, _config(16, 64, 128, 4, 3), _config(16, 64, 64, 4, 3)),
-        (256, _config(16, 128, 128, 8, 4), _config(16, 64, 64, 4, 3)),
-        (512, _config(32, 128, 64, 4, 5), _config(32, 128, 64, 4, 4)),
-        (1024, _config(64, 128, 64, 8, 4), _config(64, 128, 64, 4, 3)),
-        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
-    ),
-    ((10, 3), 128, 2688, 1024, 22): (
-        (2, _config(16, 64, 64, 4, 5), _config(16, 64, 128, 4, 5)),
-        (4, _config(16, 64, 64, 4, 3), _config(16, 64, 128, 4, 4)),
-        (8, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 3)),
-        (16, _config(16, 64, 128, 4, 3), _config(16, 128, 128, 4, 2)),
-        (32, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 3)),
-        (128, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 2)),
-        (256, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 3)),
-        (512, _config(32, 64, 128, 4, 2), _config(32, 128, 128, 4, 2)),
-        (1024, _config(64, 128, 64, 4, 3), _config(64, 128, 64, 8, 4)),
-        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
-    ),
-    ((10, 3), 64, 2688, 1024, 22): (
-        (1, _config(16, 32, 128, 4, 4), _config(16, 32, 256, 4, 5)),
-        (2, _config(16, 64, 64, 4, 5), _config(16, 64, 128, 4, 5)),
-        (4, _config(16, 64, 64, 4, 4), _config(16, 64, 128, 4, 5)),
-        (8, _config(16, 64, 64, 4, 3), _config(16, 64, 128, 4, 4)),
-        (16, _config(16, 64, 64, 4, 5), _config(16, 64, 128, 4, 3)),
-        (32, _config(16, 64, 128, 4, 3), _config(16, 64, 64, 4, 3)),
-        (128, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 2)),
-        (256, _config(16, 64, 128, 4, 3), _config(16, 128, 128, 4, 2)),
-        (512, _config(32, 128, 64, 4, 4), _config(32, 128, 128, 4, 2)),
-        (1024, _config(64, 256, 64, 8, 2), _config(64, 128, 64, 4, 4)),
-        (8192, _config(128, 256, 64, 4, 2), _config(128, 256, 64, 8, 4)),
-    ),
-    ((10, 3), 128, 5120, 2048, 22): (
-        (64, _config(16, 64, 128, 4, 4), _config(16, 64, 128, 4, 4)),
-        (128, _config(16, 128, 128, 8, 4), _config(16, 128, 128, 8, 4)),
-        (256, _config(16, 128, 128, 4, 3), _config(16, 128, 128, 4, 3)),
-        (512, _config(32, 128, 128, 4, 2), _config(32, 64, 128, 4, 3)),
-        (1024, _config(64, 256, 64, 8, 5), _config(64, 128, 64, 4, 3)),
-        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
-    ),
-    ((10, 3), 64, 5120, 2048, 22): (
-        (2, _config(16, 64, 64, 4, 5), _config(16, 64, 128, 4, 5)),
-        (4, _config(16, 64, 128, 4, 4), _config(16, 64, 128, 4, 4)),
-        (8, _config(16, 64, 128, 4, 3), _config(16, 128, 128, 4, 3)),
-        (32, _config(16, 64, 128, 4, 4), _config(16, 64, 128, 4, 4)),
-        (64, _config(16, 64, 128, 4, 4), _config(16, 64, 128, 4, 2)),
-        (128, _config(16, 64, 128, 4, 3), _config(16, 64, 128, 4, 2)),
-        (256, _config(16, 128, 128, 4, 3), _config(16, 64, 128, 4, 3)),
-        (512, _config(32, 128, 64, 4, 4), _config(32, 128, 128, 4, 2)),
-        (1024, _config(64, 256, 64, 8, 5), _config(64, 256, 64, 8, 5)),
-        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
-    ),
-}
-
-
 _DEVICE_CAPABILITY = None
 
 
@@ -210,11 +124,11 @@ def _get_launch_configs(
 ) -> tuple[dict, dict]:
     """FC1 and FC2 launch configs for a token-count hint M.
 
-    Uses a measured _TUNED_CONFIGS entry for this device and expert shape when one
-    covers M, else _get_default_config for both GEMMs.
+    Uses a measured TUNED_CONFIGS entry (vllm_fused_moe_configs.py) for this device
+    and expert shape when one covers M, else _get_default_config for both GEMMs.
     """
     key = (_get_device_capability(device), num_local_experts, N, K, top_k)
-    for max_tokens, fc1_config, fc2_config in _TUNED_CONFIGS.get(key, ()):
+    for max_tokens, fc1_config, fc2_config in TUNED_CONFIGS.get(key, ()):
         if M <= max_tokens:
             return dict(fc1_config), dict(fc2_config)
     config = _get_default_config(M=M, E=num_local_experts, top_k=top_k)
@@ -1028,6 +942,7 @@ def _moe_sum(
     out: Optional[torch.Tensor] = None,
     apply_weights: bool = True,
     acc_fp64: bool = False,
+    tiled: bool = False,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
@@ -1047,11 +962,13 @@ def _moe_sum(
             (e.g. at the activation in batch-invariant mode).
         acc_fp64: accumulate the topk sum in fp64, making the reduction
             order-independent by precision.
+        tiled: use _moe_sum_tiled_kernel, which gives the same bits. Ignored
+            with acc_fp64 or in batch-invariant mode.
     """
     if out is None:
         out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
-    # Preserve the existing BI launch and arithmetic, including FP64 reduction.
-    if acc_fp64 or batch_invariant.enabled():
+    # The original launch, also kept for BI's arithmetic, including FP64 reduction.
+    if not tiled or acc_fp64 or batch_invariant.enabled():
         BLOCK_K = min(triton.next_power_of_2(K), 1024)
         NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
         BLOCK_M = _get_num_sms(input.device)
@@ -1116,6 +1033,8 @@ def vllm_fused_moe(
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
     batch_invariant_kwargs: Optional[EPInvariantCombineArgs] = None,
+    parallel_align: bool = False,
+    tiled_sum: bool = False,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -1146,6 +1065,13 @@ def vllm_fused_moe(
         batch_invariant_kwargs: ``moe_ep_invariant_combine`` (batch-invariant mode) only;
             when set, each token is summed over this rank's subtree of the EP-invariant
             combine tree instead of in top-k order (see ``EPInvariantCombineArgs``).
+        parallel_align: build the indirection tables with the multi-CTA kernel
+            (config.inference_moe_vllm_parallel_align) when BLOCK_SIZE_M < 128 and the
+            pair count is at most _PARALLEL_ALIGN_MAX_PAIRS. Outputs are unchanged.
+            Ignored in batch-invariant mode.
+        tiled_sum: reduce the top-k slots with the tiled kernel
+            (config.inference_moe_vllm_tiled_sum). Outputs are unchanged. Ignored in
+            batch-invariant mode.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -1193,7 +1119,8 @@ def vllm_fused_moe(
     # compiling another GEMM specialization during a warmed request. Decode
     # still uses the parallel builder, including underestimated token hints.
     if (
-        not batch_invariant_mode
+        parallel_align
+        and not batch_invariant_mode
         and block_m < 128
         and effective_tokens * topk <= _PARALLEL_ALIGN_MAX_PAIRS
     ):
@@ -1346,4 +1273,5 @@ def vllm_fused_moe(
         out=out,
         apply_weights=False,
         acc_fp64=accumulate_in_fp64,
+        tiled=tiled_sum,
     )
