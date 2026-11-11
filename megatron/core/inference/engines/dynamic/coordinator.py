@@ -590,6 +590,7 @@ class CoordinatorMixin:
                 )
             ),
             "step_time_ms": self._step_time_histogram.snapshot(),
+            "step_mix": self._step_mix_counter.snapshot(),
         }
 
     def _try_send_streaming_partials(self) -> None:

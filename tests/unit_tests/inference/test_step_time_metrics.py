@@ -17,8 +17,10 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.engines.step_time_metrics import (
     STEP_TIME_BUCKETS_MS,
+    StepMixCounter,
     StepTimeHistogram,
     classify_step,
+    classify_step_mix,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -159,3 +161,67 @@ def test_render_and_window_diff_round_trip():
     assert window["all"]["decode_interfered"]["count"] == 1
     assert window["all"]["decode_interfered"]["buckets"]["16"] == 1
     assert sum(window["all"]["decode_clean"]["buckets"].values()) == 1
+
+
+@pytest.mark.parametrize(
+    "local_prefill, decode_requests, ep_any_prefill, expected",
+    [
+        (True, 0, True, "prefill_only"),
+        (True, 3, None, "mixed"),
+        (False, 5, True, "decode_interfered"),
+        (False, 5, False, "decode_clean"),
+        (False, 5, None, "decode"),
+    ],
+)
+def test_classify_step_mix(local_prefill, decode_requests, ep_any_prefill, expected):
+    assert classify_step_mix(local_prefill, decode_requests, ep_any_prefill) == expected
+
+
+def test_step_mix_counter_times_gaps_and_skips_idle():
+    counter = StepMixCounter()
+    counter.observe("decode_clean", 8, now=10.000)  # starts the clock, untimed
+    counter.observe("decode_clean", 8, now=10.010)
+    counter.observe("mixed", 600, now=10.060)
+    counter.observe("decode_clean", 8, now=20.0)  # after an idle gap: counted, not timed
+    counter.idle()
+    counter.observe("prefill_only", 900, now=20.5)  # clock restarted: untimed
+    snap = counter.snapshot()
+    assert snap["decode_clean"] == {"steps": 3, "tokens": 24, "wall_ms": pytest.approx(10.0)}
+    assert snap["mixed"] == {"steps": 1, "tokens": 600, "wall_ms": pytest.approx(50.0)}
+    assert snap["prefill_only"] == {"steps": 1, "tokens": 900, "wall_ms": 0.0}
+
+
+def _mix_metrics(counts):
+    counter = StepMixCounter()
+    t = 0.0
+    counter.observe("decode_clean", 0, now=t)
+    for step_class, tokens, ms in counts:
+        t += ms / 1e3
+        counter.observe(step_class, tokens, now=t)
+    return {"generation_tokens_total": 0, "step_mix": counter.snapshot()}
+
+
+def test_step_mix_render_and_window_diff_by_pool():
+    before = {
+        "prefill/e0": _mix_metrics([("prefill_only", 4000, 100.0)]),
+        "decode/e1": _mix_metrics([("decode_clean", 64, 10.0)]),
+    }
+    after = {
+        "prefill/e0": _mix_metrics([("prefill_only", 4000, 100.0), ("prefill_only", 2000, 60.0)]),
+        "decode/e1": _mix_metrics(
+            [("decode_clean", 64, 10.0), ("decode_clean", 64, 12.0), ("decode_clean", 64, 14.0)]
+        ),
+    }
+    text0, text1 = render_prometheus(before), render_prometheus(after)
+    assert 'mcore:step_mix_steps_total{engine="decode/e1",step="decode_clean"} 4' in text1
+    assert 'mcore:step_mix_tokens_total{step="prefill_only"} 6000' in text1
+
+    window = steady_client.diff_step_mix(
+        steady_client.parse_step_mix(text0), steady_client.parse_step_mix(text1)
+    )
+    assert window["prefill"]["prefill_only"]["steps"] == 1
+    assert window["prefill"]["prefill_only"]["mean_ms"] == pytest.approx(60.0)
+    assert window["decode"]["decode_clean"]["steps"] == 2
+    assert window["decode"]["decode_clean"]["mean_ms"] == pytest.approx(13.0)
+    assert window["decode"]["decode_clean"]["step_share"] == 1.0
+    assert window["all"]["decode_clean"]["steps"] == 2

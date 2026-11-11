@@ -14,7 +14,7 @@ from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementM
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.step_time_metrics import StepTimeHistogram
+from megatron.core.inference.engines.step_time_metrics import StepMixCounter, StepTimeHistogram
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicVLMInferenceRequest,
@@ -466,6 +466,9 @@ class DynamicInferenceEngine(
         if not hasattr(self, "_step_time_histogram"):
             # Logging steps only (the ones the engine times); see step_time_metrics.
             self._step_time_histogram = StepTimeHistogram()
+        if not hasattr(self, "_step_mix_counter"):
+            # Every step, host-timed; see step_time_metrics.StepMixCounter.
+            self._step_mix_counter = StepMixCounter()
         # Staging is drained by now (checked above), so the backlog peak starts over.
         self._staging_tasks_peak = 0
 
