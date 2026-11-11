@@ -134,6 +134,15 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+try:
+    from megatron.core.fusions.fused_qkv_qknorm_rope import (
+        HAVE_TRITON as HAVE_FUSED_QKV_QKNORM_ROPE,
+    )
+    from megatron.core.fusions.fused_qkv_qknorm_rope import fused_qkv_qknorm_rope
+except ImportError:
+    HAVE_FUSED_QKV_QKNORM_ROPE = False
+    fused_qkv_qknorm_rope = None
+
 
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
@@ -443,6 +452,27 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _has_qk_norm(self) -> bool:
+        return not all(
+            norm is None or isinstance(norm, IdentityOp)
+            for norm in (getattr(self, "q_layernorm", None), getattr(self, "k_layernorm", None))
+        )
+
+    def _can_fuse_qk_norm_rope(self) -> bool:
+        """fused_single_qkv_rope with TE RMSNorm Q/K norms: Triton split + QK-norm + RoPE."""
+        if not (HAVE_FUSED_QKV_QKNORM_ROPE and HAVE_TE and self._has_qk_norm()):
+            return False
+        import transformer_engine as te
+
+        return (
+            not self.config.qk_l2_norm
+            and self.config.normalization == "RMSNorm"
+            and all(type(n) is te.pytorch.RMSNorm for n in (self.q_layernorm, self.k_layernorm))
+            and not self.config.rotary_interleaved
+            and self._yarn_concentration_factor == 1.0
+            and self.config.num_query_groups >= self.world_size
+        )
 
     def _get_core_attention_extra_kwargs(
         self,
@@ -1492,9 +1522,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     and rotary_pos_emb[1] is not None
                 ),
                 not self.config.flash_decode,
-                HAVE_FUSED_QKV_ROPE,
-                self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
-                self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
+                (HAVE_FUSED_QKV_ROPE and not self._has_qk_norm()) or self._can_fuse_qk_norm_rope(),
             ]
         )
         # Check if fused_single_qkv_rope is requested but either unavailable or not
@@ -1654,6 +1682,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         cp_group=runtime_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
+            elif self._has_qk_norm():
+                query, key, value = fused_qkv_qknorm_rope(
+                    mixed_qkv,
+                    q_pos_emb,
+                    k_pos_emb,
+                    self.q_layernorm.weight,
+                    self.k_layernorm.weight,
+                    qkv_split_arg_list[0] // self.hidden_size_per_attention_head,
+                    self.config.layernorm_epsilon,
+                    self.config.layernorm_zero_centered_gamma,
+                )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
