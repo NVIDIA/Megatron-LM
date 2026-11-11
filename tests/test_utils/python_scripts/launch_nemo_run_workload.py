@@ -25,6 +25,9 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         in concat_allranks_logs
         or "Some NCCL operations have failed or timed out." in concat_allranks_logs
         or "Watchdog caught collective operation timeout" in concat_allranks_logs
+        # The heartbeat monitor's exit reason when the watchdog thread itself is stuck, e.g.
+        # behind a non-blocking NCCL launch that never completes. The monitor aborts the rank.
+        or "ProcessGroupNCCL watchdog hang" in concat_allranks_logs
         or "uncorrectable ECC error encountered" in concat_allranks_logs
         or "illegal memory access" in concat_allranks_logs
         or "illegal instruction" in concat_allranks_logs
@@ -56,7 +59,11 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 
 
 def _is_hang_prone_flaky_failure(concat_allranks_logs: str) -> bool:
-    """Return whether a streamed failure may prevent the attempt from exiting."""
+    """Return whether a streamed failure may prevent the attempt from exiting.
+
+    A ``ProcessGroupNCCL watchdog hang`` is deliberately absent: the heartbeat monitor
+    aborts its own rank, and torchrun then stops the others, so the attempt exits unaided.
+    """
     return "Watchdog caught collective operation timeout" in concat_allranks_logs
 
 

@@ -12,6 +12,37 @@ def test_nccl_watchdog_timeout_is_flaky():
     assert launch_nemo_run_workload.is_flaky_failure(log)
 
 
+# Heartbeat-monitor output (PyTorch ProcessGroupNCCL.cpp) when the watchdog thread is wedged.
+_NCCL_WATCHDOG_HANG_LOG = (
+    "[rank7]:[E1111 17:58:31.000000000 ProcessGroupNCCL.cpp:1987] [PG ID 0 PG GUID 0 Rank 7] "
+    "ProcessGroupNCCL's watchdog got stuck for 480 seconds without making progress in "
+    "monitoring enqueued collectives.\n"
+    "[rank7]:[F1111 18:07:31.000000000 ProcessGroupNCCL.cpp:1724] [PG ID 0 PG GUID 0 Rank 7] "
+    "Terminating the process after attempting to dump debug info, due to ProcessGroupNCCL "
+    "watchdog hang.\n"
+)
+
+
+def test_nccl_watchdog_hang_is_flaky():
+    assert launch_nemo_run_workload.is_flaky_failure(_NCCL_WATCHDOG_HANG_LOG)
+
+
+def test_nccl_watchdog_hang_is_not_hang_prone():
+    # The heartbeat monitor aborts the wedged rank itself, so the streamed monitor need not cancel.
+    assert not launch_nemo_run_workload._is_hang_prone_flaky_failure(_NCCL_WATCHDOG_HANG_LOG)
+
+
+def test_nccl_heartbeat_monitor_startup_log_is_not_flaky():
+    log = (
+        "[rank0]:[I1111 17:31:48.304211939 ProcessGroupNCCL.cpp:1791] [PG ID 0 PG GUID 0 Rank 0] "
+        "HeartbeatMonitor environments: TORCH_NCCL_ENABLE_MONITORING (Whether to kill program "
+        "when no watchdog heartbeat detected): 1, TORCH_NCCL_DUMP_ON_TIMEOUT: 1, "
+        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: 480"
+    )
+
+    assert not launch_nemo_run_workload.is_flaky_failure(log)
+
+
 def test_hang_prone_flaky_failure_cancels_active_attempt():
     experiment = Mock()
     log_buffer = launch_nemo_run_workload._ThreadSafeBuffer()
