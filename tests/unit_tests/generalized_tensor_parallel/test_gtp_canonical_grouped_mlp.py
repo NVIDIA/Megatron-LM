@@ -131,9 +131,13 @@ def traced_canonical_glu(monkeypatch):
     calls = []
     for name, kind in (
         ("grouped_gemm_glu_wrapper_sm100", "fwd"),
+        ("grouped_gemm_glu_hadamard_wrapper_sm100", "fwd"),
+        ("grouped_gemm_glu_hadamard_quant_wrapper_sm100", "fwd"),
         ("grouped_gemm_dglu_wrapper_sm100", "bwd"),
     ):
-        original = getattr(cudnn, name)
+        original = getattr(cudnn, name, None)
+        if original is None:
+            continue
 
         def wrap(original, kind):
             @functools.wraps(original)
@@ -144,13 +148,19 @@ def traced_canonical_glu(monkeypatch):
             return traced
 
         monkeypatch.setattr(cudnn, name, wrap(original, kind))
-    for cls in (GroupedMLP_CuTeGEMMGLU, GroupedMLP_CuTeGEMMGLUBf16):
-        cls.grouped_gemm_activation_kernel.cache_clear()
-        cls.grouped_gemm_dactivation_kernel.cache_clear()
+    kernel_getters = (
+        GroupedMLP_CuTeGEMMGLU.grouped_gemm_activation_kernel,
+        GroupedMLP_CuTeGEMMGLU.grouped_gemm_dactivation_kernel,
+        GroupedMLP_CuTeGEMMGLUBf16.grouped_gemm_activation_kernel,
+        GroupedMLP_CuTeGEMMGLUBf16.grouped_gemm_dactivation_kernel,
+        GroupedMLP_CuTeGEMMGLU.grouped_gemm_act_hadamard_kernel,
+        GroupedMLP_CuTeGEMMGLU.grouped_gemm_act_hadamard_quant_kernel,
+    )
+    for get_kernel in kernel_getters:
+        get_kernel.cache_clear()
     yield calls
-    for cls in (GroupedMLP_CuTeGEMMGLU, GroupedMLP_CuTeGEMMGLUBf16):
-        cls.grouped_gemm_activation_kernel.cache_clear()
-        cls.grouped_gemm_dactivation_kernel.cache_clear()
+    for get_kernel in kernel_getters:
+        get_kernel.cache_clear()
 
 
 @pytest.mark.parametrize(
