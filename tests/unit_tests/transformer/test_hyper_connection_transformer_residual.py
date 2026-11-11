@@ -37,7 +37,7 @@ def _base_init(self, config, submodules, layer_number=1, **kwargs):
     self.mhc_checkpoint_input_layernorm = self.mhc_checkpoint_pre_mlp_layernorm = False
     self._input_layernorm_returns_residual = self._pre_mlp_layernorm_returns_residual = False
     self.offload_attn_norm = self.offload_mlp_norm = False
-    self.off_interface = lambda enabled, value, tag: _NormContext(value)
+    self.off_interface = lambda enabled, value, tag, *, owner=None: _NormContext(value)
     self.bias_dropout_add_exec_handler = torch.enable_grad
     self._legacy_forward_post_mlp = object()  # The dedicated constructor must clear this shim.
 

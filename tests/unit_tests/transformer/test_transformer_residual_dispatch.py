@@ -76,7 +76,7 @@ class _DispatchLayer(TransformerLayer):
         self.recompute_input_layernorm = self.recompute_pre_mlp_layernorm = False
         self.mhc_checkpoint_input_layernorm = self.mhc_checkpoint_pre_mlp_layernorm = False
         self.offload_attn_norm = self.offload_mlp_norm = False
-        self.off_interface = lambda enabled, value, name: _OffloadContext(value)
+        self.off_interface = lambda enabled, value, name, *, owner=None: _OffloadContext(value)
         self.bias_dropout_add_exec_handler = torch.enable_grad
         self._legacy_forward_post_mlp = None
         self.events = []

@@ -962,7 +962,7 @@ def test_train_step_scopes_forward_tensor_observation_around_schedule():
     [
         ([], 1),
         (["--context-parallel-size", "2"], 1),
-        (["--dynamic-context-parallel", "--thd-max-packed-sequences", "4"], 4),
+        (["--dynamic-context-parallel", "--thd-max-packed-sequences", "4"], 1),
         (
             [
                 "--dynamic-context-parallel",
@@ -1017,3 +1017,59 @@ def test_train_builds_te_cuda_graph_helper_from_parsed_args(
     )
     assert helper.thd_max_subsamples_per_item == expected_subsamples
     assert helper.dynamic_cp_group_getter is expected_getter
+
+
+def test_sft_source_subsample_bound_covers_dynamic_cp_repacking():
+    """Destination pack capacity must not cap conversations in a source SFT item."""
+    from megatron.core.datasets.data_schedule import (
+        DefaultDynamicCPScheduler,
+        _validate_cuda_graph_microbatch_count,
+    )
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+    args = SimpleNamespace(
+        dynamic_context_parallel=True,
+        use_varlen_dataset=False,
+        sft=True,
+        mock_data=False,
+        seq_length=256,
+        data_parallel_size=2,
+        context_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+    )
+    kwargs = training_mod._get_dynamic_cp_cuda_graph_helper_kwargs(args)
+    assert kwargs["thd_max_subsamples_per_item"] == 65
+    args.mock_data = True
+    assert (
+        training_mod._get_dynamic_cp_cuda_graph_helper_kwargs(args)["thd_max_subsamples_per_item"]
+        == 1
+    )
+
+    # Two source items of [80, 80, 96] each. Every sequence needs CP2 and every output pack
+    # holds one real sequence, so the two items become six microbatches.
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=64,
+        cp_size=1,
+        dp_size=2,
+        microbatch_group_size_per_vp_stage=None,
+        max_num_seqs=1,
+    )
+    sample_id_groups = scheduler.get_groups_and_subsamples(
+        list(enumerate([80, 80, 96, 80, 80, 96]))
+    )
+    num_microbatches = len(sample_id_groups)
+    assert num_microbatches == 6
+
+    captured_limit = TECudaGraphHelper._get_default_dynamic_cp_thd_max_num_microbatches(
+        global_batch_size=2,
+        total_dcp_gpus=2,
+        max_seqlen_per_dp_cp_rank=64,
+        max_sequence_length=256,
+        max_subsamples_per_item=kwargs["thd_max_subsamples_per_item"],
+    )
+    assert captured_limit >= num_microbatches
+    config = SimpleNamespace(_cuda_graph_num_microbatches=captured_limit)
+    _validate_cuda_graph_microbatch_count(config, num_microbatches)
+    with pytest.raises(ValueError, match="outside the captured CUDA graph range"):
+        _validate_cuda_graph_microbatch_count(config, captured_limit + 1)

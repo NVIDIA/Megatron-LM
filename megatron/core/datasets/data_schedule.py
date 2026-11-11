@@ -42,12 +42,12 @@ except ImportError:
 
 def _validate_cuda_graph_microbatch_count(config, num_microbatches: int) -> None:
     """Require runtime packing to stay within the captured schedule proof."""
-    limit = getattr(config, '_cuda_graph_num_microbatches', None)
+    limit = getattr(config, "_cuda_graph_num_microbatches", None)
     if limit is not None and not 1 <= num_microbatches <= limit:
         raise ValueError(
             f"{num_microbatches=} is outside the captured CUDA graph range 1..{limit}."
         )
-    allowed = getattr(config, '_cuda_graph_allowed_microbatches', None)
+    allowed = getattr(config, "_cuda_graph_allowed_microbatches", None)
     if allowed is not None and num_microbatches not in allowed:
         raise ValueError(
             f"{num_microbatches=} is not covered by the CUDA graph liveness proof; "

@@ -813,6 +813,8 @@ def _restore_out_rope(
     if out_rope is None:
         return None
     return dataclasses.replace(out_rope, cu_seqlens_q=cu_seqlens_q, position_ids=position_ids)
+
+
 def _ensure_dsa_namespace():
     """Lazily import the cudnn-frontend DSA namespace."""
     global _DSA
