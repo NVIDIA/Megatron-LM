@@ -32,6 +32,7 @@ MODEL_ARGS:
   --use-mcore-models: true
   --moe-grouped-gemm: true
   --num-experts: 64
+  --moe-token-dispatcher-type: allgather
   --moe-router-topk: 6
   --moe-router-dtype: fp32
   --moe-z-loss-coeff: 0
