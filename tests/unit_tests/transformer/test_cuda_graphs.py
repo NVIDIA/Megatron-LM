@@ -2303,12 +2303,20 @@ def _make_simple_non_module(config):
     return _SimpleNonModule(config)
 
 
+# The DDP-overlap tests below finish their collectives in seconds. If one rank wedges while
+# launching its bucket all-reduce, a short timeout makes its peers' watchdogs report it within
+# minutes rather than the 30-minute default, leaving CI time to retry the bucket.
+_DDP_OVERLAP_TEST_TIMEOUT_MINUTES = 5
+
+
 class TestCheckpointParameterDiscovery:
     """Local-CG discovery and DDP readiness for a checkpointed nested module."""
 
     def setup_method(self, method):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel()
+        Utils.initialize_model_parallel(
+            distributed_timeout_minutes=_DDP_OVERLAP_TEST_TIMEOUT_MINUTES
+        )
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
@@ -2396,7 +2404,9 @@ class TestRepeatedParameterCapture:
 
     def setup_method(self, method):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel()
+        Utils.initialize_model_parallel(
+            distributed_timeout_minutes=_DDP_OVERLAP_TEST_TIMEOUT_MINUTES
+        )
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
