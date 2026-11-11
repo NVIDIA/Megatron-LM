@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Step-time histograms by step class: classification, bucketing, the EP-consensus flag, the
-engine hook, Prometheus rendering, and the steady-state client's window diff."""
+"""Step-time histograms and step-mix counters by step class: classification, bucketing, the
+engine hooks, Prometheus rendering, and the steady-state client's window diff."""
 
 import os
 import sys
@@ -9,11 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from megatron.core.inference.batch_dimensions_utils import (
-    CUDAGraphBatchDimensionBuilder,
-    InferenceBatchDimensions,
-)
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.engines.step_time_metrics import (
     STEP_TIME_BUCKETS_MS,
@@ -65,37 +60,6 @@ def test_histogram_buckets_are_cumulative_with_inf():
     assert snap["buckets"][-2] == 4  # le=1024 excludes 2000 ms
     assert snap["buckets"][-1] == snap["count"] == 5  # +Inf
     assert snap["sum"] == pytest.approx(2003.65)
-
-
-def _row_bound_context(any_non_decode):
-    """Just enough of a DynamicInferenceContext for _match_graph_with_ep_moe_row_bound."""
-    return SimpleNamespace(
-        cuda_graph_batch_dimensions_list=[],
-        is_hybrid_model=True,
-        expert_model_parallel_group=None,
-        _ep_zmq_communicator=None,
-        _moe_sp_size=1,
-        _eager_padded_batch_dimensions=lambda: InferenceBatchDimensions(
-            token_count=64, prefill_req_count=0, decode_req_count=4
-        ),
-        step_ep_any_prefill=None,
-    )
-
-
-@pytest.mark.parametrize("any_non_decode", [True, False])
-def test_ep_consensus_sets_step_flag(monkeypatch, any_non_decode):
-    monkeypatch.setattr(
-        InferenceBatchDimensions,
-        "sync_ep_moe_row_bound_state",
-        staticmethod(lambda *a, **k: (8, any_non_decode, True, 256)),
-    )
-    monkeypatch.setattr(
-        CUDAGraphBatchDimensionBuilder, "match_graph_config", staticmethod(lambda *a, **k: None)
-    )
-    context = _row_bound_context(any_non_decode)
-    dims = InferenceBatchDimensions(token_count=4, prefill_req_count=0, decode_req_count=4)
-    DynamicInferenceContext._match_graph_with_ep_moe_row_bound(context, dims)
-    assert context.step_ep_any_prefill is any_non_decode
 
 
 @pytest.mark.parametrize(
@@ -225,3 +189,16 @@ def test_step_mix_render_and_window_diff_by_pool():
     assert window["decode"]["decode_clean"]["mean_ms"] == pytest.approx(13.0)
     assert window["decode"]["decode_clean"]["step_share"] == 1.0
     assert window["all"]["decode_clean"]["steps"] == 2
+
+
+def test_step_mix_pools_by_native_disaggregation_engine_names():
+    """Main's native PD names engines prefill_s<i>_dp<j> / decode_s<i>_dp<j>."""
+    after = {
+        "prefill_s0_dp0": _mix_metrics([("prefill_only", 4000, 100.0), ("prefill_only", 2000, 60.0)]),
+        "decode_s1_dp0": _mix_metrics([("decode", 64, 10.0), ("decode", 64, 12.0)]),
+        "decode_s1_dp1": _mix_metrics([("decode", 64, 10.0), ("decode", 64, 16.0)]),
+    }
+    window = steady_client.diff_step_mix({}, steady_client.parse_step_mix(render_prometheus(after)))
+    assert window["prefill"]["prefill_only"]["steps"] == 2
+    assert window["decode"]["decode"]["steps"] == 4
+    assert window["decode"]["decode"]["wall_ms"] == pytest.approx(48.0)
