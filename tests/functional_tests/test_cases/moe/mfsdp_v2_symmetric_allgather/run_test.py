@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Check symmetric all-gather registration with independent buffers across nodes."""
+"""Check multi-node symmetric all-gather and reduce-scatter with separate buffers.
+
+Reduce-scatter uses an independent output allocation outside symmetric memory.
+"""
 
 import argparse
 import json
@@ -14,14 +17,14 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.autograd import DeviceType
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Replicate
+from torch.distributed.tensor import Partial, Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 
 
 def main() -> None:
-    """Gather rank-dependent values and verify NCCL selected symmetric kernels."""
+    """Check collective values, output allocation, and NCCL symmetric kernels."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -52,24 +55,40 @@ def main() -> None:
     assert source.is_symmetric_memory and output.is_symmetric_memory
     source.local_buffer.fill_(rank + 1)
 
+    # Reuse the gathered allocation as RS input; its output uses the ordinary allocator.
+    rs_input = output.view([Partial("sum")])
+    rs_output = DBuffer(mesh, [RowAtomic()], source.layout, source.dtype, device)
+    rs_input_symmetric = rs_input.is_symmetric_memory
+    rs_output_symmetric = rs_output.is_symmetric_memory
+    rs_buffers_independent = (
+        rs_input.local_buffer.untyped_storage().data_ptr()
+        != rs_output.local_buffer.untyped_storage().data_ptr()
+    )
+    assert rs_input_symmetric, "Reduce-scatter input must use symmetric memory."
+    assert not rs_output_symmetric, "Reduce-scatter output must use ordinary CUDA memory."
+    assert rs_buffers_independent, "Reduce-scatter input and output must not share storage."
+
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         assert source.allgather(0, out=output) is output
         torch.cuda.synchronize()
+        actual = output.local_buffer.view(world_size, -1).cpu()
 
-    actual = output.local_buffer.view(world_size, -1).cpu()
+        rs_input.local_buffer.fill_(rank + 1)
+        assert rs_input.reduce_scatter(0, RowAtomic(), out=rs_output) is rs_output
+        torch.cuda.synchronize()
+
+    rs_actual = rs_output.local_buffer.cpu()
     # Release registered allocations before destroying their communicator.
-    del source, output, input_pool, output_pool
-    kernels = sorted(
-        {
-            event.name
-            for event in prof.events()
-            if event.device_type == DeviceType.CUDA
-            and "nccl" in event.name.lower()
-            and "allgather" in event.name.lower()
-        }
-    )
+    del source, output, rs_input, rs_output, input_pool, output_pool
+    kernels = {
+        event.name
+        for event in prof.events()
+        if event.device_type == DeviceType.CUDA and "nccl" in event.name.lower()
+    }
+    ag_kernels = sorted(kernel for kernel in kernels if "allgather" in kernel.lower())
+    rs_kernels = sorted(kernel for kernel in kernels if "reducescatter" in kernel.lower())
     expected = torch.arange(1, world_size + 1, dtype=actual.dtype)[:, None].expand_as(actual)
     result = {
         "rank": rank,
@@ -78,9 +97,19 @@ def main() -> None:
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "nccl": torch.cuda.nccl.version(),
-        "allgather_kernels": kernels,
+        "allgather_kernels": ag_kernels,
         "values_match": torch.equal(actual, expected),
-        "symmetric_allgather": bool(kernels) and all("ncclSymk" in kernel for kernel in kernels),
+        "symmetric_allgather": bool(ag_kernels)
+        and all("ncclSymk" in kernel for kernel in ag_kernels),
+        "reduce_scatter_kernels": rs_kernels,
+        "reduce_scatter_values_match": torch.equal(
+            rs_actual, torch.full_like(rs_actual, world_size * (world_size + 1) // 2)
+        ),
+        "reduce_scatter_input_symmetric": rs_input_symmetric,
+        "reduce_scatter_output_symmetric": rs_output_symmetric,
+        "reduce_scatter_buffers_independent": rs_buffers_independent,
+        "symmetric_reduce_scatter": bool(rs_kernels)
+        and all("ncclSymkDevKernel_ReduceScatter_RailA2A_" in kernel for kernel in rs_kernels),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / f"rank-{rank}.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -88,7 +117,13 @@ def main() -> None:
     dist.destroy_process_group()
     print(json.dumps(result), flush=True)
     assert result["values_match"], "All-gather returned incorrect rank-dependent values."
-    assert result["symmetric_allgather"], f"Expected NCCL symmetric all-gather, observed {kernels}."
+    assert result[
+        "symmetric_allgather"
+    ], f"Expected NCCL symmetric all-gather, observed {ag_kernels}."
+    assert result["reduce_scatter_values_match"], "Reduce-scatter returned incorrect values."
+    assert result[
+        "symmetric_reduce_scatter"
+    ], f"Expected GIN symmetric reduce-scatter, observed {rs_kernels}."
 
 
 if __name__ == "__main__":
