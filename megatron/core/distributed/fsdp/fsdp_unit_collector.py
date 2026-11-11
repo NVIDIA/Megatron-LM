@@ -23,6 +23,8 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -162,9 +164,6 @@ class FsdpUnitCollector:
 
 def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
     """Return the parts of this module's forward that its own checkpoints rerun in backward."""
-    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-    from megatron.core.transformer.transformer_block import TransformerBlock
-
     # Read the module's own config: hybrid layers may each have one.
     config = getattr(module, "config", None)
     if config is not None and config.recompute_granularity == "full":

@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -21,6 +21,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference_params import InferenceParams
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
