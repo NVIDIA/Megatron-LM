@@ -139,6 +139,37 @@ class ParamKey:
         return False
 
 
+def resolve_layer_wise_distributed_optimizer(
+    optimizer: str, use_distributed_optimizer: bool, use_layer_wise_distributed_optimizer: bool
+) -> Tuple[str, bool]:
+    """Resolve the requested optimizer to ``(optimizer_name, use_layer_wise)``.
+
+    This is the one rule for whether an optimizer runs as
+    :class:`LayerWiseDistributedOptimizer`; the CLI, config finalization and the optimizer
+    factory all apply it:
+
+    - ``'dist_<name>'`` is the deprecated spelling of ``'<name>'`` with the layer-wise
+      distributed optimizer.
+    - An optimizer other than ``'adam'`` and ``'sgd'`` combined with
+      ``use_distributed_optimizer=True`` runs layer-wise; for example Muon with the
+      distributed optimizer is the layer-wise distributed Muon.
+    - Otherwise ``use_layer_wise_distributed_optimizer`` is kept.
+
+    Raises:
+        ValueError: If ``'adam'`` or ``'sgd'`` requests the layer-wise distributed optimizer.
+    """
+    if optimizer.startswith('dist_'):
+        return optimizer[len('dist_') :], True
+    if optimizer in ('adam', 'sgd'):
+        if use_layer_wise_distributed_optimizer:
+            raise ValueError(
+                f"use_layer_wise_distributed_optimizer is not supported with optimizer="
+                f"{optimizer!r}; use use_distributed_optimizer=True instead."
+            )
+        return optimizer, False
+    return optimizer, bool(use_layer_wise_distributed_optimizer or use_distributed_optimizer)
+
+
 @dataclass
 class OptimizerConfig:
     """Configuration object for Megatron optimizers."""
@@ -200,7 +231,8 @@ class OptimizerConfig:
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True. The training
+       CLI sets it for every MXFP8 run with --fp8-param-gather outside FSDP."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -283,6 +315,20 @@ class OptimizerConfig:
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
+
+    muon_split_qkv_per_head: bool = False
+    """Orthogonalize each head of a split QKV weight (each Q, gate, K and V head) on its own
+    instead of each projection. Requires ``muon_split_qkv``. Changes the update rule, so it is
+    off by default. Heads are cut from the full logical rows: GTP_remat shards are gathered
+    first (on every rank of the group). Like the projection split, it applies only when every
+    tensor-parallel rank holds whole query groups; otherwise the local weight is orthogonalized
+    as a whole."""
+
+    muon_split_mla_qkv: bool = False
+    """Split MLA up-projection weights (the query and key-value up-projections of MLA and
+    absorbed MLA) by head component for Muon, like fused QKV weights. Requires
+    ``muon_split_qkv``. Off by default, which keeps orthogonalizing them as whole matrices.
+    Combine with ``muon_split_qkv_per_head`` to orthogonalize each MLA head on its own."""
 
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
@@ -375,9 +421,22 @@ class OptimizerConfig:
 
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
-    When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
-    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
-    that the standard distributed-optimizer path is not triggered."""
+    An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
+    :func:`resolve_layer_wise_distributed_optimizer`); :meth:`finalize_optimizer_config` then
+    sets it and resets ``use_distributed_optimizer`` to False so that the standard
+    distributed-optimizer path is not triggered."""
+
+    second_order_optimizer_grad_collective: str = "reduce-scatter"
+    """Data-parallel gradient collective for the parameters that a second-order optimizer with
+    ``use_distributed_optimizer`` (e.g. Muon) updates whole on one rank.
+
+    - ``"reduce-scatter"``: each tensor stays whole inside one rank's shard of a padded buffer;
+      gradients are reduce-scattered and the equal-size shards all-gathered.
+    - ``"all-reduce"``: no padding; gradients are all-reduced and every owner all-gathers its
+      whole tensors (uneven sizes), which sends twice the gradient bytes.
+
+    Other parameters always use reduce-scatter. Both store the same optimizer state, so a
+    ``torch_dist`` checkpoint saved with one loads with the other."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -480,21 +539,18 @@ class OptimizerConfig:
         if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
-        if self.fp8_recipe == "mxfp8":
-            if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
+        if self.fp8_recipe == "mxfp8" and not self.reuse_grad_buf_for_mxfp8_param_ag:
+            import warnings
 
-                warnings.warn(
-                    "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
-                    "will use significant amount additional GPU memory."
-                    "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
-                    "recommended for mxfp8 training."
-                )
+            warnings.warn(
+                "mxfp8 without reuse_grad_buf_for_mxfp8_param_ag uses significantly more GPU "
+                "memory; the training CLI enables it with --fp8-param-gather."
+            )
 
         if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
             raise ValueError(
-                "overlap_param_gather_with_optimizer_step is not supported with "
-                "reuse_grad_buf_for_mxfp8_param_ag."
+                "overlap_param_gather_with_optimizer_step is not supported with the MXFP8 "
+                "parameter all-gather through the grad buffer (--fp8-param-gather with mxfp8)."
             )
 
         if self.optimizer_cuda_graph:
@@ -505,10 +561,25 @@ class OptimizerConfig:
         # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
         # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
         # value it will produce, not only the pre-finalize flag.
-        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
-            self.optimizer not in ('sgd', 'adam')
-            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
-        )
+        will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
+
+        if self.second_order_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
+            raise ValueError(
+                "second_order_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
+                f"got {self.second_order_optimizer_grad_collective!r}."
+            )
+        if self.second_order_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
+            raise ValueError(
+                "second_order_optimizer_grad_collective='all-reduce' applies to second-order "
+                "optimizers (e.g. Muon) with use_distributed_optimizer=True; got "
+                f"optimizer={self.optimizer!r}, "
+                f"use_distributed_optimizer={self.use_distributed_optimizer}."
+            )
+
+        if self.muon_split_qkv_per_head and not self.muon_split_qkv:
+            raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True.")
+        if self.muon_split_mla_qkv and not self.muon_split_qkv:
+            raise ValueError("muon_split_mla_qkv requires muon_split_qkv=True.")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
@@ -614,9 +685,8 @@ class OptimizerConfig:
             # param-gather overlap, so accept either form.
             assert (
                 self.use_distributed_optimizer
-                or self.use_layer_wise_distributed_optimizer
+                or self.uses_layer_wise_distributed_optimizer()
                 or ddp_config.use_megatron_fsdp
-                or self.optimizer == 'dist_muon'
             ), (
                 '--overlap-param-gather only supported with distributed optimizer, '
                 'megatron fsdp, or dist_muon'
@@ -636,14 +706,18 @@ class OptimizerConfig:
                 'distributed checkpointing yet'
             )
 
+        if ckpt_format == "torch" and self.uses_layer_wise_distributed_optimizer():
+            raise ValueError(
+                "--ckpt-format torch does not save the state of the DistributedOptimizer that the "
+                "LayerWise layouts chain next to the layer-wise optimizer. Use "
+                "--ckpt-format torch_dist."
+            )
+
     def validate_model(
         self, *, moe_single_grouped_weight: bool, virtual_pipeline_model_parallel_size: int | None
     ) -> None:
         """Check model-dependent constraints at the native or legacy model boundary."""
-        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
-            self.optimizer not in ('sgd', 'adam')
-            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
-        )
+        will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
         assert not (will_be_layer_wise and moe_single_grouped_weight), (
             "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
             "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
@@ -655,6 +729,16 @@ class OptimizerConfig:
                 '--overlap-param-gather-with-optimizer-step only supported with '
                 'interleaved pipeline parallelism'
             )
+
+    def uses_layer_wise_distributed_optimizer(self) -> bool:
+        """Whether this config runs as LayerWiseDistributedOptimizer, before or after
+        :meth:`finalize_optimizer_config` (see :func:`resolve_layer_wise_distributed_optimizer`).
+        """
+        return resolve_layer_wise_distributed_optimizer(
+            self.optimizer,
+            self.use_distributed_optimizer,
+            self.use_layer_wise_distributed_optimizer,
+        )[1]
 
     @property
     def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
@@ -698,15 +782,18 @@ class OptimizerConfig:
         if self.use_precision_aware_optimizer and not is_te_min_version("2.1.0"):
             self.store_param_remainders = False
 
-        # emerging optimizer check
-        if self.optimizer not in ('sgd', 'adam'):
-            if self.optimizer == 'dist_muon':
-                self.optimizer = 'muon'
-                self.use_layer_wise_distributed_optimizer = True
-
-            if self.use_distributed_optimizer:
-                self.use_layer_wise_distributed_optimizer = True
-                self.use_distributed_optimizer = False
+        # Canonical optimizer intent: e.g. muon + use_distributed_optimizer (or the deprecated
+        # dist_muon) becomes muon + use_layer_wise_distributed_optimizer. The layer-wise
+        # optimizer, not the standard DistributedOptimizer, then owns the sharding.
+        self.optimizer, self.use_layer_wise_distributed_optimizer = (
+            resolve_layer_wise_distributed_optimizer(
+                self.optimizer,
+                self.use_distributed_optimizer,
+                self.use_layer_wise_distributed_optimizer,
+            )
+        )
+        if self.use_layer_wise_distributed_optimizer:
+            self.use_distributed_optimizer = False
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

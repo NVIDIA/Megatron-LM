@@ -320,11 +320,48 @@ def test_legacy_checkpoint_gloo_requirement_follows_optimizer_kind(run_config, o
         with pytest.raises(AssertionError):
             run_config.validate()
     else:
-        run_config.validate()
-        # Validation accepts the future layer-wise path without resolving it in place.
+        # The gloo rule lets the future layer-wise path through; the optimizer section then
+        # rejects the legacy torch format, which does not save the layer-wise state.
+        with pytest.raises(ValueError, match="--ckpt-format torch does not save"):
+            run_config.validate()
+        # Validation does not resolve the layer-wise path in place.
         assert run_config.optimizer.optimizer == optimizer
         assert run_config.optimizer.use_distributed_optimizer is True
         assert run_config.optimizer.use_layer_wise_distributed_optimizer is False
+
+
+@pytest.mark.parametrize(
+    "optimizer, convert_format, save_optim, skip_train, rejected",
+    [
+        ("muon", "torch", True, False, True),
+        ("dist_muon", "torch", True, False, True),
+        # The sharded format saves the layer-wise state.
+        ("muon", "torch_dist", True, False, False),
+        # A model-only conversion, or one that builds no optimizer, saves no optimizer state.
+        ("muon", "torch", False, False, False),
+        ("muon", "torch", True, True, False),
+        # The standard DistributedOptimizer keeps its legacy parameter-state save.
+        ("adam", "torch", True, False, False),
+    ],
+)
+def test_torch_conversion_rejects_saving_layer_wise_optimizer_state(
+    run_config, optimizer, convert_format, save_optim, skip_train, rejected
+):
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.checkpoint = CheckpointConfig(
+        load="/ckpt",
+        ckpt_convert_format=convert_format,
+        ckpt_convert_save="/converted",
+        save_optim=save_optim,
+    )
+    run_config.validation.skip_train = skip_train
+
+    if rejected:
+        with pytest.raises(ValueError, match="--ckpt-convert-format torch does not save"):
+            run_config.validate()
+    else:
+        run_config.validate()
 
 
 def test_inference_container_checks_the_format_against_dist_only():
