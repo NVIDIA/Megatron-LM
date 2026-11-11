@@ -214,6 +214,27 @@ _TOPK_OOB_LANE_GUARD_FE_VERSION = (1, 29)
 # columns among copies of the cutoff key). Older frontends have no such parameter.
 _TOPK_TIE_BREAK_FE_VERSION = (1, 31)
 _TOPK_LOWEST_INDEX_TIE_BREAK = 1
+# cuDNN radix top-k (frontends 1.29 and 1.31) reads a row as a scalar prologue up to the next
+# 32-byte boundary, a vectorized body and a scalar tail, without clamping the prologue to the
+# row's length. A row longer than top_k but shorter than its prologue (at most 32 bytes / score
+# size - 1 elements, set by the row's address) is selected from a corrupt set: every in-row id
+# twice, plus columns past its length, in the next row, or before its start (wrapped to uint16
+# ids 655xx). Such a row has at most 32 / score size - 2 elements, so it exists only for
+# top_k <= 32 / score size - 3: 5 for FP32 scores, 13 for BF16 (both measured on SM90 and SM100,
+# with and without tie_break). Rows of every other length come out right.
+_CUDNN_TOPK_VECTOR_BYTES = 32
+
+
+def _cudnn_topk_min_reliable_k(dtype: torch.dtype) -> int:
+    """Smallest ``top_k`` for which cuDNN radix top-k is right on every row (FP32 6, BF16 14).
+
+    Below it, the rows the kernel can get wrong are those longer than ``top_k`` and at most
+    this many elements long (:func:`_indexer_top_k_wrapper_chunked` selects them in PyTorch).
+    """
+    element_size = torch.empty((), dtype=dtype).element_size()
+    return _CUDNN_TOPK_VECTOR_BYTES // element_size - 2
+
+
 _NAMED_PARAMETER_CACHE: dict[int, tuple[object, frozenset]] = {}
 _CLEAN_LOGITS_UNAVAILABLE_LOGGED = False
 
@@ -940,6 +961,115 @@ def _supports_lowest_index_topk_tie_break() -> bool:
     )
 
 
+_SHORT_ROWS_PATH_LOGGED: set = set()
+
+
+def _log_short_rows_path_once(topk_k: int, dtype: torch.dtype) -> None:
+    """Log once per K and score dtype that short rows of a small-K top-k run in PyTorch."""
+    key = (topk_k, dtype)
+    if key in _SHORT_ROWS_PATH_LOGGED:
+        return
+    _SHORT_ROWS_PATH_LOGGED.add(key)
+    logging.getLogger(__name__).info(
+        "DSA top-k with K=%d on %s scores: rows of %d to %d keys are selected in PyTorch "
+        "(cuDNN radix top-k returns duplicate or out-of-row ids on them).",
+        topk_k,
+        dtype,
+        topk_k + 1,
+        _cudnn_topk_min_reliable_k(dtype),
+    )
+
+
+def _exact_small_topk(
+    scores_flat: Tensor, seq_lens: Tensor, *, topk_k: int, return_topk_scores: bool
+) -> dict:
+    """Top-k of the rows' in-row scores in PyTorch, for the rows cuDNN's kernel gets wrong.
+
+    See :func:`_cudnn_topk_min_reliable_k` and :func:`_select_short_rows_exactly`.
+
+    Returns what :func:`_canonicalize_deterministic_topk_membership` returns for a raw result
+    holding a true top-K of each row's selectable in-row scores (not NaN, not ``-inf``): the
+    ``min(K, selectable count)`` best, cutoff ties by ascending index, ``-1`` indices and
+    ``finfo.min`` values in the unused slots. That is the deterministic contract, so it also
+    serves deterministic mode, and it is a valid top-k for the non-deterministic one (whose
+    order and tie choice are unspecified). Unlike the radix kernel, a NaN never takes a slot.
+
+    Row chunks bound the full-width temporaries (masked scores and the canonicalization's
+    masks and prefix ranks) to ``_DETERMINISTIC_TOPK_REPAIR_MAX_BYTES``. Shapes are fixed
+    and nothing synchronizes with the host, so it stays CUDA Graph capturable.
+    """
+    n_rows, sk = scores_flat.shape
+    device = scores_flat.device
+    bytes_per_row = sk * (scores_flat.element_size() + 16) + 40 * topk_k
+    chunk_rows = _bytes_to_chunk_rows(
+        n_rows, bytes_per_row, _DETERMINISTIC_TOPK_REPAIR_MAX_BYTES, alignment=1
+    )
+    indices = torch.empty((n_rows, topk_k), dtype=torch.int32, device=device)
+    values = (
+        torch.empty((n_rows, topk_k), dtype=scores_flat.dtype, device=device)
+        if return_topk_scores
+        else None
+    )
+    columns = torch.arange(sk, device=device, dtype=torch.int64).view(1, sk)
+    for row_start in range(0, n_rows, max(1, chunk_rows)):
+        row_end = min(row_start + chunk_rows, n_rows)
+        scores = scores_flat[row_start:row_end]
+        lens = seq_lens[row_start:row_end]
+        in_row = columns < lens.to(torch.int64).clamp(min=0, max=sk).view(-1, 1)
+        candidates = torch.where(
+            in_row & _selectable_topk_scores(scores), scores, torch.full_like(scores, float("-inf"))
+        )
+        top_values, top_indices = torch.topk(candidates, topk_k, dim=1)
+        raw_indices = torch.where(
+            top_values > float("-inf"), top_indices, torch.full_like(top_indices, -1)
+        ).to(torch.int32)
+        del candidates, top_values, top_indices
+        result = _canonicalize_deterministic_topk_membership(
+            scores.contiguous(),
+            lens.contiguous(),
+            raw_indices,
+            topk_k=topk_k,
+            return_topk_scores=return_topk_scores,
+        )
+        indices[row_start:row_end].copy_(result["indices"])
+        if return_topk_scores:
+            values[row_start:row_end].copy_(result["values"])
+    return {"indices": indices, "values": values}
+
+
+def _select_short_rows_exactly(
+    result: dict,
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    short_rows: Optional[Tensor],
+    *,
+    topk_k: int,
+    return_topk_scores: bool,
+) -> dict:
+    """Replace the ``short_rows`` of a cuDNN top-k result by :func:`_exact_small_topk`.
+
+    The kernel saw those rows with length 0 (all ``-1``); they hold at most
+    :func:`_cudnn_topk_min_reliable_k` elements, so they are selected from that many leading
+    columns, which costs ``rows x 14`` elements at most.
+    """
+    if short_rows is None:
+        return result
+    n_rows, sk = scores_flat.shape
+    width = min(sk, _cudnn_topk_min_reliable_k(scores_flat.dtype))
+    exact = _exact_small_topk(
+        scores_flat[:, :width],
+        seq_lens.clamp(max=width),
+        topk_k=topk_k,
+        return_topk_scores=return_topk_scores,
+    )
+    rows = short_rows.view(n_rows, 1)
+    indices = torch.where(rows, exact["indices"], result["indices"].reshape(n_rows, topk_k))
+    values = None
+    if return_topk_scores:
+        values = torch.where(rows, exact["values"], result["values"].reshape(n_rows, topk_k))
+    return {"indices": indices, "values": values}
+
+
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor,
     seq_lens: Tensor,
@@ -963,8 +1093,33 @@ def _indexer_top_k_wrapper_chunked(
     and deterministic selection (the dense fallback row-chunks under its own 1 GiB score
     budget when only top-k is needed), so neither this scratch budget nor the ``tie_break``
     path applies to them.
+
+    Below :func:`_cudnn_topk_min_reliable_k` of the scores' dtype (``topk_k`` < 6 for FP32,
+    < 14 for BF16), the radix kernel gets rows longer than ``topk_k`` but at most that many
+    elements long wrong. Those rows reach it with length 0 and are selected by
+    :func:`_exact_small_topk` (:func:`_select_short_rows_exactly`), which returns the
+    deterministic canonical result for them in either mode; every other row is the kernel's.
     """
     n_rows, sk = scores_flat.shape
+    all_seq_lens, short_rows = seq_lens, None
+    reliable_k = _cudnn_topk_min_reliable_k(scores_flat.dtype)
+    if topk_k < reliable_k:
+        # Rows the kernel can get wrong at this K: length 0 takes its trivial branch, which
+        # reads nothing; _select_short_rows_exactly selects them afterwards.
+        short_rows = (seq_lens > topk_k) & (seq_lens <= reliable_k)
+        seq_lens = torch.where(short_rows, torch.zeros_like(seq_lens), seq_lens).contiguous()
+        _log_short_rows_path_once(topk_k, scores_flat.dtype)
+
+    def finish(result: dict) -> dict:
+        return _select_short_rows_exactly(
+            result,
+            scores_flat,
+            all_seq_lens,
+            short_rows,
+            topk_k=topk_k,
+            return_topk_scores=return_topk_scores,
+        )
+
     chunk_rows = _topk_wrapper_chunk_rows(
         n_rows, sk, scores_flat.element_size(), max_scratch_bytes=topk_scratch_bytes
     )
@@ -1019,7 +1174,7 @@ def _indexer_top_k_wrapper_chunked(
         return result
 
     if chunk_rows >= n_rows:
-        return run_chunk(scores_flat, seq_lens)
+        return finish(run_chunk(scores_flat, seq_lens))
 
     # Each chunk's result is copied into outputs allocated before the first launch and dropped
     # before the next one. The frontend allocates a launch's outputs before its scratch, so a
@@ -1045,7 +1200,7 @@ def _indexer_top_k_wrapper_chunked(
             _copy_topk_chunk(values[row_start:row_end], tk_result["values"], "values")
         del tk_result
 
-    return {"indices": indices, "values": values}
+    return finish({"indices": indices, "values": values})
 
 
 def _copy_topk_chunk(destination: Tensor, chunk: Tensor, name: str) -> None:

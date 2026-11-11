@@ -95,8 +95,39 @@ def _forward(
     return out
 
 
+def trust_stand_in_top_k_for_any_k(monkeypatch):
+    """Hand a test's own stand-in top-k every row, as if the real kernel were right for every K.
+
+    Below ``_cudnn_topk_min_reliable_k`` the wrapper gives the kernel its short rows with
+    length 0 and selects them in PyTorch. Tests of the call plumbing and of the post-processing
+    of raw top-k output (lengths, chunks, ``return_val``, crafted raw ids, deterministic repair)
+    that run small K on CPU stand-ins call this so the stand-in still sees and decides every
+    row. The guard itself is covered by ``test_dsa_cudnn_topk_small_k.py`` and its GPU
+    counterpart.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_topk_min_reliable_k", lambda dtype: 1)
+
+
 def indexer_top_k_wrapper(input_values, seq_lens, top_k, next_n=1, return_val=True, **_unused):
-    """Row-local top-k that never reads past each row's ``seq_len``."""
+    """Row-local top-k that never reads past each row's ``seq_len``.
+
+    Below ``_cudnn_topk_min_reliable_k`` of the scores' dtype the real radix kernel returns
+    duplicate and out-of-row ids (it does not raise) on rows longer than ``top_k`` and at most
+    that many elements long; MCore must not hand it such a row, so this stand-in refuses them.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    reliable_k = dsa_cudnn_kernels._cudnn_topk_min_reliable_k(input_values.dtype)
+    if top_k < reliable_k:
+        lengths = seq_lens.to(torch.int64)
+        exposed = (lengths > top_k) & (lengths <= reliable_k)
+        if bool(exposed.any()):
+            raise ValueError(
+                f"top_k={top_k} on {input_values.dtype} scores reached the cuDNN radix top-k "
+                f"with rows of {sorted(set(lengths[exposed].tolist()))} keys, which it gets wrong"
+            )
     del next_n
     n_rows, n_cols = input_values.shape
     cols = torch.arange(n_cols).view(1, n_cols)

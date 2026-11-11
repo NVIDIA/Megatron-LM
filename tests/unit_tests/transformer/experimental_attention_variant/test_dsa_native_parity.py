@@ -17,6 +17,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_masking,
 )
 from megatron.core.utils import accepts_parameter
+from tests.unit_tests.transformer.experimental_attention_variant import dsa_cudnn_fe_fakes as fakes
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
 )
@@ -407,6 +408,7 @@ def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     q = torch.ones((1, 2, 1, 1))
     k = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
@@ -455,6 +457,7 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda b, sq, sk: 2)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
@@ -492,6 +495,7 @@ def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -591,6 +595,7 @@ def test_cudnn_topk_wrapper_rebuilds_membership_in_deterministic_mode(
             return {"indices": raw_indices.clone(), "values": values if return_val else None}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
@@ -622,6 +627,7 @@ def test_cudnn_topk_wrapper_preserves_raw_membership_outside_deterministic_mode(
             return raw_result
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
@@ -644,6 +650,7 @@ def test_cudnn_topk_wrapper_honors_explicit_deterministic_request(monkeypatch):
             return {"indices": raw_indices.clone(), "values": values if return_val else None}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
@@ -686,6 +693,7 @@ def test_cudnn_deterministic_topk_chunking_matches_single_chunk(monkeypatch):
             }
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     # One row of int32 scratch: 2 x 8 columns x 4 bytes.
     monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 64)
@@ -772,6 +780,7 @@ def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkey
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -807,6 +816,7 @@ def test_cudnn_indexer_topk_nonlocal_varlen_ends_avoid_global_score_rows(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -843,6 +853,7 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -916,6 +927,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     query_positions = torch.tensor([0, 1, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23])
     starts = torch.tensor([0] * 4 + [8] * 8)
@@ -1006,6 +1018,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     q = torch.ones((1, 8, 1, 1))
     k = torch.ones((1, 8, 1))
@@ -1441,6 +1454,7 @@ def test_cudnn_indexer_topk_incompatible_packed_boundaries_fall_back(monkeypatch
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(
         dsa_cudnn_kernels,
         "_indexer_topk_packed_thd",
@@ -1805,6 +1819,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 4, 1, 1)),
@@ -1952,6 +1967,7 @@ def test_cudnn_indexer_topk_indices_only_filters_masked_varlen_scores(monkeypatc
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -1995,6 +2011,7 @@ def test_cudnn_indexer_topk_indices_only_compacts_invalid_prefix_entries(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -2031,6 +2048,7 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -2078,6 +2096,7 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -2114,6 +2133,7 @@ def test_cudnn_indexer_topk_scores_reapply_varlen_bounds(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -2527,6 +2547,7 @@ def test_cudnn_indexer_topk_scores_local_varlen_keeps_compact_query_rows(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 1, 1, 1)),
