@@ -4,7 +4,6 @@
 
 import contextlib
 import copy
-import inspect
 import os
 import random
 import re
@@ -1104,28 +1103,14 @@ def save_checkpoint(
 
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
-                _cpu_shm = checkpoint.async_ckpt_use_cpu_shm
-                _writer_kwargs = {}
-                if _cpu_shm:
-                    if (
-                        'use_cpu_shm_for_gpu_tensors'
-                        in inspect.signature(FileSystemWriterAsync.__init__).parameters
-                    ):
-                        _writer_kwargs['use_cpu_shm_for_gpu_tensors'] = True
-                    else:
-                        raise AssertionError(
-                            'Installed nvidia-resiliency-ext does not support '
-                            'use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext '
-                            'to use --async-ckpt-use-cpu-shm.'
-                        )
                 fs_storage_writer = FileSystemWriterAsync(
                     checkpoint_name,
                     thread_count=checkpoint.dist_ckpt_workers,
                     use_msc=MultiStorageClientFeature.is_enabled(),
-                    **_writer_kwargs,
+                    use_cpu_shm_for_gpu_tensors=checkpoint.async_ckpt_use_cpu_shm,
                 )
 
-                save_state_dict_ret = save_state_dict_async_plan(
+                pending_save = save_state_dict_async_plan(
                     state_dict,
                     fs_storage_writer,
                     None,
@@ -1134,7 +1119,7 @@ def save_checkpoint(
                     enable_cache=checkpoint.ckpt_assume_constant_structure,
                 )
                 async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret
+                    fs_storage_writer, pending_save
                 )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
