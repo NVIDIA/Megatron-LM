@@ -185,4 +185,4 @@ class TestLearnableSoftmaxOffsetGradNorm:
         norm = optimizer.clip_grad_norm(1.0)
 
         assert float(norm) == pytest.approx(5.0)
-        torch.testing.assert_close(param.grad, torch.full_like(param, gradient / (5.0 + 1e-6)))
+        torch.testing.assert_close(param.grad, torch.full_like(param, gradient / 5.0))
