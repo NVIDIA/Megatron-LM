@@ -229,7 +229,7 @@ def main():
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     # Set up model and load checkpoint
