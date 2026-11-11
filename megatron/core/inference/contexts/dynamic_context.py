@@ -699,12 +699,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         mamba_max_requests = float('inf')
         # Handoff may retain every request-owned recurrent-state slot after the requests leave
-        # the batch. An idle EP rank must still run a dummy forward to join its peers' expert
+        # the batch. An idle rank must still run a dummy forward to join its tp_ep peers'
         # collectives, so disaggregated callers can reserve one slot outside request capacity.
+        # The engine's work consensus runs over the tp_ep group (ETP x EP), so a dummy forward
+        # can happen whenever that group has more than one rank, including TP > 1 with EP = 1.
         self.reserve_recurrent_state_dummy_slot = bool(
             self.is_hybrid_model
             and inference_config.reserve_recurrent_state_dummy_slot
-            and model_config.expert_model_parallel_size > 1
+            and model_config.expert_tensor_parallel_size * model_config.expert_model_parallel_size
+            > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
         # Set by setup_kv_transfer. Disaggregated handoffs can hold recurrent-state
@@ -745,7 +748,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
             assert mamba_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests "
-                f"plus {reserved_mamba_slots} reserved EP dummy slot(s). "
+                f"plus {reserved_mamba_slots} reserved tp_ep dummy slot(s). "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
