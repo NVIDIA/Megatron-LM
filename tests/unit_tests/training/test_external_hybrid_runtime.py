@@ -125,7 +125,7 @@ def test_config_lists_preserve_existing_pattern_flops(symbol, spec):
         qk_pos_emb_head_dim=2,
         v_head_dim=4,
         num_moe_experts=4 if symbol == "E" else None,
-        moe_ffn_hidden_size=24,
+        moe_ffn_hidden_size=24 if symbol == "E" else None,
         moe_router_topk=2,
         mamba_state_dim=4,
         mamba_head_dim=8,
