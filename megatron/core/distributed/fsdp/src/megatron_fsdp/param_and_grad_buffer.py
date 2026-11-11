@@ -162,6 +162,17 @@ def _free_storage(tensor: torch.Tensor):
                 tensor._typed_storage()._resize_(0)
 
 
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device) -> None:
+    """Replace ``module``'s own meta parameters and buffers with uninitialized tensors on
+    ``device``, leaving its tensors that are already on a device unchanged.
+    """
+
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(tensor, device=device) if tensor.is_meta else tensor
+
+    module._apply(materialize, recurse=False)
+
+
 TensorItemIndex = namedtuple(
     "TensorItemIndex", ["global_data_index", "size", "item_id", "bucket_id", "shape"]
 )
@@ -1272,6 +1283,8 @@ class DataParallelBuffer:
         self.temporary_bucket_allocator = (
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
+        # Stream that allocated the temporary bucket, if one is allocated.
+        self.bucket_allocation_stream = None
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
@@ -1428,6 +1441,8 @@ class DataParallelBuffer:
             dtype = self.dtype
         if device is None:
             device = self.device
+        if self.bucket_allocation_stream is None:
+            self.bucket_allocation_stream = torch.cuda.current_stream()
         # Allocate temporary storage using standardized sizes.
         alloc_size = self.shard_bucket_index.size if shard else self.bucket_index.size
         bucket = self.temporary_bucket_allocator.allocate(
@@ -1452,6 +1467,7 @@ class DataParallelBuffer:
         Release the storage of a temporarily-allocated communication bucket.
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
+        self.bucket_allocation_stream = None
 
     def reset_param_main_grad(self):
         """
@@ -3027,7 +3043,7 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            _materialize_meta_tensors(m, self.device)
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
@@ -4489,6 +4505,18 @@ class GradReducePipeline:
                     # Empty the set of parameters that are ready for gradient reduction.
                     self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
+                    # The allocating stream can differ from the current one under the 1F1B
+                    # overlap schedule, which runs some gradient hooks on its communication
+                    # stream. PyTorch's caching allocator, which backs the temporary bucket,
+                    # lets the allocating stream reuse the memory as soon as it is freed, so
+                    # that stream must wait for the reduce-scatter first, or it could
+                    # overwrite the bucket while the reduce-scatter still reads it.
+                    allocation_stream = gbuf.bucket_allocation_stream
+                    if (
+                        allocation_stream is not None
+                        and allocation_stream != torch.cuda.current_stream()
+                    ):
+                        allocation_stream.wait_event(reduce_scatter_view_out_event)
                     # Free the memory backing the temporarily-allocated communication
                     # bucket associated with this buffer. Only exists for sharded
                     # gradient buffers, or if a custom gradient data-type is used!
@@ -4548,6 +4576,8 @@ class AllGatherPipeline:
         self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
         # One DP-Outer event may be shared by all buckets in a coalesced group.
         self.outer_bucket_ready_events: Dict[Tuple[int, bool], torch.cuda.Event] = {}
+        # Buckets whose row-wise weights are re-gathered by activation recompute in backward.
+        self.recompute_buckets: set = set()
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4854,6 +4884,7 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
+        recompute: bool = False,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4870,10 +4901,72 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
+            recompute (bool, optional): Whether this is a row-wise (`bwd=False`) gather for
+                the forward that activation recompute re-runs during the backward pass. The
+                gathered buckets that have a transpose buffer are recorded, and later backward
+                gathers also gather the row-wise weights of recorded buckets in their window.
         """
+        assert not (bwd and recompute), "Recompute gathers are row-wise (bwd=False)."
         if len(params) == 0:
             return
 
+        gather_kwargs = dict(
+            prefetch_order=prefetch_order,
+            suggested_AG_prefetch_size=suggested_AG_prefetch_size,
+            async_param_gather=async_param_gather,
+            outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+        )
+        window = self._all_gather_bucket_window(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        if recompute:
+            self._record_recompute_buckets(window)
+        elif bwd:
+            self._gather_recompute_buckets(window, gather_kwargs)
+
+    def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
+        """Record the buckets whose row-wise weights a recomputed forward re-gathered.
+        Buckets without a transpose buffer use the same weights in forward and backward.
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            return
+        parameter_groups = self.buffer.parameter_groups
+        self.recompute_buckets.update(
+            bucket_id
+            for bucket_id in bucket_ids
+            if parameter_groups[bucket_id].transpose_weight_buffer is not None
+        )
+
+    def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
+        """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
+        not already gathered, so that their recomputed forward does not wait on them."""
+        pending = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.recompute_buckets
+            and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
+        ]
+        if not pending:
+            return
+        params = [
+            param
+            for bucket_id in pending
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        self._all_gather_bucket_window(params, prefetch=False, bwd=False, **gather_kwargs)
+
+    def _all_gather_bucket_window(
+        self,
+        params: List[torch.Tensor],
+        prefetch: bool = False,
+        prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_AG_prefetch_size: Optional[int] = None,
+        async_param_gather: bool = True,
+        outer_fsdp_group_param_gather: bool = False,
+        bwd: bool = False,
+    ) -> List[int]:
+        """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
+        them, as described in `all_gather_params`. Return all of these bucket IDs, including
+        those that were already gathered."""
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
@@ -4935,6 +5028,7 @@ class AllGatherPipeline:
         if outer_ag_buckets:
             self._launch_outer_prefetches(outer_ag_buckets, bwd)
 
+        extended_buckets = ag_buckets
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
         ag_buckets = [
@@ -4944,7 +5038,7 @@ class AllGatherPipeline:
             in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
-            return
+            return extended_buckets
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
@@ -4994,6 +5088,8 @@ class AllGatherPipeline:
         if not async_param_gather:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
+
+        return extended_buckets
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
         """Wait for the bucket to be ready."""

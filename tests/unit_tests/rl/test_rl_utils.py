@@ -6,6 +6,7 @@ import itertools
 import math
 import tempfile
 import traceback
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -19,6 +20,8 @@ import torch.multiprocessing as mp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -48,7 +51,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_pg_size
-from megatron.rl import rl_utils
+from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
@@ -57,7 +60,9 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.callbacks import CallbackContext
 from megatron.training.config import RLConfig
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
 from megatron.training.training import _pop_samples_seen
@@ -98,6 +103,165 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
     )
     with rl_utils.inference_model_alloc_context():
         pass
+
+
+@pytest.mark.parametrize(
+    "skip_train, rollout_only, optimizer",
+    [
+        (False, False, "optimizer"),
+        (False, True, "optimizer"),
+        (False, True, None),  # --rl-rollout-only --no-load-optim still builds the GRPO state
+        (True, False, None),
+    ],
+)
+def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
+    """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
+    loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
+    the run eval-only."""
+    calls = []
+    args = SimpleNamespace()
+    run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
+    monkeypatch.setattr(training_setup, "get_args", lambda: args)
+    monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
+    monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(
+        training_setup,
+        "build_rl_inference_model",
+        lambda *a: calls.append(("inference", a)) or "inference_model",
+    )
+    monkeypatch.setattr(
+        training_setup,
+        "load_reference_state_dict",
+        lambda *a, **k: calls.append(("ref", a, k)) or {"w": 1},
+    )
+    monkeypatch.setattr(
+        training_setup,
+        "reinitialize_grpo_microbatch_calculator",
+        lambda *a: calls.append(("mb", a)),
+    )
+    cfg = RLConfig(rl_rollout_only=rollout_only)
+    callback = training_setup.RLSetupCallback(cfg, model_provider="provider", model_type="type")
+
+    callback.on_data_init_start(
+        CallbackContext(model=["chunk"], optimizer=optimizer, checkpointing_context={"ckpt": 1})
+    )
+
+    loop_runs = not skip_train
+    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    if loop_runs:
+        expected += [
+            ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),
+            ("mb", (args, 4)),
+        ]
+    assert calls == expected
+    assert (callback.model, callback.optimizer) == (["chunk"], optimizer)
+    assert callback.inference_model == "inference_model"
+    assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
+
+
+@pytest.mark.parametrize(
+    "optimizer, packing, correction, offload",
+    [(None, True, False, True), ("optimizer", False, True, False)],
+)
+def test_next_rollout_iterator_forwards_the_grpo_schedule(
+    monkeypatch, optimizer, packing, correction, offload
+):
+    """The data hook rebuilds rollouts through get_grpo_data_iterator with the section's knobs,
+    the current iterator as the buffer and grad disabled; the CUDA cache is released only when
+    the run has no optimizer (--rl-rollout-only --no-load-optim)."""
+    seen = {}
+
+    def grpo_iterator(model, inference_model, opt, iteration, ref, **kwargs):
+        seen.update(kwargs, head=(model, inference_model, opt, iteration, ref))
+        seen["grad_enabled"] = torch.is_grad_enabled()
+        return "iterator"
+
+    empty_cache = MagicMock()
+    monkeypatch.setattr(rl_utils, "get_grpo_data_iterator", grpo_iterator)
+    monkeypatch.setattr(rl_utils.torch.cuda, "empty_cache", empty_cache)
+    rl_config = RLConfig(
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        rl_use_sequence_packing=packing,
+        rl_inference_logprobs_is_correction=correction,
+        rl_offload_optimizer_during_inference=offload,
+    )
+
+    result = rl_utils.next_rollout_iterator(
+        7,
+        "buffer",
+        model=["model"],
+        inference_model=None,
+        optimizer=optimizer,
+        ref_state_dict={"ref": 1},
+        rl_config=rl_config,
+        train_config=SimpleNamespace(global_batch_size=12),
+    )
+
+    assert result == "iterator"
+    assert seen == dict(
+        head=(["model"], None, optimizer, 7, {"ref": 1}),
+        grad_enabled=False,
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        global_batch_size=12,
+        sequence_packing=packing,
+        buffered_rollouts="buffer",
+        is_correction=correction,
+        optimizer_is_on_cpu=offload,
+    )
+    assert empty_cache.called is (optimizer is None)
+
+
+@pytest.mark.parametrize("separate", [False, True])
+def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
+    """With a separate inference model the eval hook prefetches its weights and refits them from
+    the training model before scoring, then scores the inference model with the training model
+    attached; without one it scores the training model as-is."""
+    calls = []
+    inf_core = object()
+    monkeypatch.setattr(rl_utils, "get_args", lambda: "args")
+    monkeypatch.setattr(
+        rl_utils, "unwrap_model", lambda chunk: calls.append(("unwrap", chunk)) or inf_core
+    )
+    monkeypatch.setattr(
+        rl_utils,
+        "_maybe_prefetch_separate_inference_model_weights",
+        lambda core, *, to_cpu: calls.append(("prefetch", core, to_cpu)),
+    )
+    monkeypatch.setattr(
+        rl_utils, "refit_inference_model", lambda m, im, a: calls.append(("refit", m, im, a))
+    )
+
+    def evaluate(*args, **kwargs):
+        # The positional tail is (model, optimizer, iteration); anything before it is not contract.
+        calls.append(("eval", args[-3:], kwargs))
+
+    monkeypatch.setattr(rl_utils, "evaluate_and_print_results_rl", evaluate)
+
+    rl_utils.evaluate_rollouts(
+        model=["train"],
+        inference_model=["inf"] if separate else None,
+        optimizer="optimizer",
+        prefix="iteration 3 on validation set",
+        iteration=3,
+        verbose=True,
+        write_to_tensorboard=False,
+    )
+
+    eval_kwargs = {"write_to_tensorboard": False, "training_model": ["train"] if separate else None}
+    if separate:
+        assert calls == [
+            ("unwrap", "inf"),
+            ("prefetch", inf_core, False),
+            ("refit", ["train"], ["inf"], "args"),
+            ("eval", (["inf"], "optimizer", 3), eval_kwargs),
+        ]
+    else:
+        assert calls == [("eval", (["train"], "optimizer", 3), eval_kwargs)]
 
 
 class MockModel(LanguageModule):
@@ -361,7 +525,6 @@ class TestRLUtils:
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
         args.num_attention_heads = 8
-        args.vocab_size = VOCAB
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256
@@ -374,7 +537,9 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -691,8 +856,17 @@ class TestRLUtils:
         [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    @pytest.mark.parametrize("has_optimizer", [False, True], ids=["no-optimizer", "optimizer"])
+    @pytest.mark.parametrize("separate_training_model", [False, True])
+    @pytest.mark.parametrize("initialize_model_parallel", [(1, 1)], indirect=True)
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts
+        self,
+        monkeypatch,
+        initialize_model_parallel,
+        share_config,
+        num_experts,
+        has_optimizer,
+        separate_training_model,
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -709,7 +883,24 @@ class TestRLUtils:
             )
         )
         lang_module = DummyLangModule(layer_config)
+        lang_module.rotary_pos_emb = RotaryEmbedding(32, 1.0)
         model = [SimpleNamespace(config=config, module=lang_module)]
+        training_lang_module = lang_module
+        training_model = None
+        if separate_training_model:
+            training_lang_module = DummyLangModule(config)
+            training_lang_module.rotary_pos_emb = YarnRotaryEmbedding(32, 1.0)
+            training_model = [SimpleNamespace(module=training_lang_module)]
+
+        def cached_embedding_refs():
+            refs = []
+            for module in (lang_module, training_lang_module):
+                embedding = module.rotary_pos_emb(16)
+                refs.append(
+                    weakref.ref(embedding[0] if isinstance(embedding, tuple) else embedding)
+                )
+            return refs
+
         args = SimpleNamespace(
             num_experts=num_experts,
             cuda_graph_impl="local",
@@ -722,13 +913,21 @@ class TestRLUtils:
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
-        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+        # --rl-rollout-only --no-load-optim runs the loop with no optimizer: no param sync.
+        optimizer = MagicMock() if has_optimizer else None
+        training_refs = cached_embedding_refs()
+        with rl_utils.megatron_rl_inference_mode(
+            model, optimizer, "local", False, training_model=training_model
+        ) as result:
             assert result is interface
+            assert all(ref() is None for ref in training_refs)
+            generation_refs = cached_embedding_refs()
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
                 assert current_config.cuda_graph_modules == []
                 assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
+        assert all(ref() is None for ref in generation_refs)
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),
             call(lang_module, "none"),
@@ -749,25 +948,20 @@ class TestRLUtils:
             assert current_config.cuda_graph_modules == expected_modules
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
-        lang_module.train.assert_called_once()
+        training_lang_module.train.assert_called_once()
+        if separate_training_model:
+            lang_module.train.assert_not_called()
+        if has_optimizer and not separate_training_model:
+            optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+        elif has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "do_train, skip_train, expect_train_branch",
-        [
-            pytest.param(True, False, True, id="training"),
-            pytest.param(True, True, True, id="inference_only"),
-            pytest.param(False, False, False, id="eval_only"),
-        ],
-    )
-    def test_evaluate_and_print_results_rl_wandb_step_handling(
-        self, monkeypatch, do_train, skip_train, expect_train_branch
-    ):
-        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
-        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
-        advancing iteration, so its evals log against the global step (see PR #6043)."""
-        args = SimpleNamespace(
-            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
-        )
+    @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
+    def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
+        """Only eval-only runs (--skip-train never enters the loop, so do_train=False) take the
+        decoupled eval_only/* wandb path; training and --rl-rollout-only runs log against the
+        global step (see PR #6043)."""
+        args = SimpleNamespace(world_size=1, cuda_graph_impl="none", seq_length=SEQ)
         train_state = TrainState(do_train=do_train)
         rl_config = RLConfig(
             rl_prompts_per_eval=1,
@@ -803,14 +997,10 @@ class TestRLUtils:
         )
 
         rl_utils.evaluate_and_print_results_rl(
-            data_iterator=None,
-            model=[MagicMock()],
-            optimizer=MagicMock(),
-            iteration=7,
-            write_to_tensorboard=False,
+            model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
-        if expect_train_branch:
+        if do_train:
             wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
             wandb_writer.define_metric.assert_not_called()
         else:
@@ -1161,7 +1351,7 @@ class TestRLUtils:
         not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
     )
     @pytest.mark.parametrize("packing", [False, True])
-    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+    def test_forward_step_reports_samples_seen(self, monkeypatch, run_config, packing):
         """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
         the sequences packed into the bin, or the batch size; the loop sums the reports."""
         with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
@@ -1186,18 +1376,9 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        monkeypatch.setattr(
-            train_rl,
-            "get_run_config",
-            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
-        )
-        monkeypatch.setattr(
-            train_rl,
-            "get_args",
-            lambda: SimpleNamespace(
-                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-            ),
-        )
+        run_config.rl.rl_use_sequence_packing = packing
+        run_config.rerun_state_machine.check_for_nan_in_loss = False
+        monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         if packing:
             seq_indices = [11, 12, 13, 14, 15]
             monkeypatch.setattr(

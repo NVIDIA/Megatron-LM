@@ -311,7 +311,7 @@ class TestMXFP8ReshardTransform:
     def test_flashinfer_moe_buffers_refresh_in_place(
         self, clamp_scale, rows, prepare_weights, monkeypatch
     ):
-        """Refit refreshes derived FlashInfer weights without changing graph addresses."""
+        """Refit updates FlashInfer weights in place without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
@@ -360,8 +360,10 @@ class TestMXFP8ReshardTransform:
         transform = MXFP8ReshardTransform(
             convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
         )
+        new_values = {}
         for name in buffers:
             new_data = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+            new_values[name] = new_data
             transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
             if clamp_scale is not None:
                 linear_name, expert_name = name.split(".")
@@ -376,14 +378,14 @@ class TestMXFP8ReshardTransform:
                     quantized.scale.view(torch.uint8),
                 )
 
-        # CUTLASS refits must be visible immediately, without restacking or refresh copies.
+        # Refits must be visible immediately, without restacking or refresh copies: CUTLASS
+        # shares the canonical storage and routed weights are written through.
         with monkeypatch.context() as patch:
-            if clamp_scale is not None:
 
-                def forbidden_stack(*args, **kwargs):
-                    pytest.fail("CUTLASS refit must not restack shared weights")
+            def forbidden_stack(*args, **kwargs):
+                pytest.fail("refit must not restack FlashInfer weights")
 
-                patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
+            patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
             assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is (
                 clamp_scale is None
             )
@@ -392,10 +394,20 @@ class TestMXFP8ReshardTransform:
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
-            canonical = InferenceGroupedMLP._stack_mxfp8_linear_weight(
-                grouped_mlp, linear_name, "triton"
+            if clamp_scale is None:
+                # Canonical storage is released; only the routed copy holds the weights.
+                assert buffers[f"{linear_name}.weight0"].data.untyped_storage().nbytes() == 1
+            canonical = [
+                MXFP8Tensor.from_bf16(new_values[f"{linear_name}.weight{i}"], backend="triton")
+                for i in range(num_experts)
+            ]
+            expected = prepare_weights(
+                MXFP8Tensor(
+                    data=torch.stack([w.data for w in canonical]),
+                    scale=torch.stack([w.scale for w in canonical]),
+                    backend="triton",
+                )
             )
-            expected = prepare_weights(canonical)
             assert torch.equal(flashinfer_weight.data, expected.data)
             assert torch.equal(flashinfer_weight.scale, expected.scale)
 
