@@ -12,6 +12,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -25,6 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
@@ -52,7 +54,6 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -4243,6 +4244,21 @@ else:
     fused_topk_with_score_function_supports_qb = False
     mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
+
+
+@lru_cache(maxsize=1)
+def te_supports_deterministic_moe_aux_loss() -> bool:
+    """Whether the installed TE aux-loss API accepts a deterministic execution request."""
+    if fused_moe_aux_loss is None:
+        return False
+    try:
+        parameter = inspect.signature(fused_moe_aux_loss).parameters.get("deterministic")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def set_save_original_input(module):

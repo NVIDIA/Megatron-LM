@@ -229,7 +229,7 @@ class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPac
 
 
 class TestAttentionDynamicContextParallel:
-    """Regression tests for runtime (hybrid/dynamic) CP.
+    """Regression tests for runtime dynamic CP.
 
     A model built with static context_parallel_size == 1 can be handed a
     per-microbatch CP group at runtime via PackedSeqParams.cp_group. Two

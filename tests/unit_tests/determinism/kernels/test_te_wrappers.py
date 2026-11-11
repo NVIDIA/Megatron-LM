@@ -15,6 +15,7 @@ replays live in ``context_parallel/runtime/test_te_replay.py`` and
 
 import inspect
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
+    _dsa_index_share_carrier_scope,
     _dsa_weights_proj_forward_gemm,
+    _DSAIndexShareCarrier,
     _DSAWeightsProjection,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -70,6 +73,50 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.fixture
+def aux_loss_capability_cache():
+    """Keep mocked TE APIs from changing subsequent integration-test dispatch."""
+    helper = te_ext.te_supports_deterministic_moe_aux_loss
+    helper.cache_clear()
+    yield helper
+    helper.cache_clear()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "api,expected",
+    [
+        pytest.param(None, False, id="missing"),
+        pytest.param(lambda probs: None, False, id="legacy"),
+        pytest.param(lambda **kwargs: None, False, id="kwargs_only"),
+        pytest.param(lambda deterministic=False: None, True, id="explicit"),
+        pytest.param(lambda *, deterministic=False: None, True, id="keyword_only"),
+        pytest.param(lambda deterministic=False, /: None, False, id="positional_only"),
+    ],
+)
+def test_moe_aux_loss_deterministic_capability(
+    monkeypatch, aux_loss_capability_cache, api, expected
+):
+    monkeypatch.setattr(te_ext, "fused_moe_aux_loss", api)
+    assert aux_loss_capability_cache() is expected
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("error", [TypeError, ValueError])
+def test_moe_aux_loss_uninspectable_api(monkeypatch, aux_loss_capability_cache, error):
+    def unavailable_signature():
+        raise error("signature unavailable")
+
+    class Uninspectable:
+        __signature__ = property(lambda self: unavailable_signature())
+
+        def __call__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(te_ext, "fused_moe_aux_loss", Uninspectable())
+    assert not aux_loss_capability_cache()
 
 
 def _config(**overrides):
@@ -314,7 +361,7 @@ class TestTEWrappers:
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
     def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend):
-        """Replay the DSA BF16-operand/FP32-output projection and its custom backward."""
+        """Projection outputs and gradients must be independent of the forward's carrier."""
         seeded()
         x = torch.randn(4096, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         weight = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -334,18 +381,29 @@ class TestTEWrappers:
         def project(actual_x, actual_weight):
             return _DSAWeightsProjection.apply(actual_x, actual_weight, linear, indexer)
 
-        outputs, gradients = assert_replays_bit_exact(
-            project,
-            (x, weight),
-            replays=3,
-            backward=True,
-            grad_outputs={"out": grad_output},
-            contention=True,
-            what=f"DSA weights projection[{backend}]",
-        )
-        assert outputs["out"].dtype is torch.float32
-        assert gradients["in[0]"].dtype is torch.bfloat16
-        assert gradients["in[1]"].dtype is torch.bfloat16
+        reference = None
+        # Scope creation and teardown must not change the GEMM dispatch or its numerics.
+        for carrier in (None, _DSAIndexShareCarrier(), _DSAIndexShareCarrier(), None):
+            scope = nullcontext() if carrier is None else _dsa_index_share_carrier_scope(carrier)
+            with scope:
+                outputs, gradients = assert_replays_bit_exact(
+                    project,
+                    (x, weight),
+                    replays=3,
+                    backward=True,
+                    grad_outputs={"out": grad_output},
+                    contention=True,
+                    what=f"DSA weights projection[{backend}, scoped={carrier is not None}]",
+                )
+            assert outputs["out"].dtype is torch.float32
+            assert gradients["in[0]"].dtype is torch.bfloat16
+            assert gradients["in[1]"].dtype is torch.bfloat16
+            if reference is None:
+                reference = outputs, gradients
+            for expected, actual in zip(reference, (outputs, gradients)):
+                assert actual.keys() == expected.keys()
+                for name in expected:
+                    assert bytes_equal(expected[name], actual[name]), name
         assert indexer._weights_proj_te_gemm_supported is te_gemm_supported
 
     @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])
