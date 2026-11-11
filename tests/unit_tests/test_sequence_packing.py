@@ -285,6 +285,29 @@ def test_next_dynamic_cp_group_packing_aware_fills_non_power_of_two_group():
     assert exec_times == [exec_times[0] for _ in range(14)]
 
 
+def test_next_dynamic_cp_group_packing_aware_scores_placements_by_busiest_rank():
+    # Sequence 1 takes a free rank because packing it with sequence 0 would raise the maximum;
+    # once every rank is busy, sequences 3 and 4 join the least loaded group with room.
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
+        [(0, 50), (1, 45), (2, 40), (3, 30), (4, 10)], total_gpus=3, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0], [1, 4], [2, 3]]
+    assert micro_batches == [[50], [45, 10], [40, 30]]
+    assert exec_times == [2500.0, 2125.0, 2500.0]
+
+    # The CP2 sequence keeps ranks 0 and 1 the busiest, so later placements tie at that maximum
+    # and the first candidate wins: a new CP1 group, then packing into it before using rank 3.
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
+        [(0, 200), (1, 60), (2, 30), (3, 30)], total_gpus=4, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0], [0], [1, 2], [3]]
+    assert exec_times == [20000.0, 20000.0, 4500.0, 900.0]
+
+
 def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping():
     scheduler = DefaultDynamicCPScheduler(
         max_seqlen_per_dp_cp_rank=4096,
