@@ -62,6 +62,7 @@ def _train(
 
 
 @pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp"])
+@pytest.mark.parametrize("use_copy_engine", [False, True], ids=["nccl", "copy_engine"])
 @pytest.mark.parametrize("num_groups_in_flight", [0, 2, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
@@ -89,12 +90,15 @@ def test_muon_matches_reference(
     nesterov,
     kernel_options,
     num_groups_in_flight,
+    use_copy_engine,
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
     Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
     with 8, all four Muon groups are.
     """
+    if use_copy_engine and weight_decay_method != "decoupled":
+        pytest.skip("The copy engine only moves data; one weight decay method covers it.")
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
         if world_size < 2 or world_size % 2:
@@ -141,7 +145,10 @@ def test_muon_matches_reference(
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
     optimizer = muon.FsdpMuon(
-        [params[name] for name in muon_names], num_groups_in_flight=num_groups_in_flight, **kwargs
+        [params[name] for name in muon_names],
+        num_groups_in_flight=num_groups_in_flight,
+        use_copy_engine=use_copy_engine,
+        **kwargs,
     )
     fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)

@@ -23,6 +23,7 @@ except ImportError as error:
 from emerging_optimizers import utils as eo_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
+from .copy_engine import CopyEngineP2P, CopyEngineWork
 from .dbuffer import DBuffer
 from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
@@ -64,7 +65,7 @@ class _GroupStep:
     without communication has no works, and its full tensors are views of `sharded`.
     """
 
-    works: list[dist.Work]
+    works: list[dist.Work] | list[CopyEngineWork]
     assignment: _FsdpGroupAssignment
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner: dict[int, int]
@@ -129,12 +130,21 @@ class FsdpMuon(Muon):
             orthogonalized, and whose scatters are posted before a buffer's updates are applied.
             Each buffer in flight adds its momentum inputs, full tensors, and received updates to
             the peak memory. Zero gives the non-overlapped order.
+        use_copy_engine: Move gathers and scatters with peer memcpys on the copy engines instead
+            of NCCL kernels, leaving every SM to the Newton-Schulz; see ``copy_engine``. The
+            sharded buffers of the groups in flight then stay allocated in symmetric memory.
         **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
     _fsdp_group_assignments: list[_FsdpGroupAssignment]
 
-    def __init__(self, *args: Any, num_groups_in_flight: int = 8, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        num_groups_in_flight: int = 8,
+        use_copy_engine: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         if num_groups_in_flight < 0:
             raise ValueError(
@@ -172,6 +182,23 @@ class FsdpMuon(Muon):
                 )
             )
         self._validate_parameter_groups()
+        self._copy_engine: CopyEngineP2P | None = None
+        if use_copy_engine:
+            # A group holds a slot from its gather to its apply: at most the groups in flight
+            # before, during, and after the one being orthogonalized.
+            self._copy_engine = CopyEngineP2P(
+                num_slots=2 * num_groups_in_flight + 1,
+                slot_numel=max(
+                    (
+                        rank_range.numel
+                        for assignment in self._fsdp_group_assignments
+                        if assignment.has_comm
+                        for rank_range in assignment.rank_ranges.values()
+                    ),
+                    default=1,
+                ),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
@@ -260,20 +287,26 @@ class FsdpMuon(Muon):
         """
         fsdp_group: FsdpParameterGroup = assignment.fsdp_group
         buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = self._compute_momentum_inputs(
-            fsdp_group, tensor_to_optimizer_group_index
+        copy_engine: CopyEngineP2P | None = self._copy_engine if assignment.has_comm else None
+        momentum_inputs: DBuffer = (
+            DBuffer(buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
+            if copy_engine is None
+            else copy_engine.empty(buffer)
         )
+        self._compute_momentum_inputs(fsdp_group, tensor_to_optimizer_group_index, momentum_inputs)
         this_rank: int = fsdp_group.mesh.get_rank()
         owned: list[int] = [i for i, owner in tensor_to_owner.items() if owner == this_rank]
-        works: list[dist.Work] = []
+        works: list[dist.Work] | list[CopyEngineWork] = []
         if assignment.has_comm:
             full_updates: dict[int, torch.Tensor] = {
                 i: torch.empty(
-                    buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device
+                    buffer.layout.tensor_shapes[i],
+                    dtype=momentum_inputs.dtype,
+                    device=buffer.device,
                 )
                 for i in owned
             }
-            works = gather(
+            works = (gather if copy_engine is None else copy_engine.gather)(
                 momentum_inputs,
                 full_updates,
                 tensor_to_owner=tensor_to_owner,
@@ -301,10 +334,14 @@ class FsdpMuon(Muon):
             the updates of remote-owned tensors.
         """
         buffer: DBuffer = group_step.assignment.fsdp_group.main_weight
-        local_updates: DBuffer = DBuffer(
-            buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
-        )
-        works = scatter(
+        if self._copy_engine is None:
+            local_updates: DBuffer = DBuffer(
+                buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
+            )
+        else:
+            # The owners have read the momentum inputs, so their slot receives the updates.
+            local_updates = group_step.sharded
+        works = (scatter if self._copy_engine is None else self._copy_engine.scatter)(
             group_step.full_updates,
             local_updates,
             tensor_to_owner=group_step.tensor_to_owner,
@@ -313,17 +350,16 @@ class FsdpMuon(Muon):
         return replace(group_step, works=works, sharded=local_updates)
 
     def _compute_momentum_inputs(
-        self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
-    ) -> DBuffer:
-        """Apply local weight decay, update momentum, and build inputs for orthogonalization.
+        self,
+        fsdp_group: FsdpParameterGroup,
+        tensor_to_optimizer_group_index: dict[int, int],
+        momentum_inputs: DBuffer,
+    ) -> None:
+        """Apply local weight decay, update momentum, and write inputs for orthogonalization.
 
         Tensors sharing an optimizer group are updated together with foreach kernels, a few
         launches per group instead of a few per tensor.
         """
-        buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = DBuffer(
-            buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
-        )
         by_optimizer_group: dict[int, list[int]] = {}
         for i, group_index in tensor_to_optimizer_group_index.items():
             by_optimizer_group.setdefault(group_index, []).append(i)
@@ -367,7 +403,6 @@ class FsdpMuon(Muon):
                 torch._foreach_lerp_(local_inputs, momenta, group["momentum"])
             else:
                 torch._foreach_copy_(local_inputs, momenta)
-        return momentum_inputs
 
     def _orthogonalize_updates(self, group_step: _GroupStep) -> None:
         """Replace this rank's gathered inputs with full orthogonalized updates."""

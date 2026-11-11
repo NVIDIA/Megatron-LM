@@ -110,6 +110,12 @@ Groups whose tensors all sit on one rank need no communication. They are spread
 evenly over the pipeline, the last one at the end, and hide the transfers of the other
 groups; each is applied right after its Newton–Schulz.
 
+With `use_copy_engine=True`, owners move the data with peer memcpys on the
+[copy engines](../megatron_fsdp/experimental/copy_engine.py) instead of NCCL
+kernels, so Newton–Schulz keeps every SM. The sharded buffers of the groups in
+flight live in symmetric memory, and ranks signal each other with stream memory
+operations.
+
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
 current path avoids that redundant computation.
