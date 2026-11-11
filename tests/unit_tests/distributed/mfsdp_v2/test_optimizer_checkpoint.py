@@ -25,7 +25,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import (
+    destroy_model_parallel,
+    require_canonical_grouped_glu,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -270,6 +273,55 @@ def _assert_optimizer_matches_snapshot(
     assert param_group_snapshot == _snapshot_param_group_hyperparameters(optimizer)
 
 
+class _CanonicalGroupedExperts(MegatronModule):
+    """Exercise canonical per-expert FC1 weights through the actual MCore adapter."""
+
+    def __init__(self, config, pg_collection):
+        super().__init__(config=config)
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelGroupedLinear,
+            TERowParallelGroupedLinear,
+        )
+        from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+
+        self.experts = TEGroupedMLP(
+            3,
+            config,
+            GroupedMLPSubmodules(TEColumnParallelGroupedLinear, TERowParallelGroupedLinear),
+            pg_collection,
+        )
+
+    def forward(self, hidden_states, attention_mask=None):
+        del attention_mask
+        flat = hidden_states.flatten(0, -2)
+        counts = torch.tensor([flat.shape[0] // 2, 0, flat.shape[0] // 2], device=flat.device)
+        probs = torch.ones(flat.shape[0], device=flat.device, dtype=torch.float32)
+        output, _ = self.experts(flat, counts, probs)
+        return output
+
+
+def _canonical_experts_config():
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=3,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_single_grouped_weight=False,
+        use_transformer_engine_op_fuser=True,
+        moe_mlp_glu_interleave_size=None,
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
+        add_bias_linear=False,
+        bias_activation_fusion=False,
+        gradient_accumulation_fusion=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+
+
 @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
 def test_checkpoint_roundtrip(
     process_group_collection, tmp_path_dist_ckpt: Path, precision_aware: bool
@@ -435,3 +487,61 @@ def test_tied_parameter_roundtrip(process_group_collection, tmp_path_dist_ckpt: 
 
     _assert_model_matches_snapshot(destination_model, model_snapshot)
     _assert_optimizer_matches_snapshot(destination_optimizer, state_snapshot, param_group_snapshot)
+
+
+@pytest.mark.launch_on_gb200
+def test_canonical_grouped_experts_checkpoint_resume(
+    process_group_collection, tmp_path_dist_ckpt, monkeypatch
+):
+    """Canonical FC1 weights, FP32 masters and Adam moments resume without permutation."""
+    import transformer_engine.pytorch as te
+
+    require_canonical_grouped_glu("bf16")
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    config = _canonical_experts_config()
+
+    def build(zero_init):
+        module = _CanonicalGroupedExperts(config, process_group_collection).cuda()
+        if zero_init:
+            _zero_parameters(module)
+        return _shard_and_build_optimizer(config, process_group_collection, module)
+
+    source, source_optimizer = build(False)
+    for _ in range(2):
+        _train_step(config, source, source_optimizer)
+    fused = source.module.experts._fused_ops[0]._module_groups[0]._forward_ops[0][0]
+    assert isinstance(fused, te.ops.fused.GroupedMLP_CuTeGEMMGLUBf16)
+    assert fused._gate_then_up
+    model_snapshot = _snapshot_model_state(source)
+    optimizer_snapshot = _snapshot_optimizer_state(source_optimizer)
+    group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+    with TempNamedDir(tmp_path_dist_ckpt / "canonical_grouped_experts", sync=True) as directory:
+        saved = {
+            "model": source.state_dict_for_save_checkpoint(),
+            "optimizer": source_optimizer.sharded_state_dict({}),
+        }
+        preprocess_state_dict_for_uneven_dtensor(saved)
+        dcp.save(saved, checkpoint_id=directory)
+        destination, destination_optimizer = build(True)
+        loaded = {
+            "model": destination.state_dict_for_save_checkpoint(),
+            "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
+        }
+        preprocess_state_dict_for_uneven_dtensor(loaded)
+        dcp.load(loaded, checkpoint_id=directory)
+        destination.load_state_dict(loaded["model"])
+        destination_optimizer.load_state_dict(loaded["optimizer"])
+    _assert_model_matches_snapshot(destination, model_snapshot)
+    _assert_optimizer_matches_snapshot(destination_optimizer, optimizer_snapshot, group_snapshot)
+    # A full resumed step catches stale BF16 compute buffers and stale fuser aliases,
+    # which comparing the checkpoint's FP32 DTensors alone would miss.
+    torch.manual_seed(791 + torch.distributed.get_rank())
+    _train_step(config, source, source_optimizer)
+    torch.manual_seed(791 + torch.distributed.get_rank())
+    _train_step(config, destination, destination_optimizer)
+    _assert_model_matches_snapshot(destination, _snapshot_model_state(source))
+    _assert_optimizer_matches_snapshot(
+        destination_optimizer,
+        _snapshot_optimizer_state(source_optimizer),
+        _snapshot_param_group_hyperparameters(source_optimizer),
+    )
