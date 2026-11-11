@@ -45,7 +45,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, register_checkpoint_parameter
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, set_checkpoint_parameter_id
 
 try:
     from packaging.version import Version as PkgVersion
@@ -1158,7 +1158,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             if is_float8tensor(tensor):
                 fp8_param = tensor
                 tensor = dequantize_gtp_native_fp8(tensor)
-                register_checkpoint_parameter(tensor, fp8_param)
+                set_checkpoint_parameter_id(tensor, fp8_param)
                 # Keep the legacy backlink for existing GTP checkpoint consumers.
                 tensor._gtp_dequant_src = fp8_param
 

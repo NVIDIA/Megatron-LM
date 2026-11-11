@@ -32,7 +32,7 @@ def get_checkpoint_parameter_id(tensor: torch.Tensor) -> int:
     return getattr(tensor, "_checkpoint_parameter_id", id(tensor))
 
 
-def register_checkpoint_parameter(tensor: torch.Tensor, parameter: torch.Tensor) -> None:
+def set_checkpoint_parameter_id(tensor: torch.Tensor, parameter: torch.Tensor) -> None:
     """Match a checkpoint payload to its original local parameter.
 
     Preserve shape, element order, and sharding; dtype may differ. Keep the source

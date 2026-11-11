@@ -12,7 +12,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensor,
     ShardedTensorFactory,
     get_checkpoint_parameter_id,
-    register_checkpoint_parameter,
+    set_checkpoint_parameter_id,
 )
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.launch_on_gb200
 def _model_entry(factory):
     param = torch.nn.Parameter(torch.arange(8, dtype=torch.float16).reshape(2, 4))
     payload = param.detach().to(torch.bfloat16)
-    register_checkpoint_parameter(payload, param)
+    set_checkpoint_parameter_id(payload, param)
     shard = ShardedTensor.from_rank_offsets("weight", payload, replica_id=(0, 0, 0))
     if not factory:
         return param, shard
@@ -188,9 +188,9 @@ def test_native_mxfp8_muon_checkpoint_mapping(native_mxfp8_entry):
 def test_checkpoint_parameter_registration_is_explicit_and_composable():
     param = torch.nn.Parameter(torch.ones(2, 4))
     payload = param.detach().to(torch.bfloat16)
-    register_checkpoint_parameter(payload, param)
+    set_checkpoint_parameter_id(payload, param)
     converted = payload.float()
-    register_checkpoint_parameter(converted, payload)
+    set_checkpoint_parameter_id(converted, payload)
     assert get_checkpoint_parameter_id(converted) == id(param)
     # GDP uses a fresh view to keep its semantic factory out of optimizer matching.
     view = payload.view_as(payload)
@@ -202,4 +202,4 @@ def test_checkpoint_parameter_registration_is_explicit_and_composable():
 def test_checkpoint_parameter_registration_rejects_changed_shape():
     param = torch.nn.Parameter(torch.ones(2, 4))
     with pytest.raises(ValueError, match="same shape"):
-        register_checkpoint_parameter(param.flatten(), param)
+        set_checkpoint_parameter_id(param.flatten(), param)
