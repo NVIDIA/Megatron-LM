@@ -134,8 +134,14 @@ axis.
     a single rank.
 - `TensorAtomic`. Don’t cut a parameter. For emerging optimizers that need full
   parameters.
-- `PerTensor(dist.tensor.Placement)`. If needed. Per-tensor dim-0 sharding used in
-  FSDP2. It leads to extra data copy so won’t be used by default.
+- `PerTensor(Shard(0))`. Independent per-tensor dim-0 sharding, as used in FSDP2.
+  The initial implementation creates one communication group per physical tensor
+  (tied aliases share a group), using the existing padded row-atomic layout for
+  each tensor. It supports ordinary floating-point parameters on a 1-D DP mesh.
+  Using it in any buffer placement splits all buffers into per-tensor groups.
+  This preserves Torch chunk geometry at the cost of collectives per tensor;
+  fused per-tensor communication is not implemented. See the
+  [manual-scheduling unit test](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_manual_schedule.py).
 
 ```
 Block-atomic sharding example

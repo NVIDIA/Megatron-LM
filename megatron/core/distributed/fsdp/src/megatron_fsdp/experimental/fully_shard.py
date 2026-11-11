@@ -68,7 +68,10 @@ class Placements:
 
     ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
     mesh. Placement sequences are ordered to match those axes. Use Torch's
-    ``Shard(0)`` for public parameter, gradient, and optimizer sharding.
+    ``Shard(0)`` for packed parameter, gradient, and optimizer sharding, or
+    ``PerTensor(Shard(0))`` for independent per-tensor sharding on a 1-D mesh.
+    Using PerTensor in any buffer splits the unit into single-physical-tensor
+    communication groups for all buffers, preserving tied aliases.
     """
 
     dp_axes: Sequence[MeshAxis]

@@ -10,6 +10,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PerTensor,
     Placements,
     finalize_gradients,
     fully_shard,
@@ -77,6 +78,29 @@ class NonLeafViewModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+@pytest.mark.parametrize("rows", [1, 5])
+def test_per_tensor_shards_match_torch_chunks(distributed_setup, rows):
+    """Uneven shards and empty ranks match Torch chunking; tied aliases stay tied."""
+    setup = distributed_setup
+    torch.manual_seed(42)
+    model = nn.Linear(7, rows).to(setup.device)
+    model.alias = model.weight
+    originals = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    placements = Placements([0], *[[PerTensor(Shard(0))] for _ in range(3)])
+    with fully_shard_context(FsdpContext(device=setup.device)):
+        fully_shard(model, mesh=mesh, placements=placements)
+
+    assert len(model.parameter_groups) == 2
+    assert model.alias is model.weight
+    assert model.parameter_groups[0].fsdp_parameters[0].fqns == ("weight", "alias")
+    for name, original in originals.items():
+        chunks = original.chunk(setup.world_size, dim=0)
+        expected = chunks[setup.rank] if setup.rank < len(chunks) else original[:0]
+        torch.testing.assert_close(getattr(model, name).to_local(), expected)
+        torch.testing.assert_close(getattr(model, name).full_tensor(), original)
 
 
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):

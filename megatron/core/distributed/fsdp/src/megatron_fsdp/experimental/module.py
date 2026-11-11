@@ -40,7 +40,7 @@ from .parameter_group import (
     get_containing_parameter_group,
 )
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .placement import BlockAtomic, PerTensor, RowAtomic, ShardLayout
 from .schedule_policy import SchedulePolicy
 
 
@@ -81,10 +81,28 @@ class FsdpModule:
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
+        per_tensor = any(
+            isinstance(placement, PerTensor)
+            for placements in (
+                model_weight_placements,
+                main_grad_placements,
+                main_weight_placements,
+            )
+            for placement in placements
+        )
+        if per_tensor:
+            if mesh.ndim != 1:
+                raise NotImplementedError("PerTensor currently requires a 1-D data-parallel mesh.")
+            if shard_layout is not ShardLayout.PADDED:
+                raise ValueError("PerTensor requires ShardLayout.PADDED for Torch chunking.")
+            if any(
+                effective_dtype(parameter) == torch.uint8 for parameter in owned_parameters.values()
+            ):
+                raise NotImplementedError("PerTensor does not yet support quantized parameters.")
         if grad_scale <= 0:
             raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
         parameter_groups = []
-        for group_parameters in _group_parameters(owned_parameters):
+        for group_parameters in _group_parameters(owned_parameters, per_tensor=per_tensor):
             first_parameter = next(iter(group_parameters.values()))
             group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
@@ -559,10 +577,16 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
     return parameters
 
 
-def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+def _group_parameters(
+    parameters: dict[str, nn.Parameter], *, per_tensor: bool = False
+) -> list[dict[str, nn.Parameter]]:
+    grouped: dict[tuple[torch.dtype, bool, int | None], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (effective_dtype(parameter), parameter.requires_grad)
+        key = (
+            effective_dtype(parameter),
+            parameter.requires_grad,
+            id(parameter) if per_tensor else None,
+        )
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
@@ -584,5 +608,10 @@ def _specialize_placements(
             )
     placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else RowAtomic()
     return tuple(
-        placement_type if type(placement) is Shard else placement for placement in placements
+        (
+            placement_type
+            if type(placement) is Shard or isinstance(placement, PerTensor)
+            else placement
+        )
+        for placement in placements
     )
