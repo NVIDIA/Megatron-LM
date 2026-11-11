@@ -336,7 +336,8 @@ class TestFusedCrossEntropy:
     )
     def test_fused_vocab_parallel_cross_entropy_confident_targets_replay(self, dtype):
         """Rows whose target leads by tens take the target-free sum and the target-gradient
-        write of the fused path."""
+        write of the fused path.
+        """
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         vocab = 32768

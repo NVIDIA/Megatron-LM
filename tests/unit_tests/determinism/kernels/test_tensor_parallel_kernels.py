@@ -204,7 +204,8 @@ class TestTensorParallelLayers:
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
     def test_vocab_parallel_cross_entropy_confident_targets_replay(self, label_smoothing):
         """Rows whose target leads the other logits by tens: the loss takes the target-free sum
-        and the target gradient is written by set_target_gradients; both must replay."""
+        and the target gradient is written by set_target_gradients; both must replay.
+        """
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         vocab = 32768
@@ -224,7 +225,8 @@ class TestTensorParallelLayers:
     def test_sum_exp_logits_excluding_target_restores_exp_logits(self):
         """The target-free row sum zeroes the target entries in place and restores them:
         exp_logits must come back byte-identical, and both sums must equal their direct
-        forms. Half the rows have their target on another rank and are left untouched."""
+        forms. Half the rows have their target on another rank and are left untouched.
+        """
         seeded()
         vocab = 32768
         exp_logits = torch.rand(4096, vocab, device="cuda")

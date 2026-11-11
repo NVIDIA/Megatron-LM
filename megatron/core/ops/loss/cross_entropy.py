@@ -106,7 +106,8 @@ class VocabParallelCrossEntropy:
         The target entries are zeroed for the reduction and restored afterwards (``x - x`` and
         ``0 + x`` are exact), so no logits-sized temporary is allocated. Rows whose target is
         owned by another rank are left untouched. Returns ``(sum_exp_logits, sum_exp_others)``,
-        where ``sum_exp_logits`` adds the target back as a scalar."""
+        where ``sum_exp_logits`` adds the target back as a scalar.
+        """
 
         partition_vocab_size = exp_logits.size()[-1]
         exp_2d = exp_logits.view(-1, partition_vocab_size)
@@ -130,7 +131,8 @@ class VocabParallelCrossEntropy:
         """Calculates cross entropy loss.
 
         With ``sum_exp_others`` (see ``sum_exp_logits_excluding_target``) the loss stays
-        accurate when the target dominates instead of rounding to 0."""
+        accurate when the target dominates instead of rounding to 0.
+        """
 
         if sum_exp_others is None:
             # Loss = log(sum(exp(logits))) - predicted-logit.
@@ -184,7 +186,8 @@ class VocabParallelCrossEntropy:
 
         ``target_grad`` is ``softmax[target] - 1`` computed as ``-sum_exp_others /
         sum_exp_logits``, which keeps its value where ``softmax[target] - 1`` would round to 0.
-        Rows whose target is owned by another rank (``softmax_update == 0``) keep the softmax."""
+        Rows whose target is owned by another rank (``softmax_update == 0``) keep the softmax.
+        """
 
         current = grad_2d[arange_1d, masked_target_1d]
         grad_2d[arange_1d, masked_target_1d] = torch.where(

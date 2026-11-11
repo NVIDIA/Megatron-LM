@@ -140,7 +140,8 @@ def _reference_cross_entropy(logits: torch.Tensor, target: torch.Tensor):
     """fp64 loss and gradient written as softplus(logsumexp(others) - x_target).
 
     Unlike log_softmax, this form never adds the target's exp(0) = 1 to the tiny sum of the
-    others, so it stays exact when the target dominates."""
+    others, so it stays exact when the target dominates.
+    """
     z = logits.detach().double().clone().requires_grad_(True)
     target_logit = z.gather(-1, target.unsqueeze(-1))
     others = (z - target_logit).masked_fill(
@@ -163,7 +164,8 @@ def test_vocab_parallel_cross_entropy_confident_target(monkeypatch):
     """Once the target leads by more than ~16.6 in fp32, log(sum_exp) - x and softmax - 1 used
     to round to exactly 0 while the other classes kept their gradients
     (https://arxiv.org/abs/2610.31642). The loss and the target gradient must stay accurate,
-    and the row gradient must keep summing to (nearly) zero."""
+    and the row gradient must keep summing to (nearly) zero.
+    """
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, op=None, group=None: tensor)
     margins = [5.0, 10.0, 17.0, 20.0, 40.0, 80.0]
     vocab_size = 1024
@@ -185,7 +187,8 @@ def test_vocab_parallel_cross_entropy_confident_target(monkeypatch):
 
 def test_vocab_parallel_cross_entropy_label_smoothing_matches_reference(monkeypatch):
     """With label smoothing the target gradient is now written as target_grad + smoothing;
-    it must keep matching the smoothed loss of the forward, differentiated in fp64."""
+    it must keep matching the smoothed loss of the forward, differentiated in fp64.
+    """
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, op=None, group=None: tensor)
     torch.manual_seed(0)
     label_smoothing, vocab_size = 0.1, 512
@@ -228,7 +231,8 @@ def test_vocab_parallel_cross_entropy_matches_torch_on_random_logits(monkeypatch
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPUs")
 def test_vocab_parallel_cross_entropy_confident_target_across_ranks():
     """Same check with the vocabulary split over every rank: the target, and the largest
-    other logit, sit on different ranks, so the target-free sum is reduced across ranks."""
+    other logit, sit on different ranks, so the target-free sum is reduced across ranks.
+    """
     Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
     tp_size = Utils.world_size
     rank = torch.distributed.get_rank()

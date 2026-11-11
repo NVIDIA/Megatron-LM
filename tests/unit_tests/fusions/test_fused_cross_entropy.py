@@ -91,7 +91,8 @@ def test_fused_cross_entropy_matches_torch_reference(single_rank_all_reduce, log
 def test_fused_cross_entropy_confident_target(single_rank_all_reduce, logits_dtype):
     """Once the target leads by more than ~16.6 (fp32 math), log(sum_exp) - x and softmax - 1
     used to round to exactly 0 while the other classes kept their gradients
-    (https://arxiv.org/abs/2610.31642). Both must match an fp64 reference instead."""
+    (https://arxiv.org/abs/2610.31642). Both must match an fp64 reference instead.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     margins = [5.0, 10.0, 17.0, 20.0, 40.0]
     vocab_size = 512
