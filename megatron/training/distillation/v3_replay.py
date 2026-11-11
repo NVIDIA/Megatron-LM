@@ -113,9 +113,11 @@ def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
     layout = "zigzag"
     attention_layout = "zigzag"
     if hybrid:
-        from megatron.training.arguments import core_transformer_config_from_args
+        config = getattr(args, "transformer_config", None)
+        if config is None:
+            from megatron.training.arguments import core_transformer_config_from_args
 
-        config = core_transformer_config_from_args(args)
+            config = core_transformer_config_from_args(args)
         layout = config.linear_cp_layout
         attention_layout = config.attention_cp_layout
     return {

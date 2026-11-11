@@ -28,6 +28,7 @@ import torch.distributed as dist
 from .format.arrow import file_meta
 from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
 from .format.corpus import CorpusInventory, check_chunk
+from .v3_options import runtime_options
 from .v3_storage import Storage
 
 # Placeholder budget until the epoch length is known (set once the dataset is built).
@@ -60,6 +61,7 @@ def producer_settings(args: Any) -> dict:
 
 def resume_corpus_iteration(args: Any) -> int:
     """Use the output tracker as the authoritative cursor, without deleting data yet."""
+    args = runtime_options(args)
     from .v3_runtime import dump_range
 
     global _INVENTORY, _TRACKER_PRESENT
@@ -137,9 +139,8 @@ def resume_corpus_iteration(args: Any) -> int:
 
 def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
     """Validate the source, then unpublish only this job's selected replacement tail."""
-    from megatron.training import get_args
-
     from .utils import _broadcast_without_pp
+    from .v3_options import get_args
     from .v3_runtime import _report_recorded_differences, dump_range
 
     args = get_args()
@@ -294,6 +295,7 @@ class CorpusEpoch(torch.utils.data.Dataset):
 
 def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
     """Build the whole source for exactly one epoch and wrap it (data-building ranks)."""
+    args = runtime_options(args)
     # A single unweighted prefix, all in the training part, with size None builds one
     # full epoch of the whole source.
     dataset = provider([None, None, None])[0]
@@ -306,6 +308,7 @@ def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
 
 def agree_corpus_epoch(args: Any) -> None:
     """Share the epoch length with every rank and size the run to it (collective)."""
+    args = runtime_options(args)
     length = torch.tensor(
         [getattr(args, "kd_corpus_samples", 0)],
         dtype=torch.long,

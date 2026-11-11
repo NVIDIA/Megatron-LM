@@ -18,6 +18,7 @@ from .v3_format import (
     tokenizer_fingerprint,
     validate_metadata,
 )
+from .v3_options import runtime_options
 from .v3_replay import (
     CorpusReader,
     ReplayIterator,
@@ -226,6 +227,7 @@ def frozen_resume_iteration(args: Any) -> int:
     parallel job (unchanged ``--override-ckpt-iteration``) continues inside its own
     range, and periodic ``--exit-interval`` requeues of a single writer advance.
     """
+    args = runtime_options(args)
     if not hasattr(args, "logits_save_range_start"):
         # Record the user's range start once; load_checkpoint then replaces the override.
         args.logits_save_range_start = args.override_ckpt_iteration
@@ -284,9 +286,8 @@ def _teacher_precision(args: Any) -> str:
 def _dump_settings(saver: Any) -> dict[str, Any]:
     """This dump job's metadata: required settings (minus ``first_sample``), recorded
     settings, and provenance."""
-    from megatron.training import get_args
-
     from .utils import _blend_identifiers
+    from .v3_options import get_args
 
     args = get_args()
     targets = saver.metadata_dict["saver"]
@@ -363,9 +364,8 @@ def _report_recorded_differences(differing: list[str], where: str) -> None:
 
 def initialize_dump_metadata(saver: Any) -> dict:
     """Check this dump job against the cache and find where it resumes, collectively."""
-    from megatron.training import get_args
-
     from .utils import _broadcast_without_pp
+    from .v3_options import get_args
 
     args = get_args()
     expected = _dump_settings(saver)
@@ -460,6 +460,7 @@ def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = Tr
 
 def initialize_replay(args: Any) -> None:
     """Establish a common replay plan on all ranks before building datasets."""
+    args = runtime_options(args)
     global _PLAN
     if not getattr(args, "logits_load_inputs", False) or _PLAN is not None:
         return
@@ -594,6 +595,7 @@ def ensure_replay_frontier(args: Any) -> None:
     rank 0 lists once and broadcasts newly published groups, so every rank either
     continues or raises the same exhaustion error. Never sleeps or polls.
     """
+    args = runtime_options(args)
     from megatron.core.num_microbatches_calculator import get_current_global_batch_size
 
     need = args.consumed_train_samples + get_current_global_batch_size()
@@ -635,6 +637,7 @@ def ensure_replay_frontier(args: Any) -> None:
 
 def before_train_step(args: Any) -> bool:
     """Run v3 checks at the top of each training iteration; True means exit cleanly."""
+    args = runtime_options(args)
     if getattr(args, "logits_load_inputs", False):
         initialize_replay(args)  # Once, collectively, before the first replay batch.
         ensure_replay_frontier(args)
@@ -722,6 +725,7 @@ class _ContextParallelReplay:
 
 def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader | None:
     """Build already-batched replay without applying the ordinary sampler."""
+    args = runtime_options(args)
     from megatron.core import parallel_state as mpu
     from megatron.core.num_microbatches_calculator import get_num_microbatches
 
@@ -790,7 +794,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
 
 def validation_only_config(config: Any, sample_counts: list) -> list:
     """Disable training splits without changing validation's original split ranges."""
-    from megatron.training import get_args
+    from .v3_options import get_args
 
     args = get_args()
     if not (args.mock_data or args.data_path or args.valid_data_path or args.test_data_path):
@@ -809,7 +813,7 @@ def on_tp0_batch(batch: dict, *, hybrid: bool = False, vp_stage: int | None = No
     model batch and holds them until :func:`stage_targets`.
     """
     global _PENDING_TARGETS
-    from megatron.training import get_args
+    from .v3_options import get_args
 
     args = get_args()
     if getattr(args, "logits_save_inputs", False):
@@ -858,7 +862,7 @@ def capture_dump_batch(batch: dict, *, hybrid: bool = False, vp_stage: int | Non
 
 def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
     """Separate this CP rank's already-mapped targets from the model batch fields."""
-    from megatron.training import get_args
+    from .v3_options import get_args
 
     args = get_args()
     result = dict(batch)

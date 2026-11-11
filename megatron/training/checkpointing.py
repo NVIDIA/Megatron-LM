@@ -365,7 +365,7 @@ def check_checkpoint_args(
             ('logits_load_shuffle_shards', None),
         ):
             _compare(name, default=default)
-        _compare('seq_length')
+        _compare('seq_length', config_section='model')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
     if get_checkpoint_version() >= 3.0 and not use_dist_ckpt:
@@ -1458,7 +1458,7 @@ def save_checkpoint(
         elif getattr(args, 'kd_corpus_dump', None):
             # Only the last PP stage owns a saver, but async queue completion is
             # collective across WORLD. Match its request on every other stage.
-            async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
+            async_request_cls = AsyncRequest
             async_logits_request = async_request_cls(
                 async_fn=None, async_fn_args=(), finalize_fns=[]
             )

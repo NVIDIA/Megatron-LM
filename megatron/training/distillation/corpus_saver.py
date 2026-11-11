@@ -11,10 +11,9 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
-from megatron.training import get_args
-
 from .format.arrow import write_file
 from .format.corpus import CHUNK_VERSION, chunk_path, part_path, publish_chunk
+from .v3_options import get_args
 from .v3_saver import PairedLogitsSaver
 from .v3_storage import Storage
 

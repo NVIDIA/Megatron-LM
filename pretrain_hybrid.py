@@ -401,6 +401,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
+    if getattr(get_args(), "logits_load_inputs", False):
+        from megatron.training.distillation.v3_datasets import build_validation_datasets
+
+        return build_validation_datasets(
+            train_val_test_num_samples, vp_stage, is_dataset_built_on_rank, hybrid=True
+        )
     return build_gpt_datasets(
         train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )

@@ -11,11 +11,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args, get_tensorboard_writer, get_tokenizer
+from megatron.training import get_tensorboard_writer, get_tokenizer
 
 from .format.arrow import samples_batch, write_file
 from .logits_saver import LogitsSaverHooks
 from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inputs, tail_logprob
+from .v3_options import get_args
 from .v3_replay import layout_options, token_map
 from .v3_storage import Storage, data_name, parse_name, publish
 

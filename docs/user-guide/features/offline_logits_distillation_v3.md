@@ -898,3 +898,9 @@ Small hooks in `arguments.py`, `training.py`, `checkpointing.py`, `pretrain_gpt.
 `pretrain_hybrid.py` select the V3 path. V3 reuses existing sparse top-K extraction,
 student output capture, the shared LM/sparse-KD loss and reporting, and the persistent
 asynchronous writer queue.
+
+`v3_options.py` resolves V3's shared settings through the live run configuration and
+sample counters through `TrainState`; V3-specific flags remain in the CLI namespace.
+`v3_datasets.py` uses the shared GPT dataset provider for validation-only student data.
+Its read-only split view suppresses training without changing validation boundaries or
+mutating the run-owned dataset config.
