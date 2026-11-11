@@ -57,11 +57,11 @@ def test_batch_invariant_policy(policy, monkeypatch):
             release = allocator.release_memory_blocks
 
             def observe_release(blocks):
-                registered = bool((allocator.block_hashes[blocks] >= 0).any())
+                registered = bool((allocator.pc_state.block_hashes[blocks] >= 0).any())
                 release(blocks)
                 if registered:
-                    assert not allocator.kv_hash_to_block_id
-                    assert (allocator.block_ref_counts[blocks] == 0).all()
+                    assert not allocator.registry.kv_hash_to_block_id
+                    assert (allocator.pc_state.block_ref_counts[blocks] == 0).all()
                     released.append(True)
 
             monkeypatch.setattr(allocator, "release_memory_blocks", observe_release)
