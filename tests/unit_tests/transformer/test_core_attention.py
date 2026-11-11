@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.optimizer import FP32Optimizer
@@ -147,6 +146,9 @@ class TestLearnableSoftmaxOffsetGradNorm:
         if Utils.world_size < 2 or Utils.world_size % 2:
             pytest.skip("requires an even world size of at least two")
         Utils.initialize_model_parallel(2, 1)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp"]
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -166,26 +168,19 @@ class TestLearnableSoftmaxOffsetGradNorm:
             perform_initialization=False,
             params_dtype=torch.float32,
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
         attention_cls = DotProductAttention if implementation == "local" else TEDotProductAttention
         attention = attention_cls(
-            config,
-            1,
-            AttnMaskType.causal,
-            "self",
-            pg_collection=ProcessGroupCollection(
-                tp=tp_group, cp=parallel_state.get_context_parallel_group()
-            ),
+            config, 1, AttnMaskType.causal, "self", pg_collection=self.pg_collection
         )
         param = attention.softmax_offset
         # Rank-specific gradients expose dropping rank 1's distinct head shard.
-        gradient = 3.0 if tp_group.rank() == 0 else 4.0
+        gradient = 3.0 if self.pg_collection.tp.rank() == 0 else 4.0
         param.grad = torch.full_like(param, gradient)
         optimizer = FP32Optimizer(
             torch.optim.SGD([param], lr=0.1), OptimizerConfig(), init_state_fn=None
         )
-        optimizer.tp_group = tp_group
-        optimizer.grad_stats_parallel_group = tp_group
+        optimizer.tp_group = self.pg_collection.tp
+        optimizer.grad_stats_parallel_group = self.pg_collection.tp
 
         norm = optimizer.clip_grad_norm(1.0)
 
