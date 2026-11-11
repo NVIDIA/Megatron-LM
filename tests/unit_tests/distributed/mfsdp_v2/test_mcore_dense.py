@@ -2,21 +2,22 @@
 
 """Dense MCore adapter and optimizer integration tests for MFSDP v2."""
 
-from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import transformer_engine.pytorch as te
+from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import _initialize_symmetric_memory_meshes
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    RuntimePolicy,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -213,64 +214,23 @@ def test_wraps_fsdp_unit_modules_before_root(process_group_collection):
     assert root_parameter_names == {"1.weight", "1.bias"}
 
 
-@pytest.mark.parametrize("ambient_symmetric_memory", [None, True, False])
-def test_symmetric_memory_initializes_supplied_mesh(
-    process_group_collection, distributed_setup, ambient_symmetric_memory
-):
-    """A fresh supplied group supports registration and follows the active context's policy."""
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=16,
-        num_attention_heads=4,
-        ffn_hidden_size=32,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-    )
-    model = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False).to(
-        device="cuda", dtype=config.params_dtype
-    )
-    # Keep this group cold until the adapter constructs its mesh.
-    process_group_collection.dp_cp = dist.new_group(backend="nccl")
-    construction_context = (
-        nullcontext()
-        if ambient_symmetric_memory is None
-        else fully_shard_context(
-            FsdpContext(
-                device=distributed_setup.device,
-                runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ambient_symmetric_memory, caller_managed_grad_sync=True
-                ),
-            )
-        )
-    )
-    with construction_context:
-        wrapped = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                data_parallel_sharding_strategy="optim_grads_params",
-                nccl_ub=ambient_symmetric_memory is not True,
-            ),
-            module=model,
-            device=distributed_setup.device,
-            pg_collection=process_group_collection,
-        )
+def test_symmetric_memory_rendezvous_requires_initialized_mesh(distributed_setup):
+    """A cold group's window registration succeeds after its mesh is initialized."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least two ranks.")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    device = distributed_setup.device
+    group = dist.new_group(backend="nccl")
+    mesh = DeviceMesh.from_group(group, device_type=device.type)
+    with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device)):
+        buffer = torch.empty(1024, device=device)
 
-    assert wrapped.module.context.use_symmetric_memory == (ambient_symmetric_memory is not False)
-    inputs = torch.full(
-        (2, config.hidden_size),
-        float(distributed_setup.rank + 1),
-        device=distributed_setup.device,
-        dtype=config.params_dtype,
-    )
-    run_forward_backward_on_microbatches(wrapped, lambda: wrapped(inputs).float().sum())
-    [parameter] = wrapped.parameters()
-    assert parameter.grad is not None
-    gradient = parameter.grad.full_tensor()
-    torch.testing.assert_close(
-        gradient, torch.full_like(gradient, distributed_setup.world_size + 1), rtol=0, atol=0
-    )
+    with pytest.raises(dist.DistBackendError, match="Failed to window register"):
+        symm_mem.rendezvous(buffer, group=group.group_name)
+
+    _initialize_symmetric_memory_meshes((mesh,), device)
+    assert symm_mem.rendezvous(buffer, group=group.group_name) is not None
 
 
 def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_collection):
