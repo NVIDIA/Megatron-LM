@@ -124,6 +124,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
     Supports MXFP8 compute with either high-precision or MXFP8 parameter gathers.
+    NVFP4 compute is supported with high-precision parameter gathers; FP4 parameter
+    storage and gathers are not supported.
     For MXFP8 gathers, enable both ``config.fp8_param`` and ``ddp_config.fp8_param_gather``;
     MCore's model initialization preserves the high-precision values used for main weights.
     """
@@ -337,6 +339,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "replica-gradient accumulation before FSDP packs/reduce-scatters gradients "
                 "or releases their buffers."
             )
+        if config.moe_single_grouped_weight or config.moe_single_grouped_bias:
+            raise ValueError(
+                "MFSDP v2 grouped experts require per-expert weights and biases; set "
+                "moe_single_grouped_weight=False and moe_single_grouped_bias=False."
+            )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
@@ -430,8 +437,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "MFSDP v2 per-token loss has not been tested with PP>1 "
                 "or multiple optimizer instances."
             )
-        if config.fp4 or ddp_config.fp4_param_gather:
-            raise ValueError("MFSDP v2 does not currently support FP4.")
+        if config.fp4_param or ddp_config.fp4_param_gather:
+            raise ValueError(
+                "MFSDP v2 supports NVFP4 compute with high-precision parameter gathers, "
+                "but does not support FP4 parameter storage or gathers."
+            )
+        if config.fp4 and config.fp4_recipe != "nvfp4":
+            raise ValueError("MFSDP v2 only supports FP4 compute with the NVFP4 recipe.")
+        # Per-module TE quantization overrides can select native FP4 storage without
+        # setting the model-wide flags above. Its logical BF16 dtype must not make
+        # the distributed buffer treat quantized bytes as a regular BF16 parameter.
+        from megatron.core.fp4_utils import is_grouped_nvfp4tensor, is_nvfp4tensor
+
+        for name, parameter in module.named_parameters():
+            if is_nvfp4tensor(parameter) or is_grouped_nvfp4tensor(parameter):
+                raise ValueError(
+                    f"MFSDP v2 does not support native FP4 parameter {name!r}; "
+                    "use high-precision parameter storage with NVFP4 compute."
+                )
         if config.fp8 and config.fp8_recipe != "mxfp8":
             raise ValueError("MFSDP v2 only supports FP8 with the MXFP8 recipe.")
         if config.fp8_param != ddp_config.fp8_param_gather:

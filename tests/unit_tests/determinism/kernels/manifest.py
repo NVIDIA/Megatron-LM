@@ -349,7 +349,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
-        "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
+        "QB-capable TE routing replays probabilities, gradients, and atomic histograms. "
+        "Canonical cuDNN grouped MLP dispatch replays BF16 forward and MXFP8/NVFP4 "
+        "forward/backward; BF16 atomic dprob explicitly rejects deterministic backward.",
     ),
     KernelEntry(
         name="kitchen_extension",
@@ -443,9 +445,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_moe_kernels.py",
+            K + "test_te_wrappers.py",
         ),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "test_te_wrappers covers the canonical cuDNN grouped MLP selection and precision-specific "
+        "determinism contract with discrete expert parameters.",
     ),
     KernelEntry(
         name="moe_fused_a2a",

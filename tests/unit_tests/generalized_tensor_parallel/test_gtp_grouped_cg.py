@@ -188,9 +188,24 @@ def _native_model(group, recipe):
 @pytest.mark.parametrize("registered", [False, True], ids=["default-chains", "registered-chains"])
 @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "native-mxfp8"])
 def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registered):
+    _check_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registered)
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_canonical_grouped_full_iteration_replay(expert_group, monkeypatch):
+    """Native MXFP8 GTP4: fused cuDNN canonical MLPs survive six graph/Adam replays."""
+    _check_grouped_full_iteration_replay(
+        expert_group, monkeypatch, mxfp8=True, registered=True, fused_canonical=True
+    )
+
+
+def _check_grouped_full_iteration_replay(
+    expert_group, monkeypatch, mxfp8, registered, *, fused_canonical=False
+):
     if mxfp8:
         _requires_mxfp8()
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1" if fused_canonical else "0")
     recipe = MXFP8BlockScaling() if mxfp8 else None
     model = (
         _native_model(expert_group, recipe)
@@ -263,6 +278,15 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registe
                 b.mlp.experts._with_fused_impl and b.mlp.experts._fused_ops is not None
                 for b in model
             )
+        if fused_canonical:
+            from transformer_engine.pytorch.ops.fused.grouped_mlp import GroupedMLP_CuTeGEMMGLU
+
+            for block in model:
+                (ops,) = block.mlp.experts._fused_ops
+                forward_ops = ops._module_groups[0]._forward_ops
+                assert len(forward_ops) == 1
+                assert isinstance(forward_ops[0][0], GroupedMLP_CuTeGEMMGLU)
+                assert forward_ops[0][0]._gate_then_up
         expected = trajectory(lambda: _step(model, x, recipe))
         assert any(not torch.equal(m, value) for m, value in zip(masters, initial))
         _copy_weights(masters, initial)

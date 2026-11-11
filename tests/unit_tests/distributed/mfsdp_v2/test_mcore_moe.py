@@ -29,7 +29,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig, Wide
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
-from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import (
+    destroy_model_parallel,
+    require_canonical_grouped_glu,
+)
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -68,15 +71,24 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
+@pytest.mark.parametrize(
+    "grouped_gemm", [True, False, "canonical"], ids=["grouped", "sequential", "canonical"]
+)
 def test_standard_moe_training_and_clipping(
-    process_group_collections, distributed_setup, grouped_gemm
+    process_group_collections, distributed_setup, grouped_gemm, monkeypatch
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
+    canonical = grouped_gemm == "canonical"
+    if canonical:
+        require_canonical_grouped_glu("bf16")
+        if distributed_setup.world_size < 4:
+            pytest.skip("Canonical EP=2 experts require EDP>=2 to exercise parameter sharding.")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        grouped_gemm = True
     config = TransformerConfig(
         num_layers=2,
-        hidden_size=64,
+        hidden_size=256 if canonical else 64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
@@ -84,11 +96,17 @@ def test_standard_moe_training_and_clipping(
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=grouped_gemm,
-        moe_ffn_hidden_size=128,
+        moe_ffn_hidden_size=256 if canonical else 128,
         moe_shared_expert_intermediate_size=128,
+        moe_use_grouped_tensor=canonical,
+        use_transformer_engine_op_fuser=canonical,
+        moe_mlp_glu_interleave_size=None,
+        gated_linear_unit=canonical,
+        activation_func=torch.nn.functional.silu if canonical else torch.nn.functional.gelu,
         add_bias_linear=False,
         use_cpu_initialization=True,
-        params_dtype=torch.float32,
+        bf16=canonical,
+        params_dtype=torch.bfloat16 if canonical else torch.float32,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         gradient_accumulation_fusion=False,
@@ -139,7 +157,12 @@ def test_standard_moe_training_and_clipping(
     assert isinstance(layer.mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
-        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+        lr=1.0e-3,
+        weight_decay=0.0,
+        use_distributed_optimizer=False,
+        clip_grad=1.0e-4,
+        bf16=canonical,
+        params_dtype=config.params_dtype,
     )
     reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
     optimizer = get_megatron_optimizer(optimizer_config, [model])
@@ -170,7 +193,22 @@ def test_standard_moe_training_and_clipping(
     assert torch.isfinite(losses).all()
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
-    torch.testing.assert_close(losses, reference_losses)
+    if canonical:
+        import transformer_engine.pytorch as te
+
+        for experts in (layer.mlp.experts, reference_model.decoder.layers[1].mlp.experts):
+            fused = experts._fused_ops[0]._module_groups[0]._forward_ops[0][0]
+            assert isinstance(fused, te.ops.fused.GroupedMLP_CuTeGEMMGLUBf16)
+            assert fused._gate_then_up
+        assert all(
+            group.mesh.size() == distributed_setup.world_size // 2
+            for group in layer.mlp.experts.parameter_groups
+        )
+        # BF16 gradient reductions use different accumulation orders in the EP=1
+        # full-batch reference and the EP=2/EDP=2 training path.
+        torch.testing.assert_close(losses, reference_losses, rtol=2e-3, atol=2e-4)
+    else:
+        torch.testing.assert_close(losses, reference_losses)
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
@@ -310,7 +348,7 @@ def _train(model, optimizer, input_ids, position_ids, targets):
 
     def forward():
         output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-        return torch.nn.functional.mse_loss(output, targets)
+        return torch.nn.functional.mse_loss(output.float(), targets)
 
     losses = []
     for _ in range(5):
@@ -323,3 +361,301 @@ def _train(model, optimizer, input_ids, position_ids, targets):
         ), "Gradients must exceed the clipping threshold to exercise clipping."
         losses.append(loss)
     return torch.stack(losses)
+
+
+@pytest.fixture
+def canonical_expert_process_groups(distributed_setup):
+    """Use DP-only expert sharding so both two- and four-rank runs exercise ZeRO-3."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Canonical grouped experts require at least two FSDP ranks.")
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(1234)
+    yield ProcessGroupCollection.use_mpu_process_groups()
+    destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    ("precision", "native_parameters"),
+    [("bf16", False), ("mxfp8", False), ("nvfp4", False), ("mxfp8", True)],
+    ids=["bf16", "mxfp8", "nvfp4", "mxfp8_native_gather"],
+)
+def test_canonical_grouped_experts_reshard_and_update(
+    canonical_expert_process_groups, distributed_setup, monkeypatch, precision, native_parameters
+):
+    """Canonical cuDNN experts survive real gather/backward/Adam/reshard cycles.
+
+    BF16 resident weights and native MXFP8 gathers both keep the logical checkpoint and
+    optimizer layout independent of compute precision. The unsharded reference uses the
+    same fused arithmetic, isolating
+    the distributed parameter/gradient lifecycle from quantization error. Rank-local batches
+    differ, and an empty expert becomes active on the next step.
+    """
+    import functools
+
+    cudnn = require_canonical_grouped_glu(precision)
+    import transformer_engine.pytorch as te
+    from torch.distributed.tensor import Replicate
+    from transformer_engine.common.recipe import Format, MXFP8BlockScaling, NVFP4BlockScaling
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
+    from megatron.core.fp8_utils import get_fp8_context
+    from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    fused_type = (
+        te.ops.fused.GroupedMLP_CuTeGEMMGLUBf16
+        if precision == "bf16"
+        else te.ops.fused.GroupedMLP_CuTeGEMMGLU
+    )
+    calls = []
+    for direction, name in (
+        ("forward", "grouped_gemm_glu_wrapper_sm100"),
+        ("backward", "grouped_gemm_dglu_wrapper_sm100"),
+    ):
+        original = getattr(cudnn, name)
+
+        def trace(*args, _original=original, _direction=direction, **kwargs):
+            calls.append((_direction, kwargs.get("glu_layout"), kwargs.get("b_tensor") is None))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cudnn, name, functools.wraps(original)(trace))
+    fused_type.grouped_gemm_activation_kernel.cache_clear()
+    fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+
+    recipe = {
+        "bf16": None,
+        "mxfp8": MXFP8BlockScaling(fp8_format=Format.E4M3),
+        "nvfp4": NVFP4BlockScaling(disable_stochastic_rounding=True),
+    }[precision]
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=3,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_single_grouped_weight=False,
+        use_transformer_engine_op_fuser=True,
+        moe_mlp_glu_interleave_size=None,
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
+        add_bias_linear=False,
+        bias_activation_fusion=False,
+        gradient_accumulation_fusion=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        fp8="e4m3" if precision == "mxfp8" else None,
+        fp8_recipe="mxfp8",
+        fp8_param=native_parameters,
+        fp4="e2m1" if precision == "nvfp4" else None,
+        fp4_recipe="nvfp4",
+    )
+    pg = canonical_expert_process_groups
+    submodules = GroupedMLPSubmodules(
+        linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+    )
+    torch.manual_seed(125)
+    with get_fp8_context(config, is_init=True):
+        reference = TEGroupedMLP(3, config, submodules, pg).cuda()
+        module = TEGroupedMLP(3, config, submodules, pg).cuda()
+    reference_weights = dict(reference.named_parameters())
+    if native_parameters:
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+        assert all(isinstance(parameter, MXFP8Tensor) for parameter in module.parameters())
+        # FSDP initializes its FP32 masters from preserved values, not the quantized bytes.
+        with torch.no_grad():
+            for name, parameter in module.named_parameters():
+                parameter.get_high_precision_init_val().copy_(
+                    reference_weights[name].get_high_precision_init_val()
+                )
+    else:
+        module.load_state_dict(reference.state_dict())
+    masters = {
+        name: torch.nn.Parameter(
+            (parameter.get_high_precision_init_val() if native_parameters else parameter)
+            .detach()
+            .to(device=parameter.device, dtype=torch.float32)
+            .clone()
+        )
+        for name, parameter in reference_weights.items()
+    }
+    reference_optimizer = FusedAdam(list(masters.values()), lr=1.0e-3, weight_decay=0.0)
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            fp8_param_gather=native_parameters,
+            data_parallel_sharding_strategy="optim_grads_params",
+            use_distributed_optimizer=False,
+            megatron_fsdp_main_params_dtype=torch.float32,
+            megatron_fsdp_main_grads_dtype=torch.float32,
+            megatron_fsdp_grad_comm_dtype=torch.float32,
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        module=module,
+        pg_collection=pg,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            lr=1.0e-3,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        ),
+        [model],
+        use_gloo_process_groups=False,
+    )
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    assert isinstance(model.module, FsdpModule)
+    assert all(
+        group.mesh.size() == distributed_setup.world_size for group in module.parameter_groups
+    )
+    gathered_phases = []
+    if native_parameters:
+
+        def check_forward_planes(current, _inputs):
+            for group in current.parameter_groups:
+                buffer = group._unsharded_model_weight
+                assert buffer.is_rowwise_allocated
+                # REGISTRATION is the adapter's default execution order: even the
+                # first forward may prefetch this single unit's own backward.
+            gathered_phases.append("forward")
+
+        def check_backward_planes(current, _grad_outputs):
+            for group in current.parameter_groups:
+                buffer = group._unsharded_model_weight
+                assert buffer.is_columnwise_allocated
+            gathered_phases.append("backward")
+
+        module.register_forward_pre_hook(check_forward_planes)
+        module.register_full_backward_pre_hook(check_backward_planes)
+    for step, sizes in enumerate(((256, 0, 512), (128, 256, 384))):
+        optimizer.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        model.zero_grad_buffer()
+        torch.manual_seed(780 + step + 10 * distributed_setup.rank)
+        source = torch.randn(sum(sizes), 256, device="cuda", dtype=torch.bfloat16)
+        probabilities = torch.rand(sum(sizes), device="cuda", dtype=torch.float32)
+        upstream = torch.randn_like(source) / 128
+        counts = torch.tensor(sizes, device="cuda", dtype=torch.int64)
+        results = []
+        for current in (reference, model):
+            x = source.clone().requires_grad_()
+            probs = probabilities.clone().requires_grad_()
+            with te.autocast(enabled=recipe is not None, recipe=recipe):
+                output, bias = current(x, counts, probs)
+            assert bias is None
+            output.backward(upstream)
+            results.append((output.detach(), x.grad, probs.grad))
+            ops = reference._fused_ops[0] if current is reference else module._fused_ops[0]
+            assert isinstance(ops._module_groups[0]._forward_ops[0][0], fused_type)
+        model.finish_grad_sync()
+        for index, (expected, actual) in enumerate(zip(*results)):
+            # dprob uses a floating-point reduction; GEMM outputs and dgrad are exact.
+            tolerance = dict(rtol=2e-5, atol=2e-7) if index == 2 else dict(rtol=0, atol=0)
+            torch.testing.assert_close(actual, expected, **tolerance)
+        for group in module.parameter_groups:
+            assert not group.is_rowwise_unsharded
+            if native_parameters:
+                assert not group._unsharded_model_weight.is_columnwise_allocated
+            assert group.main_grad is not None
+            full_grad = group.main_grad.redistribute((Replicate(),))
+            for index, parameter in enumerate(group.fsdp_parameters):
+                name = parameter.fqns[0]
+                expected_grad = reference_weights[name].grad.float()
+                torch.distributed.all_reduce(expected_grad, op=torch.distributed.ReduceOp.AVG)
+                masters[name].grad = expected_grad
+                actual_grad = parameter.sharded.grad
+                assert (
+                    actual_grad.to_local().data_ptr()
+                    == group.main_grad.get_tensor_view(index).data_ptr()
+                )
+                torch.testing.assert_close(
+                    full_grad.get_tensor_view(index), expected_grad, rtol=2e-5, atol=2e-7
+                )
+        success, _, _ = optimizer.step()
+        assert success
+        reference_optimizer.step()
+        for group in module.parameter_groups:
+            full_master = group.main_weight.redistribute((Replicate(),))
+            for index, parameter in enumerate(group.fsdp_parameters):
+                name = parameter.fqns[0]
+                torch.testing.assert_close(
+                    full_master.get_tensor_view(index), masters[name], rtol=1e-5, atol=2e-7
+                )
+                with torch.no_grad():
+                    if native_parameters:
+                        reference_weights[name]._get_quantizer().set_usage(
+                            rowwise=True, columnwise=True
+                        )
+                        reference_weights[name].quantize_(masters[name])
+                    else:
+                        reference_weights[name].copy_(masters[name])
+    if native_parameters:
+        assert gathered_phases == ["forward", "backward"] * 2
+    assert {direction for direction, _, _ in calls} == {"forward", "backward"}
+    assert all(layout == "gate_then_up" and discrete for _, layout, discrete in calls)
+    fused_type.grouped_gemm_activation_kernel.cache_clear()
+    fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["single_weight", "single_bias", "fp4_storage", "fp4_gather", "fp4_tensor"]
+)
+def test_canonical_grouped_experts_reject_unsupported_storage(
+    canonical_expert_process_groups, unsupported
+):
+    """Storage modes without an MFSDP v2 contract fail before allocating shards."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=3,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_single_grouped_weight=unsupported == "single_weight",
+        moe_single_grouped_bias=unsupported == "single_bias",
+        add_bias_linear=unsupported == "single_bias",
+        fp4="e2m1" if unsupported in ("fp4_storage", "fp4_gather") else None,
+        fp4_param=unsupported == "fp4_storage",
+        gradient_accumulation_fusion=False,
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=2,
+        fp4_param_gather=unsupported == "fp4_gather",
+    )
+    module = torch.nn.Linear(256, 256, device="cuda")
+    if unsupported == "fp4_tensor":
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe
+
+        if torch.cuda.get_device_capability()[0] < 10 or not hasattr(recipe, "NVFP4BlockScaling"):
+            pytest.skip("Native NVFP4 parameter construction requires Blackwell and NVFP4 TE.")
+        # A per-module/outer TE initialization override can create native FP4 while
+        # config.fp4_param and ddp_config.fp4_param_gather both remain False.
+        with te.quantized_model_init(recipe=recipe.NVFP4BlockScaling()):
+            module = te.Linear(256, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        assert not config.fp4_param and not ddp_config.fp4_param_gather
+    match = "per-expert weights and biases" if unsupported.startswith("single") else "FP4 parameter"
+    if unsupported == "fp4_tensor":
+        match += " 'weight'"
+    with pytest.raises(ValueError, match=match):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=module,
+            pg_collection=canonical_expert_process_groups,
+        )

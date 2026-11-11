@@ -54,6 +54,19 @@ def test_glu_interleave_accepts_low_precision_model_parameters(params_dtype):
     assert config.params_dtype == params_dtype
 
 
+def test_gtp_canonical_grouped_gemm_requires_discrete_weights():
+    kwargs = dict(
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        expert_gtp_weight_remat_size=2,
+        params_dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="GTP weight sharding requires"):
+        _make_glu_interleave_config(moe_single_grouped_weight=True, **kwargs)
+    config = _make_glu_interleave_config(moe_single_grouped_weight=False, **kwargs)
+    assert config.moe_mlp_glu_interleave_size is None
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
